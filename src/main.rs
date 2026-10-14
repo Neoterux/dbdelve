@@ -19,6 +19,7 @@ mod scroller;
 mod session;
 mod sql;
 mod store;
+mod structure_grid;
 mod tab_drag;
 mod views;
 mod workspace;
@@ -60,7 +61,8 @@ use actions::{
     SaveQuery, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty,
     SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit,
     ShowAllColumns, ShowEditor, ShowReferences, SortColumn, ToggleComment, ToggleFilterJoin,
-    ToggleNextJoin, TogglePinColumn, ToggleRowPanel, ToggleSidebar, ZoomEditorIn, ZoomEditorOut,
+    ToggleNextJoin, TogglePinColumn, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn,
+    ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
@@ -334,6 +336,7 @@ fn main() {
                     items: vec![
                         MenuItem::action("Toggle Sidebar", ToggleSidebar),
                         MenuItem::action("Toggle Row Panel", ToggleRowPanel),
+                        MenuItem::action("Toggle Data / Structure", ToggleStructure),
                         MenuItem::separator(),
                         MenuItem::action("Zoom In", ZoomEditorIn),
                         MenuItem::action("Zoom Out", ZoomEditorOut),

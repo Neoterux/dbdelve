@@ -14,7 +14,16 @@ impl Workspace {
     /// is offered on relations the grid refuses to edit.
     pub(crate) fn new_row(&mut self, _: &NewRow, window: &mut Window, cx: &mut Context<Self>) {
         // Does not route through `editable`: an insert has no existing row to
-        // check a column of, so the mode is asked outright.
+        // check a column of, so the mode is asked outright -- but not on a
+        // structure tab, which has no row to add and only needs pointing back.
+        if self
+            .profile()
+            .and_then(|profile| profile.session.active_object())
+            .is_some_and(|tab| matches!(tab.body, ObjectBody::Structure { .. }))
+        {
+            self.note("Switch to Data to add a row.".into(), cx);
+            return;
+        }
         if !self.require(Mode::ReadWrite, cx) {
             return;
         }
@@ -39,17 +48,16 @@ impl Workspace {
         let Some(tab) = profile.session.objects.iter().find(|tab| tab.id == id) else {
             return;
         };
-        let ObjectBody::Relation { structure, .. } = &tab.body else {
-            return;
+        let structure = match &tab.body {
+            ObjectBody::Relation { structure, .. } => structure,
+            ObjectBody::Structure { .. } | ObjectBody::Routine(_) => return,
         };
         if !tab.takes_inserts(self.engine()) {
             self.note("This view takes no inserts.".into(), cx);
             return;
         }
         // The columns are the form: without them there is nothing to draw, and
-        // guessing at them would be inventing a table. Checked before
-        // `show_structure` flips the tab, so a refused New row leaves
-        // Structure showing rather than switching to Data for nothing.
+        // guessing at them would be inventing a table.
         let StructureState::Loaded(structure) = structure else {
             self.note(
                 "DBDelve has not read this relation's columns yet.".into(),
@@ -63,10 +71,6 @@ impl Workspace {
             .iter()
             .map(|column| (column.name.clone(), column.data_type.clone()))
             .collect();
-        // From the structure view the form belongs to the data, so it goes
-        // back there first -- now that every refusal above is past.
-        self.show_structure(false, cx);
-
         let mut fields = Vec::with_capacity(columns.len());
         for (index, (column, data_type)) in columns.into_iter().enumerate() {
             let input = cx.new(|cx| InputState::new(window, cx));
@@ -1132,7 +1136,7 @@ impl Workspace {
     /// rules: the rows the server returned, no pending edits, and a capped
     /// snapshot refused rather than copied short.
     pub(crate) fn copy_results_as(&mut self, format: Format, cx: &mut Context<Self>) {
-        if self.refuse_capped("copying", cx) {
+        if !self.has_results(cx) || self.refuse_capped("copying", cx) {
             return;
         }
         let Some(results) = self
@@ -1150,12 +1154,19 @@ impl Workspace {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         // A copy changes nothing on screen, and a whole result set is too much
         // to take on trust. Unlike a refusal, the confirmation goes by itself.
-        let message = format!(
-            "Copied {} {} as {}.",
-            group_thousands(rows as u64),
-            if rows == 1 { "row" } else { "rows" },
-            format.extension().to_uppercase()
+        self.confirm(
+            format!(
+                "Copied {} {} as {}.",
+                group_thousands(rows as u64),
+                if rows == 1 { "row" } else { "rows" },
+                format.extension().to_uppercase()
+            ),
+            cx,
         );
+    }
+
+    /// A notice that goes by itself: see `clear_notice_later`.
+    pub(crate) fn confirm(&mut self, message: String, cx: &mut Context<Self>) {
         self.note(message.clone(), cx);
         if let Some(profile) = self.profile() {
             let (id, generation) = (profile.id.clone(), profile.generation);
@@ -1336,7 +1347,7 @@ impl Workspace {
     /// read it off. Pending edits are not written either: this is the result set
     /// the server returned, and applying them is a separate, visible act.
     pub(crate) fn export_results(&mut self, format: Format, cx: &mut Context<Self>) {
-        if self.refuse_capped("exporting", cx) {
+        if !self.has_results(cx) || self.refuse_capped("exporting", cx) {
             return;
         }
         let Some(profile) = self.profile() else {

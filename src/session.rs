@@ -35,6 +35,7 @@ use crate::{
     result_grid::{NewValue, ResultGrid},
     sql::{self, Destructive, Mode, SortKey, Verdict},
     store,
+    structure_grid::StructureGrid,
     theme::ConnectionColor,
     ui::row_readout,
 };
@@ -597,7 +598,7 @@ impl Session {
             None => self.active_query_tab().map(|tab| tab.shown().0),
             Some(tab) => match &tab.body {
                 ObjectBody::Relation { query, .. } => Some(query),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -614,7 +615,7 @@ impl Session {
             None => self.active_query_tab().map(|tab| tab.shown().1),
             Some(tab) => match &tab.body {
                 ObjectBody::Relation { results, .. } => Some(results),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -646,7 +647,7 @@ impl Session {
             Tab::Query(id) => self.query_tab(id).map(|tab| &tab.results),
             Tab::Object(id) => match &self.objects.iter().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { results, .. } => Some(results),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -662,7 +663,7 @@ impl Session {
                 .find(|tab| tab.id == id)
                 .and_then(|tab| match &tab.body {
                     ObjectBody::Relation { query, .. } => Some(query),
-                    ObjectBody::Routine(_) => None,
+                    ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
                 }),
         };
         matches!(state, Some(QueryState::Running { .. }))
@@ -674,7 +675,7 @@ impl Session {
             Tab::Query(id) => self.query_tab(id).map(|tab| &tab.sorting),
             Tab::Object(id) => match &self.objects.iter().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { sorting, .. } => Some(sorting),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -684,7 +685,7 @@ impl Session {
             Tab::Query(id) => self.query_tab_mut(id).map(|tab| &mut tab.sorting),
             Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { sorting, .. } => Some(sorting),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -708,7 +709,7 @@ impl Session {
             })
             .chain(self.objects.iter().filter_map(|tab| match &tab.body {
                 ObjectBody::Relation { results, .. } => Some(results),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             }))
     }
 
@@ -726,7 +727,7 @@ impl Session {
             }
             Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { query, results, .. } => Some((query, results.clone())),
-                ObjectBody::Routine(_) => None,
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
     }
@@ -1371,7 +1372,7 @@ impl ObjectTab {
     pub(crate) fn filter(&self) -> &str {
         match &self.body {
             ObjectBody::Relation { filter, .. } => filter,
-            ObjectBody::Routine(_) => "",
+            ObjectBody::Routine(_) | ObjectBody::Structure { .. } => "",
         }
     }
 
@@ -1383,7 +1384,7 @@ impl ObjectTab {
                 .iter()
                 .map(stored_filter)
                 .collect(),
-            ObjectBody::Routine(_) => Vec::new(),
+            ObjectBody::Routine(_) | ObjectBody::Structure { .. } => Vec::new(),
         }
     }
 
@@ -1393,11 +1394,16 @@ impl ObjectTab {
             name: self.name.clone(),
             filter: self.filter().to_string(),
             filter_engine: (!self.filter().is_empty()).then(|| engine.as_str().to_string()),
+            origin: match &self.body {
+                ObjectBody::Structure { origin, .. } => origin.clone(),
+                ObjectBody::Relation { .. } | ObjectBody::Routine(_) => None,
+            },
             // Nothing writes the two-field rows an older build did; they are
             // read once on the way in and superseded by `bars` on this save.
             filters: Vec::new(),
             bars: self.filters(engine),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
+            structure: matches!(self.body, ObjectBody::Structure { .. }),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
                 ObjectKind::Routine(_) => RelationKind::default(),
@@ -1424,6 +1430,13 @@ pub(crate) enum OpenedObject {
         /// open: nothing parses one back into the other.
         filters: Vec<FilterBar>,
     },
+    Structure {
+        schema: String,
+        name: String,
+        kind: RelationKind,
+        /// See `ObjectBody::Structure`'s.
+        origin: Option<String>,
+    },
     Routine {
         schema: String,
         routine: Routine,
@@ -1433,20 +1446,24 @@ pub(crate) enum OpenedObject {
 impl OpenedObject {
     pub(crate) fn schema(&self) -> &str {
         match self {
-            Self::Relation { schema, .. } | Self::Routine { schema, .. } => schema,
+            Self::Relation { schema, .. }
+            | Self::Structure { schema, .. }
+            | Self::Routine { schema, .. } => schema,
         }
     }
 
     pub(crate) fn name(&self) -> String {
         match self {
-            Self::Relation { name, .. } => name.clone(),
+            Self::Relation { name, .. } | Self::Structure { name, .. } => name.clone(),
             Self::Routine { routine, .. } => routine_name(routine),
         }
     }
 
     pub(crate) fn kind(&self) -> ObjectKind {
         match self {
-            Self::Relation { kind, .. } => ObjectKind::Relation(*kind),
+            Self::Relation { kind, .. } | Self::Structure { kind, .. } => {
+                ObjectKind::Relation(*kind)
+            }
             Self::Routine { routine, .. } => ObjectKind::Routine(routine.kind),
         }
     }
@@ -1454,7 +1471,7 @@ impl OpenedObject {
     pub(crate) fn filter(&self) -> &str {
         match self {
             Self::Relation { filter, .. } => filter,
-            Self::Routine { .. } => "",
+            Self::Structure { .. } | Self::Routine { .. } => "",
         }
     }
 
@@ -1541,15 +1558,14 @@ pub(crate) fn routine_name(routine: &Routine) -> String {
 // bytes per tab.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ObjectBody {
-    /// An opened relation: its rows, full height, with the relation's
-    /// definition behind the Structure toggle (spec §3.2).
+    /// An opened relation: its rows, full height. Its definition is a tab of
+    /// its own, [`ObjectBody::Structure`] (spec §3.2).
     ///
     /// No editor. A generated `SELECT` shown above the grid read as a query the
     /// user had written and invited edits to a buffer that then stopped being a
     /// view of the relation at all. The SQL dbdelve runs here is its own, and the
     /// only thing the user changes about it is the sort.
     Relation {
-        showing_structure: bool,
         structure: StructureState,
         results: Entity<TableState<ResultGrid>>,
         query: QueryState,
@@ -1610,6 +1626,19 @@ pub(crate) enum ObjectBody {
         /// `COUNT(*)` under the current `filter`, run only when the user asks:
         /// on a large table it is a full scan holding the connection.
         count: RowCount,
+    },
+    /// A relation's definition, opened only when asked for. It runs no query:
+    /// the structure is all it loads.
+    Structure {
+        structure: StructureState,
+        /// Over whichever section its chips picked.
+        grid: Entity<TableState<StructureGrid>>,
+        /// The filter of the data tab that last switched here, which going back
+        /// to Data returns to: a relation can have several, filtered ones among
+        /// them, and its unfiltered rows are not the ones the user left. The
+        /// filter rather than the id, because ids do not survive a restart.
+        /// A filter edited since names no tab, and Data falls back to any.
+        origin: Option<String>,
     },
     Routine(Routine),
 }
@@ -1840,7 +1869,6 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
             sorting,
             filter,
             limit,
-            showing_structure,
             ..
         } = &tab.body
         else {
@@ -1859,7 +1887,6 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
             &store::StoredGrid {
                 limit: Some(limit.unwrap_or(0)),
                 filter: filter.clone(),
-                showing_structure: *showing_structure,
                 order_by: sort
                     .iter()
                     .map(|key| (key.expression.clone(), key.ascending))
