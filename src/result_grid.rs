@@ -1072,26 +1072,41 @@ impl ResultGrid {
             .columns
             .iter()
             .enumerate()
-            .map(|(col_ix, column)| Field {
-                name: column.name.clone().into(),
-                // The cell's own type where it has one: the column's is `mixed`
-                // as soon as two documents disagree.
-                data_type: self
-                    .result
-                    .cell_types
-                    .get(row_ix)
-                    .and_then(|types| types.get(col_ix))
-                    .map(|alias| SharedString::new_static(alias))
-                    .or_else(|| column.data_type.clone().map(SharedString::from)),
-                missing: self.missing(row_ix, col_ix),
-                // Reformatted before it is clipped, never after: a document cut
-                // at 4,000 characters does not parse, and the inspector would
-                // fall back to the one long line for exactly the values big
-                // enough to need the help.
-                value: self.cell(row_ix, col_ix).map(|value| {
-                    let value = indented_json(value);
-                    clip_to(&value, FIELD_DISPLAY_LIMIT).into()
-                }),
+            .map(|(col_ix, column)| {
+                let cell = self.cell(row_ix, col_ix);
+                let json = cell.and_then(indented_json);
+                Field {
+                    name: column.name.clone().into(),
+                    // The cell's own type where it has one: the column's is `mixed`
+                    // as soon as two documents disagree.
+                    data_type: self
+                        .result
+                        .cell_types
+                        .get(row_ix)
+                        .and_then(|types| types.get(col_ix))
+                        .map(|alias| SharedString::new_static(alias))
+                        .or_else(|| column.data_type.clone().map(SharedString::from)),
+                    missing: self.missing(row_ix, col_ix),
+                    // Reformatted before it is clipped, never after: a document cut
+                    // at 4,000 characters does not parse, and the inspector would
+                    // fall back to the one long line for exactly the values big
+                    // enough to need the help.
+                    value: cell.map(|value| {
+                        let value = json.as_deref().unwrap_or(value);
+                        let clipped = clip_to(value, FIELD_DISPLAY_LIMIT);
+                        // Whole lines only, so the highlighter never sees a
+                        // document cut mid-string or mid-number.
+                        match (json.is_some(), clipped.strip_suffix('…')) {
+                            (true, Some(body)) => match body.rfind('\n') {
+                                Some(newline) => format!("{}…", &body[..=newline]),
+                                None => clipped,
+                            },
+                            _ => clipped,
+                        }
+                        .into()
+                    }),
+                    json: json.is_some(),
+                }
             })
             .collect()
     }
@@ -1750,6 +1765,8 @@ pub struct Field {
     /// without running the statement twice.
     pub data_type: Option<SharedString>,
     pub value: Option<SharedString>,
+    /// `value` is a JSON object or array, reformatted, so it can be highlighted.
+    pub json: bool,
     /// The row has no such field at all, which is not a NULL.
     pub missing: bool,
 }
@@ -2094,31 +2111,31 @@ fn clip(value: &str) -> String {
     flattened
 }
 
-/// A JSON object or array laid out over indented lines, or the value unchanged
-/// where it is not one.
+/// A JSON object or array laid out over indented lines, `None` where the value
+/// is not one.
 ///
 /// Parsed rather than taken from the column's type. SQLite has no JSON type to
 /// report — a document there lives in whatever `text` column was declared for
 /// it — so the type name answers this question for two engines out of three,
 /// and the value itself answers it for all of them.
 ///
+/// The caller keeps the original text on `None`.
+///
 /// Objects and arrays only. A bare number, string or `true` is also valid JSON,
 /// and reformatting one produces the same characters back.
 ///
-/// ponytail: runs on every repaint of the inspector rather than caching, which
-/// the leading-byte check is what makes affordable — it costs one comparison
-/// for a UUID or a timestamp and only reaches the parser for a value already
-/// shaped like a document. Cache per cell if a wide row of large documents ever
-/// makes the panel feel slow.
-fn indented_json(value: &str) -> String {
+/// ponytail: runs on every repaint of the inspector rather than caching. The
+/// leading-byte check keeps a UUID or a timestamp to one comparison, but a value
+/// shaped like a document pays for the parse and the pretty-print both. Cache
+/// per cell if a wide row of large documents ever makes the panel feel slow.
+fn indented_json(value: &str) -> Option<String> {
     let trimmed = value.trim_start();
     if !trimmed.starts_with(['{', '[']) {
-        return value.to_string();
+        return None;
     }
     serde_json::from_str::<serde_json::Value>(trimmed)
         .ok()
         .and_then(|parsed| serde_json::to_string_pretty(&parsed).ok())
-        .unwrap_or_else(|| value.to_string())
 }
 
 /// Cut to a character count, never a byte count: slicing bytes panics in the
@@ -4962,7 +4979,7 @@ mod tests {
 
     #[test]
     fn the_inspector_breaks_a_json_document_up_and_leaves_everything_else_alone() {
-        let document = indented_json(r#"{"aoi":{"acres":69.7},"tags":[1,2]}"#);
+        let document = indented_json(r#"{"aoi":{"acres":69.7},"tags":[1,2]}"#).unwrap();
         assert!(document.starts_with("{\n"), "{document}");
         assert!(document.contains("\n  \"tags\""), "{document}");
 
@@ -4970,14 +4987,38 @@ mod tests {
         // Reformatting a scalar is the characters back again, so the parser is
         // never worth reaching for one.
         for scalar in ["22.38", "true", "null", "\"quoted\""] {
-            assert_eq!(indented_json(scalar), scalar);
+            assert_eq!(indented_json(scalar), None);
         }
         // Shaped like a document without being one -- a truncated value, or
-        // prose that opens with a brace. Handed back as it arrived rather than
-        // swallowed by a parse that failed.
+        // prose that opens with a brace. Not a document, so `None`, and `fields`
+        // keeps the original text.
         for other in ["{not json at all", "[1, 2", "an ordinary sentence", ""] {
-            assert_eq!(indented_json(other), other);
+            assert_eq!(indented_json(other), None);
         }
+    }
+
+    #[test]
+    fn a_field_is_json_only_when_it_parsed_as_a_document() {
+        let grid = grid_of(&[Some(r#"{"a":1}"#), Some("[not json")]);
+        assert!(grid.fields(0)[0].json);
+        assert!(!grid.fields(1)[0].json);
+        assert_eq!(grid.fields(1)[0].value.as_deref(), Some("[not json"));
+    }
+
+    #[test]
+    fn a_clipped_document_ends_after_a_complete_line() {
+        let document = format!(
+            "[{}]",
+            (0..2_000)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let grid = grid_of(&[Some(&document)]);
+        let shown = grid.fields(0).remove(0).value.unwrap();
+
+        assert!(shown.len() < document.len());
+        assert!(shown.ends_with(",\n…"), "{}", &shown[shown.len() - 20..]);
     }
 
     #[test]

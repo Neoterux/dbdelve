@@ -15,7 +15,7 @@ use gpui::{
 };
 use gpui_base::actions::{SelectNextColumn, SelectPrevColumn};
 use gpui_component::{
-    ActiveTheme, Disableable, ElementExt, IconName, Sizable,
+    ActiveTheme, Disableable, ElementExt, IconName, RopeExt, Sizable,
     button::Button,
     highlighter::{HighlightTheme, SyntaxHighlighter},
     input::{self, Editor, EditorState, Input, InputState, Rope},
@@ -1897,6 +1897,11 @@ fn render_row_inspector(
                                     .font_family(grid.clone())
                                     .text_size(px(layout::grid(layout::TEXT_SM)))
                                     .map(|value| match field.value {
+                                        Some(text) if field.json => value.text_color(t.text).child(
+                                            StyledText::new(text.clone()).with_highlights(
+                                                json_highlights(&text, &cx.theme().highlight_theme),
+                                            ),
+                                        ),
                                         Some(text) => value.text_color(t.text).child(text),
                                         None if field.missing => value,
                                         // Italic so a NULL cannot be read
@@ -1911,6 +1916,40 @@ fn render_row_inspector(
             )
             .into_any_element(),
     )
+}
+
+thread_local! {
+    // ponytail: this saves only the query compile. Every repaint still
+    // reparses every JSON field, and because one highlighter is shared the
+    // same-text skip only hits when a row has a single JSON field. If a
+    // release build ever feels slow, compute highlights once per (row, col)
+    // next to the reformatted value, or keep one highlighter per column.
+    static JSON_HIGHLIGHTER: std::cell::RefCell<SyntaxHighlighter> =
+        std::cell::RefCell::new(SyntaxHighlighter::new("json"));
+}
+
+fn json_highlights(
+    text: &str,
+    syntax: &HighlightTheme,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    JSON_HIGHLIGHTER.with_borrow_mut(|highlighter| {
+        let new = Rope::from_str(text);
+        let old = highlighter.text();
+        let point = |rope: &Rope| {
+            let end = rope.offset_to_point(rope.len());
+            tree_sitter::Point::new(end.row, end.column)
+        };
+        let edit = tree_sitter::InputEdit {
+            start_byte: 0,
+            old_end_byte: old.len(),
+            new_end_byte: new.len(),
+            start_position: tree_sitter::Point::new(0, 0),
+            old_end_position: point(old),
+            new_end_position: point(&new),
+        };
+        highlighter.update(Some(edit), &new, None);
+        highlighter.styles(&(0..text.len()), syntax)
+    })
 }
 
 /// One segment of the Data | Structure pair. A quiet chip rather than a
