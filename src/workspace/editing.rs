@@ -734,10 +734,7 @@ impl Workspace {
         // would read as untraceable too.
         let (traced, snapshot) = {
             let grid = results.read(cx).delegate();
-            (
-                (0..grid.columns().len()).any(|col| grid.editable(row, col)),
-                grid.captured().is_some(),
-            )
+            (grid.row_editable(row), grid.captured().is_some())
         };
         // Checked before the snapshot: running a write again is not the way
         // back to editable rows.
@@ -798,45 +795,189 @@ impl Workspace {
         self.stage_value(NewValue::Default, window, cx);
     }
 
-    /// The one body behind all three, so the mode prompt and the refusal cannot
-    /// drift between them.
+    /// The grid's own gestures stage on the active cell.
     fn stage_value(&mut self, value: NewValue, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = self.profile() else {
+        let Some(cell) = self
+            .profile()
+            .and_then(|profile| profile.session.active_results())
+            .and_then(|results| results.read(cx).delegate().active())
+        else {
             return;
+        };
+        self.stage_and_refocus(cell, value, window, cx);
+    }
+
+    fn stage_and_refocus(
+        &mut self,
+        (row, col): (usize, usize),
+        value: NewValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stage_cell(row, col, value, cx)
+            && let Some(results) = self
+                .profile()
+                .and_then(|profile| profile.session.active_results())
+        {
+            // The input this just closed had focus, and a window with nothing
+            // focused has no dispatch path at all.
+            results.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// The one body behind every staged value, from the grid and the row
+    /// panel alike, so the gates, the mode prompt and the refusal cannot drift
+    /// between them. `true` once the value is staged.
+    pub(crate) fn stage_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        value: NewValue,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.profile() else {
+            return false;
         };
         // The gate `edit_cell` holds, for its reason: a batch already on screen
         // was generated from the pending set as it stood.
         if profile.session.apply_review.is_some() {
-            return;
+            return false;
         }
         let Some(results) = profile.session.active_results().cloned() else {
-            return;
-        };
-        let Some((row, col)) = results.read(cx).delegate().active() else {
-            return;
+            return false;
         };
         if results.read(cx).delegate().editable(row, col)
-            && !self.confirm_stale(StaleResume::Stage(value.clone()), cx)
+            && !self.confirm_stale(StaleResume::Stage((row, col), value.clone()), cx)
         {
-            return;
+            return false;
         }
         if results.update(cx, |table, cx| {
             let staged = table.delegate_mut().stage(row, col, value);
             cx.notify();
             staged
         }) {
-            // The input this just closed had focus, and a window with nothing
-            // focused has no dispatch path at all.
-            results.focus_handle(cx).focus(window, cx);
-            return;
+            return true;
         }
         // Asked after the attempt rather than before it, so staging a value the
         // cell already holds -- which changes nothing -- does not ask a
         // Read-only connection to raise its mode for it.
-        if !self.require(Mode::ReadWrite, cx) {
+        if self.require(Mode::ReadWrite, cx) {
+            self.note("This column cannot be edited.".into(), cx);
+        }
+        false
+    }
+
+    /// Stage what a row panel input holds, if it is not what it was filled
+    /// with: focus passing through an input is not an edit, and an input on a
+    /// NULL holds the empty string, which committing would write.
+    pub(crate) fn commit_row_input(
+        &mut self,
+        input: &Entity<gpui_component::input::TextareaState>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inputs) = &self.row_panel.inputs else {
+            return;
+        };
+        let Some((col, seed)) = inputs.fields.iter().enumerate().find_map(|(col, field)| {
+            let field = field.as_ref().filter(|field| field.input == *input)?;
+            Some((col, field.seed.clone()))
+        }) else {
+            return;
+        };
+        let (grid, row, rows) = (inputs.grid.clone(), inputs.row, inputs.rows);
+        let text = input.read(cx).value();
+        // Rows replaced or reordered since: another record is at `row` now,
+        // and the text goes the way the grid's own open input does.
+        if text == seed || grid.read(cx).delegate().rows_id() != rows {
             return;
         }
-        self.note("This column cannot be edited.".into(), cx);
+        let in_front = self
+            .profile()
+            .and_then(|profile| profile.session.active_results())
+            == Some(&grid);
+        let value = NewValue::Value(text.clone());
+        let staged = match in_front {
+            true => self.stage_cell(row, col, value, cx),
+            false => self.stage_behind(&grid, row, col, value, cx),
+        };
+        if staged
+            && let Some(field) = self
+                .row_panel
+                .inputs
+                .as_mut()
+                .and_then(|inputs| inputs.fields.get_mut(col)?.as_mut())
+        {
+            field.seed = text;
+        }
+    }
+
+    /// Stage typed text on a grid no longer in front, which is where a blur
+    /// from switching tabs lands. `stage_cell`'s gates read the tab in front,
+    /// so this asks the grid itself, and leaves text that would need the
+    /// stale-rows prompt unstaged rather than raise it over another tab.
+    fn stage_behind(
+        &mut self,
+        grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
+        row: usize,
+        col: usize,
+        value: NewValue,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let reviewing = self
+            .profile()
+            .is_none_or(|profile| profile.session.apply_review.is_some());
+        let staged = !reviewing
+            && grid.update(cx, |table, cx| {
+                let staged =
+                    !table.delegate().unconfirmed() && table.delegate_mut().stage(row, col, value);
+                cx.notify();
+                staged
+            });
+        if !staged {
+            self.note(
+                "A value typed in the row panel was not staged before switching tabs.".into(),
+                cx,
+            );
+        }
+        staged
+    }
+
+    /// A row panel chip. The input beside it is refilled even while it has
+    /// the keyboard -- a button does not take focus -- since otherwise its
+    /// old text would be staged back over the chip's value on the next blur.
+    pub(crate) fn stage_row_field(
+        &mut self,
+        row: usize,
+        col: usize,
+        value: NewValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.stage_cell(row, col, value, cx) {
+            return false;
+        }
+        let Some(results) = self
+            .profile()
+            .and_then(|profile| profile.session.active_results())
+            .cloned()
+        else {
+            return true;
+        };
+        let seed =
+            gpui::SharedString::from(results.read(cx).delegate().edit_seed(row, col).to_string());
+        if let Some(field) = self
+            .row_panel
+            .inputs
+            .as_mut()
+            .filter(|inputs| inputs.name(&results, row, cx))
+            .and_then(|inputs| inputs.fields.get_mut(col)?.as_mut())
+        {
+            field
+                .input
+                .update(cx, |input, cx| input.set_value(seed.clone(), window, cx));
+            field.seed = seed;
+        }
+        true
     }
 
     /// Whether an edit may go ahead on the grid in front: not while its rows are
@@ -942,7 +1083,19 @@ impl Workspace {
         }
         match resume {
             StaleResume::Open => self.edit_cell(&EditCell, window, cx),
-            StaleResume::Stage(value) => self.stage_value(value, window, cx),
+            // Back to the panel input the value came from, if it did, so
+            // stepping through the row carries on from there.
+            StaleResume::Stage(cell, value) => match self.row_input(cell, cx) {
+                // Through the chips' path, which refills the input: a chip's
+                // value resumed here would otherwise leave typed text in it to
+                // be staged back over the value on the next blur.
+                Some(input) => {
+                    if self.stage_row_field(cell.0, cell.1, value, window, cx) {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    }
+                }
+                None => self.stage_and_refocus(cell, value, window, cx),
+            },
             StaleResume::Delete => self.delete_row(&DeleteRow, window, cx),
         }
         cx.notify();
@@ -1269,10 +1422,11 @@ impl Workspace {
         true
     }
 
-    /// One field of the row panel, taken from the fetched cell rather than the
-    /// re-indented, clipped text the panel paints. The field's button shows a
-    /// tick for a moment after, since a copy otherwise changes nothing on
-    /// screen.
+    /// One field of the row panel, taken from the cell's whole value -- its
+    /// staged one, where it has an edit pending, as the panel shows -- rather
+    /// than the re-indented, clipped text the panel paints. The field's button
+    /// shows a tick for a moment after, since a copy otherwise changes nothing
+    /// on screen.
     pub(crate) fn copy_row_field(&mut self, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
         let Some(results) = self
             .profile()
@@ -1280,14 +1434,11 @@ impl Workspace {
         else {
             return;
         };
-        let Some(value) = results
+        let value = results
             .read(cx)
             .delegate()
-            .cell(row_ix, col_ix)
-            .map(str::to_string)
-        else {
-            return;
-        };
+            .edit_seed(row_ix, col_ix)
+            .to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(value));
 
         let copied = Some((row_ix, col_ix));
