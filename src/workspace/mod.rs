@@ -323,6 +323,7 @@ impl Workspace {
                 copied: None,
                 search: row_panel_search,
                 searched: Default::default(),
+                revealed: Default::default(),
             },
             plan_copied: false,
             pending_removal: None,
@@ -899,6 +900,9 @@ impl Render for Workspace {
         let t = *theme(cx);
         self.settle_sidebar(window, cx);
         self.reveal_landed_column(window, cx);
+        if !self.row_panel.on_screen.get() {
+            self.row_panel.revealed.take();
+        }
         self.row_panel.on_screen.set(false);
         self.row_panel.searched.set(false);
         // Every way the switcher closes ends here, so this is the one place
@@ -958,7 +962,7 @@ impl Render for Workspace {
                 .iter()
                 .position(|key| profile.session.tab_of(key) == Some(profile.session.active))
             {
-                crate::scroller::scroll_to("tab-strip", index, cx);
+                crate::scroller::scroll_to("tab-strip", "", index, cx);
             }
             // Whatever the surface in front is: a keystroke reaches the
             // workspace along the focused element's dispatch path, so a
