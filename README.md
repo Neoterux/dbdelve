@@ -217,4 +217,9 @@ GitHub at startup to check for updates, which you can turn off in Settings.
 
 ## License
 
-MIT. See [NOTICES.md](NOTICES.md) for third-party font and theme licenses.
+Copyright (C) 2026 Shayan Abbas and contributors. Licensed under the
+[GNU General Public License v3.0](LICENSE). See [NOTICES.md](NOTICES.md) for
+third-party font and theme licenses.
+
+Code contributed before the switch to GPL-3.0 was released under the
+[MIT License](licenses/MIT-dbdelve.txt), and that notice still applies to it.

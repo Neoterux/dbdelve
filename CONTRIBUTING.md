@@ -195,5 +195,5 @@ desktop UI; reviewers need to see the change, not just read the diff.
 
 ## License
 
-By contributing, you agree your contribution is licensed under the MIT
-License, same as the rest of the project.
+By contributing, you agree your contribution is licensed under the GNU
+General Public License v3.0, same as the rest of the project.

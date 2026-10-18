@@ -2,7 +2,7 @@
 name = "dbdelve"
 version = "0.3.8"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "A native SQL client"
 publish = false
 
