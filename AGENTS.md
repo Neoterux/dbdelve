@@ -50,6 +50,8 @@ require it, stop and raise it instead.
    - Grid edits on a query tab are appended to the buffer
      (`sql::appended_statement`) and run from there. On an object tab, which
      has no buffer, the statement is shown in a review dialog before it runs.
+   - Import Rows shows every statement it will send in its dialog's SQL view
+     before any runs.
    - **Explain** puts the engine's `EXPLAIN` prefix on a copy of the
      statement, never into the buffer.
    - **Format Query** rewrites the buffer on command only, through
@@ -73,21 +75,35 @@ require it, stop and raise it instead.
 
 2. **Generated SQL passes a whitelist gate, and there is one per path.**
    `sql::is_generated_write` is the single gate every statement the grid writes
-   passes first. It admits exactly three shapes:
+   passes first. It admits exactly four shapes:
 
    - a batch of `UPDATE`s, optionally bracketed by a `BEGIN`/`COMMIT` the gate
      can see closed;
-   - one `INSERT`, naming the columns it fills;
+   - one `INSERT`, naming the columns it fills, of one or more rows whose
+     values are each exactly one single-quoted literal (`N'…'` too, never two
+     adjacent), a bare `0x…` hex literal or `NULL` (no subquery, function call
+     or `SELECT` source), with no comment anywhere in it (MySQL runs
+     `/*! … */`), optionally ending in exactly `ON CONFLICT DO NOTHING` or
+     `ON DUPLICATE KEY UPDATE c = c` with `c` bare or backticked (Import Rows'
+     Skip);
    - one `DELETE` whose `WHERE` is a conjunction of equality predicates over
      distinct, unqualified columns against single-quoted literals (or a bare
      `0x…` hex literal, SQL Server's spelling of bytes): no `OR`, no
      other operator, no subquery, no function call, no CTE beside it, no
-     `RETURNING`, no `LIMIT`, and nothing else in the submission.
+     `RETURNING`, no `LIMIT`, and nothing else in the submission;
+   - a submission that is exactly one lone `BEGIN`, `BEGIN TRANSACTION`,
+     `COMMIT` or `ROLLBACK`, compared as text. These are the brackets of an
+     import's transaction, which spans submissions on a connection of the
+     import's own, and are never admitted beside anything else.
 
    Because it is a whitelist, `DROP` and `TRUNCATE` are refused structurally,
    anywhere in the tree, CTEs included (`sql::forbidden`), and so is every
    `delete` outside that one shape (`sql::deletes_anything`, checked on the
-   `INSERT` and `UPDATE` arms).
+   `INSERT` and `UPDATE` arms). On an engine where a backslash escapes
+   (`Engine::backslash_escapes`), a submission with any literal holding a quote
+   after an odd run of backslashes is refused, in every arm
+   (`sql::parse_write`): the grammar ends the string there and the engine
+   does not.
 
    `sql::is_generated_select` guards the filter bar, the one place user text is
    spliced into DBDelve's statement: exactly one query, nothing destructive
@@ -98,7 +114,8 @@ require it, stop and raise it instead.
    (`sql::is_generated_write_on` and `sql::is_generated_select` dispatch on the
    engine): `mql::is_generated_write` admits `updateOne`s whose filter is
    exactly `{_id: <literal>}` and whose update is exactly a `$set` of literals,
-   one `insertOne` of a literal document, and one `deleteOne` by `_id`; and
+   one `insertOne` of a literal document, one `insertMany` of a non-empty
+   array of literal documents, and one `deleteOne` by `_id`; and
    `mql::browse::is_generated_read` admits only the preview's own
    `find(filter).sort().skip().limit()` (no `limit()` under no row limit) and the
    status bar's `countDocuments`,
@@ -142,6 +159,7 @@ require it, stop and raise it instead.
    and has to spell it the way the server will read it. It holds no connection.
    Views and workspace code _ask_ it (`quote_identifier`, `quote_literal`, `quote_value`,
    `is_binary_type`, `qualified`, `transaction_start`, `explain_prefix`, `assigns_default`,
+   `boolean_literal`, `skips_duplicates`, `all_or_nothing`, `takes_new_fields`,
    `fields`, `syntax`, and `filter::Operator::on` for the filter dropdown) and never
    match on it. Where an engine question
    is missing, add a method to `Engine` rather than a `match` at the caller. The
@@ -249,6 +267,7 @@ futures-util = "=0.3.34"   # try_next over tiberius's result stream. dff = false
 
 mongodb = "=3.9.1"         # its own tokio runtime per connection. dff = false, rustls on ring
 time = "=0.3.55"           # ISO-8601 dates in mongosh statements. dff = false
+encoding_rs = "=0.8.35"    # Import Rows' UTF-16 and Windows-1252 files. Already in the graph
 
 lsp-types = "=0.97.0"      # the completion provider's vocabulary. No server is started
 nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
@@ -551,14 +570,14 @@ Decided, and not to be re-litigated:
   MariaDB unless a bullet names it. A profile stored before it existed says
   `mysql` and stays MySQL. The `live_` tests in `mysql.rs` run once per server
   (`on_mysql::`, `on_mariadb::`).
-- **Nine functions generate the SQL DBDelve runs, and every one quotes through `Engine`:**
+- **Ten functions generate the SQL DBDelve runs, and every one quotes through `Engine`:**
   `explorer::preview_sql`, `explorer::probe_sql` (the reference arrow's
   `SELECT 1 … LIMIT 1` per referencing relation), `explorer::count_sql` (the status bar's Count, a
   `COUNT(*)` -- `COUNT_BIG(*)` on SQL Server, whose `COUNT` is an `int` --
   under the tab's filter, run only when the user asks and through
   `sql::is_generated_select`, `sql::classify` and `sql::gate`, refused rather
   than prompted for when the gate would stop it), `sql::with_order_by`, `sql::update_row`,
-  `sql::insert_row`, `sql::delete_row`, `filter::sort_expression` and
+  `sql::insert_row`, `sql::insert_rows` (Import Rows' chunks), `sql::delete_row`, `filter::sort_expression` and
   `filter::filter_predicate`. `filter::sort_expression` is the one that gets
   forgotten, and forgetting it is silent: a double-quoted name is a _string
   literal_ in MySQL, so `ORDER BY "name"` sorts every row by the same constant
@@ -642,19 +661,24 @@ Decided, and not to be re-litigated:
   (`Origin::User`). `execute_unchecked` is the one place `connection.query` is
   called, and calls `connection.generated` for an object tab's query and a
   query tab's grid-edit apply run; the only other callers of
-  `connection.generated` are the status bar's Count (`Workspace::count_rows`)
-  and the reference arrow's one-row checks (`Workspace::show_references`). A
+  `connection.generated` are the status bar's Count (`Workspace::count_rows`),
+  the reference arrow's one-row checks (`Workspace::show_references`), and
+  `import_rows::run::send`, driven by `Workspace::import_step`, on the
+  import's own connection from `Connection::apart`. A
   statement run under `Origin::Generated` or `Origin::Internal` is wrapped in
   `EXEC sp_executesql` (`scoped`) behind `SESSION_OPTIONS` (`XACT_ABORT ON`,
   `QUOTED_IDENTIFIER ON`, `ANSI_NULLS ON`, `ANSI_WARNINGS ON`,
   `IMPLICIT_TRANSACTIONS OFF`, `ROWCOUNT 0`, `DATEFORMAT ymd`), scoped to that
   one `sp_executesql` call so a `SET` the user made themselves is exactly as
-  they left it once dbdelve's statement returns; `Origin::User` runs as typed,
-  under nothing but the login default. A preflight before the statement
-  (`PREFLIGHT_SQL`, run under `SESSION_OPTIONS` for dbdelve's own statement
-  and under the user's options for theirs, bar `USER_DESCRIBE_OPTIONS`'
-  `IMPLICIT_TRANSACTIONS OFF` and `ROWCOUNT 0`, so it compiles the statement
-  the way it will run) reads `@@TRANCOUNT`,
+  they left it once dbdelve's statement returns. An import's lone `BEGIN
+  TRANSACTION`, `COMMIT` and `ROLLBACK` (`sql::is_transaction_bracket`) go out
+  bare instead: one opened or closed inside `sp_executesql` changes
+  `@@TRANCOUNT` across a module boundary, which the server reports as error
+  266. `Origin::User` runs as typed, under nothing but the login default. A
+  preflight before the statement (`PREFLIGHT_SQL`, run under `SESSION_OPTIONS`
+  for dbdelve's own statement and under the user's options for theirs, bar
+  `USER_DESCRIBE_OPTIONS`' `IMPLICIT_TRANSACTIONS OFF` and `ROWCOUNT 0`, so it
+  compiles the statement the way it will run) reads `@@TRANCOUNT`,
   and `transaction_outcome` reads it again after a failure: T-SQL has no
   nested transactions, so dbdelve issues its own `ROLLBACK` only when its own
   `BEGIN TRANSACTION` batch opened the transaction from a count of zero, never
@@ -770,6 +794,8 @@ Decided, and not to be re-litigated:
   not even pretend: a `USE` comes back as "Command not supported by SQL API:
   USE", which `live_a_use_is_refused_rather_than_quietly_forgotten` pins. The database, warehouse, role, timeout and `MULTI_STATEMENT_COUNT`
   are fields of the request and never SQL — hard rule 1.
+  So Import Rows offers no All or nothing there (`Engine::all_or_nothing`):
+  no transaction can span its chunks.
 - **Snowflake has no connection mutex**, alone among the six: there is no
   socket to serialise, so a catalog load does not queue behind a slow query,
   and `snowflake::Connection::at_once` runs a structure load's four statements
@@ -1008,6 +1034,8 @@ Decided, and not to be re-litigated:
 - **There are no transactions to bracket a batch with** (`transaction_start` is
   `None`). A multi-row edit applies in order, and when one fails the error says
   which row did and that the rows before it applied. Nothing is rolled back.
+  Import Rows offers no All or nothing either (`Engine::all_or_nothing`), so
+  each chunk's `insertMany` is kept as it lands.
 - **A missing field is not a null.** A document may lack a field another has, and
   the grid says so: a missing cell renders empty with no `NULL` label, a null
   renders `NULL`, and a snapshot keeps the difference.

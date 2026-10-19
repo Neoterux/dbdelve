@@ -99,6 +99,7 @@ pub enum Command {
     /// Open the "New row" form over the preview. Insertion needs no primary
     /// key, so this is offered where the grid refuses to edit.
     NewRow,
+    ImportRows,
     CloseObject(u64),
     /// Stage a `NULL`, the empty string or `DEFAULT` on the active cell. The
     /// rows are how the gestures stop being folklore; the cell menu dispatches
@@ -719,6 +720,12 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             }
             if tab.takes_inserts(profile.config.engine()) {
                 items.push(Item::command("New row…", "", icon::PLUS, Command::NewRow));
+                items.push(Item::command(
+                    &format!("Import Rows into {}…", tab.name),
+                    "",
+                    icon::PLUS,
+                    Command::ImportRows,
+                ));
             }
             // Only on a row dbdelve can name by its primary key -- the same
             // condition that makes a cell of it editable.
@@ -960,7 +967,29 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             Command::ResetEditorZoom,
         ));
     }
+    if session.import_rows.is_some() {
+        items.retain(|item| beside_import(&item.command));
+    }
     items
+}
+
+/// Whether `command` acts on the app or a connection rather than the tab the
+/// import dialog covers, where it would act out of sight or open under it.
+fn beside_import(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SwitchProfile(_)
+            | Command::NextProfile
+            | Command::PreviousProfile
+            | Command::NewConnection
+            | Command::NewProject
+            | Command::ImportConnections(_)
+            | Command::RefreshConnection
+            | Command::SelectTheme
+            | Command::PickFont(_)
+            | Command::OpenSettings
+            | Command::ToggleSidebar
+    )
 }
 
 fn kind_label(kind: ObjectKind) -> &'static str {

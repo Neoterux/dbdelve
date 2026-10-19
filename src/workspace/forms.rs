@@ -806,7 +806,7 @@ impl Workspace {
                 };
                 Some(row_icon(t, path).into_any_element())
             },
-            |workspace, project| {
+            |workspace, project, _, _| {
                 if let Some(pending) = &mut workspace.pending_import {
                     pending.project = project;
                 }
@@ -886,7 +886,7 @@ impl Workspace {
         self.labelled_field(label, Input::new(input).w_full(), cx)
     }
 
-    fn labelled_field(
+    pub(crate) fn labelled_field(
         &self,
         label: &'static str,
         control: impl IntoElement,
@@ -2489,9 +2489,22 @@ impl Workspace {
                             });
                         })
                     };
-                    let menu = menu
+                    let import_workspace = menu_workspace.clone();
+                    let import_names = (schema.clone(), relation.clone());
+                    let mut menu = menu
                         .item(open("Open Data", false))
-                        .item(open("Open Structure", true))
+                        .item(open("Open Structure", true));
+                    if engine.takes_inserts(kind) {
+                        menu = menu.item(PopupMenuItem::new("Import Rows…").on_click(
+                            move |_, window, cx| {
+                                let (schema, relation) = import_names.clone();
+                                _ = import_workspace.update(cx, |workspace, cx| {
+                                    workspace.import_rows_into(schema, relation, window, cx);
+                                });
+                            },
+                        ));
+                    }
+                    let menu = menu
                         .separator()
                         .item(PopupMenuItem::new("Copy DDL").on_click(move |_, _, cx| {
                             let (schema, relation) = ddl_names.clone();

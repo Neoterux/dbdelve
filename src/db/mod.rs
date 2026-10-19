@@ -441,6 +441,65 @@ impl Engine {
         }
     }
 
+    /// How a boolean is spelled as an Import Rows value. MySQL reads `'true'`
+    /// into a `tinyint` as an error in strict mode, and SQL Server's `bit` and
+    /// SQLite's integers take `1` and `0` only.
+    pub fn boolean_literal(self, value: bool) -> &'static str {
+        match (self, value) {
+            (Self::Postgres | Self::Snowflake | Self::MongoDb, true) => "true",
+            (Self::Postgres | Self::Snowflake | Self::MongoDb, false) => "false",
+            (Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso | Self::SqlServer, true) => {
+                "1"
+            }
+            (Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso | Self::SqlServer, false) => {
+                "0"
+            }
+        }
+    }
+
+    /// Whether an insert can be told to leave a row that collides with an
+    /// existing key alone. SQL Server and Snowflake have no such clause short
+    /// of `MERGE`, and MongoDB's `insertMany` would stop at the first collision.
+    pub fn skips_duplicates(self) -> bool {
+        match self {
+            Self::Postgres | Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso => true,
+            Self::SqlServer | Self::Snowflake | Self::MongoDb => false,
+        }
+    }
+
+    /// The statement that opens a transaction spanning an import's chunks, or
+    /// why there cannot be one.
+    pub fn all_or_nothing(self) -> Result<&'static str, &'static str> {
+        match self {
+            Self::Postgres | Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso => {
+                Ok("BEGIN")
+            }
+            Self::SqlServer => Ok("BEGIN TRANSACTION"),
+            Self::Snowflake => Err(
+                "Snowflake runs each request on its own, so no transaction can span the chunks.",
+            ),
+            Self::MongoDb => Err(
+                "MongoDB has no transaction on a standalone server, so each chunk is kept as it goes.",
+            ),
+        }
+    }
+
+    /// Whether an import may map a column to a field the sample has not seen.
+    /// A collection has no fixed columns, and an unmapped field is left out
+    /// rather than written as null.
+    pub fn takes_new_fields(self) -> bool {
+        match self {
+            Self::MongoDb => true,
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer => false,
+        }
+    }
+
     /// Whether a preview page is ordered by the relation's key when nothing
     /// else sorts it. SQL Server's `OFFSET … FETCH` needs an `ORDER BY`, and
     /// one that orders nothing lets a parallel plan repeat or skip rows from
@@ -601,6 +660,32 @@ impl Engine {
         }
     }
 
+    /// Whether a date literal may carry a UTC offset. MariaDB refuses one even
+    /// into a `timestamp`, which it reads in the session's zone.
+    pub fn reads_literal_offsets(self) -> bool {
+        match self {
+            Self::MariaDb => false,
+            Self::Postgres
+            | Self::MySql
+            | Self::Sqlite
+            | Self::Turso
+            | Self::SqlServer
+            | Self::Snowflake
+            | Self::MongoDb => true,
+        }
+    }
+
+    /// Whether a backslash in a single-quoted literal escapes the character
+    /// after it. Snowflake reads it so unconditionally; MySQL and MariaDB unless
+    /// `NO_BACKSLASH_ESCAPES` is set, which is not dbdelve's to know, so they
+    /// are taken to.
+    pub fn backslash_escapes(self) -> bool {
+        match self {
+            Self::MySql | Self::MariaDb | Self::Snowflake => true,
+            Self::Postgres | Self::Sqlite | Self::Turso | Self::SqlServer | Self::MongoDb => false,
+        }
+    }
+
     /// Doubling the quote is enough for two of them: neither Postgres nor
     /// SQLite reads a backslash as an escape, the first because
     /// `standard_conforming_strings` is on by default and the second because it
@@ -609,12 +694,17 @@ impl Engine {
     /// survive as two.
     pub fn quote_literal(self, value: &str) -> String {
         match self {
-            Self::Postgres | Self::Sqlite | Self::Turso => {
+            Self::Postgres
+            | Self::Sqlite
+            | Self::Turso
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Snowflake => {
+                let value = match self.backslash_escapes() {
+                    true => value.replace('\\', r"\\"),
+                    false => value.to_string(),
+                };
                 format!("'{}'", value.replace('\'', "''"))
-            }
-            // Snowflake reads a backslash as an escape too, and unconditionally.
-            Self::MySql | Self::MariaDb | Self::Snowflake => {
-                format!("'{}'", value.replace('\\', r"\\").replace('\'', "''"))
             }
             // `N` because a bare literal is converted to the database's code
             // page first, and a character it lacks arrives as `?`. No
@@ -1253,6 +1343,22 @@ impl Connection {
             alongside[slot] = None;
         }
         result
+    }
+
+    /// A session of its own for an import, opened the way this one was, so a
+    /// transaction spanning its submissions holds nobody else's statements and
+    /// a Cancel on it stops only the import's. Dropping it ends the session,
+    /// and the server rolls back whatever it left open. Snowflake and MongoDB
+    /// keep no session to hold apart, so it is this one.
+    pub fn apart(&self) -> Result<Self, DbError> {
+        match self {
+            Self::Snowflake(_) | Self::MongoDb(_) => Ok(self.clone()),
+            Self::Postgres(connection) => connection.alongside().map(Self::Postgres),
+            Self::MySql(connection) => connection.alongside().map(Self::MySql),
+            Self::SqlServer(connection) => Ok(Self::SqlServer(connection.alongside())),
+            Self::Sqlite(connection) => connection.alongside().map(Self::Sqlite),
+            Self::Turso(connection) => connection.alongside().map(Self::Turso),
+        }
     }
 
     /// Open now what the first run would otherwise wait on opening.
@@ -2032,6 +2138,20 @@ pub fn is_cancel(engine: Engine, error: &DbError) -> bool {
         Engine::Snowflake => matches!(message, "SQL execution canceled" | "Cancelled."),
         Engine::SqlServer => message.starts_with(mssql::CANCELLED),
         Engine::MongoDb => message == "Cancelled.",
+    }
+}
+
+/// How many of a failed statement's own writes stay applied: the documents an
+/// ordered `insertMany` wrote ahead of the one that failed. Every other engine
+/// undoes the whole statement.
+pub fn applied(engine: Engine, error: &DbError) -> u64 {
+    match engine {
+        Engine::MongoDb => error
+            .message
+            .rsplit_once(mongo::APPLIED)
+            .and_then(|(_, n)| n.strip_suffix('.')?.parse().ok())
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -2824,6 +2944,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_engine_answers_the_import_questions() {
+        use Engine::*;
+        for (engine, yes, skips, begin, new_fields) in [
+            (Postgres, "true", true, Ok("BEGIN"), false),
+            (MySql, "1", true, Ok("BEGIN"), false),
+            (MariaDb, "1", true, Ok("BEGIN"), false),
+            (Sqlite, "1", true, Ok("BEGIN"), false),
+            (Turso, "1", true, Ok("BEGIN"), false),
+            (SqlServer, "1", false, Ok("BEGIN TRANSACTION"), false),
+            (Snowflake, "true", false, Err(()), false),
+            (MongoDb, "true", false, Err(()), true),
+        ] {
+            assert_eq!(engine.boolean_literal(true), yes);
+            assert_eq!(engine.skips_duplicates(), skips);
+            assert_eq!(engine.all_or_nothing().map_err(|_| ()), begin);
+            assert_eq!(engine.takes_new_fields(), new_fields);
+        }
+    }
+
+    #[test]
     fn a_packed_row_holds_what_its_cells_did() {
         let cells: Vec<Cell> = vec![
             Some("1".into()),
@@ -2886,6 +3026,19 @@ mod tests {
             Engine::MariaDb,
             &error("Query execution was interrupted (max_statement_time exceeded)")
         ));
+    }
+
+    #[test]
+    fn a_partly_applied_insert_many_says_how_many_writes_it_kept() {
+        let error = |message: String| DbError {
+            message,
+            position: None,
+        };
+        let duplicate = "E11000 duplicate key error";
+        let partly = error(format!("{duplicate}{}299.", mongo::APPLIED));
+        assert_eq!(applied(Engine::MongoDb, &partly), 299);
+        assert_eq!(applied(Engine::MongoDb, &error(duplicate.into())), 0);
+        assert_eq!(applied(Engine::Postgres, &partly), 0);
     }
 
     #[test]

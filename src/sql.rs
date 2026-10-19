@@ -31,6 +31,7 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::db::{ColumnDefinition, Engine, ExplainMode};
+use crate::import_rows::Value;
 use crate::result_grid::{NewValue, PendingRow};
 
 /// The runnable statements of a query buffer, as byte ranges into it.
@@ -541,6 +542,71 @@ pub fn insert_row(
     ))
 }
 
+/// One multi-row `INSERT` for an import chunk. `columns` holds `(name,
+/// data_type)`, each row its values in that order; a `None` has no SQL
+/// spelling, so it is an error. Every value is quoted through `Engine`, which
+/// is what the write gate's literal check relies on.
+pub(crate) fn insert_rows(
+    engine: Engine,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, &str)],
+    rows: &[Vec<Option<&Value>>],
+    skip: bool,
+) -> Result<String, String> {
+    if engine == Engine::MongoDb {
+        let names: Vec<&str> = columns.iter().map(|&(name, _)| name).collect();
+        return crate::mql::insert_many(table, &names, rows);
+    }
+    let Some(&(first, _)) = columns.first() else {
+        return Err("There is nothing in this row to insert.".into());
+    };
+    if rows.is_empty() {
+        return Err("There are no rows to insert.".into());
+    }
+    let names: Vec<String> = columns
+        .iter()
+        .map(|&(name, _)| engine.quote_identifier(name))
+        .collect();
+    let mut tuples = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut values = Vec::with_capacity(columns.len());
+        for (&(_, data_type), value) in columns.iter().zip(row) {
+            let value = value.ok_or("A value is missing from a row to insert.")?;
+            let new = match value {
+                Value::Null => NewValue::Null,
+                Value::Bool(b) => NewValue::Value(engine.boolean_literal(*b).into()),
+                Value::Json(json) => NewValue::Value(json.to_string().into()),
+                Value::Text(text) | Value::Number(text) | Value::Date { text, .. } => {
+                    NewValue::Value(text.clone().into())
+                }
+            };
+            values.push(literal(engine, &new, Some(data_type)));
+        }
+        tuples.push(format!("({})", values.join(", ")));
+    }
+    // ponytail: Stop and Skip only. Update-existing-row is deferred: Postgres cannot spell ON CONFLICT (pk) DO UPDATE under the pinned grammar, MySQL's matches any unique key, SQL Server and Snowflake would need MERGE.
+    let tail = match (skip, engine) {
+        (false, _) => String::new(),
+        (true, Engine::Postgres | Engine::Sqlite | Engine::Turso) => {
+            " ON CONFLICT DO NOTHING".into()
+        }
+        (true, Engine::MySql | Engine::MariaDb) => {
+            let first = engine.quote_identifier(first);
+            format!(" ON DUPLICATE KEY UPDATE {first} = {first}")
+        }
+        (true, Engine::Snowflake | Engine::SqlServer | Engine::MongoDb) => {
+            return Err("This engine cannot skip rows that already exist.".into());
+        }
+    };
+    Ok(format!(
+        "INSERT INTO {} ({}) VALUES {}{tail}",
+        engine.qualified(schema, table),
+        names.join(", "),
+        tuples.join(",\n")
+    ))
+}
+
 /// An `INSERT` naming every column an insert supplies, each value the engine's
 /// own parameter placeholder: a template for the user's code, put on the
 /// clipboard and never run. `None` on MongoDB, which has no placeholders, and
@@ -619,8 +685,8 @@ pub fn delete_row(
 }
 
 /// Whether `sql` is a statement dbdelve could have written: one or more `UPDATE`s,
-/// a single `INSERT`, or a single `DELETE` naming one row, and nothing else at
-/// all.
+/// a single `INSERT` of literals, a single `DELETE` naming one row, or a lone
+/// transaction bracket, and nothing else at all.
 ///
 /// The one gate every dbdelve-generated statement passes before anything runs,
 /// and the code half of hard rule 1 — dbdelve never writes a `DROP` or a
@@ -639,8 +705,23 @@ pub fn delete_row(
 /// admits more than one now: a rule that lets an `INSERT` through under a name
 /// promising an `UPDATE` is how a whitelist quietly becomes a list of things
 /// nobody refused.
+///
+/// Reads every literal as a backslash-escaping engine would, the stricter of
+/// the two readings. Every caller outside the tests has an engine and goes
+/// through [`is_generated_write_on`], which reads it as that engine does.
+#[cfg(test)]
 pub fn is_generated_write(sql: &str) -> bool {
-    let Some(tree) = parse(sql) else {
+    generated_write(sql, true)
+}
+
+/// `backslash_escapes` is [`Engine::backslash_escapes`] for the engine the
+/// statement is bound for.
+fn generated_write(sql: &str, backslash_escapes: bool) -> bool {
+    // An exact-text whitelist rather than a parse, so nothing can ride along.
+    if is_transaction_bracket(sql) {
+        return true;
+    }
+    let Some(tree) = parse_write(sql, backslash_escapes) else {
         return false;
     };
     let root = tree.root_node();
@@ -665,13 +746,142 @@ pub fn is_generated_write(sql: &str) -> bool {
     // The one place a `delete` node is tolerated, and only for the shape read
     // back out of the tree rather than trusted because dbdelve wrote it.
     if kinds == ["delete"] {
-        return delete_key_columns(sql).is_some();
+        return delete_key_columns(sql, backslash_escapes).is_some();
     }
 
     // One insert alone, or a batch of updates. A batch of inserts is a shape
     // nothing generates, so admitting it would widen the gate for nobody.
-    (kinds == ["insert"] || (!kinds.is_empty() && kinds.iter().all(|kind| *kind == "update")))
+    // A comment anywhere in an insert refuses it: MySQL runs `/*! … */` as
+    // SQL, and the grammar hides one inside a name or between tokens the shape
+    // checks below read only by kind.
+    ((kinds == ["insert"] && literal_insert(statements[0], sql) && !commented(root))
+        || (!kinds.is_empty() && kinds.iter().all(|kind| *kind == "update")))
         && !deletes_anything(root)
+}
+
+/// Whether `sql` is one lone `BEGIN`, `BEGIN TRANSACTION`, `COMMIT` or
+/// `ROLLBACK`, spelled as dbdelve writes it: the brackets of an import's
+/// transaction, which spans submissions on a connection of the import's own.
+/// Compared as text, so a bracket is never admitted beside anything else.
+pub(crate) fn is_transaction_bracket(sql: &str) -> bool {
+    let sql = sql.trim();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
+    matches!(sql, "BEGIN" | "BEGIN TRANSACTION" | "COMMIT" | "ROLLBACK")
+}
+
+/// Whether `statement` is one `INSERT` naming its columns, of one or more rows
+/// of literals, ending in nothing or in Import Rows' fixed skip clause.
+///
+/// No subquery, function call, expression or `SELECT` source, because a value
+/// that computes something is a value dbdelve did not write. The skip clause is
+/// compared as text as well as read from the tree: `ON CONFLICT (a) DO NOTHING`
+/// and `ON DUPLICATE KEY UPDATE a = VALUES(a)` are real clauses nothing
+/// generates.
+fn literal_insert(statement: Node, sql: &str) -> bool {
+    // `RETURNING` hangs beside the insert, not under it.
+    let Some(insert) = statement
+        .named_child(0)
+        .filter(|_| statement.named_child_count() == 1)
+    else {
+        return false;
+    };
+    let mut cursor = insert.walk();
+    let children: Vec<_> = insert.named_children(&mut cursor).collect();
+    let [keyword, into, target, columns, values, rest @ ..] = children.as_slice() else {
+        return false;
+    };
+    let kinds = [keyword, into, target, columns, values].map(|node| node.kind());
+    if kinds
+        != [
+            "keyword_insert",
+            "keyword_into",
+            "object_reference",
+            "list",
+            "keyword_values",
+        ]
+        || !plain_columns(*columns, sql)
+    {
+        return false;
+    }
+
+    let rows = rest.iter().take_while(|node| node.kind() == "list").count();
+    let (rows, tail) = rest.split_at(rows);
+    let null = |node: &Node| {
+        node.kind() == "literal"
+            && sql
+                .get(node.byte_range())
+                .is_some_and(|text| text.eq_ignore_ascii_case("NULL"))
+    };
+    let literal_rows = rows.iter().all(|row| {
+        let mut cursor = row.walk();
+        let values: Vec<_> = row.named_children(&mut cursor).collect();
+        !values.is_empty()
+            && values
+                .iter()
+                .all(|value| literal_value(*value, sql) || null(value))
+    });
+    let Some(last) = rows.last() else {
+        return false;
+    };
+    let Some(text) = sql.get(last.end_byte()..insert.end_byte()) else {
+        return false;
+    };
+    let text = text.trim();
+    let tail_kinds: Vec<_> = tail.iter().map(|node| node.kind()).collect();
+    let skip = match tail_kinds.as_slice() {
+        [] => text.is_empty(),
+        [
+            "keyword_on",
+            "keyword_conflict",
+            "keyword_do",
+            "keyword_nothing",
+        ] => text == "ON CONFLICT DO NOTHING",
+        [
+            "keyword_on",
+            "keyword_duplicate",
+            "keyword_key",
+            "keyword_update",
+            "assignment_list",
+        ] => updates_itself(tail[4], sql)
+            .is_some_and(|column| text == format!("ON DUPLICATE KEY UPDATE {column} = {column}")),
+        _ => false,
+    };
+    literal_rows && skip
+}
+
+/// A column list whose every entry is a plain or quoted name. A `"…"` name is a
+/// `literal` to this grammar, so the quote character is what tells it from a
+/// string.
+fn plain_columns(list: Node, sql: &str) -> bool {
+    let mut cursor = list.walk();
+    let columns: Vec<_> = list.named_children(&mut cursor).collect();
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            let mut cursor = column.walk();
+            let named: Vec<_> = column.named_children(&mut cursor).collect();
+            column.kind() == "column"
+                && matches!(named.as_slice(), [name] if name.kind() == "identifier"
+                    || (name.kind() == "literal"
+                        && sql.get(name.byte_range()).is_some_and(|text| text.starts_with('"'))))
+        })
+}
+
+/// The text of `c` when `assignments` is exactly one `c = c`, the same bare or
+/// backticked name on both sides, which is MySQL's spelling of doing nothing.
+/// Not `"c"`: under MySQL's default `sql_mode` that is a string.
+fn updates_itself<'sql>(assignments: Node, sql: &'sql str) -> Option<&'sql str> {
+    let assignment = assignments
+        .named_child(0)
+        .filter(|_| assignments.named_child_count() == 1)?;
+    let left = assignment.child_by_field_name("left")?;
+    let right = assignment.child_by_field_name("right")?;
+    let text = sql.get(left.byte_range())?;
+    (assignment.named_child_count() == 2
+        && [left, right]
+            .iter()
+            .all(|side| side.kind() == "field" && column_name(*side, sql).is_some())
+        && sql.get(right.byte_range()) == Some(text))
+    .then_some(text)
 }
 
 /// Whether `sql` is a `DELETE` whose `WHERE` names exactly `keys` — nothing
@@ -683,8 +893,16 @@ pub fn is_generated_write(sql: &str) -> bool {
 ///
 /// Set equality, order-independent. A composite key matched on half of itself
 /// reaches every row sharing that half.
+///
+/// Reads literals as strictly as [`is_generated_write`] does; callers outside
+/// the tests go through [`delete_matches_key_on`].
+#[cfg(test)]
 pub fn delete_matches_key(sql: &str, keys: &[&str]) -> bool {
-    let Some(columns) = delete_key_columns(sql) else {
+    delete_key_matches(sql, keys, true)
+}
+
+fn delete_key_matches(sql: &str, keys: &[&str], backslash_escapes: bool) -> bool {
+    let Some(columns) = delete_key_columns(sql, backslash_escapes) else {
         return false;
     };
     columns.len() == keys.len() && keys.iter().all(|key| columns.iter().any(|c| c == key))
@@ -692,7 +910,8 @@ pub fn delete_matches_key(sql: &str, keys: &[&str]) -> bool {
 
 /// [`is_generated_write`] for the engine the statement is bound for. A
 /// MongoDB grid writes mongosh statements, so its gate is `mql`'s, which
-/// admits the same three shapes read out of its own parse.
+/// admits the same shapes read out of its own parse, less the transaction
+/// bracket and with `insertMany` for the multi-row insert.
 pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
     match engine {
         Engine::MongoDb => crate::mql::is_generated_write(statement),
@@ -702,7 +921,7 @@ pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake
-        | Engine::SqlServer => is_generated_write(statement),
+        | Engine::SqlServer => generated_write(statement, engine.backslash_escapes()),
     }
 }
 
@@ -716,7 +935,7 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake
-        | Engine::SqlServer => delete_matches_key(statement, keys),
+        | Engine::SqlServer => delete_key_matches(statement, keys, engine.backslash_escapes()),
     }
 }
 
@@ -880,8 +1099,8 @@ fn deletes_anything(node: tree_sitter::Node) -> bool {
 /// a `RETURNING`, a `LIMIT`, an `OR`, a subquery, a function call, a qualified
 /// column or a second statement all change that child list or that expression
 /// tree, and so all arrive here as `None`.
-fn delete_key_columns(sql: &str) -> Option<Vec<String>> {
-    let tree = parse(sql)?;
+fn delete_key_columns(sql: &str, backslash_escapes: bool) -> Option<Vec<String>> {
+    let tree = parse_write(sql, backslash_escapes)?;
     let root = tree.root_node();
     if forbidden(root) {
         return None;
@@ -955,18 +1174,7 @@ fn equality_columns(node: tree_sitter::Node, sql: &str, columns: &mut Vec<String
             equality_columns(*left, sql, columns) && equality_columns(*right, sql, columns)
         }
         "=" => {
-            let Some(value) = sql.get(right.byte_range()) else {
-                return false;
-            };
-            // A value is a single-quoted literal and nothing else. `"other"` is
-            // a `literal` to this grammar too, and matching a column against a
-            // column is not naming a row. `N'…'` is SQL Server's single-quoted
-            // literal, and `0x…` its binary one, which is never quoted.
-            let quoted = value.strip_prefix(['N', 'n']).unwrap_or(value);
-            let hex = value
-                .strip_prefix("0x")
-                .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            if right.kind() != "literal" || !(quoted.starts_with('\'') || hex) {
+            if !literal_value(*right, sql) {
                 return false;
             }
             match column_name(*left, sql) {
@@ -979,6 +1187,73 @@ fn equality_columns(node: tree_sitter::Node, sql: &str, columns: &mut Vec<String
         }
         _ => false,
     }
+}
+
+/// A single-quoted literal and nothing else. `"other"` is a `literal` to this
+/// grammar too, and matching a column against a column is not naming a row.
+/// `N'…'` is SQL Server's single-quoted literal, and `0x…` its binary one,
+/// which is never quoted.
+///
+/// Exactly one token: the grammar reads `'1' '2'` as one `literal`, and every
+/// engine concatenates adjacent strings, so a quote inside must be doubled.
+///
+/// Not `NULL`: `WHERE id = NULL` matches no row, so only an insert admits it,
+/// and beside this rather than through it.
+fn literal_value(node: Node, sql: &str) -> bool {
+    let Some(value) = sql.get(node.byte_range()) else {
+        return false;
+    };
+    let quoted = value
+        .strip_prefix(['N', 'n'])
+        .unwrap_or(value)
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .is_some_and(|inner| inner.replace("''", "").find('\'').is_none());
+    let hex = value.strip_prefix("0x").is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    node.kind() == "literal" && (quoted || hex)
+}
+
+fn commented(node: Node) -> bool {
+    let mut cursor = node.walk();
+    matches!(node.kind(), "comment" | "marginalia") || node.children(&mut cursor).any(commented)
+}
+
+/// [`parse`] for the write gate, refusing on an engine where a backslash
+/// escapes any literal holding a quote after an odd run of backslashes.
+///
+/// The grammar ends a string at the first lone quote whatever precedes it; the
+/// engine reads `\'` as part of the string. Everything between would be string
+/// to the gate and SQL to the engine, in any arm, so the check is on every
+/// literal in the tree rather than on the values one arm reads. Either quote
+/// character, because MySQL reads `"…"` as a string with the same escapes, and
+/// `quote_literal` doubles every backslash on these engines, so nothing it
+/// writes has an odd run.
+fn parse_write(sql: &str, backslash_escapes: bool) -> Option<Tree> {
+    let tree = parse(sql)?;
+    (!(backslash_escapes && misread_literal(tree.root_node(), sql))).then_some(tree)
+}
+
+fn misread_literal(node: Node, sql: &str) -> bool {
+    let escaped_quote = |text: &str| {
+        let bytes = text.as_bytes();
+        bytes.iter().enumerate().any(|(at, byte)| {
+            matches!(byte, b'\'' | b'"')
+                && bytes[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| b == b'\\')
+                    .count()
+                    % 2
+                    == 1
+        })
+    };
+    let mut cursor = node.walk();
+    (node.kind() == "literal" && sql.get(node.byte_range()).is_some_and(escaped_quote))
+        || node
+            .children(&mut cursor)
+            .any(|child| misread_literal(child, sql))
 }
 
 /// The unqualified column a predicate's left side names, unquoted.
@@ -3771,6 +4046,289 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_admits_a_multi_row_insert_of_literals() {
+        for sql in [
+            "INSERT INTO \"public\".\"t\" (\"a\", \"b\") VALUES ('1', NULL),\n('2', 'x')",
+            "INSERT INTO \"dbo\".\"t\" (\"a\", \"b\") VALUES (N'é', 0xAB),\n('2024-01-02T03:04:05.000', NULL)",
+            "INSERT INTO `d`.`t` (`a`) VALUES ('1') ON DUPLICATE KEY UPDATE `a` = `a`",
+            "INSERT INTO \"main\".\"t\" (\"a\") VALUES ('1') ON CONFLICT DO NOTHING",
+        ] {
+            assert!(is_generated_write(sql), "{sql} was refused");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_an_insert_whose_values_are_not_literals() {
+        for sql in [
+            "INSERT INTO t (a) VALUES ((SELECT 1))",
+            "INSERT INTO t (a) VALUES (now())",
+            "INSERT INTO t (a) SELECT '1'",
+            "INSERT INTO t (a) VALUES ('1' || '2')",
+            "INSERT INTO t (a) VALUES (b)",
+            "INSERT INTO t (a) VALUES (\"b\")",
+            "INSERT INTO t (a) VALUES (1)",
+            "INSERT INTO t VALUES ('1')",
+            "INSERT INTO t (a) VALUES ('1') RETURNING *",
+            "INSERT INTO t (a) DEFAULT VALUES",
+            "REPLACE INTO t (a) VALUES ('1')",
+            "INSERT OR REPLACE INTO t (a) VALUES ('1')",
+            "INSERT IGNORE INTO t (a) VALUES ('1')",
+        ] {
+            assert!(!is_generated_write(sql), "{sql} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_conflict_clause_other_than_the_fixed_form() {
+        for tail in [
+            "ON CONFLICT (a) DO NOTHING",
+            "ON CONFLICT DO UPDATE SET a = '1'",
+            "ON DUPLICATE KEY UPDATE a = b",
+            "ON DUPLICATE KEY UPDATE a = '1'",
+            "ON DUPLICATE KEY UPDATE a = a, b = b",
+            "ON DUPLICATE KEY UPDATE a = VALUES(a)",
+        ] {
+            let sql = format!("INSERT INTO t (a) VALUES ('1') {tail}");
+            assert!(!is_generated_write(&sql), "{sql} passed the gate");
+        }
+    }
+
+    const SQL_ENGINES: [Engine; 7] = [
+        Engine::Postgres,
+        Engine::MySql,
+        Engine::MariaDb,
+        Engine::Sqlite,
+        Engine::Turso,
+        Engine::Snowflake,
+        Engine::SqlServer,
+    ];
+
+    #[test]
+    fn the_gate_refuses_a_comment_anywhere_in_an_insert() {
+        // MySQL runs a `/*! … */` comment as SQL, so a comment is never inert.
+        for sql in [
+            "INSERT INTO d/**/.t (a) VALUES ('1')",
+            "INSERT INTO d/*!.u*/.t (a) VALUES ('1')",
+            "INSERT INTO `d`/*! .u */.`t` (`a`) VALUES ('1')",
+            "INSERT INTO d -- x\n.t (a) VALUES ('1')",
+            "INSERT INTO d.t/**/ (a) VALUES ('1')",
+            "INSERT /**/ INTO t (a) VALUES ('1')",
+            "INSERT INTO t (\"a\"/**/) VALUES ('1')",
+            "INSERT INTO t (/**/\"a\") VALUES ('1')",
+            "INSERT INTO t (`a`/*!, b*/) VALUES ('1')",
+            "INSERT INTO t (a) VALUES /**/ ('1')",
+            "INSERT INTO t (a) VALUES ('1'/**/)",
+            "INSERT INTO t (a) VALUES (/*!0x41*/'1')",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE `a`/**/ = `a`",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE `a` = /*!b*/`a`",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE a = a/*!, b = '1'*/",
+            "INSERT INTO t (a) VALUES ('1') ON CONFLICT DO NOTHING/**/",
+            "INSERT INTO t (a) VALUES ('1')/**/",
+            "INSERT INTO t (a) VALUES ('1') -- x",
+        ] {
+            for engine in SQL_ENGINES {
+                assert!(
+                    !is_generated_write_on(engine, sql),
+                    "{engine:?}: {sql} passed the gate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicate_key_skip_names_its_column_as_mysql_reads_a_name() {
+        // `"a"` is a string under MySQL's default sql_mode, so `a = "a"`
+        // assigns one.
+        for sql in [
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE \"a\" = \"a\"",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE a = \"a\"",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE `a` = \"a\"",
+        ] {
+            for engine in SQL_ENGINES {
+                assert!(
+                    !is_generated_write_on(engine, sql),
+                    "{engine:?}: {sql} passed the gate"
+                );
+            }
+        }
+        for sql in [
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE `a` = `a`",
+            "INSERT INTO t (a) VALUES ('1') ON DUPLICATE KEY UPDATE a = a",
+        ] {
+            for engine in [Engine::MySql, Engine::MariaDb] {
+                assert!(is_generated_write_on(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_value_that_is_more_than_one_literal() {
+        for sql in [
+            "INSERT INTO t (a) VALUES ('1' '2')",
+            "INSERT INTO t (a) VALUES ('1'\n'2')",
+            "INSERT INTO t (a) VALUES (N'1' '2')",
+            "INSERT INTO t (a) VALUES ('1' N'2')",
+            "INSERT INTO t (a) VALUES ('1''2' '3')",
+            "INSERT INTO t (a) VALUES (0x)",
+            "INSERT INTO t (a) VALUES (0xAB 'c')",
+            "INSERT INTO t (a) VALUES (NULL '1')",
+            "DELETE FROM t WHERE id = '1' '2'",
+        ] {
+            for engine in SQL_ENGINES {
+                assert!(
+                    !is_generated_write_on(engine, sql),
+                    "{engine:?}: {sql} passed the gate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_literal_an_import_writes_passes_the_write_gate() {
+        use crate::import_rows::Value;
+        let values = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Number("-1.5e3".into()),
+            Value::Text(String::new()),
+            Value::Text("it's".into()),
+            Value::Text("''".into()),
+            Value::Text("a\\b\\".into()),
+            Value::Text("\\'".into()),
+            Value::Text("é /* -- */ ;".into()),
+            Value::Text("0xAB".into()),
+            Value::Json(serde_json::from_str(r#"{"a": "b'c"}"#).unwrap()),
+        ];
+        let types = [
+            "text",
+            "varchar(10)",
+            "nvarchar(10)",
+            "integer",
+            "varbinary(10)",
+            "datetime",
+            "datetime2",
+            "bit",
+        ];
+        for engine in SQL_ENGINES {
+            for data_type in types {
+                let rows: Vec<Vec<Option<&Value>>> =
+                    values.iter().map(|value| vec![Some(value)]).collect();
+                for skip in [false, engine.skips_duplicates()] {
+                    let statement =
+                        insert_rows(engine, "s", "t", &[("a", data_type)], &rows, skip).unwrap();
+                    assert!(
+                        is_generated_write_on(engine, &statement),
+                        "{engine:?} {data_type}: {statement}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_gate_admits_a_lone_transaction_bracket() {
+        for sql in [
+            "BEGIN",
+            "BEGIN;",
+            "BEGIN TRANSACTION",
+            "COMMIT",
+            "COMMIT;",
+            "ROLLBACK",
+            " ROLLBACK; ",
+        ] {
+            assert!(is_generated_write(sql), "{sql:?} was refused");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_bracket_beside_anything_else() {
+        for sql in [
+            "BEGIN; INSERT INTO t (a) VALUES ('1')",
+            "INSERT INTO t (a) VALUES ('1'); COMMIT",
+            "COMMIT; DROP TABLE t",
+            "ROLLBACK; COMMIT",
+            "BEGIN; COMMIT",
+            "begin",
+            "START TRANSACTION",
+            "ROLLBACK TO SAVEPOINT s",
+            "COMMIT AND CHAIN",
+            "BEGIN WORK",
+            "COMMIT;;",
+        ] {
+            assert!(!is_generated_write(sql), "{sql:?} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_quote_a_backslash_escapes_where_the_engine_reads_one() {
+        // The grammar ends each of these strings at the second `'`; MySQL and
+        // Snowflake read `\'` as a quote inside it, and the rest as SQL.
+        let probes = [
+            r"INSERT INTO t (a, b) VALUES ('a\', ', (SELECT password FROM users LIMIT 1)) # ')",
+            r"INSERT INTO t (a, b) VALUES ('a\', ', sleep(5)) -- ')",
+            r"DELETE FROM t WHERE id = 'a\' AND b = ' OR 1=1 # '",
+            r"UPDATE t SET a = 'x\', b = ' WHERE 1=1 -- ' WHERE id = '1'",
+            r"UPDATE t SET a = 'x\', b = ' WHERE 1=1; DROP TABLE t; -- ' WHERE id = '1'",
+            r"UPDATE t SET a = '1' WHERE id = 'a\' OR b = ' OR 1=1 -- '",
+            r#"UPDATE t SET a = "x\", b = " WHERE 1=1 -- " WHERE id = '1'"#,
+        ];
+        for sql in probes {
+            assert!(!is_generated_write(sql), "{sql} passed the gate");
+        }
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::Snowflake] {
+            for sql in probes {
+                assert!(
+                    !is_generated_write_on(engine, sql),
+                    "{sql} passed the gate on {engine:?}"
+                );
+            }
+            assert!(!delete_matches_key_on(engine, probes[2], &["id", "b"]));
+            // What `quote_literal` writes there still reads as one literal.
+            for value in [r"a\", "it's", r"it\'s", r"\\", r"\", r#"a\"b"#] {
+                let literal = engine.quote_literal(value);
+                for sql in [
+                    format!("INSERT INTO t (a) VALUES ({literal})"),
+                    format!("DELETE FROM t WHERE id = {literal}"),
+                    format!("UPDATE t SET a = {literal} WHERE id = {literal}"),
+                ] {
+                    assert!(
+                        is_generated_write_on(engine, &sql),
+                        "{sql} was refused on {engine:?}"
+                    );
+                }
+            }
+        }
+        // A backslash is an ordinary character where the engine says so.
+        for engine in [Engine::Postgres, Engine::Sqlite, Engine::SqlServer] {
+            for sql in [
+                r"INSERT INTO t (a) VALUES ('C:\')",
+                r"DELETE FROM t WHERE id = 'C:\'",
+                r"UPDATE t SET a = 'C:\' WHERE id = 'C:\'",
+            ] {
+                assert!(
+                    is_generated_write_on(engine, sql),
+                    "{sql} was refused on {engine:?}"
+                );
+            }
+            assert!(delete_matches_key_on(
+                engine,
+                r"DELETE FROM t WHERE id = 'C:\'",
+                &["id"]
+            ));
+        }
+    }
+
+    #[test]
+    fn the_gate_still_refuses_a_delete_matching_null() {
+        // `= NULL` matches no row, and NULL is a value only an insert writes.
+        assert!(!is_generated_write("DELETE FROM t WHERE id = NULL"));
+        assert!(!is_generated_write(
+            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t WHERE id = NULL"
+        ));
+    }
+
+    #[test]
     fn the_gate_accepts_an_update_and_a_batch_of_updates() {
         assert!(is_generated_write("UPDATE t SET a = '1' WHERE id = '2'"));
         assert!(is_generated_write(
@@ -3814,7 +4372,7 @@ mod tests {
     fn the_gate_refuses_everything_that_is_not_a_write_dbdelve_writes() {
         // Hard rule 1 in code: DROP and TRUNCATE never leave dbdelve, whatever
         // the user asked for. SELECT is here because the gate is a whitelist --
-        // being harmless is not the test, being one of the three shapes dbdelve
+        // being harmless is not the test, being one of the shapes dbdelve
         // generates is. A keyed DELETE is no longer in this list because it is
         // one of those shapes; `delete_matches_key` is what asks whether the key
         // it names is the row's.
@@ -5584,6 +6142,139 @@ mod tests {
             (Engine::MongoDb, "db.a.insertOne({ x: 1 })"),
         ] {
             assert_eq!(leaves(engine, statement), Leaves::default(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn insert_rows_writes_one_multi_row_insert_in_each_engines_spelling() {
+        use crate::import_rows::Value;
+        let (one, two, it, yes, no) = (
+            Value::Number("1".into()),
+            Value::Number("2".into()),
+            Value::Text("it's".into()),
+            Value::Bool(true),
+            Value::Bool(false),
+        );
+        let cols = [("id", "integer"), ("note", "text"), ("ok", "boolean")];
+        assert_eq!(
+            insert_rows(
+                Engine::Postgres,
+                "public",
+                "t",
+                &cols,
+                &[
+                    vec![Some(&one), Some(&it), Some(&yes)],
+                    vec![Some(&two), Some(&Value::Null), Some(&no)]
+                ],
+                true
+            )
+            .unwrap(),
+            "INSERT INTO \"public\".\"t\" (\"id\", \"note\", \"ok\") VALUES ('1', 'it''s', 'true'),\n('2', NULL, 'false') ON CONFLICT DO NOTHING"
+        );
+        assert_eq!(
+            insert_rows(
+                Engine::MySql,
+                "d",
+                "t",
+                &cols[..2],
+                &[vec![Some(&one), Some(&Value::Text("a\\b".into()))]],
+                true
+            )
+            .unwrap(),
+            "INSERT INTO `d`.`t` (`id`, `note`) VALUES ('1', 'a\\\\b') ON DUPLICATE KEY UPDATE `id` = `id`"
+        );
+        assert_eq!(
+            insert_rows(
+                Engine::SqlServer,
+                "dbo",
+                "t",
+                &[("note", "nvarchar(10)"), ("ok", "bit")],
+                &[vec![Some(&Value::Text("é".into())), Some(&yes)]],
+                false
+            )
+            .unwrap(),
+            "INSERT INTO \"dbo\".\"t\" (\"note\", \"ok\") VALUES (N'é', '1')"
+        );
+        assert_eq!(
+            insert_rows(
+                Engine::MongoDb,
+                "db",
+                "t",
+                &cols[..2],
+                &[
+                    vec![Some(&one), Some(&Value::Text("x".into()))],
+                    vec![Some(&two), None]
+                ],
+                false
+            )
+            .unwrap(),
+            "db.getCollection(\"t\").insertMany([{\"id\": 1, \"note\": \"x\"},\n{\"id\": 2}])"
+        );
+    }
+
+    #[test]
+    fn insert_rows_quotes_every_name() {
+        let v = crate::import_rows::Value::Text("x".into());
+        assert_eq!(
+            insert_rows(
+                Engine::Postgres,
+                "public",
+                "t",
+                &[("order", "text"), ("a\"b", "text")],
+                &[vec![Some(&v), Some(&v)]],
+                false
+            )
+            .unwrap(),
+            "INSERT INTO \"public\".\"t\" (\"order\", \"a\"\"b\") VALUES ('x', 'x')"
+        );
+    }
+
+    #[test]
+    fn every_engines_import_statements_pass_the_write_gate_and_the_mode_check() {
+        let v = crate::import_rows::Value::Text("x".into());
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::Turso,
+            Engine::Snowflake,
+            Engine::SqlServer,
+            Engine::MongoDb,
+        ] {
+            let statement = insert_rows(
+                engine,
+                "s",
+                "t",
+                &[("a", "text")],
+                &[vec![Some(&v)], vec![Some(&v)]],
+                engine.skips_duplicates(),
+            )
+            .unwrap();
+            assert!(
+                is_generated_write_on(engine, &statement),
+                "{engine:?}: {statement}"
+            );
+            assert_eq!(
+                gate(&classify(engine, &statement), Mode::ReadWrite, &[]),
+                None,
+                "{engine:?}: {statement}"
+            );
+            assert_eq!(
+                engine.skips_duplicates(),
+                statement.contains(" ON "),
+                "{engine:?}"
+            );
+            if let Ok(begin) = engine.all_or_nothing() {
+                for bracket in [begin, "COMMIT", "ROLLBACK"] {
+                    assert!(is_generated_write_on(engine, bracket));
+                    assert_eq!(
+                        gate(&classify(engine, bracket), Mode::ReadOnly, &[]),
+                        None,
+                        "{engine:?} {bracket}"
+                    );
+                }
+            }
         }
     }
 }

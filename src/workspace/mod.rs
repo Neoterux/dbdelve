@@ -8,6 +8,8 @@ mod commands;
 mod editing;
 mod filters;
 mod forms;
+mod import_dialog;
+mod import_rows;
 mod modes;
 mod objects;
 mod profiles;
@@ -19,6 +21,7 @@ use std::collections::HashMap;
 
 use gpui_component::menu::DropdownMenu;
 
+pub(crate) use import_dialog::PreviewGrid;
 pub(crate) use queries::error_in_buffer;
 
 use crate::connection_form::{Origin, password_to_persist};
@@ -139,6 +142,8 @@ pub(crate) struct Workspace {
     pub(crate) active: usize,
     pub(crate) form: Option<ConnectionForm>,
     pub(crate) switcher_open: bool,
+    /// Whether the menu bar last set lists Import Rows.
+    menu_imports_rows: bool,
     /// The switcher's search field, there while the switcher is open.
     pub(crate) connection_search: Option<Entity<InputState>>,
     pub(crate) connection_search_needs_focus: bool,
@@ -292,6 +297,7 @@ impl Workspace {
             active: 0,
             form: None,
             switcher_open: false,
+            menu_imports_rows: false,
             connection_search: None,
             connection_search_needs_focus: false,
             search_selection: 0,
@@ -901,6 +907,16 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
+        let imports_rows = self.profile().is_some_and(|profile| {
+            profile
+                .session
+                .active_object()
+                .is_some_and(|tab| tab.takes_inserts(profile.config.engine()))
+        });
+        if imports_rows != self.menu_imports_rows {
+            self.menu_imports_rows = imports_rows;
+            cx.set_menus(crate::app_menus(imports_rows));
+        }
         self.settle_sidebar(window, cx);
         self.reveal_landed_column(window, cx);
         if !self.row_panel.on_screen.get() {
@@ -924,6 +940,7 @@ impl Render for Workspace {
         self.sync_page_input(window, cx);
         self.sync_row_panel_filter(window, cx);
         self.sync_row_panel_inputs(window, cx);
+        self.sync_import_sql(window, cx);
         // Where a query tab that reached the front without `activate_tab` gets
         // its snapshot read. `session.active` is written in three places --
         // `Session::new`, `activate_tab` and `escape` -- and the first and last
@@ -972,6 +989,10 @@ impl Render for Workspace {
             // workspace along the focused element's dispatch path, so a
             // surface with nothing focused makes every keybinding dead.
             let focus = match profile.session.active {
+                // Under the import dialog, which only stops the mouse: a
+                // buffer or grid holding focus there would take keys for a
+                // surface nobody can see.
+                _ if profile.session.import_rows.is_some() => Focus::Window,
                 // No tab at all is still a surface: the window holds focus
                 // for the bindings that open one.
                 Tab::Query(id) => match profile.session.query_tab(id) {
@@ -1719,39 +1740,14 @@ impl Render for Workspace {
             // bindings. An inner element that can take focus claims it first
             // and stops this one from taking it back.
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::run_query))
-            .on_action(cx.listener(Self::explain_query))
-            .on_action(cx.listener(Self::format_query))
-            .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::choose_mode))
             .on_action(cx.listener(Self::reset_confirmations))
-            .on_action(cx.listener(Self::cancel_query))
-            .on_action(cx.listener(Self::apply_edits))
-            .on_action(cx.listener(Self::discard_edits))
-            .on_action(cx.listener(Self::next_edit))
-            .on_action(cx.listener(Self::previous_edit))
-            .on_action(cx.listener(Self::sort_column))
-            .on_action(cx.listener(Self::set_row_limit))
-            .on_action(cx.listener(Self::set_query_limit))
             .on_action(cx.listener(Self::set_default_row_limit_action))
-            .on_action(cx.listener(Self::custom_row_limit))
-            .on_action(cx.listener(Self::refresh_active_relation))
             .on_action(cx.listener(Self::refresh_connection))
-            .on_action(cx.listener(Self::next_page))
-            .on_action(cx.listener(Self::previous_page))
-            .on_action(cx.listener(Self::clear_filter))
-            .on_action(cx.listener(Self::add_filter))
-            .on_action(cx.listener(Self::remove_filter))
-            .on_action(cx.listener(Self::set_filter_column))
-            .on_action(cx.listener(Self::set_filter_raw))
-            .on_action(cx.listener(Self::set_filter_operator))
-            .on_action(cx.listener(Self::toggle_filter_join))
-            .on_action(cx.listener(Self::toggle_next_join))
-            .on_action(cx.listener(Self::new_row))
+            .on_action(cx.listener(Self::import_rows))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::select_database))
-            .on_action(cx.listener(Self::save_query))
             .on_action(cx.listener(Self::new_query))
             .on_action(cx.listener(Self::next_profile))
             .on_action(cx.listener(Self::previous_profile))
@@ -1763,18 +1759,49 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::zoom_editor_in))
             .on_action(cx.listener(Self::zoom_editor_out))
             .on_action(cx.listener(Self::reset_editor_zoom))
-            .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::fuzzy_open))
-            .on_action(cx.listener(Self::go_to_column))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::palette_next))
             .on_action(cx.listener(Self::palette_previous))
             .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::toggle_row_panel))
-            .on_action(cx.listener(Self::toggle_row_edit))
-            .on_action(cx.listener(Self::toggle_structure))
-            .on_action(cx.listener(Self::accept_completion))
             .on_action(cx.listener(Self::open_settings))
+            // Unregistered under the import dialog, which stops only the
+            // mouse: these act on the tab it covers, out of sight, and their
+            // menu items grey out with them.
+            .when(profile.session.import_rows.is_none(), |root| {
+                root.on_action(cx.listener(Self::run_query))
+                    .on_action(cx.listener(Self::explain_query))
+                    .on_action(cx.listener(Self::format_query))
+                    .on_action(cx.listener(Self::toggle_comment))
+                    .on_action(cx.listener(Self::cancel_query))
+                    .on_action(cx.listener(Self::apply_edits))
+                    .on_action(cx.listener(Self::discard_edits))
+                    .on_action(cx.listener(Self::next_edit))
+                    .on_action(cx.listener(Self::previous_edit))
+                    .on_action(cx.listener(Self::sort_column))
+                    .on_action(cx.listener(Self::set_row_limit))
+                    .on_action(cx.listener(Self::set_query_limit))
+                    .on_action(cx.listener(Self::custom_row_limit))
+                    .on_action(cx.listener(Self::refresh_active_relation))
+                    .on_action(cx.listener(Self::next_page))
+                    .on_action(cx.listener(Self::previous_page))
+                    .on_action(cx.listener(Self::clear_filter))
+                    .on_action(cx.listener(Self::add_filter))
+                    .on_action(cx.listener(Self::remove_filter))
+                    .on_action(cx.listener(Self::set_filter_column))
+                    .on_action(cx.listener(Self::set_filter_raw))
+                    .on_action(cx.listener(Self::set_filter_operator))
+                    .on_action(cx.listener(Self::toggle_filter_join))
+                    .on_action(cx.listener(Self::toggle_next_join))
+                    .on_action(cx.listener(Self::new_row))
+                    .on_action(cx.listener(Self::save_query))
+                    .on_action(cx.listener(Self::close_tab))
+                    .on_action(cx.listener(Self::go_to_column))
+                    .on_action(cx.listener(Self::toggle_row_panel))
+                    .on_action(cx.listener(Self::toggle_row_edit))
+                    .on_action(cx.listener(Self::toggle_structure))
+                    .on_action(cx.listener(Self::accept_completion))
+            })
             .size_full()
             // The shell is the frost: titlebar, sidebar and status bar paint
             // nothing of their own, they are the glass the window root already
@@ -1873,6 +1900,7 @@ impl Render for Workspace {
             ))
             .child(div().flex_1().min_h_0().child(main_pane))
             .children(self.render_apply_review(cx))
+            .children(self.render_import_rows(window, cx))
             .children(self.render_close_confirmation(cx))
             .children(self.render_discard_confirmation(cx))
             .children(self.render_pending_run(cx))
