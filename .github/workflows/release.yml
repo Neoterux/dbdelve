@@ -206,7 +206,7 @@ jobs:
 
             url "https://github.com/ShayanAbbas1/dbdelve/releases/download/v#{version}/DBDelve-#{version}.dmg"
             name "DBDelve"
-            desc "Native SQL client"
+            desc "Fast, native, multi-engine database client"
             homepage "https://github.com/ShayanAbbas1/dbdelve"
 
             depends_on arch: :arm64
