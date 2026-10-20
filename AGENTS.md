@@ -1,7 +1,7 @@
 # AGENTS.md
 
 DBDelve is a native database client in Rust on GPUI for macOS, Linux and Windows,
-speaking Postgres, MySQL, MariaDB, SQLite, Snowflake, SQL Server and MongoDB.
+speaking Postgres, MySQL, MariaDB, SQLite, Snowflake, SQL Server, MongoDB and Redis.
 
 The split everything below leans on is _whose SQL it is_. An editor buffer is
 the user's and is never touched uninvited; a browsing surface (an object tab's
@@ -66,7 +66,8 @@ require it, stop and raise it instead.
    from a direct ask, with the statement shown before it runs
    (`sql::delete_row`). The one exception to both is the explorer's
    right-click menu, whose Copy DROP and Copy TRUNCATE (SQLite's spelling is
-   `DELETE FROM`, MongoDB's `drop()` and `deleteMany({})`) put the text on the
+   `DELETE FROM`, MongoDB's `drop()` and `deleteMany({})`, Redis's Copy
+   TRUNCATE `FLUSHDB`, with no Copy DROP) put the text on the
    clipboard and nothing else: no buffer, no run, no gate, so pasting and
    running it is the user's own statement. And it never writes into
    a statement it cannot parse whole: `sql::with_order_by` refuses rather than
@@ -124,6 +125,28 @@ require it, stop and raise it instead.
    (`$where`, `$function`, `$accumulator`). Both read the tree-sitter parse, not
    the builder's word, for the reason above.
 
+   Redis has its own pair too. `redis_cmd::edit::is_generated_write` admits
+   only what the grid's edits, new rows and deleted rows write
+   (`RENAMENX`, `EXPIRE`, `PERSIST`, `SET … XX KEEPTTL GET` and `SET … NX`, `UNLINK`,
+   `HSET`, `HSETNX`, `HDEL`, `LSET`/`LREM`, `RPUSH`, `SADD`, `SREM`, `ZADD`,
+   `ZREM`, a list item's write: `WATCH`, an `LPOS` that checks the item
+   still is the one read, and a `MULTI`/`EXEC` bracket, and a collection's
+   JSON edit: `WATCH`, an `ECHO` of the JSON read, a bounded read
+   of the key (`HSCAN`/`SSCAN`, `LRANGE 0 100`, `ZSCAN`), and a `MULTI`/`EXEC` of writes of the key's own type), each
+   written again from its parts and compared with the text.
+   `redis_cmd::browse::is_generated_read` admits only the keys grid's
+   `SCAN 0 [MATCH p] [TYPE t] COUNT 1000`, with `TYPE` before `MATCH` too,
+   and `DBSIZE`. A key opened as a grid
+   runs through `classify` and `gate` like any typed read. A user's own
+   command is never one of these: `redis_cmd::classify` reads it by name and
+   subcommand from the `READS`, `WRITES` and `DROPS` tables, and a name in none
+   is `Unreadable`. The server has no read-only hold (`holds_read_only` is
+   false), so the tables are the Read-only boundary and must stay closed to
+   anything unlisted. `redis_cmd::refusal` is a separate list: the commands
+   that would take the session out from under DBDelve (`SELECT`, the
+   subscribe family, `MONITOR`, `SYNC`, `HELLO`, `RESET`, `QUIT`,
+   `CLIENT REPLY`) are never sent, in any mode.
+
    **The `DELETE`'s shape is verified from the parse tree, not trusted because
    `sql::delete_row` produced it.** A gate that trusts its caller is a comment;
    the check lives in the gate rather than the generator precisely so the two
@@ -152,7 +175,7 @@ require it, stop and raise it instead.
    there: no trait, no plugin surface. A UI that knows which engine it is
    talking to grows an engine-shaped special case in every view, and those are
    the special cases nobody ever removes. An enum rather than a trait for the
-   same reason in miniature: six arms the compiler makes every match
+   same reason in miniature: an arm per engine the compiler makes every match
    enumerate, instead of an open extension point.
 
    The one thing that crosses out is `db::Engine`, because DBDelve writes SQL
@@ -160,7 +183,7 @@ require it, stop and raise it instead.
    Views and workspace code _ask_ it (`quote_identifier`, `quote_literal`, `quote_value`,
    `is_binary_type`, `qualified`, `transaction_start`, `explain_prefix`, `assigns_default`,
    `boolean_literal`, `skips_duplicates`, `all_or_nothing`, `takes_new_fields`,
-   `fields`, `syntax`, and `filter::Operator::on` for the filter dropdown) and never
+   `fields`, `syntax`, `edits_query_rows`, `takes_imports`, and `filter::Operator::on` for the filter dropdown) and never
    match on it. Where an engine question
    is missing, add a method to `Engine` rather than a `match` at the caller. The
    SQL writers in `sql.rs` and `filter.rs`, and the code that builds a
@@ -234,7 +257,7 @@ trusts. `Cargo.toml` carries the full reasoning; this is the shape of it.
 ```toml
 gpui = { package = "gpui-pre", version = "=0.3.9" }  # rolling republish of zed main
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }  # font-kit, x11, wayland
-gpui-component = { version = "=0.8.0", features = ["tree-sitter-sql", "tree-sitter-javascript"] }  # each engine's highlighter
+gpui-component = { version = "=0.8.0", features = ["tree-sitter-sql", "tree-sitter-javascript", "tree-sitter-bash"] }  # each engine's highlighter
 
 tree-sitter = "=0.26.13"        # statement boundaries; the library keeps its tree private
 tree-sitter-sequel = "=0.3.11"  # the SQL grammar. A CORRECTNESS pin -- see below
@@ -267,6 +290,7 @@ futures-util = "=0.3.34"   # try_next over tiberius's result stream. dff = false
 
 mongodb = "=3.9.1"         # its own tokio runtime per connection. dff = false, rustls on ring
 time = "=0.3.55"           # ISO-8601 dates in mongosh statements. dff = false
+redis = "=1.7.1"           # redis-rs, blocking. dff = false, tls-rustls on ring
 encoding_rs = "=0.8.35"    # Import Rows' UTF-16 and Windows-1252 files. Already in the graph
 
 lsp-types = "=0.97.0"      # the completion provider's vocabulary. No server is started
@@ -291,6 +315,15 @@ gpui is pre-1.0 and breaks on minor bumps. It is `gpui-pre` because the `gpui`
 crate is a one-off snapshot nobody republishes, and gpui-component depends on
 `gpui-pre` under the name `gpui`, so taking it keeps one copy of the framework
 in the graph.
+
+Where the Redis code lives: `src/redis_cmd.rs` splits a buffer into commands
+by redis-cli's rules, refuses the session-breaking ones and classifies the
+rest; `src/redis_cmd/browse.rs` writes the keys grid's preview, count, filter
+and the read a key opens with, and holds the read gate;
+`src/redis_cmd/edit.rs` writes the commands an edit becomes and holds the
+write gate; `src/db/redis.rs` is the driver, its catalog and its rendering of
+replies. The editor's command names (`redis_cmd::names`) come from the same
+classify tables.
 
 Where the MongoDB code lives: `src/mql.rs` parses and classifies mongosh
 statements, formats them and splices a sort into one; `src/mql/browse.rs`
@@ -390,10 +423,11 @@ postgresql://dbdelve:dbdelve@127.0.0.1:55432/dbdelve_dev
 mysql://dbdelve:dbdelve@127.0.0.1:53306/dbdelve_dev
 mariadb://dbdelve:dbdelve@127.0.0.1:53307/dbdelve_dev   # MariaDB
 mssql://dbdelve:DBDelve_dev1@127.0.0.1:51433/dbdelve_dev
+redis://dbdelve:dbdelve@127.0.0.1:56379/0
 ```
 
 The ports can be moved with `DBDELVE_POSTGRES_PORT`, `DBDELVE_MYSQL_PORT`,
-`DBDELVE_MARIADB_PORT` and `DBDELVE_MSSQL_PORT`. The SQL Server image is
+`DBDELVE_MARIADB_PORT`, `DBDELVE_MSSQL_PORT` and `DBDELVE_REDIS_PORT`. The SQL Server image is
 `linux/amd64` only, so on Apple silicon it runs under emulation and takes a
 while to come up.
 Pick the engine in the form's Engine dropdown first; it decides which fields exist.
@@ -452,7 +486,7 @@ cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tes
 
 The `live_` tests are `#[ignore]`d and read `PGHOST`, `PGPORT`, `PGDATABASE`,
 `PGUSER`, `PGPASSWORD`, `dbdelve_MYSQL_URL`, `dbdelve_MARIADB_URL`,
-`dbdelve_MSSQL_URL`, `dbdelve_SQLITE_PATH`, `dbdelve_TURSO_PATH` and `dbdelve_SSH_CONFIG` (the
+`dbdelve_MSSQL_URL`, `dbdelve_REDIS_URL`, `dbdelve_SQLITE_PATH`, `dbdelve_TURSO_PATH` and `dbdelve_SSH_CONFIG` (the
 lowercase prefix is what they read; the last points `live_ssh_*` at the
 config `dev/ssh/setup.sh` generates, an `ssh -F` rather than a connection
 string); the `tests` job in `ci.yml` has the values
@@ -1066,6 +1100,54 @@ Decided, and not to be re-litigated:
   naming it, rather than rewriting the options. The form does not show it and
   saves it as it was.
 
+- **Redis is a command language of its own, classified by table.** As with
+  MongoDB, `holds_read_only` is false and `redis_cmd::classify` is the only
+  Read-only boundary; it fails closed on any name it does not list. There is
+  no `EXPLAIN`, no transaction to bracket a batch with (`transaction_start` is
+  `None`: a batch applies in order and a failure says which command failed and
+  how many ran), no Import Rows (`Engine::takes_imports` is false: a new key
+  names its own value, not a row under a file's columns) and no server-side
+  sort or count under a filter (`SCAN` has neither).
+- **The keys grid is one `keys` relation and a key opens as a query tab.**
+  Its contents have no relation to open, so a new row and a deleted row on
+  that tab are offered through `Engine::edits_query_rows`, shown in the review
+  dialog and never written into the buffer. Each cell carries a tag for how
+  its text stands for the bytes behind it, and only whole text is written
+  back: a value cut for display, a non-UTF-8 key or value, JSON documents
+  and streams are read-only. A collection's first 100 entries are read with a
+  bounded `HSCAN`/`LRANGE`/`SSCAN`/`ZRANGE` beside its size; it shows as JSON
+  only when that is all of it and at most 200 characters (`GLANCE`), tagged
+  `hash json` and so on so an edit can diff it, else as its size. JSON with a
+  byte that is not UTF-8 or an infinite score shows tagged `summary`, and is
+  read-only. `Engine::new_row_omits` leaves the keys grid's `type` out of New
+  row, since a new key is a string.
+- **Edits never clobber what they did not read.** A new key is `SET … NX`, a
+  field `HSETNX`, a rename `RENAMENX`, a string's new value `SET … XX … GET`
+  (nil on a key gone since), and the connection turns the reply that
+  says nothing happened into an error. A list item, named by its index,
+  is checked first: `WATCH`, an `LPOS … COUNT 0 MAXLEN n` that must end at
+  the index, then the write in a `MULTI`, where a nil `EXEC` is an error. A
+  collection's JSON edit is diffed against the JSON shown (`PendingRow::held`)
+  into the commands an opened key's grid writes, after a `WATCH`, an `ECHO`
+  of that JSON and a bounded read (`HSCAN`/`SSCAN`, `LRANGE 0 100`, `ZSCAN`), which the connection compares
+  with the `ECHO`: a different value, a cursor not `0`, or more entries is an
+  error before the `MULTI`. A generated run that fails `UNWATCH`es, or closes
+  the session.
+- **Cancel kills the session.** The connection's `CLIENT ID` is killed from a
+  side connection and the next command redials, so an open `MULTI` or `WATCH`
+  goes with it.
+- **The session remembers an open `MULTI` across runs** (`Session::multi`),
+  and a generated run, read or write, is refused while it is set: inside it a
+  write's reply is `QUEUED`, which would pass for applied. Nor does listing
+  the databases or the catalog send `CONFIG GET` or `DBSIZE` then, which
+  would be queued into the user's transaction. A Cancel that skips a command
+  closes the session, since the one skipped may have been the `EXEC`.
+- **It remembers a query tab's `WATCH` the same way** (`Session::watching`:
+  set by a typed `WATCH`, cleared by `UNWATCH`, by an `EXEC` or `DISCARD`
+  that closes a `MULTI`, and by a redial), and a generated run holding a
+  `WATCH` of its own, a list item's write, is refused while it is set: its
+  `EXEC` or `UNWATCH` would clear the user's along with its own.
+
 ### SSH tunnels
 
 `src/db/ssh.rs` opens a local port forward over the *system* `ssh` binary,
@@ -1086,10 +1168,12 @@ already set up on the machine.
   so `Client::connect`'s handshake checks the real name. **MySQL's
   `OptsBuilder::ip_or_hostname` is both the dial target and the name its own
   domain check runs against** (`mysql::base_options`), so through a tunnel it
-  can only ever check the tunnel's own address. That is exactly why MySQL is
-  the one engine that refuses `sslmode=verify-full` through a tunnel outright
+  can only ever check the tunnel's own address. That is exactly why MySQL
+  refuses `sslmode=verify-full` through a tunnel outright
   (`unverifiable_through_a_tunnel`) rather than silently checking the wrong
-  name, and why `base_options` sets `prefer_socket(false)` when dialling
+  name, as Redis (`Connection::open`) and MongoDB
+  (`unreachable_through_a_tunnel`, which refuses `verify-ca` too, since its
+  driver checks the name there as well) do for the same reason, and why `base_options` sets `prefer_socket(false)` when dialling
   through a tunnel: a loopback host would otherwise have the driver ask the
   server for its Unix socket path and
   reconnect to *that* path on this machine, past the tunnel entirely. Nowhere
@@ -1388,6 +1472,11 @@ wants completed and the text the grammar returns an `ERROR` node for. And **it
 must offer nothing inside a string literal or a comment**, which a token scan
 cannot do by itself and is the one place accepting a row rewrites data rather
 than a query.
+
+A Redis buffer offers command names only, in the first word of a line, from
+`redis_cmd::names` (the classify tables, less the refused commands), tagged
+read, write or destructive; a name whose subcommand decides that (`CONFIG`,
+`CLIENT`) has no tag. Key names are not offered.
 
 A MongoDB buffer (`Engine::syntax`) is read by `mql::completing` instead, a
 scan of the same kind: collections and database methods after `db.`, the

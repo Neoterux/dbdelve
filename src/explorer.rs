@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use gpui_component::tree::TreeItem;
 
 use crate::db::{Catalog, Engine, Relation, RelationKind, Routine, RoutineKind, Schema};
-use crate::mql;
+use crate::{mql, redis_cmd};
 
 /// The row counts a preview can be asked for besides none at all, and the one
 /// it opens with. The grid shows which one is in effect.
@@ -259,6 +259,8 @@ pub fn preview_sql(
 ) -> String {
     match engine {
         Engine::MongoDb => return mql::browse::find_preview(relation, filter, limit, offset),
+        // No limit or offset to write: see `Engine::pages`.
+        Engine::Redis => return redis_cmd::browse::preview(filter),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -283,8 +285,9 @@ pub fn preview_sql(
     sql
 }
 
-pub fn select_top_sql(engine: Engine, schema: &str, relation: &str) -> String {
-    match engine {
+/// `None` where no command reads a hundred rows: a Redis `SCAN` has no limit.
+pub fn select_top_sql(engine: Engine, schema: &str, relation: &str) -> Option<String> {
+    Some(match engine {
         Engine::SqlServer => format!(
             "SELECT TOP 100 * FROM {}",
             engine.qualified(schema, relation)
@@ -296,25 +299,38 @@ pub fn select_top_sql(engine: Engine, schema: &str, relation: &str) -> String {
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake => preview_sql(engine, schema, relation, "", Some(100), 0),
-    }
+        Engine::Redis => return None,
+    })
 }
 
-pub fn drop_sql(engine: Engine, schema: &str, relation: &str, kind: RelationKind) -> String {
+/// `None` where the relation cannot be dropped apart from its database: a
+/// Redis keyspace is the database's own.
+pub fn drop_sql(
+    engine: Engine,
+    schema: &str,
+    relation: &str,
+    kind: RelationKind,
+) -> Option<String> {
     let keyword = match (engine, kind) {
-        (Engine::MongoDb, _) => return format!("{}.drop()", mql::browse::handle(relation)),
+        (Engine::MongoDb, _) => return Some(format!("{}.drop()", mql::browse::handle(relation))),
+        (Engine::Redis, _) => return None,
         (_, RelationKind::Table | RelationKind::PartitionedTable) => "TABLE",
         (_, RelationKind::View) => "VIEW",
         (_, RelationKind::MaterializedView) => "MATERIALIZED VIEW",
         (Engine::Snowflake, RelationKind::ForeignTable) => "EXTERNAL TABLE",
         (_, RelationKind::ForeignTable) => "FOREIGN TABLE",
     };
-    format!("DROP {keyword} {};", engine.qualified(schema, relation))
+    Some(format!(
+        "DROP {keyword} {};",
+        engine.qualified(schema, relation)
+    ))
 }
 
 pub fn truncate_sql(engine: Engine, schema: &str, relation: &str) -> String {
     let qualified = engine.qualified(schema, relation);
     match engine {
         Engine::MongoDb => format!("{}.deleteMany({{}})", mql::browse::handle(relation)),
+        Engine::Redis => "FLUSHDB".into(),
         // SQLite has no TRUNCATE.
         Engine::Sqlite | Engine::Turso => format!("DELETE FROM {qualified};"),
         Engine::Postgres
@@ -322,6 +338,28 @@ pub fn truncate_sql(engine: Engine, schema: &str, relation: &str) -> String {
         | Engine::MariaDb
         | Engine::Snowflake
         | Engine::SqlServer => format!("TRUNCATE TABLE {qualified};"),
+    }
+}
+
+/// The command a preview's row opens with, as a result of its own
+/// ([`Engine::opened_column`]), read off the row's cells by column name: a
+/// Redis key's first `rows` entries, by the read its type takes. `None` where
+/// rows open nothing, and for a type with no read.
+pub fn open_row_sql<'a>(
+    engine: Engine,
+    rows: usize,
+    cell: impl Fn(&str) -> Option<&'a str>,
+) -> Option<String> {
+    match engine {
+        Engine::Redis => redis_cmd::browse::read(cell("key")?, cell("type")?, rows),
+        Engine::Postgres
+        | Engine::MySql
+        | Engine::MariaDb
+        | Engine::Sqlite
+        | Engine::Turso
+        | Engine::Snowflake
+        | Engine::SqlServer
+        | Engine::MongoDb => None,
     }
 }
 
@@ -339,6 +377,7 @@ pub fn probe_sql(engine: Engine, schema: &str, relation: &str, filter: &str) -> 
 pub fn count_sql(engine: Engine, schema: &str, relation: &str, filter: &str) -> String {
     match engine {
         Engine::MongoDb => return mql::browse::count_documents(relation, filter),
+        Engine::Redis => return redis_cmd::browse::count(filter),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -419,6 +458,15 @@ mod tests {
                 );
             }
         }
+
+        let keys = count_sql(Engine::Redis, "db0", "keys", "");
+        assert_eq!(keys, "DBSIZE");
+        assert!(crate::sql::is_generated_select(Engine::Redis, &keys));
+        let verdict = crate::sql::classify(Engine::Redis, &keys);
+        assert!(crate::sql::gate(&verdict, crate::sql::Mode::ReadOnly, &[]).is_none());
+        // `DBSIZE` counts every key, so a filtered count is refused, not wrong.
+        let filtered = count_sql(Engine::Redis, "db0", "keys", "MATCH user:*");
+        assert!(!crate::sql::is_generated_select(Engine::Redis, &filtered));
     }
 
     #[test]
@@ -700,19 +748,19 @@ mod tests {
     #[test]
     fn copied_statements_are_spelled_for_the_engine() {
         assert_eq!(
-            select_top_sql(Engine::SqlServer, "dbo", "t"),
+            select_top_sql(Engine::SqlServer, "dbo", "t").unwrap(),
             r#"SELECT TOP 100 * FROM "dbo"."t""#
         );
         assert_eq!(
-            select_top_sql(Engine::MySql, "db", "t"),
+            select_top_sql(Engine::MySql, "db", "t").unwrap(),
             "SELECT * FROM `db`.`t` LIMIT 100"
         );
         assert_eq!(
-            drop_sql(Engine::Postgres, "public", "v", RelationKind::View),
+            drop_sql(Engine::Postgres, "public", "v", RelationKind::View).unwrap(),
             r#"DROP VIEW "public"."v";"#
         );
         assert_eq!(
-            drop_sql(Engine::Snowflake, "S", "e", RelationKind::ForeignTable),
+            drop_sql(Engine::Snowflake, "S", "e", RelationKind::ForeignTable).unwrap(),
             r#"DROP EXTERNAL TABLE "S"."e";"#
         );
         assert_eq!(
@@ -720,13 +768,33 @@ mod tests {
             r#"DELETE FROM "main"."t";"#
         );
         assert_eq!(
-            drop_sql(Engine::MongoDb, "db", "c", RelationKind::Table),
+            drop_sql(Engine::MongoDb, "db", "c", RelationKind::Table).unwrap(),
             r#"db.getCollection("c").drop()"#
         );
         assert_eq!(
             truncate_sql(Engine::MongoDb, "db", "c"),
             r#"db.getCollection("c").deleteMany({})"#
         );
+    }
+
+    #[test]
+    fn a_redis_row_opens_its_key_and_no_other_engines_row_opens_anything() {
+        let row = |column: &str| match column {
+            "key" => Some("queue:emails"),
+            "type" => Some("list"),
+            _ => None,
+        };
+        for engine in Engine::ALL {
+            let opened = open_row_sql(engine, PREVIEW_ROW_LIMIT, row);
+            assert_eq!(opened.is_some(), engine.opened_column().is_some());
+        }
+        assert_eq!(
+            open_row_sql(Engine::Redis, PREVIEW_ROW_LIMIT, row).as_deref(),
+            Some("LRANGE queue:emails 0 999")
+        );
+        let read = open_row_sql(Engine::Redis, PREVIEW_ROW_LIMIT, row).unwrap();
+        let verdict = crate::sql::classify(Engine::Redis, &read);
+        assert!(crate::sql::gate(&verdict, crate::sql::Mode::ReadOnly, &[]).is_none());
     }
 
     #[test]

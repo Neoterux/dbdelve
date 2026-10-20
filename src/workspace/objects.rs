@@ -65,8 +65,8 @@ impl Workspace {
     ) -> Option<u64> {
         let (schema, name, kind) = (opened.schema().to_string(), opened.name(), opened.kind());
         let row_limit = self.settings.row_limit;
-        let sorting = Sorting::new(self.settings.client_sort);
         let engine = self.engine();
+        let sorting = Sorting::new(self.settings.client_sort).on(engine);
         let structure = matches!(opened, OpenedObject::Structure { .. });
         let profile = self.profile_mut()?;
         let existing = matching_tab(
@@ -341,6 +341,15 @@ impl Workspace {
             return;
         }
         let sql = explorer::count_sql(engine, &schema, &relation, filter);
+        if sql.is_empty() {
+            self.note(
+                "The server has no count for this filter: only reading every row it matches \
+                 would give one."
+                    .into(),
+                cx,
+            );
+            return;
+        }
         if !sql::is_generated_select(engine, &sql)
             || sql::gate(&sql::classify(engine, &sql), mode, &confirmed).is_some()
         {
@@ -365,7 +374,7 @@ impl Workspace {
 
         let task = cx
             .background_executor()
-            .spawn(async move { connection.generated(&sql, &cancel, None) });
+            .spawn(async move { connection.generated(&sql, &cancel, None, None) });
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             _ = workspace.update(cx, |workspace, cx| {
@@ -655,10 +664,13 @@ impl Workspace {
         else {
             return;
         };
+        // A row's opener carries the arrow a key does: following it is the
+        // same gesture.
         let foreign_keys: Vec<String> = structure
             .foreign_keys
             .iter()
             .map(|key| key.column.clone())
+            .chain(engine.opened_column().map(str::to_string))
             .collect();
         let referenced_by = structure.referenced_by.clone();
         let primary_key = structure.primary_key();
@@ -671,6 +683,7 @@ impl Workspace {
             grid.mark_foreign_keys(&foreign_keys);
             grid.mark_references(&referenced_by, &schema);
             grid.mark_primary_key(&primary_key);
+            grid.mark_opened(engine.opened_column());
             grid.mark_columns(&not_nullable, &has_default);
             cx.notify();
         });
@@ -719,6 +732,25 @@ impl Workspace {
             .find(|key| key.column == name)
             .cloned()
         else {
+            // Any cell of a row that opens as a result of its own opens it.
+            if engine.opened_column().is_none() {
+                return;
+            }
+            // The new query tab's limit, and a bound even where it has none:
+            // the tab is given it too.
+            let rows = self
+                .settings
+                .row_limit
+                .unwrap_or(explorer::PREVIEW_ROW_LIMIT);
+            let opened = grid.active().and_then(|(row, _)| {
+                explorer::open_row_sql(engine, rows, |column| {
+                    grid.cell(row, grid.column_named(column)?)
+                })
+            });
+            match opened {
+                Some(statement) => self.run_in_new_query(statement, rows, window, cx),
+                None => self.note("There is no read for this row's type.".into(), cx),
+            }
             return;
         };
         let Some(bar) = foreign_key_filter(&key, grid.active_value()) else {
@@ -840,7 +872,7 @@ impl Workspace {
                     .map(|(index, label, sql)| {
                         let answer = match sql {
                             Some(sql) => connection
-                                .generated(&sql, &CancelToken::default(), None)
+                                .generated(&sql, &CancelToken::default(), None, None)
                                 .map(|result| !result.rows.is_empty())
                                 .map_err(|error| error.message),
                             None => Err(
@@ -1246,7 +1278,7 @@ impl Workspace {
         show_snapshot(&results, &snapshot, mode, engine, cx);
         // The snapshot holds the rows already in this order. Sorted again so
         // the headers take a click, which a restored grid's do not.
-        let sorting = Sorting::restored(snapshot.client_sort.as_deref());
+        let sorting = Sorting::restored(snapshot.client_sort.as_deref()).on(engine);
         if let Some(keys) = sorting.client_keys() {
             results.update(cx, |table, cx| {
                 let order = sort_columns(engine, keys, table.delegate().columns());

@@ -39,7 +39,10 @@ const CLIP_SCAN_LIMIT: usize = 16 * CELL_DISPLAY_LIMIT;
 /// "the value" has to stop somewhere, because a multi-megabyte document laid
 /// out as wrapped text stalls the frame it is laid out in. `cmd+c` on the cell
 /// still copies all of it. Raise this if a real value gets cut.
-const FIELD_DISPLAY_LIMIT: usize = 4_000;
+pub(crate) const FIELD_DISPLAY_LIMIT: usize = 4_000;
+
+/// How much of a row's name the cell menu's Open entry spells out.
+const OPEN_LABEL_CHARS: usize = 40;
 
 /// What an absent value is called wherever one is shown.
 pub const NULL_LABEL: SharedString = SharedString::new_static("NULL");
@@ -77,6 +80,10 @@ type ReferenceMenu = Rc<Vec<(usize, SharedString)>>;
 /// A row's schema and table, and its primary key as column/value pairs — what a
 /// one-row `DELETE` needs and nothing else.
 pub type RowKey = (String, String, Vec<(String, String)>);
+
+/// A grid's schema and table, and the columns a new row of it fills as
+/// column/type pairs — what the New row form is built from.
+pub type InsertTarget = (String, String, Vec<(String, String)>);
 
 /// A grid's selection, apart from the grid it was made in.
 pub struct GridSelection {
@@ -195,6 +202,9 @@ pub struct ResultGrid {
     /// The result columns that make up the relation's primary key, marked
     /// where the structure arrives, by name for the reason `foreign_keys` is.
     primary_key: Vec<usize>,
+    /// The column naming what each row opens as a result of its own
+    /// (`Engine::opened_column`), marked where the structure arrives.
+    opened: Option<usize>,
     /// The rows picked out by clicks in the gutter or cells, for a multi-row copy.
     /// Separate from `active`, which is the single cell the keyboard and the
     /// single-cell gestures act on.
@@ -299,6 +309,9 @@ pub struct PendingRow {
     pub keys: Vec<(String, String)>,
     /// Real column name against its type, where the result says it.
     pub types: Vec<(String, String)>,
+    /// Each changed column's as-fetched value, where it has one: what an edit
+    /// that writes only its differences is diffed against.
+    pub held: Vec<(String, String)>,
 }
 
 fn next_rows_id() -> u64 {
@@ -365,6 +378,7 @@ impl ResultGrid {
             follow_groups: Vec::new(),
             reference_menus: Vec::new(),
             primary_key: Vec::new(),
+            opened: None,
             selected_rows: std::collections::BTreeSet::new(),
             row_selection_anchor: None,
             pointer_row: None,
@@ -981,6 +995,20 @@ impl ResultGrid {
         self.primary_key = self.columns_named(columns);
     }
 
+    /// Record which column names what a row opens, by name for the reason
+    /// [`ResultGrid::mark_foreign_keys`] is. Its cells carry the follow arrow
+    /// once it is marked as a key too; this is what lets the rest of the row
+    /// open it, from the cell menu and by a double-click on a cell that cannot
+    /// be edited.
+    pub fn mark_opened(&mut self, column: Option<&str>) {
+        self.opened = column.and_then(|name| {
+            self.result
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+        });
+    }
+
     fn key_icon(&self, col: usize, color: Srgb) -> Option<impl IntoElement> {
         self.primary_key.contains(&col).then(|| {
             icon(icon::PRIMARY_KEY)
@@ -1414,21 +1442,22 @@ impl ResultGrid {
         self.mode = mode;
     }
 
-    /// Whether this cell can be written back at all: the result has to be
-    /// traceable to one table, the column has to exist in it, and it must not
-    /// be part of the key — a key edit is the one edit whose result cannot be
-    /// re-verified afterwards, so the spec's §3 refuses it.
-    ///
-    /// Nor a binary column. What the grid shows there is a blob *literal* the
-    /// user could not type a replacement for anyway, and the value that came
-    /// back would be written as the text it looks like — see
-    /// [`db::Engine::is_binary_type`].
     /// Whether any cell of the row can be edited: what the row panel's pencil
     /// and the "cannot be edited" refusal both ask.
     pub fn row_editable(&self, row: usize) -> bool {
         (0..self.columns.len()).any(|col| self.editable(row, col))
     }
 
+    /// Whether this cell can be written back at all: the result has to be
+    /// traceable to one table, the column has to exist in it, and it must not
+    /// be part of the key — a key edit is the one edit whose result cannot be
+    /// re-verified afterwards, so the spec's §3 refuses it. The exception is a
+    /// key the engine edits as what the row is ([`db::Engine::edits_key_column`]).
+    ///
+    /// Nor a binary column. What the grid shows there is a blob *literal* the
+    /// user could not type a replacement for anyway, and the value that came
+    /// back would be written as the text it looks like — see
+    /// [`db::Engine::writes_back`].
     pub fn editable(&self, row: usize, col: usize) -> bool {
         // Structural only: the mode lives one step further in, on `set_pending`.
         // A Read-only connection still opens its cells, because an open input is
@@ -1437,13 +1466,15 @@ impl ResultGrid {
         let Some(edit) = &self.result.edit else {
             return false;
         };
+        let Some(Some(name)) = edit.columns.get(col) else {
+            return false;
+        };
         row < self.result.rows.len()
-            && edit.columns.get(col).is_some_and(Option::is_some)
-            && !edit.keys.contains(&col)
-            && ![self.column_type(col), self.cell_type(row, col)]
+            && (!edit.keys.contains(&col) || self.engine.edits_key_column(name))
+            && [self.column_type(col), self.cell_type(row, col)]
                 .into_iter()
                 .flatten()
-                .any(|data_type| self.engine.is_binary_type(data_type))
+                .all(|data_type| self.engine.writes_back(data_type))
     }
 
     fn column_type(&self, col: usize) -> Option<&str> {
@@ -1508,6 +1539,25 @@ impl ResultGrid {
             edit.table.clone(),
             self.key_values(edit, row)?,
         ))
+    }
+
+    /// What a new row of this grid's own is written into: where its rows are
+    /// written back to, and each column that names, typed as the first row's
+    /// cell is. `None` where its rows are written back nowhere.
+    pub fn insert_target(&self) -> Option<InsertTarget> {
+        let edit = self.result.edit.as_ref()?;
+        let columns = edit
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(col, name)| {
+                Some((
+                    name.clone()?,
+                    self.cell_type(0, col).unwrap_or_default().to_string(),
+                ))
+            })
+            .collect();
+        Some((edit.schema.clone(), edit.table.clone(), columns))
     }
 
     /// Open an input on a cell. `false` when the cell is not editable, and
@@ -1705,6 +1755,15 @@ impl ResultGrid {
                     sets,
                     keys: self.key_values(edit, row)?,
                     types: self.row_types(row),
+                    held: self
+                        .pending
+                        .iter()
+                        .filter(|pending| pending.row == row)
+                        .filter_map(|pending| {
+                            let name = edit.columns.get(pending.col)?.clone()?;
+                            Some((name, self.cell(row, pending.col)?.to_string()))
+                        })
+                        .collect(),
                 })
             })
             .collect()
@@ -2429,8 +2488,24 @@ impl TableDelegate for ResultGrid {
         };
         let hidden = self.hidden_columns();
         let name = &self.result.columns[col].name;
+        // The row's own name for it, which is the one thing a generic label
+        // could not say.
+        let opens = self
+            .opened
+            .and_then(|opened| self.cell(row, opened))
+            .map(|name| {
+                let short: String = name.chars().take(OPEN_LABEL_CHARS).collect();
+                match short.len() < name.len() {
+                    true => format!("Open \u{201c}{short}\u{2026}\u{201d}"),
+                    false => format!("Open \u{201c}{name}\u{201d}"),
+                }
+            });
         let menu = menu
             .when_some(self.focus.clone(), PopupMenu::action_context)
+            .when_some(opens, |menu, label| {
+                menu.menu(label, Box::new(crate::FollowForeignKey))
+                    .separator()
+            })
             .menu("Copy Cell", Box::new(crate::CopyCell))
             .item(PopupMenuItem::submenu(rows_as_label, rows_as))
             .separator()
@@ -2855,8 +2930,15 @@ impl ResultGrid {
             // Read-write, a key or computed column) reaches the same
             // explanation `EditCell` already gives from the keyboard.
             .on_double_click(cx.listener(move |table, _, window, cx| {
-                table.delegate_mut().set_active(row_ix, col_ix);
-                window.dispatch_action(Box::new(crate::EditCell), cx);
+                let grid = table.delegate_mut();
+                grid.set_active(row_ix, col_ix);
+                // A row that opens as a result of its own opens from any cell
+                // there is no edit to begin in.
+                let opens = grid.opened.is_some() && !grid.editable(row_ix, col_ix);
+                match opens {
+                    true => window.dispatch_action(Box::new(crate::FollowForeignKey), cx),
+                    false => window.dispatch_action(Box::new(crate::EditCell), cx),
+                }
                 cx.notify();
             }))
             // The library's row click would select a toggled-off row again.
@@ -3966,6 +4048,74 @@ mod tests {
             assert!(!grid.set_pending(0, 1, value("x'CD'")), "{data_type}");
             assert!(!grid.has_pending(), "{data_type}");
         }
+    }
+
+    #[test]
+    fn a_redis_grid_edits_what_it_holds_whole_and_renames_by_its_key() {
+        use crate::redis_cmd::edit::{BYTES, INTEGER, STRING, SUMMARY, TRUNCATED};
+        let keys = |cells: Vec<Vec<Option<&str>>>, tags: Vec<Vec<&'static str>>| {
+            ResultGrid::new(
+                QueryResult {
+                    columns: ["key", "type", "ttl", "value"].map(column).to_vec(),
+                    rows: rows(
+                        cells
+                            .into_iter()
+                            .map(|row| row.into_iter().map(|cell| cell.map(String::from)).collect())
+                            .collect(),
+                    ),
+                    cell_types: tags,
+                    edit: Some(EditTarget {
+                        schema: "db0".into(),
+                        table: "keys".into(),
+                        columns: vec![
+                            Some("key".into()),
+                            None,
+                            Some("ttl".into()),
+                            Some("value".into()),
+                        ],
+                        keys: vec![0],
+                    }),
+                    ..QueryResult::default()
+                },
+                Mode::ReadWrite,
+            )
+            .with_engine(db::Engine::Redis)
+        };
+        let mut grid = keys(
+            vec![
+                vec![Some("greeting"), Some("string"), None, Some("hello")],
+                vec![Some("long"), Some("string"), None, Some("xx…")],
+                vec![Some("user:1"), Some("hash"), Some("60"), Some("3 fields")],
+                vec![Some("\"\\xff\""), Some("string"), None, Some("\"\\xfe\"")],
+            ],
+            vec![
+                vec![STRING, STRING, INTEGER, STRING],
+                vec![STRING, STRING, INTEGER, TRUNCATED],
+                vec![STRING, STRING, INTEGER, SUMMARY],
+                vec![BYTES, STRING, INTEGER, BYTES],
+            ],
+        );
+        let editable = |grid: &ResultGrid, row| {
+            (0..4)
+                .map(|col| grid.editable(row, col))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(editable(&grid, 0), [true, false, true, true]);
+        assert_eq!(editable(&grid, 1), [true, false, true, false]);
+        assert_eq!(editable(&grid, 2), [true, false, true, false]);
+        // A name that is not text can be named, not typed.
+        assert_eq!(editable(&grid, 3), [false, false, true, false]);
+
+        assert!(grid.set_pending(0, 0, value("salutation")));
+        assert!(grid.set_pending(3, 2, value("30")));
+        let batch = crate::sql::update_batch(db::Engine::Redis, &grid.pending_updates()).unwrap();
+        assert_eq!(batch, "RENAMENX greeting salutation\nEXPIRE \"\\xff\" 30");
+        assert!(crate::sql::is_generated_write_on(db::Engine::Redis, &batch));
+
+        // The same grid on an engine that never edits a key column.
+        let postgres = keys(vec![vec![Some("k"), None, None, Some("v")]], Vec::new())
+            .with_engine(db::Engine::Postgres);
+        assert!(!postgres.editable(0, 0) && postgres.editable(0, 3));
     }
 
     #[test]

@@ -77,7 +77,7 @@ impl Operator {
     /// What the bar's own button shows: the SQL shape rather than the English,
     /// because the bar is read beside the statement it writes.
     pub(crate) fn symbol(self, engine: Engine) -> &'static str {
-        if engine.syntax() == Syntax::Mongo {
+        if engine.syntax() != Syntax::Sql {
             return self.mongo_symbol();
         }
         match self {
@@ -102,8 +102,8 @@ impl Operator {
         }
     }
 
-    /// MongoDB's filter documents have no `LIKE`: the same operators read as
-    /// the English they compile from.
+    /// MongoDB's filter documents and Redis's patterns have no `LIKE`: the
+    /// same operators read as the English they compile from.
     fn mongo_symbol(self) -> &'static str {
         match self {
             Self::Equals => "=",
@@ -130,7 +130,7 @@ impl Operator {
     /// What the dropdown row reads: the symbol and the English for it, so the
     /// list can be scanned by either.
     pub(crate) fn label(self, engine: Engine) -> &'static str {
-        if engine.syntax() == Syntax::Mongo {
+        if engine.syntax() != Syntax::Sql {
             return match self {
                 Self::Equals => "= equals",
                 Self::NotEquals => "!= not equals",
@@ -185,6 +185,23 @@ impl Operator {
     /// SQL Server has none before 2025. MongoDB has `$regex`.
     pub(crate) fn on(self, engine: Engine) -> bool {
         self != Self::Regex || !matches!(engine, Engine::Sqlite | Engine::Turso | Engine::SqlServer)
+    }
+
+    /// Whether the bar offers the operator on `column`, or on a bar with no
+    /// column picked yet. Everywhere but Redis that is [`Operator::on`]: a
+    /// `SCAN` narrows a key's name by glob and its type only exactly.
+    pub(crate) fn offered(self, engine: Engine, column: Option<&str>) -> bool {
+        match engine {
+            Engine::Redis => crate::redis_cmd::browse::offers(column, self),
+            Engine::Postgres
+            | Engine::MySql
+            | Engine::MariaDb
+            | Engine::Sqlite
+            | Engine::Turso
+            | Engine::Snowflake
+            | Engine::SqlServer
+            | Engine::MongoDb => self.on(engine),
+        }
     }
 
     /// How the operator is written to disk. A name rather than an index, so
@@ -337,6 +354,22 @@ pub(crate) fn filter_bars(filters: &[FilterRow]) -> Vec<FilterBar> {
         .collect()
 }
 
+/// Whether a bar may compare `column` at all. A Redis key's name and type are
+/// what `SCAN` can narrow by; every column of the others is.
+pub(crate) fn filters_on(engine: Engine, column: &str) -> bool {
+    match engine {
+        Engine::Redis => crate::redis_cmd::browse::filters_on(column),
+        Engine::Postgres
+        | Engine::MySql
+        | Engine::MariaDb
+        | Engine::Sqlite
+        | Engine::Turso
+        | Engine::Snowflake
+        | Engine::SqlServer
+        | Engine::MongoDb => true,
+    }
+}
+
 /// The bars that narrow anything, which is the same question as whether a bar
 /// has a predicate: an unfinished one reaches neither the statement nor the
 /// file.
@@ -372,6 +405,9 @@ pub(crate) fn derived_filter(
             None => predicate,
             Some(left) => match engine {
                 Engine::MongoDb => crate::mql::browse::joined(bar.conjunction, &left, &predicate),
+                Engine::Redis => {
+                    crate::redis_cmd::browse::joined(bar.conjunction, &left, &predicate)
+                }
                 Engine::Postgres
                 | Engine::MySql
                 | Engine::MariaDb
@@ -402,6 +438,7 @@ pub(crate) fn bar_predicate(
         // exactly what the gate is for (spec §2.3).
         return (!value.is_empty()).then(|| match engine {
             Engine::MongoDb => crate::mql::browse::raw_filter(value),
+            Engine::Redis => crate::redis_cmd::browse::raw_filter(value),
             Engine::Postgres
             | Engine::MySql
             | Engine::MariaDb
@@ -412,7 +449,9 @@ pub(crate) fn bar_predicate(
         });
     }
     let column = bar.column.as_deref()?;
-    if !bar.operator.on(engine) || (bar.operator.takes_value() && value.is_empty()) {
+    if !bar.operator.offered(engine, Some(column))
+        || (bar.operator.takes_value() && value.is_empty())
+    {
         return None;
     }
     let data_type = columns
@@ -455,6 +494,9 @@ pub(crate) fn filter_predicate(
     match engine {
         Engine::MongoDb => {
             return crate::mql::browse::filter_predicate(column, data_type, operator, value);
+        }
+        Engine::Redis => {
+            return crate::redis_cmd::browse::filter_predicate(column, operator, value);
         }
         Engine::Postgres
         | Engine::MySql
@@ -532,8 +574,8 @@ pub(crate) fn filter_predicate(
             // value, where the other two match anywhere in it. Counting matches
             // asks the question the dropdown's entry has always meant.
             Engine::Snowflake => Some(format!("REGEXP_COUNT({name}, {}) > 0", literal(value))),
-            // Written by `mql::browse::filter_predicate`, above.
-            Engine::MongoDb => None,
+            // Written by `mql::browse::filter_predicate`, above, or not at all.
+            Engine::MongoDb | Engine::Redis => None,
         },
     }
 }
@@ -759,7 +801,10 @@ pub(crate) fn sort_expression(
     match engine {
         // A document's fields are unique, and a position names nothing there.
         Engine::MongoDb => return crate::mql::browse::sort_field(name),
-        Engine::Postgres
+        // Never written into a command: a key of the sort in memory, which is
+        // the only one Redis has (`Engine::sorts_on_server`).
+        Engine::Redis
+        | Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
         | Engine::Sqlite
@@ -1241,13 +1286,23 @@ mod tests {
         // is refused before it runs, which would make an operator unusable
         // rather than unsafe. Checked per engine, because the quoting differs.
         for engine in Engine::ALL {
-            for operator in Operator::ALL.into_iter().filter(|o| o.on(engine)) {
+            // The column Redis's bar compares by glob.
+            let column = if engine == Engine::Redis {
+                "key"
+            } else {
+                "state"
+            };
+            for operator in Operator::ALL
+                .into_iter()
+                .filter(|o| o.offered(engine, Some(column)))
+            {
                 let value = match operator {
                     Operator::Between => "1..9",
                     Operator::InList | Operator::NotInList => "a, b",
                     _ => "ok",
                 };
-                let filter = predicate(engine, operator, value).expect("applied");
+                let filter = bar_predicate(engine, &bar(Some(column), operator, value), &[])
+                    .expect("applied");
                 let sql =
                     explorer::preview_sql(engine, "public", "accounts", &filter, Some(100), 0);
                 assert!(

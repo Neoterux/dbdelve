@@ -2494,7 +2494,7 @@ impl Workspace {
                     let mut menu = menu
                         .item(open("Open Data", false))
                         .item(open("Open Structure", true));
-                    if engine.takes_inserts(kind) {
+                    if engine.takes_imports(kind) {
                         menu = menu.item(PopupMenuItem::new("Import Rows…").on_click(
                             move |_, window, cx| {
                                 let (schema, relation) = import_names.clone();
@@ -2506,21 +2506,21 @@ impl Workspace {
                     }
                     let menu = menu
                         .separator()
-                        .item(PopupMenuItem::new("Copy DDL").on_click(move |_, _, cx| {
-                            let (schema, relation) = ddl_names.clone();
-                            _ = ddl_workspace.update(cx, |workspace, cx| {
-                                workspace.copy_ddl(schema, relation, kind, cx);
-                            });
-                        }))
-                        .item(copy(
-                            "Copy SELECT (Top 100)",
-                            select_top_sql(engine, &schema, &relation),
-                        ))
+                        .when(engine.copies_ddl(), |menu| {
+                            menu.item(PopupMenuItem::new("Copy DDL").on_click(move |_, _, cx| {
+                                let (schema, relation) = ddl_names.clone();
+                                _ = ddl_workspace.update(cx, |workspace, cx| {
+                                    workspace.copy_ddl(schema, relation, kind, cx);
+                                });
+                            }))
+                        })
+                        .when_some(select_top_sql(engine, &schema, &relation), |menu, sql| {
+                            menu.item(copy("Copy SELECT (Top 100)", sql))
+                        })
                         .separator()
-                        .item(copy(
-                            "Copy DROP",
-                            drop_sql(engine, &schema, &relation, kind),
-                        ));
+                        .when_some(drop_sql(engine, &schema, &relation, kind), |menu, sql| {
+                            menu.item(copy("Copy DROP", sql))
+                        });
                     if matches!(kind, RelationKind::Table | RelationKind::PartitionedTable) {
                         menu.item(copy(
                             "Copy TRUNCATE",

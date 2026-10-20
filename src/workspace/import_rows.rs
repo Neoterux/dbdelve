@@ -37,12 +37,12 @@ impl Workspace {
                 (
                     tab.schema.clone(),
                     tab.name.clone(),
-                    tab.takes_inserts(engine),
+                    tab.takes_imports(engine),
                 )
             });
         match target {
             None => self.note("Open a table to import rows into.".into(), cx),
-            Some((_, _, false)) => self.note("This view takes no inserts.".into(), cx),
+            Some((_, _, false)) => self.note("This view takes no imported rows.".into(), cx),
             Some((schema, table, true)) => self.import_rows_into(schema, table, window, cx),
         }
     }

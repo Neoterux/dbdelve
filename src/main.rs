@@ -15,6 +15,7 @@ mod import_rows;
 #[cfg_attr(not(test), allow(dead_code))]
 mod mql;
 mod palette;
+mod redis_cmd;
 mod result_grid;
 mod scroller;
 mod session;

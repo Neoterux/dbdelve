@@ -566,6 +566,25 @@ impl Session {
         self.queries.iter_mut().find(|tab| tab.id == id)
     }
 
+    /// Put away the new-row form and the review a closed tab had open. A
+    /// query tab's id is handed to the next buffer, which would find them.
+    pub(crate) fn forget(&mut self, tab: Tab) {
+        if self
+            .insert_form
+            .as_ref()
+            .is_some_and(|form| form.tab == tab)
+        {
+            self.insert_form = None;
+        }
+        if self
+            .apply_review
+            .as_ref()
+            .is_some_and(|review| review.tab == tab)
+        {
+            self.apply_review = None;
+        }
+    }
+
     /// The query buffer in front, or `None` when an object tab is.
     pub(crate) fn active_query_tab(&self) -> Option<&QueryTab> {
         match self.active {
@@ -992,6 +1011,15 @@ impl Sorting {
         match client {
             true => Self::Client(Vec::new()),
             false => Self::Server,
+        }
+    }
+
+    /// This sorting, but in memory where the engine has no server sort to
+    /// offer (`Engine::sorts_on_server`).
+    pub(crate) fn on(self, engine: Engine) -> Self {
+        match (self, engine.sorts_on_server()) {
+            (Self::Server, false) => Self::Client(Vec::new()),
+            (sorting, _) => sorting,
         }
     }
 
@@ -1443,7 +1471,7 @@ impl QueryTab {
             // nothing of a run in flight is kept.
             queue: None,
             queued_results: stored.queued_results,
-            sorting,
+            sorting: sorting.on(engine),
             row_limit,
             showing_plan: false,
             row_panel_folded: false,
@@ -1485,6 +1513,11 @@ impl ObjectTab {
     /// Whether New row is offered here: on a relation the engine inserts into.
     pub(crate) fn takes_inserts(&self, engine: Engine) -> bool {
         matches!(self.kind, ObjectKind::Relation(kind) if engine.takes_inserts(kind))
+    }
+
+    /// Whether Import Rows is offered here.
+    pub(crate) fn takes_imports(&self, engine: Engine) -> bool {
+        matches!(self.kind, ObjectKind::Relation(kind) if engine.takes_imports(kind))
     }
 
     /// The `WHERE` this tab reads the relation under, and `""` for a routine

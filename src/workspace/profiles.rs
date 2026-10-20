@@ -105,7 +105,8 @@ impl Workspace {
             | Engine::MySql
             | Engine::MariaDb
             | Engine::SqlServer
-            | Engine::MongoDb => {
+            | Engine::MongoDb
+            | Engine::Redis => {
                 let server = ServerConfig {
                     host: stored.host,
                     port: stored.port,
@@ -122,6 +123,7 @@ impl Workspace {
                     Engine::MySql => ConnectionConfig::MySql(server),
                     Engine::MariaDb => ConnectionConfig::MariaDb(server),
                     Engine::SqlServer => ConnectionConfig::SqlServer(server),
+                    Engine::Redis => ConnectionConfig::Redis(server),
                     Engine::MongoDb => ConnectionConfig::MongoDb(crate::db::MongoConfig {
                         server,
                         srv: stored.srv.unwrap_or_default(),
@@ -359,6 +361,7 @@ impl Workspace {
             | ConnectionConfig::MySql(server)
             | ConnectionConfig::MariaDb(server)
             | ConnectionConfig::SqlServer(server)
+            | ConnectionConfig::Redis(server)
             | ConnectionConfig::MongoDb(crate::db::MongoConfig { server, .. }) => vec![
                 (&form.name, default_profile_name(&config)),
                 (&form.host, server.host.clone()),
@@ -978,8 +981,9 @@ impl Workspace {
     /// one left open would name a relation that may not exist here and a
     /// relation of the same name would read the old one's rows back. Query
     /// tabs keep their SQL, which is the user's to run wherever they like, but
-    /// drop their results: those rows belong to the database left behind, and
-    /// an edit staged on them would be applied to this one.
+    /// drop their results and a New row form open on one: those rows belong
+    /// to the database left behind, and an edit staged on them, or a row
+    /// added beside them, would be applied to this one.
     pub(crate) fn set_database(
         &mut self,
         name: String,
@@ -1003,11 +1007,19 @@ impl Workspace {
         let Some(server) = profile.config.server() else {
             return;
         };
-        if already_on(
-            &server.database,
-            profile.databases.current.as_deref(),
-            &name,
-        ) {
+        // As the profile would store it: Redis lists `db3` and stores `3`.
+        let mut asked = profile.config.clone();
+        asked.set_database(name.clone());
+        let unmoved = asked
+            .server()
+            .is_some_and(|asked| asked.database == server.database);
+        if unmoved
+            || already_on(
+                &server.database,
+                profile.databases.current.as_deref(),
+                &name,
+            )
+        {
             return;
         }
         let session = &profile.session;
@@ -1082,6 +1094,7 @@ impl Workspace {
         }
         profile.session.clear_prompts();
         profile.session.apply_review = None;
+        profile.session.insert_form = None;
         profile.databases = Databases::default();
         profile.config.set_database(name);
         self.remember_profiles(cx);

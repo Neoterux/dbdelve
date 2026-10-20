@@ -24,6 +24,7 @@ mod mongo;
 mod mssql;
 mod mysql;
 mod postgres;
+mod redis;
 mod snowflake;
 mod sqlite;
 mod ssh;
@@ -103,6 +104,7 @@ pub enum Engine {
     Snowflake,
     SqlServer,
     MongoDb,
+    Redis,
 }
 
 /// The shape of a connection's details. The form draws one of these and never
@@ -125,6 +127,8 @@ pub enum Syntax {
     Sql,
     /// mongosh statements, which are JavaScript expressions.
     Mongo,
+    /// redis-cli commands, one a line.
+    Redis,
 }
 
 impl Syntax {
@@ -133,6 +137,9 @@ impl Syntax {
         match self {
             Self::Sql => "sql",
             Self::Mongo => "javascript",
+            // A shell grammar: it colours the command word and quoted strings,
+            // which is what a redis-cli line has.
+            Self::Redis => "bash",
         }
     }
 
@@ -140,6 +147,7 @@ impl Syntax {
         match self {
             Self::Sql => "--",
             Self::Mongo => "//",
+            Self::Redis => "#",
         }
     }
 
@@ -147,6 +155,7 @@ impl Syntax {
         match self {
             Self::Sql => "Write SQL…",
             Self::Mongo => "Write a query, like db.collection.find({})…",
+            Self::Redis => "Write a command, like GET key…",
         }
     }
 }
@@ -191,7 +200,7 @@ impl ExplainMode {
 
 impl Engine {
     /// Presentation order, which is the order the form's chips appear in.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Postgres,
         Self::MySql,
         Self::MariaDb,
@@ -200,6 +209,7 @@ impl Engine {
         Self::Snowflake,
         Self::SqlServer,
         Self::MongoDb,
+        Self::Redis,
     ];
 
     pub fn label(self) -> &'static str {
@@ -212,6 +222,7 @@ impl Engine {
             Self::Snowflake => "Snowflake",
             Self::SqlServer => "SQL Server",
             Self::MongoDb => "MongoDB",
+            Self::Redis => "Redis",
         }
     }
 
@@ -227,6 +238,7 @@ impl Engine {
             Self::Snowflake => "snowflake",
             Self::SqlServer => "mssql",
             Self::MongoDb => "mongodb",
+            Self::Redis => "redis",
         }
     }
 
@@ -242,6 +254,7 @@ impl Engine {
             "snowflake" => Ok(Self::Snowflake),
             "mssql" | "sqlserver" => Ok(Self::SqlServer),
             "mongodb" | "mongodb+srv" => Ok(Self::MongoDb),
+            "redis" | "rediss" => Ok(Self::Redis),
             other => Err(format!("{other} is not a database engine dbdelve speaks.")),
         }
     }
@@ -253,6 +266,7 @@ impl Engine {
             Self::MySql | Self::MariaDb => Some(mysql::DEFAULT_PORT),
             Self::SqlServer => Some(mssql::DEFAULT_PORT),
             Self::MongoDb => Some(mongo::DEFAULT_PORT),
+            Self::Redis => Some(redis::DEFAULT_PORT),
             Self::Sqlite | Self::Turso | Self::Snowflake => None,
         }
     }
@@ -263,9 +277,12 @@ impl Engine {
     /// password and no transport to choose.
     pub fn fields(self) -> Fields {
         match self {
-            Self::Postgres | Self::MySql | Self::MariaDb | Self::SqlServer | Self::MongoDb => {
-                Fields::Server
-            }
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::SqlServer
+            | Self::MongoDb
+            | Self::Redis => Fields::Server,
             Self::Sqlite | Self::Turso => Fields::File,
             Self::Snowflake => Fields::Account,
         }
@@ -283,7 +300,8 @@ impl Engine {
             | Self::Sqlite
             | Self::Turso
             | Self::Snowflake
-            | Self::SqlServer => false,
+            | Self::SqlServer
+            | Self::Redis => false,
         }
     }
 
@@ -298,7 +316,8 @@ impl Engine {
             | Self::Sqlite
             | Self::Turso
             | Self::Snowflake
-            | Self::SqlServer => false,
+            | Self::SqlServer
+            | Self::Redis => false,
         }
     }
 
@@ -334,6 +353,8 @@ impl Engine {
             // A plan there is `.explain()` on the end of the statement, which
             // is `explain_suffix`; nothing goes in front.
             (Self::MongoDb, _) => Some(""),
+            // No command plans another.
+            (Self::Redis, _) => None,
         }
     }
 
@@ -351,7 +372,8 @@ impl Engine {
                 | Self::Sqlite
                 | Self::Turso
                 | Self::Snowflake
-                | Self::SqlServer,
+                | Self::SqlServer
+                | Self::Redis,
                 ExplainMode::Plan | ExplainMode::Analyze,
             ) => "",
         }
@@ -380,8 +402,9 @@ impl Engine {
             // transaction. The gate's grammar reads this spelling too.
             Self::SqlServer => Some("BEGIN TRANSACTION"),
             // No statement opens one: a batch applies in order, and a failure
-            // says which rows already did.
-            Self::MongoDb => None,
+            // says which rows already did. Redis's `MULTI` queues commands
+            // without rolling back the ones that fail inside it.
+            Self::MongoDb | Self::Redis => None,
         }
     }
 
@@ -398,7 +421,7 @@ impl Engine {
                 true
             }
             // A document has no column defaults to fall back to.
-            Self::Sqlite | Self::Turso | Self::MongoDb => false,
+            Self::Sqlite | Self::Turso | Self::MongoDb | Self::Redis => false,
         }
     }
 
@@ -421,7 +444,24 @@ impl Engine {
             Self::SqlServer => default.starts_with("IDENTITY(") || default.starts_with("AS "),
             // SQLite's `table_info` leaves generated columns out altogether, and
             // a Snowflake identity takes a supplied value.
-            Self::Sqlite | Self::Turso | Self::Snowflake | Self::MongoDb => false,
+            Self::Sqlite | Self::Turso | Self::Snowflake | Self::MongoDb | Self::Redis => false,
+        }
+    }
+
+    /// Whether New row's form leaves `column` out because no value of it is
+    /// one a new row can take: a Redis key's type, which is whatever command
+    /// made the key, and a new key is a `SET`.
+    pub fn new_row_omits(self, column: &str) -> bool {
+        match self {
+            Self::Redis => column == "type",
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => false,
         }
     }
 
@@ -438,6 +478,24 @@ impl Engine {
             | Self::Snowflake
             | Self::SqlServer => true,
             Self::MongoDb => kind != RelationKind::View,
+            Self::Redis => true,
+        }
+    }
+
+    /// Whether Import Rows may insert a file's rows into a relation of
+    /// `kind`: where New row may, bar Redis, whose new rows are keys that
+    /// each name their own value and not rows under a file's columns.
+    pub fn takes_imports(self, kind: RelationKind) -> bool {
+        match self {
+            Self::Redis => false,
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => self.takes_inserts(kind),
         }
     }
 
@@ -448,12 +506,24 @@ impl Engine {
         match (self, value) {
             (Self::Postgres | Self::Snowflake | Self::MongoDb, true) => "true",
             (Self::Postgres | Self::Snowflake | Self::MongoDb, false) => "false",
-            (Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso | Self::SqlServer, true) => {
-                "1"
-            }
-            (Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso | Self::SqlServer, false) => {
-                "0"
-            }
+            (
+                Self::MySql
+                | Self::MariaDb
+                | Self::Sqlite
+                | Self::Turso
+                | Self::SqlServer
+                | Self::Redis,
+                true,
+            ) => "1",
+            (
+                Self::MySql
+                | Self::MariaDb
+                | Self::Sqlite
+                | Self::Turso
+                | Self::SqlServer
+                | Self::Redis,
+                false,
+            ) => "0",
         }
     }
 
@@ -463,7 +533,7 @@ impl Engine {
     pub fn skips_duplicates(self) -> bool {
         match self {
             Self::Postgres | Self::MySql | Self::MariaDb | Self::Sqlite | Self::Turso => true,
-            Self::SqlServer | Self::Snowflake | Self::MongoDb => false,
+            Self::SqlServer | Self::Snowflake | Self::MongoDb | Self::Redis => false,
         }
     }
 
@@ -481,6 +551,9 @@ impl Engine {
             Self::MongoDb => Err(
                 "MongoDB has no transaction on a standalone server, so each chunk is kept as it goes.",
             ),
+            Self::Redis => {
+                Err("Redis has no transaction that rolls back, so each chunk is kept as it goes.")
+            }
         }
     }
 
@@ -496,7 +569,59 @@ impl Engine {
             | Self::Sqlite
             | Self::Turso
             | Self::Snowflake
-            | Self::SqlServer => false,
+            | Self::SqlServer
+            | Self::Redis => false,
+        }
+    }
+
+    /// The column of a relation's preview naming what each of its rows opens
+    /// as a result of its own ([`crate::explorer::open_row_sql`]): a Redis key,
+    /// whose contents are a read of their own. `None` where a row is all there
+    /// is.
+    pub fn opened_column(self) -> Option<&'static str> {
+        match self {
+            Self::Redis => Some("key"),
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => None,
+        }
+    }
+
+    /// Whether a header click can ask the server for an order. A Redis reply's
+    /// order is the command's own, so a view of one sorts the rows it holds.
+    pub fn sorts_on_server(self) -> bool {
+        match self {
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => true,
+            Self::Redis => false,
+        }
+    }
+
+    /// Whether a preview's statement carries its row limit and its page's
+    /// offset. A Redis `SCAN` has neither: the fetch keeps the limit, and a
+    /// cursor walk has no page after the first that it can be asked for.
+    pub fn pages(self) -> bool {
+        match self {
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => true,
+            Self::Redis => false,
         }
     }
 
@@ -514,7 +639,8 @@ impl Engine {
             | Self::Sqlite
             | Self::Turso
             | Self::Snowflake
-            | Self::MongoDb => false,
+            | Self::MongoDb
+            | Self::Redis => false,
         }
     }
 
@@ -531,7 +657,8 @@ impl Engine {
             | Self::Sqlite
             | Self::Turso
             | Self::SqlServer
-            | Self::MongoDb => false,
+            | Self::MongoDb
+            | Self::Redis => false,
         }
     }
 
@@ -541,15 +668,16 @@ impl Engine {
     pub fn count_all(self) -> &'static str {
         match self {
             Self::SqlServer => "COUNT_BIG(*)",
-            // ponytail: MongoDB writes no SQL, so this is never what its count
-            // runs; the count statement it does run arrives with browsing.
+            // MongoDB and Redis write no SQL, so this is never what their
+            // count runs.
             Self::Postgres
             | Self::MySql
             | Self::MariaDb
             | Self::Sqlite
             | Self::Turso
             | Self::Snowflake
-            | Self::MongoDb => "COUNT(*)",
+            | Self::MongoDb
+            | Self::Redis => "COUNT(*)",
         }
     }
 
@@ -566,6 +694,7 @@ impl Engine {
         match self.syntax() {
             Syntax::Sql => "SQL…",
             Syntax::Mongo => "{ status: \"active\" }",
+            Syntax::Redis => "user:*",
         }
     }
 
@@ -574,6 +703,7 @@ impl Engine {
         match self.syntax() {
             Syntax::Sql => "Raw SQL",
             Syntax::Mongo => "Raw filter",
+            Syntax::Redis => "MATCH pattern",
         }
     }
 
@@ -582,6 +712,7 @@ impl Engine {
         match self.syntax() {
             Syntax::Sql => "Review SQL",
             Syntax::Mongo => "Review statement",
+            Syntax::Redis => "Review commands",
         }
     }
 
@@ -595,6 +726,23 @@ impl Engine {
             | Self::Snowflake
             | Self::SqlServer => Syntax::Sql,
             Self::MongoDb => Syntax::Mongo,
+            Self::Redis => Syntax::Redis,
+        }
+    }
+
+    /// Whether a relation has a definition [`Connection::ddl`] can write out.
+    /// A Redis keyspace is declared nowhere.
+    pub fn copies_ddl(self) -> bool {
+        match self {
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => true,
+            Self::Redis => false,
         }
     }
 
@@ -603,7 +751,12 @@ impl Engine {
     pub fn switches_database(self) -> bool {
         matches!(
             self,
-            Self::Postgres | Self::MySql | Self::MariaDb | Self::SqlServer | Self::MongoDb
+            Self::Postgres
+                | Self::MySql
+                | Self::MariaDb
+                | Self::SqlServer
+                | Self::MongoDb
+                | Self::Redis
         )
     }
 
@@ -613,7 +766,8 @@ impl Engine {
     /// standard way produces a statement that runs and means something else.
     ///
     /// `None` for MongoDB, whose field names are JavaScript strings, escaped
-    /// with a backslash rather than doubled.
+    /// with a backslash rather than doubled, and for Redis, whose names are
+    /// redis-cli words.
     fn identifier_quote(self) -> Option<char> {
         match self {
             // Snowflake folds an unquoted name to upper case and reads a quoted
@@ -626,17 +780,18 @@ impl Engine {
             // which the driver's login turns on.
             Self::SqlServer => Some('"'),
             Self::MySql | Self::MariaDb => Some('`'),
-            Self::MongoDb => None,
+            Self::MongoDb | Self::Redis => None,
         }
     }
 
     pub fn quote_identifier(self, identifier: &str) -> String {
-        match self.identifier_quote() {
-            Some(quote) => format!(
+        match (self, self.identifier_quote()) {
+            (Self::Redis, _) => crate::redis_cmd::quoted(identifier),
+            (_, Some(quote)) => format!(
                 "{quote}{}{quote}",
                 identifier.replace(quote, &format!("{quote}{quote}"))
             ),
-            None => json_string(identifier),
+            (_, None) => json_string(identifier),
         }
     }
 
@@ -647,6 +802,12 @@ impl Engine {
     /// position or a function call names no column, and pretending otherwise
     /// would light up the wrong header.
     pub fn unquote_identifier(self, expression: &str) -> String {
+        if self == Self::Redis {
+            return match crate::redis_cmd::split(expression).as_deref() {
+                Ok([word]) => String::from_utf8_lossy(word).into_owned(),
+                _ => expression.to_string(),
+            };
+        }
         let Some(quote) = self.identifier_quote() else {
             return serde_json::from_str::<String>(expression)
                 .unwrap_or_else(|_| expression.to_string());
@@ -671,7 +832,8 @@ impl Engine {
             | Self::Turso
             | Self::SqlServer
             | Self::Snowflake
-            | Self::MongoDb => true,
+            | Self::MongoDb
+            | Self::Redis => true,
         }
     }
 
@@ -682,7 +844,12 @@ impl Engine {
     pub fn backslash_escapes(self) -> bool {
         match self {
             Self::MySql | Self::MariaDb | Self::Snowflake => true,
-            Self::Postgres | Self::Sqlite | Self::Turso | Self::SqlServer | Self::MongoDb => false,
+            Self::Postgres
+            | Self::Sqlite
+            | Self::Turso
+            | Self::SqlServer
+            | Self::MongoDb
+            | Self::Redis => false,
         }
     }
 
@@ -711,6 +878,7 @@ impl Engine {
             // backslash escape in T-SQL.
             Self::SqlServer => format!("N'{}'", value.replace('\'', "''")),
             Self::MongoDb => json_string(value),
+            Self::Redis => crate::redis_cmd::quoted(value),
         }
     }
 
@@ -798,6 +966,62 @@ impl Engine {
             || (self == Self::MongoDb && name == "bindata")
     }
 
+    /// Whether a cell of `data_type` holds what an edit of it would write
+    /// back: not bytes ([`Engine::is_binary_type`]), and on Redis only text
+    /// that is the whole of its value, never the start of a long one, a
+    /// collection's size or the spelling of bytes that are not text.
+    pub fn writes_back(self, data_type: &str) -> bool {
+        match self {
+            Self::Redis => crate::redis_cmd::edit::writes_back(data_type),
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => !self.is_binary_type(data_type),
+        }
+    }
+
+    /// Whether a query tab's grid takes a new row and a deleted one, as a
+    /// relation's preview does, each shown for review before it runs and
+    /// never written into the buffer. Redis opens a key as a query tab of its
+    /// own, its contents having no relation to open, and that is where its
+    /// fields, items and members are added and taken out.
+    pub fn edits_query_rows(self) -> bool {
+        match self {
+            Self::Redis => true,
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => false,
+        }
+    }
+
+    /// Whether `column`, part of what names a grid's row, can be edited all
+    /// the same. Elsewhere a key column says which row an edit lands on and is
+    /// never what it changes. On Redis a key's name, a set's member, a sorted
+    /// set's member and score and a string's value are the row, and an edit
+    /// of one is written as a `RENAMENX`, or as a removal and an addition.
+    pub fn edits_key_column(self, column: &str) -> bool {
+        match self {
+            Self::Redis => crate::redis_cmd::edit::edits_key_column(column),
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::Snowflake
+            | Self::SqlServer
+            | Self::MongoDb => false,
+        }
+    }
+
     /// What a header click adds to a statement, as a notice names it.
     pub fn sort_clause(self) -> &'static str {
         match self {
@@ -808,7 +1032,7 @@ impl Engine {
             | Self::Turso
             | Self::Snowflake
             | Self::SqlServer => "an ORDER BY",
-            Self::MongoDb => "a sort",
+            Self::MongoDb | Self::Redis => "a sort",
         }
     }
 
@@ -1049,6 +1273,8 @@ pub enum ConnectionConfig {
     },
     Snowflake(SnowflakeConfig),
     MongoDb(MongoConfig),
+    /// `database` is the database's number, blank for 0.
+    Redis(ServerConfig),
 }
 
 impl ConnectionConfig {
@@ -1062,6 +1288,7 @@ impl ConnectionConfig {
             Self::Turso { .. } => Engine::Turso,
             Self::Snowflake(_) => Engine::Snowflake,
             Self::MongoDb(_) => Engine::MongoDb,
+            Self::Redis(_) => Engine::Redis,
         }
     }
 
@@ -1072,7 +1299,8 @@ impl ConnectionConfig {
             Self::Postgres(server)
             | Self::MySql(server)
             | Self::MariaDb(server)
-            | Self::SqlServer(server) => Some(server),
+            | Self::SqlServer(server)
+            | Self::Redis(server) => Some(server),
             Self::MongoDb(mongo) => Some(&mongo.server),
             Self::Sqlite { .. } | Self::Turso { .. } | Self::Snowflake(_) => None,
         }
@@ -1085,7 +1313,8 @@ impl ConnectionConfig {
             Self::Postgres(server)
             | Self::MySql(server)
             | Self::MariaDb(server)
-            | Self::SqlServer(server) => Some(server),
+            | Self::SqlServer(server)
+            | Self::Redis(server) => Some(server),
             Self::MongoDb(mongo) => Some(&mut mongo.server),
             Self::Sqlite { .. } | Self::Turso { .. } | Self::Snowflake(_) => None,
         }
@@ -1099,6 +1328,10 @@ impl ConnectionConfig {
             | Self::MariaDb(server)
             | Self::SqlServer(server) => server.database = name,
             Self::MongoDb(mongo) => mongo.set_database(name),
+            // Listed as `db3`, stored as the number a URL's path holds.
+            Self::Redis(server) => {
+                server.database = name.strip_prefix("db").unwrap_or(&name).to_string();
+            }
             Self::Sqlite { .. } | Self::Turso { .. } | Self::Snowflake(_) => {}
         }
     }
@@ -1125,6 +1358,7 @@ impl ConnectionConfig {
             Engine::MariaDb => server_from_url(url, "MariaDB").map(Self::MariaDb),
             Engine::SqlServer => mssql::config_from_url(url).map(Self::SqlServer),
             Engine::MongoDb => mongo::config_from_url(url).map(Self::MongoDb),
+            Engine::Redis => redis::config_from_url(url).map(Self::Redis),
             Engine::Sqlite => sqlite::path_from_url(url).map(|path| Self::Sqlite {
                 path,
                 // A URL has nowhere to say it; the form is where it is set.
@@ -1149,7 +1383,8 @@ impl ConnectionConfig {
             Self::Postgres(server)
             | Self::MySql(server)
             | Self::MariaDb(server)
-            | Self::SqlServer(server) => server.statement_timeout,
+            | Self::SqlServer(server)
+            | Self::Redis(server) => server.statement_timeout,
             Self::MongoDb(mongo) => mongo.server.statement_timeout,
             Self::Sqlite {
                 statement_timeout, ..
@@ -1186,7 +1421,8 @@ impl ConnectionConfig {
             Self::Postgres(server)
             | Self::MySql(server)
             | Self::MariaDb(server)
-            | Self::SqlServer(server) => server.endpoint(),
+            | Self::SqlServer(server)
+            | Self::Redis(server) => server.endpoint(),
             Self::MongoDb(mongo) => mongo.endpoint(),
             Self::Sqlite { path, .. } | Self::Turso { path, .. } => path.clone(),
             Self::Snowflake(account) => account.host(),
@@ -1206,6 +1442,7 @@ pub enum Connection {
     Turso(turso::Connection),
     Snowflake(snowflake::Connection),
     MongoDb(mongo::Connection),
+    Redis(redis::Connection),
 }
 
 impl Connection {
@@ -1235,6 +1472,7 @@ impl Connection {
                 snowflake::Connection::open(&account).map(Self::Snowflake)
             }
             ConnectionConfig::MongoDb(mongo) => mongo::Connection::open(&mongo).map(Self::MongoDb),
+            ConnectionConfig::Redis(server) => redis::Connection::open(&server).map(Self::Redis),
         }
     }
 
@@ -1266,6 +1504,7 @@ impl Connection {
             Self::Turso(connection) => connection.query(sql, fetch),
             Self::Snowflake(connection) => connection.query_with(sql, cancel, fetch),
             Self::MongoDb(connection) => connection.query(sql, cancel, fetch),
+            Self::Redis(connection) => connection.query(sql, fetch),
         }
     }
 
@@ -1291,6 +1530,7 @@ impl Connection {
             Self::SqlServer(connection) => Ok(Self::SqlServer(connection.alongside())),
             Self::Sqlite(connection) => connection.alongside().map(Self::Sqlite),
             Self::Turso(connection) => connection.alongside().map(Self::Turso),
+            Self::Redis(connection) => connection.alongside().map(Self::Redis),
         };
         // A server out of connections still has this one, which the statement
         // waits its turn on rather than failing. SQL Server logs in on the
@@ -1358,6 +1598,7 @@ impl Connection {
             Self::SqlServer(connection) => Ok(Self::SqlServer(connection.alongside())),
             Self::Sqlite(connection) => connection.alongside().map(Self::Sqlite),
             Self::Turso(connection) => connection.alongside().map(Self::Turso),
+            Self::Redis(connection) => connection.alongside().map(Self::Redis),
         }
     }
 
@@ -1370,23 +1611,37 @@ impl Connection {
 
     /// Run a statement dbdelve wrote at the user's ask -- a relation tab's
     /// preview, or an edit -- verbatim, as [`Connection::query`] does. SQL
-    /// Server alone runs it differently: its session options are the user's to
-    /// `SET`, and dbdelve's SQL is written for particular ones.
+    /// Server runs it differently: its session options are the user's to
+    /// `SET`, and dbdelve's SQL is written for particular ones. So does Redis,
+    /// where a write that changed nothing, a `RENAMENX` onto a name that is
+    /// taken, is an error rather than a `0`.
     ///
     /// A `feed` takes its rows as they arrive, as for [`Connection::query`];
     /// the statement carries its own `LIMIT`, so nothing else of [`Fetch`]
-    /// applies.
+    /// applies -- but `limit`, the row limit of a preview whose statement has
+    /// nowhere to write one (see [`Engine::pages`]), and `None` everywhere
+    /// else.
     pub fn generated(
         &self,
         sql: &str,
         cancel: &CancelToken,
         feed: Option<&Feed>,
+        limit: Option<usize>,
     ) -> Result<QueryResult, DbError> {
         match self {
             Self::SqlServer(connection) => connection.generated(
                 sql,
                 Fetch {
                     feed,
+                    limit,
+                    ..Fetch::default()
+                },
+            ),
+            Self::Redis(connection) => connection.generated(
+                sql,
+                Fetch {
+                    feed,
+                    limit,
                     ..Fetch::default()
                 },
             ),
@@ -1400,6 +1655,7 @@ impl Connection {
                 cancel,
                 Fetch {
                     feed,
+                    limit,
                     ..Fetch::default()
                 },
             ),
@@ -1423,6 +1679,7 @@ impl Connection {
             Self::Turso(connection) => connection.catalog(),
             Self::Snowflake(connection) => connection.catalog(),
             Self::MongoDb(connection) => connection.catalog(),
+            Self::Redis(connection) => connection.catalog(),
         }
     }
 
@@ -1437,6 +1694,7 @@ impl Connection {
             Self::Turso(connection) => connection.routines(),
             Self::Snowflake(connection) => connection.routines(),
             Self::MongoDb(connection) => connection.routines(),
+            Self::Redis(_) => Ok(Catalog::default()),
         }
     }
 
@@ -1454,9 +1712,11 @@ impl Connection {
             Self::Postgres(connection) => connection.sizes(),
             Self::MySql(connection) => connection.sizes(),
             Self::MongoDb(connection) => connection.sizes(),
-            Self::SqlServer(_) | Self::Sqlite(_) | Self::Turso(_) | Self::Snowflake(_) => {
-                Ok(Sizes::new())
-            }
+            Self::SqlServer(_)
+            | Self::Sqlite(_)
+            | Self::Turso(_)
+            | Self::Snowflake(_)
+            | Self::Redis(_) => Ok(Sizes::new()),
         }
     }
 
@@ -1472,7 +1732,7 @@ impl Connection {
             Self::Sqlite(connection) => connection.references(schema, relation),
             Self::Turso(connection) => connection.references(schema, relation),
             // Nothing declares one document's field a reference to another's.
-            Self::Snowflake(_) | Self::MongoDb(_) => Ok(Vec::new()),
+            Self::Snowflake(_) | Self::MongoDb(_) | Self::Redis(_) => Ok(Vec::new()),
         }
     }
 
@@ -1484,6 +1744,7 @@ impl Connection {
             Self::MySql(connection) => connection.databases(),
             Self::SqlServer(connection) => connection.databases(),
             Self::MongoDb(connection) => connection.databases(),
+            Self::Redis(connection) => connection.databases(),
             Self::Sqlite(_) | Self::Turso(_) | Self::Snowflake(_) => Ok(Databases::default()),
         }
     }
@@ -1497,6 +1758,7 @@ impl Connection {
             Self::Turso(connection) => connection.structure(schema, relation),
             Self::Snowflake(connection) => connection.structure(schema, relation),
             Self::MongoDb(connection) => connection.structure(schema, relation),
+            Self::Redis(connection) => connection.structure(schema, relation),
         }
     }
 
@@ -1513,6 +1775,7 @@ impl Connection {
             Self::Turso(connection) => connection.ddl(schema, relation),
             Self::Snowflake(connection) => connection.ddl(schema, relation, kind),
             Self::MongoDb(connection) => connection.ddl(schema, relation),
+            Self::Redis(connection) => connection.ddl(schema, relation),
         }
     }
 
@@ -1553,6 +1816,7 @@ impl Connection {
             Self::Turso(connection) => connection.cancel(),
             Self::Snowflake(connection) => connection.cancel(cancel),
             Self::MongoDb(connection) => connection.cancel(cancel),
+            Self::Redis(connection) => connection.cancel(),
         }
     }
 
@@ -1570,7 +1834,8 @@ impl Connection {
             | Self::Sqlite(_)
             | Self::Turso(_)
             | Self::Snowflake(_)
-            | Self::MongoDb(_) => false,
+            | Self::MongoDb(_)
+            | Self::Redis(_) => false,
         }
     }
 
@@ -1591,6 +1856,7 @@ impl Connection {
             Self::Turso(_) => Engine::Turso,
             Self::Snowflake(_) => Engine::Snowflake,
             Self::MongoDb(_) => Engine::MongoDb,
+            Self::Redis(_) => Engine::Redis,
         };
         let Some(statement) = read_only_statement(engine, read_only) else {
             return Ok(());
@@ -1672,7 +1938,7 @@ pub const MISSING: &str = "missing";
 /// The tag [`QueryResult::cell_types`] holds for `name`, for a snapshot read
 /// back from disk; `None` for a name no engine gives.
 pub fn cell_type(name: &str) -> Option<&'static str> {
-    mongo::cell_type(name)
+    mongo::cell_type(name).or_else(|| crate::redis_cmd::edit::cell_type(name))
 }
 
 /// A cell value, already formatted by the server. `None` is SQL NULL, which is
@@ -2138,6 +2404,7 @@ pub fn is_cancel(engine: Engine, error: &DbError) -> bool {
         Engine::Snowflake => matches!(message, "SQL execution canceled" | "Cancelled."),
         Engine::SqlServer => message.starts_with(mssql::CANCELLED),
         Engine::MongoDb => message == "Cancelled.",
+        Engine::Redis => message == redis::CANCELLED,
     }
 }
 
@@ -2178,6 +2445,12 @@ pub fn cancel_cost(engine: Engine, error: &DbError, reads: bool) -> Option<Strin
         Engine::Turso if !reads => Some(
             "If the statement was inside a transaction, Turso will not commit it: the COMMIT \
              fails and the transaction is rolled back."
+                .into(),
+        ),
+        // Redis has no way to stop a command short of ending its session.
+        Engine::Redis => Some(
+            "A cancel closes the session it lands on: a MULTI or WATCH it held is gone, and the \
+             next command opens a new one."
                 .into(),
         ),
         Engine::Sqlite
@@ -2766,7 +3039,7 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
         (Engine::SqlServer, _) => None,
         // No session setting holds a client to reads; the classifier is the
         // boundary there.
-        (Engine::MongoDb, _) => None,
+        (Engine::MongoDb | Engine::Redis, _) => None,
     }
 }
 
@@ -3063,6 +3336,11 @@ mod tests {
                 engine != Engine::MongoDb,
                 "{engine:?}"
             );
+            assert_eq!(
+                engine.takes_imports(RelationKind::Table),
+                engine != Engine::Redis,
+                "{engine:?}"
+            );
         }
     }
 
@@ -3139,8 +3417,8 @@ mod tests {
         );
         // Named, not merely rejected: "invalid URL" leaves the user guessing
         // which part of it dbdelve objected to.
-        let error = ConnectionConfig::from_url("redis://db.example.test/0").unwrap_err();
-        assert!(error.contains("redis"), "{error}");
+        let error = ConnectionConfig::from_url("cassandra://db.example.test/ks").unwrap_err();
+        assert!(error.contains("cassandra"), "{error}");
         assert!(ConnectionConfig::from_url("db.example.test/dbdelve").is_err());
     }
 
@@ -3261,7 +3539,7 @@ mod tests {
 
         for engine in Engine::ALL
             .into_iter()
-            .filter(|e| !matches!(e, Engine::SqlServer | Engine::MongoDb))
+            .filter(|e| !matches!(e, Engine::SqlServer | Engine::MongoDb | Engine::Redis))
         {
             assert_eq!(
                 engine.quote_literal("odd'value"),
@@ -3269,6 +3547,10 @@ mod tests {
                 "{engine:?}"
             );
         }
+        // A redis-cli word: bare where it can be, else double-quoted.
+        assert_eq!(Engine::Redis.quote_literal("odd'value"), "\"odd'value\"");
+        assert_eq!(Engine::Redis.quote_identifier("user:1"), "user:1");
+        assert_eq!(Engine::Redis.unquote_identifier("\"a key\""), "a key");
 
         // Only MySQL reads a backslash as an escape, so only MySQL has to
         // double one. Getting this wrong is how a trailing backslash turns the

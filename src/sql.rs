@@ -64,6 +64,7 @@ impl Buffer {
                 .flat_map(|batch| tsql_statements(sql, batch))
                 .collect(),
             Engine::MongoDb => crate::mql::statements(sql),
+            Engine::Redis => crate::redis_cmd::statements(sql),
             Engine::Postgres
             | Engine::MySql
             | Engine::MariaDb
@@ -160,7 +161,8 @@ pub(crate) fn queued_statements(
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake
-        | Engine::MongoDb => Buffer::for_engine(engine, sql).statements().to_vec(),
+        | Engine::MongoDb
+        | Engine::Redis => Buffer::for_engine(engine, sql).statements().to_vec(),
     };
     let Some(selection) = selection.filter(|sel| !sel.is_empty()) else {
         return units;
@@ -188,7 +190,8 @@ pub(crate) fn expected_sets(engine: Engine, sql: &str) -> usize {
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake
-        | Engine::MongoDb => 1,
+        | Engine::MongoDb
+        | Engine::Redis => 1,
     }
 }
 
@@ -268,6 +271,8 @@ impl SortKey {
 pub fn order_by(engine: Engine, statement: &str) -> Option<Vec<SortKey>> {
     match engine {
         Engine::MongoDb => return crate::mql::browse::order_by(statement),
+        // A reply's order is the command's own; nothing sorts it.
+        Engine::Redis => return None,
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -321,6 +326,7 @@ pub fn order_by(engine: Engine, statement: &str) -> Option<Vec<SortKey>> {
 pub fn with_order_by(engine: Engine, statement: &str, keys: &[SortKey]) -> Option<String> {
     match engine {
         Engine::MongoDb => return crate::mql::browse::with_order_by(statement, keys),
+        Engine::Redis => return None,
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -506,6 +512,7 @@ pub fn insert_row(
 ) -> Result<String, String> {
     match engine {
         Engine::MongoDb => return crate::mql::insert_row(table, columns, types),
+        Engine::Redis => return crate::redis_cmd::edit::insert_row(schema, table, columns),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -558,6 +565,9 @@ pub(crate) fn insert_rows(
         let names: Vec<&str> = columns.iter().map(|&(name, _)| name).collect();
         return crate::mql::insert_many(table, &names, rows);
     }
+    if engine == Engine::Redis {
+        return Err("Redis takes no imported rows.".into());
+    }
     let Some(&(first, _)) = columns.first() else {
         return Err("There is nothing in this row to insert.".into());
     };
@@ -595,7 +605,7 @@ pub(crate) fn insert_rows(
             let first = engine.quote_identifier(first);
             format!(" ON DUPLICATE KEY UPDATE {first} = {first}")
         }
-        (true, Engine::Snowflake | Engine::SqlServer | Engine::MongoDb) => {
+        (true, Engine::Snowflake | Engine::SqlServer | Engine::MongoDb | Engine::Redis) => {
             return Err("This engine cannot skip rows that already exist.".into());
         }
     };
@@ -623,7 +633,7 @@ pub fn insert_template(
         Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::Turso | Engine::Snowflake => {
             |_| "?".into()
         }
-        Engine::MongoDb => return None,
+        Engine::MongoDb | Engine::Redis => return None,
     };
     let names: Vec<String> = columns
         .iter()
@@ -661,6 +671,9 @@ pub fn delete_row(
 ) -> Option<String> {
     match engine {
         Engine::MongoDb => return crate::mql::delete_row(table, keys, types).ok(),
+        Engine::Redis => {
+            return crate::redis_cmd::edit::delete_row(schema, table, keys, types).ok();
+        }
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -915,6 +928,7 @@ fn delete_key_matches(sql: &str, keys: &[&str], backslash_escapes: bool) -> bool
 pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
     match engine {
         Engine::MongoDb => crate::mql::is_generated_write(statement),
+        Engine::Redis => crate::redis_cmd::edit::is_generated_write(statement),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -929,6 +943,7 @@ pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
 pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> bool {
     match engine {
         Engine::MongoDb => crate::mql::delete_matches_key(statement, keys),
+        Engine::Redis => crate::redis_cmd::edit::delete_matches_key(statement, keys),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -960,6 +975,7 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
 pub fn is_generated_select(engine: Engine, sql: &str) -> bool {
     match engine {
         Engine::MongoDb => return crate::mql::browse::is_generated_read(sql),
+        Engine::Redis => return crate::redis_cmd::browse::is_generated_read(sql),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -1813,6 +1829,7 @@ fn repeats(count: u64) -> Result<(), String> {
 pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String, String> {
     match engine {
         Engine::MongoDb => return crate::mql::update_batch(rows),
+        Engine::Redis => return crate::redis_cmd::edit::update_batch(rows),
         Engine::Postgres
         | Engine::MySql
         | Engine::MariaDb
@@ -1880,10 +1897,14 @@ pub(crate) fn remember_statement(history: &mut Vec<String>, sql: &str) {
 /// `UPDATE` appended to it becomes one statement, and the next `cmd+enter`
 /// would send both as one. dbdelve is writing here because the user asked it to,
 /// so the boundary of what they wrote has to survive the ask.
-pub(crate) fn appended_statement(buffer: &str, statement: &str) -> String {
+pub(crate) fn appended_statement(engine: Engine, buffer: &str, statement: &str) -> String {
     let text = buffer.trim_end();
     if text.is_empty() {
         return statement.to_string();
+    }
+    // A Redis command ends with its line, and a `;` would join its last word.
+    if engine == Engine::Redis {
+        return format!("{text}\n\n{statement}");
     }
 
     format!("{}\n\n{statement}", terminated(text))
@@ -2076,7 +2097,8 @@ pub(crate) fn explainable(engine: Engine, sql: &str) -> Result<(), String> {
         | Engine::Sqlite
         | Engine::Turso
         | Engine::Snowflake
-        | Engine::SqlServer => Ok(()),
+        | Engine::SqlServer
+        | Engine::Redis => Ok(()),
     }
 }
 
@@ -2089,6 +2111,9 @@ pub(crate) fn explainable(engine: Engine, sql: &str) -> Result<(), String> {
 /// bare `EXPLAIN` is bytecode, and a `FORMAT` other than text or tree is JSON,
 /// XML or YAML. Those stay in the grid, where they are at least legible.
 pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
+    if engine == Engine::Redis {
+        return None;
+    }
     let Some(dialect) = dialect(engine) else {
         return crate::mql::typed_explain(sql);
     };
@@ -2158,7 +2183,8 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
         | Engine::Turso
         | Engine::Snowflake
         | Engine::SqlServer
-        | Engine::MongoDb => None,
+        | Engine::MongoDb
+        | Engine::Redis => None,
     }
 }
 
@@ -2170,6 +2196,9 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
 /// finds statement boundaries in a buffer someone is still typing into;
 /// this needs a typed statement, and would rather refuse than guess.
 pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
+    if engine == Engine::Redis {
+        return crate::redis_cmd::classify(sql);
+    }
     let Some(dialect) = dialect(engine) else {
         return crate::mql::classify(sql);
     };
@@ -2204,8 +2233,8 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
         .fold(Verdict::READ, Verdict::max)
 }
 
-/// The `sqlparser` dialect an engine's SQL is read in; `None` for MongoDB,
-/// which is not SQL.
+/// The `sqlparser` dialect an engine's SQL is read in; `None` for MongoDB
+/// and Redis, which are not SQL.
 fn dialect(engine: Engine) -> Option<Box<dyn Dialect>> {
     Some(match engine {
         Engine::Postgres => Box::new(PostgreSqlDialect {}),
@@ -2213,7 +2242,7 @@ fn dialect(engine: Engine) -> Option<Box<dyn Dialect>> {
         Engine::Sqlite | Engine::Turso => Box::new(SQLiteDialect {}),
         Engine::Snowflake => Box::new(SnowflakeDialect {}),
         Engine::SqlServer => Box::new(MsSqlDialect {}),
-        Engine::MongoDb => return None,
+        Engine::MongoDb | Engine::Redis => return None,
     })
 }
 
@@ -2384,6 +2413,9 @@ pub(crate) struct Leaves {
 /// grammar does not know, which still changed the session if it ran.
 /// Snowflake and MongoDB keep nothing from one run to the next.
 pub(crate) fn leaves(engine: Engine, sql: &str) -> Leaves {
+    if engine == Engine::Redis {
+        return crate::redis_cmd::leaves(sql);
+    }
     let mut leaves = Leaves::default();
     let Some(dialect) = dialect(engine).filter(|_| engine != Engine::Snowflake) else {
         return leaves;
@@ -2834,6 +2866,7 @@ pub(crate) fn gate(verdict: &Verdict, mode: Mode, confirmed: &[Destructive]) -> 
 pub(crate) fn format(engine: Engine, sql: &str) -> Result<String, &'static str> {
     let dialect = match engine {
         Engine::MongoDb => return crate::mql::format(sql),
+        Engine::Redis => return Err("Not formatting: a Redis command is one line, as typed."),
         Engine::SqlServer => sqlformat::Dialect::SQLServer,
         Engine::Postgres
         | Engine::MySql
@@ -3522,7 +3555,7 @@ mod tests {
         ] {
             for engine in Engine::ALL
                 .into_iter()
-                .filter(|e| !matches!(e, Engine::SqlServer | Engine::MongoDb))
+                .filter(|e| !matches!(e, Engine::SqlServer | Engine::MongoDb | Engine::Redis))
             {
                 assert_eq!(
                     Buffer::for_engine(engine, sql).statements(),
@@ -4755,6 +4788,7 @@ mod tests {
                 .collect(),
             keys: owned(keys),
             types: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -5090,7 +5124,7 @@ mod tests {
             ("SELECT 2", "SELECT 1"),
             ("SELECT 2;\n", "SELECT\n  1"),
         ] {
-            let appended = appended_statement(buffer, recalled);
+            let appended = appended_statement(Engine::Postgres, buffer, recalled);
             let line = appended.lines().count() - recalled.lines().count();
 
             assert_eq!(
@@ -5106,15 +5140,22 @@ mod tests {
         // Without the semicolon, "SELECT 1" and "UPDATE ..." would read back
         // as a single statement, and cmd+enter would send both at once.
         assert_eq!(
-            appended_statement("SELECT 1", "UPDATE t SET a = 1"),
+            appended_statement(Engine::Postgres, "SELECT 1", "UPDATE t SET a = 1"),
             "SELECT 1;\n\nUPDATE t SET a = 1"
         );
     }
 
     #[test]
+    fn a_redis_buffer_takes_its_appended_command_on_a_line_of_its_own() {
+        let appended = appended_statement(Engine::Redis, "GET a  \n", "SET a 1 KEEPTTL");
+        assert_eq!(appended, "GET a\n\nSET a 1 KEEPTTL");
+        assert_eq!(crate::redis_cmd::parse(&appended).unwrap().len(), 2);
+    }
+
+    #[test]
     fn an_already_terminated_buffer_keeps_a_single_semicolon() {
         assert_eq!(
-            appended_statement("SELECT 1;", "UPDATE t SET a = 1"),
+            appended_statement(Engine::Postgres, "SELECT 1;", "UPDATE t SET a = 1"),
             "SELECT 1;\n\nUPDATE t SET a = 1"
         );
     }
@@ -5178,7 +5219,7 @@ mod tests {
             ("SELECT 'a;'", "SELECT 'a;';"),
             ("SELECT 1;;", "SELECT 1;;"),
         ] {
-            let appended = appended_statement(buffer, "UPDATE t SET a = 1");
+            let appended = appended_statement(Engine::Postgres, buffer, "UPDATE t SET a = 1");
 
             assert_eq!(appended, format!("{expected}\n\nUPDATE t SET a = 1"));
             assert_eq!(
@@ -5192,7 +5233,7 @@ mod tests {
     #[test]
     fn an_empty_buffer_yields_just_the_statement() {
         assert_eq!(
-            appended_statement("", "UPDATE t SET a = 1"),
+            appended_statement(Engine::Postgres, "", "UPDATE t SET a = 1"),
             "UPDATE t SET a = 1"
         );
     }
@@ -5200,7 +5241,7 @@ mod tests {
     #[test]
     fn trailing_whitespace_in_the_buffer_does_not_ragged_the_join() {
         assert_eq!(
-            appended_statement("SELECT 1\n\n  ", "UPDATE t SET a = 1"),
+            appended_statement(Engine::Postgres, "SELECT 1\n\n  ", "UPDATE t SET a = 1"),
             "SELECT 1;\n\nUPDATE t SET a = 1"
         );
     }

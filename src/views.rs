@@ -312,7 +312,11 @@ fn render_query_surface(
             tab.row_panel_editing,
             &tab.row_panel_split,
             row_panel,
-            None,
+            profile
+                .session
+                .insert_form
+                .as_ref()
+                .filter(|form| form.tab == Tab::Query(tab.id)),
             &scope,
             cx,
         ),
@@ -828,6 +832,7 @@ fn render_filter_bar(
 ) -> AnyElement {
     let names: Vec<SharedString> = columns
         .iter()
+        .filter(|column| crate::filter::filters_on(engine, &column.name))
         .map(|column| SharedString::from(column.name.clone()))
         .collect();
     div()
@@ -922,12 +927,13 @@ fn render_filter_bar(
                     )
                     .dropdown_menu({
                         let chosen = filter.operator;
+                        let column = filter.column.clone();
                         move |menu, _, _| {
                             Operator::ALL
                                 .into_iter()
                                 // An operator the engine cannot express is not
                                 // offered: SQLite has no regex (spec §7).
-                                .filter(|operator| operator.on(engine))
+                                .filter(|operator| operator.offered(engine, column.as_deref()))
                                 .fold(
                                     menu.scrollable(true).max_h(px(layout::MENU_MAX_HEIGHT)),
                                     |menu, operator| {
@@ -2539,69 +2545,73 @@ pub(crate) fn render_paging(
     });
     // The pager appears only once there is somewhere to go: a first page
     // shorter than its limit is the whole relation, and arrows over it are
-    // controls that can do nothing.
-    let pager = preview.and_then(|(_, offset, full_page)| {
-        (offset > 0 || full_page).then(|| {
-            div()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                .children((offset > 0).then(|| {
-                    icon_button(
-                        "previous-page",
-                        icon::CHEVRON_LEFT,
-                        Tone::Quiet,
-                        Control::Compact,
-                        t,
+    // controls that can do nothing. So is one over a statement with no page
+    // after its first to ask for.
+    let pages = profile.config.engine().pages();
+    let pager = preview
+        .filter(|_| pages)
+        .and_then(|(_, offset, full_page)| {
+            (offset > 0 || full_page).then(|| {
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .children((offset > 0).then(|| {
+                        icon_button(
+                            "previous-page",
+                            icon::CHEVRON_LEFT,
+                            Tone::Quiet,
+                            Control::Compact,
+                            t,
+                        )
+                        .tooltip("Previous page")
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(PreviousPage), cx);
+                        })
+                    }))
+                    .child(
+                        // Dressed as the row-limit chips beside it rather than as
+                        // the library's field: its own fill is the frost again,
+                        // which stacks to a black slab on this strip. A wash lets
+                        // the glass through and is a faint step on opaque themes.
+                        div()
+                            .h(px(layout::chrome(layout::CONTROL_HEIGHT_COMPACT)))
+                            .w(px(layout::chrome(44.)))
+                            .px(px(layout::SPACE_SM))
+                            .flex()
+                            .items_center()
+                            .rounded(px(layout::RADIUS_CONTROL))
+                            .bg(t.element_active)
+                            // The strong edge is what says "type here": on glass
+                            // the wash alone is close to the strip behind it.
+                            .border_1()
+                            .border_color(t.border_strong)
+                            .text_size(px(layout::chrome(layout::TEXT_SM)))
+                            .text_color(t.text)
+                            .child(
+                                Input::new(&session.page_input)
+                                    .appearance(false)
+                                    .px_0()
+                                    .h_full()
+                                    .text_size(px(layout::chrome(layout::TEXT_SM))),
+                            ),
                     )
-                    .tooltip("Previous page")
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(PreviousPage), cx);
-                    })
-                }))
-                .child(
-                    // Dressed as the row-limit chips beside it rather than as
-                    // the library's field: its own fill is the frost again,
-                    // which stacks to a black slab on this strip. A wash lets
-                    // the glass through and is a faint step on opaque themes.
-                    div()
-                        .h(px(layout::chrome(layout::CONTROL_HEIGHT_COMPACT)))
-                        .w(px(layout::chrome(44.)))
-                        .px(px(layout::SPACE_SM))
-                        .flex()
-                        .items_center()
-                        .rounded(px(layout::RADIUS_CONTROL))
-                        .bg(t.element_active)
-                        // The strong edge is what says "type here": on glass
-                        // the wash alone is close to the strip behind it.
-                        .border_1()
-                        .border_color(t.border_strong)
-                        .text_size(px(layout::chrome(layout::TEXT_SM)))
-                        .text_color(t.text)
-                        .child(
-                            Input::new(&session.page_input)
-                                .appearance(false)
-                                .px_0()
-                                .h_full()
-                                .text_size(px(layout::chrome(layout::TEXT_SM))),
-                        ),
-                )
-                .children(full_page.then(|| {
-                    icon_button(
-                        "next-page",
-                        icon::CHEVRON_RIGHT,
-                        Tone::Quiet,
-                        Control::Compact,
-                        t,
-                    )
-                    .tooltip("Next page")
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(NextPage), cx);
-                    })
-                }))
-        })
-    });
+                    .children(full_page.then(|| {
+                        icon_button(
+                            "next-page",
+                            icon::CHEVRON_RIGHT,
+                            Tone::Quiet,
+                            Control::Compact,
+                            t,
+                        )
+                        .tooltip("Next page")
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(NextPage), cx);
+                        })
+                    }))
+            })
+        });
 
     preview.map(|_| {
         div()
@@ -2654,6 +2664,10 @@ pub(crate) fn render_view_sorting(
 ) -> Option<AnyElement> {
     let t = *theme(cx);
     let session = &profile.session;
+    // Memory is the only choice there, so there is no choice to show.
+    if !profile.config.engine().sorts_on_server() {
+        return None;
+    }
     let client = match session.active {
         Tab::Object(_) => relation_preview(session).and(session.sorting(session.active)),
         Tab::Query(_) => session

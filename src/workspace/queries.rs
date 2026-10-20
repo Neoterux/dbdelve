@@ -1348,6 +1348,7 @@ impl Workspace {
         let in_front = (profile.session.active == Tab::Query(id))
             .then(|| profile.session.fallback(Tab::Query(id)));
         profile.session.queries.remove(position);
+        profile.session.forget(Tab::Query(id));
         let profile_id = profile.id.clone();
         if let Some(fallback) = in_front {
             self.front_after_close(fallback, window, cx);
@@ -1460,13 +1461,49 @@ impl Workspace {
         };
         let (id, editor) = (tab.id, tab.editor.clone());
         let text = editor.read(cx).value().to_string();
-        let appended = appended_statement(&text, &sql);
+        let appended = appended_statement(self.engine(), &text, &sql);
         let line = appended.lines().count().saturating_sub(sql.lines().count()) as u32;
         editor.update(cx, |editor, cx| {
             editor.set_value(appended, window, cx);
             editor.set_cursor_position(Position::new(line, 0), window, cx);
         });
         self.activate_tab(Tab::Query(id), window, cx);
+    }
+
+    /// A new query tab holding `statement`, run at once: a row opened as a
+    /// result of its own, by a command that is then the user's to read, edit
+    /// and run again, through the same gate as any they type.
+    pub(crate) fn run_in_new_query(
+        &mut self,
+        statement: String,
+        at_most: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.profile().map(|profile| profile.session.next_query_id);
+        self.new_query(&NewQuery, window, cx);
+        // Not whatever tab is in front if the new one could not be made: that
+        // buffer is the user's.
+        let Some(editor) = self
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .filter(|tab| Some(tab.id) == id)
+            .map(|tab| tab.editor.clone())
+        else {
+            return;
+        };
+        // An unlimited tab would let a Redis scan follow its cursor to the end.
+        if let Some(tab) = self
+            .profile_mut()
+            .and_then(|profile| profile.session.query_tab_mut(id.unwrap_or_default()))
+        {
+            tab.row_limit.get_or_insert(at_most);
+        }
+        editor.update(cx, |editor, cx| {
+            editor.set_value(statement, window, cx);
+            editor.set_cursor_position(Position::new(0, 0), window, cx);
+        });
+        self.run_query(&RunQuery, window, cx);
     }
 
     /// The first unsaved buffer, or a new one when every open tab has a name.
@@ -1545,6 +1582,7 @@ impl Workspace {
             // leave `cmd+w` looking like it had done nothing.
             if let Some(open) = was_open {
                 profile.session.queries.retain(|tab| tab.id != open);
+                profile.session.forget(Tab::Query(open));
                 // With the tab, as in `close_buffer`: a snapshot with no
                 // tab left to come back to is rows the next buffer to be
                 // handed this id would show as its own.
@@ -1866,6 +1904,17 @@ impl Workspace {
                 .and_then(|query| query.row_limit),
             _ => None,
         };
+        // A preview whose statement has nowhere to write its limit.
+        let preview_limit = match tab {
+            Tab::Object(object) if !engine.pages() => self
+                .issued_to(&id, generation)
+                .and_then(|profile| profile.session.objects.iter().find(|tab| tab.id == object))
+                .and_then(|tab| match &tab.body {
+                    ObjectBody::Relation { limit, .. } => *limit,
+                    ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
+                }),
+            Tab::Object(_) | Tab::Query(_) => None,
+        };
         // Rows land in the grid as they arrive, but only in a grid cleared for
         // them: a refresh keeps the rows it is replacing until the new ones are
         // whole, and a plan's rows never reach the grid at all. A relation's
@@ -1922,7 +1971,7 @@ impl Workspace {
                 held: None,
             };
             let result = match (generated, alongside) {
-                (true, _) => connection.generated(&sql, &cancel, fed.as_ref()),
+                (true, _) => connection.generated(&sql, &cancel, fed.as_ref(), preview_limit),
                 (false, false) => connection.query(&sql, &cancel, fetch),
                 (false, true) => connection.query_alongside(&sql, &cancel, fetch, read_only),
             };
