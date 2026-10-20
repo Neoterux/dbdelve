@@ -77,19 +77,15 @@ impl Workspace {
                     .collect();
                 (tab.schema.clone(), tab.name.clone(), columns)
             }
-            // The grid's own columns, where its rows are written back to.
-            Tab::Query(_) if engine.edits_query_rows() => {
-                let target = profile
-                    .session
-                    .active_results()
-                    .and_then(|results| results.read(cx).delegate().insert_target());
-                let Some(target) = target else {
+            // The grid's own columns, where its rows are written back to: one
+            // table, which is never so for a join or a computed result.
+            Tab::Query(_) => {
+                let Some(target) = profile.session.query_insert_target(cx) else {
                     self.note("These rows take no new row.".into(), cx);
                     return;
                 };
                 target
             }
-            Tab::Query(_) => return,
         };
         let mut fields = Vec::with_capacity(columns.len());
         for (index, (column, data_type)) in columns.into_iter().enumerate() {
@@ -1686,7 +1682,7 @@ impl Workspace {
             return;
         };
         let (id, editor) = (tab.id, tab.editor.clone());
-        let Some(select) = tab.last_query.clone() else {
+        let Some(refresh) = tab.apply_refresh() else {
             self.note(
                 "dbdelve does not know which statement produced these rows.".into(),
                 cx,
@@ -1697,14 +1693,7 @@ impl Workspace {
         let text = editor.read(cx).value().to_string();
         let appended = appended_statement(self.engine(), &text, &batch);
         editor.update(cx, |editor, cx| editor.set_value(appended, window, cx));
-        self.execute_and_then(
-            batch,
-            Tab::Query(id),
-            Some(Refresh::Statement(select)),
-            false,
-            None,
-            cx,
-        );
+        self.execute_and_then(batch, Tab::Query(id), Some(refresh), false, None, cx);
     }
 
     /// Run the batch a relation tab is showing. The modal stays up until it
@@ -1724,9 +1713,9 @@ impl Workspace {
             Tab::Query(id) => match profile
                 .session
                 .query_tab(id)
-                .and_then(|query| query.last_query.clone())
+                .and_then(QueryTab::apply_refresh)
             {
-                Some(statement) => Refresh::Statement(statement),
+                Some(refresh) => refresh,
                 None => {
                     self.note(
                         "dbdelve does not know which statement produced these rows.".into(),

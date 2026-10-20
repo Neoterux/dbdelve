@@ -1614,7 +1614,7 @@ fn result_switcher(tab: &QueryTab, cx: &mut Context<Workspace>) -> Option<AnyEle
                 tab.id,
                 index,
                 &query_label(&finished.sql),
-                &finished.state,
+                tab.state_of(finished),
                 index == queue.showing,
                 cx,
             )
@@ -3202,6 +3202,19 @@ fn render_query_toolbar(
                 ))
         });
 
+    // Only over rows read from one table with its key: what the grid
+    // writes its edits back to is what the new row is inserted into. Named,
+    // since a queue's results can each be a different table.
+    let new_row = (!session.naming)
+        .then(|| session.query_insert_target(cx))
+        .flatten()
+        .map(|(_, table, _)| {
+            let label = format!("New row in {table}");
+            button("new-row", label, Tone::Quiet, Control::Compact, t).on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(NewRow), cx);
+            })
+        });
+
     let named = session.open_query().is_some();
     let save_workspace = workspace.clone();
     let rename_workspace = workspace.clone();
@@ -3214,6 +3227,7 @@ fn render_query_toolbar(
         .border_color(t.border)
         .text_size(px(layout::chrome(layout::TEXT_SM)))
         .children(plan_toggle)
+        .children(new_row)
         .child(div().flex_1())
         .children(naming)
         // A named query is already written to disk on every swap, so there
