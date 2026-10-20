@@ -77,10 +77,9 @@ impl Workspace {
             .profile()
             .and_then(|profile| profile.session.active_results())
             .is_some_and(|results| {
-                let table = results.read(cx);
-                table
-                    .selected_row()
-                    .is_some_and(|row| table.delegate().row_editable(row))
+                let grid = results.read(cx).delegate();
+                grid.selected_row()
+                    .is_some_and(|row| grid.row_editable(row))
             });
         if self.row_panel.on_screen.get() && (editing || editable) {
             self.toggle_row_panel_edit(cx);
@@ -127,7 +126,7 @@ impl Workspace {
         let target = editing
             .then(|| {
                 let results = self.profile()?.session.active_results()?.clone();
-                let row = results.read(cx).selected_row()?;
+                let row = results.read(cx).delegate().selected_row()?;
                 Some((results, row))
             })
             .flatten();
@@ -653,8 +652,8 @@ impl Workspace {
         else {
             return;
         };
-        // Through the mode trait: 0.6.4 made the inherent method `pub(crate)`,
-        // and this is the only public way left to offer the menu an action.
+        // Through the mode trait: gpui-base 0.8 keeps the inherent method
+        // `pub(crate)`, and this is the only public way to offer the menu an action.
         let accepted = editor.update(cx, |editor, cx| {
             EditorMode::handle_context_menu_action(
                 editor,
