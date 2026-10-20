@@ -757,7 +757,32 @@ impl Engine {
                 | Self::SqlServer
                 | Self::MongoDb
                 | Self::Redis
+                | Self::Snowflake
         )
+    }
+
+    /// Whether a profile picks the schema unqualified names resolve in.
+    /// MySQL's database is its schema, and SQL Server's default schema is the
+    /// login's.
+    pub fn picks_schema(self) -> bool {
+        matches!(self, Self::Postgres | Self::Snowflake)
+    }
+
+    /// A database the server keeps for itself, listed after the user's own.
+    /// Postgres's `postgres` is an ordinary database people work in.
+    pub fn is_system_database(self, name: &str) -> bool {
+        let system: &[&str] = match self {
+            Self::MySql | Self::MariaDb => {
+                &["information_schema", "mysql", "performance_schema", "sys"]
+            }
+            Self::SqlServer => &["master", "tempdb", "model", "msdb"],
+            Self::MongoDb => &["admin", "local", "config"],
+            // The account usage share every account has. `SNOWFLAKE_SAMPLE_DATA`
+            // is a share too, but one people query.
+            Self::Snowflake => &["SNOWFLAKE"],
+            _ => &[],
+        };
+        system.contains(&name)
     }
 
     /// Postgres and SQLite take the standard's double quote. MySQL takes a
@@ -1165,6 +1190,7 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
         statement_timeout: 0,
         // Same reason: a URL has nowhere to say it either.
         ssh: None,
+        schema: None,
     })
 }
 
@@ -1241,6 +1267,10 @@ pub struct ServerConfig {
     /// A local port forward to dial through instead of connecting to `host`
     /// directly. None is the ordinary direct connection.
     pub ssh: Option<SshTunnel>,
+    /// The schema unqualified names resolve in first, where
+    /// [`Engine::picks_schema`]. None leaves the server's
+    /// `search_path` alone.
+    pub schema: Option<String>,
 }
 
 impl ServerConfig {
@@ -1324,16 +1354,62 @@ impl ConnectionConfig {
     /// Move the profile onto another database on the same server.
     pub fn set_database(&mut self, name: String) {
         match self {
-            Self::Postgres(server)
-            | Self::MySql(server)
-            | Self::MariaDb(server)
-            | Self::SqlServer(server) => server.database = name,
+            // Schemas belong to one database, so the active one doesn't carry over.
+            Self::Postgres(server) => {
+                server.database = name;
+                server.schema = None;
+            }
+            Self::MySql(server) | Self::MariaDb(server) | Self::SqlServer(server) => {
+                server.database = name
+            }
             Self::MongoDb(mongo) => mongo.set_database(name),
+            Self::Snowflake(account) => account.set_database(name),
             // Listed as `db3`, stored as the number a URL's path holds.
             Self::Redis(server) => {
                 server.database = name.strip_prefix("db").unwrap_or(&name).to_string();
             }
-            Self::Sqlite { .. } | Self::Turso { .. } | Self::Snowflake(_) => {}
+            Self::Sqlite { .. } | Self::Turso { .. } => {}
+        }
+    }
+
+    /// The database as the profile holds it, which may be blank.
+    pub fn database(&self) -> Option<&str> {
+        match self {
+            Self::Snowflake(account) => Some(&account.database),
+            _ => self.server().map(|server| server.database.as_str()),
+        }
+    }
+
+    /// The database the profile is on, spelled as [`Connection::databases`]
+    /// lists it. None where a blank one leaves the server to pick.
+    pub fn database_name(&self) -> Option<String> {
+        let database = self.database()?;
+        match self {
+            Self::Snowflake(account) => Some(account.stored_database()),
+            Self::Postgres(_) if database.is_empty() => Some("postgres".into()),
+            Self::Redis(_) => Some(format!(
+                "db{}",
+                if database.is_empty() { "0" } else { database }
+            )),
+            _ => Some(database.to_string()).filter(|name| !name.is_empty()),
+        }
+    }
+
+    /// The schema picked as the active one, where [`Engine::picks_schema`].
+    /// None until one is picked.
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            Self::Postgres(server) => server.schema.as_deref(),
+            Self::Snowflake(account) => account.schema.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_schema(&mut self, schema: Option<String>) {
+        match self {
+            Self::Postgres(server) => server.schema = schema,
+            Self::Snowflake(account) => account.schema = schema,
+            _ => {}
         }
     }
 
@@ -1615,7 +1691,8 @@ impl Connection {
     /// Server runs it differently: its session options are the user's to
     /// `SET`, and dbdelve's SQL is written for particular ones. So does Redis,
     /// where a write that changed nothing, a `RENAMENX` onto a name that is
-    /// taken, is an error rather than a `0`.
+    /// taken, is an error rather than a `0`. And Snowflake, which sends it
+    /// without the active schema, a field only the user's statements carry.
     ///
     /// A `feed` takes its rows as they arrive, as for [`Connection::query`];
     /// the statement carries its own `LIMIT`, so nothing else of [`Fetch`]
@@ -1646,11 +1723,19 @@ impl Connection {
                     ..Fetch::default()
                 },
             ),
+            Self::Snowflake(connection) => connection.generated(
+                sql,
+                cancel,
+                Fetch {
+                    feed,
+                    limit,
+                    ..Fetch::default()
+                },
+            ),
             Self::Postgres(_)
             | Self::MySql(_)
             | Self::Sqlite(_)
             | Self::Turso(_)
-            | Self::Snowflake(_)
             | Self::MongoDb(_) => self.query(
                 sql,
                 cancel,
@@ -1739,14 +1824,49 @@ impl Connection {
 
     /// The databases on the server, for a profile to be moved onto one. Empty
     /// where [`Engine::switches_database`] is false.
-    pub fn databases(&self) -> Result<Databases, DbError> {
-        match self {
+    pub fn databases(&self, engine: Engine) -> Result<Databases, DbError> {
+        let mut databases = match self {
             Self::Postgres(connection) => connection.databases(),
             Self::MySql(connection) => connection.databases(),
             Self::SqlServer(connection) => connection.databases(),
             Self::MongoDb(connection) => connection.databases(),
             Self::Redis(connection) => connection.databases(),
-            Self::Sqlite(_) | Self::Turso(_) | Self::Snowflake(_) => Ok(Databases::default()),
+            Self::Snowflake(connection) => connection.databases(),
+            Self::Sqlite(_) | Self::Turso(_) => Ok(Databases::default()),
+        }?;
+        databases.system_last(engine);
+        Ok(databases)
+    }
+
+    /// Make `schema` the first place unqualified names resolve in every
+    /// session this connection opens from here on. Never waits, so switches
+    /// made one after another are recorded in that order; the sessions
+    /// already open follow on [`Self::apply_schema`]. A no-op where
+    /// [`Engine::picks_schema`] is false.
+    pub fn set_schema(&self, schema: Option<&str>) {
+        match self {
+            Self::Postgres(connection) => connection.set_schema(schema),
+            Self::Snowflake(connection) => connection.set_schema(schema),
+            _ => {}
+        }
+    }
+
+    /// Move the sessions already open onto the schema last recorded by
+    /// [`Self::set_schema`], which may be newer than the one recorded when
+    /// this was called. Waits for a statement running on them to finish.
+    pub fn apply_schema(&self) -> Result<(), DbError> {
+        match self {
+            Self::Postgres(connection) => connection.apply_schema(),
+            _ => Ok(()),
+        }
+    }
+
+    /// The schema the server put the session in when it connected, before any
+    /// picked one was applied. None where it isn't asked or there was none.
+    pub fn current_schema(&self) -> Option<&str> {
+        match self {
+            Self::Postgres(connection) => connection.current_schema(),
+            _ => None,
         }
     }
 
@@ -2160,6 +2280,14 @@ pub struct Databases {
     pub names: Vec<String>,
     /// The one this connection is in. MySQL can be in none.
     pub current: Option<String>,
+}
+
+impl Databases {
+    /// Stable, so each half keeps the order the server listed it in.
+    fn system_last(&mut self, engine: Engine) {
+        self.names
+            .sort_by_key(|name| engine.is_system_database(name));
+    }
 }
 
 pub type Sizes = std::collections::HashMap<String, std::collections::HashMap<String, Statistics>>;
@@ -3218,6 +3346,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_databases_are_listed_after_the_users_own_in_server_order() {
+        let listed = |engine, names: &[&str]| {
+            let mut databases = Databases {
+                names: names.iter().map(|name| (*name).to_string()).collect(),
+                current: None,
+            };
+            databases.system_last(engine);
+            databases.names
+        };
+        assert_eq!(
+            listed(
+                Engine::MySql,
+                &["app", "information_schema", "mysql", "orders", "sys"]
+            ),
+            ["app", "orders", "information_schema", "mysql", "sys"]
+        );
+        assert_eq!(
+            listed(
+                Engine::SqlServer,
+                &["master", "model", "msdb", "sales", "tempdb"]
+            ),
+            ["sales", "master", "model", "msdb", "tempdb"]
+        );
+        assert_eq!(
+            listed(Engine::MongoDb, &["admin", "config", "local", "shop"]),
+            ["shop", "admin", "config", "local"]
+        );
+        // `postgres` is a database people work in.
+        assert_eq!(
+            listed(Engine::Postgres, &["app", "postgres", "zeta"]),
+            ["app", "postgres", "zeta"]
+        );
+        assert_eq!(
+            listed(
+                Engine::Snowflake,
+                &["ANALYTICS", "SNOWFLAKE", "SNOWFLAKE_SAMPLE_DATA"]
+            ),
+            ["ANALYTICS", "SNOWFLAKE_SAMPLE_DATA", "SNOWFLAKE"]
+        );
+        assert!(Engine::MariaDb.is_system_database("performance_schema"));
+        assert!(!Engine::Postgres.is_system_database("mysql"));
+        assert!(!Engine::Redis.is_system_database("db0"));
+    }
+
+    #[test]
     fn every_engine_answers_the_import_questions() {
         use Engine::*;
         for (engine, yes, skips, begin, new_fields) in [
@@ -3906,6 +4079,26 @@ mod tests {
             ConnectionConfig::Snowflake(account).endpoint(),
             "myorg.privatelink.example"
         );
+    }
+
+    #[test]
+    fn a_snowflake_profile_picks_its_schema_and_drops_it_with_the_database() {
+        let mut config = ConnectionConfig::Snowflake(SnowflakeConfig {
+            database: "analytics".into(),
+            ..Default::default()
+        });
+        assert_eq!(config.database_name().as_deref(), Some("ANALYTICS"));
+        assert_eq!(config.schema(), None);
+
+        config.set_schema(Some("Staging".into()));
+        assert_eq!(config.schema(), Some("Staging"));
+        config.set_database("ANALYTICS".into());
+        assert_eq!(config.schema(), Some("Staging"), "the same database");
+
+        config.set_database("lower".into());
+        assert_eq!(config.database(), Some(r#""lower""#));
+        assert_eq!(config.database_name().as_deref(), Some("lower"));
+        assert_eq!(config.schema(), None);
     }
 
     #[test]

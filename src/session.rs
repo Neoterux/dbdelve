@@ -86,6 +86,21 @@ impl Profile {
         }
     }
 
+    /// The schema unqualified names resolve in first, where the engine has
+    /// one to pick: until one is picked, the one the server put the session
+    /// in. None where nothing is picked and the server named none, or wasn't
+    /// asked, rather than a guess at its default.
+    pub(crate) fn active_schema(&self) -> Option<&str> {
+        if !self.config.engine().picks_schema() {
+            return None;
+        }
+        let current = match &self.state {
+            ProfileState::Connected(connection) => connection.current_schema(),
+            _ => None,
+        };
+        self.config.schema().or(current)
+    }
+
     pub(crate) fn connection(&self) -> Option<Connection> {
         match &self.state {
             ProfileState::Connected(connection) => Some((**connection).clone()),
@@ -157,6 +172,7 @@ impl Profile {
             srv: mongo.map(|mongo| mongo.srv),
             options: mongo.map(|mongo| mongo.options.clone()),
             login_database: mongo.and_then(|mongo| mongo.login_database.clone()),
+            schema: self.config.schema().map(str::to_string),
             // App-wide now, in `[settings]`. Kept on the stored shape and left
             // unwritten so the value an older build put here is still there for
             // the migration to read on the next upgrade.

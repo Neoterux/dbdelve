@@ -421,6 +421,7 @@ impl ConnectionForm {
             warehouse: optional(&self.warehouse),
             role: optional(&self.role),
             statement_timeout: self.statement_timeout(cx)?,
+            schema: None,
         })
     }
 
@@ -474,7 +475,22 @@ impl ConnectionForm {
                     read(&self.ssh_identity_file),
                 ],
             )?,
+            schema: None,
         })
+    }
+}
+
+/// The active schema `current` holds, picked in the titlebar rather than the
+/// form, onto `config`, only while it is on the same engine and database:
+/// schemas belong to one database. Read from the profile at save time, so one
+/// picked while the form was open stays. The database is compared as the
+/// engine spells it, so `analytics` is still Snowflake's `ANALYTICS`.
+pub(crate) fn keep_schema(config: &mut ConnectionConfig, current: &ConnectionConfig) {
+    if let Some(schema) = current.schema()
+        && config.engine() == current.engine()
+        && config.database_name() == current.database_name()
+    {
+        config.set_schema(Some(schema.to_string()));
     }
 }
 
@@ -617,6 +633,39 @@ mod tests {
     }
 
     #[test]
+    fn the_active_schema_stays_only_on_the_engine_and_database_it_was_picked_on() {
+        let postgres = |database: &str| {
+            ConnectionConfig::Postgres(ServerConfig {
+                database: database.into(),
+                ..ServerConfig::default()
+            })
+        };
+        let snowflake = |database: &str| {
+            ConnectionConfig::Snowflake(SnowflakeConfig {
+                database: database.into(),
+                ..SnowflakeConfig::default()
+            })
+        };
+        let kept = |picked_on: &ConnectionConfig, mut saved: ConnectionConfig| {
+            let mut current = picked_on.clone();
+            current.set_schema(Some("sales".into()));
+            keep_schema(&mut saved, &current);
+            saved.schema().map(str::to_string)
+        };
+        let sales = Some("sales".to_string());
+        assert_eq!(kept(&postgres("app"), postgres("app")), sales);
+        assert_eq!(kept(&postgres("app"), postgres("other")), None);
+        // Blank is the `postgres` it connects to.
+        assert_eq!(kept(&postgres(""), postgres("postgres")), sales);
+        assert_eq!(kept(&postgres("app"), snowflake("app")), None);
+        assert_eq!(kept(&snowflake("ANALYTICS"), snowflake("analytics")), sales);
+        assert_eq!(
+            kept(&snowflake("ANALYTICS"), snowflake(r#""analytics""#)),
+            None
+        );
+    }
+
+    #[test]
     fn the_ssh_fields_are_a_tunnel_only_while_it_is_on() {
         assert_eq!(ssh_tunnel(false, fields("bastion", "nope")), Ok(None));
         assert_eq!(
@@ -700,6 +749,7 @@ mod tests {
             root_certificate: None,
             statement_timeout: 0,
             ssh: None,
+            schema: None,
         };
         let typed = ConnectionConfig::Postgres(server("hunter2"));
         assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));

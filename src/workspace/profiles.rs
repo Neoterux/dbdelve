@@ -6,7 +6,7 @@
 use super::*;
 use gpui_component::menu::PopupMenuItem;
 
-use crate::connection_form::{ConnectionTest, duplicate_profile_name};
+use crate::connection_form::{ConnectionTest, duplicate_profile_name, keep_schema};
 use crate::import::{self, Source};
 use crate::session::STALE_ROWS;
 use crate::sql::{Destructive, Mode};
@@ -118,6 +118,7 @@ impl Workspace {
                     root_certificate: stored.root_certificate,
                     statement_timeout: stored.statement_timeout.unwrap_or_default(),
                     ssh: stored.ssh,
+                    schema: stored.schema,
                 };
                 match engine {
                     Engine::MySql => ConnectionConfig::MySql(server),
@@ -143,6 +144,7 @@ impl Workspace {
                 warehouse: stored.warehouse,
                 role: stored.role,
                 statement_timeout: stored.statement_timeout.unwrap_or_default(),
+                schema: stored.schema,
             }),
         };
         let stored_queries = stored_buffers(
@@ -710,7 +712,7 @@ impl Workspace {
             .then(|| form.project_name.read(cx).value().to_string());
         let project =
             projects::chosen_project(typed.as_deref(), form.project.as_deref(), &self.projects);
-        let ((name, config), project) = match form
+        let ((name, mut config), project) = match form
             .config(cx)
             .and_then(|profile| project.map(|project| (profile, project)))
         {
@@ -723,6 +725,11 @@ impl Workspace {
                 return;
             }
         };
+        if let Some(editing) = editing.as_deref()
+            && let Some(profile) = self.profiles.iter().find(|profile| profile.id == editing)
+        {
+            keep_schema(&mut config, &profile.config);
+        }
 
         if let Some(running) = editing.as_deref().and_then(|id| {
             self.profiles
@@ -944,7 +951,7 @@ impl Workspace {
         let (id, generation) = (profile.id.clone(), profile.generation);
         let fetch = cx
             .background_executor()
-            .spawn(async move { connection.databases() });
+            .spawn(async move { connection.databases(engine) });
         cx.spawn_in(window, async move |workspace, cx| {
             let result = fetch.await;
             _ = workspace.update_in(cx, |workspace, window, cx| {
@@ -1004,22 +1011,14 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let Some(server) = profile.config.server() else {
+        let Some(configured) = profile.config.database() else {
             return;
         };
         // As the profile would store it: Redis lists `db3` and stores `3`.
         let mut asked = profile.config.clone();
         asked.set_database(name.clone());
-        let unmoved = asked
-            .server()
-            .is_some_and(|asked| asked.database == server.database);
-        if unmoved
-            || already_on(
-                &server.database,
-                profile.databases.current.as_deref(),
-                &name,
-            )
-        {
+        let unmoved = asked.database() == Some(configured);
+        if unmoved || already_on(configured, profile.databases.current.as_deref(), &name) {
             return;
         }
         let session = &profile.session;
@@ -1101,6 +1100,104 @@ impl Workspace {
         profile.config.set_database(name);
         self.remember_profiles(cx);
         self.reconnect(index, cx);
+    }
+
+    /// Offer the schemas the catalog already holds, to pick the active one.
+    pub(crate) fn select_schema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        if !profile.config.engine().picks_schema() {
+            return;
+        }
+        let unready = match (&profile.state, &profile.catalog) {
+            (ProfileState::Connected(_), CatalogState::Loaded(..)) => None,
+            (ProfileState::Connected(_), CatalogState::Loading) => {
+                Some("The schemas are still loading.")
+            }
+            (ProfileState::Connected(_), CatalogState::Failed(_)) => {
+                Some("The catalog did not load, so there are no schemas to pick from.")
+            }
+            _ => Some("The connection is not open."),
+        };
+        match unready {
+            Some(message) => self.note(message.into(), cx),
+            None => self.open_palette(PaletteMode::Schema, window, cx),
+        }
+    }
+
+    /// Make `name` the profile's active schema, on the sessions it has open
+    /// and the ones it opens later, without a reconnect: tabs, results and
+    /// staged edits all stay. A statement running holds the session, so the
+    /// `SET` waits for it rather than cancelling it.
+    pub(crate) fn set_schema(&mut self, name: String, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        // Not `active_schema`: picking the one shown while none is stored
+        // still pins it, whatever the role's own `search_path` says.
+        if profile.config.schema() == Some(name.as_str()) {
+            return;
+        }
+        // A connect in flight was handed the config before this, and the
+        // reconnect that would hand it the new one can be refused.
+        if matches!(profile.state, ProfileState::Connecting) {
+            self.note(
+                "The connection is still opening, so the schema was not switched.".into(),
+                cx,
+            );
+            return;
+        }
+        // A `SET` inside the user's transaction is undone by their ROLLBACK,
+        // which would leave the titlebar naming a schema the session left.
+        // Snowflake's rides on each request instead, out of a ROLLBACK's reach.
+        // The session checks again once a statement still running lets go.
+        if profile.in_transaction && profile.config.engine() == Engine::Postgres {
+            self.note(
+                "A transaction is open on this connection, so the schema was not switched.".into(),
+                cx,
+            );
+            return;
+        }
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let previous = profile.config.schema().map(str::to_string);
+        profile.config.set_schema(Some(name.clone()));
+        let (id, generation) = (profile.id.clone(), profile.generation);
+        let connection = profile.connection();
+        self.remember_profiles(cx);
+        cx.notify();
+        let Some(connection) = connection else {
+            return;
+        };
+        // Recorded here, in the order the switches were made, so that
+        // whichever thread applies last applies the latest.
+        connection.set_schema(Some(&name));
+        let applying = connection.clone();
+        let set = on_own_thread(move || applying.apply_schema());
+        cx.spawn(async move |workspace, cx| {
+            let Err(error) = set.await else {
+                return;
+            };
+            _ = workspace.update(cx, |workspace, cx| {
+                let Some(profile) = workspace.issued_to(&id, generation) else {
+                    return;
+                };
+                // A later switch already holds the config, and is its own to
+                // report.
+                if profile.config.schema() == Some(name.as_str()) {
+                    profile.config.set_schema(previous.clone());
+                    connection.set_schema(previous.as_deref());
+                }
+                profile.session.notice = Some(error.message);
+                workspace.remember_profiles(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn open_connection_form(

@@ -459,6 +459,7 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
         // A URL has nowhere to say it; the form is where it is set.
         statement_timeout: 0,
         ssh: None,
+        schema: None,
     })
 }
 
@@ -510,6 +511,45 @@ fn connection_string(server: &ServerConfig) -> String {
         ));
     }
     parts.join(" ")
+}
+
+/// `schema` ahead of the session's default `search_path`, as the role,
+/// database or server set it, so `"$user"` and extension schemas stay on it.
+/// `reset_val` is that default however many switches came before. Sets nothing
+/// inside a transaction block, where the block's first statement has already
+/// moved `statement_timestamp` past its start: a ROLLBACK would undo the set.
+fn set_search_path_sql(schema: &str) -> String {
+    // An `E''` literal reads the same whatever `standard_conforming_strings` is.
+    let first = Engine::Postgres
+        .quote_identifier(schema)
+        .replace('\\', r"\\")
+        .replace('\'', "''");
+    format!(
+        "SELECT pg_catalog.set_config('search_path', \
+         pg_catalog.concat_ws(', ', E'{first}', NULLIF(reset_val, '')), false) \
+         FROM pg_catalog.pg_settings WHERE name = 'search_path' \
+         AND pg_catalog.transaction_timestamp() = pg_catalog.statement_timestamp()"
+    )
+}
+
+/// A `SET` after connecting rather than a startup option: PgBouncer and other
+/// poolers refuse a connection that sends `options` at all.
+fn set_search_path(client: &mut Client, schema: &str) -> Result<(), DbError> {
+    let set = set_search_path_sql(schema);
+    let Client { client, driver } = client;
+    let messages = driver
+        .block_on(client.simple_query(&set))
+        .and_then(|done| done)
+        .map_err(|error| query_error(&error, &set))?;
+    match messages
+        .iter()
+        .any(|message| matches!(message, SimpleQueryMessage::Row(_)))
+    {
+        true => Ok(()),
+        false => Err(plain_error(
+            "A transaction is open on this connection, so the schema was not switched.".into(),
+        )),
+    }
 }
 
 /// The server's own name, which TLS verifies, dialled at the tunnel's address
@@ -601,6 +641,9 @@ pub struct Connection {
     /// The server process behind the client, for asking after the statement
     /// it is running from another connection. `None` if it would not say.
     pid: Option<i32>,
+    /// The schema the server's own `search_path` put the session in, read
+    /// before a picked one is set. None if it would not say, or names none.
+    current_schema: Option<String>,
     /// A second session to the same server, for what has to be asked while
     /// this one is busy with a statement's rows: its column types, and
     /// whether it can be stopped at the row limit. Opened the first time it
@@ -613,8 +656,9 @@ pub struct Connection {
     /// What [`Self::sizes`] opens its own connection with. Kept for the reason
     /// MySQL keeps its copy: the password is already held by the live client,
     /// and nothing above `src/db/` may learn which engines want a second one
-    /// (AGENTS.md, hard rule 4).
-    server: ServerConfig,
+    /// (AGENTS.md, hard rule 4). Shared between clones, so a schema set on one
+    /// reaches the sessions any of them opens later.
+    server: Arc<Mutex<ServerConfig>>,
 }
 
 impl Connection {
@@ -662,31 +706,84 @@ impl Connection {
                 connection: connection.fuse(),
             },
         };
-        let pid = client
-            .driver
-            .block_on(
-                client
-                    .client
-                    .simple_query("SELECT pg_catalog.pg_backend_pid()"),
-            )
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|messages| {
-                messages.into_iter().find_map(|message| match message {
-                    SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
-                    _ => None,
-                })
-            });
+        let row =
+            client
+                .driver
+                .block_on(client.client.simple_query(
+                    "SELECT pg_catalog.pg_backend_pid(), pg_catalog.current_schema()",
+                ))
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|messages| {
+                    messages.into_iter().find_map(|message| match message {
+                        SimpleQueryMessage::Row(row) => Some(row),
+                        _ => None,
+                    })
+                });
+        let pid = row.as_ref().and_then(|row| row.get(0)?.parse().ok());
+        let current_schema = row.and_then(|row| row.get(1).map(str::to_string));
+        if let Some(schema) = &server.schema {
+            set_search_path(&mut client, schema)?;
+        }
 
         Ok(Self {
             cancel: client.client.cancel_token(),
             pid,
+            current_schema,
             side: Arc::default(),
             connector,
             client: Arc::new(Mutex::new(client)),
             tunnel,
-            server: server.clone(),
+            server: Arc::new(Mutex::new(server.clone())),
         })
+    }
+
+    fn server(&self) -> ServerConfig {
+        self.server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// For every session opened from here on; [`Self::apply_schema`] moves
+    /// the two already open.
+    pub fn set_schema(&self, schema: Option<&str>) {
+        self.server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .schema = schema.map(str::to_string);
+    }
+
+    pub fn current_schema(&self) -> Option<&str> {
+        self.current_schema.as_deref()
+    }
+
+    /// `SET` on this session, then on the side session, which is never in a
+    /// transaction of the user's. This one waits for a statement running on
+    /// it to finish, and a `SET` inside a transaction the user then rolls back
+    /// is undone with it, as one they typed would be.
+    pub fn apply_schema(&self) -> Result<(), DbError> {
+        let mut client = self.client.lock().map_err(|_| DbError {
+            message: "The connection is unavailable after an earlier internal failure.".into(),
+            position: None,
+        })?;
+        // Read only once the session is held: two switches whose threads take
+        // it out of order both apply the later one, not each their own.
+        let Some(schema) = self.server().schema else {
+            return Ok(());
+        };
+        set_search_path(&mut client, &schema)?;
+        if let Ok(mut side) = self.side.lock()
+            && side.as_ref().is_some_and(|side| {
+                side.client.lock().map_or(true, |mut side| {
+                    set_search_path(&mut side, &schema).is_err()
+                })
+            })
+        {
+            // Reopened from the recorded schema the next time it is needed.
+            *side = None;
+        }
+        Ok(())
     }
 
     /// A second session, for a statement to run on beside this one's; see
@@ -695,7 +792,8 @@ impl Connection {
     pub fn alongside(&self) -> Result<Self, DbError> {
         Ok(Self {
             side: self.side.clone(),
-            ..Self::connect(&self.server, self.tunnel.clone())?
+            server: self.server.clone(),
+            ..Self::connect(&self.server(), self.tunnel.clone())?
         })
     }
 
@@ -867,7 +965,7 @@ impl Connection {
         if side.as_ref().is_none_or(Connection::is_lost) {
             let server = ServerConfig {
                 statement_timeout: SIDE_TIMEOUT_SECONDS,
-                ..self.server.clone()
+                ..self.server()
             };
             *side = Self::connect(&server, self.tunnel.clone()).ok();
         }
@@ -970,7 +1068,7 @@ impl Connection {
     /// waiting on a relation's lock never holds the mutex a user's query waits
     /// on. The side connection is dropped on return.
     pub fn sizes(&self) -> Result<Sizes, DbError> {
-        let side = Self::connect(&self.server, self.tunnel.clone())?;
+        let side = Self::connect(&self.server(), self.tunnel.clone())?;
         assemble_sizes(side.internal_query(SIZES_SQL)?)
     }
 
@@ -1615,6 +1713,7 @@ mod tests {
             root_certificate: None,
             statement_timeout: 0,
             ssh: None,
+            schema: None,
         }
     }
 
@@ -1634,6 +1733,7 @@ mod tests {
             root_certificate: None,
             statement_timeout: 0,
             ssh: None,
+            schema: None,
         }
     }
 
@@ -1711,6 +1811,131 @@ mod tests {
             connection_string(&config).contains("options='-c statement_timeout=30000'"),
             "{}",
             connection_string(&config)
+        );
+    }
+
+    #[test]
+    fn an_active_schema_is_never_a_startup_option_a_pooler_would_refuse() {
+        let schema = Some("Sales".to_string());
+        let string = connection_string(&ServerConfig {
+            schema: schema.clone(),
+            ..config()
+        });
+        assert!(!string.contains("options="), "{string}");
+        let string = connection_string(&ServerConfig {
+            schema,
+            statement_timeout: 30,
+            ..config()
+        });
+        assert!(
+            string.contains(&format!("options={}", quote("-c statement_timeout=30000"))),
+            "{string}"
+        );
+    }
+
+    #[test]
+    fn the_active_schema_is_quoted_then_escaped_into_the_literal() {
+        assert!(set_search_path_sql("Sales").contains(r#"E'"Sales"'"#));
+        assert!(
+            set_search_path_sql(r#"it's "odd" \here"#).contains(r#"E'"it''s ""odd"" \\here"'"#)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_an_active_schema_leads_every_session_and_moves_the_open_ones() {
+        let shown = |connection: &Connection| {
+            connection
+                .internal_query("SHOW search_path")
+                .expect("search_path should show")
+                .rows[0]
+                .get(0)
+                .map(|path| path.replace(", ", ","))
+        };
+        let connection = Connection::open(&ServerConfig {
+            schema: Some(r#"odd "schema" \here"#.into()),
+            ..live_config()
+        })
+        .expect("connection should open");
+        assert_eq!(
+            shown(&connection).as_deref(),
+            Some(r#""odd ""schema"" \here","$user",public"#)
+        );
+
+        // Recorded out of the order they apply in: the last recorded wins.
+        connection.set_schema(Some("first"));
+        connection.set_schema(Some("Other"));
+        connection.apply_schema().expect("the schema should set");
+        connection.apply_schema().expect("the schema should set");
+        assert_eq!(
+            shown(&connection).as_deref(),
+            Some(r#""Other","$user",public"#)
+        );
+        let fresh = connection
+            .alongside()
+            .expect("a second session should open");
+        assert_eq!(shown(&fresh).as_deref(), Some(r#""Other","$user",public"#));
+        connection.set_schema(Some("Third"));
+        let later = fresh.alongside().expect("a third session should open");
+        assert_eq!(shown(&later).as_deref(), Some(r#""Third","$user",public"#));
+
+        connection
+            .query("BEGIN", Fetch::default())
+            .expect("the transaction should open");
+        assert!(connection.apply_schema().is_err());
+        connection
+            .query("ROLLBACK", Fetch::default())
+            .expect("the transaction should close");
+        assert_eq!(
+            shown(&connection).as_deref(),
+            Some(r#""Other","$user",public"#)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_an_active_schema_keeps_the_roles_own_search_path_after_it() {
+        let admin = Connection::open(&live_config()).expect("connection should open");
+        let role = format!("dbdelve_schema_tail_{}", std::process::id());
+        let run = |sql: &str| {
+            admin
+                .query(sql, Fetch::default())
+                .unwrap_or_else(|error| panic!("{sql}: {}", error.message));
+        };
+        run(&format!("DROP ROLE IF EXISTS {role}"));
+        run(&format!("CREATE ROLE {role} LOGIN PASSWORD 'tail'"));
+        run(&format!(
+            r#"ALTER ROLE {role} SET search_path = "$user", public, extra"#
+        ));
+        let opened = Connection::open(&ServerConfig {
+            user: role.clone(),
+            password: "tail".into(),
+            schema: Some("sales".into()),
+            ..live_config()
+        });
+        let shown = opened.map(|connection| {
+            connection.set_schema(Some("Other"));
+            let first = connection
+                .internal_query("SHOW search_path")
+                .expect("search_path should show")
+                .rows[0]
+                .get(0)
+                .map(str::to_string);
+            connection.apply_schema().expect("the schema should set");
+            let second = connection
+                .internal_query("SHOW search_path")
+                .expect("search_path should show")
+                .rows[0]
+                .get(0)
+                .map(str::to_string);
+            (first, second)
+        });
+        run(&format!("DROP ROLE {role}"));
+        let (first, second) = shown.expect("the role should connect");
+        assert_eq!(first.as_deref(), Some(r#""sales", "$user", public, extra"#));
+        assert_eq!(
+            second.as_deref(),
+            Some(r#""Other", "$user", public, extra"#)
         );
     }
 
@@ -1812,6 +2037,7 @@ mod tests {
                 root_certificate: None,
                 statement_timeout: 0,
                 ssh: None,
+                schema: None,
             }
         );
     }
