@@ -11,9 +11,13 @@ introduce limits.
 
 ![DBDelve in Gruvbox Light Glass: a join in the editor and its result grid below](assets/screenshots/query-light.png)
 
-DBDelve in action with 1M rows loaded.
+Scrolling a million rows:
 
-https://github.com/user-attachments/assets/ee555c10-4a18-4059-b451-bfadfc9f9ae0
+https://github.com/user-attachments/assets/6e15d566-a110-46c6-a236-52af7d877d4c
+
+Launching, with the last results already there:
+
+https://github.com/user-attachments/assets/9e55da56-8577-43e0-812a-c77eb5d0e701
 
 ## Why
 
