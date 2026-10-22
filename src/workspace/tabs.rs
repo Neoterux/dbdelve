@@ -17,9 +17,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.sidebar_hidden = !self.sidebar_hidden;
-        // A folded sidebar takes the open switcher panel with it: the panel is
-        // anchored to a row that is no longer on screen.
-        self.switcher_open = false;
         cx.notify();
     }
 
@@ -125,20 +122,21 @@ impl Workspace {
             .is_some_and(|(folded, editing, _)| *editing && !*folded);
         let target = editing
             .then(|| {
-                let results = self.profile()?.session.active_results()?.clone();
+                let profile = self.profile()?;
+                let results = profile.session.active_results()?.clone();
                 let row = results.read(cx).delegate().selected_row()?;
-                Some((results, row))
+                Some((results, row, profile.id.clone(), profile.session.active))
             })
             .flatten();
         if self.row_panel.inputs.as_ref().is_some_and(|inputs| {
             !target
                 .as_ref()
-                .is_some_and(|(results, row)| inputs.name(results, *row, cx))
+                .is_some_and(|(results, row, ..)| inputs.name(results, *row, cx))
         }) {
             self.drop_row_inputs(window, cx);
         }
         self.row_panel.typing = None;
-        let Some((results, row)) = target else {
+        let Some((results, row, profile, tab)) = target else {
             return;
         };
         let rows = results.read(cx).delegate().rows_id();
@@ -147,6 +145,8 @@ impl Workspace {
             .inputs
             .get_or_insert_with(|| views::RowInputs {
                 grid: results.clone(),
+                profile,
+                tab,
                 row,
                 rows,
                 fields: Vec::new(),
@@ -523,9 +523,10 @@ impl Workspace {
     }
 
     /// A step is a step from what the field says, not from whatever was last
-    /// committed: the step buttons do not take focus, so typing 79 and
-    /// pressing + never blurs the field, and stepping the committed 72 would
-    /// land on 77 and drop the 79 on the way.
+    /// committed. The click on + does blur the field, but a blur is reported
+    /// only once the next frame is drawn and the click can arrive first:
+    /// stepping the committed 72 would then land on 77 and drop the 79 typed
+    /// on the way.
     pub(crate) fn step_opacity(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_opacity_input(window, cx);
         let theme = theme::theme(cx);
@@ -569,17 +570,14 @@ impl Workspace {
             return;
         }
         // Whatever is in front, in the order it is stacked: the palette paints
-        // over the settings modal, which paints over the stale-edit prompt,
-        // the stopped-run prompt and the run prompt, which paint over the
-        // discard-close confirmation, which paints over the close
-        // confirmation, which paints over the new-row form, which paints over
-        // the apply review, which paints over the surface -- so `escape`
-        // backs out of them in that order, one at a time. The palette stays
-        // first so that picking a font from inside settings closes the font
-        // list and leaves the modal it was opened from standing.
-        if self.close_settings(window, cx) {
-            return;
-        }
+        // over the stale-edit prompt, the stopped-run prompt and the run
+        // prompt, which paint over the discard-close confirmation, which
+        // paints over the close confirmation, which paints over the import
+        // dialog, which paints over the apply review, which paints over the
+        // surface and the settings panel beside it -- so `escape` backs out
+        // of them in that order, one at a time. The palette stays first so
+        // that picking a font from inside settings closes the font list and
+        // leaves the panel it was opened from standing.
         if self.cancel_stale_edit(cx) {
             return;
         }
@@ -600,25 +598,33 @@ impl Workspace {
         if self.cancel_close_tab(cx) {
             return;
         }
-        // The import dialog paints over the new row form and the apply review.
         if self.close_import(cx) {
-            return;
-        }
-        // Before the apply review, though confirming a row clears the form in
-        // the same step that opens the review, so the two are never both open
-        // on one tab. `close_new_row` is scoped to the active tab's own form,
-        // so one left open elsewhere falls through to the steps below instead
-        // of eating this keystroke.
-        if self.close_new_row(cx) {
             return;
         }
         if self.close_apply_review(cx) {
             return;
         }
-        // Below the modals and prompts, which paint over the switcher.
-        if self.switcher_open {
-            self.switcher_open = false;
-            cx.notify();
+        // Only from inside the panel: it sits beside the workspace rather than
+        // over it, and an `escape` in the editor is for the editor's
+        // completions, or for the new-row form beside the grid. The search is
+        // emptied before the panel closes.
+        if self.settings_open && self.settings_focus.contains_focused(window, cx) {
+            // The default row limit's Custom… field is put away alone, as a
+            // click elsewhere would.
+            if matches!(self.custom_limit, Some((LimitTarget::Default, _))) {
+                self.custom_limit = None;
+                self.settings_focus.focus(window, cx);
+                cx.notify();
+            } else if !self.clear_settings_search(window, cx) {
+                self.close_settings(window, cx);
+            }
+            return;
+        }
+        // Confirming a row clears the form in the same step that opens the
+        // review, so the two are never both open on one tab. `close_new_row`
+        // is scoped to the active tab's own form, so one left open elsewhere
+        // falls through to the steps below instead of eating this keystroke.
+        if self.close_new_row(cx) {
             return;
         }
         let Some(profile) = self.profile_mut() else {

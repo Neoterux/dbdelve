@@ -62,6 +62,12 @@ pub mod layout {
     pub const RADIUS_CONTROL: f32 = 6.0;
     pub const RADIUS_PANEL: f32 = 10.0;
     pub const RADIUS_LARGE: f32 = 16.0;
+    /// The floating cards that hold a surface of their own: the palette and
+    /// the settings panel.
+    pub const RADIUS_CARD: f32 = 14.0;
+    pub const RADIUS_KEYCAP: f32 = 5.0;
+    /// The cards a settings group's rows sit on, inside the settings panel.
+    pub const RADIUS_SETTINGS_CARD: f32 = 12.0;
 
     /// The three heights a button is drawn at. Standard is for the dialogs and
     /// the connection form, where it sits beside a field and is the thing the
@@ -109,7 +115,6 @@ pub mod layout {
     pub const INSPECTOR_MIN_WIDTH: f32 = 200.0;
     pub const INSPECTOR_MAX_WIDTH: f32 = 900.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
-    pub const SWITCHER_WIDTH: f32 = 320.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;
     pub const DIALOG_WIDTH: f32 = 420.0;
@@ -119,10 +124,50 @@ pub mod layout {
     /// Import Rows lays its options, mapping and preview side by side.
     pub const IMPORT_DIALOG_WIDTH: f32 = 960.0;
     pub const IMPORT_DIALOG_HEIGHT: f32 = 640.0;
-    /// The palette. Wide enough for a schema-qualified name and its kind, and
-    /// capped so a catalog of thousands scrolls rather than filling the window.
-    pub const PALETTE_WIDTH: f32 = 520.0;
-    pub const PALETTE_MAX_HEIGHT: f32 = 360.0;
+    /// The palette. Wide enough for a schema-qualified name, its kind and a
+    /// chord, and its list capped so a catalog of thousands scrolls rather than
+    /// filling the window.
+    pub const PALETTE_WIDTH: f32 = 640.0;
+    pub const PALETTE_MAX_HEIGHT: f32 = 400.0;
+    pub const PALETTE_MIN_HEIGHT: f32 = 120.0;
+    /// What the card holds besides its list -- the field, the scopes and the
+    /// footer -- kept clear of the window's bottom edge when the list is cut.
+    pub const PALETTE_CHROME_HEIGHT: f32 = 180.0;
+    pub const PALETTE_INPUT_HEIGHT: f32 = 52.0;
+    pub const PALETTE_ROW_HEIGHT: f32 = 40.0;
+    pub const PALETTE_HEADER_HEIGHT: f32 = 28.0;
+    pub const PALETTE_TILE_SIZE: f32 = 26.0;
+    pub const PALETTE_ACCENT_BAR_WIDTH: f32 = 3.0;
+    pub const PALETTE_ACCENT_BAR_HEIGHT: f32 = 16.0;
+    /// The settings panel, docked at the window's right edge. Not scaled with
+    /// the chrome: a row too narrow for its control puts it under the text.
+    pub const SETTINGS_PANEL_WIDTH: f32 = 440.0;
+    /// The most of a narrow window's width the panel takes, so the window's
+    /// own edge never cuts it off.
+    pub const SETTINGS_PANEL_MAX_SHARE: f32 = 0.6;
+    pub const SETTINGS_HEADER_HEIGHT: f32 = 52.0;
+    pub const SETTINGS_TAB_SIZE: f32 = 32.0;
+    pub const SETTINGS_TAB_UNDERLINE_WIDTH: f32 = 16.0;
+    pub const SETTINGS_TAB_UNDERLINE_HEIGHT: f32 = 2.0;
+    pub const SETTINGS_ROW_HEIGHT: f32 = 56.0;
+    /// Between a settings row's title and the description under it.
+    pub const SETTINGS_DESCRIPTION_GAP: f32 = 2.0;
+    /// A row with no description under its title: the keyboard's, sixty of
+    /// them, which at the full height would be a list to scroll for ever.
+    pub const SETTINGS_ROW_COMPACT_HEIGHT: f32 = 44.0;
+    /// How narrow a row's title and description get before its control
+    /// wraps under them.
+    pub const SETTINGS_TEXT_MIN_WIDTH: f32 = 200.0;
+    pub const SWITCH_WIDTH: f32 = 32.0;
+    pub const SWITCH_HEIGHT: f32 = 18.0;
+    pub const SWITCH_THUMB_SIZE: f32 = 14.0;
+    pub const KEYCAP_HEIGHT: f32 = 20.0;
+    pub const KEYCAP_GAP: f32 = 2.0;
+    /// How far the window behind a modal surface is blurred.
+    pub const SCRIM_BLUR: f32 = 6.0;
+    /// The accent as a tint behind a selected pill, and as its edge.
+    pub const ACCENT_WASH: f32 = 0.14;
+    pub const ACCENT_EDGE: f32 = 0.45;
     /// An anchored menu, capped so a wide relation's column list scrolls rather
     /// than running off the window.
     pub const MENU_MAX_HEIGHT: f32 = 320.0;
@@ -377,6 +422,10 @@ const POPUP_MUTED_CONTRAST: f32 = 3.0;
 /// Muted and faint text on a glass card, as shares of the body text: Zeron's.
 const POPUP_MUTED_INK: f32 = 0.64;
 const POPUP_FAINT_INK: f32 = 0.48;
+/// How dark the window goes behind a modal surface. Lighter on a light theme,
+/// where the same black reads as a stain rather than a dim: Zeron's.
+const SCRIM_DARK: f32 = 0.35;
+const SCRIM_LIGHT: f32 = 0.19;
 
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
@@ -588,8 +637,8 @@ pub struct Theme {
     pub panel: Srgb,
     /// Chrome, furthest back: sidebar, titlebar, status bar, table headers.
     pub surface: Srgb,
-    /// The floating plane: the connection switcher and anything else that sits
-    /// over chrome. One step past `surface` in dark themes; in light themes it
+    /// The floating plane: the palette and anything else that sits over
+    /// chrome. One step past `surface` in dark themes; in light themes it
     /// stays white and earns its elevation from a border and shadow instead,
     /// because "lighter than white" does not exist.
     pub overlay: Srgb,
@@ -720,18 +769,32 @@ impl Theme {
         self.bg.alpha(self.tint(DATA_ALPHA))
     }
 
-    /// What an engine's logo is drawn on outside the titlebar: the panes, and
-    /// the palette and switcher cards. On glass a card is frosted over
-    /// [`Theme::popup_backdrop`], the worst its contents are shown over.
-    pub fn logo_planes(self) -> [Srgb; 3] {
+    /// The dim laid over the window behind a modal surface.
+    pub fn scrim(self) -> Rgba {
+        BLACK.alpha(match self.appearance {
+            Appearance::Dark => SCRIM_DARK,
+            Appearance::Light => SCRIM_LIGHT,
+        })
+    }
+
+    /// What an engine's logo is drawn on outside the titlebar: the panes, the
+    /// palette's card, and the tile a palette row holds its icon in, which is
+    /// the hover wash over the card, or over the selected row's. On glass the
+    /// card is frosted over [`Theme::popup_backdrop`], the worst its contents
+    /// are shown over.
+    pub fn logo_planes(self) -> [Srgb; 5] {
+        let card = self.overlay_glass().flatten(self.popup_backdrop());
+        let selected = self.element_active.flatten(card);
         [
             self.bg,
             self.panel,
-            self.overlay_glass().flatten(self.popup_backdrop()),
+            card,
+            self.element_hover.flatten(card),
+            self.element_hover.flatten(selected),
         ]
     }
 
-    /// Every floating card — a modal, the palette, the switcher, and each
+    /// Every floating card — a modal, the palette, and each
     /// menu, select, tooltip and completion list gpui-component draws. On glass
     /// it is a tint over a backdrop blur of the window beneath it, and that is
     /// all it covers: the blur only sees what the window drew, and the desktop
@@ -2341,7 +2404,7 @@ mod tests {
 
     #[test]
     fn a_floating_card_is_the_same_card_whichever_theme_asks_for_it() {
-        // The switcher and the reference popup ask on the theme `for_popup`
+        // The palette and the reference popup ask on the theme `for_popup`
         // returns, gpui-component's popups on the installed one, and they sit
         // side by side.
         for t in Theme::all() {

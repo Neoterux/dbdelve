@@ -244,6 +244,9 @@ pub(crate) struct Session {
     pub(crate) explorer_filter: Entity<InputState>,
     pub(crate) explorer_tree: Entity<TreeState>,
     pub(crate) explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,
+    /// The matched characters of each row's name, by tree item id, as
+    /// [`crate::explorer::ExplorerTree::highlights`] built them.
+    pub(crate) explorer_highlights: Arc<HashMap<String, Vec<Range<usize>>>>,
     /// `cmd+enter` reaches the workspace only through the focused element's
     /// dispatch path, so an unfocused editor makes the primary keystroke dead.
     pub(crate) editor_needs_focus: bool,
@@ -318,6 +321,75 @@ pub(crate) struct ApplyReview {
     /// the confirmation lying about what it confirms.
     pub(crate) title: &'static str,
     pub(crate) sql: String,
+}
+
+impl ApplyReview {
+    /// Whether this review was written from `tab`'s rows: the one tab it is
+    /// drawn over, and the one grid whose edits it holds up.
+    pub(crate) fn covers(&self, tab: Tab) -> bool {
+        self.tab == tab
+    }
+}
+
+/// What a new review from `from` does about the session's one review slot.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSlot {
+    Free,
+    /// `from`'s own review is on screen, and the new one is its newer
+    /// statement: what `cmd+s` regenerates from the same pending edits.
+    Replace,
+    /// `from`'s own review is on screen and stays.
+    Refuse,
+    /// Another tab's review, out of sight behind `from`, to be brought forward.
+    JumpTo(Tab),
+    /// Held by a tab no longer open. Nothing can bring it forward, so it is
+    /// put away and the slot is free.
+    Stale,
+}
+
+impl ReviewSlot {
+    pub(crate) fn for_review_from(
+        held: Option<&ApplyReview>,
+        from: Tab,
+        replaces_own: bool,
+        is_open: impl FnOnce(Tab) -> bool,
+    ) -> Self {
+        match held {
+            None => Self::Free,
+            Some(review) if review.covers(from) && replaces_own => Self::Replace,
+            Some(review) if review.covers(from) => Self::Refuse,
+            Some(review) if is_open(review.tab) => Self::JumpTo(review.tab),
+            Some(_) => Self::Stale,
+        }
+    }
+}
+
+/// Whether `slot` holds a review written from `grid`'s rows, which an edit
+/// to that grid would leave describing something it no longer holds.
+pub(crate) fn review_holds_up(slot: Option<&ApplyReview>, grid: Tab) -> bool {
+    slot.is_some_and(|review| review.covers(grid))
+}
+
+/// Whether an edit may be staged into `owner`'s grid. Asked of the tab whose
+/// grid it is, not the tab in front: a row panel's blur lands on its own
+/// grid after another tab has been brought forward.
+pub(crate) fn may_stage_into(slot: Option<&ApplyReview>, importing: bool, owner: Tab) -> bool {
+    !importing && !review_holds_up(slot, owner)
+}
+
+/// Put away the new-row form and the review `tab` had open.
+pub(crate) fn forget_tab(
+    form: &mut Option<InsertForm>,
+    review: &mut Option<ApplyReview>,
+    tab: Tab,
+) {
+    form.take_if(|open| open.tab == tab);
+    drop_review_of(review, tab);
+}
+
+/// Put away the review written from `tab`'s rows, leaving another tab's be.
+pub(crate) fn drop_review_of(slot: &mut Option<ApplyReview>, tab: Tab) {
+    slot.take_if(|review| review.covers(tab));
 }
 
 /// The row a table has not got yet, one field per column (spec §4).
@@ -552,6 +624,7 @@ impl Session {
             explorer_filter,
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
             explorer_leaves: Arc::new(HashMap::new()),
+            explorer_highlights: Arc::new(HashMap::new()),
             editor_needs_focus: true,
             save_name_needs_focus: false,
             saved_queries,
@@ -582,23 +655,44 @@ impl Session {
         self.queries.iter_mut().find(|tab| tab.id == id)
     }
 
-    /// Put away the new-row form and the review a closed tab had open. A
-    /// query tab's id is handed to the next buffer, which would find them.
+    /// Put away the new-row form and the review a closed tab, query or
+    /// object, had open. Left in place, a form holds its inputs alive for
+    /// nothing, a query tab's id is handed to the next buffer, which would
+    /// find both, and a review holds the session's one slot with no tab left
+    /// to bring it forward from.
     pub(crate) fn forget(&mut self, tab: Tab) {
-        if self
-            .insert_form
-            .as_ref()
-            .is_some_and(|form| form.tab == tab)
-        {
-            self.insert_form = None;
+        forget_tab(&mut self.insert_form, &mut self.apply_review, tab);
+    }
+
+    pub(crate) fn apply_review_covers(&self, tab: Tab) -> bool {
+        review_holds_up(self.apply_review.as_ref(), tab)
+    }
+
+    /// Asked of the tab whose grid is being edited, which a blur can make a
+    /// tab other than the active one.
+    pub(crate) fn may_stage_into(&self, owner: Tab) -> bool {
+        may_stage_into(
+            self.apply_review.as_ref(),
+            self.import_rows.is_some(),
+            owner,
+        )
+    }
+
+    pub(crate) fn review_slot(&self, from: Tab, replaces_own: bool) -> ReviewSlot {
+        ReviewSlot::for_review_from(self.apply_review.as_ref(), from, replaces_own, |tab| {
+            self.is_open(tab)
+        })
+    }
+
+    pub(crate) fn is_open(&self, tab: Tab) -> bool {
+        match tab {
+            Tab::Query(id) => self.query_tab(id).is_some(),
+            Tab::Object(id) => self.objects.iter().any(|object| object.id == id),
         }
-        if self
-            .apply_review
-            .as_ref()
-            .is_some_and(|review| review.tab == tab)
-        {
-            self.apply_review = None;
-        }
+    }
+
+    pub(crate) fn drop_apply_review_of(&mut self, tab: Tab) {
+        drop_review_of(&mut self.apply_review, tab);
     }
 
     /// The query buffer in front, or `None` when an object tab is.
@@ -2248,6 +2342,141 @@ pub(crate) fn result_pane_is_expanded(query: &QueryState) -> bool {
 mod tests {
     use super::*;
     use crate::sql;
+
+    fn review_from(tab: Tab) -> ApplyReview {
+        ApplyReview {
+            tab,
+            title: "Apply edits",
+            sql: "UPDATE t SET a = 1".into(),
+        }
+    }
+
+    #[test]
+    fn a_review_covers_only_the_tab_it_was_written_from() {
+        let review = review_from(Tab::Query(1));
+        assert!(review.covers(Tab::Query(1)));
+        assert!(!review.covers(Tab::Query(2)));
+        assert!(!review.covers(Tab::Object(1)));
+    }
+
+    fn slot(held: Option<&ApplyReview>, from: Tab, replaces_own: bool, open: bool) -> ReviewSlot {
+        ReviewSlot::for_review_from(held, from, replaces_own, |_| open)
+    }
+
+    #[test]
+    fn a_new_review_is_written_into_an_empty_slot() {
+        assert_eq!(slot(None, Tab::Object(2), false, true), ReviewSlot::Free);
+        assert_eq!(slot(None, Tab::Object(2), true, true), ReviewSlot::Free);
+    }
+
+    #[test]
+    fn a_new_review_jumps_to_another_open_tab_holding_the_slot() {
+        let held = review_from(Tab::Object(1));
+        assert_eq!(
+            slot(Some(&held), Tab::Object(2), false, true),
+            ReviewSlot::JumpTo(Tab::Object(1))
+        );
+        // Replacing is only ever of the tab's own review.
+        assert_eq!(
+            slot(Some(&held), Tab::Query(1), true, true),
+            ReviewSlot::JumpTo(Tab::Object(1))
+        );
+    }
+
+    #[test]
+    fn a_review_held_by_a_closed_tab_is_stale_and_never_jumped_to() {
+        let held = review_from(Tab::Object(1));
+        let mut asked = None;
+        let decided = ReviewSlot::for_review_from(Some(&held), Tab::Object(2), false, |tab| {
+            asked = Some(tab);
+            false
+        });
+        assert_eq!(decided, ReviewSlot::Stale);
+        assert_eq!(asked, Some(Tab::Object(1)));
+    }
+
+    #[test]
+    fn apply_edits_replaces_its_own_tabs_review() {
+        let held = review_from(Tab::Object(1));
+        assert_eq!(
+            slot(Some(&held), Tab::Object(1), true, true),
+            ReviewSlot::Replace
+        );
+    }
+
+    #[test]
+    fn other_creators_leave_their_own_tabs_review_in_place() {
+        let held = review_from(Tab::Object(1));
+        assert_eq!(
+            slot(Some(&held), Tab::Object(1), false, true),
+            ReviewSlot::Refuse
+        );
+    }
+
+    #[test]
+    fn staging_into_a_reviewed_grid_behind_the_active_tab_is_refused() {
+        // Typed into tab 1's row panel, then tab 2 brought forward: the blur
+        // stages into tab 1's grid, which its review is holding.
+        let (owner, active) = (Tab::Object(1), Tab::Object(2));
+        let held = review_from(owner);
+        assert!(!may_stage_into(Some(&held), false, owner));
+        assert!(may_stage_into(Some(&held), false, active));
+    }
+
+    #[test]
+    fn staging_behind_the_active_tab_is_allowed_while_only_the_active_tab_is_reviewed() {
+        let (owner, active) = (Tab::Object(1), Tab::Object(2));
+        let held = review_from(active);
+        assert!(may_stage_into(Some(&held), false, owner));
+        assert!(may_stage_into(Some(&held), false, Tab::Query(1)));
+        assert!(may_stage_into(None, false, owner));
+    }
+
+    #[test]
+    fn staging_is_refused_while_rows_are_being_imported() {
+        assert!(!may_stage_into(None, true, Tab::Object(1)));
+    }
+
+    fn form_on(tab: Tab) -> InsertForm {
+        InsertForm {
+            tab,
+            schema: "public".into(),
+            table: "t".into(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn closing_a_tab_forgets_its_review_and_form() {
+        for closed in [Tab::Object(1), Tab::Query(1)] {
+            let mut form = Some(form_on(closed));
+            let mut review = Some(review_from(closed));
+            forget_tab(&mut form, &mut review, closed);
+            assert!(form.is_none());
+            assert!(review.is_none());
+        }
+    }
+
+    #[test]
+    fn closing_a_tab_leaves_another_tabs_review_and_form() {
+        let mut form = Some(form_on(Tab::Object(2)));
+        let mut review = Some(review_from(Tab::Object(2)));
+        forget_tab(&mut form, &mut review, Tab::Object(1));
+        assert!(form.is_some_and(|form| form.tab == Tab::Object(2)));
+        assert!(review.is_some_and(|review| review.tab == Tab::Object(2)));
+    }
+
+    #[test]
+    fn discarding_one_tab_leaves_another_tabs_review_in_place() {
+        let mut slot = Some(review_from(Tab::Object(1)));
+        drop_review_of(&mut slot, Tab::Object(2));
+        assert!(
+            slot.as_ref()
+                .is_some_and(|review| review.tab == Tab::Object(1))
+        );
+        drop_review_of(&mut slot, Tab::Object(1));
+        assert!(slot.is_none());
+    }
 
     #[test]
     fn a_plan_survives_the_round_trip_through_a_snapshot() {

@@ -241,7 +241,9 @@ an upgrade, or ask for confirmation.
   function call or anything else it does not recognise still needs Full.
   Before this a bare `IF` needed Full everywhere, whatever it held.
 - `Workspace::set_mode` is the only place a mode changes; it also pushes the
-  mode into every open grid, which caches it.
+  mode into every open grid, which caches it. `CycleMode` (no default chord,
+  "Cycle Access Level") steps Read-only, Read-write, Full and back through
+  `choose_mode`, so it takes the titlebar menu's path and nothing else.
 - `Connection::set_read_only` holds a Read-only session to reads on the server
   (Postgres and MySQL; SQLite has no such setting, Snowflake no session
   to hold it in, and SQL Server no session-level switch). It is a backstop, not the boundary: `sql::gate` is. A
@@ -1233,26 +1235,63 @@ The shape a change to the main pane has to fit (`session.rs`, with the
 - **A project is a named list of profile ids** (`store::StoredProject`, the
   `[[projects]]` tables in `profiles.toml`). A connection is in at most one,
   and those in none form the No project group, so each appears in the
-  switcher exactly once (`Workspace::move_to_project` keeps it that way).
-  Which project you are in is derived from the connection in front
-  (`Workspace::current_group`), never stored: it is what the titlebar names
-  and what the palette and next/previous connection keep to. Expanding a
-  group in the switcher is only looking (`expanded_groups`) and switches
-  nothing. The switcher's search field (`connection_search`) overrides
-  expansion while it holds text: a connection matches on its name, host or
-  project, every group with a match shows open, the rest hide, and up/down
-  move a selection Enter opens (`searched_connections` lists matches in
-  display order). Tabs, saved queries and history stay per
-  profile, which is what keeps projects from mixing state. A project may hold
-  no connections. The connection form's Project control
+  palette's Connections scope exactly once (`Workspace::move_to_project` keeps
+  it that way). Which project you are in is derived from the connection in
+  front (`Workspace::current_group`), never stored: it is what the titlebar
+  names and what All in the palette and next/previous connection keep to.
+  Tabs, saved queries and history stay per profile, which is what keeps
+  projects from mixing state. A project may hold no connections. The connection form's Project control
   (`Workspace::project_dropdown`) picks the project, new and edit alike: a new
   connection starts in the project its form was opened for
   (`ConnectionForm::project`), an edited one in its own, and "New project…"
   names one that saving makes, or joins if the name is taken
-  (`projects::chosen_project`). File → New Project (`NewProject`, no default
-  chord) names a project in the switcher, or on the welcome surface below
-  while there is no connection; an empty project in the switcher offers Add
-  connection in place of members.
+  (`projects::chosen_project`).
+- **The titlebar's project and connection open the palette on Connections**
+  (`Workspace::open_connections`, also `SwitchConnection`, no default chord);
+  there is no switcher panel of its own. That scope is a tree
+  (`palette::tree`, over the rows `palette::listed_connections` builds): the
+  connections in no project first, under No project ("Connections" when
+  there are no projects and another group stands beside them), then under
+  Projects each project as a row of its own -- folder tile, name, connection
+  count, chevron -- with its connections indented beneath it on a hairline
+  guide, then Manage (New connection…, New project…) at the bottom whatever
+  is typed. Connection rows carry their engine's logo (in their colour when
+  they have one), a status dot read as the row is drawn, and the one in
+  front is marked current; an empty project holds one "New connection in…"
+  row. `enter` on a project's row folds or unfolds it
+  (`Command::ToggleProject`, the one row the palette stays up for); what is
+  folded is `Workspace::collapsed_projects`, by name, kept for the session,
+  starting unfolded, and the project in front is unfolded whenever a palette
+  opens. With something typed nothing is folded: a connection that matches
+  brings its project's row above it as context (highlighted only where the
+  project's own name matched), a project that matches brings every
+  connection it holds, the project holding the best match comes first, and
+  the list opens on the best match rather than on the context row above it.
+  Rows are told apart by what they are (`palette::Group`, and a project's row
+  by its command), never by the header's text, so a project called "Manage"
+  is its own project. A connection also matches on its host (`Item::also`),
+  scored apart so a match never runs from its name into it, but highlights
+  only in its name. Under All the tree is not drawn: only the other
+  connections in the project in front appear, as a flat group. Whatever is
+  done to one connection or project is a follow-up list, never a panel of
+  its own: `shift-enter` on a connection's row (`palette_row_actions`), its
+  trailing actions button or a right click puts up `Mode::ConnectionActions`
+  (switch, edit, duplicate, move to a project, leave its project, remove,
+  and its project's new connection, rename and delete), the same on a
+  project's row puts up `Mode::ProjectActions` (new connection in it,
+  rename, delete), and the Commands scope offers the same for the connection
+  in front plus Rename/Delete project over `Mode::Projects`. On a row with no
+  actions `shift-enter` is `enter`. Removing a connection or deleting a
+  project goes through a one-row `Mode::Confirm`, which is the only arming
+  they get: it opens with nothing selected, and a click there only selects,
+  so neither a held `enter` nor a double click goes through it. Nothing that
+  removes or deletes, and no connection, is remembered under Recent
+  (`palette::remembered`). New Project and renames take the name in the
+  palette's own field (`Mode::NameProject`, checked by
+  `projects::project_name_refusal` as it is typed, and offering no row for a
+  rename to the name it has). File → New Project (`NewProject`, no default
+  chord) opens that, or the welcome surface's name field while there is no
+  connection.
 - **No connection is a state, not a prompt.** With no profiles and no form
   open, the window is the welcome surface (`Workspace::render_welcome`): New
   project, New connection, each project with an Add connection of its own, and
@@ -1264,8 +1303,15 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   lost); before anything is added,
   `render_import_choice` asks which project the new connections join
   (`PendingImport`): "Imported from <client>" by default, made if it is new
-  and joined if not, an existing project, or none. While it asks, the switcher
-  and New Project stay shut, since the switcher's panel draws over it.
+  and joined if not, an existing project, or none. While it asks, the
+  palette draws over it, so it lists nothing that could change the answer or
+  take away the project it names (`palette::waits_for_import`): the
+  Connections scope is empty and says why, and the rows for New Project,
+  Rename and Delete project, moving a connection to or out of a project,
+  New connection in a project, and Remove connection are left out, as are
+  the lists they open. A palette opened before the question came up is
+  checked again when a row is confirmed. The welcome surface's New Project
+  is refused too.
   Nothing forces a connection on a first launch, the form can always be
   cancelled, and removing the last connection lands back there. Settings opens
   there too. `note` writes to `welcome_notice` while it is in front, and a
@@ -1287,7 +1333,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `ProfileState::Failed`. A failed profile offers `ui::reconnect_button`
   (dispatching `RefreshConnection`) beside the status bar's message and under
   a query's error, where the failure is already being read. `ui::status_dot` draws a
-  profile's state the same way in the status bar and on each switcher row.
+  profile's state the same way in the status bar and on each connection row in
+  the palette.
 - **A profile's database is the one it opens, and Select Database moves it.**
   On an engine where `Engine::switches_database`, `Workspace::set_database`
   writes the picked name into the profile's config, persists it and
@@ -1494,8 +1541,8 @@ the visible one.
 
 Use these rather than hand-rolling: `EditorState` (the SQL buffer: rope-backed,
 IME, line numbers, tree-sitter highlighting), `DataTable` over a `TableDelegate`
-(the grid, virtualized on both axes), `ListState` (the palette's search field,
-virtualized scroll and click-to-confirm), `PopupMenu` and the `DropdownMenu`
+(the grid, virtualized on both axes), `v_virtual_list` (the palette's rows,
+virtualized at their two heights, header and row), `PopupMenu` and the `DropdownMenu`
 trait (an anchored menu whose open state the library owns, which is the answer
 to the "GPUI drops view state" hazard below rather than a dropdown of ours),
 `Root` dialog layers, resizable panels, `Spinner`, and the completion popup.
@@ -1512,11 +1559,26 @@ is unscoped, and an unscoped binding wins at every depth (see "GPUI hazards").
 `show_editor` must therefore `cx.propagate()` on the paths where DBDelve has
 nothing stacked to close, or the completion popup cannot be dismissed.
 
-It does **not** provide a fuzzy matcher or a command palette. Those are ours:
-`src/palette.rs` and `src/completion.rs` both score with `nucleo-matcher`. A
-palette row carries a `Command`; `Workspace::run_command` routes every one into
+It does **not** provide a fuzzy matcher, and its `command` palette filters by
+substring in a fixed layout. Both are ours: `src/fuzzy.rs` is the one matcher
+(`nucleo-matcher`) every list that narrows as it is typed into goes through --
+the palette and its pickers (the connection form's engine among them), completions, the explorer's filter and the settings search -- so a query that finds something in one finds it in the others, and
+each draws the matched characters with `ui::highlighted`. A palette row carries a `Command`; `Workspace::run_command` routes every one into
 the method its button or keystroke already calls, so the palette is never a
-second implementation of anything.
+second implementation of anything. `cmd+p` (`FuzzyOpen`, "Go to Object")
+opens it on Objects, `cmd+shift+p` on Commands, `SearchEverything` (no default chord) on All and the titlebar's project or
+connection on Connections; the stroke that opened it, or the one for the scope it
+shows, closes it, and another scope's stroke moves it there (`palette::stroke`).
+`tab` and `shift-tab` step through the scopes, and so do `right` and `left`
+once the caret sits bare at the end or the start of the field, an empty one
+included (`palette::arrow`). Anywhere else, and in every picker, the arrows
+are the field's own: the palette's handler propagates, and GPUI hands the
+keystroke to the next binding in line, the input's caret movement.
+A palette open while the catalog loads says so on Objects, and takes the
+objects in when they land (`Workspace::catalog_landed`). One opened from the
+settings panel, or put up by a row confirmed there, hands the keyboard back to
+the panel's search when it is dismissed or a theme or font is picked from it;
+any other row it confirms leaves focus where its command put it.
 
 It also does **not** ship the icons its `IconName` names: those are Lucide file
 paths with no files behind them. `src/icons.rs` is DBDelve's `AssetSource`: it

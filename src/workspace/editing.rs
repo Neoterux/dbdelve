@@ -4,7 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
-use crate::session::{StaleEdit, StaleResume, refreshing};
+use crate::session::{ReviewSlot, StaleEdit, StaleResume, refreshing};
 
 impl Workspace {
     /// Open the "New row" form over the preview in front, one field per column
@@ -139,7 +139,7 @@ impl Workspace {
 
     /// Generate the `INSERT` and show it. **Nothing runs here** — Run in the
     /// review panel is the ask (`AGENTS.md` rule 1).
-    pub(crate) fn confirm_new_row(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn confirm_new_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_notice();
         let engine = self.engine();
         let Some(profile) = self.profile() else {
@@ -182,6 +182,9 @@ impl Workspace {
                 "dbdelve refused to run a statement it wrote itself: it is not an INSERT.".into(),
                 cx,
             );
+            return;
+        }
+        if !self.review_slot_free(tab, false, window, cx) {
             return;
         }
 
@@ -712,7 +715,7 @@ impl Workspace {
         // A batch already on screen was generated from the pending set as it
         // stood. Another edit behind the modal would leave the statement the
         // user is reading describing something other than what the grid holds.
-        if profile.session.apply_review.is_some() || profile.session.import_rows.is_some() {
+        if !profile.session.may_stage_into(profile.session.active) {
             return;
         }
         let Some(results) = profile.session.active_results().cloned() else {
@@ -857,7 +860,7 @@ impl Workspace {
         };
         // The gate `edit_cell` holds, for its reason: a batch already on screen
         // was generated from the pending set as it stood.
-        if profile.session.apply_review.is_some() || profile.session.import_rows.is_some() {
+        if !profile.session.may_stage_into(profile.session.active) {
             return false;
         }
         let Some(results) = profile.session.active_results().cloned() else {
@@ -902,6 +905,7 @@ impl Workspace {
             return;
         };
         let (grid, row, rows) = (inputs.grid.clone(), inputs.row, inputs.rows);
+        let owner = (inputs.profile.clone(), inputs.tab);
         let text = input.read(cx).value();
         // Rows replaced or reordered since: another record is at `row` now,
         // and the text goes the way the grid's own open input does.
@@ -915,7 +919,7 @@ impl Workspace {
         let value = NewValue::Value(text.clone());
         let staged = match in_front {
             true => self.stage_cell(row, col, value, cx),
-            false => self.stage_behind(&grid, row, col, value, cx),
+            false => self.stage_behind(&grid, owner, row, col, value, cx),
         };
         if staged
             && let Some(field) = self
@@ -930,20 +934,24 @@ impl Workspace {
 
     /// Stage typed text on a grid no longer in front, which is where a blur
     /// from switching tabs lands. `stage_cell`'s gates read the tab in front,
-    /// so this asks the grid itself, and leaves text that would need the
-    /// stale-rows prompt unstaged rather than raise it over another tab.
+    /// so this asks the grid's own profile and tab, and the grid itself, and
+    /// leaves text that would need the stale-rows prompt unstaged rather than
+    /// raise it over another tab.
     fn stage_behind(
         &mut self,
         grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
+        (profile, tab): (String, Tab),
         row: usize,
         col: usize,
         value: NewValue,
         cx: &mut Context<Self>,
     ) -> bool {
-        let reviewing = self.profile().is_none_or(|profile| {
-            profile.session.apply_review.is_some() || profile.session.import_rows.is_some()
-        });
-        let staged = !reviewing
+        let may_stage = self
+            .profiles
+            .iter()
+            .find(|found| found.id == profile)
+            .is_some_and(|found| found.session.may_stage_into(tab));
+        let staged = may_stage
             && grid.update(cx, |table, cx| {
                 let staged =
                     !table.delegate().unconfirmed() && table.delegate_mut().stage(row, col, value);
@@ -1136,7 +1144,12 @@ impl Workspace {
     /// Deliberately not on a keybinding, for the reason [`Workspace::apply_edits`]
     /// is not: a destructive write one fat finger from a navigation key is a
     /// write nobody asked for. The palette row is how it is reached.
-    pub(crate) fn delete_row(&mut self, _: &DeleteRow, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn delete_row(
+        &mut self,
+        _: &DeleteRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Does not route through `editable`: `row_key` answers "can this row be
         // named" and is true regardless of mode, so the mode is asked outright.
         if !self.require(Mode::ReadWrite, cx) {
@@ -1147,11 +1160,10 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        // A statement already generated is the one the user is reading; another
-        // behind it would leave that panel describing something else.
-        if profile.session.apply_review.is_some() || profile.session.import_rows.is_some() {
+        if profile.session.import_rows.is_some() {
             return;
         }
+        let tab = profile.session.active;
         // Scoped to the active tab's own form: one left open on another tab
         // (or a closed one, cleared at close) must not block this one.
         if profile
@@ -1167,7 +1179,6 @@ impl Workspace {
         // statement, and a delete there would be dbdelve writing into a buffer to
         // destroy rows -- bar an engine whose opened rows are a query tab, where
         // the delete is reviewed as a relation's is and the buffer is left be.
-        let tab = profile.session.active;
         if !matches!(tab, Tab::Object(_)) && !engine.edits_query_rows() {
             self.note(
                 "Deleting a row is offered on a table's rows, not on a query's results.".into(),
@@ -1222,6 +1233,9 @@ impl Workspace {
                     .into(),
                 cx,
             );
+            return;
+        }
+        if !self.review_slot_free(tab, false, window, cx) {
             return;
         }
 
@@ -1626,6 +1640,7 @@ impl Workspace {
         let Some(results) = profile.session.active_results().cloned() else {
             return;
         };
+        let own_review = profile.session.apply_review_covers(tab);
         let pending = results.read(cx).delegate().pending_updates();
         // Nothing partial runs: a batch missing one of its rows is not the
         // change the user made.
@@ -1649,7 +1664,9 @@ impl Workspace {
         }
 
         match tab {
+            Tab::Query(_) if own_review => {}
             Tab::Query(_) => self.apply_in_buffer(batch, window, cx),
+            Tab::Object(_) if !self.review_slot_free(tab, true, window, cx) => {}
             Tab::Object(_) => {
                 if let Some(profile) = self.profile_mut() {
                     profile.session.apply_review = Some(ApplyReview {
@@ -1731,15 +1748,60 @@ impl Workspace {
     /// Put the batch away, leaving the edits pending: reading a statement and
     /// deciding not to run it is not the same as throwing the edits out, which
     /// is what Discard is for.
+    ///
+    /// Scoped to the active tab, the only one it is drawn over, as
+    /// `close_new_row` is: one left on another tab must not eat the `escape`
+    /// meant for what this tab has in front.
     pub(crate) fn close_apply_review(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(profile) = self.profile_mut() else {
             return false;
         };
+        if !profile.session.apply_review_covers(profile.session.active) {
+            return false;
+        }
         let closed = profile.session.apply_review.take().is_some();
         if closed {
             cx.notify();
         }
         closed
+    }
+
+    /// Whether a review written from `from` may be put in front of the user.
+    ///
+    /// Refused while any review is open, another tab's included: the session
+    /// holds one, and a second would overwrite the first's statement unseen.
+    /// Another tab's is brought forward, so what is in the way is on screen.
+    /// `from`'s own is replaced only when `replaces_own`, the new statement
+    /// then being its newer one.
+    ///
+    /// Asked last, once the creator has nothing left of its own to refuse:
+    /// a creator that would have refused anyway must not move the user.
+    fn review_slot_free(
+        &mut self,
+        from: Tab,
+        replaces_own: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.profile_mut() else {
+            return false;
+        };
+        match profile.session.review_slot(from, replaces_own) {
+            ReviewSlot::Free | ReviewSlot::Replace => true,
+            ReviewSlot::Stale => {
+                profile.session.apply_review = None;
+                true
+            }
+            ReviewSlot::Refuse => false,
+            ReviewSlot::JumpTo(holder) => {
+                self.activate_tab(holder, window, cx);
+                self.note(
+                    "Run or close this statement before starting another.".into(),
+                    cx,
+                );
+                false
+            }
+        }
     }
 
     /// Back to exactly the rows the server sent.
@@ -1749,10 +1811,10 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(results) = self
-            .profile()
-            .and_then(|profile| profile.session.active_results().cloned())
-        else {
+        let Some((tab, results)) = self.profile().and_then(|profile| {
+            let results = profile.session.active_results()?.clone();
+            Some((profile.session.active, results))
+        }) else {
             return;
         };
         results.update(cx, |table, cx| {
@@ -1760,7 +1822,7 @@ impl Workspace {
             table.refresh(cx);
         });
         if let Some(profile) = self.profile_mut() {
-            profile.session.apply_review = None;
+            profile.session.drop_apply_review_of(tab);
         }
         cx.notify();
     }

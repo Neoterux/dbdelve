@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 60] = [
+const ICONS: [(&str, &IconData); 62] = [
     ("icons/git-fork.svg", icondata_lu::LuGitFork),
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
@@ -77,6 +77,11 @@ const ICONS: [(&str, &IconData); 60] = [
     ("icons/folder.svg", icondata_lu::LuFolder),
     ("icons/folder-minus.svg", icondata_lu::LuFolderMinus),
     ("icons/folder-plus.svg", icondata_lu::LuFolderPlus),
+    (
+        "icons/sliders-horizontal.svg",
+        icondata_lu::LuSlidersHorizontal,
+    ),
+    ("icons/keyboard.svg", icondata_lu::LuKeyboard),
     ("icons/engine-postgres.svg", icondata_si::SiPostgresql),
     ("icons/engine-mysql.svg", icondata_si::SiMysql),
     ("icons/engine-mariadb.svg", icondata_si::SiMariadb),
@@ -98,7 +103,6 @@ pub mod icon {
     pub const CLOSE_WINDOW: &str = "icons/close.svg";
     pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
     pub const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
-    pub const SWITCHER: &str = "icons/chevrons-up-down.svg";
     /// A connection's mode, on its pill in the titlebar.
     pub const READ_ONLY: &str = "icons/eye.svg";
     pub const READ_WRITE: &str = "icons/pencil.svg";
@@ -133,6 +137,8 @@ pub mod icon {
     pub const CHECK: &str = "icons/check.svg";
     pub const CLOSE: &str = "icons/close.svg";
     pub const COPY: &str = "icons/copy.svg";
+    /// What else can be done to a row, beside it.
+    pub const MORE: &str = "icons/ellipsis.svg";
     /// A floppy disk, which is what "save" looks like everywhere else.
     pub const SAVE: &str = "icons/save.svg";
     pub const RENAME: &str = "icons/pencil.svg";
@@ -154,6 +160,8 @@ pub mod icon {
     pub const REFERENCED_BY: &str = "icons/arrow-down-right.svg";
     pub const PRIMARY_KEY: &str = "icons/key.svg";
     pub const SETTINGS: &str = "icons/settings.svg";
+    pub const SLIDERS: &str = "icons/sliders-horizontal.svg";
+    pub const KEYBOARD: &str = "icons/keyboard.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -208,7 +216,6 @@ mod tests {
         for path in [
             icon::CHEVRON_DOWN,
             icon::CHEVRON_RIGHT,
-            icon::SWITCHER,
             icon::READ_ONLY,
             icon::READ_WRITE,
             icon::FULL_ACCESS,
@@ -244,6 +251,9 @@ mod tests {
             icon::REFERENCED_BY,
             icon::PRIMARY_KEY,
             icon::SETTINGS,
+            icon::SLIDERS,
+            icon::KEYBOARD,
+            icon::THEME,
         ] {
             assert_draws(path);
         }

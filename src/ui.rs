@@ -7,8 +7,8 @@
 //! up looking like two different applications.
 
 use gpui::{
-    AnyElement, Div, FontWeight, InteractiveElement, IntoElement, Keystroke, ParentElement, Styled,
-    div, prelude::FluentBuilder, px,
+    AnyElement, Div, FontWeight, HighlightStyle, InteractiveElement, IntoElement, Keystroke,
+    ParentElement, SharedString, Styled, StyledText, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     InteractiveElementExt, POPOVER_BLUR,
@@ -16,7 +16,7 @@ use gpui_component::{
     kbd::Kbd,
 };
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use crate::{
     actions::RefreshConnection,
@@ -43,6 +43,24 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         ObjectKind::Routine(RoutineKind::Function) => icon::FUNCTION,
         ObjectKind::Routine(RoutineKind::Procedure) => icon::PROCEDURE,
     }
+}
+
+/// `text` with the byte `ranges` a filter matched drawn in the accent, bolder.
+pub(crate) fn highlighted(
+    text: impl Into<SharedString>,
+    ranges: &[Range<usize>],
+    t: Theme,
+) -> StyledText {
+    let style = HighlightStyle {
+        color: Some(t.accent.into()),
+        font_weight: Some(FontWeight::SEMIBOLD),
+        ..Default::default()
+    };
+    let text = StyledText::new(text);
+    if ranges.is_empty() {
+        return text;
+    }
+    text.with_highlights(ranges.iter().map(|range| (range.clone(), style)))
 }
 
 /// One column of icons down the sidebar, so every label starts at the same x
@@ -98,16 +116,37 @@ pub(crate) fn engine_logo(t: Theme, engine: Engine, planes: &[Srgb]) -> impl Int
         .text_color(theme::engine_brand(engine, t, planes))
 }
 
+/// A connection's state, apart from the connection itself, for a list built
+/// once and drawn after.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Status {
+    Idle,
+    Connecting,
+    Connected,
+    Failed,
+}
+
+impl From<&ProfileState> for Status {
+    fn from(state: &ProfileState) -> Self {
+        match state {
+            ProfileState::Idle => Status::Idle,
+            ProfileState::Connecting => Status::Connecting,
+            ProfileState::Connected(_) => Status::Connected,
+            ProfileState::Failed(_) => Status::Failed,
+        }
+    }
+}
+
 /// A connection's state as one dot, the same in the status bar and the
-/// switcher: faint idle, muted while connecting, green connected, red failed
+/// palette: faint idle, muted while connecting, green connected, red failed
 /// or lost. Never the connection's own colour: a red one would read as lost,
 /// and a gray one as idle.
-pub(crate) fn status_dot(t: Theme, state: &ProfileState) -> Div {
-    let fill = match state {
-        ProfileState::Idle => t.text_faint,
-        ProfileState::Connecting => t.text_muted,
-        ProfileState::Connected(_) => t.success,
-        ProfileState::Failed(_) => t.danger,
+pub(crate) fn status_dot(t: Theme, status: impl Into<Status>) -> Div {
+    let fill = match status.into() {
+        Status::Idle => t.text_faint,
+        Status::Connecting => t.text_muted,
+        Status::Connected => t.success,
+        Status::Failed => t.danger,
     };
     div()
         .flex_shrink_0()
@@ -521,13 +560,6 @@ pub(crate) fn keycap(stroke: &'static str) -> Kbd {
     Kbd::new(Keystroke::parse(stroke).expect("keycap strokes are compile-time constants"))
 }
 
-/// The same keycap for a stroke only known at runtime -- a rebound chord read
-/// back off disk, which [`keycap`]'s constant cannot cover. One GPUI cannot
-/// parse draws nothing rather than a cap with garbage on it.
-pub(crate) fn keycap_for(stroke: &str) -> Option<Kbd> {
-    Keystroke::parse(stroke).ok().map(Kbd::new)
-}
-
 /// The same cap as plain text, for the readouts that run as a sentence rather
 /// than carrying a chip of their own. `Kbd`'s own formatter, so a cap written
 /// into a string reads the way the drawn ones do -- `⌘0` on macOS, `Ctrl+0`
@@ -554,6 +586,85 @@ pub(crate) fn chord_hint(id: &str, overrides: &HashMap<String, String>) -> Strin
         .and_then(|spec| keybindings::chords_for(spec, overrides).first().copied())
         .map(keycap_text)
         .unwrap_or_default()
+}
+
+/// The chord bound to an action today, as GPUI writes it -- an override if the
+/// user set one, else the shipped default -- or `None` for an unbound action.
+pub(crate) fn chord_for(id: &str, overrides: &HashMap<String, String>) -> Option<String> {
+    keybindings::REGISTRY
+        .iter()
+        .find(|spec| spec.id == id)
+        .and_then(|spec| keybindings::chords_for(spec, overrides).first().copied())
+        .map(str::to_string)
+}
+
+/// A chord as the keys a hand presses, one label per keycap: the modifiers in
+/// the platform's order, then the key. A two-stroke chord is both strokes'
+/// keys in turn.
+pub(crate) fn keycap_parts(chord: &str) -> Vec<gpui::SharedString> {
+    chord
+        .split_whitespace()
+        .filter_map(|stroke| Keystroke::parse(stroke).ok())
+        .flat_map(|stroke| {
+            let held = stroke.modifiers;
+            let modifiers = [
+                (held.control, "⌃", "Ctrl"),
+                (held.alt, "⌥", "Alt"),
+                (held.shift, "⇧", "Shift"),
+                (held.platform, "⌘", "Super"),
+                (held.function, "fn", "Fn"),
+            ];
+            let mut parts: Vec<gpui::SharedString> = modifiers
+                .into_iter()
+                .filter(|(down, _, _)| *down)
+                .map(|(_, mac, other)| {
+                    if cfg!(target_os = "macos") {
+                        mac
+                    } else {
+                        other
+                    }
+                    .into()
+                })
+                .collect();
+            let bare = Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                ..stroke
+            };
+            parts.push(Kbd::format(&bare).into());
+            parts
+        })
+        .collect()
+}
+
+/// One key of a shortcut, as a small cap.
+pub(crate) fn key_chip(label: impl Into<gpui::SharedString>, t: Theme) -> Div {
+    let height = layout::chrome(layout::KEYCAP_HEIGHT);
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(height))
+        .min_w(px(height))
+        .px(px(layout::SPACE_XS))
+        .rounded(px(layout::RADIUS_KEYCAP))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.element_hover)
+        .text_size(px(layout::chrome(layout::TEXT_XS)))
+        .line_height(gpui::relative(1.))
+        .text_color(t.text_muted)
+        .child(label.into())
+}
+
+/// A chord as a keycap per key, the way the platform draws one in a menu.
+pub(crate) fn keycaps(chord: &str, t: Theme) -> Div {
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(layout::KEYCAP_GAP))
+        .children(keycap_parts(chord).into_iter().map(|key| key_chip(key, t)))
 }
 
 /// A shortcut hint and what it does, in the app face rather than the editor's
@@ -657,6 +768,18 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chord_reads_as_a_cap_per_key_with_the_modifiers_in_platform_order() {
+        let expected: &[&str] = if cfg!(target_os = "macos") {
+            &["⇧", "⌘", "P"]
+        } else {
+            &["Ctrl", "Shift", "P"]
+        };
+        assert_eq!(keycap_parts("secondary-shift-p"), expected);
+        assert_eq!(keycap_parts("g g").len(), 2);
+    }
+
     use super::*;
     use crate::explorer;
 

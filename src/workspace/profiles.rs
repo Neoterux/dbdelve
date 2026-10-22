@@ -304,8 +304,6 @@ impl Workspace {
                 .map(|profile| profile.name.clone())
                 .collect::<Vec<_>>(),
         );
-        self.switcher_open = false;
-        cx.notify();
 
         let password_task = {
             let id = id.clone();
@@ -315,7 +313,7 @@ impl Workspace {
         cx.spawn_in(window, async move |workspace, cx| {
             let password = password_task.await;
             _ = workspace.update_in(cx, |workspace, window, cx| {
-                // Removed from the switcher while the Keychain answered --
+                // Removed while the Keychain answered --
                 // nothing left to seed a form from.
                 let Some(profile) = workspace.profiles.iter().find(|profile| profile.id == id)
                 else {
@@ -841,7 +839,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Removed from the switcher while the form sat open: there is nothing
+        // Removed while the form sat open: there is nothing
         // left to save onto, and the id is the only handle the form kept.
         let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
             cx.notify();
@@ -1215,10 +1213,22 @@ impl Workspace {
         form.project = project;
         self.form = Some(form);
         self.pending_project_deletion = None;
-        self.switcher_open = false;
-        // The form branch of `Render` returns before painting the modal, so a
-        // flag left set would reappear the moment the form closes.
-        self.settings_open = false;
+        cx.notify();
+    }
+
+    /// Opens the form over a saved connection, in its own project.
+    pub(crate) fn edit_profile(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        let mut form = ConnectionForm::editing(profile, window, cx);
+        form.project = self.group_of(&profile.id).map(str::to_string);
+        self.form = Some(form);
         cx.notify();
     }
 
@@ -1269,7 +1279,6 @@ impl Workspace {
                 // The question takes the reading line's place, as a summary
                 // would.
                 workspace.clear_notice();
-                workspace.switcher_open = false;
                 workspace.pending_import = Some(PendingImport {
                     source,
                     report,
@@ -1484,6 +1493,7 @@ impl Workspace {
         // paints the same sentence twice in the same red.
         let Some(connection) = profile.connection() else {
             profile.catalog = CatalogState::Failed("Not connected.".into());
+            self.catalog_landed(id, cx);
             return;
         };
         let catalog_task = cx
@@ -1523,6 +1533,7 @@ impl Workspace {
                     profile.session.completion_columns.borrow_mut().clear();
                     workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
+                    workspace.catalog_landed(&id, cx);
                     cx.notify();
                     workspace.load_routines(&id, generation, cx);
                     workspace.load_sizes(&id, generation, cx);
@@ -1583,6 +1594,7 @@ impl Workspace {
                     }
                     workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
+                    workspace.catalog_landed(&id, cx);
                     cx.notify();
                 })
                 .ok();
@@ -1732,15 +1744,13 @@ impl Workspace {
         let filter = profile.session.explorer_filter.read(cx).value();
         let explorer = match &profile.catalog {
             CatalogState::Loaded(catalog, _) => build_explorer_tree(catalog, &filter),
-            _ => explorer::ExplorerTree {
-                items: Vec::new(),
-                leaves: HashMap::new(),
-            },
+            _ => explorer::ExplorerTree::default(),
         };
         let tree = profile.session.explorer_tree.clone();
 
         if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
             profile.session.explorer_leaves = Arc::new(explorer.leaves);
+            profile.session.explorer_highlights = Arc::new(explorer.highlights);
         }
         tree.update(cx, |tree, cx| tree.set_items(explorer.items, cx));
     }
@@ -1754,8 +1764,6 @@ impl Workspace {
         }
         self.active = index;
         self.form = None;
-        self.switcher_open = false;
-        self.pending_removal = None;
         // Written here rather than at quit, so the profile in front survives a
         // crash as well as a close.
         self.remember_profiles(cx);
@@ -1799,17 +1807,13 @@ impl Workspace {
         self.cycle_profile(-1, cx);
     }
 
+    /// Asked about first, in the palette's confirmation (`Mode::Confirm`).
     pub(crate) fn remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(profile) = self.profiles.get(index) else {
             return;
         };
         let id = profile.id.clone();
         let name = profile.name.clone();
-        if self.pending_removal.as_deref() != Some(&id) {
-            self.pending_removal = Some(id);
-            cx.notify();
-            return;
-        }
         if index == self.active
             && let Err(message) = self.persist_buffer(cx)
         {
@@ -1839,15 +1843,12 @@ impl Workspace {
         store::delete_password(&id);
         let removed_queries = store::delete_queries(&id);
         let _ = store::delete_grids(&id);
-        self.pending_removal = None;
         for project in &mut self.projects {
             project.connections.retain(|member| member != &id);
         }
         self.active = active_after_removal(self.active, index, self.profiles.len());
         self.remember_profiles(cx);
-        // The switcher lives in a titlebar the welcome surface does not have.
         if self.profiles.is_empty() {
-            self.switcher_open = false;
             self.refocus_front();
         }
         self.connect_active(cx);

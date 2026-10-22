@@ -9,6 +9,7 @@ mod explain;
 mod explorer;
 mod export;
 mod filter;
+mod fuzzy;
 mod import;
 mod import_rows;
 // Nothing calls it until the MongoDB engine is wired in (phase 1b).
@@ -19,6 +20,7 @@ mod redis_cmd;
 mod result_grid;
 mod scroller;
 mod session;
+mod settings_panel;
 mod sql;
 mod store;
 mod structure_grid;
@@ -39,32 +41,32 @@ use gpui::{
     AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
     Focusable, FontWeight, InteractiveElement, IntoElement, Menu, MenuItem, ParentElement, Render,
     StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowDecorations, WindowOptions,
-    deferred, div, point, prelude::FluentBuilder, px,
+    div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    Disableable, IndexPath, Root,
+    Disableable, Root,
     input::{
         CompletionProvider, EditorMode, EditorState, Enter, IndentInline, Input, InputEvent,
         InputModeKind, InputState, Position,
     },
-    list::{List, ListEvent, ListItem, ListState},
+    list::ListItem,
     resizable::{ResizableState, h_resizable, resizable_panel},
     tree::tree as render_tree,
 };
 
 use actions::{
     AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette,
-    CopyCell, CopyResults, CopyRow, CopyRows, CustomRowLimit, DeleteRow, DiscardEdits, EditCell,
-    ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn,
+    CopyCell, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode, DeleteRow, DiscardEdits,
+    EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn,
     ImportConnections, ImportRows, LimitTarget, NewConnection, NewProject, NewQuery, NewRow,
-    NextEdit, NextPage, NextProfile, NextTab, OpenReference, OpenSettings, PaletteNext,
-    PalettePrevious, PreviousEdit, PreviousPage, PreviousProfile, PreviousTab, Quit,
-    RefreshConnection, RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations,
-    ResetEditorZoom, RunQuery, SaveQuery, SelectDatabase, SelectTheme, SetDefault,
-    SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode,
-    SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowReferences, SortColumn,
-    ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit,
-    ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+    NextEdit, NextPage, NextProfile, NextTab, OpenReference, OpenSettings, PreviousEdit,
+    PreviousPage, PreviousProfile, PreviousTab, Quit, RefreshConnection, RefreshRelation,
+    RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom, RunQuery, SaveQuery,
+    SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty,
+    SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit,
+    ShowAllColumns, ShowEditor, ShowReferences, SortColumn, SwitchConnection, ToggleComment,
+    ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit, ToggleRowPanel,
+    ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
@@ -80,7 +82,7 @@ use filter::{
     sort_columns, sort_expression, value_placeholder,
 };
 use icons::{Icons, icon};
-use palette::{Command, Mode as PaletteMode, Palette};
+use palette::{Command, Mode as PaletteMode, Palette, PaletteEvent, Scope, Stroke};
 use result_grid::{NewValue, ResultGrid};
 use session::{
     ApplyReview, CatalogState, CloseTarget, Explained, Focus, InsertField, InsertForm, ObjectBody,
@@ -92,8 +94,8 @@ use sql::{Buffer, SortKey};
 use theme::{ConnectionColor, FontSlot, Fonts, Theme, fonts, layout, popup_theme, theme};
 use ui::{
     Control, Tone, button, button_label, dialog, engine_logo, frosted_card, group_thousands,
-    human_bytes, icon_button, object_icon, one_line, raised_card, relative_age, row_icon,
-    row_icon_tinted, row_readout, section_label, segment, titlebar,
+    highlighted, human_bytes, icon_button, object_icon, one_line, relative_age, row_icon,
+    row_readout, section_label, segment, titlebar,
 };
 use workspace::Workspace;
 
