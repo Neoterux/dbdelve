@@ -164,6 +164,9 @@ pub(crate) enum Part {
     Card,
     Tile(usize),
     Backdrop,
+    /// The connection form's card, which rises in on the same curve as the
+    /// welcome card, with nothing ahead of it.
+    Form,
 }
 
 const FIELD_LOGO_MS: u64 = 160;
@@ -245,6 +248,17 @@ pub(crate) fn pose(part: Part, intro: bool, elapsed: f32) -> Pose {
             opacity: ease_in_out(progress(elapsed, BACKDROP_AT_MS, BACKDROP_MS)),
             offset: 0.,
         },
+        Part::Form => rise(elapsed, 0., RISE_MS, RISE_PX),
+    }
+}
+
+/// When the connection form's entrance has landed: its card, and the
+/// contours behind it unless they were already up.
+pub(crate) fn form_entrance_ms(backdrop_shown: bool) -> f32 {
+    if backdrop_shown {
+        RISE_MS
+    } else {
+        RISE_MS.max(BACKDROP_AT_MS + BACKDROP_MS)
     }
 }
 
@@ -264,7 +278,7 @@ pub(crate) fn entrance_ms(intro: bool) -> f32 {
 
 /// A piece of the entrance where it is now. The caller positions it, relative
 /// or absolute, so the offset moves it without moving anything beside it.
-fn posed(element: gpui::Div, pose: Pose) -> gpui::Div {
+pub(super) fn posed(element: gpui::Div, pose: Pose) -> gpui::Div {
     element.top(px(pose.offset)).opacity(pose.opacity)
 }
 
@@ -740,7 +754,11 @@ impl Workspace {
 /// glass theme already has the desktop behind it. Sized to cover the surface
 /// at the asset's own proportions, and in steps, so a resize redraws the
 /// bitmap a few times rather than on every pixel.
-fn backdrop(t: Theme, viewport: gpui::Size<gpui::Pixels>, pose: Pose) -> Option<gpui::Div> {
+pub(super) fn backdrop(
+    t: Theme,
+    viewport: gpui::Size<gpui::Pixels>,
+    pose: Pose,
+) -> Option<gpui::Div> {
     if t.is_glass {
         return None;
     }
@@ -858,15 +876,26 @@ mod tests {
 
     #[test]
     fn a_bare_sqlite_path_is_a_file_and_any_other_path_is_still_being_typed() {
+        // What counts as absolute is the platform's call: `/Users/…` has no
+        // drive, so it is not an absolute path on Windows.
+        #[cfg(windows)]
+        let (absolute, other_absolute, partial) = (
+            r"C:\Users\ana\app.db",
+            r"D:\var\lib\app.db3",
+            r"C:\Users\ana\ap",
+        );
+        #[cfg(not(windows))]
+        let (absolute, other_absolute, partial) =
+            ("/Users/ana/app.db", "/var/lib/app.db3", "/Users/ana/ap");
         for text in [
-            "/Users/ana/app.db",
+            absolute,
             "~/data/app.sqlite",
             "~/data/app.SQLITE3",
-            "/var/lib/app.db3",
+            other_absolute,
         ] {
             assert_eq!(recognise(text), Recognised::File, "{text}");
         }
-        for text in ["/Users/ana/ap", "~/data/app.csv", "~"] {
+        for text in [partial, "~/data/app.csv", "~"] {
             assert_eq!(recognise(text), Recognised::Typing, "{text}");
         }
         // Relative paths are not offered: the form could not say where from.
@@ -944,6 +973,18 @@ mod tests {
         let late = pose(Part::Tile(5), false, midway);
         assert!(early.opacity > late.opacity);
         assert!(early.offset < late.offset);
+    }
+
+    #[test]
+    fn the_form_rises_at_once_and_only_waits_on_contours_it_brought() {
+        assert_eq!(pose(Part::Form, false, 0.).opacity, 0.);
+        let landed = Pose {
+            opacity: 1.,
+            offset: 0.,
+        };
+        assert_eq!(pose(Part::Form, false, form_entrance_ms(true)), landed);
+        assert_eq!(pose(Part::Backdrop, false, form_entrance_ms(false)), landed);
+        assert!(form_entrance_ms(true) < form_entrance_ms(false));
     }
 
     #[test]
