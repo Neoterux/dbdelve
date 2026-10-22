@@ -28,7 +28,7 @@ use gpui::{App, Window};
 
 use crate::{db::Engine, store};
 
-use color::{Oklch, Rgba, Srgb};
+use color::{Oklch, Rgba, Srgb, contrast_ratio};
 use gpui_component::{
     ThemeMode,
     highlighter::{HighlightTheme, HighlightThemeStyle, SyntaxColors},
@@ -177,6 +177,18 @@ impl Default for Theme {
 /// `cx.set_global` have run, which `main` does before opening the window.
 pub fn theme(cx: &gpui::App) -> &Theme {
     cx.global::<Theme>()
+}
+
+/// The active theme as [`Theme::for_popup`] sets it. Kept beside the theme by
+/// [`Theme::apply_to_components`] rather than derived where it is read: a
+/// preview grid or a palette list reading it once a row would search for the
+/// card once a row.
+struct PopupTheme(Theme);
+
+impl gpui::Global for PopupTheme {}
+
+pub fn popup_theme(cx: &gpui::App) -> Theme {
+    cx.global::<PopupTheme>().0
 }
 
 /// Which of the three faces a family is being set for. dbdelve's type does three
@@ -352,11 +364,19 @@ pub const OPACITY_MAX: f32 = 0.95;
 pub const OPACITY_STEP: f32 = 0.05;
 const PANEL_ALPHA: f32 = 0.14;
 const DATA_ALPHA: f32 = 0.14;
-/// A modal card's own transmission. Nowhere near the other three, and for the
-/// opposite reason: what is behind a modal is the app's own text, not the
-/// desktop. Enough to keep the card from reading as a slab cut out of the
-/// window, never enough to read a grid row through.
-const OVERLAY_ALPHA: f32 = 0.97;
+/// The least of its own tone a floating card is allowed on glass: Zeron's menu
+/// fill. A floor, not the fill — see [`Theme::overlay_glass`].
+const OVERLAY_ALPHA_FLOOR: f32 = 0.15;
+/// What a floating card's text holds against the worst backdrop the card can
+/// be shown over: WCAG AA for body text, `danger` included, since on a card it
+/// says what went wrong; and AA large for muted, faint and accent text, which
+/// on a card is a shortcut, a heading, a hint or a match beside the body
+/// rather than body.
+const POPUP_TEXT_CONTRAST: f32 = 4.5;
+const POPUP_MUTED_CONTRAST: f32 = 3.0;
+/// Muted and faint text on a glass card, as shares of the body text: Zeron's.
+const POPUP_MUTED_INK: f32 = 0.64;
+const POPUP_FAINT_INK: f32 = 0.48;
 
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
@@ -611,6 +631,12 @@ pub struct Theme {
     pub syntax_type: Srgb,
     pub syntax_variable: Srgb,
     pub syntax_operator: Srgb,
+
+    /// The card [`Theme::for_popup`] set this theme's inks for. Kept rather
+    /// than searched for again, because the search reads the theme's own muted
+    /// text, which gpui-component still paints on the card, and `for_popup`
+    /// has replaced it with one that can stand a thinner card.
+    popup_card: Option<Rgba>,
 }
 
 impl Theme {
@@ -694,19 +720,142 @@ impl Theme {
         self.bg.alpha(self.tint(DATA_ALPHA))
     }
 
-    /// A modal's card. The densest plane in the window by a long way — it
-    /// covers the work rather than sitting beside it, and what shows through
-    /// is that work, not the desktop — but not opaque: on a glass theme a
-    /// fully solid card is the one surface that stops being the same window.
     /// What an engine's logo is drawn on outside the titlebar: the panes, and
-    /// the palette and switcher overlays, which on glass are composited over
-    /// the window's background.
+    /// the palette and switcher cards. On glass a card is frosted over
+    /// [`Theme::popup_backdrop`], the worst its contents are shown over.
     pub fn logo_planes(self) -> [Srgb; 3] {
-        [self.bg, self.panel, self.overlay_glass().flatten(self.bg)]
+        [
+            self.bg,
+            self.panel,
+            self.overlay_glass().flatten(self.popup_backdrop()),
+        ]
     }
 
+    /// Every floating card — a modal, the palette, the switcher, and each
+    /// menu, select, tooltip and completion list gpui-component draws. On glass
+    /// it is a tint over a backdrop blur of the window beneath it, and that is
+    /// all it covers: the blur only sees what the window drew, and the desktop
+    /// shows through the card exactly as far as it shows through the window
+    /// there. So Zeron's menu fill is where the search starts, and the card
+    /// takes as much more of its own tone as it needs for its text to hold
+    /// [`POPUP_TEXT_CONTRAST`], and muted text [`POPUP_MUTED_CONTRAST`], over
+    /// [`Theme::popup_backdrop`].
+    ///
+    /// Searched for at this theme's opacity, not the floor's: the less of the
+    /// desktop the window lets through, the less a card has to shut out, and
+    /// every opacity change reinstalls the theme and so searches again.
+    /// Searched for rather than tabled per theme, because a theme imported from
+    /// Zed can ask for glass too.
     pub fn overlay_glass(self) -> Rgba {
-        self.overlay.alpha(self.tint(OVERLAY_ALPHA))
+        if let Some(card) = self.popup_card {
+            return card;
+        }
+        if !self.is_glass {
+            return self.overlay.opaque();
+        }
+        let backdrop = self.popup_backdrop();
+        // The theme's own muted as well as the card's: gpui-component paints
+        // its popups' secondary text in the theme's, and has no card to ask.
+        let card_muted = self.popup_ink(self.text_muted, POPUP_MUTED_INK);
+        let holds = |alpha: f32| {
+            let card = self.overlay.alpha(alpha).flatten(backdrop);
+            contrast_ratio(self.text, card) >= POPUP_TEXT_CONTRAST
+                && [self.text_muted, card_muted]
+                    .into_iter()
+                    .all(|muted| contrast_ratio(muted, card) >= POPUP_MUTED_CONTRAST)
+        };
+        let alpha = (0..=40)
+            .map(|step| OVERLAY_ALPHA_FLOOR + (1.0 - OVERLAY_ALPHA_FLOOR) * step as f32 / 40.0)
+            .find(|&alpha| holds(alpha))
+            .unwrap_or(1.0);
+        self.overlay.alpha(alpha)
+    }
+
+    /// The worst a glass card's text can be shown over: the brightest broad
+    /// fill the window paints under dark glass, and the darkest under light,
+    /// with the frost over the worst desktop there is — white under dark
+    /// glass, black under light. Broad because the blur is: at
+    /// [`gpui_component::POPOVER_BLUR`] a line of text or an icon is tone a few
+    /// levels off its plane, and only a fill that covers a good part of the
+    /// card survives it — a plane, a block of selected or edited rows, a
+    /// button. Not a titlebar band: a card opens below the titlebar, never
+    /// over it.
+    fn popup_backdrop(self) -> Srgb {
+        let desktop = match self.appearance {
+            Appearance::Dark => WHITE,
+            Appearance::Light => BLACK,
+        };
+        let chrome = self.frost().flatten(desktop);
+        let planes = [
+            chrome,
+            self.panel_glass().flatten(chrome),
+            self.data_glass().flatten(chrome),
+        ];
+        let washed = planes.into_iter().flat_map(|plane| {
+            [self.selection, self.edited, self.element_active].map(|wash| wash.flatten(plane))
+        });
+        let luminance = |c: &Srgb| c.relative_luminance();
+        let fills = planes.into_iter().chain(washed).chain([self.control]);
+        match self.appearance {
+            Appearance::Dark => fills.max_by(|a, b| luminance(a).total_cmp(&luminance(b))),
+            Appearance::Light => fills.min_by(|a, b| luminance(a).total_cmp(&luminance(b))),
+        }
+        .unwrap_or(desktop)
+    }
+
+    /// This theme as text is set on a floating card. On glass, muted and faint
+    /// may be Zeron's fixed shares of the body text instead of the theme's own
+    /// greys — see [`Theme::popup_ink`] — and each ink is moved in Oklch
+    /// lightness, away from the card, only as far as it takes to hold over
+    /// [`Theme::popup_backdrop`]. The inks move rather than the card: a thin
+    /// card is what makes it frosted, and a faint heading is not worth giving
+    /// that up for. Lightness only, so an error still reads red and a match
+    /// still reads as the accent. An opaque theme comes back unchanged.
+    pub fn for_popup(self) -> Self {
+        if !self.is_glass || self.popup_card.is_some() {
+            return self;
+        }
+        let fill = self.overlay_glass();
+        let card = fill.flatten(self.popup_backdrop());
+        let toward = match self.appearance {
+            Appearance::Dark => 1.0,
+            Appearance::Light => 0.0,
+        };
+        let legible = |ink: Srgb, minimum: f32| {
+            let own = Oklch::from_srgb(ink);
+            let moved = (1..=40).map(|step| {
+                let lightness = own.l + (toward - own.l) * step as f32 / 40.0;
+                Oklch::new(lightness, own.c, own.h).to_srgb()
+            });
+            std::iter::once(ink)
+                .chain(moved)
+                .find(|&ink| contrast_ratio(ink, card) >= minimum)
+                .unwrap_or(self.text)
+        };
+        let muted = self.popup_ink(self.text_muted, POPUP_MUTED_INK);
+        let faint = self.popup_ink(self.text_faint, POPUP_FAINT_INK);
+        Self {
+            text_muted: legible(muted, POPUP_MUTED_CONTRAST),
+            text_faint: legible(faint, POPUP_MUTED_CONTRAST),
+            accent: legible(self.accent, POPUP_MUTED_CONTRAST),
+            danger: legible(self.danger, POPUP_TEXT_CONTRAST),
+            popup_card: Some(fill),
+            ..self
+        }
+    }
+
+    /// The theme's own grey or Zeron's `share` of the body text, whichever
+    /// stands further off the card's own tone: most families' own muted
+    /// already reads better than Zeron's share does, and a card the backdrop
+    /// shows through is no place to give any of that up. Judged on the opaque
+    /// tone, since how much of it the card takes is searched for from this.
+    fn popup_ink(self, own: Srgb, share: f32) -> Srgb {
+        let share = self.text.alpha(share).flatten(self.overlay);
+        if contrast_ratio(share, self.overlay) > contrast_ratio(own, self.overlay) {
+            share
+        } else {
+            own
+        }
     }
 
     /// An opaque theme has no desktop behind it to let through, so every tint
@@ -732,6 +881,8 @@ impl Theme {
     /// and `Workspace::new` sets it again from disk before the first frame.
     pub fn apply_to_components(self, cx: &mut gpui::App) {
         let fonts = fonts(cx).clone();
+        let popup = self.for_popup();
+        cx.set_global(PopupTheme(popup));
         gpui_component::Theme::update(cx, |component| {
             component.shadow = false;
             component.radius = gpui::px(layout::RADIUS_CONTROL);
@@ -765,11 +916,14 @@ impl Theme {
             component.colors.ring = self.accent.into();
             // Only the completion popup reads this, for the matched prefix of a
             // suggestion. Left at the library default it is a blue belonging to no
-            // palette dbdelve ships.
-            component.colors.blue = self.accent.into();
+            // palette dbdelve ships. The card's accent, since the card is the
+            // only place it is painted.
+            component.colors.blue = popup.accent.into();
             component.colors.muted = self.surface.into();
             component.colors.muted_foreground = self.text_muted.into();
-            component.colors.popover = self.overlay.into();
+            // Translucent on glass only, and that is what tells gpui-component
+            // to frost its popups; opaque, they are drawn exactly as before.
+            component.colors.popover = self.overlay_glass().into();
             component.colors.popover_foreground = self.text.into();
             // Both button variants are the same neutral: a dbdelve button is a grey
             // that steps visibly brighter under the pointer, never a colour.
@@ -1086,6 +1240,8 @@ impl Theme {
             syntax_type: Oklch::new(0.80, 0.10, 205.0).to_srgb(),
             syntax_variable: neutral(0.90),
             syntax_operator: neutral(0.74),
+
+            popup_card: None,
         }
     }
 
@@ -1132,6 +1288,8 @@ impl Theme {
             syntax_type: Oklch::new(0.44, 0.12, 205.0).to_srgb(),
             syntax_variable: neutral(0.28),
             syntax_operator: neutral(0.40),
+
+            popup_card: None,
         }
     }
 
@@ -1701,7 +1859,6 @@ pub(crate) fn restored_fonts(stored: Option<store::StoredFonts>, available: &[St
 
 #[cfg(test)]
 mod tests {
-    use super::color::contrast_ratio;
     use super::*;
 
     /// WCAG AA: 4.5 for body text, 3.0 for large text and UI components.
@@ -2109,6 +2266,214 @@ mod tests {
                         glass.name,
                         got.h,
                         own.h
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every opacity the setting can land on, floor to ceiling.
+    fn opacities() -> impl Iterator<Item = f32> {
+        let steps = ((OPACITY_MAX - OPACITY_MIN) / OPACITY_STEP).round() as usize;
+        (0..=steps).map(|step| OPACITY_MIN + OPACITY_STEP * step as f32)
+    }
+
+    #[test]
+    fn a_floating_card_keeps_its_text_over_the_worst_backdrop() {
+        // A glass card is a tint over a blur of the window beneath it, and the
+        // blur softens what is under it without darkening it, so the raw-tint
+        // checks say nothing here. At every opacity the setting allows, since
+        // the card is searched for at the one in force. Asked for on the
+        // installed theme, as gpui-component does, and on `for_popup`'s, as
+        // the app's own cards do.
+        for t in Theme::all().into_iter().filter(|t| t.is_glass) {
+            for (asker, t, asked) in opacities()
+                .map(|opacity| t.with_opacity(opacity))
+                .flat_map(|t| [("installed", t, t), ("popup", t, t.for_popup())])
+            {
+                let card = asked.overlay_glass();
+                let under = card.flatten(t.popup_backdrop());
+                let at =
+                    |what: &str| format!("{what} at {:.2}, asked on the {asker} theme", t.opacity);
+                check(t, &at("text on a floating card"), t.text, under, AA_TEXT);
+                check(
+                    t,
+                    &at("muted on a floating card"),
+                    t.text_muted,
+                    under,
+                    AA_LARGE,
+                );
+                check(
+                    t,
+                    &at("a floating card's own muted"),
+                    t.for_popup().text_muted,
+                    under,
+                    AA_LARGE,
+                );
+                // A card that has to go solid to be read has stopped being
+                // glass, which is a palette to fix rather than a fill to accept.
+                assert!(
+                    (OVERLAY_ALPHA_FLOOR..1.0).contains(&card.a),
+                    "{}: a floating card at {:.3} of its own tone at {:.2}",
+                    t.name,
+                    card.a,
+                    t.opacity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_floating_cards_inks_hold_over_the_worst_backdrop() {
+        // The card is searched for its body and muted text only; faint, danger
+        // and accent are moved to hold on whatever card that leaves.
+        for t in Theme::all().into_iter().filter(|t| t.is_glass) {
+            for t in opacities().map(|opacity| t.with_opacity(opacity)) {
+                let popup = t.for_popup();
+                let under = popup.overlay_glass().flatten(t.popup_backdrop());
+                let at = |what: &str| format!("{what} on a floating card at {:.2}", t.opacity);
+                check(t, &at("faint"), popup.text_faint, under, AA_LARGE);
+                check(t, &at("accent"), popup.accent, under, AA_LARGE);
+                check(t, &at("danger"), popup.danger, under, AA_TEXT);
+            }
+        }
+    }
+
+    #[test]
+    fn a_floating_card_is_the_same_card_whichever_theme_asks_for_it() {
+        // The switcher and the reference popup ask on the theme `for_popup`
+        // returns, gpui-component's popups on the installed one, and they sit
+        // side by side.
+        for t in Theme::all() {
+            for t in opacities().map(|opacity| t.with_opacity(opacity)) {
+                let popup = t.for_popup();
+                assert_eq!(
+                    popup.overlay_glass(),
+                    t.overlay_glass(),
+                    "{} at {:.2}",
+                    t.name,
+                    t.opacity
+                );
+                let again = popup.for_popup();
+                assert_eq!(
+                    (again.text_muted, again.text_faint),
+                    (popup.text_muted, popup.text_faint),
+                    "{} at {:.2}",
+                    t.name,
+                    t.opacity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_floating_card_is_backed_by_the_worst_fill_it_can_cover() {
+        // Built here from the tokens the way the window stacks them, rather
+        // than taken from `popup_backdrop`'s own list, so a fill that list
+        // misses fails here. Each plane under each wash a block of rows can
+        // wear, a table's header, and a button at rest. Not a hovered or
+        // pressed one: the pointer doing that is on the card instead.
+        for t in Theme::all().into_iter().filter(|t| t.is_glass) {
+            for t in opacities().map(|opacity| t.with_opacity(opacity)) {
+                let backdrop = t.popup_backdrop().relative_luminance();
+                let (desktop, worse): (Srgb, fn(f32, f32) -> bool) = match t.appearance {
+                    Appearance::Dark => (WHITE, |a, b| a > b),
+                    Appearance::Light => (BLACK, |a, b| a < b),
+                };
+                let chrome = t.frost().flatten(desktop);
+                let editor = t.panel_glass().flatten(chrome);
+                let results = t.data_glass().flatten(chrome);
+                let mut fills = vec![
+                    ("chrome".to_string(), chrome),
+                    ("the editor".to_string(), editor),
+                    ("the results".to_string(), results),
+                    (
+                        "a table's header".to_string(),
+                        t.panel_glass().flatten(results),
+                    ),
+                    ("a button".to_string(), t.control),
+                ];
+                for (plane, under) in [
+                    ("chrome", chrome),
+                    ("the editor", editor),
+                    ("the results", results),
+                ] {
+                    for (wash, over) in [
+                        ("selected", t.selection),
+                        ("edited", t.edited),
+                        ("hovered", t.element_hover),
+                        ("highlighted", t.element_active),
+                    ] {
+                        fills.push((format!("{wash} rows on {plane}"), over.flatten(under)));
+                    }
+                }
+                for (name, fill) in fills {
+                    assert!(
+                        !worse(fill.relative_luminance(), backdrop),
+                        "{} at {:.2}: {name} is worse than the card's backdrop",
+                        t.name,
+                        t.opacity
+                    );
+                }
+                assert!(
+                    worse(desktop.relative_luminance(), backdrop),
+                    "{} at {:.2}: a card searched against the bare desktop",
+                    t.name,
+                    t.opacity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_floating_card_lets_the_desktop_through_at_the_default() {
+        // The complaint this exists to catch: a card searched against a white
+        // backdrop came out near-opaque and read as a solid slab beside the
+        // frosted window around it. At the default every family's card is
+        // still mostly the window behind it.
+        for t in Theme::all().into_iter().filter(|t| t.is_glass) {
+            let card = t.with_opacity(t.default_opacity()).overlay_glass();
+            assert!(
+                card.a <= 0.30,
+                "{}: a floating card at {:.3} of its own tone at the default",
+                t.name,
+                card.a
+            );
+        }
+    }
+
+    #[test]
+    fn an_opaque_theme_floats_its_cards_exactly_as_before() {
+        for t in Theme::all().into_iter().filter(|t| !t.is_glass) {
+            assert_eq!(t.overlay_glass(), t.overlay.opaque(), "{}", t.name);
+            let popup = t.for_popup();
+            assert_eq!(
+                (popup.text_muted, popup.text_faint),
+                (t.text_muted, t.text_faint),
+                "{}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_floating_cards_muted_text_never_reads_worse_than_the_themes_own() {
+        // On the card as it is drawn over the worst backdrop, not on its
+        // opaque tone, which is what `popup_ink` already chose by.
+        for t in Theme::all() {
+            for t in opacities().map(|opacity| t.with_opacity(opacity)) {
+                let popup = t.for_popup();
+                let card = t.overlay_glass().flatten(t.popup_backdrop());
+                for (name, own, on_card) in [
+                    ("muted", t.text_muted, popup.text_muted),
+                    ("faint", t.text_faint, popup.text_faint),
+                ] {
+                    let (own, on_card) = (contrast_ratio(own, card), contrast_ratio(on_card, card));
+                    assert!(
+                        on_card >= own,
+                        "{} at {:.2}: {name} on a floating card at {on_card:.2}, the theme's own at {own:.2}",
+                        t.name,
+                        t.opacity
                     );
                 }
             }

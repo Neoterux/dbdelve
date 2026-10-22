@@ -653,7 +653,7 @@ impl Workspace {
                             .text_color(t.text_faint)
                             .child("No connections yet"),
                     )
-                    .child(self.project_actions(index, &project.name, cx))
+                    .child(self.project_actions(index, &project.name, t, cx))
                     .child(
                         button(
                             ("welcome-add-connection", index),
@@ -765,7 +765,7 @@ impl Workspace {
     /// Where an import's connections go, asked before any is added: a new
     /// project named for the client by default, one already made, or none.
     pub(crate) fn render_import_choice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let pending = self.pending_import.as_ref()?;
         let source = pending.source.label();
         let known = self
@@ -912,7 +912,7 @@ impl Workspace {
     /// `Palette > Input`, which is the only predicate deep enough to win the
     /// keystroke back from the search field. See `move_palette_selection`.
     pub(crate) fn render_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let list = self.palette.as_ref()?;
         let placeholder = list.read(cx).delegate().placeholder();
         let workspace = cx.entity().downgrade();
@@ -938,11 +938,10 @@ impl Workspace {
                         // list grows downwards from a fixed line.
                         .mt(px(layout::TITLEBAR_HEIGHT * 2.))
                         .w(px(layout::PALETTE_WIDTH))
-                        .bg(t.overlay_glass())
                         .border_1()
                         .border_color(t.border_strong)
                         .rounded(px(layout::RADIUS_PANEL))
-                        .shadow_lg()
+                        .map(|card| raised_card(card, t))
                         .overflow_hidden()
                         .child(
                             List::new(list)
@@ -961,7 +960,7 @@ impl Workspace {
 
     /// What `cmd+w` asks before it takes unapplied cell edits with the tab.
     pub(crate) fn render_reference_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let popup = self.reference_popup.as_ref()?;
         let rows: Vec<AnyElement> = match &popup.choices {
             None => vec![note(t, "Checking…")],
@@ -1021,7 +1020,7 @@ impl Workspace {
                         .flex()
                         .flex_col()
                         .rounded(px(layout::RADIUS_CONTROL))
-                        .bg(t.overlay)
+                        .map(|card| frosted_card(card, t))
                         .border_1()
                         .border_color(t.border)
                         .children(rows)
@@ -1038,7 +1037,7 @@ impl Workspace {
     }
 
     pub(crate) fn render_discard_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         self.profile()?.session.pending_discard.as_ref()?;
         let cancel_workspace = cx.entity().downgrade();
         let discard_workspace = cancel_workspace.clone();
@@ -1111,7 +1110,7 @@ impl Workspace {
 
     /// What `cmd+w` asks before it takes a saved query with the tab.
     pub(crate) fn render_close_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let name = self.profile()?.session.pending_close.clone()?;
         let cancel_workspace = cx.entity().downgrade();
         let delete_workspace = cancel_workspace.clone();
@@ -1191,7 +1190,7 @@ impl Workspace {
     /// verdict behind it cannot disagree about what they are asking (spec
     /// §5).
     pub(crate) fn render_pending_run(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let profile = self.profile()?;
         let pending = profile.session.pending_run.as_ref()?;
         // Re-derived rather than trusted from when the prompt was raised: the
@@ -1355,7 +1354,7 @@ impl Workspace {
     /// A queue's statement failed with more of the queue left to run, so the
     /// rest waits here until the user says whether it still runs.
     pub(crate) fn render_queue_failure(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let profile = self.profile()?;
         let Tab::Query(id) = profile.session.queue_failure? else {
             return None;
@@ -1451,7 +1450,7 @@ impl Workspace {
     /// Asked before the first edit on rows restored from an earlier session,
     /// which may no longer be what the database holds.
     pub(crate) fn render_stale_edit(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let profile = self.profile()?;
         let stale = profile.session.stale_edit.as_ref()?;
         let dont_ask = stale.dont_ask;
@@ -1614,7 +1613,7 @@ impl Workspace {
     /// starts and the pending edits go with it, so after a failure this is the
     /// only remaining copy of what was attempted.
     pub(crate) fn render_apply_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = *theme(cx);
+        let t = popup_theme(cx);
         let code = fonts(cx).editor.clone();
         let profile = self.profile()?;
         let review = profile.session.apply_review.as_ref()?;
@@ -1724,6 +1723,7 @@ impl Workspace {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
         let panel = self.switcher_open.then(|| {
+            let t = popup_theme(cx);
             let add_workspace = workspace.clone();
             let dismiss_workspace = workspace.clone();
             let searched = self.searched_connections(cx);
@@ -1972,7 +1972,7 @@ impl Workspace {
                 };
                 profile_rows.entry(group).or_default().push(row);
             }
-            let groups = self.render_project_groups(profile_rows, searched.is_some(), cx);
+            let groups = self.render_project_groups(profile_rows, searched.is_some(), t, cx);
 
             div()
                 .absolute()
@@ -1993,11 +1993,10 @@ impl Workspace {
                 .left_0()
                 .w(px(layout::SWITCHER_WIDTH))
                 .p(px(layout::SPACE_XS))
-                .bg(t.overlay_glass())
                 .border_1()
                 .border_color(t.border_strong)
                 .rounded(px(layout::RADIUS_PANEL))
-                .shadow_lg()
+                .map(|card| raised_card(card, t))
                 .flex()
                 .flex_col()
                 .children(self.connection_search.as_ref().map(|input| {
@@ -2194,9 +2193,9 @@ impl Workspace {
         &self,
         mut members: HashMap<Option<String>, Vec<AnyElement>>,
         searching: bool,
+        t: Theme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let t = *theme(cx);
         let workspace = cx.entity().downgrade();
         let current = self.current_group().map(str::to_string);
         let mut rows = Vec::new();
@@ -2287,7 +2286,7 @@ impl Workspace {
                 {
                     rows.push(name_field(input));
                 } else {
-                    rows.push(self.project_header(index, project, is_current, expanded, cx));
+                    rows.push(self.project_header(index, project, is_current, expanded, t, cx));
                 }
                 if expanded {
                     rows.push(group_body(Some(&project.name), index));
@@ -2319,9 +2318,9 @@ impl Workspace {
         project: &store::StoredProject,
         selected: bool,
         expanded: bool,
+        t: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let t = *theme(cx);
         let workspace = cx.entity().downgrade();
         let name = project.name.clone();
         group_header(("project", index), selected, expanded, t)
@@ -2336,7 +2335,7 @@ impl Workspace {
                     .whitespace_nowrap()
                     .child(project.name.clone()),
             )
-            .child(self.project_actions(index, &project.name, cx))
+            .child(self.project_actions(index, &project.name, t, cx))
             .on_click(move |_, _, cx| {
                 _ = workspace.update(cx, |workspace, cx| {
                     workspace.toggle_group(Some(name.clone()), cx);
@@ -2347,8 +2346,13 @@ impl Workspace {
 
     /// Rename and delete, revealed by hovering a row grouped as
     /// `project-row-{index}`, or held in view while the delete is armed.
-    fn project_actions(&self, index: usize, name: &str, cx: &mut Context<Self>) -> gpui::Div {
-        let t = *theme(cx);
+    fn project_actions(
+        &self,
+        index: usize,
+        name: &str,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let workspace = cx.entity().downgrade();
         let rename_workspace = workspace.clone();
         let rename_name = name.to_string();
