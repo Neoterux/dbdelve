@@ -28,6 +28,18 @@ on:
       - "dev/**"
       - ".github/workflows/ci.yml"
 
+# Only main saves: the repository gets 10 GB of cache, and every job on every
+# branch saving its own 0.5-2 GB copy evicted main's within the hour, so most
+# runs started cold. PRs still restore main's.
+#
+# The vendored crates under vendor/ rebuild on every run whatever the cache
+# holds: cargo judges a path crate fresh by file mtimes, and a checkout gives
+# every file a new one. Only a non-path source (a git dependency) avoids that.
+# Nothing here pushes or comments; build scripts and proc macros from a PR run
+# with whatever token the job holds.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -37,9 +49,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: |
-          sudo apt-get update
+          # The runner image ships Microsoft's apt repository, which we install
+          # nothing from; when it errors (403s, lapsed signatures) it fails
+          # the whole update.
+          { grep -rl packages.microsoft.com /etc/apt/sources.list.d || true; } | xargs -r sudo rm -f
+          sudo apt-get update -o Acquire::Retries=3
           sudo apt-get install -y build-essential pkg-config cmake \
             libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libdbus-1-dev
@@ -66,11 +86,19 @@ jobs:
       dbdelve_SSH_CONFIG: ${{ github.workspace }}/dev/ssh/.generated/ssh_config
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Started before the apt step so the databases boot while it runs.
       - run: docker compose up -d
       - run: |
-          sudo apt-get update
+          # The runner image ships Microsoft's apt repository, which we install
+          # nothing from; when it errors (403s, lapsed signatures) it fails
+          # the whole update.
+          { grep -rl packages.microsoft.com /etc/apt/sources.list.d || true; } | xargs -r sudo rm -f
+          sudo apt-get update -o Acquire::Retries=3
           sudo apt-get install -y build-essential pkg-config cmake \
             libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libdbus-1-dev sqlite3 \
@@ -82,7 +110,11 @@ jobs:
       # without one; the mock tests cover the same ground offline. The one
       # live test that needs no account stays: it is what proves the TLS
       # provider is linked at run time.
-      - run: cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_
+      - run: cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ --skip reads_run_at_once
+      # These time two reads run at once against the same two in turn. With
+      # the rest of the suite sharing the runner's cores, a CPU-bound engine
+      # like SQLite misses the margin by chance, so they run alone.
+      - run: cargo test reads_run_at_once -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ --test-threads=1
       - run: cargo test snowflake::tests::live_an_account_that_does_not_exist -- --ignored
       # The backdrop blur's pixel tests live in the vendored wgpu renderer,
       # which isn't a workspace member, so `cargo test` alone never runs them.
@@ -94,21 +126,33 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets -- -D warnings
 
   macos-build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build
 
   windows-lint:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets -- -D warnings
 
   # Tests too, not only the build: the storage tests are what exercise the
@@ -117,7 +161,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build
       - run: cargo test
       # The backdrop blur's Direct3D WARP pixel tests live in the vendored
