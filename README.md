@@ -6,7 +6,7 @@ and keeps scrolling smoothly through large tables at which other clients crash o
 
 > Early days. Everything listed below works today.
 
-![DBDelve in Gruvbox Dark Glass: a table open in the grid, with the row panel showing one row's values and its JSON highlighted](assets/screenshots/table-dark.png)
+![DBDelve in Gruvbox Dark Glass: a SELECT on the events table in the editor and its result grid below](assets/screenshots/query-dark.png)
 
 ![DBDelve in Gruvbox Light Glass: a join in the editor and its result grid below](assets/screenshots/query-light.png)
 
@@ -68,6 +68,8 @@ time.
   Tokyo Night, Gruvbox and Dracula, each in dark and light, and each of those
   in glass. Import themes from Zed or VS Code, or write your own; see
   [docs/themes.md](docs/themes.md).
+
+  ![The theme picker, with themes imported from Zed and VS Code and the import commands below them](assets/screenshots/themes.png)
 - **Bring your connections with you.** Import every saved connection,
   passwords and SSH settings included, from DBeaver on macOS, Linux and
   Windows, or from TablePlus on macOS.
@@ -85,6 +87,8 @@ time.
 - **Read a row in full.** Open the row panel to see every value in a row at
   full length, with JSON highlighted, and edit a long value there instead of
   in a cell.
+
+  ![A table open in the grid, with the row panel showing one row's values and its JSON highlighted](assets/screenshots/table-dark.png)
 - **Import rows from a file.** Load a CSV, TSV or JSON file into a table or
   collection. Every row is checked, and every statement shown, before anything
   runs.
@@ -103,7 +107,7 @@ time.
   and your connections, with fuzzy search throughout and every shortcut
   rebindable. Settings are searchable too, docked beside your work.
 
-  ![The command palette scoped to connections, grouped by project](assets/screenshots/palette-connections.png)
+  <img src="assets/screenshots/shortcuts.png" width="360" alt="The Shortcuts page in Settings: every action with its key binding and an Edit button">
 - **Your SSH, not a reimplementation.** Tunnels run through your own `ssh`, so
   your config, agent and hardware keys just work.
 
