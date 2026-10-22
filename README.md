@@ -6,9 +6,9 @@ and keeps scrolling smoothly through large tables at which other clients crash o
 
 > Early days. Everything listed below works today.
 
-![DBDelve, dark theme](assets/screenshotglass.png)
+![DBDelve in Gruvbox Dark Glass: a table open in the grid, with the row panel showing one row's values and its JSON highlighted](assets/screenshots/table-dark.png)
 
-![DBDelve, light theme](assets/screenshotlight.png)
+![DBDelve in Gruvbox Light Glass: a join in the editor and its result grid below](assets/screenshots/query-light.png)
 
 DBDelve in action with 1M rows loaded.
 
@@ -59,6 +59,8 @@ How these were measured, and the full results, are in [BENCHMARKS.md](BENCHMARKS
 Support for other database engines is planned, and more will be added over
 time.
 
+![The welcome screen: paste a connection URL or pick one of the engines, import from DBeaver or TablePlus, or pick a theme](assets/screenshots/welcome.png)
+
 ## What it does
 
 - **Make it yours.** A theme library with DBDelve's own Dark, Light and Black,
@@ -73,10 +75,35 @@ time.
   schema tree and history, and wears its own color in the title bar. Run it
   read-only, read-write or with full access, and DBDelve asks before anything
   destructive.
+
+  ![The connection form, grouped into connection, security and behaviour, with a color and a project for the connection](assets/screenshots/connection-form.png)
 - **Edits you can read first.** Change a cell in place and DBDelve writes the
   `UPDATE` into the editor for you to check before it runs.
-- **Keyboard-first.** A command palette for everything, fuzzy search across
-  your schema, and every shortcut rebindable.
+- **Keep the columns you need.** Hide the rest, or pin a column to the left
+  edge so it stays put while you scroll. The layout is still there after a
+  restart.
+- **Read a row in full.** Open the row panel to see every value in a row at
+  full length, with JSON highlighted, and edit a long value there instead of
+  in a cell.
+- **Import rows from a file.** Load a CSV, TSV or JSON file into a table or
+  collection. Every row is checked, and every statement shown, before anything
+  runs.
+
+  ![Importing events.csv: format options on the left, each file column mapped to a table column, and a preview of the rows](assets/screenshots/import.png)
+- **See the query plan.** Run Explain, or type an `EXPLAIN` yourself, and the
+  plan opens highlighted in a pane of its own, with bad row estimates called
+  out.
+
+  ![An Explain Analyze plan for a join: each node with its actual and estimated rows and time, and a ×76 misestimate flagged](assets/screenshots/query-plan.png)
+- **Completion that knows your schema.** Tables and columns as you type, and
+  a table's columns as soon as you write its name and a dot.
+
+  ![Completing accounts. to its columns in a join](assets/screenshots/completion.png)
+- **Keyboard-first.** One palette for commands, tables, saved queries, history
+  and your connections, with fuzzy search throughout and every shortcut
+  rebindable. Settings are searchable too, docked beside your work.
+
+  ![The command palette scoped to connections, grouped by project](assets/screenshots/palette-connections.png)
 - **Your SSH, not a reimplementation.** Tunnels run through your own `ssh`, so
   your config, agent and hardware keys just work.
 
