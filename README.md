@@ -44,16 +44,8 @@ data lives are all in [docs/install.md](docs/install.md).
 
 ## Supported databases
 
-Postgres, MySQL, MariaDB, SQLite, Snowflake, SQL Server, MongoDB and Redis
-(and Valkey, KeyDB, Dragonfly). A few engines have limits of their own:
-
-- **Snowflake:** no in-line editing, since it doesn't enforce primary keys.
-  [Setup](docs/snowflake.md).
-- **SQL Server:** 2017 or later, no Explain. [What differs](docs/mssql.md).
-- **MongoDB:** mongosh statements like `db.accounts.find({ status: "active" })`.
-  No transactions, so a batch of edits applies in order.
-- **Redis:** redis-cli commands in the editor, every key type editable as a
-  grid. [More](docs/redis.md).
+Postgres, MySQL, MariaDB, SQLite, Turso, Snowflake, SQL Server, MongoDB and
+Redis (and Valkey, KeyDB, Dragonfly).
 
 More engines are planned.
 
