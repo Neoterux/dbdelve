@@ -16,6 +16,7 @@ mod profiles;
 mod projects;
 mod queries;
 mod tabs;
+mod welcome;
 
 use std::collections::{HashMap, HashSet};
 
@@ -57,6 +58,8 @@ pub(crate) struct Settings {
     /// holds rather than by asking the server again. Off by default, which is
     /// how every tab sorted before this was a choice.
     pub(crate) client_sort: bool,
+    /// Whether the first-run greeting has played on the welcome surface.
+    pub(crate) welcomed: bool,
     /// Keybinding overrides, keyed by action id. Applied to the keymap on
     /// the next launch -- see `src/keybindings.rs`.
     pub(crate) custom_keybindings: HashMap<String, String>,
@@ -84,6 +87,7 @@ impl Default for Settings {
             check_for_updates: true,
             color_titlebar: true,
             client_sort: false,
+            welcomed: false,
             custom_keybindings: HashMap::new(),
         }
     }
@@ -218,6 +222,13 @@ pub(crate) struct Workspace {
     /// The welcome surface's half of `editor_needs_focus`: set when whatever
     /// held focus over it has gone, applied on the next frame.
     pub(crate) welcome_needs_focus: bool,
+    /// The welcome surface's connection URL field. Kept rather than built
+    /// with the surface: a fresh one every frame would lose what was typed.
+    pub(crate) welcome_url: Entity<InputState>,
+    /// When the welcome surface last came on screen, and whether it was
+    /// greeting a first run. `None` while something else is in front, so it
+    /// enters again the next time it is shown.
+    pub(crate) welcome_entrance: Option<welcome::Entrance>,
     /// A column a structure tab asked to see, waiting for its data tab's rows:
     /// the tab's id and the column's name.
     pub(crate) reveal_on_rows: Option<(u64, String)>,
@@ -278,6 +289,21 @@ impl Workspace {
                 workspace.search_settings(cx);
             }
         })
+        .detach();
+        let welcome_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Paste a connection URL")
+                .clean_on_escape()
+        });
+        cx.subscribe_in(
+            &welcome_url,
+            window,
+            |workspace, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => workspace.submit_welcome_url(window, cx),
+                _ => {}
+            },
+        )
         .detach();
         let opacity_input = cx.new(|cx| InputState::new(window, cx));
         // With the window, because committing reinstalls the theme. Enter and
@@ -346,6 +372,8 @@ impl Workspace {
             welcome_notice: None,
             project_name_error: None,
             welcome_needs_focus: true,
+            welcome_url,
+            welcome_entrance: None,
             reveal_on_rows: None,
             store_unreadable: false,
             next_generation: 0,
@@ -383,7 +411,10 @@ impl Workspace {
                     .flatten()
                     .map(|(name, opacity)| (name.clone(), restored_opacity(Some(*opacity))))
                     .collect();
-                let restored = restored_theme(stored_settings.theme.as_deref());
+                let restored = restored_theme(
+                    stored_settings.theme.as_deref(),
+                    theme::Appearance::of_system(cx.window_appearance()),
+                );
                 install_theme(
                     restored.with_opacity(workspace.settings.opacity_for(&restored)),
                     window,
@@ -408,6 +439,8 @@ impl Workspace {
                     stored_settings.check_for_updates.unwrap_or(true);
                 workspace.settings.color_titlebar = stored_settings.color_titlebar.unwrap_or(true);
                 workspace.settings.client_sort = stored_settings.client_sort.unwrap_or(false);
+                workspace.settings.welcomed =
+                    welcome::welcomed(stored_settings.welcomed, !profiles.is_empty());
                 workspace.settings.custom_keybindings = stored_settings
                     .custom_keybindings
                     .clone()
@@ -1084,7 +1117,7 @@ impl Render for Workspace {
             && self.profiles.is_empty()
             && std::mem::take(&mut self.welcome_needs_focus)
         {
-            self.focus.focus(window, cx);
+            self.welcome_url.focus_handle(cx).focus(window, cx);
         }
         if std::mem::take(&mut self.custom_limit_needs_focus)
             && let Some((_, input)) = &self.custom_limit
@@ -1118,6 +1151,11 @@ impl Render for Workspace {
             }
         }
 
+        if self.form.is_some() || self.profile().is_some() {
+            self.welcome_entrance = None;
+        } else {
+            self.begin_welcome(cx);
+        }
         if self.form.is_some() {
             return div()
                 .id("connection-form")
@@ -1171,7 +1209,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::zoom_editor_out))
                 .on_action(cx.listener(Self::reset_editor_zoom))
                 .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
-                .child(self.beside_settings(self.render_welcome(cx).into_any_element(), cx))
+                .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.render_import_choice(cx))
                 .children(self.palette.clone());
         };

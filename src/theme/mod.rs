@@ -141,6 +141,28 @@ pub mod layout {
     pub const PALETTE_ACCENT_BAR_HEIGHT: f32 = 16.0;
     /// The settings panel, docked at the window's right edge. Not scaled with
     /// the chrome: a row too narrow for its control puts it under the text.
+    /// The welcome surface. Its card is narrower than the palette's: it holds
+    /// a grid of short engine names, not long labels.
+    pub const WELCOME_WIDTH: f32 = 520.0;
+    pub const WELCOME_TOP: f32 = 104.0;
+    /// Less air above once projects are in the card, so their list starts
+    /// on screen on a laptop.
+    pub const WELCOME_TOP_WITH_PROJECTS: f32 = 64.0;
+    pub const WELCOME_MARK_SIZE: f32 = 44.0;
+    pub const WELCOME_MARK_GAP: f32 = 14.0;
+    pub const WELCOME_TITLE_SIZE: f32 = 20.0;
+    pub const WELCOME_TITLE_LINE: f32 = 26.0;
+    pub const WELCOME_TITLE_GAP: f32 = 22.0;
+    pub const WELCOME_FIELD_ICON: f32 = 18.0;
+    pub const WELCOME_SECTION_PADDING: f32 = 6.0;
+    pub const WELCOME_ITEM_GAP: f32 = 2.0;
+    pub const WELCOME_ITEM_INSET: f32 = 10.0;
+    /// Concentric with the card's corner: its radius less the padding between.
+    pub const WELCOME_ITEM_RADIUS: f32 = RADIUS_CARD - WELCOME_SECTION_PADDING;
+    pub const WELCOME_GRID_COLUMNS: u16 = 3;
+    /// A card narrower than this has no room for three engine names a row.
+    pub const WELCOME_NARROW: f32 = 420.0;
+
     pub const SETTINGS_PANEL_WIDTH: f32 = 440.0;
     /// The most of a narrow window's width the panel takes, so the window's
     /// own edge never cuts it off.
@@ -168,6 +190,19 @@ pub mod layout {
     /// The accent as a tint behind a selected pill, and as its edge.
     pub const ACCENT_WASH: f32 = 0.14;
     pub const ACCENT_EDGE: f32 = 0.45;
+    /// How much of `border` the welcome surface's contours keep.
+    pub const CONTOUR_SHARE: f32 = 0.8;
+    /// How much of the card's tone the light behind it carries.
+    pub const LIFT_ALPHA: f32 = 0.6;
+    /// The welcome backdrop is rasterised again only when the window crosses
+    /// one of these steps, not on every pixel of a resize.
+    pub const BACKDROP_STEP: f32 = 160.0;
+    /// The lift is a soft gradient, so it is rasterised this many times
+    /// smaller and scaled up: nothing in it needs the resolution.
+    pub const LIFT_DOWNSCALE: f32 = 8.0;
+    /// The contour asset's width over its height, which the backdrop keeps
+    /// whatever shape the window is.
+    pub const BACKDROP_ASPECT: f32 = 1200.0 / 780.0;
     /// An anchored menu, capped so a wide relation's column list scrolls rather
     /// than running off the window.
     pub const MENU_MAX_HEIGHT: f32 = 320.0;
@@ -208,6 +243,16 @@ pub enum Appearance {
     #[default]
     Dark,
     Light,
+}
+
+impl Appearance {
+    /// The system's light or dark, whatever its vibrancy.
+    pub fn of_system(appearance: gpui::WindowAppearance) -> Self {
+        match appearance {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Self::Light,
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => Self::Dark,
+        }
+    }
 }
 
 impl gpui::Global for Theme {}
@@ -697,9 +742,11 @@ impl Theme {
         all
     }
 
-    /// Every theme dbdelve ships: every dark theme, then every light one. The
-    /// first is the default, and opaque: a blurred window reads as noise among
-    /// a desktop full of others, so glass is something to pick, not a start.
+    /// Every theme dbdelve ships: every dark theme, then every light one. A
+    /// first run starts on the first or on DBDelve Light, by the system's
+    /// appearance (`starting_theme`), and both are opaque: a blurred window
+    /// reads as noise among a desktop full of others, so glass is something to
+    /// pick, not a start.
     fn built_in() -> [Self; 29] {
         [
             Self::black(),
@@ -770,6 +817,20 @@ impl Theme {
     }
 
     /// The dim laid over the window behind a modal surface.
+    /// The depth contours behind the welcome card: the hairline, fainter,
+    /// since they are scenery rather than an edge.
+    pub fn contour(self) -> Rgba {
+        Rgba {
+            a: self.border.a * layout::CONTOUR_SHARE,
+            ..self.border
+        }
+    }
+
+    /// The glow the welcome card sits in: the card's own tone, thinned.
+    pub fn lift(self) -> Rgba {
+        self.overlay.alpha(layout::LIFT_ALPHA)
+    }
+
     pub fn scrim(self) -> Rgba {
         BLACK.alpha(match self.appearance {
             Appearance::Dark => SCRIM_DARK,
@@ -1867,11 +1928,21 @@ const RENAMED_THEMES: [(&str, &str); 4] = [
     ("GitHub Glass", "GitHub Dark Glass"),
 ];
 
+/// Where someone who has never picked a theme starts: the opaque DBDelve theme
+/// on the system's side. Only a start; once one is saved the system's
+/// appearance no longer matters.
+pub(crate) fn starting_theme(system: Appearance) -> Theme {
+    match system {
+        Appearance::Dark => Theme::black(),
+        Appearance::Light => Theme::light(),
+    }
+}
+
 /// A theme read back from disk, by name. An absent or unknown name is the
-/// default: a palette dropped from `all` between launches must not strand the
-/// app on a name nothing answers to. Case-blind because the names were
-/// once spelled "dbdelve Dark" and profiles written then still say so.
-pub(crate) fn restored_theme(name: Option<&str>) -> Theme {
+/// starting theme: a palette dropped from `all` between launches must not
+/// strand the app on a name nothing answers to. Case-blind because the names
+/// were once spelled "dbdelve Dark" and profiles written then still say so.
+pub(crate) fn restored_theme(name: Option<&str>, system: Appearance) -> Theme {
     name.and_then(|name| {
         let name = RENAMED_THEMES
             .iter()
@@ -1881,7 +1952,7 @@ pub(crate) fn restored_theme(name: Option<&str>) -> Theme {
             .into_iter()
             .find(|theme| theme.name.eq_ignore_ascii_case(name))
     })
-    .unwrap_or_default()
+    .unwrap_or_else(|| starting_theme(system))
 }
 
 /// Push a theme everywhere it is read from. Only a glass theme wants the
@@ -2642,18 +2713,53 @@ mod tests {
         // so restoring it alone proves nothing.
         for (old, new) in RENAMED_THEMES {
             assert!(Theme::all().iter().any(|t| t.name == new), "{new}");
-            assert_eq!(restored_theme(Some(old)).name, new);
+            assert_eq!(restored_theme(Some(old), Appearance::Dark).name, new);
         }
         assert_eq!(
-            restored_theme(Some("gruvbox glass")).name,
+            restored_theme(Some("gruvbox glass"), Appearance::Dark).name,
             "Gruvbox Dark Glass"
         );
-        assert_eq!(restored_theme(Some("Dracula Glass")).name, "Dracula Glass");
+        assert_eq!(
+            restored_theme(Some("Dracula Glass"), Appearance::Dark).name,
+            "Dracula Glass"
+        );
+    }
+
+    #[test]
+    fn a_first_run_starts_on_the_systems_side_and_a_saved_theme_wins() {
+        assert_eq!(
+            restored_theme(None, Appearance::Light).name,
+            "DBDelve Light"
+        );
+        assert_eq!(restored_theme(None, Appearance::Dark).name, "DBDelve Black");
+        for system in [Appearance::Light, Appearance::Dark] {
+            assert!(!restored_theme(None, system).is_glass);
+            assert_eq!(
+                restored_theme(Some("Dracula"), system).name,
+                "Dracula",
+                "{system:?}"
+            );
+            assert_eq!(
+                restored_theme(Some("DBDelve Black"), system).name,
+                "DBDelve Black"
+            );
+        }
+        assert_eq!(
+            Appearance::of_system(gpui::WindowAppearance::VibrantLight),
+            Appearance::Light
+        );
+        assert_eq!(
+            Appearance::of_system(gpui::WindowAppearance::VibrantDark),
+            Appearance::Dark
+        );
     }
 
     #[test]
     fn a_theme_stored_under_its_old_lowercase_name_is_still_restored() {
-        assert_eq!(restored_theme(Some("dbdelve Dark")).name, "DBDelve Dark");
+        assert_eq!(
+            restored_theme(Some("dbdelve Dark"), Appearance::Dark).name,
+            "DBDelve Dark"
+        );
     }
 
     #[test]
