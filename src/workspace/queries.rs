@@ -5,11 +5,10 @@
 
 use std::ops::Range;
 
-use gpui::Pixels;
 use gpui_component::table::TableState;
 
 use crate::db::{Feed, Fetch, QueryResult, Row, Stopped};
-use crate::result_grid::ColumnView;
+use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{Finished, Lane, PendingRun, Queue, Resume, Step, TabKey, next_step};
@@ -2210,11 +2209,13 @@ impl Workspace {
                                     let sort = sort_columns(engine, &keys, &result.columns);
                                     let (names, widths, vertical, horizontal, column_view) = &shown;
                                     let column_view = carried_view(table.delegate(), column_view);
+                                    let (carried_names, carried_widths) =
+                                        carried_layout(table.delegate(), names, widths);
                                     *table.delegate_mut() = ResultGrid::new(result, mode)
                                         .with_engine(engine)
                                         .with_sort(sort, sortable)
                                         .with_client_sort(client_keys.as_deref())
-                                        .with_layout(names, widths)
+                                        .with_layout(&carried_names, &carried_widths)
                                         .with_column_view(&column_view);
                                     // Streamed rows are the finished result's
                                     // first rows, in order, so what was picked
@@ -2933,6 +2934,20 @@ fn carried_view(grid: &ResultGrid, at_start: &ColumnView) -> ColumnView {
     }
 }
 
+/// The widths the finished grid starts from: the streamed grid's, which hold
+/// any column dragged while the rows were arriving, over the ones taken when
+/// the run began.
+fn carried_layout(
+    grid: &ResultGrid,
+    names: &[String],
+    widths: &[ColumnWidth],
+) -> (Vec<String>, Vec<ColumnWidth>) {
+    match grid.columns().is_empty() {
+        true => (names.to_vec(), widths.to_vec()),
+        false => grid.layout(),
+    }
+}
+
 /// Move what has arrived into the grid. A new result set starts the grid over,
 /// as it would have when the set's statement finished. `true` when anything
 /// on screen changed.
@@ -2941,7 +2956,7 @@ fn pour(
     results: &Entity<TableState<ResultGrid>>,
     mode: Mode,
     engine: Engine,
-    (names, widths, column_view): (&[String], &[Pixels], &ColumnView),
+    (names, widths, column_view): (&[String], &[ColumnWidth], &ColumnView),
     cx: &mut App,
 ) -> bool {
     let fed = feed.take();
