@@ -6,6 +6,7 @@
 
 mod commands;
 mod editing;
+mod files;
 mod filters;
 mod forms;
 mod import_dialog;
@@ -278,6 +279,9 @@ pub(crate) struct Workspace {
     /// What `note` says while there is no connection and no form to say it
     /// on: the welcome surface's line.
     pub(crate) welcome_notice: Option<String>,
+    /// Statements written for data files opened before their profile had
+    /// connected: profile id, query tab, statement. Run once it has.
+    pub(crate) runs_on_connect: Vec<(String, u64, String)>,
     /// Why the welcome surface's name field refused what was typed: a line
     /// of its own, so a refusal never covers the notice, which may be the
     /// only word that the profiles file failed to load.
@@ -437,6 +441,7 @@ impl Workspace {
                 .filter(|source| source.found())
                 .collect(),
             welcome_notice: None,
+            runs_on_connect: Vec::new(),
             project_name_error: None,
             welcome_needs_focus: true,
             welcome_url,
@@ -1088,9 +1093,11 @@ impl Render for Workspace {
         if self.form.is_some() && self.settings_open {
             self.drop_settings(window, cx);
         }
-        // Deferred to render for the `&mut Window` a background task does not
-        // have: the catalog that names these tabs resolves off-thread, and a
-        // grid cannot be built without a window.
+        // Both deferred to render for the `&mut Window` a background task
+        // does not have: a connect finds the picked database gone, and the
+        // catalog that names these tabs resolves, off-thread, and neither a
+        // tab can be closed nor a grid built without a window.
+        self.leave_database_left_behind(window, cx);
         self.restore_objects(window, cx);
         self.sync_page_input(window, cx);
         self.sync_row_panel_filter(window, cx);
@@ -1277,6 +1284,8 @@ impl Render for Workspace {
         let Some(profile) = self.profile() else {
             return div()
                 .id("welcome")
+                // A data file dropped anywhere on the window opens in DuckDB.
+                .on_drop(cx.listener(Self::drop_data_files))
                 .size_full()
                 .track_focus(&self.focus)
                 .text_color(t.text)
@@ -1905,6 +1914,8 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
+            // A data file dropped anywhere on the window opens in DuckDB.
+            .on_drop(cx.listener(Self::drop_data_files))
             .relative()
             // The floor under the focus, so a surface with nothing focusable
             // on it still has a dispatch path for the workspace's own

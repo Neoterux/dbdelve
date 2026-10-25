@@ -73,6 +73,25 @@ rusqlite = { version = "0.40", default-features = false, features = [
     "column_metadata",
     "column_decltype",
 ] }
+# DuckDB, embedded the way SQLite is: no server, the engine compiled into the
+# binary. `parquet` and `json` are DuckDB's own readers, linked in so a file
+# opens with no extension downloaded at run time; `vtab` is duckdb-rs's
+# table-function API, through which `db::xlsx` adds `read_xlsx`. Its default
+# features only add a prebuilt-library download that `bundled` has no use for.
+duckdb = { version = "=1.20000.0", default-features = false, features = [
+    "bundled",
+    "parquet",
+    "json",
+    "vtab",
+] }
+# Spreadsheets for DuckDB's `read_xlsx` (`db::xlsx`): DuckDB's own excel
+# extension is not one libduckdb-sys can link in, and a download at run time is
+# not something a database client should need to open a file.
+calamine = { version = "=0.36.1", features = ["dates"] }
+# A DuckDB `UUID` arrives as its sixteen bytes and a `BIGNUM` as its digits in
+# base 256; see `db::duckdb::printable`.
+uuid = "=1.24.1"
+num-bigint = "=0.4.8"
 
 turso_sdk_kit = { version = "=0.8.2", default-features = false, features = ["fts"] }
 turso_core = "=0.8.2"

@@ -48,8 +48,8 @@ data lives are all in [docs/install.md](docs/install.md).
 
 ## Supported databases
 
-Postgres, MySQL, MariaDB, SQLite, Turso, Snowflake, SQL Server, MongoDB and
-Redis (and Valkey, KeyDB, Dragonfly).
+Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB, Snowflake, SQL Server, MongoDB
+and Redis (and Valkey, KeyDB, Dragonfly).
 
 More engines are planned.
 
@@ -89,6 +89,9 @@ More engines are planned.
   statement shown before anything runs.
 
   ![Importing events.csv: format options on the left, each file column mapped to a table column, and a preview of the rows](assets/screenshots/import.png)
+
+- **Open a data file** by dropping it on the window: a CSV, Excel, Parquet or
+  JSON file opens in DuckDB, held in memory, as a query you can change.
 
 - **See the query plan** highlighted in its own pane, with bad row estimates
   called out.

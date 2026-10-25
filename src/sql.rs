@@ -19,11 +19,12 @@ use serde::Deserialize;
 // Aliased: `tree_sitter::Parser` already owns the name `Parser` in this file,
 // and the two parsers are never interchangeable -- see `classify`'s doc.
 use sqlparser::ast::{
-    AlterTableOperation, ConditionalStatementBlock, CopySource, CopyTarget, Expr, Query, SetExpr,
-    Statement, UtilityOption,
+    AlterTableOperation, ConditionalStatementBlock, CopySource, CopyTarget, Delete, Expr, Insert,
+    Merge, Query, SetExpr, Statement, Update, UtilityOption,
 };
 use sqlparser::dialect::{
-    Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
+    Dialect, DuckDbDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
+    SnowflakeDialect,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
@@ -70,6 +71,7 @@ impl Buffer {
             | Engine::MariaDb
             | Engine::Sqlite
             | Engine::Turso
+            | Engine::DuckDb
             | Engine::Snowflake => statements_in(sql),
         };
 
@@ -160,6 +162,7 @@ pub(crate) fn queued_statements(
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::MongoDb
         | Engine::Redis => Buffer::for_engine(engine, sql).statements().to_vec(),
@@ -189,6 +192,7 @@ pub(crate) fn expected_sets(engine: Engine, sql: &str) -> usize {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::MongoDb
         | Engine::Redis => 1,
@@ -278,6 +282,7 @@ pub fn order_by(engine: Engine, statement: &str) -> Option<Vec<SortKey>> {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -332,6 +337,7 @@ pub fn with_order_by(engine: Engine, statement: &str, keys: &[SortKey]) -> Optio
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -518,6 +524,7 @@ pub fn insert_row(
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -598,7 +605,7 @@ pub(crate) fn insert_rows(
     // ponytail: Stop and Skip only. Update-existing-row is deferred: Postgres cannot spell ON CONFLICT (pk) DO UPDATE under the pinned grammar, MySQL's matches any unique key, SQL Server and Snowflake would need MERGE.
     let tail = match (skip, engine) {
         (false, _) => String::new(),
-        (true, Engine::Postgres | Engine::Sqlite | Engine::Turso) => {
+        (true, Engine::Postgres | Engine::Sqlite | Engine::Turso | Engine::DuckDb) => {
             " ON CONFLICT DO NOTHING".into()
         }
         (true, Engine::MySql | Engine::MariaDb) => {
@@ -630,9 +637,12 @@ pub fn insert_template(
     let placeholder: fn(usize) -> String = match engine {
         Engine::Postgres => |n| format!("${n}"),
         Engine::SqlServer => |n| format!("@p{n}"),
-        Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::Turso | Engine::Snowflake => {
-            |_| "?".into()
-        }
+        Engine::MySql
+        | Engine::MariaDb
+        | Engine::Sqlite
+        | Engine::Turso
+        | Engine::DuckDb
+        | Engine::Snowflake => |_| "?".into(),
         Engine::MongoDb | Engine::Redis => return None,
     };
     let names: Vec<String> = columns
@@ -679,6 +689,7 @@ pub fn delete_row(
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -934,6 +945,7 @@ pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => generated_write(statement, engine.backslash_escapes()),
     }
@@ -949,6 +961,7 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => delete_key_matches(statement, keys, engine.backslash_escapes()),
     }
@@ -981,6 +994,7 @@ pub fn is_generated_select(engine: Engine, sql: &str) -> bool {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -1835,6 +1849,7 @@ pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer => {}
     }
@@ -2104,6 +2119,7 @@ pub(crate) fn explainable(engine: Engine, sql: &str) -> Result<(), String> {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer
         | Engine::Redis => Ok(()),
@@ -2185,10 +2201,11 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
         Engine::Sqlite => (word(tokens.next().as_ref(), "QUERY")
             && word(tokens.next().as_ref(), "PLAN"))
         .then_some(ExplainMode::Plan),
-        // Turso has no Explain at all (`Engine::explain_prefix`), and
+        // Turso and DuckDB have no Explain at all (`Engine::explain_prefix`), and
         // Snowflake's and SQL Server's plans are shapes the parser does not read.
         Engine::MariaDb
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake
         | Engine::SqlServer
         | Engine::MongoDb
@@ -2248,6 +2265,7 @@ fn dialect(engine: Engine) -> Option<Box<dyn Dialect>> {
         Engine::Postgres => Box::new(PostgreSqlDialect {}),
         Engine::MySql | Engine::MariaDb => Box::new(MySqlDialect {}),
         Engine::Sqlite | Engine::Turso => Box::new(SQLiteDialect {}),
+        Engine::DuckDb => Box::new(DuckDbDialect {}),
         Engine::Snowflake => Box::new(SnowflakeDialect {}),
         Engine::SqlServer => Box::new(MsSqlDialect {}),
         Engine::MongoDb | Engine::Redis => return None,
@@ -2304,6 +2322,105 @@ pub(crate) fn rerunnable(engine: Engine, sql: &str) -> bool {
     verdict.mode == Mode::ReadOnly && verdict.destructive.is_empty()
 }
 
+/// Whether the last statement of `sql` answers with rows: a query, or a
+/// write with a `RETURNING`. DuckDB answers a command with a result set too,
+/// a single `Count` or `Success` column, which only the statement tells apart
+/// from a query's own column of that name.
+///
+/// duckdb-rs keeps the type DuckDB gives a prepared statement to itself, so
+/// it is read off the text: the last statement alone, so an earlier one the
+/// grammar cannot read does not hide it, and by its first word where the
+/// grammar cannot read it either -- DuckDB has queries of its own, `TABLE t`
+/// or `PIVOT`, as well as commands. A word not known as a command reads as a
+/// query, since showing a command's count as a row costs less than dropping
+/// a query's rows.
+pub(crate) fn answers_with_rows(engine: Engine, sql: &str) -> bool {
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    let Some(tokens) = located_tokens(dialect.as_ref(), sql) else {
+        return true;
+    };
+    let Some(last) = between_semicolons(&tokens).pop() else {
+        return false;
+    };
+    match SqlParser::parse_sql(dialect.as_ref(), &sql[last.clone()]) {
+        Ok(statements) => statements.last().is_some_and(statement_answers_with_rows),
+        Err(_) => !tokens
+            .iter()
+            .filter(|(_, range)| last.contains(&range.start))
+            .find_map(|(token, _)| match token {
+                Token::Word(word) => Some(word),
+                _ => None,
+            })
+            .is_some_and(|word| {
+                COMMAND_WORDS
+                    .iter()
+                    .any(|command| word.value.eq_ignore_ascii_case(command))
+            }),
+    }
+}
+
+/// The first words of the statements DuckDB answers with a `Count` or a
+/// `Success` of its own.
+const COMMAND_WORDS: &[&str] = &[
+    "ABORT",
+    "ALTER",
+    "ANALYZE",
+    "ATTACH",
+    "BEGIN",
+    "CHECKPOINT",
+    "COMMENT",
+    "COMMIT",
+    "COPY",
+    "CREATE",
+    "DEALLOCATE",
+    "DELETE",
+    "DETACH",
+    "DROP",
+    "END",
+    "EXPORT",
+    "FORCE",
+    "IMPORT",
+    "INSERT",
+    "INSTALL",
+    "LOAD",
+    "MERGE",
+    "PREPARE",
+    "RESET",
+    "ROLLBACK",
+    "SET",
+    "START",
+    "TRUNCATE",
+    "UPDATE",
+    "USE",
+    "VACUUM",
+];
+
+fn statement_answers_with_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_answers_with_rows(query),
+        Statement::Insert(Insert { returning, .. })
+        | Statement::Update(Update { returning, .. })
+        | Statement::Delete(Delete { returning, .. }) => returning.is_some(),
+        Statement::Merge(Merge { output, .. }) => output.is_some(),
+        _ => false,
+    }
+}
+
+/// A query answers with rows unless its body is a write a `WITH` leads:
+/// `WITH s AS (…) INSERT INTO t SELECT * FROM s` parses as a query.
+fn query_answers_with_rows(query: &Query) -> bool {
+    match query.body.as_ref() {
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => statement_answers_with_rows(statement),
+        SetExpr::Query(query) => query_answers_with_rows(query),
+        _ => true,
+    }
+}
+
 /// Whether a submission may be stopped part way once its rows pass the limit:
 /// a read, and the only statement in it. Stopping one statement of several
 /// ends the rest with it -- a `COMMIT` behind a `SELECT` never runs, a `SET`
@@ -2325,6 +2442,173 @@ pub(crate) fn stoppable(engine: Engine, sql: &str) -> bool {
         && parsed_alone
         && Buffer::for_engine(engine, sql).statements().len() == 1
         && !touches_session(engine, sql)
+}
+
+/// The one table a query's rows are rows of, read off the statement for an
+/// engine whose driver does not say which table a result column came from.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TableRead {
+    /// The name as written, one entry per dotted part.
+    pub(crate) table: Vec<String>,
+    pub(crate) columns: Vec<Projected>,
+}
+
+/// One entry of a [`TableRead`]'s select list.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Projected {
+    /// A `*`, which stands for every column of the table in its own order.
+    Every,
+    /// A bare or table-qualified name, as written.
+    Column(String),
+    /// Anything else, which names no column a write could land on.
+    Computed,
+}
+
+/// [`TableRead`] for the last statement of `sql`, when it is a plain select of
+/// one table: no join, subquery, table function, CTE, set operation,
+/// `DISTINCT`, grouping or window clause, and no table alias renaming the
+/// columns. Every one of those makes a result row something other than one
+/// row of the table, or a column something other than the column it names,
+/// so each refuses rather than being read past.
+pub(crate) fn table_read(engine: Engine, sql: &str) -> Option<TableRead> {
+    use sqlparser::ast::{
+        GroupByExpr, ObjectName, SelectFlavor, SelectItem, SelectItemQualifiedWildcardKind,
+        TableFactor, WildcardAdditionalOptions,
+    };
+
+    let dialect = dialect(engine)?;
+    let Statement::Query(query) = SqlParser::parse_sql(dialect.as_ref(), sql).ok()?.pop()? else {
+        return None;
+    };
+    let Query {
+        with: None,
+        body,
+        locks,
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators,
+        ..
+    } = *query
+    else {
+        return None;
+    };
+    let SetExpr::Select(select) = *body else {
+        return None;
+    };
+    let plain = select.distinct.is_none()
+        && select.select_modifiers.is_none()
+        && select.top.is_none()
+        && select.exclude.is_none()
+        && select.into.is_none()
+        && select.lateral_views.is_empty()
+        && select.prewhere.is_none()
+        && select.connect_by.is_empty()
+        && matches!(&select.group_by, GroupByExpr::Expressions(by, with) if by.is_empty() && with.is_empty())
+        && select.cluster_by.is_empty()
+        && select.distribute_by.is_empty()
+        && select.sort_by.is_empty()
+        && select.having.is_none()
+        && select.named_window.is_empty()
+        && select.qualify.is_none()
+        && select.value_table_mode.is_none()
+        && locks.is_empty()
+        && pipe_operators.is_empty();
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints,
+        version: None,
+        with_ordinality: false,
+        partitions,
+        json_path: None,
+        index_hints,
+        ..
+    } = &from.relation
+    else {
+        return None;
+    };
+    if !plain
+        || !from.joins.is_empty()
+        || !with_hints.is_empty()
+        || !partitions.is_empty()
+        || !index_hints.is_empty()
+        || alias
+            .as_ref()
+            .is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return None;
+    }
+
+    let parts = |name: &ObjectName| -> Option<Vec<String>> {
+        name.0
+            .iter()
+            .map(|part| part.as_ident().map(|ident| ident.value.clone()))
+            .collect()
+    };
+    let table = parts(name)?;
+    // Once aliased, the table is named by its alias alone. Unaliased, by any
+    // tail of the name it was written with.
+    let qualifiers: Vec<&[String]> = match alias {
+        Some(alias) => vec![std::slice::from_ref(&alias.name.value)],
+        None => (0..table.len()).map(|from| &table[from..]).collect(),
+    };
+    let qualifies = |written: &[String]| {
+        qualifiers.iter().any(|qualifier| {
+            qualifier.len() == written.len()
+                && qualifier
+                    .iter()
+                    .zip(written)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
+    };
+    let bare = |options: &WildcardAdditionalOptions| {
+        options.opt_ilike.is_none()
+            && options.opt_exclude.is_none()
+            && options.opt_except.is_none()
+            && options.opt_replace.is_none()
+            && options.opt_rename.is_none()
+            && options.opt_alias.is_none()
+    };
+    let column = |expr: &Expr| match expr {
+        Expr::Identifier(ident) => Projected::Column(ident.value.clone()),
+        Expr::CompoundIdentifier(idents) => match idents.split_last() {
+            Some((last, qualifier))
+                if qualifies(
+                    &qualifier
+                        .iter()
+                        .map(|ident| ident.value.clone())
+                        .collect::<Vec<_>>(),
+                ) =>
+            {
+                Projected::Column(last.value.clone())
+            }
+            // A struct's field, read off a column of the table.
+            _ => Projected::Computed,
+        },
+        _ => Projected::Computed,
+    };
+
+    let mut columns = Vec::with_capacity(select.projection.len().max(1));
+    if select.projection.is_empty() && select.flavor == SelectFlavor::FromFirstNoSelect {
+        columns.push(Projected::Every);
+    }
+    for item in &select.projection {
+        columns.push(match item {
+            SelectItem::Wildcard(options) if bare(options) => Projected::Every,
+            SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(name),
+                options,
+            ) if bare(options) && qualifies(&parts(name)?) => Projected::Every,
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => column(expr),
+            _ => return None,
+        });
+    }
+    Some(TableRead { table, columns })
 }
 
 /// Whether `sql` is nothing but queries that only read: no `SET`, `USE`,
@@ -2959,6 +3243,7 @@ fn sqlformat_dialect(engine: Engine) -> Option<sqlformat::Dialect> {
         | Engine::MariaDb
         | Engine::Sqlite
         | Engine::Turso
+        | Engine::DuckDb
         | Engine::Snowflake => sqlformat::Dialect::Generic,
         Engine::MongoDb | Engine::Redis => return None,
     })
@@ -4315,12 +4600,13 @@ mod tests {
         }
     }
 
-    const SQL_ENGINES: [Engine; 7] = [
+    const SQL_ENGINES: [Engine; 8] = [
         Engine::Postgres,
         Engine::MySql,
         Engine::MariaDb,
         Engine::Sqlite,
         Engine::Turso,
+        Engine::DuckDb,
         Engine::Snowflake,
         Engine::SqlServer,
     ];
@@ -6572,6 +6858,7 @@ mod tests {
             Engine::MariaDb,
             Engine::Sqlite,
             Engine::Turso,
+            Engine::DuckDb,
             Engine::Snowflake,
             Engine::SqlServer,
             Engine::MongoDb,

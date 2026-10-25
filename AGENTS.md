@@ -1,7 +1,8 @@
 # AGENTS.md
 
 DBDelve is a native database client in Rust on GPUI for macOS, Linux and Windows,
-speaking Postgres, MySQL, MariaDB, SQLite, Snowflake, SQL Server, MongoDB and Redis.
+speaking Postgres, MySQL, MariaDB, SQLite, DuckDB, Snowflake, SQL Server, MongoDB and
+Redis.
 
 The split everything below leans on is _whose SQL it is_. An editor buffer is
 the user's and is never touched uninvited; a browsing surface (an object tab's
@@ -32,7 +33,8 @@ require it, stop and raise it instead.
    aborts it, and only if `pg_stat_activity` shows the session's process running
    this statement's exact text, never waiting on the side session to find
    out; MySQL and MariaDB `KILL QUERY` anywhere, since a killed statement is
-   rolled back alone; SQLite interrupts it; MongoDB drops the cursor; SQL Server
+   rolled back alone; SQLite interrupts it; DuckDB fetches no further; MongoDB
+   drops the cursor; SQL Server
    sends `SET ROWCOUNT limit+1` as a batch of its own ahead of it and always
    `SET ROWCOUNT 0` after, reconnecting if that reset fails, unless a
    `SET ROWCOUNT` of the user's own is in force, which that reset would erase.
@@ -182,7 +184,7 @@ require it, stop and raise it instead.
    and has to spell it the way the server will read it. It holds no connection.
    Views and workspace code _ask_ it (`quote_identifier`, `quote_literal`, `quote_value`,
    `is_binary_type`, `qualified`, `transaction_start`, `explain_prefix`, `assigns_default`,
-   `boolean_literal`, `skips_duplicates`, `all_or_nothing`, `takes_new_fields`,
+   `boolean_literal`, `skips_duplicates`, `skips_duplicates_into`, `all_or_nothing`, `takes_new_fields`,
    `fields`, `syntax`, `edits_query_rows`, `takes_imports`, `logo`, `brand`, and `filter::Operator::on` for the filter dropdown) and never
    match on it. Where an engine question
    is missing, add a method to `Engine` rather than a `match` at the caller. The
@@ -228,7 +230,7 @@ an upgrade, or ask for confirmation.
   confirmation, before any mode comparison: every typo lands there, and asking
   for Full to get a syntax error back would teach people to live in Full.
   The exception is Read-only on an engine where `Engine::holds_read_only` is
-  false (SQLite, Snowflake, SQL Server): nothing on the server would stop it writing, so
+  false (SQLite, DuckDB, Snowflake, SQL Server): nothing on the server would stop it writing, so
   the verdict carries Read-write and the gate asks for that instead.
 - Unknown statements and `ALTER` operations other than `ADD COLUMN` need Full.
   Keep it that strict.
@@ -275,6 +277,10 @@ mysql = "28"               # rust-mysql-simple, blocking. default-features = fal
 rusqlite = "0.40"          # bundled + column_metadata + column_decltype. dff = false
 turso_sdk_kit = { version = "=0.8.2", default-features = false, features = ["fts"] }  # Turso, blocking rsapi
 turso_core = "=0.8.2"      # its Value
+duckdb = { version = "=1.20000.0", default-features = false, features = ["bundled", "parquet", "json", "vtab"] }  # DuckDB, Arrow results
+calamine = { version = "=0.36.1", features = ["dates"] }  # spreadsheets, for DuckDB's read_xlsx
+uuid = "=1.24.1"           # a DuckDB UUID's sixteen bytes, as text
+num-bigint = "=0.4.8"      # a DuckDB BIGNUM's base-256 digits, as text
 
 rustls = "0.23"            # TLS; the driver ships none. default-features = false
 rustls-native-certs = "0.8"     # the platform trust store, for Postgres
@@ -467,6 +473,17 @@ sqlite3 dev/dbdelve_dev.db < dev/sqlite/001-dbdelve-demo.sql
 ```
 
 The seed uses `unhex()`, so it needs sqlite3 3.41 or later.
+
+DuckDB has no server either. Build the file once, then give the form its
+absolute path; the `duckdb` CLI comes from `brew install duckdb` or duckdb.org:
+
+```sh
+rm -f dev/dbdelve_dev.duckdb && duckdb dev/dbdelve_dev.duckdb < dev/duckdb/001-dbdelve-demo.sql
+```
+
+The seed expects a fresh file, hence the `rm`. It ends with `type_gallery`, a
+table of DuckDB-only types (nested LIST/STRUCT/MAP, ENUM, HUGEINT, infinite
+dates) for checking how a cell renders them.
 
 `dev/load.sh` rebuilds Postgres `events` about a hundred columns wide for load testing;
 it is opt-in and CI never runs it (see `CONTRIBUTING.md`).
@@ -678,12 +695,13 @@ Decided, and not to be re-litigated:
   engine's default `LIKE` escape, which is the backslash on Postgres and MySQL,
   and `like_pattern` escapes `%`, `_` and the backslash itself with it.
   **SQLite, which has no default escape at all**, gets `instr`/`substr`
-  substring arithmetic instead: case-sensitive where its own `LIKE` is not,
+  substring arithmetic instead, and so does DuckDB, which has none either: case-sensitive where its own `LIKE` is not,
   which is the price of not silently widening a match on a value containing
   `%`. **SQL Server has no default escape either**, but a bracket makes any
   character literal there, so its pattern brackets `%`, `_` and `[` (`[%]`)
   and keeps `LIKE`. The regex match is Postgres `~`, MySQL `REGEXP_LIKE(col, pattern)`
-  (8.0.4 and later), MariaDB `REGEXP_INSTR(col, pattern) > 0` (it has no
+  (8.0.4 and later), DuckDB `regexp_matches(col, pattern)`, MariaDB
+  `REGEXP_INSTR(col, pattern) > 0` (it has no
   `REGEXP_LIKE`, and its infix `REGEXP` is not in the grammar the gate
   parses), and **omitted from the dropdown on SQLite and SQL Server**, which
   ship no regex (SQL Server not before 2025).
@@ -840,9 +858,9 @@ Decided, and not to be re-litigated:
   refresh runs an `EXPLAIN ANALYZE` again.
 - **`SET column = DEFAULT` is withheld on SQLite** (`Engine::assigns_default`),
   where `DEFAULT` is not an expression.
-- **Read-only has no server-side backstop on SQLite, Snowflake or SQL Server.**
-  Postgres gets `default_transaction_read_only`, MySQL `SET SESSION TRANSACTION
-  READ ONLY`. So on the other three, Read-only refuses a statement `sql::classify` cannot
+- **Read-only has no server-side backstop on SQLite, DuckDB, Snowflake or SQL
+  Server.** Postgres gets `default_transaction_read_only`, MySQL `SET SESSION
+  TRANSACTION READ ONLY`. So on the other four, Read-only refuses a statement `sql::classify` cannot
   read rather than offering to run it once (`Engine::holds_read_only`).
 - **Snowflake has no session, because it is spoken to over its SQL REST API.**
   It publishes no Rust driver. Each submission is one HTTPS request, so nothing
@@ -1069,6 +1087,59 @@ Decided, and not to be re-litigated:
   (`Engine::holds_read_only`). `Connection::connect` is a closure because
   holding `Arc<TursoDatabase>` directly overflows the compiler's `Send`
   evaluation of `db::Connection`. Its live test reads `dbdelve_TURSO_PATH`.
+- **DuckDB is embedded through duckdb-rs, `bundled`: a file, or a database in
+  memory.** A blank path is a database in memory, gone when the profile
+  disconnects; a path that does not exist is refused rather than created, as
+  on SQLite. `parquet` and `json` are linked in, so reading those files
+  downloads nothing. The catalog, structure, keys and DDL come from
+  `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`,
+  `duckdb_constraints()` and `duckdb_indexes()`. Results arrive as Arrow
+  batches and every cell is rendered by Arrow's formatter; a `TIMESTAMPTZ`,
+  which DuckDB hands over under the zone's name, is relabelled `+00:00` first,
+  since Arrow formats a named zone only with `chrono-tz`. Every statement of a
+  submission but the last runs as it is prepared, and the last one streams,
+  so a read past the row limit is stopped by fetching no further. DuckDB
+  answers a command with a one-column result of its own, `Count` or
+  `Success`, and `sql::answers_with_rows` is what tells that apart from a
+  query's column of the same name. duckdb-rs answers `is_autocommit` with
+  `true` whatever the state, so a failed submission's transaction is rolled
+  back by reading its text, as on MySQL. A cancel, even a read's, or a failed
+  write aborts the transaction it lands in: it refuses everything until a
+  `ROLLBACK`, and a `COMMIT` rolls it back. A second connection (`alongside`,
+  and an import's `apart`) is cloned from an idle one the profile holds,
+  since opening an in-memory database again makes a new, empty one. A
+  connection cloned that way starts on the database the file opened as, not
+  where a `USE` moved the one it was cloned from: `USE` belongs to the
+  connection and `ATTACH` to the instance. So the profile's picked database
+  and schema are kept on the driver's connection and shared by its clones,
+  and every connection it hands out (`alongside`, so `query_alongside` and
+  `apart` too) runs the `USE` before anything else. Nothing picked runs
+  nothing, and the session's `search_path` stays DuckDB's own. **A
+  DuckDB result is editable only as a plain select of one keyed table**: the
+  driver names no column's table, so `sql::table_read` reads the statement
+  for one base table (no join, subquery, table function, CTE, set operation,
+  `DISTINCT`, grouping, window clause or renaming alias) whose columns are
+  `*` or bare names, and `duckdb::edit_target` takes the table and its
+  primary key from the catalog. The connection that ran the statement says
+  where its names resolve: `current_database()`, `current_schema()` and the
+  `search_path`, which is either DuckDB's own (blank) or exactly the one
+  entry a `USE` writes for those two, so a picked schema keeps a bare
+  `SELECT * FROM account_scores` editable. A bare name is looked for only in
+  the current schema, though DuckDB would go on to `main` when it is not
+  there. Anything in doubt refuses: a column count the parse and the driver
+  disagree on, a column read twice, any other search path (DuckDB tries each
+  entry in turn), a temporary table of the same name, a schema whose name is
+  also an attached database's (DuckDB calls `"analytics"."t"` ambiguous
+  then), a table in another database. DuckDB enforces its keys, unlike
+  Snowflake. No Explain, and no Read-only backstop.
+  Its tests need nothing external and run under plain `cargo test`.
+  `read_xlsx` is a table function of DBDelve's own over calamine (`db::xlsx`),
+  registered at open, since DuckDB's `excel` extension cannot be linked in: a
+  column whose filled cells are all numbers is a `DOUBLE`, anything else text
+  as the sheet shows it. A data file dropped on the window or picked from the
+  palette (`workspace::files`) opens in a DuckDB profile held in memory, made
+  if there is none, as a query tab whose `SELECT * FROM read_csv(…)` DBDelve
+  wrote on screen and runs once the profile connects.
 - **Geometry is Postgres-only.** MySQL has a `GEOMETRY` type; rendering it is a
   separate decision nobody has asked for.
 - **MariaDB's `JSON` is a `longtext` with a `json_valid` check**, and is shown
@@ -1365,7 +1436,31 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   queued ones and snapshots included, because those rows belong to the old
   database and an edit staged on them would be applied to the new one. A
   switch with unapplied cell edits on any grid is refused rather than
-  discarding them.
+  discarding them. On DuckDB (`Engine::switches_database_in_session`) the
+  databases are the ones attached to the instance, which reopening the file
+  would detach, so the same switch is a `USE` on the connection already open
+  (`Workspace::use_database`): no reconnect, a new generation and a fresh
+  catalog, and a `USE` that fails puts the profile back where it was. The
+  database the file opens as is stored blank, so a renamed file still opens.
+- **Where `Engine::picks_schema` (Postgres, Snowflake, DuckDB), the titlebar
+  picks the schema unqualified names resolve in**, without a reconnect: tabs,
+  results and staged edits stay, since every name DBDelve writes names its
+  schema. `Workspace::set_schema` records it on the profile and on the live
+  connection, which applies it to the sessions open and to every one it opens
+  later. Postgres puts it in front of the session's own `search_path`, and
+  refuses inside a transaction, since a `ROLLBACK` would undo it;
+  Snowflake sends it with the user's statements only; DuckDB `USE`s
+  `database.schema`, which a `ROLLBACK` does not undo. MySQL and MariaDB have
+  no schema apart from the database, and SQL Server's default schema is the
+  login's (`ALTER USER … WITH DEFAULT_SCHEMA`), with no per-session setting.
+  A picked schema that is gone when a Postgres or Snowflake profile connects is
+  kept, and names resolve past it or fail in the server's words; DuckDB's
+  `USE` refuses one, so its connection opens where nothing is picked, or on the
+  picked database without the schema, and the profile drops what was not
+  there and says so (`Connection::unpicked`). A dropped database closes what
+  the profile held of it on the next frame (`Profile::left_database`), as a
+  switch does. An attached database always goes this way after a restart,
+  since `ATTACH` lasts as long as the instance.
 - **Both kinds are addressed by id, never by index.** A result comes back
   carrying the `Tab` it was issued for, and an id that no longer resolves drops
   the result rather than landing it somewhere. Indexing would put a slow query's

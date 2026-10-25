@@ -68,6 +68,14 @@ absolute path:
 sqlite3 dev/dbdelve_dev.db < dev/sqlite/001-dbdelve-demo.sql
 ```
 
+DuckDB is the same: build the file once and give the form its absolute path.
+The `duckdb` CLI comes from `brew install duckdb` or [duckdb.org](https://duckdb.org/install).
+The seed expects a fresh file, so remove the old one first:
+
+```sh
+rm -f dev/dbdelve_dev.duckdb && duckdb dev/dbdelve_dev.duckdb < dev/duckdb/001-dbdelve-demo.sql
+```
+
 ## Running tests
 
 Plain unit tests run with no setup:
@@ -226,7 +234,7 @@ chore(release): bump version to 0.3.8
 
 | Scope         | Covers                                                                  |
 | ------------- | ----------------------------------------------------------------------- |
-| `postgres`, `mysql`, `sqlite`, `mssql`, `mongo`, `redis`, `snowflake`, `turso` | One engine's module in `src/db/` (MySQL covers MariaDB) |
+| `postgres`, `mysql`, `sqlite`, `mssql`, `mongo`, `redis`, `snowflake`, `turso`, `duckdb` | One engine's module in `src/db/` (MySQL covers MariaDB) |
 | `db`          | Engine dispatch and what every engine shares (`src/db/mod.rs`)          |
 | `ssh`         | SSH tunnels                                                             |
 | `connections` | Connection form, profiles, TLS                                          |
