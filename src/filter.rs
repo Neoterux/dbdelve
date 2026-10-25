@@ -484,7 +484,7 @@ pub(crate) fn changed_filter(filter: &mut String, offset: &mut usize, typed: &st
 /// One column against one value under one operator, quoted the way the server
 /// will read it. `None` where the value does not add up to a predicate.
 ///
-/// A SQL-generating call site (`AGENTS.md`, engine divergences), and the only
+/// A SQL-generating call site (`docs/agents/engines.md`), and the only
 /// place a filter bar becomes SQL -- every operator composes here, through
 /// `quote_identifier` and `quote_value`, so there is one place a quote can be
 /// got wrong rather than one per operator.
@@ -595,7 +595,7 @@ pub(crate) fn filter_predicate(
 ///
 /// `LIKE` where the engine has an escape character for the wildcards the user's
 /// own value may hold, and exact substring arithmetic where it does not. Two
-/// engine divergences meet here (`AGENTS.md`, and spec §7):
+/// engine divergences meet here (`docs/agents/engines.md`, and spec §7):
 ///
 /// The escape is the engine's **default** rather than an `ESCAPE` clause naming
 /// it, because `tree_sitter_sequel` does not parse one and `is_generated_select`

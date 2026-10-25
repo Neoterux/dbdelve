@@ -93,6 +93,7 @@ calamine = { version = "=0.36.1", features = ["dates"] }
 uuid = "=1.24.1"
 num-bigint = "=0.4.8"
 
+# Turso, a local file only, through the blocking rsapi; turso_core for its Value.
 turso_sdk_kit = { version = "=0.8.2", default-features = false, features = ["fts"] }
 turso_core = "=0.8.2"
 
@@ -180,7 +181,7 @@ cbc = "=0.1.2"
 # `postgres` crate drives tokio-postgres: each connection owns a tokio
 # current-thread runtime and every call is a `block_on` on the background
 # thread the query already runs on. Nothing tokio-shaped reaches GPUI's
-# executor (AGENTS.md, "Do not add tokio").
+# executor (AGENTS.md, "Do not put tokio on GPUI's executor").
 #
 # Default features off: they are `native-tls`, which is OpenSSL on Linux, and
 # `winauth`. `rustls` is the only TLS it offers otherwise, and it is
@@ -264,7 +265,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 # refuses. dprint's parser, straight into a serde_json `Value`; its `serde`
 # feature adds only serde, already in the graph.
 jsonc-parser = { version = "=0.34.0", features = ["serde"] }
-toml = "0.9"
+toml = "0.9"   # profiles.toml
 url = "2"
 
 # ISO-8601 dates in mongosh statements (`ISODate(…)`, `{"$date": …}`), for
@@ -314,6 +315,8 @@ sqlformat = { version = "=0.5.0", default-features = false }
 # writes the same generic-password items security-framework did, so passwords
 # saved by an earlier build still read back.
 keyring = "4"
+# The bundled fonts; Lucide icon data and Simple Icons brand logos for the
+# engines, since gpui-component ships no icon files.
 guic-gpui-assets = "=0.2.0"
 icondata_lu = "=0.1.0"
 icondata_si = "=0.1.0"

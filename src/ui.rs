@@ -636,7 +636,7 @@ pub(crate) fn option_row(
 
 /// An on/off choice. Drawn here rather than taken from gpui-component, whose
 /// switch springs its thumb across: nothing in DBDelve moves on a click (see
-/// AGENTS.md, "Animation"). A button underneath, so Tab reaches it and Space
+/// docs/agents/ui.md, "Animation"). A button underneath, so Tab reaches it and Space
 /// or Enter flips it.
 pub(crate) fn switch(id: impl Into<gpui::ElementId>, on: bool, t: Theme) -> Button {
     let width = layout::chrome(layout::SWITCH_WIDTH);

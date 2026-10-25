@@ -92,7 +92,7 @@ impl Workspace {
     /// On the background executor because the Postgres path opens a socket and
     /// spins a current-thread tokio runtime inside `cancel_query` to do it.
     /// That is legal for exactly the reason connecting is (AGENTS.md, "Do not
-    /// add tokio"): the runtime belongs to the blocking driver and lives and
+    /// put tokio on GPUI's executor"): the runtime belongs to the blocking driver and lives and
     /// dies on the thread the driver is running on. Nothing tokio-shaped is
     /// handed to GPUI's executor, which is the thing that panics.
     pub(crate) fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {

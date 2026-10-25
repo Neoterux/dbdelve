@@ -198,8 +198,8 @@ This is an "open an issue first" change. Roughly: a new module under
 `Engine` enum in `src/db/mod.rs`. It needs the same test coverage the
 existing engines have — unit tests plus `live_*` integration tests marked
 `#[ignore]`, run against `docker compose` if the engine can run in a
-container, or a documented external instance if it can't. Read "Engine
-divergences" in `AGENTS.md` first: it lists where the three engines already
+container, or a documented external instance if it can't. Read
+`docs/agents/engines.md` first: it lists where the engines already
 disagree (transaction bracketing, filter operators, timeouts, cancellation),
 so a fourth engine's differences land in those same places rather than
 scattered through the UI layer.
