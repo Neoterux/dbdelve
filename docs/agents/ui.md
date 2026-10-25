@@ -7,7 +7,7 @@ IME, line numbers, tree-sitter highlighting), `DataTable` over a `TableDelegate`
 (the grid, virtualized on both axes), `v_virtual_list` (the palette's rows,
 virtualized at their two heights, header and row), `PopupMenu` and the `DropdownMenu`
 trait (an anchored menu whose open state the library owns, which is the answer
-to the "GPUI drops view state" hazard in `AGENTS.md` rather than a dropdown of ours),
+to the "GPUI drops view state" hazard under "Animation hazards" below rather than a dropdown of ours),
 `Root` dialog layers, resizable panels, `Spinner`, and the completion popup.
 
 **Completion is the library's.** `CompletionProvider` is the trait and the
@@ -81,6 +81,23 @@ accept a library default appearance; map it to our theme tokens.
   only offered themes of its own appearance and the theme picked is the theme
   shown. A change that lands while a theme list is previewing goes into
   `theme_before_preview` and the palette's fallback, never over the preview.
+
+## Animation hazards
+
+The redraw hazard, the one that costs CPU, is in `AGENTS.md`, "GPUI hazards". The rest:
+
+- **`with_animation` replays from zero on remount.** Anything that must survive
+  being unmounted mid-animation needs a wall-clock-driven tween evaluated fresh
+  each render, not an element-id-keyed animation.
+- **GPUI drops view state the same frame the view unmounts.** Exit animations
+  need an explicit open → closing → closed lifecycle plus a reaping timer.
+  Every dropdown, toast and modal hits this.
+- **No scale transform on `div`.** SVG only at this revision. Approximate with
+  fade plus translate.
+- **`translateY` is a relative-position inset** applied after layout, so siblings
+  do not shift.
+- **`.hover()` snaps with no transition**, so hover states are instant
+  everywhere. A colour fade would have to be hand-driven from a wall clock.
 
 ## Animation
 

@@ -184,8 +184,11 @@ docker compose up -d
 cargo run
 ```
 
-Linux needs the system packages listed in `README.md` first. The development
-databases accept:
+Linux needs the system packages listed in `README.md` first. **Plain `cargo
+run` is the release variant**: with `DBDELVE_VARIANT` unset it reads and
+writes the installed app's profiles and keychain passwords. Run
+`DBDELVE_VARIANT=dev cargo run` to share the dev bundle's instead. The
+development databases accept:
 
 ```text
 postgresql://dbdelve:dbdelve@127.0.0.1:55432/dbdelve_dev
@@ -196,18 +199,18 @@ redis://dbdelve:dbdelve@127.0.0.1:56379/0
 mongodb://dbdelve:dbdelve@127.0.0.1:57017/dbdelve_dev
 ```
 
-What CI (`.github/workflows/ci.yml`) runs, and what a change should pass
-locally:
+What a change should pass locally:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test                      # unit tests; no database needed
-cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ # plus the live_ tests
 ```
 
 The `live_` tests are `#[ignore]`d and read their connection settings from the
-environment; the `tests` job in `ci.yml` has the values for the dev databases.
+environment. The `tests` job in `.github/workflows/ci.yml` is the recipe for
+running them: the values for the dev databases, and the exact `cargo test`
+runs, which split off the timing tests and the vendored renderer's tests.
 
 ## Platforms
 
@@ -219,13 +222,16 @@ Paths per platform and the rest of storage are in `docs/agents/session.md`.
 - **Keybindings** are spelled `secondary-`, which GPUI reads as Cmd on macOS and
   Ctrl elsewhere. Never `cmd-`: on Linux that is Super, which the window manager
   takes first.
-- **The dev and release apps share nothing on disk.** `store::variant_name`
-  moves the support directory and the keychain service together, and a variant
-  it rejects is an error, never a fall back to the release name.
+- **The dev and release apps share nothing on disk** when the dev one runs
+  as `DBDELVE_VARIANT=dev`, which the bundle sets for itself.
+  `store::variant_name` moves the support directory and the keychain service
+  together, and a variant it rejects is an error, never a fall back to the
+  release name.
 
 ## GPUI hazards
 
-Hard-won and easy to rediscover. Read before writing any animated element.
+Hard-won and easy to rediscover. The ones only animation work reaches are in
+`docs/agents/ui.md`.
 
 - **A repeating `with_animation` element requests a redraw every display frame
   while mounted.** One spinner has been measured pinning a window at 120Hz and
@@ -234,18 +240,6 @@ Hard-won and easy to rediscover. Read before writing any animated element.
   one**: anything else that moves needs raising first, and a second repeating
   animation means building that clock and moving both onto it. What moves
   today is listed in `docs/agents/ui.md`.
-- **`with_animation` replays from zero on remount.** Anything that must survive
-  being unmounted mid-animation needs a wall-clock-driven tween evaluated fresh
-  each render, not an element-id-keyed animation.
-- **GPUI drops view state the same frame the view unmounts.** Exit animations
-  need an explicit open → closing → closed lifecycle plus a reaping timer.
-  Every dropdown, toast and modal hits this.
-- **No scale transform on `div`.** SVG only at this revision. Approximate with
-  fade plus translate.
-- **`translateY` is a relative-position inset** applied after layout, so siblings
-  do not shift.
-- **`.hover()` snaps with no transition**, so hover states are instant
-  everywhere. A colour fade would have to be hand-driven from a wall clock.
 - **A window with nothing focused has no dispatch path, so every keybinding is
   dead.** A keystroke reaches a handler only along the focused element's path to
   the root. Unmount whatever had focus (close a modal, switch to a surface with
@@ -298,7 +292,8 @@ Read the file a task touches before changing that area:
   and running statements**: sessions, queues, sorting, persisted buffers and
   grid snapshots, storage paths, the welcome surface, and completion.
 - `docs/agents/ui.md`: **building UI**: which gpui-component pieces to use, the
-  titlebar and system appearance, and everything that animates today.
+  titlebar and system appearance, the animation hazards, and everything that
+  animates today.
 - `docs/agents/stack.md`: **dependencies**: why each `default-features = false`,
   how the tokio-based drivers stay off GPUI's executor, and where the MongoDB
   and Redis code lives.

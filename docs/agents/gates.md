@@ -157,9 +157,11 @@ deliberate and belongs in anything that documents either feature.
 
 The core of the mode check is in `AGENTS.md`, "Connection modes". The detail:
 
-- **Read-only on an engine with no server-side hold.** `Engine::holds_read_only`
-  is false on SQLite, DuckDB, Snowflake and SQL Server, so a Read-only verdict
-  there carries Read-write and the gate asks for that.
+- **An unreadable statement on an engine with no server-side hold.**
+  `Engine::holds_read_only` is false on SQLite, DuckDB, Snowflake and SQL
+  Server, so a statement `sqlparser` cannot parse carries Read-write there, not
+  Read-only, and the gate asks for that. A statement it parses keeps its own
+  verdict.
 - **`IF` conditions.** T-SQL's `IF … ELSE` and the `IF … END IF` Postgres, MySQL
   and Snowflake parse to the same variant. `condition_verdict` reads a plain
   name, value, comparison or `IS …` test as a read, and a subquery (`EXISTS`,
