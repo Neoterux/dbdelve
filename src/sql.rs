@@ -6974,4 +6974,133 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_function_the_engine_lists_stops_being_a_read() {
+        use crate::db::Engine;
+
+        let sql = "SELECT set_config('default_transaction_read_only', 'off', false)";
+        assert!(classify(Engine::Postgres, sql).mode > Mode::ReadOnly);
+        assert_eq!(
+            gate(&classify(Engine::Postgres, sql), Mode::ReadOnly, &[]),
+            Some(Stop::Upgrade(Mode::ReadWrite))
+        );
+        assert_eq!(
+            gate(&classify(Engine::Postgres, sql), Mode::ReadWrite, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_function_stays_a_read_on_an_engine_that_does_not_list_it() {
+        use crate::db::{Engine, Syntax};
+
+        let sql = "SELECT set_config('default_transaction_read_only', 'off', false)";
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() == Syntax::Sql && *engine != Engine::Postgres)
+        {
+            assert_eq!(classify(engine, sql).mode, Mode::ReadOnly, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_listed_call_is_found_wherever_the_parser_can_put_one() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT nextval('s')",
+            "SELECT * FROM nextval('s')",
+            "SELECT * FROM t, LATERAL nextval('s') x",
+            "SELECT * FROM t WHERE id = (SELECT nextval('s'))",
+            "WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n",
+            "SELECT nextval /* c */ ('s')",
+        ] {
+            assert!(
+                classify(Engine::Postgres, sql).mode > Mode::ReadOnly,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_qualified_listed_call_reads_like_the_bare_one() {
+        use crate::db::Engine;
+
+        let bare = classify(Engine::Postgres, "SELECT set_config('a', 'b', false)");
+        let qualified = classify(
+            Engine::Postgres,
+            "SELECT pg_catalog.set_config('a', 'b', false)",
+        );
+        assert!(bare.mode > Mode::ReadOnly);
+        assert_eq!(bare.mode, qualified.mode);
+    }
+
+    #[test]
+    fn a_listed_name_inside_a_literal_or_a_comment_is_not_a_call() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT 'set_config(1)'",
+            "SELECT 1 -- set_config('a', 'b', false)",
+            "SELECT 1 /* nextval('s') */",
+            "SELECT set_config FROM t",
+        ] {
+            assert_eq!(
+                classify(Engine::Postgres, sql).mode,
+                Mode::ReadOnly,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_function_nobody_listed_stays_a_read_on_every_engine() {
+        use crate::db::{Engine, Syntax};
+
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() == Syntax::Sql)
+        {
+            for sql in ["SELECT my_function(1)", "SELECT * FROM my_function(1)"] {
+                assert_eq!(
+                    classify(engine, sql).mode,
+                    Mode::ReadOnly,
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_listed_function_stops_being_a_read_on_the_engine_that_lists_it() {
+        use crate::db::Engine;
+
+        for engine in Engine::ALL {
+            for name in engine.spec().sql.denied_functions {
+                let sql = format!("SELECT {name}()");
+                assert!(
+                    classify(engine, &sql).mode > Mode::ReadOnly,
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_listed_calls_classify_the_same_whichever_comes_first() {
+        use crate::db::Engine;
+
+        let one = classify(
+            Engine::Postgres,
+            "SELECT nextval('s'), set_config('a', 'b', false)",
+        );
+        let other = classify(
+            Engine::Postgres,
+            "SELECT set_config('a', 'b', false), nextval('s')",
+        );
+        assert!(one.mode > Mode::ReadOnly);
+        assert_eq!(one.mode, other.mode);
+        assert_eq!(one.destructive, other.destructive);
+    }
 }
