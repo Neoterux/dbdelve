@@ -472,6 +472,37 @@ impl Engine {
         }
     }
 
+    /// How a transaction the user drives is opened on this engine, for the
+    /// `BEGIN` Begin Transaction writes into their buffer. `None` where there
+    /// is none to drive.
+    ///
+    /// Not [`Engine::transaction_start`], which answers a different question:
+    /// whether a *generated* batch needs brackets of its own. Postgres needs
+    /// none there, because one submission is already one implicit
+    /// transaction, and still opens a transaction here, because an explicit
+    /// `BEGIN` is held across submissions by the session. Keeping them apart
+    /// is the point; collapsing them would silently stop opening transactions
+    /// on Postgres. An explicit arm per engine for the reason
+    /// `transaction_start` has one.
+    pub fn begins_transaction(self) -> Option<&'static str> {
+        match self {
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::DuckDb
+            | Self::Snowflake => Some("BEGIN"),
+            // A bare `BEGIN` opens a statement block in T-SQL, not a
+            // transaction, and this spelling is the one the gate reads.
+            Self::SqlServer => Some("BEGIN TRANSACTION"),
+            // `MULTI` queues commands and rolls none of them back, and
+            // MongoDB's transactions need a client session dbdelve does not
+            // hold open across statements.
+            Self::MongoDb | Self::Redis => None,
+        }
+    }
+
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
     ///
     /// SQLite's `UPDATE` takes an expression on the right and `DEFAULT` is not
