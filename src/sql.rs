@@ -2271,10 +2271,16 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
 
     // An empty or comment-only string parses to no statements at all. There is
     // nothing there to be dangerous, and a dialog over nothing is noise.
-    statements
+    let verdict = statements
         .iter()
         .map(statement_verdict)
-        .fold(Verdict::READ, Verdict::max)
+        .fold(Verdict::READ, Verdict::max);
+    // Raised, never replaced: the statements above may already need more.
+    if calls_denied_function(engine, sql) {
+        verdict.max(Verdict::WRITE)
+    } else {
+        verdict
+    }
 }
 
 /// The `sqlparser` dialect an engine's SQL is read in; `None` for MongoDB
@@ -2701,6 +2707,43 @@ fn touches_session(engine: Engine, sql: &str) -> bool {
                 }
             }
             _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a query calls one of the engine's `denied_functions`, wherever the
+/// call sits: the parser puts one in four different nodes (scalar, table,
+/// `LATERAL` table and `TABLE(..)` position), so the tokens are read instead.
+/// Only the last word before the parenthesis is compared, so a schema-qualified
+/// call counts. A column that merely shares a name keeps its statement in turn,
+/// the conservative side.
+///
+/// Separate from [`SESSION_FUNCTIONS`], which answers what the session keeps;
+/// this answers whether Read-only may run the call. A name may be on both.
+fn calls_denied_function(engine: Engine, sql: &str) -> bool {
+    let denied = engine.spec().sql.denied_functions;
+    // An engine that lists nothing is judged by the parse alone, as it was
+    // before the list existed.
+    if denied.is_empty() {
+        return false;
+    }
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    let Ok(tokens) = Tokenizer::new(dialect.as_ref(), sql).tokenize() else {
+        return true;
+    };
+    let mut tokens = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .peekable();
+    while let Some(token) = tokens.next() {
+        if let Token::Word(word) = token
+            && tokens.peek() == Some(&&Token::LParen)
+            && denied.contains(&word.value.to_lowercase().as_str())
+        {
+            return true;
         }
     }
     false
