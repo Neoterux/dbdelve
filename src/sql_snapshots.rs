@@ -5,12 +5,15 @@
 //! judge it.
 
 mod batches;
+mod engines;
 mod explain;
+mod fake_spec;
 mod filters;
 mod gates;
 mod previews;
 mod redis_writes;
 mod rows;
+mod sessions;
 mod sorts;
 mod spellings;
 

@@ -29,6 +29,7 @@ mod mysql;
 mod postgres;
 mod redis;
 mod snowflake;
+mod spec;
 mod sqlite;
 mod ssh;
 mod turso;
@@ -38,6 +39,13 @@ pub use duckdb::IN_MEMORY as DUCKDB_IN_MEMORY;
 
 pub use mongo::MongoConfig;
 pub use snowflake::{SnowflakeConfig, account_identifier, normalize_host};
+use spec::ReadOnlySession;
+#[cfg(test)]
+pub use spec::{Abilities, Hints, Hooks, SqlSpec};
+pub use spec::{
+    EngineSpec, ExplainPrefix, ForeignTable, FormatDialect, Paging, Params, ParserDialect,
+    RegexMatch, SelectTop, SkipDuplicates, StatementSplit, SubstringMatch, Truncate, TypedExplain,
+};
 
 /// One run's claim on Cancel: [`Connection::query`] runs under it, and
 /// [`Connection::cancel`] stops only what ran under it.
@@ -206,38 +214,30 @@ impl ExplainMode {
 }
 
 impl Engine {
-    /// The engine's brand logo. SQL Server's is a generic server glyph, because
-    /// Simple Icons carries no Microsoft logos.
-    pub fn logo(self) -> &'static str {
+    /// Everything that sets this engine apart, as data.
+    pub fn spec(self) -> &'static EngineSpec {
         match self {
-            Self::Postgres => "icons/engine-postgres.svg",
-            Self::MySql => "icons/engine-mysql.svg",
-            Self::MariaDb => "icons/engine-mariadb.svg",
-            Self::Sqlite => "icons/engine-sqlite.svg",
-            Self::Turso => "icons/engine-turso.svg",
-            Self::DuckDb => "icons/engine-duckdb.svg",
-            Self::Snowflake => "icons/engine-snowflake.svg",
-            Self::SqlServer => "icons/engine-sqlserver.svg",
-            Self::MongoDb => "icons/engine-mongodb.svg",
-            Self::Redis => "icons/engine-redis.svg",
+            Self::Postgres => &spec::POSTGRES,
+            Self::MySql => &spec::MYSQL,
+            Self::MariaDb => &spec::MARIADB,
+            Self::Sqlite => &spec::SQLITE,
+            Self::Turso => &spec::TURSO,
+            Self::DuckDb => &spec::DUCKDB,
+            Self::Snowflake => &spec::SNOWFLAKE,
+            Self::SqlServer => &spec::SQL_SERVER,
+            Self::MongoDb => &spec::MONGODB,
+            Self::Redis => &spec::REDIS,
         }
+    }
+
+    /// The engine's brand logo.
+    pub fn logo(self) -> &'static str {
+        self.spec().logo
     }
 
     /// The engine's brand colour as 0xRRGGBB. The theme reads only its hue.
     pub fn brand(self) -> u32 {
-        match self {
-            Self::Postgres => 0x4169E1,
-            Self::MySql => 0x4479A1,
-            // The sea lion's colour rather than the wordmark's near-black teal.
-            Self::MariaDb => 0xC0765A,
-            Self::Sqlite => 0x003B57,
-            Self::Turso => 0x4FF8D2,
-            Self::DuckDb => 0xFFF000,
-            Self::Snowflake => 0x29B5E8,
-            Self::SqlServer => 0xCC2927,
-            Self::MongoDb => 0x47A248,
-            Self::Redis => 0xFF4438,
-        }
+        self.spec().brand
     }
 
     /// Presentation order, which is the order the form's chips appear in.
@@ -255,80 +255,52 @@ impl Engine {
     ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Postgres => "Postgres",
-            Self::MySql => "MySQL",
-            Self::MariaDb => "MariaDB",
-            Self::Sqlite => "SQLite",
-            Self::Turso => "Turso",
-            Self::DuckDb => "DuckDB",
-            Self::Snowflake => "Snowflake",
-            Self::SqlServer => "SQL Server",
-            Self::MongoDb => "MongoDB",
-            Self::Redis => "Redis",
-        }
+        self.spec().label
     }
 
     /// The spelling stored in `profiles.toml`. Changing one of these strings
     /// orphans every profile already written with it.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Postgres => "postgres",
-            Self::MySql => "mysql",
-            Self::MariaDb => "mariadb",
-            Self::Sqlite => "sqlite",
-            Self::Turso => "turso",
-            Self::DuckDb => "duckdb",
-            Self::Snowflake => "snowflake",
-            Self::SqlServer => "mssql",
-            Self::MongoDb => "mongodb",
-            Self::Redis => "redis",
-        }
+        self.spec().id
     }
 
     /// Every spelling [`Engine::parse`] reads: the URL schemes as well as the
-    /// stored spellings. A table so the welcome surface can tell a scheme still
+    /// stored spellings. Listed so the welcome surface can tell a scheme still
     /// being typed from one that is no scheme at all.
-    pub const SCHEMES: [(&'static str, Self); 16] = [
-        ("postgres", Self::Postgres),
-        ("postgresql", Self::Postgres),
-        ("mysql", Self::MySql),
-        ("mariadb", Self::MariaDb),
-        ("sqlite", Self::Sqlite),
-        ("sqlite3", Self::Sqlite),
-        ("file", Self::Sqlite),
-        ("turso", Self::Turso),
-        ("duckdb", Self::DuckDb),
-        ("snowflake", Self::Snowflake),
-        ("mssql", Self::SqlServer),
-        ("sqlserver", Self::SqlServer),
-        ("mongodb", Self::MongoDb),
-        ("mongodb+srv", Self::MongoDb),
-        ("redis", Self::Redis),
-        ("rediss", Self::Redis),
-    ];
+    pub fn schemes() -> impl Iterator<Item = (&'static str, Self)> {
+        Self::ALL.into_iter().flat_map(|engine| {
+            engine
+                .spec()
+                .schemes
+                .iter()
+                .map(move |scheme| (*scheme, engine))
+        })
+    }
 
     /// Accepts the URL schemes as well as the stored spellings, so one function
     /// serves both the profile reader and the URL box.
     pub fn parse(value: &str) -> Result<Self, String> {
         let value = value.trim().to_ascii_lowercase();
-        Self::SCHEMES
-            .iter()
+        Self::schemes()
             .find(|(spelling, _)| *spelling == value)
-            .map(|(_, engine)| *engine)
+            .map(|(_, engine)| engine)
             .ok_or_else(|| format!("{value} is not a database engine dbdelve speaks."))
+    }
+
+    /// The engine whose files end in `extension`, whatever its case.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|engine| {
+            engine
+                .spec()
+                .file_extensions
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+        })
     }
 
     /// The port a blank one means, where the engine has one.
     pub fn default_port(self) -> Option<u16> {
-        match self {
-            Self::Postgres => Some(postgres::DEFAULT_PORT),
-            Self::MySql | Self::MariaDb => Some(mysql::DEFAULT_PORT),
-            Self::SqlServer => Some(mssql::DEFAULT_PORT),
-            Self::MongoDb => Some(mongo::DEFAULT_PORT),
-            Self::Redis => Some(redis::DEFAULT_PORT),
-            Self::Sqlite | Self::Turso | Self::DuckDb | Self::Snowflake => None,
-        }
+        self.spec().default_port
     }
 
     /// Which set of fields makes a connection to this engine, which is what
@@ -336,90 +308,45 @@ impl Engine {
     /// are absent for a file, and an account has a key where a server has a
     /// password and no transport to choose.
     pub fn fields(self) -> Fields {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::SqlServer
-            | Self::MongoDb
-            | Self::Redis => Fields::Server,
-            Self::Sqlite | Self::Turso | Self::DuckDb => Fields::File,
-            Self::Snowflake => Fields::Account,
-        }
+        self.spec().layout
     }
 
     /// Whether the form offers a field of driver options passed through as
     /// typed: MongoDB's connection-string options (`authSource`, `replicaSet`,
     /// `readPreference`, …), which outnumber any set of fields worth drawing.
     pub fn takes_options(self) -> bool {
-        match self {
-            Self::MongoDb => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::Redis => false,
-        }
+        self.spec().takes_options
     }
 
     /// Whether the host may instead be a DNS name whose SRV records list the
     /// servers (`mongodb+srv`), which the form offers as a toggle.
     pub fn resolves_srv(self) -> bool {
-        match self {
-            Self::MongoDb => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::Redis => false,
-        }
+        self.spec().resolves_srv
     }
 
     /// What `mode` is spelled as here, or `None` where the engine has no such
     /// mode. Returned as a prefix because that is the whole of the difference:
     /// the statement it is put in front of is the user's, unchanged.
-    ///
-    /// SQLite has no `ExplainMode::Analyze`. Its bare `EXPLAIN` lists bytecode
-    /// rather than a plan, so the plan-only mode is `EXPLAIN QUERY PLAN`, and
-    /// there is no form that reports what a run actually cost. `None` is what
-    /// keeps the menu from offering a mode that would only produce an error.
-    ///
-    /// MySQL's `EXPLAIN ANALYZE` arrived in 8.0.18; MariaDB has none and spells
-    /// the same thing `ANALYZE` with no `EXPLAIN`. Server versions are not
-    /// detected: an older server refuses the statement and says so, which is
-    /// the error the user needs and is hard rule 6's business rather than a
-    /// version check's.
     pub fn explain_prefix(self, mode: ExplainMode) -> Option<&'static str> {
-        match (self, mode) {
-            (Self::Postgres | Self::MySql | Self::MariaDb, ExplainMode::Plan) => Some("EXPLAIN "),
-            (Self::Postgres | Self::MySql, ExplainMode::Analyze) => Some("EXPLAIN ANALYZE "),
-            (Self::MariaDb, ExplainMode::Analyze) => Some("ANALYZE "),
-            (Self::Sqlite, ExplainMode::Plan) => Some("EXPLAIN QUERY PLAN "),
-            (Self::Sqlite, ExplainMode::Analyze) => None,
-            (Self::Turso, _) => None,
-            // A plan as box-drawn text in one column, a shape `explain.rs`
-            // does not read yet.
-            (Self::DuckDb, _) => None,
-            // Its plan is a fourth shape `explain.rs` does not read yet.
-            (Self::Snowflake, _) => None,
-            // SQL Server has no prefix form. A plan comes from `SET SHOWPLAN_XML
-            // ON`, a session switch that has to be a batch of its own, so
-            // Explain would mean changing the session around the user's
-            // statement rather than putting a word on a copy of it.
-            (Self::SqlServer, _) => None,
+        match self.syntax() {
+            Syntax::Sql => {
+                let sql = &self.spec().sql;
+                let prefix = match mode {
+                    ExplainMode::Plan => sql.explain_plan,
+                    ExplainMode::Analyze => sql.explain_analyze,
+                };
+                prefix.map(|prefix| match prefix {
+                    ExplainPrefix::Explain => "EXPLAIN ",
+                    ExplainPrefix::ExplainAnalyze => "EXPLAIN ANALYZE ",
+                    ExplainPrefix::Analyze => "ANALYZE ",
+                    ExplainPrefix::ExplainQueryPlan => "EXPLAIN QUERY PLAN ",
+                })
+            }
             // A plan there is `.explain()` on the end of the statement, which
             // is `explain_suffix`; nothing goes in front.
-            (Self::MongoDb, _) => Some(""),
+            Syntax::Mongo => Some(""),
             // No command plans another.
-            (Self::Redis, _) => None,
+            Syntax::Redis => None,
         }
     }
 
@@ -434,21 +361,10 @@ impl Engine {
     /// engines, whose whole difference is the prefix, and the cursor's own
     /// `.explain(verbosity)` on MongoDB.
     pub fn explain_suffix(self, mode: ExplainMode) -> &'static str {
-        match (self, mode) {
-            (Self::MongoDb, ExplainMode::Plan) => r#".explain("queryPlanner")"#,
-            (Self::MongoDb, ExplainMode::Analyze) => r#".explain("executionStats")"#,
-            (
-                Self::Postgres
-                | Self::MySql
-                | Self::MariaDb
-                | Self::Sqlite
-                | Self::Turso
-                | Self::DuckDb
-                | Self::Snowflake
-                | Self::SqlServer
-                | Self::Redis,
-                ExplainMode::Plan | ExplainMode::Analyze,
-            ) => "",
+        match (self.syntax(), mode) {
+            (Syntax::Mongo, ExplainMode::Plan) => r#".explain("queryPlanner")"#,
+            (Syntax::Mongo, ExplainMode::Analyze) => r#".explain("executionStats")"#,
+            (Syntax::Sql | Syntax::Redis, ExplainMode::Plan | ExplainMode::Analyze) => "",
         }
     }
 
@@ -456,49 +372,24 @@ impl Engine {
     /// batch, or `None` for the engine that already makes one submission
     /// atomic. `COMMIT` and `ROLLBACK` are spelled the same everywhere, so the
     /// opening word is the whole of the difference.
-    ///
-    /// MySQL's own spelling is `START TRANSACTION`, and `BEGIN` is its
-    /// documented alias outside a stored program. The alias is what dbdelve
-    /// writes because the brackets go into the statement text, where
-    /// `sql::is_generated_write` has to read them back: the tree-sitter
-    /// grammar has no `START TRANSACTION`, so the gate would refuse dbdelve's own
-    /// batch.
     pub fn transaction_start(self) -> Option<&'static str> {
-        match self {
-            // One simple-query submission is already one implicit transaction.
-            Self::Postgres => None,
-            Self::MySql | Self::MariaDb => Some("BEGIN"),
-            Self::Sqlite | Self::Turso | Self::DuckDb => Some("BEGIN"),
-            // Every statement autocommits unless the submission brackets it.
-            Self::Snowflake => Some("BEGIN"),
-            // A bare `BEGIN` opens a statement block in T-SQL, not a
-            // transaction. The gate's grammar reads this spelling too.
-            Self::SqlServer => Some("BEGIN TRANSACTION"),
+        match self.syntax() {
+            Syntax::Sql => self.spec().sql.transaction_opening(),
             // No statement opens one: a batch applies in order, and a failure
             // says which rows already did. Redis's `MULTI` queues commands
             // without rolling back the ones that fail inside it.
-            Self::MongoDb | Self::Redis => None,
+            Syntax::Mongo | Syntax::Redis => None,
         }
     }
 
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
     ///
-    /// SQLite's `UPDATE` takes an expression on the right and `DEFAULT` is not
-    /// one there, so the gesture has to be withheld rather than attempted. It
-    /// answers here for the reason [`Engine::transaction_start`] does: the
+    /// Where it is not, the gesture has to be withheld rather than attempted.
+    /// It answers here for the reason [`Engine::transaction_start`] does: the
     /// question is about which engine is connected, and rule 4 keeps every one
     /// of those inside `src/db/` — the caller asks, and never matches.
     pub fn assigns_default(self) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer => true,
-            // A document has no column defaults to fall back to.
-            Self::Sqlite | Self::Turso | Self::MongoDb | Self::Redis => false,
-        }
+        self.spec().abilities.assigns_default
     }
 
     /// Whether the server fills `column` itself and an insert leaves it out:
@@ -507,164 +398,85 @@ impl Engine {
     /// write into `default`, so a plain default -- `now()`, a serial's
     /// `nextval`, an identity `BY DEFAULT` -- is not one.
     pub fn generates(self, column: &ColumnDefinition) -> bool {
-        let Some(default) = column.default.as_deref() else {
-            return false;
-        };
-        match self {
-            Self::Postgres => default.starts_with("GENERATED ALWAYS AS "),
-            Self::MySql | Self::MariaDb => {
-                default == "AUTO_INCREMENT" || default.starts_with("GENERATED ALWAYS AS (")
-            }
-            // A default constraint's definition always comes wrapped in
-            // parentheses, so neither prefix can be one.
-            Self::SqlServer => default.starts_with("IDENTITY(") || default.starts_with("AS "),
-            // SQLite's `table_info` leaves generated columns out altogether, and
-            // a Snowflake identity takes a supplied value.
-            Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::MongoDb
-            | Self::Redis => false,
-        }
+        // MongoDB's and Redis's spec carry no markers, which is their answer
+        // too.
+        self.spec().generates(column)
     }
 
     /// Whether New row's form leaves `column` out because no value of it is
     /// one a new row can take: a Redis key's type, which is whatever command
     /// made the key, and a new key is a `SET`.
     pub fn new_row_omits(self, column: &str) -> bool {
-        match self {
-            Self::Redis => column == "type",
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => false,
+        match self.syntax() {
+            Syntax::Redis => column == "type",
+            Syntax::Sql | Syntax::Mongo => false,
         }
     }
 
-    /// Whether New row may insert into a relation of `kind`. A SQL view can
-    /// take an insert (an updatable view, or a trigger behind it), so the
-    /// server is left to say; a MongoDB view never does.
+    /// Whether New row may insert into a relation of `kind`.
     pub fn takes_inserts(self, kind: RelationKind) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer => true,
-            Self::MongoDb => kind != RelationKind::View,
-            Self::Redis => true,
-        }
+        self.spec().takes_inserts(kind)
     }
 
     /// Whether Import Rows may insert a file's rows into a relation of
-    /// `kind`: where New row may, bar Redis, whose new rows are keys that
-    /// each name their own value and not rows under a file's columns.
+    /// `kind`: where New row may, on an engine that takes imports at all.
     pub fn takes_imports(self, kind: RelationKind) -> bool {
-        match self {
-            Self::Redis => false,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => self.takes_inserts(kind),
-        }
+        self.spec().abilities.imports && self.takes_inserts(kind)
     }
 
-    /// How a boolean is spelled as an Import Rows value. MySQL reads `'true'`
-    /// into a `tinyint` as an error in strict mode, and SQL Server's `bit` and
-    /// SQLite's integers take `1` and `0` only.
+    /// How a boolean is spelled as an Import Rows value. Import Rows reads
+    /// `spec().sql.boolean_literal` itself (`sql::sql_insert_rows`), so this is
+    /// the per-engine readout the tests pin.
+    #[cfg(test)]
     pub fn boolean_literal(self, value: bool) -> &'static str {
-        match (self, value) {
-            (Self::Postgres | Self::DuckDb | Self::Snowflake | Self::MongoDb, true) => "true",
-            (Self::Postgres | Self::DuckDb | Self::Snowflake | Self::MongoDb, false) => "false",
-            (
-                Self::MySql
-                | Self::MariaDb
-                | Self::Sqlite
-                | Self::Turso
-                | Self::SqlServer
-                | Self::Redis,
-                true,
-            ) => "1",
-            (
-                Self::MySql
-                | Self::MariaDb
-                | Self::Sqlite
-                | Self::Turso
-                | Self::SqlServer
-                | Self::Redis,
-                false,
-            ) => "0",
-        }
+        let literal = match self.syntax() {
+            Syntax::Sql => self.spec().sql.boolean_literal,
+            Syntax::Mongo => spec::BooleanLiteral::TrueFalse,
+            Syntax::Redis => spec::BooleanLiteral::OneZero,
+        };
+        literal.spelled(value)
     }
 
     /// Whether an insert can be told to leave a row that collides with an
-    /// existing key alone. SQL Server and Snowflake have no such clause short
-    /// of `MERGE`, and MongoDB's `insertMany` would stop at the first collision.
+    /// existing key alone.
     pub fn skips_duplicates(self) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb => true,
-            Self::SqlServer | Self::Snowflake | Self::MongoDb | Self::Redis => false,
-        }
+        // MongoDB's and Redis's spec say `None`, which is their answer too.
+        self.spec().sql.skip_duplicates != SkipDuplicates::None
     }
 
     /// [`Engine::skips_duplicates`] for an insert into a table of `structure`.
-    /// DuckDB refuses `ON CONFLICT DO NOTHING` on a table with no primary key,
-    /// unique constraint or unique index, where the others take it as a clause
-    /// with nothing to do.
     pub fn skips_duplicates_into(self, structure: &Structure) -> bool {
-        self.skips_duplicates()
-            && (self != Self::DuckDb
-                || structure.constraints.iter().any(|constraint| {
+        match self.spec().sql.skip_duplicates {
+            SkipDuplicates::None => false,
+            SkipDuplicates::OnConflictDoNothing {
+                needs_unique_key: true,
+            } => {
+                structure.constraints.iter().any(|constraint| {
                     constraint.definition.starts_with("PRIMARY KEY (")
                         || constraint.definition.starts_with("UNIQUE (")
-                })
-                || structure.indexes.iter().any(|index| {
+                }) || structure.indexes.iter().any(|index| {
                     index
                         .definition
                         .get(..20)
                         .is_some_and(|start| start.eq_ignore_ascii_case("CREATE UNIQUE INDEX "))
-                }))
+                })
+            }
+            SkipDuplicates::OnConflictDoNothing {
+                needs_unique_key: false,
+            }
+            | SkipDuplicates::OnDuplicateKey => true,
+        }
     }
 
     /// The statement that opens a transaction spanning an import's chunks, or
     /// why there cannot be one.
     pub fn all_or_nothing(self) -> Result<&'static str, &'static str> {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb => Ok("BEGIN"),
-            Self::SqlServer => Ok("BEGIN TRANSACTION"),
-            Self::Snowflake => Err(
-                "Snowflake runs each request on its own, so no transaction can span the chunks.",
-            ),
-            Self::MongoDb => Err(
-                "MongoDB has no transaction on a standalone server, so each chunk is kept as it goes.",
-            ),
-            Self::Redis => {
-                Err("Redis has no transaction that rolls back, so each chunk is kept as it goes.")
-            }
+        let spec = self.spec();
+        match spec.abilities.chunk_refusal {
+            Some(reason) => Err(reason),
+            // Not `transaction_opening`: one submission being atomic says
+            // nothing of a transaction across several.
+            None => Ok(spec.sql.transaction.opening()),
         }
     }
 
@@ -672,17 +484,9 @@ impl Engine {
     /// A collection has no fixed columns, and an unmapped field is left out
     /// rather than written as null.
     pub fn takes_new_fields(self) -> bool {
-        match self {
-            Self::MongoDb => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::Redis => false,
+        match self.syntax() {
+            Syntax::Mongo => true,
+            Syntax::Sql | Syntax::Redis => false,
         }
     }
 
@@ -691,34 +495,18 @@ impl Engine {
     /// whose contents are a read of their own. `None` where a row is all there
     /// is.
     pub fn opened_column(self) -> Option<&'static str> {
-        match self {
-            Self::Redis => Some("key"),
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => None,
+        match self.syntax() {
+            Syntax::Redis => Some("key"),
+            Syntax::Sql | Syntax::Mongo => None,
         }
     }
 
     /// Whether a header click can ask the server for an order. A Redis reply's
     /// order is the command's own, so a view of one sorts the rows it holds.
     pub fn sorts_on_server(self) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => true,
-            Self::Redis => false,
+        match self.syntax() {
+            Syntax::Sql | Syntax::Mongo => true,
+            Syntax::Redis => false,
         }
     }
 
@@ -726,77 +514,31 @@ impl Engine {
     /// offset. A Redis `SCAN` has neither: the fetch keeps the limit, and a
     /// cursor walk has no page after the first that it can be asked for.
     pub fn pages(self) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => true,
-            Self::Redis => false,
+        match self.syntax() {
+            Syntax::Sql | Syntax::Mongo => true,
+            Syntax::Redis => false,
         }
     }
 
     /// Whether a preview page is ordered by the relation's key when nothing
-    /// else sorts it. SQL Server's `OFFSET … FETCH` needs an `ORDER BY`, and
-    /// one that orders nothing lets a parallel plan repeat or skip rows from
-    /// one page to the next, so its first page waits for the structure that
-    /// names the key (`sql::paged` writes it).
+    /// else sorts it, which `OFFSET … FETCH` paging needs (`sql::paged`
+    /// writes it).
     pub fn pages_by_key(self) -> bool {
-        match self {
-            Self::SqlServer => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::MongoDb
-            | Self::Redis => false,
-        }
+        self.spec().sql.paging == Paging::OffsetFetch
     }
 
     /// Whether the row count the catalog carries for a table is exact rather
-    /// than the statistics' estimate. Snowflake keeps an exact `ROW_COUNT` per
-    /// table; the others' numbers are as of the last time statistics were
-    /// gathered, and SQLite keeps none.
+    /// than the statistics' estimate.
     pub fn exact_row_estimates(self) -> bool {
-        match self {
-            Self::Snowflake => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::SqlServer
-            | Self::MongoDb
-            | Self::Redis => false,
-        }
+        self.spec().abilities.exact_row_estimates
     }
 
-    /// The aggregate a relation's row count is written with. T-SQL's `COUNT`
-    /// is an `int` and fails past 2,147,483,647 rows, so SQL Server's is
-    /// `COUNT_BIG`; every other engine's `COUNT` is already 64-bit.
+    /// The aggregate a relation's row count is written with.
+    #[cfg(test)]
     pub fn count_all(self) -> &'static str {
-        match self {
-            Self::SqlServer => "COUNT_BIG(*)",
-            // MongoDB and Redis write no SQL, so this is never what their
-            // count runs.
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::MongoDb
-            | Self::Redis => "COUNT(*)",
-        }
+        // MongoDB and Redis write no SQL, so their spec's answer is never
+        // what their count runs.
+        self.spec().sql.count_all.aggregate()
     }
 
     /// Whether the server holds a Read-only session to reads -- the backstop
@@ -805,6 +547,13 @@ impl Engine {
     /// refuses it in Read-only instead of offering to run it once.
     pub fn holds_read_only(self) -> bool {
         read_only_statement(self, true).is_some()
+    }
+
+    /// Whether switching the schema has to wait for an open transaction to
+    /// end, because the switch would be sent inside it and undone by the
+    /// user's `ROLLBACK`.
+    pub fn schema_switch_waits_for_transaction(self) -> bool {
+        self.spec().abilities.schema_switch_waits_for_transaction
     }
 
     /// What the filter bar's raw input asks for.
@@ -835,120 +584,43 @@ impl Engine {
     }
 
     pub fn syntax(self) -> Syntax {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer => Syntax::Sql,
-            Self::MongoDb => Syntax::Mongo,
-            Self::Redis => Syntax::Redis,
-        }
+        self.spec().syntax
     }
 
     /// Whether a relation has a definition [`Connection::ddl`] can write out.
-    /// A Redis keyspace is declared nowhere.
     pub fn copies_ddl(self) -> bool {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => true,
-            Self::Redis => false,
-        }
+        self.spec().abilities.copies_ddl
     }
 
     /// Whether one server holds several databases a profile can be moved
-    /// between, which [`Connection::databases`] lists. DuckDB's are the ones
-    /// attached to the instance the profile opened.
+    /// between, which [`Connection::databases`] lists.
     pub fn switches_database(self) -> bool {
-        matches!(
-            self,
-            Self::Postgres
-                | Self::MySql
-                | Self::MariaDb
-                | Self::SqlServer
-                | Self::MongoDb
-                | Self::Redis
-                | Self::Snowflake
-                | Self::DuckDb
-        )
+        self.spec().abilities.switches_database
     }
 
     /// Whether moving the profile onto another database is a `USE` on the
-    /// connection already open rather than a new connection. Reopening a
-    /// DuckDB file detaches everything attached to it, and an in-memory
-    /// database opened again is a new, empty one.
+    /// connection already open rather than a new connection.
     pub fn switches_database_in_session(self) -> bool {
-        matches!(self, Self::DuckDb)
+        self.spec().abilities.switches_database_in_session
     }
 
     /// Whether a profile picks the schema unqualified names resolve in.
-    /// MySQL's database is its schema, and SQL Server's default schema is the
-    /// login's.
     pub fn picks_schema(self) -> bool {
-        matches!(self, Self::Postgres | Self::Snowflake | Self::DuckDb)
+        self.spec().abilities.picks_schema
     }
 
     /// A database the server keeps for itself, listed after the user's own.
-    /// Postgres's `postgres` is an ordinary database people work in.
     pub fn is_system_database(self, name: &str) -> bool {
-        let system: &[&str] = match self {
-            Self::MySql | Self::MariaDb => {
-                &["information_schema", "mysql", "performance_schema", "sys"]
-            }
-            Self::SqlServer => &["master", "tempdb", "model", "msdb"],
-            Self::MongoDb => &["admin", "local", "config"],
-            // The account usage share every account has. `SNOWFLAKE_SAMPLE_DATA`
-            // is a share too, but one people query.
-            Self::Snowflake => &["SNOWFLAKE"],
-            _ => &[],
-        };
-        system.contains(&name)
-    }
-
-    /// Postgres and SQLite take the standard's double quote. MySQL takes a
-    /// backtick, which it accepts whether or not `ANSI_QUOTES` is set — a double
-    /// quote there is a *string literal*, so quoting a MySQL identifier the
-    /// standard way produces a statement that runs and means something else.
-    ///
-    /// `None` for MongoDB, whose field names are JavaScript strings, escaped
-    /// with a backslash rather than doubled, and for Redis, whose names are
-    /// redis-cli words.
-    fn identifier_quote(self) -> Option<char> {
-        match self {
-            // Snowflake folds an unquoted name to upper case and reads a quoted
-            // one exactly, and the catalog reports names as stored -- so quoting
-            // what the catalog said is always the name it meant.
-            Self::Postgres | Self::Sqlite | Self::Turso | Self::DuckDb | Self::Snowflake => {
-                Some('"')
-            }
-            // Not T-SQL's own `[name]`: the grammar every gate in `sql.rs`
-            // parses with has no brackets, and the pin does not move. The
-            // standard quote names an identifier under `QUOTED_IDENTIFIER`,
-            // which the driver's login turns on.
-            Self::SqlServer => Some('"'),
-            Self::MySql | Self::MariaDb => Some('`'),
-            Self::MongoDb | Self::Redis => None,
-        }
+        self.spec().system_databases.contains(&name)
     }
 
     pub fn quote_identifier(self, identifier: &str) -> String {
-        match (self, self.identifier_quote()) {
-            (Self::Redis, _) => crate::redis_cmd::quoted(identifier),
-            (_, Some(quote)) => format!(
-                "{quote}{}{quote}",
-                identifier.replace(quote, &format!("{quote}{quote}"))
-            ),
-            (_, None) => json_string(identifier),
+        match self.syntax() {
+            Syntax::Sql => self.spec().quote_identifier(identifier),
+            // A field name is a JavaScript string, escaped with a backslash
+            // rather than doubled.
+            Syntax::Mongo => json_string(identifier),
+            Syntax::Redis => crate::redis_cmd::quoted(identifier),
         }
     }
 
@@ -959,156 +631,46 @@ impl Engine {
     /// position or a function call names no column, and pretending otherwise
     /// would light up the wrong header.
     pub fn unquote_identifier(self, expression: &str) -> String {
-        if self == Self::Redis {
-            return match crate::redis_cmd::split(expression).as_deref() {
+        match self.syntax() {
+            Syntax::Sql => self.spec().unquote_identifier(expression),
+            Syntax::Mongo => serde_json::from_str::<String>(expression)
+                .unwrap_or_else(|_| expression.to_string()),
+            Syntax::Redis => match crate::redis_cmd::split(expression).as_deref() {
                 Ok([word]) => String::from_utf8_lossy(word).into_owned(),
                 _ => expression.to_string(),
-            };
-        }
-        let Some(quote) = self.identifier_quote() else {
-            return serde_json::from_str::<String>(expression)
-                .unwrap_or_else(|_| expression.to_string());
-        };
-        match expression
-            .strip_prefix(quote)
-            .and_then(|rest| rest.strip_suffix(quote))
-        {
-            Some(inner) => inner.replace(&format!("{quote}{quote}"), &quote.to_string()),
-            None => expression.to_string(),
+            },
         }
     }
 
-    /// Whether a date literal may carry a UTC offset. MariaDB refuses one even
-    /// into a `timestamp`, which it reads in the session's zone.
+    /// Whether a date literal may carry a UTC offset.
     pub fn reads_literal_offsets(self) -> bool {
-        match self {
-            Self::MariaDb => false,
-            Self::Postgres
-            | Self::MySql
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::SqlServer
-            | Self::Snowflake
-            | Self::MongoDb
-            | Self::Redis => true,
-        }
+        self.spec().sql.literal_offsets
     }
 
     /// Whether a backslash in a single-quoted literal escapes the character
-    /// after it. Snowflake reads it so unconditionally; MySQL and MariaDB unless
-    /// `NO_BACKSLASH_ESCAPES` is set, which is not dbdelve's to know, so they
-    /// are taken to.
+    /// after it.
     pub fn backslash_escapes(self) -> bool {
-        match self {
-            Self::MySql | Self::MariaDb | Self::Snowflake => true,
-            Self::Postgres
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::SqlServer
-            | Self::MongoDb
-            | Self::Redis => false,
-        }
+        self.spec().sql.backslash_escapes
     }
 
-    /// Doubling the quote is enough for two of them: neither Postgres nor
-    /// SQLite reads a backslash as an escape, the first because
-    /// `standard_conforming_strings` is on by default and the second because it
-    /// has no such notion at all. MySQL does, unless `NO_BACKSLASH_ESCAPES` is
-    /// set — which is again not dbdelve's to set — so a literal backslash has to
-    /// survive as two.
     pub fn quote_literal(self, value: &str) -> String {
-        match self {
-            Self::Postgres
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Snowflake => {
-                let value = match self.backslash_escapes() {
-                    true => value.replace('\\', r"\\"),
-                    false => value.to_string(),
-                };
-                format!("'{}'", value.replace('\'', "''"))
-            }
-            // `N` because a bare literal is converted to the database's code
-            // page first, and a character it lacks arrives as `?`. No
-            // backslash escape in T-SQL.
-            Self::SqlServer => format!("N'{}'", value.replace('\'', "''")),
-            Self::MongoDb => json_string(value),
-            Self::Redis => crate::redis_cmd::quoted(value),
+        match self.syntax() {
+            Syntax::Sql => self.spec().quote_literal(value),
+            Syntax::Mongo => json_string(value),
+            Syntax::Redis => crate::redis_cmd::quoted(value),
         }
     }
 
     /// [`Self::quote_literal`] for a value bound for a column of `data_type`,
-    /// on the one engine where the type changes how its literal is spelled.
-    ///
-    /// SQL Server's binary value is its hex literal, bare: quoted, it is a
-    /// string, compared by its UTF-16 bytes, and matches no row. Bare only when
-    /// it is exactly such a literal, because this is the one way a value enters
-    /// a statement unquoted. And `N` only where a column needs it: an
-    /// `nvarchar` literal against a `varchar` key converts the column rather
-    /// than itself, so the edit scans the index. An ASCII value reads the same
-    /// in every code page, which is what makes dropping the `N` safe.
+    /// on an engine where the type changes how its literal is spelled.
     pub fn quote_value(self, value: &str, data_type: Option<&str>) -> String {
-        let (Self::SqlServer, Some(data_type)) = (self, data_type) else {
-            return self.quote_literal(value);
-        };
-        let lowered = data_type.to_ascii_lowercase();
-        let name = lowered.split('(').next().unwrap_or_default().trim();
-        let hex = value
-            .get(..2)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("0x"))
-            .and_then(|_| value.get(2..))
-            .filter(|digits| {
-                digits.len() % 2 == 0 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-        let narrow = matches!(
-            name,
-            "char"
-                | "varchar"
-                | "text"
-                | "bit"
-                | "tinyint"
-                | "smallint"
-                | "int"
-                | "bigint"
-                | "decimal"
-                | "numeric"
-                | "real"
-                | "float"
-                | "money"
-                | "smallmoney"
-                | "date"
-                | "time"
-                | "datetime"
-                | "datetime2"
-                | "smalldatetime"
-                | "datetimeoffset"
-                | "uniqueidentifier"
-        );
-        if let Some(digits) = hex.filter(|_| self.is_binary_type(name)) {
-            format!("0x{digits}")
-        } else if matches!(name, "datetime" | "smalldatetime")
-            && let Some(iso) = iso_datetime(value)
-        {
-            iso
-        } else if narrow && value.is_ascii() {
-            format!("'{}'", value.replace('\'', "''"))
-        } else {
-            self.quote_literal(value)
+        match self.syntax() {
+            Syntax::Sql => self.spec().quote_value(value, data_type),
+            Syntax::Mongo | Syntax::Redis => self.quote_literal(value),
         }
     }
 
     /// Whether a [`Column::data_type`] names a type whose values are bytes.
-    ///
-    /// Substrings because the families are open-ended in two directions: MySQL
-    /// prefixes its blobs and binaries, and SQLite gives BLOB affinity to any
-    /// declared type merely *containing* `blob`. `image` only on SQL Server,
-    /// where it is the legacy binary type; elsewhere it is a name anyone may
-    /// give a column or a domain, and a SQLite `image` column holds text.
     ///
     /// What it is for: a blob is rendered as the engine's own literal — `x'AB'`,
     /// `0xAB` — and [`Engine::quote_literal`] would quote that back as the six
@@ -1117,32 +679,23 @@ impl Engine {
     /// that could not name the type says nothing, and treating silence as binary
     /// would make ordinary columns read-only.
     pub fn is_binary_type(self, data_type: &str) -> bool {
-        let name = data_type.to_ascii_lowercase();
-        name == "bytea"
-            || name.contains("blob")
-            || name.contains("binary")
-            || (self == Self::SqlServer
-                && matches!(name.as_str(), "image" | "rowversion" | "timestamp"))
-            || (self == Self::MongoDb && name == "bindata")
+        self.spec().is_binary_type(data_type)
     }
 
-    /// Whether a cell of `data_type` holds what an edit of it would write
-    /// back: not bytes ([`Engine::is_binary_type`]), and on Redis only text
-    /// that is the whole of its value, never the start of a long one, a
-    /// collection's size or the spelling of bytes that are not text.
-    pub fn writes_back(self, data_type: &str) -> bool {
-        match self {
-            Self::Redis => crate::redis_cmd::edit::writes_back(data_type),
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => !self.is_binary_type(data_type),
-        }
+    /// Whether a cell whose type is known as each of `types` -- none, where
+    /// no driver named one -- holds what an edit of it would write back: on an
+    /// engine that edits rows at all, not bytes ([`Engine::is_binary_type`]),
+    /// and on Redis only text that is the whole of its value, never the start
+    /// of a long one, a collection's size or the spelling of bytes that are
+    /// not text.
+    pub fn writes_back<'a>(self, types: impl IntoIterator<Item = &'a str>) -> bool {
+        self.spec().writes_back(types)
+    }
+
+    /// Whether a grid's cells and rows may be written back at all, which an
+    /// engine in the read-only tier never is.
+    pub fn edits_rows(self) -> bool {
+        self.spec().abilities.edits
     }
 
     /// Whether a query tab's grid takes a deleted row, as a relation's preview
@@ -1152,17 +705,9 @@ impl Engine {
     /// are taken out. A new row needs no such gate: any grid written back to
     /// one table takes one.
     pub fn edits_query_rows(self) -> bool {
-        match self {
-            Self::Redis => true,
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => false,
+        match self.syntax() {
+            Syntax::Redis => true,
+            Syntax::Sql | Syntax::Mongo => false,
         }
     }
 
@@ -1172,83 +717,35 @@ impl Engine {
     /// set's member and score and a string's value are the row, and an edit
     /// of one is written as a `RENAMENX`, or as a removal and an addition.
     pub fn edits_key_column(self, column: &str) -> bool {
-        match self {
-            Self::Redis => crate::redis_cmd::edit::edits_key_column(column),
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer
-            | Self::MongoDb => false,
+        match self.syntax() {
+            Syntax::Redis => crate::redis_cmd::edit::edits_key_column(column),
+            Syntax::Sql | Syntax::Mongo => false,
         }
     }
 
     /// What a header click adds to a statement, as a notice names it.
     pub fn sort_clause(self) -> &'static str {
-        match self {
-            Self::Postgres
-            | Self::MySql
-            | Self::MariaDb
-            | Self::Sqlite
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::SqlServer => "an ORDER BY",
-            Self::MongoDb | Self::Redis => "a sort",
+        match self.syntax() {
+            Syntax::Sql => "an ORDER BY",
+            Syntax::Mongo | Syntax::Redis => "a sort",
         }
     }
 
     pub fn qualified(self, schema: &str, name: &str) -> String {
-        format!(
-            "{}.{}",
-            self.quote_identifier(schema),
-            self.quote_identifier(name)
-        )
+        match self.syntax() {
+            Syntax::Sql => self.spec().qualified(schema, name),
+            Syntax::Mongo | Syntax::Redis => format!(
+                "{}.{}",
+                self.quote_identifier(schema),
+                self.quote_identifier(name)
+            ),
+        }
     }
 }
 
 /// A JavaScript string literal, which a JSON string always is.
 fn json_string(value: &str) -> String {
     serde_json::Value::from(value).to_string()
-}
-
-/// A `datetime` value as `'YYYY-MM-DDThh:mm:ss…'`, the one spelling of it
-/// `DATEFORMAT` and `SET LANGUAGE` never reorder: with a space instead of the
-/// `T`, or as a bare date, `british` reads `2024-01-02` as the first of
-/// February. `None` for anything not shaped like the grid's own rendering.
-fn iso_datetime(value: &str) -> Option<String> {
-    // Every byte of the shape is ASCII, so matching bytes also keeps the
-    // slices below on character boundaries.
-    let shaped = |text: &[u8], shape: &[u8]| {
-        text.len() == shape.len()
-            && text.iter().zip(shape).all(|(byte, want)| match want {
-                b'9' => byte.is_ascii_digit(),
-                _ => byte == want,
-            })
-    };
-    let bytes = value.as_bytes();
-    if bytes.len() < 10 || !shaped(&bytes[..10], b"9999-99-99") {
-        return None;
-    }
-    let time = match &bytes[10..] {
-        [] => b" 00:00:00".as_slice(),
-        rest => rest,
-    };
-    let clock = time.len() >= 9 && shaped(&time[..9], b" 99:99:99");
-    let fraction = &time[time.len().min(9)..];
-    let fraction_ok = match fraction {
-        [] => true,
-        [b'.', digits @ ..] => !digits.is_empty() && digits.iter().all(u8::is_ascii_digit),
-        _ => false,
-    };
-    let time = value
-        .get(11..)
-        .filter(|time| !time.is_empty())
-        .unwrap_or("00:00:00");
-    (clock && fraction_ok).then(|| format!("'{}T{time}'", &value[..10]))
 }
 
 /// A URL is percent-encoded by definition, and a path with a space in it is
@@ -3416,24 +2913,18 @@ pub(super) fn plain_error(message: String) -> DbError {
 /// reopen the file under `SQLITE_OPEN_READ_ONLY` when the mode lands on
 /// `ReadOnly`.
 fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> {
-    match (engine, read_only) {
-        (Engine::Postgres, true) => Some("SET default_transaction_read_only = on"),
-        (Engine::Postgres, false) => Some("SET default_transaction_read_only = off"),
-        (Engine::MySql | Engine::MariaDb, true) => Some("SET SESSION TRANSACTION READ ONLY"),
-        (Engine::MySql | Engine::MariaDb, false) => Some("SET SESSION TRANSACTION READ WRITE"),
-        (Engine::Sqlite, _) => None,
-        (Engine::Turso, _) => None,
-        // An open database has no session switch; read-only is a way to open
-        // the file, which a profile does not ask for yet.
-        (Engine::DuckDb, _) => None,
-        // There is no session to set anything on.
-        (Engine::Snowflake, _) => None,
-        // No session-level switch exists. `ApplicationIntent=ReadOnly` routes a
-        // login to a readable replica and is ignored by a primary.
-        (Engine::SqlServer, _) => None,
-        // No session setting holds a client to reads; the classifier is the
-        // boundary there.
-        (Engine::MongoDb | Engine::Redis, _) => None,
+    match (engine.spec().sql.read_only_session, read_only) {
+        (ReadOnlySession::DefaultTransaction, true) => {
+            Some("SET default_transaction_read_only = on")
+        }
+        (ReadOnlySession::DefaultTransaction, false) => {
+            Some("SET default_transaction_read_only = off")
+        }
+        (ReadOnlySession::SessionTransaction, true) => Some("SET SESSION TRANSACTION READ ONLY"),
+        (ReadOnlySession::SessionTransaction, false) => Some("SET SESSION TRANSACTION READ WRITE"),
+        // MongoDB and Redis land here too: no session setting holds a client
+        // to reads; the classifier is the boundary there.
+        (ReadOnlySession::None, _) => None,
     }
 }
 

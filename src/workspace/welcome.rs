@@ -38,15 +38,6 @@ impl Recognised {
     }
 }
 
-const FILE_EXTENSIONS: [(&str, Engine); 6] = [
-    ("db", Engine::Sqlite),
-    ("sqlite", Engine::Sqlite),
-    ("sqlite3", Engine::Sqlite),
-    ("db3", Engine::Sqlite),
-    ("duckdb", Engine::DuckDb),
-    ("ddb", Engine::DuckDb),
-];
-
 pub(crate) fn recognise(text: &str) -> Recognised {
     let text = text.trim();
     if text.is_empty() {
@@ -57,13 +48,9 @@ pub(crate) fn recognise(text: &str) -> Recognised {
         let engine = Path::new(text)
             .extension()
             .and_then(|extension| extension.to_str())
-            .and_then(|extension| {
-                FILE_EXTENSIONS
-                    .iter()
-                    .find(|(known, _)| known.eq_ignore_ascii_case(extension))
-            });
+            .and_then(Engine::from_extension);
         return match engine {
-            Some((_, engine)) => Recognised::File(*engine),
+            Some(engine) => Recognised::File(engine),
             None => Recognised::Typing,
         };
     }
@@ -78,10 +65,7 @@ pub(crate) fn recognise(text: &str) -> Recognised {
         Some(scheme) => Engine::parse(scheme).map_or(Recognised::Unknown, Recognised::Url),
         None => {
             let typed = text.to_ascii_lowercase();
-            if Engine::SCHEMES
-                .iter()
-                .any(|(spelling, _)| spelling.starts_with(&typed))
-            {
+            if Engine::schemes().any(|(spelling, _)| spelling.starts_with(&typed)) {
                 Recognised::Typing
             } else {
                 Recognised::Unknown
@@ -858,6 +842,25 @@ fn item_label(label: impl Into<gpui::SharedString>) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_file_extension_names_its_engine() {
+        let cases = [
+            ("db", Engine::Sqlite),
+            ("sqlite", Engine::Sqlite),
+            ("sqlite3", Engine::Sqlite),
+            ("db3", Engine::Sqlite),
+            ("duckdb", Engine::DuckDb),
+            ("ddb", Engine::DuckDb),
+        ];
+        for (extension, engine) in cases {
+            for extension in [extension.to_owned(), extension.to_ascii_uppercase()] {
+                let path = format!("~/a.{extension}");
+                assert_eq!(recognise(&path), Recognised::File(engine), "{path}");
+            }
+        }
+        assert_eq!(recognise("~/a.turso"), Recognised::Typing);
+    }
 
     #[test]
     fn a_url_is_recognised_by_the_scheme_the_form_reads() {

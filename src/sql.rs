@@ -23,15 +23,18 @@ use sqlparser::ast::{
     Merge, Query, SetExpr, Statement, Update, UtilityOption,
 };
 use sqlparser::dialect::{
-    Dialect, DuckDbDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
-    SnowflakeDialect,
+    Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
+    SQLiteDialect, SnowflakeDialect,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
 use sqlparser::tokenizer::{Location, Token, Tokenizer, Whitespace};
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::db::{ColumnDefinition, Engine, ExplainMode};
+use crate::db::{
+    ColumnDefinition, Engine, EngineSpec, ExplainMode, ExplainPrefix, FormatDialect, Paging,
+    Params, ParserDialect, SkipDuplicates, StatementSplit, Syntax, TypedExplain,
+};
 use crate::import_rows::Value;
 use crate::result_grid::{NewValue, PendingRow};
 
@@ -59,20 +62,14 @@ impl Buffer {
     /// A MongoDB buffer is mongosh statements, not SQL, and `mql` reads its
     /// boundaries: a newline ends a statement there unless a `.` continues it.
     pub fn for_engine(engine: Engine, sql: &str) -> Self {
-        let statements = match engine {
-            Engine::SqlServer => batches(sql)
+        let statements = match engine.syntax() {
+            Syntax::Sql if batches_on(engine) => batches(sql)
                 .into_iter()
                 .flat_map(|batch| tsql_statements(sql, batch))
                 .collect(),
-            Engine::MongoDb => crate::mql::statements(sql),
-            Engine::Redis => crate::redis_cmd::statements(sql),
-            Engine::Postgres
-            | Engine::MySql
-            | Engine::MariaDb
-            | Engine::Sqlite
-            | Engine::Turso
-            | Engine::DuckDb
-            | Engine::Snowflake => statements_in(sql),
+            Syntax::Sql => statements_in(sql),
+            Syntax::Mongo => crate::mql::statements(sql),
+            Syntax::Redis => crate::redis_cmd::statements(sql),
         };
 
         Self { statements }
@@ -155,17 +152,9 @@ pub(crate) fn queued_statements(
     sql: &str,
     selection: Option<Range<usize>>,
 ) -> Vec<Range<usize>> {
-    let units = match engine {
-        Engine::SqlServer => queued_batches(sql),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::MongoDb
-        | Engine::Redis => Buffer::for_engine(engine, sql).statements().to_vec(),
+    let units = match batches_on(engine) {
+        true => queued_batches(sql),
+        false => Buffer::for_engine(engine, sql).statements().to_vec(),
     };
     let Some(selection) = selection.filter(|sel| !sel.is_empty()) else {
         return units;
@@ -185,17 +174,9 @@ pub(crate) fn queued_statements(
 /// procedure call, a loop or a trigger can return more sets than the batch has
 /// statements, and there is no reading that off the text.
 pub(crate) fn expected_sets(engine: Engine, sql: &str) -> usize {
-    match engine {
-        Engine::SqlServer => tsql_statements(sql, 0..sql.len()).len().max(1),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::MongoDb
-        | Engine::Redis => 1,
+    match batches_on(engine) {
+        true => tsql_statements(sql, 0..sql.len()).len().max(1),
+        false => 1,
     }
 }
 
@@ -230,8 +211,7 @@ pub(crate) fn split_reads(
                 word.starts_with('#') || word.starts_with('@') && !word.starts_with("@@")
             })
     };
-    if engine != Engine::SqlServer || !batches.iter().all(|batch| reads_alone(&sql[batch.clone()]))
-    {
+    if !batches_on(engine) || !batches.iter().all(|batch| reads_alone(&sql[batch.clone()])) {
         return Vec::new();
     }
     batches
@@ -273,18 +253,11 @@ impl SortKey {
 /// that could carry one and does not; `None` is a statement dbdelve cannot read
 /// well enough to say without guessing.
 pub fn order_by(engine: Engine, statement: &str) -> Option<Vec<SortKey>> {
-    match engine {
-        Engine::MongoDb => return crate::mql::browse::order_by(statement),
+    match engine.syntax() {
+        Syntax::Mongo => return crate::mql::browse::order_by(statement),
         // A reply's order is the command's own; nothing sorts it.
-        Engine::Redis => return None,
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+        Syntax::Redis => return None,
+        Syntax::Sql => {}
     }
     let sql = statement;
     let tree = parse(sql)?;
@@ -329,17 +302,10 @@ pub fn order_by(engine: Engine, statement: &str) -> Option<Vec<SortKey>> {
 /// guessed at, because the alternative is handing the server a statement the
 /// user did not write and cannot read.
 pub fn with_order_by(engine: Engine, statement: &str, keys: &[SortKey]) -> Option<String> {
-    match engine {
-        Engine::MongoDb => return crate::mql::browse::with_order_by(statement, keys),
-        Engine::Redis => return None,
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+    match engine.syntax() {
+        Syntax::Mongo => return crate::mql::browse::with_order_by(statement, keys),
+        Syntax::Redis => return None,
+        Syntax::Sql => {}
     }
     let sql = statement;
     let tree = parse(sql)?;
@@ -372,7 +338,16 @@ pub fn with_order_by(engine: Engine, statement: &str, keys: &[SortKey]) -> Optio
     Some(splice(sql, &tree, insert_at..insert_at, &clause))
 }
 
-/// A generated preview's page, spelled the way `engine` reads one.
+/// [`sql_paged`] for `engine`. A MongoDB or Redis preview comes back as it
+/// is.
+pub fn paged(engine: Engine, statement: &str, key: &[String]) -> Option<String> {
+    match engine.syntax() {
+        Syntax::Sql => sql_paged(engine.spec(), statement, key),
+        Syntax::Mongo | Syntax::Redis => Some(statement.to_string()),
+    }
+}
+
+/// A generated preview's page, spelled the way `spec` reads one.
 ///
 /// Every engine but SQL Server takes the `LIMIT … OFFSET …` a preview is
 /// generated with. T-SQL has no `LIMIT`, and the grammar the gates parse with
@@ -388,8 +363,8 @@ pub fn with_order_by(engine: Engine, statement: &str, keys: &[SortKey]) -> Optio
 /// preview with no limit is one page already, and comes back as it is.
 ///
 /// `None` for a statement this cannot read, or whose limit it cannot.
-pub fn paged(engine: Engine, statement: &str, key: &[String]) -> Option<String> {
-    if engine != Engine::SqlServer {
+pub(crate) fn sql_paged(spec: &EngineSpec, statement: &str, key: &[String]) -> Option<String> {
+    if spec.sql.paging == Paging::LimitOffset {
         return Some(statement.to_string());
     }
     let tree = parse(statement)?;
@@ -413,7 +388,7 @@ pub fn paged(engine: Engine, statement: &str, key: &[String]) -> Option<String> 
         None => {
             key.iter()
                 .fold("ORDER BY (SELECT NULL)".to_string(), |order, column| {
-                    format!("{order}, {}", engine.quote_identifier(column))
+                    format!("{order}, {}", spec.quote_identifier(column))
                 })
                 + " "
         }
@@ -448,28 +423,10 @@ pub fn unpaged(statement: &str) -> String {
     unpage().unwrap_or_else(|| statement.to_string())
 }
 
-/// One row's `UPDATE`: every column in `sets` assigned, every column in `keys`
-/// matched.
-///
-/// Values go in as literals and are never cast. Postgres applies the target
-/// column's assignment cast, so `'123'` lands in an `int4` exactly as `123`
-/// would, and SQLite applies the column's type affinity to the same effect. A
-/// cast dbdelve chose for itself could only ever be the wrong one. A cleared cell
-/// is therefore the empty string, and [`NewValue`]'s other two arms are the
-/// keywords: three different writes, which is the whole point of spelling two
-/// of them as something other than a value.
-///
-/// `keys` carries plain values, because a row identified by a `NULL` is a row
-/// `=` does not find; the caller drops such a row before it gets here.
-///
-/// `types` names each column's type where it is known, for the engine whose
-/// literal depends on it (`Engine::quote_value`). A column missing from it is
-/// quoted the way any value is.
-///
-/// `None` when either list is empty. A statement with no `WHERE` rewrites every
-/// row in the table and one with no `SET` is not a statement at all, so a caller
-/// that has lost the row's key gets nothing to run rather than something that
-/// runs.
+/// [`sql_update_statement`] for `engine`. MongoDB's and Redis's edits are
+/// written by their own modules, and only the tests read the SQL-shaped text
+/// spelled with their quoting here.
+#[cfg(test)]
 pub fn update_row(
     engine: Engine,
     schema: &str,
@@ -478,6 +435,9 @@ pub fn update_row(
     keys: &[(&str, &str)],
     types: &[(String, String)],
 ) -> Option<String> {
+    if engine.syntax() == Syntax::Sql {
+        return sql_update_statement(engine.spec(), schema, table, sets, keys, types);
+    }
     if sets.is_empty() || keys.is_empty() {
         return None;
     }
@@ -516,33 +476,38 @@ pub fn insert_row(
     columns: &[(&str, Option<&str>)],
     types: &[(String, String)],
 ) -> Result<String, String> {
-    match engine {
-        Engine::MongoDb => return crate::mql::insert_row(table, columns, types),
-        Engine::Redis => return crate::redis_cmd::edit::insert_row(schema, table, columns),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+    match engine.syntax() {
+        Syntax::Sql => sql_insert_row(engine.spec(), schema, table, columns, types),
+        Syntax::Mongo => crate::mql::insert_row(table, columns, types),
+        Syntax::Redis => crate::redis_cmd::edit::insert_row(schema, table, columns),
     }
+}
+
+/// [`insert_row`] for a SQL engine, written from its spec alone: nothing here
+/// asks which engine it is, so an engine with no arm of its own writes through
+/// it too. The same holds for every `sql_` writer below.
+pub(crate) fn sql_insert_row(
+    spec: &EngineSpec,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, Option<&str>)],
+    types: &[(String, String)],
+) -> Result<String, String> {
     if columns.is_empty() {
         return Err("There is nothing in this row to insert.".into());
     }
 
     let names: Vec<String> = columns
         .iter()
-        .map(|&(column, _)| engine.quote_identifier(column))
+        .map(|&(column, _)| spec.quote_identifier(column))
         .collect();
     let values: Vec<String> = columns
         .iter()
         // An insert leaves a default to apply by omitting the column outright,
         // so the third state the grid's edits carry has nothing to mean here.
         .map(|&(column, value)| {
-            literal(
-                engine,
+            sql_literal(
+                spec,
                 &value.map_or(NewValue::Null, |value| NewValue::Value(value.into())),
                 type_of(types, column),
             )
@@ -550,7 +515,7 @@ pub fn insert_row(
         .collect();
     Ok(format!(
         "INSERT INTO {} ({}) VALUES ({})",
-        engine.qualified(schema, table),
+        spec.qualified(schema, table),
         names.join(", "),
         values.join(", ")
     ))
@@ -558,8 +523,8 @@ pub fn insert_row(
 
 /// One multi-row `INSERT` for an import chunk. `columns` holds `(name,
 /// data_type)`, each row its values in that order; a `None` has no SQL
-/// spelling, so it is an error. Every value is quoted through `Engine`, which
-/// is what the write gate's literal check relies on.
+/// spelling, so it is an error. Every value is quoted as the engine quotes it,
+/// which is what the write gate's literal check relies on.
 pub(crate) fn insert_rows(
     engine: Engine,
     schema: &str,
@@ -568,13 +533,24 @@ pub(crate) fn insert_rows(
     rows: &[Vec<Option<&Value>>],
     skip: bool,
 ) -> Result<String, String> {
-    if engine == Engine::MongoDb {
-        let names: Vec<&str> = columns.iter().map(|&(name, _)| name).collect();
-        return crate::mql::insert_many(table, &names, rows);
+    match engine.syntax() {
+        Syntax::Sql => sql_insert_rows(engine.spec(), schema, table, columns, rows, skip),
+        Syntax::Mongo => {
+            let names: Vec<&str> = columns.iter().map(|&(name, _)| name).collect();
+            crate::mql::insert_many(table, &names, rows)
+        }
+        Syntax::Redis => Err("Redis takes no imported rows.".into()),
     }
-    if engine == Engine::Redis {
-        return Err("Redis takes no imported rows.".into());
-    }
+}
+
+pub(crate) fn sql_insert_rows(
+    spec: &EngineSpec,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, &str)],
+    rows: &[Vec<Option<&Value>>],
+    skip: bool,
+) -> Result<String, String> {
     let Some(&(first, _)) = columns.first() else {
         return Err("There is nothing in this row to insert.".into());
     };
@@ -583,7 +559,7 @@ pub(crate) fn insert_rows(
     }
     let names: Vec<String> = columns
         .iter()
-        .map(|&(name, _)| engine.quote_identifier(name))
+        .map(|&(name, _)| spec.quote_identifier(name))
         .collect();
     let mut tuples = Vec::with_capacity(rows.len());
     for row in rows {
@@ -592,33 +568,31 @@ pub(crate) fn insert_rows(
             let value = value.ok_or("A value is missing from a row to insert.")?;
             let new = match value {
                 Value::Null => NewValue::Null,
-                Value::Bool(b) => NewValue::Value(engine.boolean_literal(*b).into()),
+                Value::Bool(b) => NewValue::Value(spec.sql.boolean_literal.spelled(*b).into()),
                 Value::Json(json) => NewValue::Value(json.to_string().into()),
                 Value::Text(text) | Value::Number(text) | Value::Date { text, .. } => {
                     NewValue::Value(text.clone().into())
                 }
             };
-            values.push(literal(engine, &new, Some(data_type)));
+            values.push(sql_literal(spec, &new, Some(data_type)));
         }
         tuples.push(format!("({})", values.join(", ")));
     }
     // ponytail: Stop and Skip only. Update-existing-row is deferred: Postgres cannot spell ON CONFLICT (pk) DO UPDATE under the pinned grammar, MySQL's matches any unique key, SQL Server and Snowflake would need MERGE.
-    let tail = match (skip, engine) {
+    let tail = match (skip, spec.sql.skip_duplicates) {
         (false, _) => String::new(),
-        (true, Engine::Postgres | Engine::Sqlite | Engine::Turso | Engine::DuckDb) => {
-            " ON CONFLICT DO NOTHING".into()
-        }
-        (true, Engine::MySql | Engine::MariaDb) => {
-            let first = engine.quote_identifier(first);
+        (true, SkipDuplicates::OnConflictDoNothing { .. }) => " ON CONFLICT DO NOTHING".into(),
+        (true, SkipDuplicates::OnDuplicateKey) => {
+            let first = spec.quote_identifier(first);
             format!(" ON DUPLICATE KEY UPDATE {first} = {first}")
         }
-        (true, Engine::Snowflake | Engine::SqlServer | Engine::MongoDb | Engine::Redis) => {
+        (true, SkipDuplicates::None) => {
             return Err("This engine cannot skip rows that already exist.".into());
         }
     };
     Ok(format!(
         "INSERT INTO {} ({}) VALUES {}{tail}",
-        engine.qualified(schema, table),
+        spec.qualified(schema, table),
         names.join(", "),
         tuples.join(",\n")
     ))
@@ -634,21 +608,27 @@ pub fn insert_template(
     table: &str,
     columns: &[ColumnDefinition],
 ) -> Option<String> {
-    let placeholder: fn(usize) -> String = match engine {
-        Engine::Postgres => |n| format!("${n}"),
-        Engine::SqlServer => |n| format!("@p{n}"),
-        Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake => |_| "?".into(),
-        Engine::MongoDb | Engine::Redis => return None,
+    match engine.syntax() {
+        Syntax::Sql => sql_insert_template(engine.spec(), schema, table, columns),
+        Syntax::Mongo | Syntax::Redis => None,
+    }
+}
+
+pub(crate) fn sql_insert_template(
+    spec: &EngineSpec,
+    schema: &str,
+    table: &str,
+    columns: &[ColumnDefinition],
+) -> Option<String> {
+    let placeholder: fn(usize) -> String = match spec.sql.params {
+        Params::Question => |_| "?".into(),
+        Params::Dollar => |n| format!("${n}"),
+        Params::AtP => |n| format!("@p{n}"),
     };
     let names: Vec<String> = columns
         .iter()
-        .filter(|column| !engine.generates(column))
-        .map(|column| engine.quote_identifier(&column.name))
+        .filter(|column| !spec.generates(column))
+        .map(|column| spec.quote_identifier(&column.name))
         .collect();
     if names.is_empty() {
         return None;
@@ -656,7 +636,7 @@ pub fn insert_template(
     let values: Vec<String> = (1..=names.len()).map(placeholder).collect();
     Some(format!(
         "INSERT INTO {} ({}) VALUES ({});",
-        engine.qualified(schema, table),
+        spec.qualified(schema, table),
         names.join(", "),
         values.join(", ")
     ))
@@ -679,20 +659,20 @@ pub fn delete_row(
     keys: &[(&str, &str)],
     types: &[(String, String)],
 ) -> Option<String> {
-    match engine {
-        Engine::MongoDb => return crate::mql::delete_row(table, keys, types).ok(),
-        Engine::Redis => {
-            return crate::redis_cmd::edit::delete_row(schema, table, keys, types).ok();
-        }
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+    match engine.syntax() {
+        Syntax::Sql => sql_delete_row(engine.spec(), schema, table, keys, types),
+        Syntax::Mongo => crate::mql::delete_row(table, keys, types).ok(),
+        Syntax::Redis => crate::redis_cmd::edit::delete_row(schema, table, keys, types).ok(),
     }
+}
+
+pub(crate) fn sql_delete_row(
+    spec: &EngineSpec,
+    schema: &str,
+    table: &str,
+    keys: &[(&str, &str)],
+    types: &[(String, String)],
+) -> Option<String> {
     if keys.is_empty() {
         return None;
     }
@@ -703,8 +683,8 @@ pub fn delete_row(
         .collect();
     Some(format!(
         "DELETE FROM {} WHERE {}",
-        engine.qualified(schema, table),
-        assignments(engine, &keys, types, " AND ")
+        spec.qualified(schema, table),
+        sql_assignments(spec, &keys, types, " AND ")
     ))
 }
 
@@ -740,7 +720,7 @@ pub fn is_generated_write(sql: &str) -> bool {
 
 /// `backslash_escapes` is [`Engine::backslash_escapes`] for the engine the
 /// statement is bound for.
-fn generated_write(sql: &str, backslash_escapes: bool) -> bool {
+pub(crate) fn generated_write(sql: &str, backslash_escapes: bool) -> bool {
     // An exact-text whitelist rather than a parse, so nothing can ride along.
     if is_transaction_bracket(sql) {
         return true;
@@ -937,33 +917,19 @@ fn delete_key_matches(sql: &str, keys: &[&str], backslash_escapes: bool) -> bool
 /// admits the same shapes read out of its own parse, less the transaction
 /// bracket and with `insertMany` for the multi-row insert.
 pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
-    match engine {
-        Engine::MongoDb => crate::mql::is_generated_write(statement),
-        Engine::Redis => crate::redis_cmd::edit::is_generated_write(statement),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => generated_write(statement, engine.backslash_escapes()),
+    match engine.syntax() {
+        Syntax::Mongo => crate::mql::is_generated_write(statement),
+        Syntax::Redis => crate::redis_cmd::edit::is_generated_write(statement),
+        Syntax::Sql => generated_write(statement, engine.backslash_escapes()),
     }
 }
 
 /// [`delete_matches_key`] for the engine the statement is bound for.
 pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> bool {
-    match engine {
-        Engine::MongoDb => crate::mql::delete_matches_key(statement, keys),
-        Engine::Redis => crate::redis_cmd::edit::delete_matches_key(statement, keys),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => delete_key_matches(statement, keys, engine.backslash_escapes()),
+    match engine.syntax() {
+        Syntax::Mongo => crate::mql::delete_matches_key(statement, keys),
+        Syntax::Redis => crate::redis_cmd::edit::delete_matches_key(statement, keys),
+        Syntax::Sql => delete_key_matches(statement, keys, engine.backslash_escapes()),
     }
 }
 
@@ -986,17 +952,10 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
 /// a transaction: a preview never brackets anything, so seeing through
 /// brackets here would only widen what is accepted.
 pub fn is_generated_select(engine: Engine, sql: &str) -> bool {
-    match engine {
-        Engine::MongoDb => return crate::mql::browse::is_generated_read(sql),
-        Engine::Redis => return crate::redis_cmd::browse::is_generated_read(sql),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+    match engine.syntax() {
+        Syntax::Mongo => return crate::mql::browse::is_generated_read(sql),
+        Syntax::Redis => return crate::redis_cmd::browse::is_generated_read(sql),
+        Syntax::Sql => {}
     }
     let Some(tree) = parse(sql) else {
         return false;
@@ -1058,6 +1017,7 @@ fn generated_statements<'tree>(root: &Node<'tree>) -> Option<Vec<Node<'tree>>> {
     }
 }
 
+#[cfg(test)]
 fn assignments(
     engine: Engine,
     columns: &[(&str, NewValue)],
@@ -1077,6 +1037,25 @@ fn assignments(
         .join(separator)
 }
 
+fn sql_assignments(
+    spec: &EngineSpec,
+    columns: &[(&str, NewValue)],
+    types: &[(String, String)],
+    separator: &str,
+) -> String {
+    columns
+        .iter()
+        .map(|(column, value)| {
+            format!(
+                "{} = {}",
+                spec.quote_identifier(column),
+                sql_literal(spec, value, type_of(types, column))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn type_of<'a>(types: &'a [(String, String)], column: &str) -> Option<&'a str> {
     types
         .iter()
@@ -1084,13 +1063,22 @@ fn type_of<'a>(types: &'a [(String, String)], column: &str) -> Option<&'a str> {
         .map(|(_, data_type)| data_type.as_str())
 }
 
+#[cfg(test)]
+fn literal(engine: Engine, value: &NewValue, data_type: Option<&str>) -> String {
+    match value {
+        NewValue::Value(value) => engine.quote_value(value, data_type),
+        NewValue::Null => "NULL".to_string(),
+        NewValue::Default => "DEFAULT".to_string(),
+    }
+}
+
 /// A value as it goes into a statement: quoted, or one of the two keywords that
 /// stand for there being no value to quote. Unquoted is the only way to write
 /// either — `'NULL'` and `'DEFAULT'` are the words, and a user who typed one of
 /// them into a cell meant the word.
-fn literal(engine: Engine, value: &NewValue, data_type: Option<&str>) -> String {
+fn sql_literal(spec: &EngineSpec, value: &NewValue, data_type: Option<&str>) -> String {
     match value {
-        NewValue::Value(value) => engine.quote_value(value, data_type),
+        NewValue::Value(value) => spec.quote_value(value, data_type),
         NewValue::Null => "NULL".to_string(),
         NewValue::Default => "DEFAULT".to_string(),
     }
@@ -1684,6 +1672,11 @@ fn go_lines(sql: &str) -> Vec<(Range<usize>, Option<u64>)> {
         .collect()
 }
 
+/// Whether `engine` reads a buffer as `GO`-separated batches.
+fn batches_on(engine: Engine) -> bool {
+    engine.syntax() == Syntax::Sql && engine.spec().sql.statement_split == StatementSplit::Batches
+}
+
 /// The text between `GO` lines.
 fn batches(sql: &str) -> Vec<Range<usize>> {
     let mut batches = Vec::new();
@@ -1772,7 +1765,7 @@ fn tsql_statements(sql: &str, batch: Range<usize>) -> Vec<Range<usize>> {
 /// `GO` lines around it. More than one batch, or a batch asked to run more than
 /// once, is refused rather than sent as text the server cannot read.
 pub(crate) fn one_batch(engine: Engine, sql: &str) -> Result<&str, String> {
-    if engine != Engine::SqlServer {
+    if !batches_on(engine) {
         return Ok(sql);
     }
     batch_counts(engine, sql)?;
@@ -1793,7 +1786,7 @@ pub(crate) fn one_batch(engine: Engine, sql: &str) -> Result<&str, String> {
 /// batch, and running it once is not what the buffer says; a selection run a
 /// batch at a time has to refuse it for the reason a single one does.
 pub(crate) fn batch_counts(engine: Engine, sql: &str) -> Result<(), String> {
-    if engine != Engine::SqlServer {
+    if !batches_on(engine) {
         return Ok(());
     }
     for (_, count) in go_lines(sql) {
@@ -1805,7 +1798,7 @@ pub(crate) fn batch_counts(engine: Engine, sql: &str) -> Result<(), String> {
 /// Refused when the `GO` that ends the batch holding `offset` carries a count:
 /// running the statement under the cursor once would quietly drop it.
 pub(crate) fn batch_repeats(engine: Engine, sql: &str, offset: usize) -> Result<(), String> {
-    if engine != Engine::SqlServer {
+    if !batches_on(engine) {
         return Ok(());
     }
     match go_lines(sql)
@@ -1829,7 +1822,7 @@ fn repeats(count: u64) -> Result<(), String> {
 /// Every pending row as one `UPDATE`, joined into a single string.
 ///
 /// All-or-nothing, which each engine reaches differently, and
-/// `Engine::transaction_start` is where that per-engine answer lives. Postgres
+/// `SqlSpec::transaction_opening` is where that per-engine answer lives. Postgres
 /// runs one submission as a single implicit transaction and needs nothing;
 /// MySQL and SQLite commit every statement on its own, so a batch of more than
 /// one is bracketed — in the statement text itself, where the user can read,
@@ -1841,18 +1834,14 @@ fn repeats(count: u64) -> Result<(), String> {
 /// the change the user made, and dbdelve would have no way to say which part of
 /// it ran.
 pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String, String> {
-    match engine {
-        Engine::MongoDb => return crate::mql::update_batch(rows),
-        Engine::Redis => return crate::redis_cmd::edit::update_batch(rows),
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer => {}
+    match engine.syntax() {
+        Syntax::Sql => sql_update_batch(engine.spec(), rows),
+        Syntax::Mongo => crate::mql::update_batch(rows),
+        Syntax::Redis => crate::redis_cmd::edit::update_batch(rows),
     }
+}
+
+pub(crate) fn sql_update_batch(spec: &EngineSpec, rows: &[PendingRow]) -> Result<String, String> {
     if rows.is_empty() {
         return Err("There are no edits to apply.".into());
     }
@@ -1872,8 +1861,8 @@ pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String
     let statements: Option<Vec<String>> = rows
         .iter()
         .map(|row| {
-            update_row(
-                engine,
+            sql_update_statement(
+                spec,
                 &row.schema,
                 &row.table,
                 &borrowed_sets(&row.sets),
@@ -1890,11 +1879,57 @@ pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String
     let batch = statements
         .ok_or("dbdelve cannot name an edited row by its primary key.")?
         .join("\n");
-    let bracket = engine.transaction_start().filter(|_| rows.len() > 1);
+    let bracket = spec.sql.transaction_opening().filter(|_| rows.len() > 1);
     Ok(match bracket {
         Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
         None => batch,
     })
+}
+
+/// One row's `UPDATE`: every column in `sets` assigned, every column in `keys`
+/// matched.
+///
+/// Values go in as literals and are never cast. Postgres applies the target
+/// column's assignment cast, so `'123'` lands in an `int4` exactly as `123`
+/// would, and SQLite applies the column's type affinity to the same effect. A
+/// cast dbdelve chose for itself could only ever be the wrong one. A cleared cell
+/// is therefore the empty string, and [`NewValue`]'s other two arms are the
+/// keywords: three different writes, which is the whole point of spelling two
+/// of them as something other than a value.
+///
+/// `keys` carries plain values, because a row identified by a `NULL` is a row
+/// `=` does not find; the caller drops such a row before it gets here.
+///
+/// `types` names each column's type where it is known, for the engine whose
+/// literal depends on it (`EngineSpec::quote_value`). A column missing from it is
+/// quoted the way any value is.
+///
+/// `None` when either list is empty. A statement with no `WHERE` rewrites every
+/// row in the table and one with no `SET` is not a statement at all, so a caller
+/// that has lost the row's key gets nothing to run rather than something that
+/// runs.
+fn sql_update_statement(
+    spec: &EngineSpec,
+    schema: &str,
+    table: &str,
+    sets: &[(&str, NewValue)],
+    keys: &[(&str, &str)],
+    types: &[(String, String)],
+) -> Option<String> {
+    if sets.is_empty() || keys.is_empty() {
+        return None;
+    }
+
+    let keys: Vec<(&str, NewValue)> = keys
+        .iter()
+        .map(|&(column, value)| (column, NewValue::Value(value.into())))
+        .collect();
+    Some(format!(
+        "UPDATE {} SET {} WHERE {}",
+        spec.qualified(schema, table),
+        sql_assignments(spec, sets, types, ", "),
+        sql_assignments(spec, &keys, types, " AND ")
+    ))
 }
 
 /// A statement at the front of the history, and there only once however many
@@ -1918,7 +1953,7 @@ pub(crate) fn appended_statement(engine: Engine, buffer: &str, statement: &str) 
         return statement.to_string();
     }
     // A Redis command ends with its line, and a `;` would join its last word.
-    if engine == Engine::Redis {
+    if engine.syntax() == Syntax::Redis {
         return format!("{text}\n\n{statement}");
     }
 
@@ -2111,18 +2146,10 @@ impl Verdict {
 
 /// Whether `sql` can be put in an Explain mode, and why not when it cannot.
 pub(crate) fn explainable(engine: Engine, sql: &str) -> Result<(), String> {
-    match engine {
-        Engine::MongoDb => crate::mql::explainable(sql),
+    match engine.syntax() {
+        Syntax::Mongo => crate::mql::explainable(sql),
         // The server refuses what it cannot explain, and says so.
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer
-        | Engine::Redis => Ok(()),
+        Syntax::Sql | Syntax::Redis => Ok(()),
     }
 }
 
@@ -2135,7 +2162,7 @@ pub(crate) fn explainable(engine: Engine, sql: &str) -> Result<(), String> {
 /// bare `EXPLAIN` is bytecode, and a `FORMAT` other than text or tree is JSON,
 /// XML or YAML. Those stay in the grid, where they are at least legible.
 pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
-    if engine == Engine::Redis {
+    if engine.syntax() == Syntax::Redis {
         return None;
     }
     let Some(dialect) = dialect(engine) else {
@@ -2150,8 +2177,8 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
     if !word(tokens.next().as_ref(), "EXPLAIN") {
         return None;
     }
-    match engine {
-        Engine::Postgres if tokens.next_if(|token| **token == Token::LParen).is_some() => {
+    match engine.spec().sql.typed_explain {
+        TypedExplain::Postgres if tokens.next_if(|token| **token == Token::LParen).is_some() => {
             let mut mode = ExplainMode::Plan;
             loop {
                 let name = tokens.next()?;
@@ -2179,13 +2206,13 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
                 }
             }
         }
-        Engine::Postgres => Some(
+        TypedExplain::Postgres => Some(
             match word(tokens.peek(), "ANALYZE") || word(tokens.peek(), "ANALYSE") {
                 true => ExplainMode::Analyze,
                 false => ExplainMode::Plan,
             },
         ),
-        Engine::MySql => {
+        TypedExplain::MySql => {
             let analyze = tokens
                 .next_if(|token| word(Some(token), "ANALYZE"))
                 .is_some();
@@ -2198,18 +2225,10 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
                 false => ExplainMode::Plan,
             })
         }
-        Engine::Sqlite => (word(tokens.next().as_ref(), "QUERY")
+        TypedExplain::Sqlite => (word(tokens.next().as_ref(), "QUERY")
             && word(tokens.next().as_ref(), "PLAN"))
         .then_some(ExplainMode::Plan),
-        // Turso and DuckDB have no Explain at all (`Engine::explain_prefix`), and
-        // Snowflake's and SQL Server's plans are shapes the parser does not read.
-        Engine::MariaDb
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake
-        | Engine::SqlServer
-        | Engine::MongoDb
-        | Engine::Redis => None,
+        TypedExplain::None => None,
     }
 }
 
@@ -2221,14 +2240,14 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
 /// finds statement boundaries in a buffer someone is still typing into;
 /// this needs a typed statement, and would rather refuse than guess.
 pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
-    if engine == Engine::Redis {
+    if engine.syntax() == Syntax::Redis {
         return crate::redis_cmd::classify(sql);
     }
     let Some(dialect) = dialect(engine) else {
         return crate::mql::classify(sql);
     };
 
-    if engine == Engine::MariaDb
+    if engine.spec().sql.explain_analyze == Some(ExplainPrefix::Analyze)
         && let Some(explain) = mariadb_analyze_as_explain(dialect.as_ref(), sql)
     {
         return classify(engine, &explain);
@@ -2261,15 +2280,19 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
 /// The `sqlparser` dialect an engine's SQL is read in; `None` for MongoDB
 /// and Redis, which are not SQL.
 fn dialect(engine: Engine) -> Option<Box<dyn Dialect>> {
-    Some(match engine {
-        Engine::Postgres => Box::new(PostgreSqlDialect {}),
-        Engine::MySql | Engine::MariaDb => Box::new(MySqlDialect {}),
-        Engine::Sqlite | Engine::Turso => Box::new(SQLiteDialect {}),
-        Engine::DuckDb => Box::new(DuckDbDialect {}),
-        Engine::Snowflake => Box::new(SnowflakeDialect {}),
-        Engine::SqlServer => Box::new(MsSqlDialect {}),
-        Engine::MongoDb | Engine::Redis => return None,
-    })
+    (engine.syntax() == Syntax::Sql).then(|| parser(engine.spec().sql.parser_dialect))
+}
+
+fn parser(dialect: ParserDialect) -> Box<dyn Dialect> {
+    match dialect {
+        ParserDialect::Generic => Box::new(GenericDialect {}),
+        ParserDialect::PostgreSql => Box::new(PostgreSqlDialect {}),
+        ParserDialect::MySql => Box::new(MySqlDialect {}),
+        ParserDialect::Sqlite => Box::new(SQLiteDialect {}),
+        ParserDialect::DuckDb => Box::new(DuckDbDialect {}),
+        ParserDialect::Snowflake => Box::new(SnowflakeDialect {}),
+        ParserDialect::MsSql => Box::new(MsSqlDialect {}),
+    }
 }
 
 /// MariaDB's `ANALYZE <statement>` respelled as the `EXPLAIN ANALYZE` sqlparser
@@ -2705,11 +2728,11 @@ pub(crate) struct Leaves {
 /// grammar does not know, which still changed the session if it ran.
 /// Snowflake and MongoDB keep nothing from one run to the next.
 pub(crate) fn leaves(engine: Engine, sql: &str) -> Leaves {
-    if engine == Engine::Redis {
+    if engine.syntax() == Syntax::Redis {
         return crate::redis_cmd::leaves(sql);
     }
     let mut leaves = Leaves::default();
-    let Some(dialect) = dialect(engine).filter(|_| engine != Engine::Snowflake) else {
+    let Some(dialect) = dialect(engine).filter(|_| !engine.spec().sql.stateless_requests) else {
         return leaves;
     };
     match SqlParser::parse_sql(dialect.as_ref(), sql) {
@@ -3178,21 +3201,22 @@ pub(crate) fn gate(verdict: &Verdict, mode: Mode, confirmed: &[Destructive]) -> 
 // multi-line string literal through as one token, and a prefix would edit its
 // value.
 pub(crate) fn format(engine: Engine, sql: &str) -> Result<String, &'static str> {
-    let (Some(reader), Some(layout)) = (dialect(engine), sqlformat_dialect(engine)) else {
-        return match engine {
-            Engine::Redis => Err("Not formatting: a Redis command is one line, as typed."),
-            _ => crate::mql::format(sql),
-        };
-    };
+    match engine.syntax() {
+        Syntax::Sql => {}
+        Syntax::Mongo => return crate::mql::format(sql),
+        Syntax::Redis => return Err("Not formatting: a Redis command is one line, as typed."),
+    }
+    let reader = parser(engine.spec().sql.parser_dialect);
+    let layout = sqlformat_dialect(engine.spec().sql.format_dialect);
     if has_dollar_quote(sql) {
         return Err(DOLLAR_QUOTED);
     }
     let Some(tokens) = located_tokens(reader.as_ref(), sql) else {
         return Err(UNENDED);
     };
-    let statements = match engine {
-        Engine::SqlServer => Buffer::for_engine(engine, sql).statements().to_vec(),
-        _ => between_semicolons(&tokens),
+    let statements = match batches_on(engine) {
+        true => Buffer::for_engine(engine, sql).statements().to_vec(),
+        false => between_semicolons(&tokens),
     };
     let options = sqlformat::FormatOptions {
         dialect: layout,
@@ -3233,20 +3257,11 @@ pub(crate) fn format(engine: Engine, sql: &str) -> Result<String, &'static str> 
     }
 }
 
-/// The sqlformat dialect an engine's SQL is laid out in; `None` for MongoDB
-/// and Redis, which are not SQL.
-fn sqlformat_dialect(engine: Engine) -> Option<sqlformat::Dialect> {
-    Some(match engine {
-        Engine::SqlServer => sqlformat::Dialect::SQLServer,
-        Engine::Postgres
-        | Engine::MySql
-        | Engine::MariaDb
-        | Engine::Sqlite
-        | Engine::Turso
-        | Engine::DuckDb
-        | Engine::Snowflake => sqlformat::Dialect::Generic,
-        Engine::MongoDb | Engine::Redis => return None,
-    })
+fn sqlformat_dialect(dialect: FormatDialect) -> sqlformat::Dialect {
+    match dialect {
+        FormatDialect::Generic => sqlformat::Dialect::Generic,
+        FormatDialect::SqlServer => sqlformat::Dialect::SQLServer,
+    }
 }
 
 const DOLLAR_QUOTED: &str = "Not formatting: a dollar-quoted body would be rewritten.";
