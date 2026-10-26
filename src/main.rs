@@ -56,17 +56,18 @@ use gpui_component::{
 
 use actions::{
     AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette,
-    CopyCell, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode, DeleteRow, DiscardEdits,
-    EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn,
-    ImportConnections, ImportRows, LimitTarget, NewConnection, NewProject, NewQuery, NewRow,
-    NextEdit, NextPage, NextProfile, NextTab, OpenReference, OpenSettings, PreviousEdit,
-    PreviousPage, PreviousProfile, PreviousTab, Quit, RefreshConnection, RefreshRelation,
-    RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom, RunQuery, SaveQuery,
-    SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty,
-    SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit,
-    ShowAllColumns, ShowEditor, ShowReferences, SortColumn, SubmitConnection, SwitchConnection,
-    ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit,
-    ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+    CommitTransaction, CopyCell, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode,
+    DeleteRow, DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen,
+    GoToColumn, HideColumn, ImportConnections, ImportRows, LimitTarget, NewConnection, NewProject,
+    NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextTab, OpenReference, OpenSettings,
+    PreviousEdit, PreviousPage, PreviousProfile, PreviousTab, Quit, RefreshConnection,
+    RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom,
+    RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
+    SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw,
+    SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowReferences,
+    SortColumn, SubmitConnection, SwitchConnection, ToggleAutoCommit, ToggleComment,
+    ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit, ToggleRowPanel,
+    ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
