@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::tls::SslMode;
 
+#[cfg(test)]
+mod conformance;
 mod duckdb;
 mod mongo;
 mod mssql;
@@ -419,6 +421,13 @@ impl Engine {
             // No command plans another.
             (Self::Redis, _) => None,
         }
+    }
+
+    /// `sql` as the statement that explains it in `mode`, or `None` where
+    /// `explain_prefix` is.
+    pub fn explain(self, mode: ExplainMode, sql: &str) -> Option<String> {
+        self.explain_prefix(mode)
+            .map(|prefix| format!("{prefix}{sql}{}", self.explain_suffix(mode)))
     }
 
     /// What goes after the statement to put it in `mode`: nothing on the SQL
@@ -4817,5 +4826,21 @@ mod tests {
              CONSTRAINT \"pk\" PRIMARY KEY (id),\n    \
              CONSTRAINT \"by_note\" CHECK (note <> N'')\n);\nCREATE INDEX by_note;"
         );
+    }
+
+    #[test]
+    fn read_only_statements_are_recorded_per_engine() {
+        let mut out = String::new();
+        for engine in Engine::ALL {
+            for read_only in [true, false] {
+                crate::sql_snapshots::fragment(
+                    &mut out,
+                    engine,
+                    &format!("read_only={read_only}"),
+                    read_only_statement(engine, read_only),
+                );
+            }
+        }
+        crate::sql_snapshots::check("spellings_read_only", &out);
     }
 }

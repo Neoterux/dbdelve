@@ -22,6 +22,8 @@ mod scroller;
 mod session;
 mod settings_panel;
 mod sql;
+#[cfg(test)]
+mod sql_snapshots;
 mod store;
 mod structure_grid;
 mod tab_drag;
@@ -269,7 +271,7 @@ fn main() {
             // same file: nothing here can wait for a window and an entity to
             // exist first.
             let overrides = store::peek_profiles()
-                .and_then(|(_, _, _, settings, _)| settings)
+                .and_then(|list| list.settings)
                 .and_then(|settings| settings.custom_keybindings)
                 .unwrap_or_default();
             cx.bind_keys(keybindings::build_bindings(&overrides));

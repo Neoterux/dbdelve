@@ -29,7 +29,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   is typed. Connection rows carry their engine's logo (in their colour when
   they have one), a status dot read as the row is drawn, and the one in
   front is marked current; an empty project holds one "New connection in…"
-  row. `enter` on a project's row folds or unfolds it
+  row. A profile on an engine this build lacks (`Workspace::unavailable`) is
+  listed in its project greyed, its reason as the hint, with no status dot
+  and never under All; `enter` goes straight to the Remove confirmation, and
+  with no supported profile ⌘⇧P opens this scope to reach them
+  (`palette::without_a_connection`). `enter` on a project's row folds or unfolds it
   (`Command::ToggleProject`, the one row the palette stays up for); what is
   folded is `Workspace::collapsed_projects`, by name, kept for the session,
   starting unfolded, and the project in front is unfolded whenever a palette
@@ -343,7 +347,10 @@ the visible one.
   over it; if it cannot be moved, nothing is saved for the rest of the session
   (`store_unreadable`). The keybinding read at launch uses `peek_profiles`,
   which moves nothing, so the move and its notice belong to the workspace's
-  own load.
+  own load. A profile on an engine this build cannot read is kept whole as its
+  TOML table (`store::UnavailableProfile`), written back in its place, listed
+  greyed, and can only be removed; nothing filed under its id is deleted while
+  it holds that id, and a file with none decodes and saves exactly as before.
 - **Passwords** go through `keyring`, never into `profiles.toml`: Keychain on
   macOS, Secret Service on Linux, Credential Manager on Windows.
 - **Keybindings** are spelled `secondary-`, which GPUI reads as Cmd on macOS and
