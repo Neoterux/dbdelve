@@ -1,45 +1,45 @@
 ---
 source: src/sql_snapshots.rs
 ---
-[postgres] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_xact_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_try_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_try_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_try_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_try_advisory_xact_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_unlock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_xact_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_try_advisory_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_try_advisory_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_try_advisory_xact_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_try_advisory_xact_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_unlock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_notify('c', 'p') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_terminate_backend(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_cancel_backend(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_reload_conf() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_rotate_logfile() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_switch_wal() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_create(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
