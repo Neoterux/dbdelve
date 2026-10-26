@@ -190,6 +190,12 @@ pub struct SqlSpec {
     pub read_only_session: ReadOnlySession,
     /// Nothing outlives one request, so no statement leaves state behind.
     pub stateless_requests: bool,
+    /// Functions whose effect the server-side Read-only hold does not stop, so
+    /// the verdict has to: a call to one needs more than Read-only wherever it
+    /// sits in the statement. A deny-list of named functions, not an allow-list
+    /// of safe ones -- a function that is not here, a user-defined one included,
+    /// stays a read. Lower-case, matched against the name as written.
+    pub denied_functions: &'static [&'static str],
 }
 
 impl SqlSpec {
@@ -219,6 +225,7 @@ impl SqlSpec {
         substring: SubstringMatch::Like,
         read_only_session: ReadOnlySession::None,
         stateless_requests: false,
+        denied_functions: &[],
     };
 
     /// The word that opens a transaction around a generated multi-statement
