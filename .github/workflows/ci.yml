@@ -70,6 +70,10 @@ jobs:
     # Not 22.04: its sqlite3 (3.37) predates unhex(), which the dev seed uses.
     runs-on: ubuntu-24.04
     env:
+      # insta lets either variable rewrite or force-pass a snapshot, and CI must
+      # fail on any difference instead.
+      INSTA_UPDATE: "no"
+      INSTA_FORCE_PASS: "0"
       PGHOST: 127.0.0.1
       PGPORT: "55432"
       PGDATABASE: dbdelve_dev
@@ -110,11 +114,13 @@ jobs:
       # without one; the mock tests cover the same ground offline. The one
       # live test that needs no account stays: it is what proves the TLS
       # provider is linked at run time.
-      - run: cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ --skip reads_run_at_once
+      - run: cargo test -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ --skip reads_run_at_once --skip conformance
       # These time two reads run at once against the same two in turn. With
       # the rest of the suite sharing the runner's cores, a CPU-bound engine
       # like SQLite misses the margin by chance, so they run alone.
       - run: cargo test reads_run_at_once -- --include-ignored --skip snowflake::tests::live_ --skip turso::tests::live_ --test-threads=1
+      # Own step: each DuckDB subject seeds a 1M-row table, which would add contention to the timing assertions above.
+      - run: cargo test live_conformance -- --include-ignored --skip turso::tests::live_ --test-threads=4
       - run: cargo test snowflake::tests::live_an_account_that_does_not_exist -- --ignored
       # The backdrop blur's pixel tests live in the vendored wgpu renderer,
       # which isn't a workspace member, so `cargo test` alone never runs them.
@@ -159,6 +165,11 @@ jobs:
   # APPDATA paths, and no other job runs them on Windows.
   windows-build:
     runs-on: windows-latest
+    env:
+      # insta lets either variable rewrite or force-pass a snapshot, and CI must
+      # fail on any difference instead.
+      INSTA_UPDATE: "no"
+      INSTA_FORCE_PASS: "0"
     steps:
       - uses: actions/checkout@v4
         with:

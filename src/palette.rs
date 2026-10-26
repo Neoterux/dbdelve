@@ -51,8 +51,8 @@ use crate::{
     session::{CatalogState, ObjectBody, Profile, QueryState, Tab, routine_name},
     store::StoredProject,
     theme::{
-        Appearance, ConnectionColor, FontSlot, Theme, fonts, install_theme, layout, popup_theme,
-        theme, user,
+        Appearance, ConnectionColor, FontSlot, Fonts, Theme, fonts, install_theme, layout,
+        popup_theme, theme, user,
     },
     ui::{
         Control, Tone, chord_for, highlighted, icon_button, key_chip, keycap_parts, keycaps,
@@ -165,11 +165,13 @@ pub enum Mode {
     Confirm(Target),
 }
 
-/// What a confirmation is about, by index into the profiles or the projects.
+/// What a confirmation is about, by index into the profiles, the projects or
+/// the profiles this build cannot open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     Connection(usize),
     Project(usize),
+    Unavailable(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,7 +206,9 @@ impl Mode {
             Mode::NameProject(Some(_)) => "Rename the project…",
             Mode::Projects(ProjectVerb::Rename) => "Rename a project…",
             Mode::Projects(ProjectVerb::Delete) => "Delete a project…",
-            Mode::Confirm(Target::Connection(_)) => "Remove this connection?",
+            Mode::Confirm(Target::Connection(_) | Target::Unavailable(_)) => {
+                "Remove this connection?"
+            }
             Mode::Confirm(Target::Project(_)) => "Delete this project?",
         }
     }
@@ -231,7 +235,7 @@ impl Mode {
             Mode::Projects(ProjectVerb::Delete) | Mode::Confirm(Target::Project(_)) => {
                 "Delete project"
             }
-            Mode::Confirm(Target::Connection(_)) => "Remove connection",
+            Mode::Confirm(Target::Connection(_) | Target::Unavailable(_)) => "Remove connection",
         }
     }
 
@@ -246,7 +250,7 @@ impl Mode {
             Mode::MoveToProject(_) => "Move",
             Mode::NameProject(None) => "Create",
             Mode::NameProject(Some(_)) => "Rename",
-            Mode::Confirm(Target::Connection(_)) => "Remove",
+            Mode::Confirm(Target::Connection(_) | Target::Unavailable(_)) => "Remove",
             Mode::Confirm(Target::Project(_)) => "Delete",
             _ => "Select",
         }
@@ -335,6 +339,8 @@ pub enum Command {
     /// Put the palette back up over the one row that does it.
     Confirm(Target),
     RemoveConnection(usize),
+    /// By index into the profiles this build cannot open.
+    RemoveUnavailable(usize),
     NextProfile,
     PreviousProfile,
     NewConnection,
@@ -404,6 +410,8 @@ struct Item {
     status: Option<usize>,
     /// A statement, drawn in the editor's face.
     mono: bool,
+    /// A label drawn muted: a connection this build cannot open.
+    muted: bool,
     scope: Scope,
     /// Listed under All as well as in its own scope.
     in_all: bool,
@@ -437,6 +445,7 @@ impl Item {
             tint: None,
             status: None,
             mono: false,
+            muted: false,
             scope: Scope::Commands,
             in_all: true,
             group: Group::Bare,
@@ -466,6 +475,11 @@ impl Item {
 
     fn mono(mut self) -> Self {
         self.mono = true;
+        self
+    }
+
+    fn muted(mut self) -> Self {
+        self.muted = true;
         self
     }
 
@@ -765,6 +779,7 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
             Command::Confirm(_)
                 | Command::PickProject(ProjectVerb::Delete)
                 | Command::RemoveConnection(_)
+                | Command::RemoveUnavailable(_)
                 | Command::DeleteProject(_)
         )
 }
@@ -784,6 +799,7 @@ pub fn waits_for_import(scope: Scope, command: &Command) -> bool {
                 | Command::MoveToProject(..)
                 | Command::Confirm(_)
                 | Command::RemoveConnection(_)
+                | Command::RemoveUnavailable(_)
                 | Command::NewConnectionIn(_)
                 | Command::NewProject
                 | Command::PickProject(_)
@@ -939,11 +955,13 @@ impl Palette {
             (Mode::Confirm(target), _) => confirm_items(workspace, target),
             (Mode::NameProject(_), _) => Vec::new(),
             (Mode::Search(_), Some(profile)) => search_items(workspace, profile, cx),
-            (Mode::Font(slot), Some(_)) => font_items(slot, cx),
+            (Mode::Font(slot), _) => font_items(slot, cx),
             (Mode::Database, Some(profile)) => database_items(profile),
             (Mode::Schema, Some(profile)) => schema_items(profile),
             (Mode::Columns, Some(profile)) => column_items(profile, cx),
             (Mode::Engine, _) => engine_items(workspace),
+            // With no connection to open, only those this build cannot.
+            (Mode::Search(Scope::Connections), None) => connection_items(workspace),
             (_, None) => Vec::new(),
         };
         let import_pending = workspace.pending_import.is_some();
@@ -1442,7 +1460,7 @@ impl Palette {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
-                                    .text_color(t.text)
+                                    .text_color(if item.muted { t.text_muted } else { t.text })
                                     .when(folded.is_some(), |label| {
                                         label.font_weight(FontWeight::MEDIUM)
                                     })
@@ -1624,17 +1642,11 @@ impl Palette {
 
     /// What `enter` does to the row selected, for the footer.
     fn verb(&self) -> &'static str {
-        let item = self.selected_item().map(|index| &self.items[index]);
-        match item {
-            Some(item) if matches!(item.command, Command::ToggleProject(_)) => {
-                if self.collapsed.contains(&item.label) {
-                    "Expand"
-                } else {
-                    "Collapse"
-                }
-            }
-            _ => self.mode.verb(),
-        }
+        row_verb(
+            self.mode,
+            self.selected_item().map(|index| &self.items[index]),
+            &self.collapsed,
+        )
     }
 
     fn render_footer(&self, t: Theme) -> impl IntoElement {
@@ -1931,6 +1943,35 @@ fn object_items(profile: &Profile) -> Vec<Item> {
     items
 }
 
+/// What `enter` does to `item`, for the footer.
+fn row_verb(mode: Mode, item: Option<&Item>, collapsed: &HashSet<String>) -> &'static str {
+    match item {
+        Some(item) if matches!(item.command, Command::ToggleProject(_)) => {
+            if collapsed.contains(&item.label) {
+                "Expand"
+            } else {
+                "Collapse"
+            }
+        }
+        Some(item) if matches!(item.command, Command::Confirm(Target::Unavailable(_))) => "Remove",
+        _ => mode.verb(),
+    }
+}
+
+/// The palette a mode opens with no connection to open: the theme lists, the
+/// engine list and the font lists, as on the welcome surface, the connection
+/// form and the settings panel, and while there are connections this build
+/// cannot open, the Connections scope that lists them, and the one row that
+/// removes one.
+pub fn without_a_connection(mode: Mode, unavailable: bool) -> Option<Mode> {
+    match mode {
+        Mode::Theme(_) | Mode::ImportTheme(..) | Mode::Engine | Mode::Font(_) => Some(mode),
+        Mode::Search(_) if unavailable => Some(Mode::Search(Scope::Connections)),
+        Mode::Confirm(Target::Unavailable(_)) if unavailable => Some(mode),
+        _ => None,
+    }
+}
+
 const NO_PROJECT: &str = "No project";
 const PROJECTS: &str = "Projects";
 const MANAGE: &str = "Manage";
@@ -1946,6 +1987,9 @@ struct Listed<'a> {
     endpoint: String,
     logo: &'static str,
     color: Option<ConnectionColor>,
+    /// A connection this build cannot open, by index into
+    /// `Workspace::unavailable`, and why.
+    unavailable: Option<(usize, String)>,
 }
 
 /// Every connection, by project, then the ways to add one or a project.
@@ -1966,7 +2010,23 @@ fn connection_items(workspace: &Workspace) -> Vec<Item> {
             endpoint: profile.config.endpoint(),
             logo: profile.config.engine().logo(),
             color: profile.color,
+            unavailable: None,
         })
+        .chain(
+            workspace
+                .unavailable
+                .iter()
+                .enumerate()
+                .map(|(at, gone)| Listed {
+                    id: &gone.id,
+                    name: &gone.name,
+                    host: String::new(),
+                    endpoint: String::new(),
+                    logo: icon::DATABASE,
+                    color: None,
+                    unavailable: Some((at, crate::workspace::unavailable_reason(&gone.engine))),
+                }),
+        )
         .collect();
     let overrides = &workspace.settings.custom_keybindings;
     let mut items = listed_connections(&listed, &workspace.projects, workspace.active);
@@ -2034,6 +2094,21 @@ fn listed_connections(
         let before = items.len();
         for (index, connection) in connections.iter().enumerate() {
             if project_of[index] != group {
+                continue;
+            }
+            if let Some((at, reason)) = &connection.unavailable {
+                items.push(
+                    Item::new(
+                        connection.name,
+                        connection.logo,
+                        Command::Confirm(Target::Unavailable(*at)),
+                    )
+                    .hint(reason.clone())
+                    .muted()
+                    .scope(Scope::Connections)
+                    .group(header.clone())
+                    .beyond_all(),
+                );
                 continue;
             }
             let item = Item::new(
@@ -2252,6 +2327,16 @@ fn confirm_items(workspace: &Workspace, target: Target) -> Vec<Item> {
                 "its connections are kept",
             )
         }
+        Target::Unavailable(at) => {
+            let Some(gone) = workspace.unavailable.get(at) else {
+                return Vec::new();
+            };
+            (
+                format!("Remove {}", gone.name),
+                Command::RemoveUnavailable(at),
+                "its saved queries go too",
+            )
+        }
     };
     vec![
         Item::new(label, icon::DELETE, command)
@@ -2348,22 +2433,33 @@ fn history_items(profile: &Profile) -> Vec<Item> {
 /// slot will take a proportional one. Render each label in its own family and
 /// filter the grid's list by advance width if picking blind starts to cost.
 fn font_items(slot: FontSlot, cx: &App) -> Vec<Item> {
-    let current = fonts(cx).family(slot).clone();
-    let mut names = cx.text_system().all_font_names();
+    font_items_from(
+        slot,
+        fonts(cx).family(slot),
+        cx.text_system().all_font_names(),
+    )
+}
+
+/// The default first, by name, so getting back to it does not mean
+/// remembering which of the hundreds of families it was.
+fn font_items_from(slot: FontSlot, current: &str, mut names: Vec<String>) -> Vec<Item> {
+    let default = Fonts::default().family(slot).to_string();
     names.sort();
     names.dedup();
-    names
+    let families = names
         .into_iter()
         .filter(|name| !name.starts_with('.'))
         .map(|name| {
-            let hint = if name.as_str() == current.as_ref() {
-                "current"
-            } else {
-                ""
-            };
+            let hint = if name == current { "current" } else { "" };
             Item::new(name.clone(), icon::FONT, Command::SetFont(slot, name)).hint(hint)
-        })
-        .collect()
+        });
+    std::iter::once(Item::new(
+        format!("Default ({default})"),
+        icon::RESET,
+        Command::SetFont(slot, default),
+    ))
+    .chain(families)
+    .collect()
 }
 
 /// The theme a theme list marks as picked, and opens on: the one on screen,
@@ -2628,8 +2724,8 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     }
 
     // A query's rows that are written back to, which take a new row on every
-    // engine, and a deleted one where the engine deletes them there as well
-    // as on a relation's.
+    // engine that takes inserts, and a deleted one where the engine deletes
+    // them there as well as on a relation's.
     if session.active_query_tab().is_some() {
         if let Some((_, table, _)) = session.query_insert_target(cx) {
             items.push(command(
@@ -3361,6 +3457,26 @@ mod tests {
     }
 
     #[test]
+    fn the_font_list_leads_with_the_default_by_name() {
+        let names = ["Menlo", ".SF NS", "Lilex", "Fira Code", "Menlo"].map(String::from);
+        let items = font_items_from(FontSlot::Editor, "Menlo", names.to_vec());
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["Default (Lilex)", "Fira Code", "Lilex", "Menlo"]);
+        assert!(matches!(
+            &items[0].command,
+            Command::SetFont(FontSlot::Editor, family) if family == "Lilex"
+        ));
+        assert_eq!(hint_of(&items, "Menlo"), "current");
+        assert_eq!(hint_of(&items, "Lilex"), "");
+
+        let names = ["IBM Plex Sans", "Lilex"].map(String::from);
+        let items = font_items_from(FontSlot::Chrome, "IBM Plex Sans", names.to_vec());
+        assert_eq!(items[0].label, "Default (IBM Plex Sans)");
+        assert_eq!(hint_of(&items, "Default (IBM Plex Sans)"), "");
+        assert_eq!(hint_of(&items, "IBM Plex Sans"), "current");
+    }
+
+    #[test]
     fn the_selection_skips_headers_and_wraps_both_ways() {
         let rows = [
             Row::Header("A".into()),
@@ -3434,6 +3550,7 @@ mod tests {
             endpoint: host.to_string(),
             logo: Engine::Postgres.logo(),
             color: None,
+            unavailable: None,
         }
     }
 
@@ -3458,6 +3575,83 @@ mod tests {
                 project("Analytics", &["warehouse"]),
             ],
         )
+    }
+
+    fn with_unavailable() -> (Vec<Listed<'static>>, Vec<StoredProject>) {
+        let (mut rows, mut projects) = connections();
+        rows.push(Listed {
+            unavailable: Some((0, "Needs the odbc plugin".into())),
+            logo: icon::DATABASE,
+            ..listed("ch", "ClickHouse", "")
+        });
+        projects[0].connections.push("ch".into());
+        (rows, projects)
+    }
+
+    #[test]
+    fn an_unavailable_connection_is_listed_greyed_in_its_project() {
+        let (rows, projects) = with_unavailable();
+        let items = listed_connections(&rows, &projects, 0);
+        let row = items
+            .iter()
+            .find(|item| item.label == "ClickHouse")
+            .unwrap();
+        assert!(matches!(
+            row.command,
+            Command::Confirm(Target::Unavailable(0))
+        ));
+        assert_eq!(row.hint.as_ref(), "Needs the odbc plugin");
+        assert!(row.muted && !row.in_all);
+        assert!(row.status.is_none() && row.tint.is_none());
+        assert!(matches!(row.group, Group::Project(0, _)));
+        let billing = items
+            .iter()
+            .find(|item| matches!(item.command, Command::ToggleProject(0)))
+            .unwrap();
+        assert_eq!(billing.hint.as_ref(), "3 connections");
+    }
+
+    #[test]
+    fn enter_on_an_unavailable_row_says_remove() {
+        let (rows, projects) = with_unavailable();
+        let items = listed_connections(&rows, &projects, 0);
+        let verb = |label: &str| {
+            row_verb(
+                Mode::Search(Scope::Connections),
+                items.iter().find(|item| item.label == label),
+                &HashSet::new(),
+            )
+        };
+        assert_eq!(verb("ClickHouse"), "Remove");
+        assert_eq!(verb("Orders"), "Switch");
+    }
+
+    #[test]
+    fn with_no_connection_only_unavailable_ones_open_beside_themes_engines_and_fonts() {
+        let open = |mode, unavailable| without_a_connection(mode, unavailable);
+        assert!(open(Mode::Engine, false) == Some(Mode::Engine));
+        assert!(open(Mode::Theme(None), false) == Some(Mode::Theme(None)));
+        assert!(open(Mode::Font(FontSlot::Grid), false) == Some(Mode::Font(FontSlot::Grid)));
+        for mode in [
+            Mode::Search(Scope::Commands),
+            Mode::Search(Scope::Connections),
+            Mode::Confirm(Target::Unavailable(0)),
+        ] {
+            assert!(open(mode, false).is_none());
+        }
+        for mode in [
+            Mode::Search(Scope::Commands),
+            Mode::Search(Scope::All),
+            Mode::Search(Scope::Connections),
+        ] {
+            assert!(open(mode, true) == Some(Mode::Search(Scope::Connections)));
+        }
+        assert!(
+            open(Mode::Confirm(Target::Unavailable(0)), true)
+                == Some(Mode::Confirm(Target::Unavailable(0)))
+        );
+        assert!(open(Mode::Confirm(Target::Connection(0)), true).is_none());
+        assert!(open(Mode::Schema, true).is_none());
     }
 
     #[test]
@@ -3739,6 +3933,11 @@ mod tests {
         ] {
             assert!(!remembered(Scope::Commands, &command));
         }
+        assert!(!remembered(Scope::Commands, &Command::RemoveUnavailable(0)));
+        assert!(waits_for_import(
+            Scope::Commands,
+            &Command::RemoveUnavailable(0)
+        ));
     }
 
     #[test]
