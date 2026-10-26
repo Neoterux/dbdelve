@@ -81,14 +81,16 @@ require it, stop and raise it instead.
    trait for the same reason in miniature: an arm per engine the compiler makes
    every match enumerate, instead of an open extension point.
 
-   The one thing that crosses out is `db::Engine` (`src/db/mod.rs`), because
-   DBDelve writes SQL and has to spell it the way the server will read it. It
-   holds no connection. Views and workspace code _ask_ it, through its
+   What crosses out is `db::Engine` (`src/db/mod.rs`) and the data that
+   describes it, `EngineSpec` and its strategy types (`src/db/spec.rs`),
+   because DBDelve writes SQL and has to spell it the way the server will read
+   it. Neither holds a connection or a driver type. Views and workspace code _ask_ it, through its
    methods, and never match on it. Where an engine question is missing, add a
-   method to `Engine` rather than a `match` at the caller. The SQL writers in
-   `sql.rs` and `filter.rs`, `explorer.rs`'s generators, the code that builds
-   a `ConnectionConfig`, and `import::already_have`'s MariaDB-is-MySQL check
-   are the only places above `src/db/` that match on it.
+   method to `Engine` rather than a `match` at the caller. `sql.rs`,
+   `filter.rs` and `explorer.rs` branch on `Engine::syntax()` and read the
+   engine's `EngineSpec`; they never name an engine. The only places above
+   `src/db/` that do are the code that builds or persists a `ConnectionConfig`,
+   the importers, and the few file-opening and `PG*` connect paths.
 
 5. **Blank passwords are valid.** Never warn about them. Usernames containing `@`
    must work. Both are required by cloud IAM auth and both are commonly broken.
@@ -221,7 +223,10 @@ runs, which split off the timing tests and the vendored renderer's tests.
 Paths per platform and the rest of storage are in `docs/agents/session.md`.
 
 - **Storage** is decided in `store.rs`. A `profiles.toml` that will not load is
-  moved aside to `profiles.toml.broken` before anything can save over it.
+  moved aside to `profiles.toml.broken` before anything can save over it. A
+  profile on an engine this build cannot read is kept whole as its TOML table
+  (`store::UnavailableProfile`), written back in its place, listed greyed, and
+  can only be removed; a file with none decodes and saves exactly as before.
 - **Passwords** go through `keyring`, never into `profiles.toml`.
 - **Keybindings** are spelled `secondary-`, which GPUI reads as Cmd on macOS and
   Ctrl elsewhere. Never `cmd-`: on Linux that is Super, which the window manager

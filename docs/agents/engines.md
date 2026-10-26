@@ -7,13 +7,14 @@ Decided, and not to be re-litigated:
   MariaDB unless a bullet names it. A profile stored before it existed says
   `mysql` and stays MySQL. The `live_` tests in `mysql.rs` run once per server
   (`on_mysql::`, `on_mariadb::`).
-- **Ten functions generate the SQL DBDelve runs, and every one quotes through `Engine`:**
+- **Ten functions generate the SQL DBDelve runs, and every one quotes through the engine's
+  `EngineSpec` (`Engine::quote_*` forwards to it on SQL engines):**
   `explorer::preview_sql`, `explorer::probe_sql` (the reference arrow's
   `SELECT 1 … LIMIT 1` per referencing relation), `explorer::count_sql` (the status bar's Count, a
   `COUNT(*)` -- `COUNT_BIG(*)` on SQL Server, whose `COUNT` is an `int` --
   under the tab's filter, run only when the user asks and through
   `sql::is_generated_select`, `sql::classify` and `sql::gate`, refused rather
-  than prompted for when the gate would stop it), `sql::with_order_by`, `sql::update_row`,
+  than prompted for when the gate would stop it), `sql::with_order_by`, `sql::update_batch`,
   `sql::insert_row`, `sql::insert_rows` (Import Rows' chunks), `sql::delete_row`, `filter::sort_expression` and
   `filter::filter_predicate`. `filter::sort_expression` is the one that gets
   forgotten, and forgetting it is silent: a double-quoted name is a _string
@@ -41,6 +42,17 @@ Decided, and not to be re-litigated:
   `explorer::truncate_sql`, and `Connection::ddl` where an engine assembles
   its DDL rather than asking the server for it) quotes through `Engine` too,
   though none of it is ever run.
+- **An engine is one `EngineSpec` in `src/db/spec.rs`, and `Engine::spec()` is
+  the only per-variant match in `impl Engine`.** A SQL engine's `SqlSpec` is `SqlSpec::ANSI`
+  plus overrides, so a field it leaves alone is the shared behaviour and the
+  writers in `sql.rs`, `filter.rs` and `explorer.rs` read the spec, not the
+  engine. Its `Abilities` start from `Abilities::NONE`, the read-only tier, and
+  switch on only what the engine does. The one hook, `Hooks::quote_value`,
+  covers a literal that depends on the column's type (SQL Server) and returns
+  `None` to fall back to `quote_literal`. A spec field is a bool, a strategy
+  enum or a list of names DBDelve's own code reads, never SQL text. Per-engine
+  snapshots in `src/sql_snapshots` hold the generated text, and
+  `fake_spec.rs` shows a spec nobody wrote an arm for generating SQL.
 - **A relation tab's row number is the catalog's, never a count run unasked.**
   An unfiltered tab shows the row estimate that rides along with the explorer's
   sizes (Postgres `reltuples`, MySQL `TABLE_ROWS`, SQL Server
