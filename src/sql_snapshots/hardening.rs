@@ -127,10 +127,7 @@ const SHAPES: &[(&str, &str)] = &[
         "control spaced bit-and of a quoted column",
         r#"SELECT U & "x" FROM t"#,
     ),
-    (
-        "control bit-and of an unquoted column",
-        "SELECT U&x FROM t",
-    ),
+    ("control bit-and of an unquoted column", "SELECT U&x FROM t"),
     ("control qualified column", "SELECT t.id FROM t"),
     (
         "control qualified column sharing no listed name",
