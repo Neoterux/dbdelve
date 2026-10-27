@@ -8300,4 +8300,174 @@ mod tests {
             classify(Engine::SqlServer, "SELECT FROM WHERE (").mode
         );
     }
+
+    /// What the Run action submits for a non-empty selection: the branch of
+    /// `Workspace::sql_to_run` that reads the selection. That method needs a
+    /// GPUI `Entity<EditorState>`, so this composes the same three pure
+    /// pieces it does, and a change there has to be mirrored here.
+    ///
+    /// `None` is "there is no statement to run".
+    fn submitted_for_selection(
+        engine: crate::db::Engine,
+        buffer: &str,
+        selection: Range<usize>,
+    ) -> Option<Result<String, String>> {
+        assert!(!selection.is_empty());
+        // The editor's selection is a byte range into the buffer. Slicing off a
+        // character boundary would panic, which is what the offsets named in
+        // the tests below rule out.
+        assert!(
+            buffer.is_char_boundary(selection.start) && buffer.is_char_boundary(selection.end),
+            "{engine:?}: {selection:?}"
+        );
+        match one_batch(engine, &buffer[selection]) {
+            Ok(batch) if batch.trim().is_empty() => None,
+            Ok(batch) => Some(Ok(batch.to_string())),
+            Err(message) => Some(Err(message)),
+        }
+    }
+
+    /// The answer to `HARD-07`, "does a shipped route submit text that reaches
+    /// the executable-comment shapes?": **yes**, and it is established rather
+    /// than unknown.
+    ///
+    /// Run on a non-empty editor selection that holds one statement or none
+    /// sends the selection to the driver verbatim, on every engine but SQL
+    /// Server, where only the `GO` lines around the batch are removed
+    /// (`sql_to_run`, through `one_batch`). Two shapes reach the classifier
+    /// through it, both on a Read-only profile against a MariaDB server:
+    ///
+    /// 1. the user selects `/*M!100100 ... */` alone, and the splitter finds
+    ///    no statement in it, so nothing cuts it down;
+    /// 2. the user selects one statement with an executable comment inside it,
+    ///    and the comment rides in the statement's range, since a token
+    ///    follows it.
+    ///
+    /// Before plan 01-04 the typed parser read both as a comment, and
+    /// `classify` called the first a plain read. On a live MariaDB 11.4 that
+    /// text, `SET SESSION TRANSACTION READ WRITE`, disarmed the server's own
+    /// read-only hold, after which an `INSERT` succeeded. This test pins the
+    /// closed hole through the route rather than through `classify` alone.
+    ///
+    /// The buffer is `"-- café\n/*M!100100 SET SESSION TRANSACTION READ WRITE
+    /// */\nSELECT 1;\n"`. The `é` is two bytes, so byte offsets and character
+    /// offsets differ, and the selection is bytes `9..57`: byte 9 follows the
+    /// newline that ends the first line and byte 57 is the end of `*/`. Both
+    /// fall on character boundaries, so the slice cannot panic.
+    #[test]
+    fn a_selection_of_only_an_executable_comment_reaches_the_classifier_whole() {
+        let buffer = "-- café\n/*M!100100 SET SESSION TRANSACTION READ WRITE */\nSELECT 1;\n";
+        let selection = 9..57;
+        let comment = "/*M!100100 SET SESSION TRANSACTION READ WRITE */";
+        assert_eq!(&buffer[selection.clone()], comment);
+
+        for engine in sql_engines() {
+            let found = queued_statements(engine, buffer, Some(selection.clone()));
+            assert!(found.len() <= 1, "{engine:?}: {found:?}");
+
+            // SQL Server reads its buffer a batch at a time and trims the one
+            // it sends, so what it submits is not the selection byte for byte.
+            if batches_on(engine) {
+                continue;
+            }
+            let submitted = submitted_for_selection(engine, buffer, selection.clone())
+                .unwrap_or_else(|| panic!("{engine:?}: a selection that holds text submits it"))
+                .unwrap_or_else(|message| panic!("{engine:?}: {message}"));
+            assert_eq!(submitted, comment, "{engine:?}");
+        }
+
+        for engine in marker_engines() {
+            let verdict = classify(engine, comment);
+            assert!(is_stopped(engine, comment), "{engine:?}");
+            assert!(
+                gate(&verdict, Mode::ReadOnly, &[]).is_some(),
+                "{engine:?}: a Read-only profile lets the release through"
+            );
+        }
+    }
+
+    /// The second reachable shape: one selected statement with the comment
+    /// inside it. The buffer is `"SELECT 'é' /*M!100100 INTO @y */ FROM t;\n"`
+    /// and the selection is bytes `0..41`, the statement and its `;`. Byte 41
+    /// is the end of the `;`, a character boundary, and the `é` makes the
+    /// range one byte longer than the 40 characters in it.
+    #[test]
+    fn a_selection_with_an_executable_comment_inside_a_statement_carries_it_to_the_classifier() {
+        let buffer = "SELECT 'é' /*M!100100 INTO @y */ FROM t;\n";
+        let selection = 0..41;
+        assert_eq!(
+            &buffer[selection.clone()],
+            "SELECT 'é' /*M!100100 INTO @y */ FROM t;"
+        );
+
+        for engine in sql_engines() {
+            let found = queued_statements(engine, buffer, Some(selection.clone()));
+            assert_eq!(found.len(), 1, "{engine:?}: {found:?}");
+            assert!(
+                buffer[found[0].clone()].contains("/*M!100100 INTO @y */"),
+                "{engine:?}: the comment travels inside the statement's range"
+            );
+
+            if batches_on(engine) {
+                continue;
+            }
+            let submitted = submitted_for_selection(engine, buffer, selection.clone())
+                .unwrap_or_else(|| panic!("{engine:?}: a selection that holds text submits it"))
+                .unwrap_or_else(|message| panic!("{engine:?}: {message}"));
+            assert_eq!(submitted, &buffer[selection.clone()], "{engine:?}");
+        }
+
+        for engine in marker_engines() {
+            let submitted = &buffer[selection.clone()];
+            assert!(is_stopped(engine, submitted), "{engine:?}");
+            assert!(
+                gate(&classify(engine, submitted), Mode::ReadOnly, &[]).is_some(),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// An empty selection does not take the selection branch: `sql_to_run`
+    /// falls through to the statement under the cursor, so the whole-selection
+    /// answer above says nothing about it. Here the cursor sits inside the
+    /// comment, byte 20, and the statement it runs is `SELECT 1`, not the
+    /// comment: the splitter has no statement for a comment on its own.
+    #[test]
+    fn an_empty_selection_runs_the_statement_at_the_cursor_and_not_the_selection() {
+        let buffer = "-- café\n/*M!100100 SET SESSION TRANSACTION READ WRITE */\nSELECT 1;\n";
+
+        for engine in sql_engines() {
+            // An empty selection is no selection to `queued_statements`.
+            assert_eq!(
+                queued_statements(engine, buffer, Some(20..20)),
+                queued_statements(engine, buffer, None),
+                "{engine:?}"
+            );
+            if batches_on(engine) {
+                continue;
+            }
+            let range = Buffer::for_engine(engine, buffer)
+                .statement_at(20)
+                .unwrap_or_else(|| panic!("{engine:?}: the buffer holds a statement"));
+            assert_eq!(&buffer[range], "SELECT 1", "{engine:?}");
+        }
+    }
+
+    /// A selection of only whitespace holds nothing to run: `sql_to_run`
+    /// returns no statement and the Run action says so.
+    #[test]
+    fn a_selection_of_only_whitespace_submits_nothing() {
+        let buffer = "SELECT 1;\n \t\n";
+        // Bytes 10..13 are the space, the tab and the newline after the first
+        // line, all one byte wide.
+        let selection = 10..13;
+        assert_eq!(&buffer[selection.clone()], " \t\n");
+
+        for engine in sql_engines() {
+            assert!(
+                submitted_for_selection(engine, buffer, selection.clone()).is_none(),
+                "{engine:?}"
+            );
+        }
+    }
 }
