@@ -537,6 +537,17 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // The armed `default_transaction_read_only` stops none of these, and
         // `set_config` turns it off. Reading a file the role may read is not
         // here: that is a read, and how DBDelve opens its own files.
+        //
+        // The large-object writers persist and rewrite stored data under the
+        // armed hold (reproduced live: `lo_from_bytea`, `lo_put` and
+        // `lo_truncate` each took effect). `lo_get` and `loread` are absent
+        // because reading an object is a read. The recovery and replication
+        // controls (`pg_promote`, `pg_wal_replay_pause`, the replication slot
+        // calls) are absent too: they need a superuser or a replication role,
+        // none was reproduced against the dev server, and they control
+        // recovery rather than stored data. The live differential asks the
+        // server's catalog for the large-object family, so a writer a later
+        // version adds fails there by name.
         denied_functions: &[
             "set_config",
             "nextval",
@@ -560,10 +571,21 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "pg_switch_wal",
             "pg_create_restore_point",
             "pg_stat_reset",
+            "pg_stat_reset_shared",
+            "pg_stat_reset_single_table_counters",
+            "pg_stat_reset_single_function_counters",
+            "pg_stat_reset_slru",
+            "pg_stat_reset_replication_slot",
             "lo_create",
             "lo_import",
             "lo_export",
             "lo_unlink",
+            "lo_from_bytea",
+            "lo_put",
+            "lo_creat",
+            "lowrite",
+            "lo_truncate",
+            "lo_truncate64",
             "dblink",
             "dblink_exec",
             "dblink_connect",
