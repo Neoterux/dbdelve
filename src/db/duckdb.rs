@@ -2491,6 +2491,7 @@ mod tests {
         row_limit_drains_an_ineligible_read,
         capped_read_keeps_the_users_transaction,
         read_only_session_refuses_a_write,
+        denied_functions_agree_with_the_server,
         generated_writes_round_trip,
     );
 }
