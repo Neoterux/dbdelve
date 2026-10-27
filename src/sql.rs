@@ -7933,4 +7933,206 @@ mod tests {
             assert!(is_stopped(engine, "SET NAMES DEFAULT"), "{engine:?}");
         }
     }
+
+    /// The engines whose dialect expands the marker, found through the spec the
+    /// way `classify` finds them.
+    fn marker_engines() -> impl Iterator<Item = crate::db::Engine> {
+        sql_engines().filter(|engine| engine.spec().sql.parser_dialect == ParserDialect::MySql)
+    }
+
+    fn destroys_as(engine: crate::db::Engine, sql: &str, kind: Destructive) -> bool {
+        classify(engine, sql) == Verdict::destroys(kind)
+    }
+
+    fn is_unreadable(engine: crate::db::Engine, sql: &str) -> bool {
+        classify(engine, sql).destructive == [Destructive::Unreadable]
+    }
+
+    #[test]
+    fn a_comment_the_server_executes_is_judged_by_the_statement_it_holds() {
+        for engine in marker_engines() {
+            for sql in [
+                "/*M!100100 DROP TABLE t */",
+                "/*M!DROP TABLE t */",
+                "/*M!100100DROP TABLE t */",
+                "/*M!10010 DROP TABLE t */",
+                "/*M!100100\nDROP TABLE t */",
+            ] {
+                assert!(
+                    destroys_as(engine, sql, Destructive::Drop),
+                    "{engine:?}: {sql}"
+                );
+            }
+            assert!(
+                destroys_as(
+                    engine,
+                    "/*M!100100 TRUNCATE TABLE t */",
+                    Destructive::Truncate
+                ),
+                "{engine:?}"
+            );
+            assert!(
+                destroys_as(
+                    engine,
+                    "/*M!100100 DELETE FROM t */",
+                    Destructive::UnfilteredDelete
+                ),
+                "{engine:?}"
+            );
+            assert!(
+                is_stopped(engine, "/*M!100100 INSERT INTO t VALUES (1) */"),
+                "{engine:?}"
+            );
+            assert!(
+                is_plain_read(engine, "/*M!100100 SELECT 1 */"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_the_server_executes_after_a_statement_is_judged_the_same_way() {
+        for engine in marker_engines() {
+            for sql in [
+                "SELECT 1; /*M!100100 DROP TABLE t */",
+                "SELECT 1;\n/*M!100100 DROP TABLE t */",
+            ] {
+                assert!(
+                    destroys_as(engine, sql, Destructive::Drop),
+                    "{engine:?}: {sql}"
+                );
+            }
+            assert!(
+                is_stopped(
+                    engine,
+                    "SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */"
+                ),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_the_server_executes_cannot_disarm_the_read_only_hold() {
+        for engine in marker_engines() {
+            for sql in [
+                "/*M!100100 SET SESSION TRANSACTION READ WRITE */",
+                "/*M!100100 SET SESSION transaction_read_only = 0 */",
+                "/*M!100100 SET GLOBAL read_only = 0 */",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fragment_in_a_comment_the_server_executes_belongs_to_the_statement_around_it() {
+        for engine in marker_engines() {
+            assert!(
+                is_stopped(engine, "SELECT 1 /*M!100100 INTO @y */ FROM t"),
+                "{engine:?}"
+            );
+            assert!(
+                is_plain_read(engine, "SELECT 2 /*M!100100 +1 */"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_the_server_executes_fused_with_a_bare_statement_is_unreadable() {
+        // The server inlines the comment into its neighbours, so the two run as
+        // one statement it rejects.
+        for engine in marker_engines() {
+            assert!(
+                is_unreadable(engine, "/*M!100100 DROP TABLE t */ SELECT 1"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_call_in_a_comment_the_server_executes_is_stopped() {
+        for engine in marker_engines() {
+            assert!(
+                is_stopped(engine, "/*M!100100 SELECT get_lock('k', 1) */"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_the_server_reads_as_part_of_a_plain_comment_stays_one() {
+        for engine in marker_engines() {
+            assert!(
+                is_plain_read(engine, "/*M!1234 DROP TABLE t */"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_that_is_not_a_comment_token_is_left_alone() {
+        for engine in marker_engines() {
+            for sql in [
+                "SELECT '/*M!100100 DROP TABLE t */'",
+                "-- /*M!100100 DROP TABLE t */\nSELECT 1",
+                "# /*M!100100 DROP TABLE t */\nSELECT 1",
+            ] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialect_that_does_not_expand_the_marker_is_not_affected_by_it() {
+        for engine in
+            sql_engines().filter(|engine| !marker_engines().any(|marker| marker == *engine))
+        {
+            assert!(
+                is_plain_read(engine, "/*M!100100 DROP TABLE t */"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_executable_comment_that_cannot_be_read_is_unreadable() {
+        for engine in marker_engines() {
+            for sql in [
+                "/*M!100100 DROP TABLE t",
+                "/*M!100100 /*M!100100 SELECT 7 */ */",
+                // The version no server reaches, which opens every dump file.
+                "/*M!999999\\- enable the sandbox mode */",
+            ] {
+                assert!(is_unreadable(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_byte_character_in_an_executable_comment_cannot_split_it() {
+        for engine in marker_engines() {
+            assert!(
+                is_plain_read(engine, "/*M!100100 SELECT 'é' */"),
+                "{engine:?}"
+            );
+            for sql in [
+                "/*M!100100é DROP TABLE t */",
+                "/*M!é DROP TABLE t */",
+                "/*M!１００１００ DROP TABLE t */",
+            ] {
+                assert!(is_unreadable(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_and_a_lone_empty_executable_comment_are_silent_reads() {
+        for engine in sql_engines() {
+            for sql in ["", "   \n\t", "/*M!*/"] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql:?}");
+            }
+        }
+    }
 }
