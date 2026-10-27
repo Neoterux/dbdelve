@@ -2110,6 +2110,7 @@ mod tests {
         read_only_session_refuses_a_write,
         denied_functions_agree_with_the_server,
         session_settings_agree_with_the_server,
+        executable_comments_agree_with_the_server,
         generated_writes_round_trip,
     );
 
@@ -2129,6 +2130,7 @@ mod tests {
         read_only_session_refuses_a_write,
         denied_functions_agree_with_the_server,
         session_settings_agree_with_the_server,
+        executable_comments_agree_with_the_server,
         generated_writes_round_trip,
     );
 
