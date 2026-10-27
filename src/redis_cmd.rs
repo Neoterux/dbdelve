@@ -960,10 +960,12 @@ mod tests {
             ("GET a", &read),
             ("hgetall h", &read),
             ("SCAN 0 MATCH user:* COUNT 100", &read),
-            ("CONFIG GET maxmemory", &read),
+            ("CONFIG GET maxmemory", &write),
+            ("CONFIG HELP", &read),
             ("config set maxmemory 1", &drop),
             ("CONFIG REWRITE", &drop),
-            ("CLIENT LIST", &read),
+            ("CLIENT LIST", &write),
+            ("CLIENT ID", &read),
             ("CLIENT KILL ID 4", &write),
             ("SCRIPT EXISTS abc", &read),
             ("SCRIPT FLUSH", &drop),
@@ -1048,5 +1050,31 @@ mod tests {
         assert_eq!(leaves("DISCARD").transaction, Some(false));
         assert!(leaves("CLIENT SETNAME me").settings);
         assert_eq!(leaves("GET a"), Leaves::default());
+    }
+
+    #[test]
+    fn the_two_commands_that_return_secrets_are_split_from_their_siblings_by_name() {
+        let write = Verdict::WRITE;
+        for text in ["config get requirepass", "CLIENT LIST TYPE normal"] {
+            assert_eq!(classify(text), write, "{text}");
+        }
+        for text in [
+            "CONFIG HELP",
+            "CLIENT ID",
+            "CLIENT INFO",
+            "CLIENT GETNAME",
+            "CLIENT GETREDIR",
+            "CLIENT TRACKINGINFO",
+            "CLIENT HELP",
+        ] {
+            assert_eq!(classify(text), Verdict::READ, "{text}");
+        }
+    }
+
+    #[test]
+    fn listing_clients_leaves_no_session_setting_but_naming_one_does() {
+        assert_eq!(leaves("CLIENT LIST"), Leaves::default());
+        assert!(leaves("CLIENT SETNAME me").settings);
+        assert!(leaves("CLIENT NO-TOUCH ON").settings);
     }
 }

@@ -444,3 +444,72 @@ source: src/sql_snapshots.rs
 [redis] "HDEL h f g"
   |HDEL h f g|
   = write_on=false select=false classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None confirm[none]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[drop]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[truncate]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[unfiltered]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[all3]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CONFIG GET maxmemory"
+  |CONFIG GET maxmemory|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "config get requirepass"
+  |config get requirepass|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CONFIG HELP"
+  |CONFIG HELP|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CONFIG SET maxmemory 1"
+  |CONFIG SET maxmemory 1|
+  = write_on=false select=false classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop)) confirm[none]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[drop]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:None confirm[truncate]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[unfiltered]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[all3]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CONFIG"
+  |CONFIG|
+  = write_on=false select=false classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce) confirm[none]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[drop]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[truncate]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[unfiltered]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[all3]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT LIST"
+  |CLIENT LIST|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT LIST TYPE normal"
+  |CLIENT LIST TYPE normal|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT ID"
+  |CLIENT ID|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT INFO"
+  |CLIENT INFO|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT GETNAME"
+  |CLIENT GETNAME|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT GETREDIR"
+  |CLIENT GETREDIR|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT TRACKINGINFO"
+  |CLIENT TRACKINGINFO|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT HELP"
+  |CLIENT HELP|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT SETNAME app"
+  |CLIENT SETNAME app|
+  = write_on=false select=false classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None confirm[none]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[drop]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[truncate]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[unfiltered]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[all3]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT PAUSE 100"
+  |CLIENT PAUSE 100|
+  = write_on=false select=false classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop)) confirm[none]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[drop]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:None confirm[truncate]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[unfiltered]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:Some(Confirm(Drop)) confirm[all3]=ro:Some(Upgrade(Full)),rw:Some(Upgrade(Full)),full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "CLIENT"
+  |CLIENT|
+  = write_on=false select=false classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce) confirm[none]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[drop]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[truncate]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[unfiltered]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) confirm[all3]=ro:Some(Upgrade(ReadWrite)),rw:Some(RunOnce),full:Some(RunOnce) matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[redis] "GET k\nCLIENT LIST"
+  |GET k|
+  |CLIENT LIST|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
