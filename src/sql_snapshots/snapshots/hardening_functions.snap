@@ -46,6 +46,9 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -89,6 +92,9 @@ source: src/sql_snapshots.rs
 [postgres] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -134,6 +140,9 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -177,6 +186,9 @@ source: src/sql_snapshots.rs
 [mysql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -222,6 +234,9 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -265,6 +280,9 @@ source: src/sql_snapshots.rs
 [mariadb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -310,6 +328,9 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -353,6 +374,9 @@ source: src/sql_snapshots.rs
 [sqlite] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -398,6 +422,9 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -441,6 +468,9 @@ source: src/sql_snapshots.rs
 [turso] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -486,6 +516,9 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -529,6 +562,9 @@ source: src/sql_snapshots.rs
 [duckdb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -574,6 +610,9 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -617,6 +656,9 @@ source: src/sql_snapshots.rs
 [snowflake] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -662,6 +704,9 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -705,6 +750,9 @@ source: src/sql_snapshots.rs
 [mssql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -750,6 +798,9 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_all_locks() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -793,6 +844,9 @@ source: src/sql_snapshots.rs
 [mongodb] control user-defined call: SELECT my_function(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control plain projection: SELECT a, b FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -838,6 +892,9 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -881,3 +938,6 @@ source: src/sql_snapshots.rs
 [redis] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|

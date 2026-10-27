@@ -62,6 +62,9 @@ const CALLS: &[(&str, &str)] = &[
     ("dblink_connect_u", "'c', 'dbname=x'"),
     ("dblink_send_query", "'c', 'SELECT 1'"),
     ("query_to_xml", "'select 1', true, false, ''"),
+    ("query_to_xml_and_xmlschema", "'select 1', true, false, ''"),
+    ("query_to_xmlschema", "'select 1', true, false, ''"),
+    ("ts_stat", "'select to_tsvector(''a'')'"),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -163,6 +166,18 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "sql-text executor carrying a disarm",
         "SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '')",
+    ),
+    (
+        "sql-text executor in table position",
+        "SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$)",
+    ),
+    (
+        "sql-text executor carrying a write",
+        "SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '')",
+    ),
+    (
+        "control denied name inside a literal with no executor",
+        "SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)'",
     ),
 ];
 
