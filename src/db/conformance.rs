@@ -812,6 +812,57 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
             second + 1,
             "{at}: the control disturbed the sequence"
         );
+
+        // DuckDB holds no session read-only, so the verdict is the whole
+        // boundary there and the counter is the canary. Observed on the
+        // embedded `v2.0.0-dev88614`: `query` and `json_execute_serialized_sql`
+        // run the text they are handed, `query_table` resolves a table name and
+        // runs none. Asserted as that answer, not as whatever the server says,
+        // so a DuckDB that changes it fails here by name.
+        if engine == Engine::DuckDb {
+            let inner = format!("select nextval(''{schema}.dbdelve_denied_970'')");
+            let counter = || -> i64 {
+                cell(&subject.run(scenario, &current, Fetch::default()))
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{at}: the sequence did not answer a number"))
+            };
+            for carrier in [
+                format!("SELECT * FROM query('{inner}')"),
+                format!("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('{inner}'))"),
+            ] {
+                above_a_read(&carrier);
+                let before = counter();
+                subject.run(scenario, &carrier, Fetch::default());
+                assert_eq!(
+                    counter(),
+                    before + 1,
+                    "{at}: `{carrier}` did not run its text, so it is not a carrier and should not be listed"
+                );
+            }
+            let by_name = format!("SELECT * FROM query_table('{inner}')");
+            assert_eq!(
+                rated(&by_name),
+                sql::Mode::ReadOnly,
+                "{at}: `{by_name}` is rated above a read, but query_table runs no text"
+            );
+            let before = counter();
+            let refused = subject
+                .connection
+                .query(&by_name, &CancelToken::default(), Fetch::default())
+                .expect_err(&format!(
+                    "{at}: query_table ran `{by_name}`, so it is a carrier and should be listed"
+                ));
+            assert!(
+                refused.message.contains("does not exist"),
+                "{at}: query_table refused `{by_name}` for another reason: {}",
+                refused.message
+            );
+            assert_eq!(
+                counter(),
+                before,
+                "{at}: query_table moved the sequence through `{by_name}`"
+            );
+        }
     }
 }
 
