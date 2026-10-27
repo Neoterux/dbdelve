@@ -620,6 +620,9 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
             for disarm in [
                 "SELECT set_config('default_transaction_read_only', 'off', false)",
                 r#"SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false)"#,
+                // The denied call is inside a string, so the name scan sees
+                // the carrier and never the payload.
+                "SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '')",
             ] {
                 above_a_read(disarm);
                 hold(true);

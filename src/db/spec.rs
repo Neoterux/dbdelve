@@ -548,6 +548,14 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // recovery rather than stored data. The live differential asks the
         // server's catalog for the large-object family, so a writer a later
         // version adds fails there by name.
+        //
+        // A function that executes its text argument as a query reaches any
+        // listed call through a name the token scan cannot read, because the
+        // call sits inside a string: `query_to_xml('select set_config(...)')`
+        // released the hold on the dev server. SPI's read-only mode refuses
+        // DML inside that text and refuses none of the listed functions,
+        // which is why the carrier works where `query_to_xml('delete ...')`
+        // does not. The carrier is listed, never the text it carries.
         denied_functions: &[
             "set_config",
             "nextval",
@@ -586,6 +594,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "lowrite",
             "lo_truncate",
             "lo_truncate64",
+            "query_to_xml",
             "dblink",
             "dblink_exec",
             "dblink_connect",
