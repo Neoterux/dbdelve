@@ -42,6 +42,23 @@ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnc
 [postgres] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] hash line comment: # c => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] hash line comment, line break: # c
+ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] hash line comment after a block comment: /* a */ # c => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] nested block comment: /* /* n */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] batch separator only: GO => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
@@ -83,6 +100,23 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] hash line comment: # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] hash line comment, line break: # c
+ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] hash line comment after a block comment: /* a */ # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] nested block comment: /* /* n */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] batch separator only: GO => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
@@ -124,6 +158,23 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] hash line comment: # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] hash line comment, line break: # c
+ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] hash line comment after a block comment: /* a */ # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] nested block comment: /* /* n */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] batch separator only: GO => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -165,6 +216,23 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [sqlite] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] hash line comment: # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] hash line comment, line break: # c
+ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -206,6 +274,23 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [turso] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] hash line comment: # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] hash line comment, line break: # c
+ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -247,6 +332,23 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [duckdb] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] hash line comment: # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] hash line comment, line break: # c
+ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -288,6 +390,23 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] hash line comment: # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] hash line comment, line break: # c
+ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] hash line comment after a block comment: /* a */ # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -329,6 +448,23 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [mssql] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] hash line comment: # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] hash line comment, line break: # c
+ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] nested block comment: /* /* n */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -370,6 +506,23 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [mongodb] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mongodb] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mongodb] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mongodb] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mongodb] semicolon then comment: ; -- c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] line comment: -- c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mongodb] block comment after a line comment: -- a
+/* b */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] hash line comment: # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] hash line comment, line break: # c
+ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -411,3 +564,20 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] lone semicolon: ; => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] two semicolons: ;; => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] semicolon then comment: ; -- c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] line comment: -- c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] block comment: /* c */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] block comment after a line comment: -- a
+/* b */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] hash line comment: # c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] hash line comment, line break: # c
+ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|

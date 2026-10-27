@@ -642,11 +642,36 @@ const EXECUTABLE_COMMENTS: &[(&str, &str)] = &[
     ("ordinary block comment before a read", "/* c */ SELECT 1"),
 ];
 
+/// Submissions the typed parser reads as no statement at all, which the
+/// zero-statement cross-check looks at: the forms that must stay silent reads,
+/// and the comment residue the pinned tokenizer reads as real tokens. The
+/// existing dialect corpus holds no hash-comment or nested-comment text, so
+/// this is the only place a carve-out that stopped clearing them would show.
+const NOTHING_TO_RUN: &[(&str, &str)] = &[
+    ("empty", ""),
+    ("whitespace only", "  \n\t"),
+    ("lone semicolon", ";"),
+    ("two semicolons", ";;"),
+    ("semicolon then comment", "; -- c"),
+    ("line comment", "-- c"),
+    ("block comment", "/* c */"),
+    ("block comment after a line comment", "-- a\n/* b */"),
+    ("hash line comment", "# c"),
+    ("hash line comment, line break", "# c\n"),
+    ("hash line comment after a block comment", "/* a */ # c"),
+    ("nested block comment", "/* /* n */ */"),
+    (
+        "nested block comment hiding a statement",
+        "/* /* n */ DROP TABLE t */",
+    ),
+    ("batch separator only", "GO"),
+];
+
 #[test]
 fn executable_comment_corpus_per_engine() {
     let mut out = String::new();
     for engine in Engine::ALL {
-        for (case, sql) in EXECUTABLE_COMMENTS {
+        for (case, sql) in EXECUTABLE_COMMENTS.iter().chain(NOTHING_TO_RUN) {
             record(&mut out, engine, case, sql);
         }
     }
