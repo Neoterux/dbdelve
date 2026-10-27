@@ -485,6 +485,183 @@ pub(super) fn read_only_session_refuses_a_write(subject: &Subject) {
     subject.run(scenario, &insert, Fetch::default());
 }
 
+/// The classifier's new verdicts against what the server does, as a pair per
+/// case: the statement is rated above a read, and the server really does what
+/// that rating claims. Each is matched by a control that must not move, a
+/// statement whose effect on the hold is none, which is rated a read and
+/// leaves the canary write refused in the same session -- without it a server
+/// that refused everything would pass.
+pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
+    let scenario = "denied_functions_agree_with_the_server";
+    let at = format!("{scenario} on {:?}", subject.engine);
+    let engine = subject.engine;
+    let schema = subject.schema;
+    // Row 970, one lock key, one large object and one sequence, all named for
+    // this scenario: CI runs four scenarios at a time against one server.
+    let canary = 970;
+    let sequence = engine.qualified(schema, "dbdelve_denied_970");
+    let insert = sql_insert(engine, schema, canary, "denied function");
+    let rated = |sql: &str| sql::classify(engine, sql).mode;
+    let above_a_read = |sql: &str| {
+        assert!(
+            rated(sql) > sql::Mode::ReadOnly,
+            "{at}: `{sql}` is rated {:?}, which a Read-only profile would run",
+            rated(sql)
+        );
+    };
+    let hold = |on: bool| {
+        subject
+            .connection
+            .set_read_only(on)
+            .unwrap_or_else(|error| panic!("{at}: {error}"));
+    };
+    let cell = |result: &QueryResult| {
+        result
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .unwrap_or_else(|| panic!("{at}: no value came back"))
+            .to_string()
+    };
+
+    let mut unwind = vec![
+        sql_delete(engine, schema, canary),
+        format!("DROP SEQUENCE IF EXISTS {sequence}"),
+    ];
+    let (held_calls, control, advance, current): (Vec<(&str, &str)>, &str, String, String) =
+        match engine {
+            Engine::Postgres => {
+                unwind.push("SELECT pg_advisory_unlock_all()".to_string());
+                unwind.push("SELECT lo_unlink(970970)".to_string());
+                (
+                    vec![
+                        ("an advisory lock", "SELECT pg_advisory_lock(970970)"),
+                        (
+                            "a notification",
+                            "SELECT pg_notify('dbdelve_denied_970', 'x')",
+                        ),
+                        ("a large object", "SELECT lo_create(970970)"),
+                    ],
+                    "SELECT current_setting('search_path')",
+                    format!("SELECT nextval('{schema}.dbdelve_denied_970')"),
+                    format!("SELECT currval('{schema}.dbdelve_denied_970')"),
+                )
+            }
+            Engine::MySql | Engine::MariaDb => {
+                unwind.push("SELECT RELEASE_ALL_LOCKS()".to_string());
+                (
+                    vec![("a named lock", "SELECT GET_LOCK('dbdelve_denied_970', 0)")],
+                    "SELECT version()",
+                    format!("SELECT NEXTVAL({sequence})"),
+                    format!("SELECT LASTVAL({sequence})"),
+                )
+            }
+            _ => (
+                Vec::new(),
+                "SELECT version()",
+                format!("SELECT nextval('{schema}.dbdelve_denied_970')"),
+                format!("SELECT currval('{schema}.dbdelve_denied_970')"),
+            ),
+        };
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: unwind,
+        rollback: false,
+        read_write: engine.holds_read_only(),
+    };
+
+    // An engine with no hold has nothing to differ on here: both directions
+    // of the switch must still be accepted, and the sequence case below runs.
+    if !engine.holds_read_only() {
+        hold(true);
+        hold(false);
+    } else {
+        let refused = || {
+            let error = subject
+                .connection
+                .query(&insert, &CancelToken::default(), Fetch::default())
+                .expect_err(&format!("{at}: the hold took a write it should refuse"));
+            assert!(
+                error.message.contains(subject.read_only_refusal),
+                "{at}: refused for another reason: {}",
+                error.message
+            );
+        };
+        // The control: rated a read, runs on the held session, and the hold
+        // is still armed after it.
+        let controlled = || {
+            assert_eq!(
+                rated(control),
+                sql::Mode::ReadOnly,
+                "{at}: control `{control}`"
+            );
+            hold(true);
+            subject.run(scenario, control, Fetch::default());
+            refused();
+            hold(false);
+        };
+
+        for (case, call) in &held_calls {
+            above_a_read(call);
+            hold(true);
+            // The call itself succeeds with the hold armed, which is why the
+            // verdict has to be the one to stop it.
+            subject.run(&format!("{scenario}: {case}"), call, Fetch::default());
+            hold(false);
+            controlled();
+        }
+
+        if engine == Engine::Postgres {
+            let disarm = "SELECT set_config('default_transaction_read_only', 'off', false)";
+            above_a_read(disarm);
+            hold(true);
+            refused();
+            subject.run(scenario, disarm, Fetch::default());
+            // The write that was refused a moment ago now goes through.
+            subject.run(scenario, &insert, Fetch::default());
+            hold(false);
+            controlled();
+        }
+    }
+
+    if engine.spec().sql.denied_functions.contains(&"nextval") {
+        subject.run(
+            scenario,
+            &format!("CREATE SEQUENCE {sequence}"),
+            Fetch::default(),
+        );
+        above_a_read(&advance);
+        assert_eq!(rated(&current), sql::Mode::ReadOnly, "{at}: `{current}`");
+        let first: i64 = cell(&subject.run(scenario, &advance, Fetch::default()))
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: the sequence did not answer a number"));
+        let second: i64 = cell(&subject.run(scenario, &advance, Fetch::default()))
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: the sequence did not answer a number"));
+        assert_eq!(
+            second,
+            first + 1,
+            "{at}: the call did not advance the sequence"
+        );
+        // The control reads where the sequence stands and leaves it there.
+        let read: i64 = cell(&subject.run(scenario, &current, Fetch::default()))
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: the sequence did not answer a number"));
+        assert_eq!(
+            read, second,
+            "{at}: the read-only spelling moved the sequence"
+        );
+        let third: i64 = cell(&subject.run(scenario, &advance, Fetch::default()))
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: the sequence did not answer a number"));
+        assert_eq!(
+            third,
+            second + 1,
+            "{at}: the control disturbed the sequence"
+        );
+    }
+}
+
 pub(super) fn generated_writes_round_trip(subject: &Subject) {
     let scenario = "generated_writes_round_trip";
     let at = format!("{scenario} on {:?}", subject.engine);
