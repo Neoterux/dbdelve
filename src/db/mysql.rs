@@ -2111,6 +2111,7 @@ mod tests {
         denied_functions_agree_with_the_server,
         session_settings_agree_with_the_server,
         executable_comments_agree_with_the_server,
+        comment_forms_agree_with_the_server,
         generated_writes_round_trip,
     );
 
@@ -2131,6 +2132,7 @@ mod tests {
         denied_functions_agree_with_the_server,
         session_settings_agree_with_the_server,
         executable_comments_agree_with_the_server,
+        comment_forms_agree_with_the_server,
         generated_writes_round_trip,
     );
 

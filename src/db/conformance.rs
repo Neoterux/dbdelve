@@ -1063,6 +1063,111 @@ pub(super) fn executable_comments_agree_with_the_server(subject: &Subject) {
     );
 }
 
+/// The audit D-11 asks for: for each comment form, does the classifier ever
+/// skip as a comment what the server runs? The one direction that matters is
+/// asserted, and only it: **if the server ran a write, a Read-only profile's
+/// gate must have stopped the submission.** The reverse is harmless. A
+/// classifier that stops a submission the server ignores has over-classified,
+/// which is the safe side, and the flat reading of a nested block comment is
+/// expected to do exactly that.
+///
+/// Each form is submitted two ways, with a write to a table this scenario
+/// creates for itself: the write *inside* the comment, which only a server that
+/// reads the form as code will run, and the write *after* a comment that holds
+/// nothing, which every server runs and so shows the classifier reads past the
+/// comment to the statement. A form that is no comment on an engine, such as a
+/// hash on Postgres, is a syntax error there and asserts nothing.
+///
+/// RESULT (2026-10-26, against the compose Postgres 15, MySQL 8.4, MariaDB 11.4
+/// and SQL Server): no exploitable gap beyond the executable comment plan 01-04
+/// closed. Every submission the server ran was stopped by a Read-only gate. The
+/// only writes the server ran from inside a comment were the executable
+/// comments, `/*!50000 ... */` on MySQL and MariaDB and `/*M!100100 ... */` on
+/// MariaDB, and the classifier rates both by what they hold. With that fix
+/// reverted this scenario fails on MariaDB at `/*M!100100 INSERT ... */`, so it
+/// finds the one real hole. Where the server reads a form as no comment at all,
+/// the classifier stops it though the server ran nothing: a `--` with no space
+/// and a nested block comment on MySQL and MariaDB, and a hash on Postgres and
+/// SQL Server. That is the over-classification the research predicted. The
+/// batch splitter and the grammar pins are untouched on this evidence.
+pub(super) fn comment_forms_agree_with_the_server(subject: &Subject) {
+    let scenario = "comment_forms_agree_with_the_server";
+    let at = format!("{scenario} on {:?}", subject.engine);
+    let engine = subject.engine;
+    // One helper table named for this scenario: CI runs four scenarios at a
+    // time against one server, and the shared fixture is never written.
+    let table = engine.qualified(subject.schema, "dbdelve_forms_973");
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: vec![format!("DROP TABLE IF EXISTS {table}")],
+        rollback: false,
+        read_write: false,
+    };
+    let run = |sql: &str| subject.run(scenario, sql, Fetch::default());
+    // A form the server does not read as a comment answers with an error of its
+    // own; the effect on the table is what is asserted on.
+    let send = |sql: &str| {
+        let _ = subject
+            .connection
+            .query(sql, &CancelToken::default(), Fetch::default());
+    };
+    let rows = || -> u32 {
+        run(&format!("SELECT COUNT(*) FROM {table}"))
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("{at}: the canary table answered no count"))
+    };
+    run(&format!("DROP TABLE IF EXISTS {table}"));
+    run(&format!("CREATE TABLE {table} (id INT)"));
+    let write = format!("INSERT INTO {table} VALUES (1)");
+
+    // How a form carries a body: the text of the comment around it.
+    type Comment = fn(&str) -> String;
+    let forms: [(&str, Comment); 8] = [
+        ("a line comment with a space", |body| format!("-- {body}\n")),
+        ("a line comment without one", |body| format!("--{body}\n")),
+        ("a hash line comment", |body| format!("# {body}\n")),
+        ("a block comment", |body| format!("/* {body} */")),
+        ("a nested block comment", |body| {
+            format!("/* /* {body} */ */")
+        }),
+        ("a comment both servers execute", |body| {
+            format!("/*!50000 {body} */")
+        }),
+        ("a comment only MariaDB executes", |body| {
+            format!("/*M!100100 {body} */")
+        }),
+        ("a comment with a version too short to run", |body| {
+            format!("/*M!1234 {body} */")
+        }),
+    ];
+    let mut observed_a_run = false;
+    for (name, comment) in forms {
+        for (shape, sql) in [
+            ("write inside", comment(&write)),
+            ("write after", format!("{}{write}", comment("a note"))),
+        ] {
+            send(&sql);
+            let ran = rows() > 0;
+            run(&format!("DELETE FROM {table}"));
+            if !ran {
+                continue;
+            }
+            observed_a_run = true;
+            let verdict = sql::classify(engine, &sql);
+            assert!(
+                sql::gate(&verdict, sql::Mode::ReadOnly, &[]).is_some(),
+                "{at}: the server ran `{sql}` ({name}, {shape}), and a Read-only profile \
+                 would have run it too: rated {verdict:?}"
+            );
+        }
+    }
+    // A scenario in which nothing ever ran asserted nothing.
+    assert!(observed_a_run, "{at}: no submission wrote to the canary");
+}
+
 pub(super) fn generated_writes_round_trip(subject: &Subject) {
     let scenario = "generated_writes_round_trip";
     let at = format!("{scenario} on {:?}", subject.engine);
