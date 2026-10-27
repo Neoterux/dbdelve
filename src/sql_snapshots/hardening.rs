@@ -111,6 +111,26 @@ const SHAPES: &[(&str, &str)] = &[
         "sequence without parentheses, qualified",
         "SELECT db.s.nextval FROM t",
     ),
+    (
+        "unicode-escaped name",
+        r#"SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false)"#,
+    ),
+    (
+        "unicode-escaped name, no escape sequence",
+        r#"SELECT U&"set_config"('default_transaction_read_only', 'off', false)"#,
+    ),
+    (
+        "unicode-escaped name, schema-qualified",
+        r#"SELECT pg_catalog.U&"set_c\006fnfig"('a', 'b', false)"#,
+    ),
+    (
+        "control spaced bit-and of a quoted column",
+        r#"SELECT U & "x" FROM t"#,
+    ),
+    (
+        "control bit-and of an unquoted column",
+        "SELECT U&x FROM t",
+    ),
     ("control qualified column", "SELECT t.id FROM t"),
     (
         "control qualified column sharing no listed name",
