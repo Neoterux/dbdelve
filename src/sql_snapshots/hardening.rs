@@ -244,9 +244,6 @@ const SESSION_RULES: &[(&str, &str)] = &[
         "SET @@time_zone = 'UTC'",
     ),
     ("time zone", "SET TIME ZONE 'UTC'"),
-    ("charset, unicode", "SET NAMES utf8mb4"),
-    ("charset, multibyte trail", "SET NAMES gbk"),
-    ("charset, default", "SET NAMES DEFAULT"),
     ("unknown setting", "SET x = 1"),
     ("navigation setting", "SET search_path TO other"),
     ("navigation setting, equals", "SET search_path = other"),
@@ -321,12 +318,187 @@ const SESSION_SHAPES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Settings that stay off every allow-list, on the engine that has them, and the
+/// reason each is not navigation or comfort. A name here is stopped by the
+/// default alone, so none of it is data a spec carries: the list exists to prove
+/// the default holds for the names most likely to be added to an allow-list by
+/// mistake.
+pub(crate) const EXCLUDED_SETTINGS: &[(Engine, &[&str])] = &[
+    (
+        Engine::Postgres,
+        &[
+            // The hold itself and the identity changes.
+            "default_transaction_read_only",
+            "transaction_read_only",
+            "role",
+            "session_authorization",
+            // Turn off the server's own checks.
+            "session_replication_role",
+            "row_security",
+            "check_function_bodies",
+            // Change how a quote or a backslash in the next statement is read.
+            "standard_conforming_strings",
+            "backslash_quote",
+            "escape_string_warning",
+            "client_encoding",
+            // Change what a statement means or when it is durable.
+            "synchronous_commit",
+            "transform_null_equals",
+            "array_nulls",
+        ],
+    ),
+    (
+        Engine::MySql,
+        &[
+            "transaction_read_only",
+            "tx_read_only",
+            "read_only",
+            "super_read_only",
+            "sql_mode",
+            "character_set_client",
+            "character_set_connection",
+            "collation_connection",
+            "foreign_key_checks",
+            "unique_checks",
+            "sql_log_bin",
+            "sql_safe_updates",
+        ],
+    ),
+    (
+        Engine::MariaDb,
+        &[
+            "transaction_read_only",
+            "tx_read_only",
+            "read_only",
+            "super_read_only",
+            "sql_mode",
+            "character_set_client",
+            "character_set_connection",
+            "collation_connection",
+            "foreign_key_checks",
+            "unique_checks",
+            "sql_log_bin",
+            "sql_safe_updates",
+        ],
+    ),
+    (
+        Engine::DuckDb,
+        &[
+            // One-way: once off, DBDelve's own file opening stays off.
+            "enable_external_access",
+            "lock_configuration",
+            "allowed_directories",
+            "allowed_paths",
+            "autoinstall_known_extensions",
+            "autoload_known_extensions",
+            "allow_unsigned_extensions",
+            "allow_community_extensions",
+            "disabled_filesystems",
+            "custom_extension_repository",
+            "temp_directory",
+            "secret_directory",
+            "allow_persistent_secrets",
+            "access_mode",
+        ],
+    ),
+    (
+        Engine::SqlServer,
+        &[
+            "IDENTITY_INSERT t",
+            "IMPLICIT_TRANSACTIONS",
+            // Read at parse time, and changes how a double quote is read.
+            "QUOTED_IDENTIFIER",
+            "NOEXEC",
+            "PARSEONLY",
+            "FMTONLY",
+            "SHOWPLAN_ALL",
+            "FORCEPLAN",
+            "CONTEXT_INFO",
+            "OFFSETS SELECT",
+            "FIPS_FLAGGER",
+            "REMOTE_PROC_TRANSACTIONS",
+            "CURSOR_CLOSE_ON_COMMIT",
+            "ANSI_DEFAULTS",
+            "ANSI_NULL_DFLT_ON",
+            "QUERY_GOVERNOR_COST_LIMIT",
+        ],
+    ),
+    // The embedded file engines configure through `PRAGMA`, which is a different
+    // statement type and already needs Full, so a `SET` there is a statement the
+    // server rejects. The stateless engine keeps no session for one to change.
+    (Engine::Sqlite, &["foreign_keys", "journal_mode"]),
+    (Engine::Turso, &["foreign_keys", "journal_mode"]),
+    (Engine::Snowflake, &["search_path", "timezone"]),
+];
+
+/// `SET NAMES` for charsets either side of the single-byte line: the ones a
+/// statement can still be lexed in, and the multibyte ones whose trail bytes can
+/// swallow a backslash and leave the parser's reading of a quote behind the
+/// server's.
+const CHARSETS: &[&str] = &[
+    "DEFAULT",
+    "utf8mb4",
+    "UTF8MB4",
+    "utf8mb3",
+    "utf8",
+    "latin1",
+    "ascii",
+    "binary",
+    "'utf8mb4'",
+    "gbk",
+    "big5",
+    "sjis",
+    "cp932",
+    "gb18030",
+    "ucs2",
+    "utf16",
+];
+
+/// The statement that assigns a setting, spelled the way the engine's own
+/// dialect assigns one.
+pub(crate) fn set_statement(engine: Engine, name: &str) -> String {
+    match engine {
+        Engine::SqlServer => format!("SET {name} ON"),
+        _ => format!("SET {name} = 1"),
+    }
+}
+
 #[test]
 fn session_setting_corpus_per_engine() {
     let mut out = String::new();
     for engine in Engine::ALL {
         for (case, sql) in SESSION_RULES.iter().chain(SESSION_SHAPES) {
             record(&mut out, engine, case, sql);
+        }
+        for charset in CHARSETS {
+            record(&mut out, engine, "charset", &format!("SET NAMES {charset}"));
+        }
+        for name in engine.spec().sql.plain_settings {
+            record(
+                &mut out,
+                engine,
+                "allow-listed",
+                &set_statement(engine, name),
+            );
+            record(
+                &mut out,
+                engine,
+                "allow-listed, server-wide",
+                &format!("SET GLOBAL {name} = 1"),
+            );
+        }
+        for (owner, names) in EXCLUDED_SETTINGS {
+            if *owner != engine {
+                continue;
+            }
+            for name in *names {
+                record(
+                    &mut out,
+                    engine,
+                    "not allow-listed",
+                    &set_statement(engine, name),
+                );
+            }
         }
     }
     check("hardening_settings", &out);

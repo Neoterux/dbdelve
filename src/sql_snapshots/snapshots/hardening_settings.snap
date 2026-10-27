@@ -36,9 +36,6 @@ source: src/sql_snapshots.rs
 [postgres] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -66,6 +63,36 @@ source: src/sql_snapshots.rs
 [postgres] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES utf8mb3 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES utf8 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES latin1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES ascii => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES binary => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET default_transaction_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET transaction_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET role = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET session_authorization = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET session_replication_role = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET row_security = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET check_function_bodies = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET standard_conforming_strings = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET backslash_quote = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET escape_string_warning = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET client_encoding = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET synchronous_commit = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET transform_null_equals = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] not allow-listed: SET array_nulls = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -101,9 +128,6 @@ source: src/sql_snapshots.rs
 [mysql] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mysql] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mysql] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -131,6 +155,34 @@ source: src/sql_snapshots.rs
 [mysql] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES utf8mb3 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES utf8 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES latin1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES ascii => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES binary => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET transaction_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET tx_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET super_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET sql_mode = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET character_set_client = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET character_set_connection = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET collation_connection = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET foreign_key_checks = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET unique_checks = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET sql_log_bin = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] not allow-listed: SET sql_safe_updates = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -166,9 +218,6 @@ source: src/sql_snapshots.rs
 [mariadb] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mariadb] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mariadb] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -196,6 +245,34 @@ source: src/sql_snapshots.rs
 [mariadb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES utf8mb3 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES utf8 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES latin1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES ascii => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES binary => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET transaction_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET tx_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET super_read_only = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET sql_mode = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET character_set_client = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET character_set_connection = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET collation_connection = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET foreign_key_checks = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET unique_checks = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET sql_log_bin = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] not allow-listed: SET sql_safe_updates = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -231,9 +308,6 @@ source: src/sql_snapshots.rs
 [sqlite] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[sqlite] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[sqlite] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -261,6 +335,24 @@ source: src/sql_snapshots.rs
 [sqlite] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES utf8mb3 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES utf8 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES latin1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES ascii => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES binary => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES big5 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES sjis => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES cp932 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES gb18030 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES ucs2 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] charset: SET NAMES utf16 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] not allow-listed: SET foreign_keys = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] not allow-listed: SET journal_mode = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -296,9 +388,6 @@ source: src/sql_snapshots.rs
 [turso] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[turso] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[turso] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -326,6 +415,24 @@ source: src/sql_snapshots.rs
 [turso] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES utf8mb3 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES utf8 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES latin1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES ascii => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES binary => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES big5 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES sjis => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES cp932 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES gb18030 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES ucs2 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] charset: SET NAMES utf16 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] not allow-listed: SET foreign_keys = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] not allow-listed: SET journal_mode = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -361,9 +468,6 @@ source: src/sql_snapshots.rs
 [duckdb] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[duckdb] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[duckdb] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -391,6 +495,36 @@ source: src/sql_snapshots.rs
 [duckdb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES utf8mb3 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES utf8 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES latin1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES ascii => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES binary => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES big5 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES sjis => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES cp932 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES gb18030 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES ucs2 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] charset: SET NAMES utf16 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] not allow-listed: SET enable_external_access = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET lock_configuration = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET allowed_directories = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET allowed_paths = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET autoinstall_known_extensions = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET autoload_known_extensions = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET allow_unsigned_extensions = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET allow_community_extensions = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET disabled_filesystems = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET custom_extension_repository = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET temp_directory = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET secret_directory = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET allow_persistent_secrets = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] not allow-listed: SET access_mode = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -426,9 +560,6 @@ source: src/sql_snapshots.rs
 [snowflake] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[snowflake] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[snowflake] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -456,6 +587,24 @@ source: src/sql_snapshots.rs
 [snowflake] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES utf8mb3 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES utf8 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES latin1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES ascii => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES binary => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES big5 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES sjis => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES cp932 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES gb18030 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES ucs2 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] charset: SET NAMES utf16 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] not allow-listed: SET search_path = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] not allow-listed: SET timezone = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -491,9 +640,6 @@ source: src/sql_snapshots.rs
 [mssql] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mssql] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mssql] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -521,6 +667,38 @@ source: src/sql_snapshots.rs
 [mssql] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES utf8mb3 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES utf8 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES latin1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES ascii => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES binary => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET IDENTITY_INSERT t ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET IMPLICIT_TRANSACTIONS ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET QUOTED_IDENTIFIER ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET NOEXEC ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET PARSEONLY ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET FMTONLY ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET SHOWPLAN_ALL ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET FORCEPLAN ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET CONTEXT_INFO ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET OFFSETS SELECT ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET FIPS_FLAGGER ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET REMOTE_PROC_TRANSACTIONS ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET CURSOR_CLOSE_ON_COMMIT ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET ANSI_DEFAULTS ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET ANSI_NULL_DFLT_ON ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] not allow-listed: SET QUERY_GOVERNOR_COST_LIMIT ON => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mongodb] identity change: SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -556,9 +734,6 @@ source: src/sql_snapshots.rs
 [mongodb] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] time zone: SET TIME ZONE 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] unknown setting: SET x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] navigation setting: SET search_path TO other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] navigation setting, equals: SET search_path = other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -586,6 +761,22 @@ source: src/sql_snapshots.rs
 [mongodb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES utf8mb3 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES utf8 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES latin1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES ascii => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES binary => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES gbk => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES big5 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES sjis => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES cp932 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES gb18030 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES ucs2 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] charset: SET NAMES utf16 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -621,9 +812,6 @@ source: src/sql_snapshots.rs
 [redis] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] time zone: SET TIME ZONE 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[redis] charset, unicode: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[redis] charset, multibyte trail: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[redis] charset, default: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -651,3 +839,19 @@ source: src/sql_snapshots.rs
 [redis] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES utf8mb3 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES utf8 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES latin1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES ascii => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES binary => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES 'utf8mb4' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
