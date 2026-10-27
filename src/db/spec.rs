@@ -196,6 +196,13 @@ pub struct SqlSpec {
     /// of safe ones -- a function that is not here, a user-defined one included,
     /// stays a read. Lower-case, matched against the name as written.
     pub denied_functions: &'static [&'static str],
+    /// Session settings that change nothing a Read-only profile protects, so
+    /// setting one stays a read: navigation and comfort. Every other setting a
+    /// user's own `SET` names is stopped, because the hold's whole value is
+    /// being hard to remove and each dialect has more settings than anyone has
+    /// listed. Lower-case, matched case-insensitively against the name once its
+    /// `@@` prefix and scope part are gone.
+    pub plain_settings: &'static [&'static str],
 }
 
 impl SqlSpec {
@@ -226,6 +233,7 @@ impl SqlSpec {
         read_only_session: ReadOnlySession::None,
         stateless_requests: false,
         denied_functions: &[],
+        plain_settings: &[],
     };
 
     /// The word that opens a transaction around a generated multi-statement
