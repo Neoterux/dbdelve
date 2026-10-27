@@ -39,7 +39,7 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] marker inside an ordinary block comment: /* /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] unterminated executable comment: /*M!100100 DROP TABLE t => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
-[postgres] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -56,8 +56,8 @@ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnc
 [postgres] hash line comment, line break: # c
  => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] hash line comment after a block comment: /* a */ # c => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
-[postgres] nested block comment: /* /* n */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] nested block comment: /* /* n */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] batch separator only: GO => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
@@ -445,7 +445,7 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] marker inside an ordinary block comment: /* /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] unterminated executable comment: /*M!100100 DROP TABLE t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mssql] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -462,8 +462,8 @@ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw
 [mssql] hash line comment, line break: # c
  => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] hash line comment after a block comment: /* a */ # c => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mssql] nested block comment: /* /* n */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
