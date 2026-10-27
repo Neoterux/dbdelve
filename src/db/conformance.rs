@@ -662,6 +662,249 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
     }
 }
 
+/// The classifier's verdicts on the statements that undo a Read-only hold,
+/// against what the server does with them. Each statement is rated above a
+/// read, and with the hold armed the canary write the server refused a moment
+/// ago goes through after it. The one statement that is not a disarm is the
+/// identity change: the hold stays armed, so that case asserts on the session's
+/// reported user instead, and on the hold still being on.
+///
+/// Every positive is matched by a control from `plain_settings`, rated a read,
+/// that leaves the same canary write refused in the same session. Without the
+/// controls a server that refused everything would pass.
+pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
+    let scenario = "session_settings_agree_with_the_server";
+    let at = format!("{scenario} on {:?}", subject.engine);
+    let engine = subject.engine;
+    let schema = subject.schema;
+    let rated = |sql: &str| sql::classify(engine, sql).mode;
+    let above_a_read = |sql: &str| {
+        assert!(
+            rated(sql) > sql::Mode::ReadOnly,
+            "{at}: `{sql}` is rated {:?}, which a Read-only profile would run",
+            rated(sql)
+        );
+    };
+
+    // The statement an engine sends to release its own hold is the one the
+    // classifier must never let a Read-only profile run. Pure, so it covers
+    // every engine and not only the live one.
+    for each in Engine::ALL {
+        if let Some(release) = super::read_only_statement(each, false) {
+            assert!(
+                sql::classify(each, release).mode > sql::Mode::ReadOnly,
+                "{at}: the statement {each:?} sends to release its hold, `{release}`, is rated {:?}",
+                sql::classify(each, release).mode
+            );
+        }
+    }
+    if !engine.holds_read_only() {
+        return;
+    }
+
+    // Row 971, named for this scenario: CI runs four scenarios at a time
+    // against one server.
+    let canary = 971;
+    let insert = sql_insert(engine, schema, canary, "session setting");
+    let delete = sql_delete(engine, schema, canary);
+    let postgres = engine == Engine::Postgres;
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: if postgres {
+            vec![
+                "RESET ROLE".to_string(),
+                "RESET SESSION AUTHORIZATION".to_string(),
+                delete.clone(),
+            ]
+        } else {
+            vec![delete.clone()]
+        },
+        rollback: true,
+        read_write: true,
+    };
+    let hold = |on: bool| {
+        subject
+            .connection
+            .set_read_only(on)
+            .unwrap_or_else(|error| panic!("{at}: {error}"));
+    };
+    let run = |sql: &str| subject.run(scenario, sql, Fetch::default());
+    let cell = |sql: &str| {
+        run(sql)
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .unwrap_or_else(|| panic!("{at}: `{sql}` answered nothing"))
+            .to_string()
+    };
+    let refused = || {
+        let error = subject
+            .connection
+            .query(&insert, &CancelToken::default(), Fetch::default())
+            .expect_err(&format!("{at}: the hold took a write it should refuse"));
+        assert!(
+            error.message.contains(subject.read_only_refusal),
+            "{at}: refused for another reason: {}",
+            error.message
+        );
+    };
+    // Back to a clean session: nothing open, the hold lifted, no canary row.
+    let reset = || {
+        run("ROLLBACK");
+        hold(false);
+        run(&delete);
+    };
+    // Rated above a read, and the write refused with the hold armed goes
+    // through after it, with the hold still nominally on.
+    let disarms = |case: &str, before: &[&str], statement: &str| {
+        above_a_read(statement);
+        hold(true);
+        refused();
+        for sql in before {
+            run(sql);
+        }
+        subject.run(&format!("{scenario}: {case}"), statement, Fetch::default());
+        subject.run(&format!("{scenario}: {case}"), &insert, Fetch::default());
+        reset();
+    };
+    // Rated a read, and the same write is still refused afterwards.
+    let leaves_the_hold = |case: &str, before: &[&str], statement: &str| {
+        assert_eq!(
+            rated(statement),
+            sql::Mode::ReadOnly,
+            "{at}: control `{statement}`"
+        );
+        hold(true);
+        for sql in before {
+            run(sql);
+        }
+        subject.run(&format!("{scenario}: {case}"), statement, Fetch::default());
+        refused();
+        reset();
+    };
+
+    let release = super::read_only_statement(engine, false)
+        .unwrap_or_else(|| panic!("{at}: a holding engine has a statement that releases it"));
+    disarms("the hold's own release", &[], release);
+
+    if postgres {
+        disarms("a write transaction", &[], "BEGIN READ WRITE");
+        disarms(
+            "a session write access mode",
+            &[],
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        );
+        disarms(
+            "a transaction write access mode",
+            &["BEGIN"],
+            "SET TRANSACTION READ WRITE",
+        );
+        disarms(
+            "the transaction read-only setting",
+            &["BEGIN"],
+            "SET transaction_read_only = off",
+        );
+        disarms(
+            "the function form of the setting",
+            &[],
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+        );
+
+        // An identity change leaves the hold armed, so there is no canary to
+        // ask: the session's own answer to who it is has to move instead.
+        let other = cell(
+            "SELECT rolname FROM pg_roles WHERE rolname <> current_user ORDER BY rolname LIMIT 1",
+        );
+        let other = engine.quote_identifier(&other);
+        for (case, statement, undo) in [
+            ("a role change", format!("SET ROLE {other}"), "RESET ROLE"),
+            (
+                "an authorization change",
+                format!("SET SESSION AUTHORIZATION {other}"),
+                "RESET SESSION AUTHORIZATION",
+            ),
+        ] {
+            above_a_read(&statement);
+            hold(true);
+            let who = cell("SELECT current_user");
+            subject.run(&format!("{scenario}: {case}"), &statement, Fetch::default());
+            assert_ne!(
+                cell("SELECT current_user"),
+                who,
+                "{at}: {case} did not change the session's user"
+            );
+            assert_eq!(
+                cell("SELECT current_setting('default_transaction_read_only')"),
+                "on",
+                "{at}: {case} disarmed the hold, which it is rated for not doing"
+            );
+            run(undo);
+            reset();
+        }
+
+        leaves_the_hold(
+            "a search-path change",
+            &[],
+            &format!("SET search_path TO {schema}"),
+        );
+        leaves_the_hold(
+            "a read access mode",
+            &["BEGIN"],
+            "SET TRANSACTION READ ONLY",
+        );
+    } else {
+        disarms("a write transaction", &[], "START TRANSACTION READ WRITE");
+        disarms(
+            "a write access mode for the next transaction",
+            &[],
+            "SET TRANSACTION READ WRITE",
+        );
+        disarms(
+            "the transaction read-only setting",
+            &[],
+            "SET SESSION transaction_read_only = 0",
+        );
+        disarms(
+            "the transaction read-only setting, doubled-at",
+            &[],
+            "SET @@session.transaction_read_only = OFF",
+        );
+        if engine == Engine::MariaDb {
+            disarms("its older spelling", &[], "SET tx_read_only = 0");
+        } else {
+            // Removed in 8.0.3, so the server refuses the name outright. It is
+            // still rated above a read, and the hold is still armed.
+            above_a_read("SET tx_read_only = 0");
+            hold(true);
+            let error = subject
+                .connection
+                .query(
+                    "SET tx_read_only = 0",
+                    &CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect_err(&format!("{at}: the server accepted a removed variable"));
+            assert!(
+                error.message.contains("Unknown system variable"),
+                "{at}: refused for another reason: {}",
+                error.message
+            );
+            refused();
+            reset();
+        }
+
+        leaves_the_hold("a comfort setting", &[], "SET SESSION wait_timeout = 28800");
+        leaves_the_hold("a read access mode", &[], "SET TRANSACTION READ ONLY");
+    }
+
+    // The fixture is as it was found.
+    assert_eq!(
+        subject.read(scenario).rows.len(),
+        EXPECTED.len(),
+        "{at}: the fixture does not hold its original rows"
+    );
+}
+
 pub(super) fn generated_writes_round_trip(subject: &Subject) {
     let scenario = "generated_writes_round_trip";
     let at = format!("{scenario} on {:?}", subject.engine);

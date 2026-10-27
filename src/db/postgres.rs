@@ -2472,6 +2472,7 @@ mod tests {
         capped_read_keeps_the_users_transaction,
         read_only_session_refuses_a_write,
         denied_functions_agree_with_the_server,
+        session_settings_agree_with_the_server,
         generated_writes_round_trip,
     );
 
