@@ -42,34 +42,34 @@ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnc
 [postgres] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment alone, five digits: /*M!10010 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mysql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mysql] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mysql] executable comment alone, five digits: /*M!10010 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment alone, line break after the version: /*M!100100
-DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment after an ordinary statement: SELECT 1; /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mysql] executable comment after an ordinary statement: SELECT 1; /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment after an ordinary statement, own line: SELECT 1;
-/*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding a truncate: /*M!100100 TRUNCATE TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding an unfiltered delete: /*M!100100 DELETE FROM t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding a write: /*M!100100 INSERT INTO t VALUES (1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+/*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mysql] executable comment holding a truncate: /*M!100100 TRUNCATE TABLE t */ => |classify=Full [Truncate] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Truncate))|
+[mysql] executable comment holding an unfiltered delete: /*M!100100 DELETE FROM t */ => |classify=Full [UnfilteredDelete] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(UnfilteredDelete))|
+[mysql] executable comment holding a write: /*M!100100 INSERT INTO t VALUES (1) */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] executable comment holding a read: /*M!100100 SELECT 1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding the write access mode: /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding the write access mode after a statement: SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding the hold name: /*M!100100 SET SESSION transaction_read_only = 0 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment holding a denied call: /*M!100100 SELECT get_lock('k', 1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] fragment that changes the statement around it: SELECT 1 /*M!100100 INTO @y */ FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] executable comment holding the write access mode: /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] executable comment holding the write access mode after a statement: SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] executable comment holding the hold name: /*M!100100 SET SESSION transaction_read_only = 0 */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] executable comment holding a denied call: /*M!100100 SELECT get_lock('k', 1) */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] fragment that changes the statement around it: SELECT 1 /*M!100100 INTO @y */ FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] fragment that only extends the statement around it: SELECT 2 /*M!100100 +1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment fused with a bare statement: /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment, lower-case marker: /*m!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] executable comment fused with a bare statement: /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] executable comment, lower-case marker: /*m!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] executable comment with a multi-byte character in the body: /*M!100100 SELECT 'é' */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment with a multi-byte character where the digits end: /*M!100100é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment with a multi-byte character straight after the marker: /*M!é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] executable comment with full-width digits: /*M!１００１００ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] executable comment with a multi-byte character where the digits end: /*M!100100é DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] executable comment with a multi-byte character straight after the marker: /*M!é DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] executable comment with full-width digits: /*M!１００１００ DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] executable comment, empty: /*M!*/ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] four-digit version, a plain comment on the server: /*M!1234 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] space before the digits: /*M! 100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] space before the digits: /*M! 100100 DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] bang before the letter: /*!M100100 DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] the form both servers execute: /*!50000 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mysql] the form only the older server executes: /*!50700 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
@@ -81,36 +81,36 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] marker inside an ordinary block comment: /* /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] unterminated executable comment: /*M!100100 DROP TABLE t => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
-[mysql] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment alone, five digits: /*M!10010 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mariadb] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mariadb] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mariadb] executable comment alone, five digits: /*M!10010 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] executable comment alone, line break after the version: /*M!100100
-DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment after an ordinary statement: SELECT 1; /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mariadb] executable comment after an ordinary statement: SELECT 1; /*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] executable comment after an ordinary statement, own line: SELECT 1;
-/*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding a truncate: /*M!100100 TRUNCATE TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding an unfiltered delete: /*M!100100 DELETE FROM t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding a write: /*M!100100 INSERT INTO t VALUES (1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+/*M!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
+[mariadb] executable comment holding a truncate: /*M!100100 TRUNCATE TABLE t */ => |classify=Full [Truncate] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Truncate))|
+[mariadb] executable comment holding an unfiltered delete: /*M!100100 DELETE FROM t */ => |classify=Full [UnfilteredDelete] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(UnfilteredDelete))|
+[mariadb] executable comment holding a write: /*M!100100 INSERT INTO t VALUES (1) */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] executable comment holding a read: /*M!100100 SELECT 1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding the write access mode: /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding the write access mode after a statement: SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding the hold name: /*M!100100 SET SESSION transaction_read_only = 0 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment holding a denied call: /*M!100100 SELECT get_lock('k', 1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] fragment that changes the statement around it: SELECT 1 /*M!100100 INTO @y */ FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] executable comment holding the write access mode: /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] executable comment holding the write access mode after a statement: SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] executable comment holding the hold name: /*M!100100 SET SESSION transaction_read_only = 0 */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] executable comment holding a denied call: /*M!100100 SELECT get_lock('k', 1) */ => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] fragment that changes the statement around it: SELECT 1 /*M!100100 INTO @y */ FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] fragment that only extends the statement around it: SELECT 2 /*M!100100 +1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment fused with a bare statement: /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment, lower-case marker: /*m!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] executable comment fused with a bare statement: /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] executable comment, lower-case marker: /*m!100100 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] executable comment with a multi-byte character in the body: /*M!100100 SELECT 'é' */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment with a multi-byte character where the digits end: /*M!100100é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment with a multi-byte character straight after the marker: /*M!é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] executable comment with full-width digits: /*M!１００１００ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] executable comment with a multi-byte character where the digits end: /*M!100100é DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] executable comment with a multi-byte character straight after the marker: /*M!é DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] executable comment with full-width digits: /*M!１００１００ DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] executable comment, empty: /*M!*/ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] four-digit version, a plain comment on the server: /*M!1234 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] space before the digits: /*M! 100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] space before the digits: /*M! 100100 DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] bang before the letter: /*!M100100 DROP TABLE t */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] the form both servers execute: /*!50000 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
 [mariadb] the form only the older server executes: /*!50700 DROP TABLE t */ => |classify=Full [Drop] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(Confirm(Drop))|
@@ -122,7 +122,7 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] marker inside an ordinary block comment: /* /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] unterminated executable comment: /*M!100100 DROP TABLE t => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
-[mariadb] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|

@@ -29,7 +29,7 @@ use sqlparser::dialect::{
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
-use sqlparser::tokenizer::{Location, Token, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError, Whitespace};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::db::{
@@ -2259,7 +2259,18 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
     // An unreadable verdict's mode is the lowest one it may be run once in.
     // Any, where the server holds Read-only to reads; otherwise nothing stops
     // what it turns out to write, so Read-only may not run it at all.
-    let Ok(statements) = SqlParser::parse_sql(dialect.as_ref(), sql) else {
+    let parsed = match executed_tokens(engine, dialect.as_ref(), sql) {
+        // The derived stream is read here and goes no further: the driver is
+        // handed `sql`, exactly as typed.
+        Some(tokens) => tokens.ok().and_then(|tokens| {
+            SqlParser::new(dialect.as_ref())
+                .with_tokens(tokens)
+                .parse_statements()
+                .ok()
+        }),
+        None => SqlParser::parse_sql(dialect.as_ref(), sql).ok(),
+    };
+    let Some(statements) = parsed else {
         return Verdict {
             mode: if engine.holds_read_only() {
                 Mode::ReadOnly
@@ -2283,6 +2294,75 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
     } else {
         verdict
     }
+}
+
+/// `sql` as the server will read it, for a dialect whose server runs the text
+/// of a MariaDB-only executable comment (`/*M!100100 … */`): the tokens, with
+/// each such comment replaced by the tokens of what it holds. `None` where
+/// there is nothing to expand, so every other submission is read as it always
+/// was.
+///
+/// The server inlines the comment's text into its neighbours rather than
+/// running it as a statement of its own, so a fragment (`INTO @y`) belongs to
+/// the statement around it and a comment followed by a bare statement fuses
+/// with it into one the server rejects. Expanding in the token stream and
+/// parsing once reads exactly that, names the destructive kind the inner
+/// statement carries, and cannot recurse. The one space after each expansion
+/// keeps two words from fusing into one that neither text holds.
+///
+/// MySQL ignores the marker, so on it this reads a comment as code: the safe
+/// direction, and the dialect is what the parser shares, not the server.
+/// The `/*!` form needs no help here, the pinned tokenizer expands it itself.
+///
+/// Never returned beyond [`classify`] and [`calls_denied_function`]: the
+/// statement DBDelve sends is the statement the user typed.
+fn executed_tokens(
+    engine: Engine,
+    dialect: &dyn Dialect,
+    sql: &str,
+) -> Option<Result<Vec<Token>, TokenizerError>> {
+    if engine.spec().sql.parser_dialect != ParserDialect::MySql {
+        return None;
+    }
+    let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    if !tokens.iter().any(|token| executable_body(token).is_some()) {
+        return None;
+    }
+    let mut expanded = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match executable_body(&token) {
+            Some(body) => match Tokenizer::new(dialect, body).tokenize() {
+                Ok(inner) => {
+                    expanded.extend(inner);
+                    expanded.push(Token::Whitespace(Whitespace::Space));
+                }
+                Err(error) => return Some(Err(error)),
+            },
+            None => expanded.push(token),
+        }
+    }
+    Some(Ok(expanded))
+}
+
+/// The text the server runs out of a comment token, when it is a MariaDB-only
+/// executable comment: `M!`, then a version of no digits or of five or more,
+/// then the code. One to four digits are not a version, and the server reads
+/// them as part of a comment it then rejects, so they stay a comment here.
+///
+/// Matched on bytes, as ASCII, because the comment is arbitrary user text: a
+/// multi-byte character straight after the marker or where the digits end must
+/// not be split, and a full-width digit is not a version digit.
+fn executable_body(token: &Token) -> Option<&str> {
+    let Token::Whitespace(Whitespace::MultiLineComment(comment)) = token else {
+        return None;
+    };
+    let rest = comment
+        .get(..2)
+        .filter(|marker| marker.eq_ignore_ascii_case("M!"))
+        .map(|_| &comment[2..])?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    // Every byte counted is one ASCII digit, so `digits` is a character boundary.
+    (!(1..=4).contains(&digits)).then(|| &rest[digits..])
 }
 
 /// The `sqlparser` dialect an engine's SQL is read in; `None` for MongoDB
@@ -2734,7 +2814,10 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
     let Some(dialect) = dialect(engine) else {
         return false;
     };
-    let Ok(tokens) = Tokenizer::new(dialect.as_ref(), sql).tokenize() else {
+    // The calls the server will run, so one inside an executable comment counts.
+    let tokens = executed_tokens(engine, dialect.as_ref(), sql)
+        .unwrap_or_else(|| Tokenizer::new(dialect.as_ref(), sql).tokenize());
+    let Ok(tokens) = tokens else {
         return true;
     };
     let mut tokens = tokens
