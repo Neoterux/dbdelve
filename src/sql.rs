@@ -8218,4 +8218,48 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_hash_line_comment_stays_a_silent_read_where_the_dialect_lexes_it_as_a_comment() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::Snowflake] {
+            for sql in ["# a note", "# a note\n", "/* a */ # a note"] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_block_comment_leaves_residue_the_tokenizer_reads_as_code() {
+        use crate::db::Engine;
+
+        // Both dialects nest, and the grammar does not, so what follows the
+        // inner close is a range the lexer reads as operators. Rare, and the
+        // conservative side.
+        for engine in [Engine::Postgres, Engine::SqlServer] {
+            for sql in ["/* /* n */ */", "/* /* n */ DROP TABLE t */"] {
+                assert!(is_unreadable(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cross_check_and_a_parse_error_refuse_with_one_verdict() {
+        use crate::db::Engine;
+
+        // One engine that holds Read-only on the server and one that does not,
+        // since the mode an unreadable verdict may run in depends on it.
+        for engine in [Engine::Postgres, Engine::SqlServer] {
+            assert_eq!(
+                classify(engine, "/* /* n */ */"),
+                classify(engine, "SELECT FROM WHERE ("),
+                "{engine:?}"
+            );
+        }
+        assert_ne!(
+            classify(Engine::Postgres, "SELECT FROM WHERE (").mode,
+            classify(Engine::SqlServer, "SELECT FROM WHERE (").mode
+        );
+    }
 }
