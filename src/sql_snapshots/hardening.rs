@@ -503,3 +503,152 @@ fn session_setting_corpus_per_engine() {
     }
     check("hardening_settings", &out);
 }
+
+/// Comment forms the MySQL family reads differently from the rest, and the
+/// controls that must not move. Every executable-comment case is a live server
+/// observation (MariaDB 11.4 executes the `M!` marker and MySQL 8.4 ignores it),
+/// so the sentence says what the server does with the text, not what the parser
+/// makes of it.
+const EXECUTABLE_COMMENTS: &[(&str, &str)] = &[
+    (
+        "executable comment alone, destructive",
+        "/*M!100100 DROP TABLE t */",
+    ),
+    (
+        "executable comment alone, no version",
+        "/*M!DROP TABLE t */",
+    ),
+    (
+        "executable comment alone, version glued to the code",
+        "/*M!100100DROP TABLE t */",
+    ),
+    (
+        "executable comment alone, five digits",
+        "/*M!10010 DROP TABLE t */",
+    ),
+    (
+        "executable comment alone, line break after the version",
+        "/*M!100100\nDROP TABLE t */",
+    ),
+    (
+        "executable comment after an ordinary statement",
+        "SELECT 1; /*M!100100 DROP TABLE t */",
+    ),
+    (
+        "executable comment after an ordinary statement, own line",
+        "SELECT 1;\n/*M!100100 DROP TABLE t */",
+    ),
+    (
+        "executable comment holding a truncate",
+        "/*M!100100 TRUNCATE TABLE t */",
+    ),
+    (
+        "executable comment holding an unfiltered delete",
+        "/*M!100100 DELETE FROM t */",
+    ),
+    (
+        "executable comment holding a write",
+        "/*M!100100 INSERT INTO t VALUES (1) */",
+    ),
+    (
+        "executable comment holding a read",
+        "/*M!100100 SELECT 1 */",
+    ),
+    (
+        "executable comment holding the write access mode",
+        "/*M!100100 SET SESSION TRANSACTION READ WRITE */",
+    ),
+    (
+        "executable comment holding the write access mode after a statement",
+        "SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */",
+    ),
+    (
+        "executable comment holding the hold name",
+        "/*M!100100 SET SESSION transaction_read_only = 0 */",
+    ),
+    (
+        "executable comment holding a denied call",
+        "/*M!100100 SELECT get_lock('k', 1) */",
+    ),
+    (
+        "fragment that changes the statement around it",
+        "SELECT 1 /*M!100100 INTO @y */ FROM t",
+    ),
+    (
+        "fragment that only extends the statement around it",
+        "SELECT 2 /*M!100100 +1 */",
+    ),
+    (
+        "executable comment fused with a bare statement",
+        "/*M!100100 DROP TABLE t */ SELECT 1",
+    ),
+    (
+        "executable comment, lower-case marker",
+        "/*m!100100 DROP TABLE t */",
+    ),
+    (
+        "executable comment with a multi-byte character in the body",
+        "/*M!100100 SELECT 'é' */",
+    ),
+    (
+        "executable comment with a multi-byte character where the digits end",
+        "/*M!100100é DROP TABLE t */",
+    ),
+    (
+        "executable comment with a multi-byte character straight after the marker",
+        "/*M!é DROP TABLE t */",
+    ),
+    (
+        "executable comment with full-width digits",
+        "/*M!１００１００ DROP TABLE t */",
+    ),
+    ("executable comment, empty", "/*M!*/"),
+    (
+        "four-digit version, a plain comment on the server",
+        "/*M!1234 DROP TABLE t */",
+    ),
+    ("space before the digits", "/*M! 100100 DROP TABLE t */"),
+    ("bang before the letter", "/*!M100100 DROP TABLE t */"),
+    ("the form both servers execute", "/*!50000 DROP TABLE t */"),
+    (
+        "the form only the older server executes",
+        "/*!50700 DROP TABLE t */",
+    ),
+    (
+        "marker inside a string literal",
+        "SELECT '/*M!100100 DROP TABLE t */'",
+    ),
+    (
+        "marker after a line comment",
+        "-- /*M!100100 DROP TABLE t */\nSELECT 1",
+    ),
+    (
+        "marker after a hash comment",
+        "# /*M!100100 DROP TABLE t */\nSELECT 1",
+    ),
+    (
+        "marker inside an ordinary block comment",
+        "/* /*M!100100 DROP TABLE t */ SELECT 1",
+    ),
+    ("unterminated executable comment", "/*M!100100 DROP TABLE t"),
+    (
+        "nested executable comment",
+        "/*M!100100 /*M!100100 SELECT 7 */ */",
+    ),
+    (
+        "dump header, the version no server reaches",
+        "/*M!999999\\- enable the sandbox mode */",
+    ),
+    ("ordinary block comment before a read", "/* c */ SELECT 1"),
+];
+
+#[test]
+fn executable_comment_corpus_per_engine() {
+    let mut out = String::new();
+    for engine in Engine::ALL {
+        for (case, sql) in EXECUTABLE_COMMENTS {
+            record(&mut out, engine, case, sql);
+        }
+    }
+    check("hardening_comments", &out);
+}
