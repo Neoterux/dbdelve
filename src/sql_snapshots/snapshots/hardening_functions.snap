@@ -23,10 +23,23 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT pg_switch_wal() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT lo_create(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -96,10 +109,23 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -169,10 +195,23 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -242,10 +281,23 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -315,10 +367,23 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -388,10 +453,23 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -461,10 +539,23 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -534,10 +625,23 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -607,10 +711,23 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT pg_switch_wal() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT lo_create(0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_creat(-1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_truncate(0, 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT lo_get(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT loread(0, 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -680,10 +797,23 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
