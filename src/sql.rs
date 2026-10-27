@@ -3067,6 +3067,13 @@ fn grants_write(modes: &[TransactionMode]) -> bool {
     })
 }
 
+/// The client charsets a statement can still be lexed in: the unicode family,
+/// Latin-1, ASCII and binary. A multibyte-trail charset such as `gbk` can have
+/// a trail byte that is a backslash, which moves a quote under a reader that
+/// still assumes `SqlSpec::backslash_escapes`, the same way the strictness mode
+/// does, so any other charset is stopped.
+const SINGLE_BYTE_CHARSETS: &[&str] = &["utf8", "utf8mb3", "utf8mb4", "latin1", "ascii", "binary"];
+
 /// What a user's own `SET` may do on a Read-only profile.
 ///
 /// Decided by what the parser says the statement is, not by a name, wherever a
@@ -3111,6 +3118,11 @@ fn set_verdict(spec: &SqlSpec, set: &Set) -> Verdict {
                 .map(|name| plain_setting_verdict(spec, &[name.as_str()], true)),
         ),
         Set::SetSessionParam(SetSessionParamKind::Statistics(_)) => Verdict::READ,
+        Set::SetNames { charset_name, .. }
+            if SINGLE_BYTE_CHARSETS.contains(&charset_name.value.to_ascii_lowercase().as_str()) =>
+        {
+            Verdict::READ
+        }
         // Everything else the parser still accepts names no setting to look up,
         // so nothing can have vouched for it.
         _ => Verdict::WRITE,
