@@ -905,6 +905,164 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
     );
 }
 
+/// The two servers of the MySQL dialect disagree about a MariaDB-only
+/// executable comment (`/*M!100100 … */`): one runs what it holds, the other
+/// reads a comment. The classifier cannot know which it is talking to, so it
+/// rates what the executing one would run, and this scenario pins both halves:
+/// the executing server really does the destructive thing and really does
+/// disarm the hold, and the other really does neither.
+///
+/// Which one this is is asked of the server, not of the engine: `SELECT 2
+/// /*M!100100 +1 */` answers 3 from one and 2 from the other. Every positive
+/// has a control spelled as a plain comment that is rated a read and leaves the
+/// same object, or the same refused write, untouched on both.
+pub(super) fn executable_comments_agree_with_the_server(subject: &Subject) {
+    let scenario = "executable_comments_agree_with_the_server";
+    let at = format!("{scenario} on {:?}", subject.engine);
+    let engine = subject.engine;
+    let schema = subject.schema;
+    // Row 972 and one helper table, both named for this scenario: CI runs four
+    // scenarios at a time against one server. The shared fixture table is never
+    // the target of a statement that drops anything.
+    let canary = 972;
+    let table = engine.qualified(schema, "dbdelve_comments_972");
+    let create = format!("CREATE TABLE {table} (id INT)");
+    let delete = sql_delete(engine, schema, canary);
+    let insert = sql_insert(engine, schema, canary, "executable comment");
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: vec![delete.clone(), format!("DROP TABLE IF EXISTS {table}")],
+        rollback: true,
+        read_write: true,
+    };
+    let run = |sql: &str| subject.run(scenario, sql, Fetch::default());
+    // The effect is what is asserted on, and a server that ignores a comment
+    // answers a submission of nothing else with an error of its own.
+    let send = |sql: &str| {
+        let _ = subject
+            .connection
+            .query(sql, &CancelToken::default(), Fetch::default());
+    };
+    let hold = |on: bool| {
+        subject
+            .connection
+            .set_read_only(on)
+            .unwrap_or_else(|error| panic!("{at}: {error}"));
+    };
+    let cell = |sql: &str| {
+        run(sql)
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .unwrap_or_else(|| panic!("{at}: `{sql}` answered nothing"))
+            .to_string()
+    };
+    let table_exists = || {
+        let found = cell(&format!(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = {} AND table_name = 'dbdelve_comments_972'",
+            engine.quote_literal(schema)
+        ));
+        found == "1"
+    };
+    let refused = || {
+        let error = subject
+            .connection
+            .query(&insert, &CancelToken::default(), Fetch::default())
+            .expect_err(&format!("{at}: the hold took a write it should refuse"));
+        assert!(
+            error.message.contains(subject.read_only_refusal),
+            "{at}: refused for another reason: {}",
+            error.message
+        );
+    };
+    let verdict = |sql: &str| sql::classify(engine, sql);
+    let stopped = |sql: &str| {
+        let rated = verdict(sql);
+        assert!(
+            rated.mode > sql::Mode::ReadOnly
+                && !rated.destructive.contains(&sql::Destructive::Unreadable),
+            "{at}: `{sql}` is rated {rated:?}, which a Read-only profile would run"
+        );
+    };
+    let a_read = |sql: &str| {
+        assert_eq!(
+            verdict(sql),
+            sql::Verdict::READ,
+            "{at}: control `{sql}` is not rated a plain read"
+        );
+    };
+
+    let executes = match cell("SELECT 2 /*M!100100 +1 */").as_str() {
+        "3" => true,
+        "2" => false,
+        other => panic!("{at}: the probe answered {other}, which neither server gives"),
+    };
+
+    // The destructive form: rated by the kind it holds on both servers, and the
+    // object is gone afterwards on the one that runs it and still there on the
+    // other.
+    let drop = format!("/*M!100100 DROP TABLE {table} */");
+    assert_eq!(
+        verdict(&drop).destructive,
+        [sql::Destructive::Drop],
+        "{at}: `{drop}`"
+    );
+    run(&create);
+    send(&drop);
+    assert_eq!(
+        table_exists(),
+        !executes,
+        "{at}: the server that {} the marker {} the canary",
+        if executes { "runs" } else { "ignores" },
+        if executes { "left" } else { "dropped" }
+    );
+    if executes {
+        run(&create);
+    }
+    // The control: four digits are no version, a plain comment to both.
+    let plain = format!("/*M!1234 DROP TABLE {table} */");
+    a_read(&plain);
+    send(&plain);
+    assert!(table_exists(), "{at}: a plain comment dropped the canary");
+    run(&format!("DROP TABLE {table}"));
+
+    // The hole this closes: with the hold armed, a comment holding the release
+    // is a write the server has refused until now.
+    let release = super::read_only_statement(engine, false)
+        .unwrap_or_else(|| panic!("{at}: a holding engine has a statement that releases it"));
+    let disarm = format!("/*M!100100 {release} */");
+    stopped(&disarm);
+    stopped(&format!("SELECT 1; {disarm}"));
+    hold(true);
+    refused();
+    send(&disarm);
+    if executes {
+        // The write that was refused a moment ago now goes through.
+        run(&insert);
+    } else {
+        refused();
+    }
+    run("ROLLBACK");
+    hold(false);
+    run(&delete);
+
+    let plain = format!("/*M!1234 {release} */");
+    a_read(&plain);
+    hold(true);
+    send(&plain);
+    refused();
+    run("ROLLBACK");
+    hold(false);
+
+    // The fixture is as it was found.
+    assert_eq!(
+        subject.read(scenario).rows.len(),
+        EXPECTED.len(),
+        "{at}: the fixture does not hold its original rows"
+    );
+}
+
 pub(super) fn generated_writes_round_trip(subject: &Subject) {
     let scenario = "generated_writes_round_trip";
     let at = format!("{scenario} on {:?}", subject.engine);
