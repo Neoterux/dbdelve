@@ -23,6 +23,12 @@ source: src/sql_snapshots.rs
 [postgres] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] user variable beginning with the scope word: SET @global = 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -63,6 +69,8 @@ source: src/sql_snapshots.rs
 [postgres] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[postgres] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -165,6 +173,12 @@ source: src/sql_snapshots.rs
 [mysql] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] user variable beginning with the scope word: SET @global = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -205,6 +219,8 @@ source: src/sql_snapshots.rs
 [mysql] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -289,6 +305,12 @@ source: src/sql_snapshots.rs
 [mariadb] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] user variable beginning with the scope word: SET @global = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -329,6 +351,8 @@ source: src/sql_snapshots.rs
 [mariadb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -415,6 +439,12 @@ source: src/sql_snapshots.rs
 [sqlite] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -455,6 +485,8 @@ source: src/sql_snapshots.rs
 [sqlite] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -495,6 +527,12 @@ source: src/sql_snapshots.rs
 [turso] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -535,6 +573,8 @@ source: src/sql_snapshots.rs
 [turso] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -575,6 +615,12 @@ source: src/sql_snapshots.rs
 [duckdb] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -615,6 +661,8 @@ source: src/sql_snapshots.rs
 [duckdb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[duckdb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -689,6 +737,12 @@ source: src/sql_snapshots.rs
 [snowflake] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -729,6 +783,8 @@ source: src/sql_snapshots.rs
 [snowflake] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[snowflake] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -769,6 +825,12 @@ source: src/sql_snapshots.rs
 [mssql] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mssql] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] user variable beginning with the scope word: SET @global = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -809,6 +871,8 @@ source: src/sql_snapshots.rs
 [mssql] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -895,6 +959,12 @@ source: src/sql_snapshots.rs
 [mongodb] savepoint release: RELEASE SAVEPOINT a => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -935,6 +1005,8 @@ source: src/sql_snapshots.rs
 [mongodb] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -973,6 +1045,12 @@ source: src/sql_snapshots.rs
 [redis] savepoint release: RELEASE SAVEPOINT a => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] user variable beginning with the scope word: SET @global = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -1013,6 +1091,8 @@ source: src/sql_snapshots.rs
 [redis] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|

@@ -238,6 +238,30 @@ const SESSION_RULES: &[(&str, &str)] = &[
     ("bracketed read", "BEGIN; SELECT 1; COMMIT"),
     ("server-wide scope", "SET GLOBAL max_execution_time = 1"),
     (
+        "server-wide transaction access mode",
+        "SET GLOBAL TRANSACTION READ ONLY",
+    ),
+    (
+        "server-wide transaction isolation level",
+        "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    ),
+    (
+        "persistent transaction access mode",
+        "SET PERSIST TRANSACTION READ ONLY",
+    ),
+    (
+        "persistent-only transaction access mode",
+        "SET PERSIST_ONLY TRANSACTION READ ONLY",
+    ),
+    (
+        "local transaction access mode",
+        "SET LOCAL TRANSACTION READ ONLY",
+    ),
+    (
+        "user variable beginning with the scope word",
+        "SET @global = 1",
+    ),
+    (
         "server-wide scope, doubled-at prefix",
         "SET @@global.time_zone = 'UTC'",
     ),
@@ -345,6 +369,14 @@ const SESSION_SHAPES: &[(&str, &str)] = &[
     (
         "two statements, user variable second",
         "SELECT 1; SET @x = 1",
+    ),
+    (
+        "two statements, server-wide transaction second",
+        "SELECT 1; SET GLOBAL TRANSACTION READ ONLY",
+    ),
+    (
+        "two statements, server-wide transaction first",
+        "SET GLOBAL TRANSACTION READ ONLY; SELECT 1",
     ),
 ];
 
