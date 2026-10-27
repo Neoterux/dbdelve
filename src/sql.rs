@@ -19,8 +19,9 @@ use serde::Deserialize;
 // Aliased: `tree_sitter::Parser` already owns the name `Parser` in this file,
 // and the two parsers are never interchangeable -- see `classify`'s doc.
 use sqlparser::ast::{
-    AlterTableOperation, ConditionalStatementBlock, CopySource, CopyTarget, Delete, Expr, Insert,
-    Merge, Query, SetExpr, Statement, Update, UtilityOption,
+    AlterTableOperation, ConditionalStatementBlock, ContextModifier, CopySource, CopyTarget,
+    Delete, Expr, Insert, Merge, ObjectName, ObjectNamePart, Query, Set, SetExpr,
+    SetSessionParamKind, Statement, TransactionAccessMode, TransactionMode, Update, UtilityOption,
 };
 use sqlparser::dialect::{
     Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
@@ -33,7 +34,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::db::{
     ColumnDefinition, Engine, EngineSpec, ExplainMode, ExplainPrefix, FormatDialect, Paging,
-    Params, ParserDialect, SkipDuplicates, StatementSplit, Syntax, TypedExplain,
+    Params, ParserDialect, SkipDuplicates, SqlSpec, StatementSplit, Syntax, TypedExplain,
 };
 use crate::import_rows::Value;
 use crate::result_grid::{NewValue, PendingRow};
@@ -2271,9 +2272,10 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
 
     // An empty or comment-only string parses to no statements at all. There is
     // nothing there to be dangerous, and a dialog over nothing is noise.
+    let spec = &engine.spec().sql;
     let verdict = statements
         .iter()
-        .map(statement_verdict)
+        .map(|statement| statement_verdict(spec, statement))
         .fold(Verdict::READ, Verdict::max);
     // Raised, never replaced: the statements above may already need more.
     if calls_denied_function(engine, sql) {
@@ -2851,10 +2853,10 @@ impl Leaves {
 /// data-modifying CTE, so
 /// `COPY (WITH x AS (DELETE FROM t RETURNING a) SELECT a FROM x) TO STDOUT`
 /// empties a table under a variant that reads as `COPY TO`.
-fn statement_verdict(statement: &Statement) -> Verdict {
-    let verdict = variant_verdict(statement);
+fn statement_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
+    let verdict = variant_verdict(spec, statement);
     match owned_query(statement) {
-        Some(query) => verdict.max(query_verdict(query)),
+        Some(query) => verdict.max(query_verdict(spec, query)),
         None => verdict,
     }
 }
@@ -2881,7 +2883,7 @@ fn owned_query(statement: &Statement) -> Option<&Query> {
 
 /// What a statement's variant alone says. Never called directly: the fold in
 /// `statement_verdict` is the half that reads what the variant is carrying.
-fn variant_verdict(statement: &Statement) -> Verdict {
+fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
     match statement {
         // Read only as a variant. Everything dangerous a query can hold is
         // inside it, and `statement_verdict` folds that in.
@@ -2902,7 +2904,7 @@ fn variant_verdict(statement: &Statement) -> Verdict {
                     .flatten()
                     .any(analyze_option_is_on);
             if analyze {
-                statement_verdict(statement)
+                statement_verdict(spec, statement)
             } else {
                 Verdict::READ
             }
@@ -2922,10 +2924,18 @@ fn variant_verdict(statement: &Statement) -> Verdict {
             } else {
                 statements
                     .iter()
-                    .map(statement_verdict)
+                    .map(|statement| statement_verdict(spec, statement))
                     .fold(Verdict::READ, Verdict::max)
             }
         }
+
+        // A transaction opened read-write overrides the session's Read-only hold
+        // for that transaction, with no `SET` at all (Postgres spells it `BEGIN
+        // READ WRITE`). Below the scripting-block guard so a block keeps being
+        // read by what it holds.
+        Statement::StartTransaction { modes, .. } if grants_write(modes) => Verdict::WRITE,
+
+        Statement::Set(set) => set_verdict(spec, set),
 
         // `IF … ELSE` (T-SQL's, and the `IF … END IF` Postgres, MySQL and
         // Snowflake parse to the same variant) is as dangerous as what it holds.
@@ -2938,11 +2948,11 @@ fn variant_verdict(statement: &Statement) -> Verdict {
             blocks
                 .clone()
                 .filter_map(|block| block.condition.as_ref())
-                .map(condition_verdict)
+                .map(|condition| condition_verdict(spec, condition))
                 .chain(
                     blocks
                         .flat_map(ConditionalStatementBlock::statements)
-                        .map(statement_verdict),
+                        .map(|statement| statement_verdict(spec, statement)),
                 )
                 .fold(Verdict::READ, Verdict::max)
         }
@@ -2966,7 +2976,8 @@ fn variant_verdict(statement: &Statement) -> Verdict {
         // and touches no data, so refusing it in Read-only would refuse
         // navigation, not damage.
         | Statement::Use { .. }
-        | Statement::Set { .. }
+        // A plain opening is a bracket, and the one that asks for write access
+        // is the arm above this list.
         | Statement::StartTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }
@@ -3043,6 +3054,141 @@ fn variant_verdict(statement: &Statement) -> Verdict {
     }
 }
 
+/// Whether a transaction's modes ask for write access. Read on its own, not
+/// through the `session` flag of `SET TRANSACTION`: the parser drops the
+/// `SESSION` keyword from `SET SESSION TRANSACTION READ WRITE`, which is the
+/// spelling that disarms a Read-only hold for the rest of the session.
+fn grants_write(modes: &[TransactionMode]) -> bool {
+    modes.iter().any(|mode| {
+        matches!(
+            mode,
+            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite)
+        )
+    })
+}
+
+/// What a user's own `SET` may do on a Read-only profile.
+///
+/// Decided by what the parser says the statement is, not by a name, wherever a
+/// name does not have to decide it. A role or authorization change changes who
+/// the session is, and a transaction mode list granting write access defeats
+/// the server's hold. A setting is a read only when `spec.plain_settings` names
+/// it: the hold's whole value is being hard to remove, so a name nobody listed
+/// is stopped rather than assumed harmless. Every assignment of a multi-part
+/// `SET` has to pass, so the verdict does not depend on their order.
+fn set_verdict(spec: &SqlSpec, set: &Set) -> Verdict {
+    match set {
+        Set::SetRole { .. } | Set::SetSessionAuthorization(_) => Verdict::WRITE,
+        Set::SetTransaction { modes, .. } if grants_write(modes) => Verdict::WRITE,
+        Set::SetTransaction { .. } | Set::SetTimeZone { .. } => Verdict::READ,
+        Set::SingleAssignment {
+            scope,
+            variable,
+            values,
+            ..
+        } => {
+            // T-SQL has no list of assignments, so the parser reads `SET @x = 1,
+            // @@session.transaction_read_only = 0` as one variable with two
+            // values, the second a comparison. A variable followed by more than
+            // one value is not read past: the carve-out below covers a plain
+            // assignment, not whatever was folded into it.
+            setting_verdict(spec, *scope, variable, values.len() == 1)
+        }
+        Set::ParenthesizedAssignments { variables, .. } => settings_verdict(
+            variables
+                .iter()
+                .map(|name| setting_verdict(spec, None, name, true)),
+        ),
+        Set::MultipleAssignments { assignments } => settings_verdict(
+            assignments
+                .iter()
+                .map(|assignment| setting_verdict(spec, assignment.scope, &assignment.name, true)),
+        ),
+        Set::SetSessionParam(SetSessionParamKind::Generic(param)) => settings_verdict(
+            param
+                .names
+                .iter()
+                .map(|name| plain_setting_verdict(spec, &[name.as_str()], true)),
+        ),
+        Set::SetSessionParam(SetSessionParamKind::Statistics(_)) => Verdict::READ,
+        // Everything else the parser still accepts names no setting to look up,
+        // so nothing can have vouched for it.
+        _ => Verdict::WRITE,
+    }
+}
+
+/// The maximum over a `SET`'s assignments, and stopped when it has none.
+fn settings_verdict(verdicts: impl Iterator<Item = Verdict>) -> Verdict {
+    verdicts
+        .fold(None, |most: Option<Verdict>, verdict| {
+            Some(match most {
+                Some(most) => most.max(verdict),
+                None => verdict,
+            })
+        })
+        .unwrap_or(Verdict::WRITE)
+}
+
+/// One assigned name: a user variable is session scratch space and cannot
+/// disarm a hold, so it stays a read; a server-wide scope never does, whatever
+/// the name. `variable_ok` is whether a user variable may be read as one.
+fn setting_verdict(
+    spec: &SqlSpec,
+    scope: Option<ContextModifier>,
+    name: &ObjectName,
+    variable_ok: bool,
+) -> Verdict {
+    if scope == Some(ContextModifier::Global) {
+        return Verdict::WRITE;
+    }
+    let parts: Option<Vec<&str>> = name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+            // A name computed by a function is not a name anyone listed.
+            ObjectNamePart::Function(_) => None,
+        })
+        .collect();
+    match parts {
+        Some(parts) => plain_setting_verdict(spec, &parts, variable_ok),
+        None => Verdict::WRITE,
+    }
+}
+
+/// The name's parts as written: `["@@session", "time_zone"]`, `["TIMEZONE"]`.
+fn plain_setting_verdict(spec: &SqlSpec, parts: &[&str], variable_ok: bool) -> Verdict {
+    // One leading `@` is a user variable. Two is a system variable, which is
+    // exactly what this rule exists to look at.
+    if variable_ok
+        && let [only] = parts
+        && only.starts_with('@')
+        && !only.starts_with("@@")
+    {
+        return Verdict::READ;
+    }
+    let (scope, name) = match parts {
+        [name] => (None, *name),
+        [scope, name] => (Some(*scope), *name),
+        // A qualified name that is not a scope prefix names a setting an
+        // extension defined, which no list here can have vouched for.
+        _ => return Verdict::WRITE,
+    };
+    let scope = scope.map(|scope| scope.trim_start_matches("@@").to_ascii_lowercase());
+    // The scope keywords that make a setting server-wide or persistent, and
+    // the two that leave it session-local. Any other first part is not a scope.
+    match scope.as_deref() {
+        None | Some("session" | "local") => {}
+        Some(_) => return Verdict::WRITE,
+    }
+    let name = name.trim_start_matches("@@").to_ascii_lowercase();
+    if spec.plain_settings.contains(&name.as_str()) {
+        Verdict::READ
+    } else {
+        Verdict::WRITE
+    }
+}
+
 /// Whether an `EXPLAIN (…)` option turns ANALYZE on -- which runs the statement
 /// for real.
 ///
@@ -3067,30 +3213,30 @@ fn analyze_option_is_on(option: &UtilityOption) -> bool {
 /// A CTE body can be a `DELETE`. `WITH x AS (DELETE FROM t RETURNING *) SELECT *
 /// FROM x` parses as `Statement::Query`, so reading only the top-level variant
 /// calls a statement that empties a table a read.
-fn query_verdict(query: &Query) -> Verdict {
-    let mut verdict = set_expr_verdict(&query.body);
+fn query_verdict(spec: &SqlSpec, query: &Query) -> Verdict {
+    let mut verdict = set_expr_verdict(spec, &query.body);
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            verdict = verdict.max(query_verdict(&cte.query));
+            verdict = verdict.max(query_verdict(spec, &cte.query));
         }
     }
     verdict
 }
 
-fn set_expr_verdict(body: &SetExpr) -> Verdict {
+fn set_expr_verdict(spec: &SqlSpec, body: &SetExpr) -> Verdict {
     match body {
         // `SELECT * INTO newt FROM t` is DDL wearing a select's clothes: same
         // variant as a read, one field apart, and it creates a table.
         SetExpr::Select(select) if select.into.is_some() => Verdict::WRITE,
         SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Verdict::READ,
-        SetExpr::Query(query) => query_verdict(query),
+        SetExpr::Query(query) => query_verdict(spec, query),
         SetExpr::SetOperation { left, right, .. } => {
-            set_expr_verdict(left).max(set_expr_verdict(right))
+            set_expr_verdict(spec, left).max(set_expr_verdict(spec, right))
         }
         SetExpr::Insert(statement)
         | SetExpr::Update(statement)
         | SetExpr::Delete(statement)
-        | SetExpr::Merge(statement) => statement_verdict(statement),
+        | SetExpr::Merge(statement) => statement_verdict(spec, statement),
     }
 }
 
@@ -3099,7 +3245,7 @@ fn set_expr_verdict(body: &SetExpr) -> Verdict {
 /// write anything a Postgres or Snowflake function can, so everything but
 /// operators over names, values and subqueries keeps that verdict. A subquery
 /// is read like any other query.
-fn condition_verdict(condition: &Expr) -> Verdict {
+fn condition_verdict(spec: &SqlSpec, condition: &Expr) -> Verdict {
     match condition {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => Verdict::READ,
         Expr::IsNull(expr)
@@ -3111,7 +3257,7 @@ fn condition_verdict(condition: &Expr) -> Verdict {
         | Expr::IsUnknown(expr)
         | Expr::IsNotUnknown(expr)
         | Expr::Nested(expr)
-        | Expr::UnaryOp { expr, .. } => condition_verdict(expr),
+        | Expr::UnaryOp { expr, .. } => condition_verdict(spec, expr),
         Expr::BinaryOp { left, right, .. }
         | Expr::Like {
             expr: left,
@@ -3124,19 +3270,19 @@ fn condition_verdict(condition: &Expr) -> Verdict {
             pattern: right,
             escape_char: None,
             ..
-        } => condition_verdict(left).max(condition_verdict(right)),
+        } => condition_verdict(spec, left).max(condition_verdict(spec, right)),
         Expr::Between {
             expr, low, high, ..
-        } => condition_verdict(expr)
-            .max(condition_verdict(low))
-            .max(condition_verdict(high)),
+        } => condition_verdict(spec, expr)
+            .max(condition_verdict(spec, low))
+            .max(condition_verdict(spec, high)),
         Expr::InList { expr, list, .. } => list
             .iter()
-            .map(condition_verdict)
-            .fold(condition_verdict(expr), Verdict::max),
-        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => query_verdict(subquery),
+            .map(|item| condition_verdict(spec, item))
+            .fold(condition_verdict(spec, expr), Verdict::max),
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => query_verdict(spec, subquery),
         Expr::InSubquery { expr, subquery, .. } => {
-            condition_verdict(expr).max(query_verdict(subquery))
+            condition_verdict(spec, expr).max(query_verdict(spec, subquery))
         }
         _ => Verdict::FULL,
     }
@@ -7332,7 +7478,7 @@ mod tests {
         SqlParser::parse_sql(dialect.as_ref(), sql)
             .expect("the statement parses in this dialect")
             .iter()
-            .map(statement_verdict)
+            .map(|statement| statement_verdict(spec, statement))
             .fold(Verdict::READ, Verdict::max)
     }
 
@@ -7467,17 +7613,20 @@ mod tests {
         for engine in [Engine::MySql, Engine::MariaDb, Engine::SqlServer] {
             let hold_last = classify(engine, "SET @x = 1, @@session.transaction_read_only = 0");
             let hold_first = classify(engine, "SET @@session.transaction_read_only = 0, @x = 1");
-            assert!(is_stopped(
-                engine,
-                "SET @x = 1, @@session.transaction_read_only = 0"
-            ));
+            assert!(
+                is_stopped(engine, "SET @x = 1, @@session.transaction_read_only = 0"),
+                "{engine:?}"
+            );
             assert_eq!(hold_last, hold_first, "{engine:?}");
 
             let unknown_last = classify(engine, "SET @x = 1, y = 2");
             let unknown_first = classify(engine, "SET y = 2, @x = 1");
             assert!(is_stopped(engine, "SET y = 2, @x = 1"), "{engine:?}");
             assert_eq!(unknown_last, unknown_first, "{engine:?}");
-
+        }
+        // T-SQL has no list of assignments, and its parse folds the second one
+        // into the first as a value, so only the MySQL family reads this one.
+        for engine in [Engine::MySql, Engine::MariaDb] {
             assert!(is_plain_read(engine, "SET @x = 1, @y = 2"), "{engine:?}");
         }
     }
