@@ -536,6 +536,7 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 // Queued before anything creates it, so a panic part-way
                 // through the write cases still removes it.
                 unwind.push("SELECT lo_unlink(970971)".to_string());
+                unwind.push("SELECT lo_unlink(970972)".to_string());
                 (
                     vec![
                         ("an advisory lock", "SELECT pg_advisory_lock(970970)"),
@@ -623,6 +624,10 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 // The denied call is inside a string, so the name scan sees
                 // the carrier and never the payload.
                 "SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '')",
+                // Table position and a dollar-quoted payload: the rule does
+                // not depend on the scalar position or the single-quoted
+                // spelling.
+                "SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$)",
             ] {
                 above_a_read(disarm);
                 hold(true);
@@ -632,7 +637,7 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 subject.run(scenario, &insert, Fetch::default());
                 hold(false);
                 controlled();
-                // The canary is the same row for both spellings.
+                // The canary is the same row for every spelling.
                 subject.run(
                     scenario,
                     &sql_delete(engine, schema, canary),
@@ -666,6 +671,26 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 cell(&subject.run(scenario, &read_back, Fetch::default())),
                 "x",
                 "{at}: the object was not rewritten and truncated under the hold"
+            );
+            hold(false);
+            controlled();
+
+            // The same evidence reached through a string literal: the server
+            // took a write while the hold was armed, and the only thing the
+            // classifier can see is the carrier's name. This is the wider half
+            // of the exposure, since nothing was released to do it.
+            let carried = "970972";
+            let carried_write = format!(
+                "SELECT query_to_xml('select lo_from_bytea({carried}, ''abc''::bytea)', true, false, '')"
+            );
+            let carried_read = format!("SELECT convert_from(lo_get({carried}), 'UTF8')");
+            above_a_read(&carried_write);
+            hold(true);
+            subject.run(scenario, &carried_write, Fetch::default());
+            assert_eq!(
+                cell(&subject.run(scenario, &carried_read, Fetch::default())),
+                "abc",
+                "{at}: the object was not created through the carrier under the hold"
             );
             hold(false);
             controlled();
@@ -706,6 +731,49 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 unlisted.is_empty(),
                 "{at}: large-object functions on neither the deny-list nor the reads: {unlisted:?}"
             );
+
+            // The executors are found by shape, not by name: what they share
+            // is an argument that is SQL text, which the server records as one
+            // named `query` or `sqlquery`. A name here neither list knows is a
+            // function a later version added, and whether it runs its text is
+            // a decision: one that does goes on the deny-list, one that does
+            // not goes in this array with what its `query` actually is.
+            let not_run = [
+                // `query` is an OUT column here, the text of the statement a
+                // backend is running; nothing takes it as an argument.
+                "pg_stat_get_activity",
+            ];
+            let executors = subject.run(
+                scenario,
+                "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'pg_catalog' \
+                 AND (p.proargnames @> ARRAY['query'] OR p.proargnames @> ARRAY['sqlquery']) \
+                 ORDER BY 1",
+                Fetch::default(),
+            );
+            let found: Vec<_> = executors.rows.iter().filter_map(|row| row.get(0)).collect();
+            let unknown: Vec<_> = found
+                .iter()
+                .filter(|name| !listed.contains(name) && !not_run.contains(name))
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "{at}: functions taking SQL text on neither the deny-list nor the carve-out: {unknown:?}"
+            );
+            // An empty answer is a failed probe: a server built without these
+            // functions has not been checked, and would otherwise pass here.
+            for executor in [
+                "query_to_xml",
+                "query_to_xml_and_xmlschema",
+                "query_to_xmlschema",
+                "ts_stat",
+            ] {
+                assert!(
+                    found.contains(&executor),
+                    "{at}: `{executor}` is missing from the server's catalog, so the executors were not probed (found {found:?})"
+                );
+            }
         }
     }
 
