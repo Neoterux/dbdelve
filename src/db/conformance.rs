@@ -977,6 +977,44 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
 
         leaves_the_hold("a comfort setting", &[], "SET SESSION wait_timeout = 28800");
         leaves_the_hold("a read access mode", &[], "SET TRANSACTION READ ONLY");
+
+        // The server-wide scope of a transaction setting, which the parser reads
+        // as no scope at all. The access-mode spelling is rated and never sent:
+        // it would change the default for every later session on a server these
+        // scenarios share. The isolation-level spelling is sent set to the value
+        // already in force, so a server that accepts it is left as it was, and
+        // one that refuses it for want of the privilege has said it is not a
+        // read. Either answer is asserted, so neither is a skip.
+        above_a_read("SET GLOBAL TRANSACTION READ ONLY");
+        let level = cell("SELECT @@global.transaction_isolation");
+        let spelled = level.replace('-', " ");
+        let server_wide = format!("SET GLOBAL TRANSACTION ISOLATION LEVEL {spelled}");
+        above_a_read(&server_wide);
+        hold(true);
+        match subject
+            .connection
+            .query(&server_wide, &CancelToken::default(), Fetch::default())
+        {
+            Err(error) => assert!(
+                error.message.contains("SUPER"),
+                "{at}: refused for another reason: {}",
+                error.message
+            ),
+            Ok(_) => assert_eq!(
+                cell("SELECT @@global.transaction_isolation"),
+                level,
+                "{at}: the server-wide isolation level moved"
+            ),
+        }
+        refused();
+        reset();
+        // The same level for this session alone is a read and leaves the same
+        // canary refused.
+        leaves_the_hold(
+            "a session isolation level",
+            &[],
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {spelled}"),
+        );
     }
 
     // The fixture is as it was found.
