@@ -1933,15 +1933,21 @@ fn command_reads(command: &Value) -> bool {
     }
 }
 
-/// What a `$out` or `$merge` anywhere in `value` does. `$out` replaces its
-/// target collection whole, as `CREATE OR REPLACE TABLE … AS SELECT` does, so
-/// it is a drop; `$merge` writes into what is there.
+/// What a `$out`, `$merge` or JavaScript operator anywhere in `value` does.
+/// `$out` replaces its target collection whole, as `CREATE OR REPLACE TABLE …
+/// AS SELECT` does, so it is a drop; `$merge` writes into what is there.
 fn out_verdict(value: &Value) -> Verdict {
     match value {
         Value::Document(fields) => fields.iter().fold(Verdict::READ, |verdict, (key, value)| {
             let stage = match key.as_str() {
                 "$out" => Verdict::destroys(Destructive::Drop),
                 "$merge" => Verdict::WRITE,
+                // Arbitrary JavaScript in the database process is a different
+                // order of thing from a write: rated Write, a Read-write
+                // profile would run it with no prompt at all. This is not
+                // `browse::runs_code`, which also flags a string where `$or`
+                // wants documents -- the filter bar's rule, not this one.
+                "$where" | "$function" | "$accumulator" => Verdict::FULL,
                 _ => Verdict::READ,
             };
             verdict.max(stage).max(out_verdict(value))
