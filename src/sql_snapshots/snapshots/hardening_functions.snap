@@ -45,6 +45,7 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -87,6 +88,7 @@ source: src/sql_snapshots.rs
 [postgres] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -131,6 +133,7 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -173,6 +176,7 @@ source: src/sql_snapshots.rs
 [mysql] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -217,6 +221,7 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -259,6 +264,7 @@ source: src/sql_snapshots.rs
 [mariadb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -303,6 +309,7 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -345,6 +352,7 @@ source: src/sql_snapshots.rs
 [sqlite] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -389,6 +397,7 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -431,6 +440,7 @@ source: src/sql_snapshots.rs
 [turso] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -475,6 +485,7 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -517,6 +528,7 @@ source: src/sql_snapshots.rs
 [duckdb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -561,6 +573,7 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -603,6 +616,7 @@ source: src/sql_snapshots.rs
 [snowflake] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -647,6 +661,7 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -689,6 +704,7 @@ source: src/sql_snapshots.rs
 [mssql] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -733,6 +749,7 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_all_locks() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -775,6 +792,7 @@ source: src/sql_snapshots.rs
 [mongodb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control user-defined call: SELECT my_function(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control plain projection: SELECT a, b FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -819,6 +837,7 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -861,3 +880,4 @@ source: src/sql_snapshots.rs
 [redis] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|

@@ -61,6 +61,7 @@ const CALLS: &[(&str, &str)] = &[
     ("dblink_connect", "'c', 'dbname=x'"),
     ("dblink_connect_u", "'c', 'dbname=x'"),
     ("dblink_send_query", "'c', 'SELECT 1'"),
+    ("query_to_xml", "'select 1', true, false, ''"),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -159,6 +160,10 @@ const SHAPES: &[(&str, &str)] = &[
     ("control load_file", "SELECT LOAD_FILE('/etc/hostname')"),
     ("control user-defined call", "SELECT my_function(1)"),
     ("control plain projection", "SELECT a, b FROM t"),
+    (
+        "sql-text executor carrying a disarm",
+        "SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '')",
+    ),
 ];
 
 fn record(out: &mut String, engine: Engine, case: &str, sql: &str) {
