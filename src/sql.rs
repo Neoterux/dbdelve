@@ -2256,9 +2256,6 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
 
     // All or nothing: one statement it cannot read makes the whole submission
     // one it cannot vouch for.
-    // An unreadable verdict's mode is the lowest one it may be run once in.
-    // Any, where the server holds Read-only to reads; otherwise nothing stops
-    // what it turns out to write, so Read-only may not run it at all.
     let parsed = match executed_tokens(engine, dialect.as_ref(), sql) {
         // The derived stream is read here and goes no further: the driver is
         // handed `sql`, exactly as typed.
@@ -2271,18 +2268,16 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
         None => SqlParser::parse_sql(dialect.as_ref(), sql).ok(),
     };
     let Some(statements) = parsed else {
-        return Verdict {
-            mode: if engine.holds_read_only() {
-                Mode::ReadOnly
-            } else {
-                Mode::ReadWrite
-            },
-            destructive: vec![Destructive::Unreadable],
-        };
+        return unreadable_verdict(engine);
     };
 
     // An empty or comment-only string parses to no statements at all. There is
-    // nothing there to be dangerous, and a dialog over nothing is noise.
+    // nothing there to be dangerous, and a dialog over nothing is noise -- but
+    // only when the grammar agrees there is nothing, so a range it finds that
+    // the typed parser skipped is refused rather than run silently.
+    if statements.is_empty() && grammar_finds_more_than_comments(engine, dialect.as_ref(), sql) {
+        return unreadable_verdict(engine);
+    }
     let spec = &engine.spec().sql;
     let verdict = statements
         .iter()
@@ -2294,6 +2289,49 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
     } else {
         verdict
     }
+}
+
+/// What a submission `classify` cannot vouch for is: unreadable, and runnable
+/// once. The mode is the lowest one it may be run once in -- Read-only where the
+/// server holds Read-only to reads, otherwise nothing stops what it turns out
+/// to write, so Read-only may not run it at all. One construction, so a parse
+/// error and the zero-statement cross-check cannot drift apart.
+fn unreadable_verdict(engine: Engine) -> Verdict {
+    Verdict {
+        mode: if engine.holds_read_only() {
+            Mode::ReadOnly
+        } else {
+            Mode::ReadWrite
+        },
+        destructive: vec![Destructive::Unreadable],
+    }
+}
+
+/// Whether the grammar finds a statement range in `sql` that holds more than
+/// whitespace, semicolons and comments *to `sqlparser`'s own lexer*, for a
+/// submission `sqlparser` read as no statement at all.
+///
+/// The two parsers disagree on comment-only text, and nearly always because the
+/// grammar is one standard dialect: it reads a MySQL or Snowflake `#` line
+/// comment as a statement, and an inner `*/` of a nested comment as a leftover.
+/// A range is divergent only when the lexer of the engine's own dialect finds a
+/// real token in it, which is what clears every line comment a dialect has
+/// without a comment stripper of ours. Leftovers of a nested block comment on
+/// the two dialects that nest (`*/` lexes as operators) stay refused: rare, and
+/// the conservative side. A range the lexer cannot read counts as divergent.
+fn grammar_finds_more_than_comments(engine: Engine, dialect: &dyn Dialect, sql: &str) -> bool {
+    Buffer::for_engine(engine, sql)
+        .statements()
+        .iter()
+        .any(|range| {
+            Tokenizer::new(dialect, &sql[range.clone()])
+                .tokenize()
+                .map_or(true, |tokens| {
+                    tokens
+                        .iter()
+                        .any(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+                })
+        })
 }
 
 /// `sql` as the server will read it, for a dialect whose server runs the text
