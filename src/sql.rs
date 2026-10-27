@@ -7302,4 +7302,327 @@ mod tests {
             }
         }
     }
+
+    /// The eight engines whose requests are SQL, which is where a `SET` means
+    /// something to `classify`.
+    fn sql_engines() -> impl Iterator<Item = crate::db::Engine> {
+        use crate::db::Syntax;
+
+        crate::db::Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() == Syntax::Sql)
+    }
+
+    /// Needs more than Read-only, and for a reason other than the parser
+    /// having refused it: an unreadable statement says nothing about the rule.
+    fn is_stopped(engine: crate::db::Engine, sql: &str) -> bool {
+        let verdict = classify(engine, sql);
+        verdict.mode > Mode::ReadOnly && !verdict.destructive.contains(&Destructive::Unreadable)
+    }
+
+    fn is_plain_read(engine: crate::db::Engine, sql: &str) -> bool {
+        let verdict = classify(engine, sql);
+        verdict.mode == Mode::ReadOnly && verdict.destructive.is_empty()
+    }
+
+    /// What `classify` would say for `sql` on an engine whose spec is `spec`,
+    /// without the engine: the way to give a spec a list no engine carries.
+    fn verdict_under(spec: &crate::db::SqlSpec, sql: &str) -> Verdict {
+        let dialect = parser(spec.parser_dialect);
+        SqlParser::parse_sql(dialect.as_ref(), sql)
+            .expect("the statement parses in this dialect")
+            .iter()
+            .map(statement_verdict)
+            .fold(Verdict::READ, Verdict::max)
+    }
+
+    fn with_plain_settings(
+        parser_dialect: ParserDialect,
+        plain_settings: &'static [&'static str],
+    ) -> crate::db::SqlSpec {
+        crate::db::SqlSpec {
+            parser_dialect,
+            plain_settings,
+            ..crate::db::SqlSpec::ANSI
+        }
+    }
+
+    #[test]
+    fn a_role_change_and_an_authorization_change_need_more_than_read_only() {
+        for engine in sql_engines() {
+            for sql in [
+                "SET ROLE other",
+                "SET LOCAL ROLE other",
+                "SET SESSION AUTHORIZATION other",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+                assert_eq!(
+                    gate(&classify(engine, sql), Mode::ReadOnly, &[]),
+                    Some(Stop::Upgrade(Mode::ReadWrite)),
+                    "{engine:?}: {sql}"
+                );
+                assert_eq!(
+                    gate(&classify(engine, sql), Mode::ReadWrite, &[]),
+                    None,
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_access_mode_needs_more_than_read_only_in_every_spelling() {
+        use crate::db::Engine;
+
+        for engine in sql_engines() {
+            for sql in [
+                "SET TRANSACTION READ WRITE",
+                "SET SESSION TRANSACTION READ WRITE",
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+                "START TRANSACTION READ WRITE",
+                "BEGIN TRANSACTION READ WRITE",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        // The two dialects whose `BEGIN` opens a scripting block do not read
+        // the bare spelling as a transaction at all.
+        for engine in sql_engines().filter(|e| !matches!(e, Engine::Snowflake | Engine::SqlServer))
+        {
+            assert!(is_stopped(engine, "BEGIN READ WRITE"), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_read_access_mode_and_an_isolation_level_stay_reads() {
+        for engine in sql_engines() {
+            for sql in [
+                "SET TRANSACTION READ ONLY",
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "START TRANSACTION READ ONLY",
+            ] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_brackets_stay_reads() {
+        for engine in sql_engines() {
+            for sql in [
+                "BEGIN",
+                "START TRANSACTION",
+                "COMMIT",
+                "ROLLBACK",
+                "SAVEPOINT a",
+                "RELEASE SAVEPOINT a",
+                "BEGIN; SELECT 1; COMMIT",
+            ] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_wide_scope_needs_more_than_read_only_whatever_the_name() {
+        use crate::db::Engine;
+
+        for engine in sql_engines() {
+            assert!(
+                is_stopped(engine, "SET GLOBAL time_zone = 'UTC'"),
+                "{engine:?}"
+            );
+        }
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::SqlServer] {
+            assert!(
+                is_stopped(engine, "SET @@global.time_zone = 'UTC'"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_variable_stays_a_read_and_a_doubled_at_session_setting_does_not() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::SqlServer] {
+            assert!(is_plain_read(engine, "SET @x = 1"), "{engine:?}");
+            assert!(
+                is_stopped(engine, "SET @@session.transaction_read_only = 0"),
+                "{engine:?}"
+            );
+            assert!(
+                is_stopped(engine, "SET @@transaction_read_only = OFF"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reordering_the_assignments_of_one_set_does_not_change_its_verdict() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::SqlServer] {
+            let hold_last = classify(engine, "SET @x = 1, @@session.transaction_read_only = 0");
+            let hold_first = classify(engine, "SET @@session.transaction_read_only = 0, @x = 1");
+            assert!(is_stopped(
+                engine,
+                "SET @x = 1, @@session.transaction_read_only = 0"
+            ));
+            assert_eq!(hold_last, hold_first, "{engine:?}");
+
+            let unknown_last = classify(engine, "SET @x = 1, y = 2");
+            let unknown_first = classify(engine, "SET y = 2, @x = 1");
+            assert!(is_stopped(engine, "SET y = 2, @x = 1"), "{engine:?}");
+            assert_eq!(unknown_last, unknown_first, "{engine:?}");
+
+            assert!(is_plain_read(engine, "SET @x = 1, @y = 2"), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_setting_on_no_list_needs_more_than_read_only_on_every_engine() {
+        for engine in sql_engines() {
+            assert!(is_stopped(engine, "SET x = 1"), "{engine:?}");
+            assert!(is_stopped(engine, "SET x = 1, y = 2"), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_set_nested_in_a_block_reaches_the_verdict_it_has_alone() {
+        use crate::db::Engine;
+
+        for engine in sql_engines() {
+            // A plain EXPLAIN runs nothing, so only the analysing one carries
+            // the verdict of what it explains.
+            assert!(
+                is_stopped(engine, "EXPLAIN ANALYZE SET ROLE other"),
+                "{engine:?}"
+            );
+            assert!(
+                is_plain_read(engine, "EXPLAIN SET ROLE other"),
+                "{engine:?}"
+            );
+
+            let (conditional, scripting) = match engine {
+                Engine::SqlServer => (
+                    Some("IF 1 = 1 SET ROLE other"),
+                    Some("BEGIN SET ROLE other; END"),
+                ),
+                Engine::Snowflake => (
+                    Some("IF 1 = 1 THEN SET ROLE other; END IF"),
+                    Some("BEGIN SET ROLE other; END"),
+                ),
+                _ => (Some("IF 1 = 1 THEN SET ROLE other; END IF"), None),
+            };
+            for sql in conditional.into_iter().chain(scripting) {
+                assert_eq!(
+                    classify(engine, sql),
+                    classify(engine, "SET ROLE other"),
+                    "{engine:?}: {sql}"
+                );
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        for engine in sql_engines().filter(|e| !matches!(e, Engine::Snowflake | Engine::SqlServer))
+        {
+            assert!(
+                is_stopped(engine, "IF 1 = 1 THEN SET x = 1; END IF"),
+                "{engine:?}"
+            );
+        }
+        assert!(is_stopped(
+            Engine::Snowflake,
+            "BEGIN START TRANSACTION READ WRITE; END"
+        ));
+        assert!(is_plain_read(Engine::Snowflake, "BEGIN COMMIT; END"));
+    }
+
+    #[test]
+    fn a_setting_on_the_allow_list_is_found_at_any_nesting_depth() {
+        let postgres = with_plain_settings(ParserDialect::PostgreSql, &["search_path"]);
+        let snowflake = with_plain_settings(ParserDialect::Snowflake, &["search_path"]);
+
+        for sql in [
+            "SET search_path TO other",
+            "IF 1 = 1 THEN SET search_path TO other; END IF",
+            "EXPLAIN ANALYZE SET search_path TO other",
+        ] {
+            assert_eq!(verdict_under(&postgres, sql), Verdict::READ, "{sql}");
+        }
+        assert_eq!(
+            verdict_under(&snowflake, "BEGIN SET search_path TO other; END"),
+            Verdict::READ
+        );
+
+        for sql in [
+            "SET x = 1",
+            "IF 1 = 1 THEN SET x = 1; END IF",
+            "EXPLAIN ANALYZE SET x = 1",
+        ] {
+            assert_eq!(verdict_under(&postgres, sql), Verdict::WRITE, "{sql}");
+        }
+        assert_eq!(
+            verdict_under(&snowflake, "BEGIN SET x = 1; END"),
+            Verdict::WRITE
+        );
+    }
+
+    #[test]
+    fn a_setting_name_is_normalised_before_the_allow_list_is_asked() {
+        let mysql = with_plain_settings(ParserDialect::MySql, &["time_zone"]);
+
+        for sql in [
+            "SET time_zone = 'UTC'",
+            "SET TIME_ZONE = 'UTC'",
+            "SET SESSION time_zone = 'UTC'",
+            "SET @@time_zone = 'UTC'",
+            "SET @@session.time_zone = 'UTC'",
+            "SET @@SESSION.Time_Zone = 'UTC'",
+            "SET LOCAL time_zone = 'UTC'",
+        ] {
+            assert_eq!(verdict_under(&mysql, sql), Verdict::READ, "{sql}");
+        }
+        // The server-wide scope wins over an allow-list hit, however it is
+        // spelled.
+        for sql in [
+            "SET GLOBAL time_zone = 'UTC'",
+            "SET @@global.time_zone = 'UTC'",
+            "SET @@GLOBAL.time_zone = 'UTC'",
+        ] {
+            assert_eq!(verdict_under(&mysql, sql), Verdict::WRITE, "{sql}");
+        }
+        // One name off the list stops the whole statement, in either order.
+        for sql in [
+            "SET time_zone = 'UTC', y = 2",
+            "SET y = 2, time_zone = 'UTC'",
+        ] {
+            assert_eq!(verdict_under(&mysql, sql), Verdict::WRITE, "{sql}");
+        }
+        assert_eq!(
+            verdict_under(&mysql, "SET time_zone = 'UTC', @x = 1"),
+            Verdict::READ
+        );
+    }
+
+    #[test]
+    fn an_allow_listed_name_on_an_engine_with_an_empty_list_is_stopped() {
+        let listed = with_plain_settings(ParserDialect::PostgreSql, &["search_path"]);
+        let empty = with_plain_settings(ParserDialect::PostgreSql, &[]);
+        let sql = "SET search_path TO other";
+        assert_eq!(verdict_under(&listed, sql), Verdict::READ);
+        assert_eq!(verdict_under(&empty, sql), Verdict::WRITE);
+    }
+
+    #[test]
+    fn a_set_the_parser_accepts_without_an_assignment_is_stopped() {
+        use crate::db::Engine;
+
+        // Accepted by the pinned parser, and carries no setting name to look
+        // up, so the allow-list has nothing to say and the default decides.
+        assert!(is_stopped(Engine::MySql, "SET NAMES DEFAULT"));
+        assert!(is_stopped(Engine::Postgres, "SET NAMES DEFAULT"));
+    }
 }
