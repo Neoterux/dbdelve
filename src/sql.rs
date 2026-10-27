@@ -7774,4 +7774,151 @@ mod tests {
         assert!(is_stopped(Engine::MySql, "SET NAMES DEFAULT"));
         assert!(is_stopped(Engine::Postgres, "SET NAMES DEFAULT"));
     }
+
+    #[test]
+    fn an_engine_with_a_session_to_set_lists_its_settings_and_the_rest_list_none() {
+        use crate::db::Engine;
+
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::DuckDb,
+            Engine::SqlServer,
+        ] {
+            assert!(!engine.spec().sql.plain_settings.is_empty(), "{engine:?}");
+        }
+        // SQLite and Turso configure through `PRAGMA`, which is already Full,
+        // and Snowflake's requests keep no session for a `SET` to change.
+        for engine in [Engine::Sqlite, Engine::Turso, Engine::Snowflake] {
+            assert!(engine.spec().sql.plain_settings.is_empty(), "{engine:?}");
+            for sql in [
+                "SET search_path TO other",
+                "SET timezone = 'UTC'",
+                "SET x = 1",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_allow_listed_setting_stays_a_read_on_its_engine_unless_server_wide() {
+        use crate::sql_snapshots::hardening::set_statement;
+
+        for engine in sql_engines() {
+            for name in engine.spec().sql.plain_settings {
+                let sql = set_statement(engine, name);
+                assert!(is_plain_read(engine, &sql), "{engine:?}: {sql}");
+                let global = format!("SET GLOBAL {name} = 1");
+                assert!(is_stopped(engine, &global), "{engine:?}: {global}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_setting_left_off_every_list_is_stopped_on_the_engine_that_has_it() {
+        use crate::sql_snapshots::hardening::{EXCLUDED_SETTINGS, set_statement};
+
+        for (engine, names) in EXCLUDED_SETTINGS {
+            for name in *names {
+                let sql = set_statement(*engine, name);
+                assert!(is_stopped(*engine, &sql), "{engine:?}: {sql}");
+                // The name is stopped because nothing listed it, so a list
+                // that gained it would be the regression.
+                assert!(
+                    !engine
+                        .spec()
+                        .sql
+                        .plain_settings
+                        .contains(&name.to_ascii_lowercase().as_str()),
+                    "{engine:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_and_comfort_settings_stay_reads_where_the_engine_has_them() {
+        use crate::db::Engine;
+
+        for (engine, sql) in [
+            (Engine::Postgres, "SET search_path TO other"),
+            (Engine::Postgres, "SET SESSION search_path = other"),
+            (Engine::Postgres, "SET LOCAL statement_timeout = 1000"),
+            (Engine::Postgres, "SET timezone = 'UTC'"),
+            (Engine::Postgres, "SET TIMEZONE TO 'UTC'"),
+            (Engine::MySql, "SET autocommit = 0"),
+            (Engine::MySql, "SET time_zone = 'UTC'"),
+            (Engine::MySql, "SET @@session.time_zone = 'UTC'"),
+            (Engine::MySql, "SET SESSION max_execution_time = 1000"),
+            (Engine::MariaDb, "SET autocommit = 0"),
+            (Engine::DuckDb, "SET threads = 2"),
+            (Engine::DuckDb, "SET search_path = 'main'"),
+            (Engine::SqlServer, "SET NOCOUNT ON"),
+            (Engine::SqlServer, "SET ROWCOUNT 10"),
+            (Engine::SqlServer, "SET STATISTICS IO ON"),
+        ] {
+            assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn the_two_mysql_family_servers_name_their_timeout_and_isolation_differently() {
+        use crate::db::Engine;
+
+        assert!(is_plain_read(Engine::MySql, "SET max_execution_time = 1"));
+        assert!(is_stopped(Engine::MySql, "SET max_statement_time = 1"));
+        assert!(is_plain_read(Engine::MariaDb, "SET max_statement_time = 1"));
+        assert!(is_stopped(Engine::MariaDb, "SET max_execution_time = 1"));
+        // MariaDB still answers to the older isolation-level spelling.
+        assert!(is_plain_read(Engine::MariaDb, "SET tx_isolation = 'x'"));
+        assert!(is_stopped(Engine::MySql, "SET tx_isolation = 'x'"));
+        assert!(is_plain_read(
+            Engine::MySql,
+            "SET transaction_isolation = 'x'"
+        ));
+        assert!(is_plain_read(
+            Engine::MariaDb,
+            "SET transaction_isolation = 'x'"
+        ));
+    }
+
+    #[test]
+    fn the_one_way_configuration_ratchets_on_the_embedded_analytics_engine_are_stopped() {
+        use crate::db::Engine;
+
+        // Once off, DBDelve's own CSV, Parquet and Excel opening stays off for
+        // the rest of the session, and a locked configuration refuses every
+        // later `SET`.
+        for sql in [
+            "SET enable_external_access = false",
+            "SET lock_configuration = true",
+        ] {
+            assert!(is_stopped(Engine::DuckDb, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_charset_that_cannot_swallow_a_backslash_stays_a_read() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for charset in [
+                "utf8mb4", "UTF8MB4", "utf8mb3", "utf8", "latin1", "ascii", "binary",
+            ] {
+                let sql = format!("SET NAMES {charset}");
+                assert!(is_plain_read(engine, &sql), "{engine:?}: {sql}");
+            }
+            assert!(
+                is_plain_read(engine, "SET NAMES utf8mb4 COLLATE utf8mb4_bin"),
+                "{engine:?}"
+            );
+            for charset in ["gbk", "big5", "sjis", "cp932", "gb18030", "ucs2", "utf16"] {
+                let sql = format!("SET NAMES {charset}");
+                assert!(is_stopped(engine, &sql), "{engine:?}: {sql}");
+            }
+            assert!(is_stopped(engine, "SET NAMES DEFAULT"), "{engine:?}");
+        }
+    }
 }
