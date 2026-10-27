@@ -95,6 +95,9 @@ source: src/sql_snapshots.rs
 [postgres] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -189,6 +192,9 @@ source: src/sql_snapshots.rs
 [mysql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -283,6 +289,9 @@ source: src/sql_snapshots.rs
 [mariadb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -377,6 +386,9 @@ source: src/sql_snapshots.rs
 [sqlite] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -471,6 +483,9 @@ source: src/sql_snapshots.rs
 [turso] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -565,6 +580,9 @@ source: src/sql_snapshots.rs
 [duckdb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -659,6 +677,9 @@ source: src/sql_snapshots.rs
 [snowflake] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -753,6 +774,9 @@ source: src/sql_snapshots.rs
 [mssql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -847,6 +871,9 @@ source: src/sql_snapshots.rs
 [mongodb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT setval('s', 10) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -941,3 +968,6 @@ source: src/sql_snapshots.rs
 [redis] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
