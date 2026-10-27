@@ -29,7 +29,7 @@ use sqlparser::dialect::{
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
-use sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError, Whitespace};
+use sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError, Whitespace, Word};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::db::{
@@ -2284,7 +2284,7 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
         .map(|statement| statement_verdict(spec, statement))
         .fold(Verdict::READ, Verdict::max);
     // Raised, never replaced: the statements above may already need more.
-    if calls_denied_function(engine, sql) {
+    if calls_denied_function(engine, sql) || sets_server_wide(engine, sql) {
         verdict.max(Verdict::WRITE)
     } else {
         verdict
@@ -2879,6 +2879,62 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
         previous = Some(token);
     }
     false
+}
+
+/// Whether `sql` has `SET` followed straight away by a server-wide or
+/// persistent scope word: `GLOBAL`, `PERSIST` or `PERSIST_ONLY`.
+///
+/// Read from the tokens because the parser has already dropped the scope of
+/// `SET GLOBAL TRANSACTION ...` into the `session` flag of `SetTransaction`,
+/// and [`set_verdict`] rates a transaction that asks for no write access a
+/// read, so a server-wide change to the default access mode or isolation level
+/// would pass as one. Only the word straight after `SET` counts, so `SET @global`
+/// (a user variable), `SET @@global.x` (which [`setting_verdict`] already
+/// stops) and `SET LOCAL TRANSACTION` are untouched. The pair is looked for
+/// anywhere rather than at the start of a statement, because the parser also
+/// accepts a `SET` inside an `IF ... THEN` block, where the statement opens
+/// with something else; and it is a pair, so the order of two statements does
+/// not matter.
+///
+/// What it costs, and what it does not: every other statement it reaches is
+/// already a write through the global-scope arm of [`setting_verdict`], so the
+/// one verdict it moves is the transaction spelling whose scope the parser
+/// discarded.
+///
+/// A tokenizer failure answers `false`, unlike [`calls_denied_function`]. That
+/// one is only asked on an engine that lists a function; this is asked on every
+/// SQL engine, and a submission the tokenizer cannot read is already refused by
+/// name as unreadable. Raising here would fold a write into that verdict and
+/// move every record that says so.
+fn sets_server_wide(engine: Engine, sql: &str) -> bool {
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    // The statements the server will run, so a scope inside an executable
+    // comment counts the way a denied call does.
+    let tokens = executed_tokens(engine, dialect.as_ref(), sql)
+        .unwrap_or_else(|| Tokenizer::new(dialect.as_ref(), sql).tokenize());
+    let Ok(tokens) = tokens else {
+        return false;
+    };
+    let words: Vec<Option<&Word>> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .map(|token| match token {
+            Token::Word(word) if word.quote_style.is_none() => Some(word),
+            _ => None,
+        })
+        .collect();
+    words.windows(2).any(|pair| {
+        matches!(
+            pair,
+            [Some(set), Some(scope)]
+                if set.value.eq_ignore_ascii_case("set")
+                    && ["global", "persist", "persist_only"]
+                        .iter()
+                        .any(|name| scope.value.eq_ignore_ascii_case(name))
+        )
+    })
 }
 
 /// Whether the tokens spell an identifier as a unicode escape, `U&"..."`: an
@@ -7905,6 +7961,17 @@ mod tests {
         for engine in [Engine::MySql, Engine::MariaDb] {
             assert!(
                 is_stopped(engine, "SELECT 1; SET GLOBAL TRANSACTION READ ONLY"),
+                "{engine:?}"
+            );
+        }
+        // The parser also accepts the statement inside a block, where it does
+        // not open the statement.
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::Postgres] {
+            assert!(
+                is_stopped(
+                    engine,
+                    "IF 1 = 1 THEN SET GLOBAL TRANSACTION READ ONLY; END IF"
+                ),
                 "{engine:?}"
             );
         }
