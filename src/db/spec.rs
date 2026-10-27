@@ -614,6 +614,9 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpLike,
         read_only_session: ReadOnlySession::SessionTransaction,
+        // The armed read-only transaction stops none of the named-lock calls.
+        // No sequences, so no `nextval`.
+        denied_functions: &["get_lock", "release_lock", "release_all_locks"],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -665,6 +668,16 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpInstr,
         read_only_session: ReadOnlySession::SessionTransaction,
+        // The armed read-only transaction stops none of the named-lock calls;
+        // it does refuse a sequence advance, but a held session is not the
+        // boundary.
+        denied_functions: &[
+            "get_lock",
+            "release_lock",
+            "release_all_locks",
+            "nextval",
+            "setval",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -711,6 +724,9 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
         substring: SubstringMatch::Instr,
         // No `generated_defaults`: `table_info` leaves generated columns out
         // altogether.
+        // Inert while `rusqlite` is built without its `load_extension`
+        // feature, and listed so enabling it cannot quietly open a hole.
+        denied_functions: &["load_extension"],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -749,6 +765,9 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
         },
         parser_dialect: ParserDialect::Sqlite,
         substring: SubstringMatch::Instr,
+        // Inert for the same reason as SQLite's. The rest of Turso's function
+        // set has not been surveyed.
+        denied_functions: &["load_extension"],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -791,6 +810,8 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // `explain.rs` does not read yet. No `read_only_session`: an open
         // database has no session switch; read-only is a way to open the
         // file, which a profile does not ask for yet.
+        // Nothing holds a session read-only, so an advance on a sequence runs.
+        denied_functions: &["nextval", "setval"],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -848,6 +869,15 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // shape `explain.rs` does not read yet. No `read_only_session`: there
         // is no session to set anything on. No `generated_defaults`: an
         // identity takes a supplied value.
+        // `seq.nextval` is no call at all, which the scan reads off the period
+        // before the name. Procedures are `CALL` statements, already Full.
+        denied_functions: &[
+            "system$cancel_all_queries",
+            "system$cancel_query",
+            "system$abort_session",
+            "nextval",
+            "getnextval",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -915,6 +945,10 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         // `read_only_session`: no session-level switch exists.
         // `ApplicationIntent=ReadOnly` routes a login to a readable replica
         // and is ignored by a primary.
+        // The pass-through table functions run a statement on another server,
+        // and nothing holds a session read-only. A scalar function cannot have
+        // a side effect in T-SQL, so none is listed.
+        denied_functions: &["openquery", "openrowset", "opendatasource"],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -951,6 +985,8 @@ pub(crate) const MONGODB: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
+    // No `denied_functions`: this is not SQL, and its own closed tables decide
+    // what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,
@@ -988,6 +1024,8 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
+    // No `denied_functions`: this is not SQL, and its own closed tables decide
+    // what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,

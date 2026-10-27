@@ -2716,8 +2716,9 @@ fn touches_session(engine: Engine, sql: &str) -> bool {
 /// call sits: the parser puts one in four different nodes (scalar, table,
 /// `LATERAL` table and `TABLE(..)` position), so the tokens are read instead.
 /// Only the last word before the parenthesis is compared, so a schema-qualified
-/// call counts. A column that merely shares a name keeps its statement in turn,
-/// the conservative side.
+/// call counts, and a listed word straight after a period counts without one.
+/// A column that merely shares a name keeps its statement in turn, the
+/// conservative side.
 ///
 /// Separate from [`SESSION_FUNCTIONS`], which answers what the session keeps;
 /// this answers whether Read-only may run the call. A name may be on both.
@@ -2738,13 +2739,16 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)))
         .peekable();
+    let mut previous = None;
     while let Some(token) = tokens.next() {
         if let Token::Word(word) = token
-            && tokens.peek() == Some(&&Token::LParen)
             && denied.contains(&word.value.to_lowercase().as_str())
+            // Snowflake reads a sequence as `seq.nextval`, no call at all.
+            && (tokens.peek() == Some(&&Token::LParen) || previous == Some(&Token::Period))
         {
             return true;
         }
+        previous = Some(token);
     }
     false
 }
