@@ -157,8 +157,8 @@ comment, on a Read-only profile.
 
 ## Findings made after the first draft
 
-Three further gaps were found by code review after the first draft of this
-document. Each is closed in the same release.
+Four further gaps were found by code review and verification after the first
+draft of this document. Each is closed in the same release.
 
 - **A Postgres identifier spelled as a unicode escape**, such as
   `SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false)`,
@@ -177,6 +177,34 @@ document. Each is closed in the same release.
   the development account was refused with error 1227 on both servers for want
   of the privilege. The statement does not release the session hold. Closed by
   plan 01-07, task 1, which reads the scope from the tokens.
+- **A Postgres function that executes its text argument as a query.**
+  `query_to_xml`, `query_to_xml_and_xmlschema`, `query_to_xmlschema` and
+  `ts_stat` take a string and run it, so a listed call carried inside that
+  string reached the server through a literal the name scan never reads.
+  The verifier ran three statements on the live Postgres 15, each with
+  `default_transaction_read_only` set to `on`:
+  - `SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)', true, false, '')`
+    followed by `SHOW default_transaction_read_only` answered `on`, then `off`.
+  - `SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only','off',false))$q$)`
+    left the setting at `off`.
+  - `SELECT query_to_xml('select lo_from_bytea(970973, ''abc''::bytea)', true, false, '')`
+    created a large object while the hold was armed. That is a write on a
+    Read-only profile, not only a release of the hold: with the hold off
+    afterwards, `pg_largeobject_metadata` held one row for it.
+
+  The large object was removed with `lo_unlink` afterwards. Closed by plan
+  01-08, which lists the four executors; the record of the changed verdicts is
+  `hardening_functions` in `src/sql_snapshots/snapshots/`. Plan 01-09 asked the
+  same question of DuckDB on the embedded build the tests use
+  (`v2.0.0-dev88614`): `query` and `json_execute_serialized_sql` ran their text
+  and advanced a sequence, and are listed, while `query_table` resolves a table
+  name, runs no text and is not.
+
+The deny-list names functions. A call it does not name stays a read, so the
+list is best-effort inside a `SELECT` and not a boundary. Where an engine holds
+Read-only on the server, that hold is the boundary, and the list is what stops
+the statements that would release it. DuckDB has no such hold, so there the
+classifier's verdict is all there is.
 
 ## Affected versions
 
