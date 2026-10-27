@@ -326,7 +326,24 @@ pub(crate) fn leaves(text: &str) -> Leaves {
             "MULTI" => leaves.transaction = Some(true),
             "EXEC" | "DISCARD" => leaves.transaction = Some(false),
             "WATCH" | "AUTH" | "READONLY" | "READWRITE" => leaves.settings = true,
-            "CLIENT" if kind(&command) == Some(Kind::Write) => leaves.settings = true,
+            // By name, not by verdict: `CLIENT LIST` is a write for what it
+            // discloses, and says nothing about the session it is run on.
+            "CLIENT"
+                if matches!(
+                    command.subcommand().as_str(),
+                    "KILL"
+                        | "UNPAUSE"
+                        | "SETNAME"
+                        | "SETINFO"
+                        | "NO-EVICT"
+                        | "NO-TOUCH"
+                        | "TRACKING"
+                        | "CACHING"
+                        | "UNBLOCK"
+                ) =>
+            {
+                leaves.settings = true
+            }
             _ => {}
         }
     }
@@ -357,16 +374,18 @@ fn kind(command: &Command) -> Option<Kind> {
     let sub = command.subcommand();
     use Kind::*;
     Some(match (name.as_str(), sub.as_str()) {
-        ("CONFIG", "GET" | "HELP") => Read,
+        ("CONFIG", "HELP") => Read,
+        // These two answer with what a Read-only profile should not be handed
+        // unasked: `requirepass` and `masterauth`, and every connected
+        // client's address and name. Their siblings reveal nothing of the kind.
+        ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
-        ("CLIENT", "LIST" | "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => {
-            Read
-        }
+        ("CLIENT", "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => Read,
         (
             "CLIENT",
-            "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
-            | "CACHING" | "UNBLOCK",
+            "LIST" | "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH"
+            | "TRACKING" | "CACHING" | "UNBLOCK",
         ) => Write,
         ("SCRIPT", "EXISTS" | "HELP") => Read,
         ("SCRIPT", "LOAD" | "KILL") => Write,
