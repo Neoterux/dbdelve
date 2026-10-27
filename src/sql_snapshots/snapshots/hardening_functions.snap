@@ -23,21 +23,21 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT pg_switch_wal() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_create(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_creat(-1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_truncate(0, 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
