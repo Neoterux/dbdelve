@@ -7865,6 +7865,99 @@ mod tests {
     }
 
     #[test]
+    fn a_server_wide_transaction_scope_is_stopped_whatever_the_parser_dropped() {
+        use crate::db::Engine;
+
+        // The parser reads these as a transaction with no scope, and a
+        // transaction that asks for no write access is a read, so the scope has
+        // to come from the tokens.
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for sql in [
+                "SET GLOBAL TRANSACTION READ ONLY",
+                "set global transaction read only",
+                "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET /* scope */ GLOBAL TRANSACTION READ ONLY",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        // Wherever a dialect parses the persistent scopes they are raised the
+        // same way; one that cannot is refused for that, as it was.
+        for engine in sql_engines() {
+            for sql in [
+                "SET PERSIST TRANSACTION READ ONLY",
+                "SET PERSIST_ONLY TRANSACTION READ ONLY",
+            ] {
+                let verdict = classify(engine, sql);
+                if !verdict.destructive.contains(&Destructive::Unreadable) {
+                    assert!(verdict.mode > Mode::ReadOnly, "{engine:?}: {sql}");
+                }
+            }
+        }
+        // Per statement, so the order of two does not matter.
+        for engine in sql_engines() {
+            assert_eq!(
+                classify(engine, "SELECT 1; SET GLOBAL TRANSACTION READ ONLY"),
+                classify(engine, "SET GLOBAL TRANSACTION READ ONLY; SELECT 1"),
+                "{engine:?}"
+            );
+        }
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert!(
+                is_stopped(engine, "SELECT 1; SET GLOBAL TRANSACTION READ ONLY"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_scope_and_a_variable_that_begins_with_the_scope_word_stay_reads() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for sql in [
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET TRANSACTION READ ONLY",
+                "SET LOCAL TRANSACTION READ ONLY",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET @global = 1",
+                "SET @globally = 1",
+            ] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+            // The two spellings that already named the scope keep their verdict.
+            for sql in [
+                "SET GLOBAL max_execution_time = 1",
+                "SET @@global.time_zone = 'UTC'",
+            ] {
+                assert!(is_stopped(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        for engine in sql_engines() {
+            for sql in ["BEGIN", "START TRANSACTION", "SELECT 1 AS global"] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_submission_the_tokenizer_cannot_read_is_not_raised_by_the_scope_rule() {
+        for engine in sql_engines() {
+            // Refused by name already; raising it would fold a write into the
+            // unreadable verdict.
+            assert_eq!(
+                classify(engine, "SET GLOBAL TRANSACTION READ ONLY; SELECT 'x"),
+                classify(engine, "SELECT 'x"),
+                "{engine:?}"
+            );
+            for sql in ["", "-- nothing here", "/* nor here */"] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_user_variable_stays_a_read_and_a_doubled_at_session_setting_does_not() {
         use crate::db::Engine;
 
