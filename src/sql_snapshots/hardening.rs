@@ -159,3 +159,175 @@ fn denied_function_corpus_per_engine() {
     }
     check("hardening_functions", &out);
 }
+
+/// Statements that change who the session is, or whether it can write, grouped
+/// by the rule that decides them. Written once and run on every engine, so a
+/// dialect that does not parse one shows `Unreadable` rather than nothing.
+const SESSION_RULES: &[(&str, &str)] = &[
+    ("identity change", "SET ROLE other"),
+    ("identity change, local", "SET LOCAL ROLE other"),
+    ("authorization change", "SET SESSION AUTHORIZATION other"),
+    ("write access mode", "SET TRANSACTION READ WRITE"),
+    (
+        "write access mode, session keyword",
+        "SET SESSION TRANSACTION READ WRITE",
+    ),
+    (
+        "write access mode, characteristics",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+    ),
+    (
+        "write access mode after an isolation level",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+    ),
+    ("read access mode", "SET TRANSACTION READ ONLY"),
+    (
+        "read access mode, session keyword",
+        "SET SESSION TRANSACTION READ ONLY",
+    ),
+    (
+        "isolation level",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    ),
+    ("transaction opening, write", "BEGIN READ WRITE"),
+    (
+        "transaction opening, write, spelled out",
+        "START TRANSACTION READ WRITE",
+    ),
+    (
+        "transaction opening, write, with the noise word",
+        "BEGIN TRANSACTION READ WRITE",
+    ),
+    ("transaction opening, read", "START TRANSACTION READ ONLY"),
+    ("transaction opening", "BEGIN"),
+    ("transaction opening, spelled out", "START TRANSACTION"),
+    ("transaction commit", "COMMIT"),
+    ("transaction rollback", "ROLLBACK"),
+    ("savepoint", "SAVEPOINT a"),
+    ("savepoint release", "RELEASE SAVEPOINT a"),
+    ("bracketed read", "BEGIN; SELECT 1; COMMIT"),
+    ("server-wide scope", "SET GLOBAL max_execution_time = 1"),
+    (
+        "server-wide scope, doubled-at prefix",
+        "SET @@global.time_zone = 'UTC'",
+    ),
+    (
+        "server-wide scope on a harmless name",
+        "SET GLOBAL time_zone = 'UTC'",
+    ),
+    (
+        "hold name, session prefix",
+        "SET @@session.transaction_read_only = 0",
+    ),
+    ("hold name, doubled-at", "SET @@transaction_read_only = OFF"),
+    (
+        "hold name, session keyword",
+        "SET SESSION transaction_read_only = 0",
+    ),
+    ("hold name", "SET transaction_read_only = off"),
+    (
+        "hold name, default",
+        "SET default_transaction_read_only = off",
+    ),
+    ("hold name, older spelling", "SET tx_read_only = 0"),
+    (
+        "hold name, local",
+        "SET LOCAL default_transaction_read_only = off",
+    ),
+    ("user variable", "SET @x = 1"),
+    (
+        "session setting, doubled-at",
+        "SET @@session.time_zone = 'UTC'",
+    ),
+    (
+        "session setting, doubled-at, bare",
+        "SET @@time_zone = 'UTC'",
+    ),
+    ("time zone", "SET TIME ZONE 'UTC'"),
+    ("charset, unicode", "SET NAMES utf8mb4"),
+    ("charset, multibyte trail", "SET NAMES gbk"),
+    ("charset, default", "SET NAMES DEFAULT"),
+    ("unknown setting", "SET x = 1"),
+    ("navigation setting", "SET search_path TO other"),
+    ("navigation setting, equals", "SET search_path = other"),
+    ("comfort setting", "SET statement_timeout = 1000"),
+    ("comfort setting, time zone", "SET timezone = 'UTC'"),
+    ("comfort setting, no count", "SET NOCOUNT ON"),
+    ("comfort setting, auto-commit", "SET autocommit = 0"),
+    ("comfort setting, time zone name", "SET time_zone = 'UTC'"),
+];
+
+/// A `SET` whose verdict is the maximum over its assignments, written both
+/// ways round, and the same `SET` sitting inside the blocks the parser lets one
+/// hide in. Each pair must record the same verdict.
+const SESSION_SHAPES: &[(&str, &str)] = &[
+    (
+        "hold name after a user variable",
+        "SET @x = 1, @@session.transaction_read_only = 0",
+    ),
+    (
+        "hold name before a user variable",
+        "SET @@session.transaction_read_only = 0, @x = 1",
+    ),
+    ("two user variables", "SET @x = 1, @y = 2"),
+    ("user variable then unknown setting", "SET @x = 1, y = 2"),
+    ("unknown setting then user variable", "SET y = 2, @x = 1"),
+    ("two unknown settings", "SET x = 1, y = 2"),
+    (
+        "identity change in an IF block",
+        "IF 1 = 1 THEN SET ROLE other; END IF",
+    ),
+    ("identity change in a T-SQL IF", "IF 1 = 1 SET ROLE other"),
+    (
+        "identity change in a scripting block",
+        "BEGIN SET ROLE other; END",
+    ),
+    (
+        "unknown setting in an IF block",
+        "IF 1 = 1 THEN SET x = 1; END IF",
+    ),
+    ("unknown setting in a T-SQL IF", "IF 1 = 1 SET x = 1"),
+    (
+        "unknown setting in a scripting block",
+        "BEGIN SET x = 1; END",
+    ),
+    (
+        "navigation setting in an IF block",
+        "IF 1 = 1 THEN SET search_path TO other; END IF",
+    ),
+    (
+        "navigation setting in a scripting block",
+        "BEGIN SET search_path TO other; END",
+    ),
+    (
+        "write opening in a scripting block",
+        "BEGIN START TRANSACTION READ WRITE; END",
+    ),
+    (
+        "identity change under an analysing explain",
+        "EXPLAIN ANALYZE SET ROLE other",
+    ),
+    (
+        "identity change under a plain explain",
+        "EXPLAIN SET ROLE other",
+    ),
+    (
+        "two statements, hold name second",
+        "SELECT 1; SET transaction_read_only = 0",
+    ),
+    (
+        "two statements, user variable second",
+        "SELECT 1; SET @x = 1",
+    ),
+];
+
+#[test]
+fn session_setting_corpus_per_engine() {
+    let mut out = String::new();
+    for engine in Engine::ALL {
+        for (case, sql) in SESSION_RULES.iter().chain(SESSION_SHAPES) {
+            record(&mut out, engine, case, sql);
+        }
+    }
+    check("hardening_settings", &out);
+}
