@@ -69,6 +69,8 @@ const CALLS: &[(&str, &str)] = &[
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
     ("load_extension", "'x'"),
+    ("query", "'select 1'"),
+    ("json_execute_serialized_sql", "'{}'"),
     ("system$cancel_all_queries", "1"),
     ("system$cancel_query", "'q'"),
     ("system$abort_session", "1"),
@@ -186,6 +188,10 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "duckdb text executor by name",
         "SELECT * FROM query_table('s')",
+    ),
+    (
+        "duckdb serialized-plan executor",
+        "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')'))",
     ),
     (
         "control column named like the duckdb text executor",
