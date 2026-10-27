@@ -570,6 +570,37 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "dblink_connect_u",
             "dblink_send_query",
         ],
+        // What a user's own `SET` may change on a Read-only profile without
+        // asking. Left off on purpose: the hold's own two names, `role` and
+        // `session_authorization`, the switches that turn the server's checks
+        // off, and everything that changes how a quote or a backslash is read.
+        plain_settings: &[
+            "search_path",
+            "timezone",
+            "statement_timeout",
+            "lock_timeout",
+            "idle_in_transaction_session_timeout",
+            "idle_session_timeout",
+            "application_name",
+            "extra_float_digits",
+            "datestyle",
+            "intervalstyle",
+            "client_min_messages",
+            "bytea_output",
+            "lc_monetary",
+            "lc_numeric",
+            "lc_time",
+            "default_text_search_config",
+            "work_mem",
+            "jit",
+            "random_page_cost",
+            "max_parallel_workers_per_gather",
+            "enable_seqscan",
+            "default_transaction_isolation",
+            "default_transaction_deferrable",
+            "transaction_isolation",
+            "xmloption",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -625,6 +656,29 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         // The armed read-only transaction stops none of the named-lock calls.
         // No sequences, so no `nextval`.
         denied_functions: &["get_lock", "release_lock", "release_all_locks"],
+        // Left off on purpose: both spellings of the hold, the server-wide
+        // switches, and `sql_mode`, whose `NO_BACKSLASH_ESCAPES` and
+        // `ANSI_QUOTES` change how every later statement is lexed and are not
+        // stopped by the armed hold.
+        plain_settings: &[
+            "time_zone",
+            "autocommit",
+            "max_execution_time",
+            "sql_select_limit",
+            "wait_timeout",
+            "interactive_timeout",
+            "lock_wait_timeout",
+            "innodb_lock_wait_timeout",
+            "net_read_timeout",
+            "net_write_timeout",
+            "group_concat_max_len",
+            "lc_time_names",
+            "div_precision_increment",
+            "default_week_format",
+            "transaction_isolation",
+            "sql_big_selects",
+            "max_join_size",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -686,6 +740,30 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
             "nextval",
             "setval",
         ],
+        // The same list as MySQL's with the names MariaDB spells differently:
+        // `max_statement_time` for the statement timeout, and `tx_isolation`
+        // beside `transaction_isolation`. Its `tx_read_only` is a hold name and
+        // stays off, as `transaction_read_only` does.
+        plain_settings: &[
+            "time_zone",
+            "autocommit",
+            "max_statement_time",
+            "sql_select_limit",
+            "wait_timeout",
+            "interactive_timeout",
+            "lock_wait_timeout",
+            "innodb_lock_wait_timeout",
+            "net_read_timeout",
+            "net_write_timeout",
+            "group_concat_max_len",
+            "lc_time_names",
+            "div_precision_increment",
+            "default_week_format",
+            "transaction_isolation",
+            "tx_isolation",
+            "sql_big_selects",
+            "max_join_size",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -735,6 +813,10 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
         // Inert while `rusqlite` is built without its `load_extension`
         // feature, and listed so enabling it cannot quietly open a hole.
         denied_functions: &["load_extension"],
+        // No `plain_settings`, deliberately: SQLite has no `SET` statement. It
+        // configures through `PRAGMA`, a different statement type that already
+        // needs Full, so a `SET` here is one the server rejects and stopping it
+        // costs nobody a working statement.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -776,6 +858,8 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
         // Inert for the same reason as SQLite's. The rest of Turso's function
         // set has not been surveyed.
         denied_functions: &["load_extension"],
+        // No `plain_settings`, for the reason SQLite has none: configuration is
+        // `PRAGMA`, which is already Full, and there is no `SET` to allow.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -820,6 +904,25 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // file, which a profile does not ask for yet.
         // Nothing holds a session read-only, so an advance on a sequence runs.
         denied_functions: &["nextval", "setval"],
+        // Names verified in `duckdb_settings()`. The configuration ratchets
+        // (`enable_external_access`, `lock_configuration`) are left off on
+        // purpose: once set they cannot be undone, and one in a user's buffer
+        // would end DBDelve's own CSV, Parquet and Excel opening for the rest
+        // of the session. The extension, directory and secret settings are off
+        // for the same reason.
+        plain_settings: &[
+            "threads",
+            "memory_limit",
+            "max_memory",
+            "timezone",
+            "calendar",
+            "search_path",
+            "schema",
+            "default_order",
+            "default_null_order",
+            "preserve_insertion_order",
+            "enable_progress_bar",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -886,6 +989,10 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
             "nextval",
             "getnextval",
         ],
+        // No `plain_settings`, deliberately: nothing a `SET` sets outlives one
+        // request on the SQL API, which answers even `USE` with a refusal, so
+        // an allow-list would protect nothing. A `SET` here prompts and
+        // changes nothing; the one extra arm is cheaper than a special case.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -957,6 +1064,30 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         // and nothing holds a session read-only. A scalar function cannot have
         // a side effect in T-SQL, so none is listed.
         denied_functions: &["openquery", "openrowset", "opendatasource"],
+        // Names from the engine's own category table. Left off on purpose:
+        // `quoted_identifier`, which is read at parse time and changes how a
+        // double quote is read, `implicit_transactions`, which DBDelve's
+        // auto-commit switch relies on, and `identity_insert`. `set statistics`
+        // and `set transaction isolation level` are read from the parse
+        // instead, not from here.
+        plain_settings: &[
+            "nocount",
+            "rowcount",
+            "textsize",
+            "language",
+            "dateformat",
+            "datefirst",
+            "deadlock_priority",
+            "lock_timeout",
+            "arithabort",
+            "arithignore",
+            "numeric_roundabort",
+            "ansi_nulls",
+            "ansi_padding",
+            "ansi_warnings",
+            "concat_null_yields_null",
+            "xact_abort",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -993,8 +1124,8 @@ pub(crate) const MONGODB: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
-    // No `denied_functions`: this is not SQL, and its own closed tables decide
-    // what a Read-only profile may run.
+    // No `denied_functions` or `plain_settings`: this is not SQL, and its own
+    // closed tables decide what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,
@@ -1032,8 +1163,8 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
-    // No `denied_functions`: this is not SQL, and its own closed tables decide
-    // what a Read-only profile may run.
+    // No `denied_functions` or `plain_settings`: this is not SQL, and its own
+    // closed tables decide what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,
