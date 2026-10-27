@@ -179,6 +179,18 @@ const SHAPES: &[(&str, &str)] = &[
         "control denied name inside a literal with no executor",
         "SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)'",
     ),
+    (
+        "duckdb text executor",
+        "SELECT * FROM query('select nextval(''s'')')",
+    ),
+    (
+        "duckdb text executor by name",
+        "SELECT * FROM query_table('s')",
+    ),
+    (
+        "control column named like the duckdb text executor",
+        "SELECT t.query FROM t",
+    ),
 ];
 
 fn record(out: &mut String, engine: Engine, case: &str, sql: &str) {
