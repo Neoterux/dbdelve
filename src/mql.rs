@@ -4071,6 +4071,30 @@ mod tests {
     }
 
     #[test]
+    fn javascript_operators_need_full_at_any_depth_and_in_every_call_shape() {
+        for text in [
+            "db.c.find({$where: 'sleep(1000)'})",
+            "db.c.aggregate([{$addFields: {x: {$function: {body: 'f', args: [], lang: 'js'}}}}])",
+            "db.c.aggregate([{$group: {_id: 1, x: {$accumulator: {init: 'f', accumulate: 'g', accumulateArgs: [], merge: 'h', lang: 'js'}}}}])",
+            "db.c.find({$and: [{a: {$or: [{$where: '1'}]}}]})",
+            "db.c.aggregate([{$lookup: {from: 'o', pipeline: [{$match: {$where: '1'}}], as: 'z'}}])",
+            "db.c.find({}).hint({$where: '1'})",
+            "db.runCommand({find: 'c', filter: {$where: '1'}})",
+            "db.runCommand({aggregate: 'c', pipeline: [{$match: {$where: '1'}}], cursor: {}})",
+            "db.c.find({\"\\u0024where\": '1'})",
+        ] {
+            assert_eq!(classify(text), Verdict::FULL, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_string_where_or_wants_documents_is_still_a_read_in_a_typed_statement() {
+        for text in ["db.c.find({$or: 'x'})", "db.c.find({a: '$where'})"] {
+            assert_eq!(classify(text), Verdict::READ, "{text}");
+        }
+    }
+
+    #[test]
     fn drops_classify_as_destructive() {
         for text in [
             "db.c.aggregate([{$match: {}}, {$out: 'd'}])",
