@@ -2842,6 +2842,16 @@ fn touches_session(engine: Engine, sql: &str) -> bool {
 ///
 /// Separate from [`SESSION_FUNCTIONS`], which answers what the session keeps;
 /// this answers whether Read-only may run the call. A name may be on both.
+///
+/// A call the list does not name stays a read: a user-defined function keeps
+/// its statement. A denied call carried as text inside another function is
+/// seen only because that other function is itself listed, since the scan
+/// compares names and never reads what a string says. The list is therefore
+/// best-effort inside a `SELECT`, not a boundary. Where an engine holds
+/// Read-only server-side, the hold is the boundary, and the list is what stops
+/// the statements that would release it. The same root cause reached the list
+/// three times: a spelling of a name, a sibling family of names, and the
+/// functions that execute their text argument.
 fn calls_denied_function(engine: Engine, sql: &str) -> bool {
     let denied = engine.spec().sql.denied_functions;
     // An engine that lists nothing is judged by the parse alone, as it was
