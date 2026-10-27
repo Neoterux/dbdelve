@@ -7582,6 +7582,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_name_spelled_as_a_unicode_escape_is_read_as_a_denied_call() {
+        use crate::db::Engine;
+
+        for sql in [
+            // The verifier's own repro: the server decodes `\006f` to an `o`.
+            r#"SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false)"#,
+            // The same form spelling the name plainly stops on the name alone.
+            r#"SELECT U&"set_config"('default_transaction_read_only', 'off', false)"#,
+            r#"SELECT pg_catalog.U&"set_c\006fnfig"('a', 'b', false)"#,
+            // The lower-case prefix is the same escape to the server.
+            r#"SELECT u&"set_c\006fnfig"('a', 'b', false)"#,
+        ] {
+            assert!(is_stopped(Engine::Postgres, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_spaced_bit_and_of_a_quoted_column_is_still_a_read() {
+        for engine in sql_engines() {
+            for sql in [
+                r#"SELECT U & "x" FROM t"#,
+                "SELECT U\n&\t\"x\" FROM t",
+                r#"SELECT U/**/&"x" FROM t"#,
+                "SELECT U&x FROM t",
+            ] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_engine_that_lists_no_function_is_unmoved_by_the_escaped_spelling() {
+        let sql = r#"SELECT U&"set_c\006fnfig"('a', 'b', false)"#;
+        for engine in sql_engines().filter(|e| e.spec().sql.denied_functions.is_empty()) {
+            assert!(is_plain_read(engine, sql), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_comment_only_submission_is_unmoved_by_the_escaped_spelling_rule() {
+        for engine in sql_engines() {
+            for sql in ["", "   ", "-- U&\"x\"", "/* U&\"x\" */"] {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_escaped_call_and_a_plain_denied_call_classify_the_same_whichever_comes_first() {
+        use crate::db::Engine;
+
+        let one = classify(
+            Engine::Postgres,
+            r#"SELECT U&"set_c\006fnfig"('a', 'b', false), nextval('s')"#,
+        );
+        let other = classify(
+            Engine::Postgres,
+            r#"SELECT nextval('s'), U&"set_c\006fnfig"('a', 'b', false)"#,
+        );
+        assert!(one.mode > Mode::ReadOnly);
+        assert_eq!(one.mode, other.mode);
+        assert_eq!(one.destructive, other.destructive);
+    }
+
     /// The eight engines whose requests are SQL, which is where a `SET` means
     /// something to `classify`.
     fn sql_engines() -> impl Iterator<Item = crate::db::Engine> {
