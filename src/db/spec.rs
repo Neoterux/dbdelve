@@ -942,8 +942,23 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // `explain.rs` does not read yet. No `read_only_session`: an open
         // database has no session switch; read-only is a way to open the
         // file, which a profile does not ask for yet.
-        // Nothing holds a session read-only, so an advance on a sequence runs.
-        denied_functions: &["nextval", "setval"],
+        // Nothing holds a session read-only, so an advance on a sequence runs,
+        // and the classifier is the only thing between a statement and its
+        // effect. The text executors were observed, not assumed, on the
+        // embedded build `SELECT version()` reports as `v2.0.0-dev88614`
+        // (crate `duckdb` 1.20000.0), with the sequence counter as the canary:
+        // `SELECT * FROM query('select nextval(...)')` moved it from 3 to 4,
+        // and `SELECT * FROM json_execute_serialized_sql(json_serialize_sql(
+        // 'select nextval(...)'))` moved it from 4 to 5, so both are listed.
+        // `query_table` is not: it resolves its argument as a table name and
+        // refuses the rest (`query_table('select 1')` answers "Table with name
+        // select 1 does not exist"), so it runs no text and listing it would
+        // only stop a read. `json_serialize_sql` and `json_deserialize_sql`
+        // turn text into JSON and back and run nothing. `duckdb_functions()`
+        // shows no other function with an argument named like a query. Listing
+        // `query` also stops `t.query`, a column of that name, until the
+        // profile is upgraded: the same accepted cost as `t.nextval`.
+        denied_functions: &["nextval", "setval", "query", "json_execute_serialized_sql"],
         // Names verified in `duckdb_settings()`. The configuration ratchets
         // (`enable_external_access`, `lock_configuration`) are left off on
         // purpose: once set they cannot be undone, and one in a user's buffer

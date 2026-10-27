@@ -53,6 +53,8 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -97,6 +99,7 @@ source: src/sql_snapshots.rs
 [postgres] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -150,6 +153,8 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -194,6 +199,7 @@ source: src/sql_snapshots.rs
 [mysql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -247,6 +253,8 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -291,6 +299,7 @@ source: src/sql_snapshots.rs
 [mariadb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -344,6 +353,8 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT load_extension('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -388,6 +399,7 @@ source: src/sql_snapshots.rs
 [sqlite] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -441,6 +453,8 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT load_extension('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -485,6 +499,7 @@ source: src/sql_snapshots.rs
 [turso] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -538,6 +553,8 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT query('select 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -580,9 +597,10 @@ source: src/sql_snapshots.rs
 [duckdb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -635,6 +653,8 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -679,6 +699,7 @@ source: src/sql_snapshots.rs
 [snowflake] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -732,6 +753,8 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -776,6 +799,7 @@ source: src/sql_snapshots.rs
 [mssql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mongodb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -829,6 +853,8 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_all_locks() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT load_extension('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT query('select 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -873,6 +899,7 @@ source: src/sql_snapshots.rs
 [mongodb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT nextval('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -926,6 +953,8 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT load_extension('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT query('select 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -970,4 +999,5 @@ source: src/sql_snapshots.rs
 [redis] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
