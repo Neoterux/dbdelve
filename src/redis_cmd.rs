@@ -7,9 +7,11 @@
 //! addition; redis-cli would send it.
 //!
 //! Classifying a command is a lookup by its name (and subcommand, where the
-//! word after the name decides: `CONFIG GET` reads, `CONFIG SET` is
-//! destructive). The server has no Read-only hold to fall back on, so this is
-//! the whole boundary, and a name the table does not know is unreadable.
+//! word after the name decides: `CONFIG GET` writes nothing and is
+//! rated a write for what it returns, `requirepass` and `masterauth`, while
+//! `CONFIG SET` is destructive). The server has no Read-only hold to fall back
+//! on, so this is the whole boundary, and a name the table does not know is
+//! unreadable.
 
 use std::ops::Range;
 
@@ -378,6 +380,11 @@ fn kind(command: &Command) -> Option<Kind> {
         // These two answer with what a Read-only profile should not be handed
         // unasked: `requirepass` and `masterauth`, and every connected
         // client's address and name. Their siblings reveal nothing of the kind.
+        // The rule is deliberately limited to plaintext secrets and client
+        // enumeration: the password hashes `ACL LIST` and `ACL GETUSER` return,
+        // and the client fields in `ACL LOG` and `SLOWLOG GET`, are knowingly
+        // left as reads. Widening it changes what a Read-only profile may run,
+        // which is a product decision that has not been made.
         ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
