@@ -10,7 +10,7 @@ mod explain;
 mod fake_spec;
 mod filters;
 mod gates;
-mod hardening;
+pub(crate) mod hardening;
 mod previews;
 mod redis_writes;
 mod rows;
