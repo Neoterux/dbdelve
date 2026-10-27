@@ -612,15 +612,27 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
         }
 
         if engine == Engine::Postgres {
-            let disarm = "SELECT set_config('default_transaction_read_only', 'off', false)";
-            above_a_read(disarm);
-            hold(true);
-            refused();
-            subject.run(scenario, disarm, Fetch::default());
-            // The write that was refused a moment ago now goes through.
-            subject.run(scenario, &insert, Fetch::default());
-            hold(false);
-            controlled();
+            // The server decodes `\006f` to an `o` where the lexer reports the
+            // raw text, so the second spelling is the same call the first is.
+            for disarm in [
+                "SELECT set_config('default_transaction_read_only', 'off', false)",
+                r#"SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false)"#,
+            ] {
+                above_a_read(disarm);
+                hold(true);
+                refused();
+                subject.run(scenario, disarm, Fetch::default());
+                // The write that was refused a moment ago now goes through.
+                subject.run(scenario, &insert, Fetch::default());
+                hold(false);
+                controlled();
+                // The canary is the same row for both spellings.
+                subject.run(
+                    scenario,
+                    &sql_delete(engine, schema, canary),
+                    Fetch::default(),
+                );
+            }
         }
     }
 
