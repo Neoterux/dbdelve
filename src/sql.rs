@@ -7630,6 +7630,43 @@ mod tests {
     }
 
     #[test]
+    fn a_large_object_writer_is_stopped_and_a_large_object_reader_is_not() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT lo_from_bytea(1, 'abc'::bytea)",
+            "SELECT lo_put(1, 0, 'abc'::bytea)",
+            "SELECT lo_creat(-1)",
+            "SELECT lowrite(0, 'abc'::bytea)",
+            "SELECT lo_truncate(0, 1)",
+            "SELECT lo_truncate64(0, 1)",
+        ] {
+            assert!(is_stopped(Engine::Postgres, sql), "{sql}");
+        }
+        for sql in ["SELECT lo_get(1)", "SELECT loread(0, 10)"] {
+            for engine in sql_engines() {
+                assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_stat_reset_call_is_stopped_on_postgres() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT pg_stat_reset()",
+            "SELECT pg_stat_reset_shared('bgwriter')",
+            "SELECT pg_stat_reset_single_table_counters(1)",
+            "SELECT pg_stat_reset_single_function_counters(1)",
+            "SELECT pg_stat_reset_slru('CommitTs')",
+            "SELECT pg_stat_reset_replication_slot('s')",
+        ] {
+            assert!(is_stopped(Engine::Postgres, sql), "{sql}");
+        }
+    }
+
+    #[test]
     fn a_spaced_bit_and_of_a_quoted_column_is_still_a_read() {
         for engine in sql_engines() {
             for sql in [
