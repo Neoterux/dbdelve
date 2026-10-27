@@ -13,7 +13,7 @@ use crate::{
 /// Function calls whose verdict the deny-list moves, one name and its arguments
 /// each, written as a plain `SELECT` so the scalar position is the one under
 /// test.
-const CALLS: [(&str, &str); 31] = [
+const CALLS: &[(&str, &str)] = &[
     (
         "set_config",
         "'default_transaction_read_only', 'off', false",
@@ -48,11 +48,22 @@ const CALLS: [(&str, &str); 31] = [
     ("dblink_connect", "'c', 'dbname=x'"),
     ("dblink_connect_u", "'c', 'dbname=x'"),
     ("dblink_send_query", "'c', 'SELECT 1'"),
+    ("get_lock", "'k', 1"),
+    ("release_lock", "'k'"),
+    ("release_all_locks", ""),
+    ("load_extension", "'x'"),
+    ("system$cancel_all_queries", "1"),
+    ("system$cancel_query", "'q'"),
+    ("system$abort_session", "1"),
+    ("getnextval", "seq1"),
+    ("openquery", "srv, 'SELECT 1'"),
+    ("openrowset", "'SQLNCLI', 'x', 'DELETE FROM t'"),
+    ("opendatasource", "'SQLNCLI', 'x'"),
 ];
 
 /// The same call in each position the parser can put one, and the controls that
 /// must never move: a function nobody listed, and a projection calling nothing.
-const SHAPES: [(&str, &str); 10] = [
+const SHAPES: &[(&str, &str)] = &[
     ("table position", "SELECT * FROM nextval('s')"),
     (
         "lateral table position",
@@ -79,6 +90,43 @@ const SHAPES: [(&str, &str); 10] = [
         "two denied calls reversed",
         "SELECT set_config('a', 'b', false), nextval('s')",
     ),
+    (
+        "openquery in table position",
+        "SELECT * FROM OPENQUERY(srv, 'SELECT 1')",
+    ),
+    (
+        "openrowset in table position",
+        "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t')",
+    ),
+    (
+        "opendatasource in table position",
+        "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x')",
+    ),
+    (
+        "table function wrapper",
+        "SELECT * FROM TABLE(GETNEXTVAL(seq1))",
+    ),
+    ("sequence without parentheses", "SELECT s.nextval"),
+    (
+        "sequence without parentheses, qualified",
+        "SELECT db.s.nextval FROM t",
+    ),
+    ("control qualified column", "SELECT t.id FROM t"),
+    (
+        "control qualified column sharing no listed name",
+        "SELECT t.nextvalue FROM t",
+    ),
+    ("control session read lastval", "SELECT lastval()"),
+    ("control session read currval", "SELECT currval('s')"),
+    ("control last_insert_id", "SELECT last_insert_id()"),
+    ("control sleep", "SELECT sleep(1)"),
+    ("control file reader", "SELECT * FROM read_csv('f.csv')"),
+    ("control file string factor", "SELECT * FROM 'f.csv'"),
+    (
+        "control pg_read_file",
+        "SELECT pg_read_file('/etc/hostname')",
+    ),
+    ("control load_file", "SELECT LOAD_FILE('/etc/hostname')"),
     ("control user-defined call", "SELECT my_function(1)"),
     ("control plain projection", "SELECT a, b FROM t"),
 ];
