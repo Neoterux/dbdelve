@@ -7146,4 +7146,156 @@ mod tests {
         assert_eq!(one.mode, other.mode);
         assert_eq!(one.destructive, other.destructive);
     }
+
+    #[test]
+    fn a_lock_call_needs_more_than_read_only_on_both_mysql_engines() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for sql in [
+                "SELECT get_lock('k', 1)",
+                "SELECT release_lock('k')",
+                "SELECT release_all_locks()",
+            ] {
+                assert!(
+                    classify(engine, sql).mode > Mode::ReadOnly,
+                    "{engine:?}: {sql}"
+                );
+            }
+            for sql in ["SELECT lastval()", "SELECT last_insert_id()"] {
+                assert_eq!(
+                    classify(engine, sql).mode,
+                    Mode::ReadOnly,
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sequence_advance_needs_more_than_read_only_only_where_sequences_exist() {
+        use crate::db::Engine;
+
+        for engine in [Engine::MariaDb, Engine::DuckDb] {
+            for sql in ["SELECT nextval('s')", "SELECT setval('s', 1)"] {
+                assert!(
+                    classify(engine, sql).mode > Mode::ReadOnly,
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            classify(Engine::MySql, "SELECT nextval('s')").mode,
+            Mode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn a_pass_through_table_function_needs_more_than_read_only_on_sql_server() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT * FROM OPENQUERY(srv, 'SELECT 1')",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t')",
+            "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x')",
+        ] {
+            assert!(
+                classify(Engine::SqlServer, sql).mode > Mode::ReadOnly,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_control_call_and_a_bare_sequence_read_need_more_than_read_only_on_snowflake() {
+        use crate::db::Engine;
+
+        for sql in [
+            "SELECT system$cancel_all_queries(1)",
+            "SELECT system$cancel_query('q')",
+            "SELECT system$abort_session(1)",
+            "SELECT * FROM TABLE(GETNEXTVAL(seq1))",
+            "SELECT s.nextval",
+            "SELECT db.s.nextval FROM t",
+        ] {
+            assert!(
+                classify(Engine::Snowflake, sql).mode > Mode::ReadOnly,
+                "{sql}"
+            );
+        }
+        for sql in ["SELECT t.id FROM t", "SELECT t.nextvalue FROM t"] {
+            assert_eq!(
+                classify(Engine::Snowflake, sql).mode,
+                Mode::ReadOnly,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extension_loader_needs_more_than_read_only_on_both_sqlite_engines() {
+        use crate::db::Engine;
+
+        for engine in [Engine::Sqlite, Engine::Turso] {
+            assert!(
+                classify(engine, "SELECT load_extension('x')").mode > Mode::ReadOnly,
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_or_url_reader_stays_a_read_on_every_engine() {
+        use crate::db::{Engine, Syntax};
+
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() == Syntax::Sql)
+        {
+            for name in ["read_csv", "read_text", "pg_read_file", "load_file", "glob"] {
+                assert!(
+                    !engine.spec().sql.denied_functions.contains(&name),
+                    "{engine:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_engine_not_read_as_sql_lists_no_function() {
+        use crate::db::{Engine, Syntax};
+
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() != Syntax::Sql)
+        {
+            assert!(engine.spec().sql.denied_functions.is_empty(), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_another_engine_lists_does_not_raise_this_engines_verdict() {
+        use crate::db::{Engine, Syntax};
+
+        let sql_engines = || {
+            Engine::ALL
+                .into_iter()
+                .filter(|engine| engine.syntax() == Syntax::Sql)
+        };
+        for lister in sql_engines() {
+            for name in lister.spec().sql.denied_functions {
+                for engine in sql_engines() {
+                    if engine.spec().sql.denied_functions.contains(name) {
+                        continue;
+                    }
+                    let verdict = classify(engine, &format!("SELECT {name}()"));
+                    // A dialect that cannot read the name at all is refused
+                    // for that, which is not what is under test.
+                    if verdict.destructive.is_empty() {
+                        assert_eq!(verdict.mode, Mode::ReadOnly, "{engine:?}: {name}");
+                    }
+                }
+            }
+        }
+    }
 }
