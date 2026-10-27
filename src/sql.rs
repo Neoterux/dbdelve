@@ -2858,6 +2858,11 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
     let Ok(tokens) = tokens else {
         return true;
     };
+    // Read before the whitespace is dropped: the whitespace is what separates a
+    // bit-and from the escape form.
+    if escapes_an_identifier(&tokens) {
+        return true;
+    }
     let mut tokens = tokens
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)))
@@ -2874,6 +2879,31 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
         previous = Some(token);
     }
     false
+}
+
+/// Whether the tokens spell an identifier as a unicode escape, `U&"..."`: an
+/// unquoted `U`, an ampersand and a double-quoted word, written with nothing
+/// between them.
+///
+/// Postgres decodes the escape and the lexer reports the raw text, so the name
+/// the server calls is not the name [`calls_denied_function`] would compare.
+/// The form is the answer rather than the name: the escape character is
+/// changeable by a `UESCAPE` clause, so a decoder would be a second lexer kept
+/// in step with the server by hand, and a decoded name can itself be escaped.
+///
+/// One false positive, on an engine that lists any function: a bit-and of a
+/// double-quoted column written with no whitespace. It fails towards a prompt,
+/// and a space makes it a read again.
+fn escapes_an_identifier(tokens: &[Token]) -> bool {
+    tokens.windows(3).any(|window| {
+        matches!(
+            window,
+            [Token::Word(prefix), Token::Ampersand, Token::Word(name)]
+                if prefix.quote_style.is_none()
+                    && prefix.value.eq_ignore_ascii_case("u")
+                    && name.quote_style == Some('"')
+        )
+    })
 }
 
 /// What running `sql` leaves on its session that a fresh connection to the
@@ -7614,10 +7644,20 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_that_lists_no_function_is_unmoved_by_the_escaped_spelling() {
+    fn an_engine_that_lists_no_function_never_reads_the_escaped_spelling_as_a_call() {
+        use crate::db::Engine;
+
         let sql = r#"SELECT U&"set_c\006fnfig"('a', 'b', false)"#;
-        for engine in sql_engines().filter(|e| e.spec().sql.denied_functions.is_empty()) {
-            assert!(is_plain_read(engine, sql), "{engine:?}");
+        let listing_nothing: Vec<_> = Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.spec().sql.denied_functions.is_empty())
+            .collect();
+        // Every SQL engine lists something, so the engines asked are the two
+        // whose requests are not SQL. The assertion fails if that changes,
+        // rather than letting the loop below pass over nothing.
+        assert!(!listing_nothing.is_empty());
+        for engine in listing_nothing {
+            assert!(!calls_denied_function(engine, sql), "{engine:?}");
         }
     }
 
