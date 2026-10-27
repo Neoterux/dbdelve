@@ -533,6 +533,9 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
             Engine::Postgres => {
                 unwind.push("SELECT pg_advisory_unlock_all()".to_string());
                 unwind.push("SELECT lo_unlink(970970)".to_string());
+                // Queued before anything creates it, so a panic part-way
+                // through the write cases still removes it.
+                unwind.push("SELECT lo_unlink(970971)".to_string());
                 (
                     vec![
                         ("an advisory lock", "SELECT pg_advisory_lock(970970)"),
@@ -633,6 +636,73 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                     Fetch::default(),
                 );
             }
+
+            // The three calls that wrote under the hold when the family was
+            // reviewed, in order, each rated above a read first. `lo_creat`,
+            // `lowrite` and `lo_truncate64` take the same path and would need
+            // their own oid bookkeeping for no new evidence; the corpus covers
+            // their classification.
+            let object = "970971";
+            let read_back = format!("SELECT convert_from(lo_get({object}), 'UTF8')");
+            assert_eq!(
+                rated(&read_back),
+                sql::Mode::ReadOnly,
+                "{at}: `{read_back}`"
+            );
+            hold(true);
+            for write in [
+                format!("SELECT lo_from_bytea({object}, 'abc'::bytea)"),
+                format!("SELECT lo_put({object}, 0, 'xyz'::bytea)"),
+                format!("SELECT lo_truncate(lo_open({object}, 131072), 1)"),
+            ] {
+                above_a_read(&write);
+                subject.run(scenario, &write, Fetch::default());
+            }
+            // The server wrote while the hold was armed: that is the evidence.
+            assert_eq!(
+                cell(&subject.run(scenario, &read_back, Fetch::default())),
+                "x",
+                "{at}: the object was not rewritten and truncated under the hold"
+            );
+            hold(false);
+            controlled();
+
+            // The catalog is the authority on the family. A name neither list
+            // knows fails here by name, which is the point rather than a
+            // flake: a later server version added a function, and what it does
+            // is a decision. The namespace keeps an extension's function out,
+            // and the escaped underscore keeps the prefix from widening to
+            // every name that begins with `lo`.
+            let reads = [
+                "lo_get",
+                "loread",
+                "lo_open",
+                "lo_close",
+                "lo_lseek",
+                "lo_lseek64",
+                "lo_tell",
+                "lo_tell64",
+            ];
+            let family = subject.run(
+                scenario,
+                "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'pg_catalog' \
+                 AND (p.proname LIKE 'lo\\_%' OR p.proname IN ('loread', 'lowrite')) \
+                 ORDER BY 1",
+                Fetch::default(),
+            );
+            let listed = engine.spec().sql.denied_functions;
+            let unlisted: Vec<_> = family
+                .rows
+                .iter()
+                .filter_map(|row| row.get(0))
+                .filter(|name| !listed.contains(name) && !reads.contains(name))
+                .collect();
+            assert!(
+                unlisted.is_empty(),
+                "{at}: large-object functions on neither the deny-list nor the reads: {unlisted:?}"
+            );
         }
     }
 
