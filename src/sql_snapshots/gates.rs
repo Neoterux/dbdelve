@@ -372,6 +372,12 @@ fn mongo_and_redis_gate_corpus() {
         "db.runCommand({drop: \"accounts\"})",
         "{c}.bulkWrite([])",
         "{c}.findOneAndDelete({})",
+        "{c}.aggregate([{\"$group\": {\"_id\": 1, \"x\": {\"$accumulator\": {\"init\": \"f\", \"accumulate\": \"g\", \"accumulateArgs\": [], \"merge\": \"h\", \"lang\": \"js\"}}}}])",
+        "{c}.find({\"$and\": [{\"a\": {\"$or\": [{\"$where\": \"1\"}]}}]})",
+        "{c}.aggregate([{\"$lookup\": {\"from\": \"o\", \"pipeline\": [{\"$match\": {\"$where\": \"1\"}}], \"as\": \"z\"}}])",
+        "db.runCommand({find: \"accounts\", filter: {\"$where\": \"sleep(1000)\"}})",
+        "db.runCommand({aggregate: \"accounts\", pipeline: [{\"$match\": {\"$where\": \"1\"}}], cursor: {}})",
+        "{c}.find({\"$or\": \"x\"})",
     ]
     .iter()
     .map(|text| text.replace("{c}", c))

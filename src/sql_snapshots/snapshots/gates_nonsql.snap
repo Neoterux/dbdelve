@@ -183,6 +183,30 @@ source: src/sql_snapshots.rs
   |db.getCollection("accounts").findOneAndDelete({})|
   = write_on=false select=false classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None confirm[none]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[drop]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[truncate]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[unfiltered]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None confirm[all3]=ro:Some(Upgrade(ReadWrite)),rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
 
+[mongodb] "db.getCollection(\"accounts\").aggregate([{\"$group\": {\"_id\": 1, \"x\": {\"$accumulator\": {\"init\": \"f\", \"accumulate\": \"g\", \"accumulateArgs\": [], \"merge\": \"h\", \"lang\": \"js\"}}}}])"
+  |db.getCollection("accounts").aggregate([{"$group": {"_id": 1, "x": {"$accumulator": {"init": "f", "accumulate": "g", "accumulateArgs": [], "merge": "h", "lang": "js"}}}}])|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[mongodb] "db.getCollection(\"accounts\").find({\"$and\": [{\"a\": {\"$or\": [{\"$where\": \"1\"}]}}]})"
+  |db.getCollection("accounts").find({"$and": [{"a": {"$or": [{"$where": "1"}]}}]})|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[mongodb] "db.getCollection(\"accounts\").aggregate([{\"$lookup\": {\"from\": \"o\", \"pipeline\": [{\"$match\": {\"$where\": \"1\"}}], \"as\": \"z\"}}])"
+  |db.getCollection("accounts").aggregate([{"$lookup": {"from": "o", "pipeline": [{"$match": {"$where": "1"}}], "as": "z"}}])|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[mongodb] "db.runCommand({find: \"accounts\", filter: {\"$where\": \"sleep(1000)\"}})"
+  |db.runCommand({find: "accounts", filter: {"$where": "sleep(1000)"}})|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[mongodb] "db.runCommand({aggregate: \"accounts\", pipeline: [{\"$match\": {\"$where\": \"1\"}}], cursor: {}})"
+  |db.runCommand({aggregate: "accounts", pipeline: [{"$match": {"$where": "1"}}], cursor: {}})|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
+[mongodb] "db.getCollection(\"accounts\").find({\"$or\": \"x\"})"
+  |db.getCollection("accounts").find({"$or": "x"})|
+  = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
+
 [redis] "GET k"
   |GET k|
   = write_on=false select=false classify=ReadOnly [] gate ro=None rw=None full=None confirm[none]=ro:None,rw:None,full:None confirm[drop]=ro:None,rw:None,full:None confirm[truncate]=ro:None,rw:None,full:None confirm[unfiltered]=ro:None,rw:None,full:None confirm[all3]=ro:None,rw:None,full:None matches_key[id]=false matches_key[id+Region]=false matches_key[Region]=false matches_key[none]=false
