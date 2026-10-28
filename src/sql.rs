@@ -2850,8 +2850,9 @@ fn touches_session(engine: Engine, sql: &str) -> bool {
 /// best-effort inside a `SELECT`, not a boundary. Where an engine holds
 /// Read-only server-side, the hold is the boundary, and the list is what stops
 /// the statements that would release it. The same root cause reached the list
-/// three times: a spelling of a name, a sibling family of names, and the
-/// functions that execute their text argument.
+/// four times: a spelling of a name, a sibling family of names, the functions
+/// that execute their text argument, and one of those whose text argument the
+/// catalog does not name, so a shape probe over the catalog could not find it.
 fn calls_denied_function(engine: Engine, sql: &str) -> bool {
     let denied = engine.spec().sql.denied_functions;
     // An engine that lists nothing is judged by the parse alone, as it was
