@@ -178,10 +178,10 @@ draft of this document. Each is closed in the same release.
   of the privilege. The statement does not release the session hold. Closed by
   plan 01-07, task 1, which reads the scope from the tokens.
 - **A Postgres function that executes its text argument as a query.**
-  `query_to_xml`, `query_to_xml_and_xmlschema`, `query_to_xmlschema` and
-  `ts_stat` take a string and run it, so a listed call carried inside that
-  string reached the server through a literal the name scan never reads.
-  The verifier ran three statements on the live Postgres 15, each with
+  `query_to_xml`, `query_to_xml_and_xmlschema`, `query_to_xmlschema`,
+  `ts_stat` and `ts_rewrite` take a string and run it, so a listed call carried
+  inside that string reached the server through a literal the name scan never
+  reads. The verifier ran three statements on the live Postgres 15, each with
   `default_transaction_read_only` set to `on`:
   - `SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)', true, false, '')`
     followed by `SHOW default_transaction_read_only` answered `on`, then `off`.
@@ -192,10 +192,32 @@ draft of this document. Each is closed in the same release.
     Read-only profile, not only a release of the hold: with the hold off
     afterwards, `pg_largeobject_metadata` held one row for it.
 
+  The large object was removed with `lo_unlink` afterwards.
+
+  `ts_rewrite(tsquery, text)` runs its second argument as a query in the same
+  way, and the server's catalog gives it no argument names, so the probe built
+  to catch a further carrier by the names the catalog records could not see it.
+  The verifier ran two statements on the live Postgres 15.13, each with
+  `default_transaction_read_only` set to `on`:
+  - `SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'',''off'',false)::tsquery, ''c''::tsquery')`
+    followed by `SHOW default_transaction_read_only` answered `off`: the hold
+    was released.
+  - `SELECT ts_rewrite('a'::tsquery, 'select lo_from_bytea(970981, ''abc''::bytea)::text::tsquery, ''c''::tsquery')`
+    created a large object while the hold was armed, with nothing released to
+    do it. That is a write on a Read-only profile, not only a release of the
+    hold: `pg_largeobject_metadata` held one row for it.
+
   The large object was removed with `lo_unlink` afterwards. Closed by plan
-  01-08, which lists the four executors; the record of the changed verdicts is
-  `hardening_functions` in `src/sql_snapshots/snapshots/`. Plan 01-09 asked the
-  same question of DuckDB on the embedded build the tests use
+  01-10, which lists `ts_rewrite`.
+
+  The carriers listed are the ones found so far, and the probe that checks the
+  list against the server's catalog sees only those whose text argument the
+  catalog names, which is why `ts_rewrite` was missed by it; it is held by name
+  instead. Extension carriers such as `tablefunc.crosstab` and
+  `xml2.xpath_table` live outside `pg_catalog` and are outside that probe by
+  design. Plan 01-08 listed the executors the catalog names; the record of the changed verdicts
+  is `hardening_functions` in `src/sql_snapshots/snapshots/`. Plan 01-09 asked
+  the same question of DuckDB on the embedded build the tests use
   (`v2.0.0-dev88614`): `query` and `json_execute_serialized_sql` ran their text
   and advanced a sequence, and are listed, while `query_table` resolves a table
   name, runs no text and is not.
