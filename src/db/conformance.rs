@@ -537,6 +537,7 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 // through the write cases still removes it.
                 unwind.push("SELECT lo_unlink(970971)".to_string());
                 unwind.push("SELECT lo_unlink(970972)".to_string());
+                unwind.push("SELECT lo_unlink(970974)".to_string());
                 (
                     vec![
                         ("an advisory lock", "SELECT pg_advisory_lock(970970)"),
@@ -628,6 +629,9 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 // not depend on the scalar position or the single-quoted
                 // spelling.
                 "SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$)",
+                // This carrier's text argument has no name in the catalog,
+                // which is why the shape probe below cannot find it.
+                "SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery')",
             ] {
                 above_a_read(disarm);
                 hold(true);
@@ -691,6 +695,25 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 cell(&subject.run(scenario, &carried_read, Fetch::default())),
                 "abc",
                 "{at}: the object was not created through the carrier under the hold"
+            );
+            hold(false);
+            controlled();
+
+            // The same write through a carrier whose text argument the catalog
+            // does not name: the verdict is the only thing between the
+            // statement and the server here too.
+            let unnamed = "970974";
+            let unnamed_write = format!(
+                "SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea({unnamed}, ''abc''::bytea)::text::tsquery, ''c''::tsquery')"
+            );
+            let unnamed_read = format!("SELECT convert_from(lo_get({unnamed}), 'UTF8')");
+            above_a_read(&unnamed_write);
+            hold(true);
+            subject.run(scenario, &unnamed_write, Fetch::default());
+            assert_eq!(
+                cell(&subject.run(scenario, &unnamed_read, Fetch::default())),
+                "abc",
+                "{at}: the object was not created through `ts_rewrite` under the hold"
             );
             hold(false);
             controlled();
