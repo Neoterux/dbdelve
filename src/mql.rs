@@ -1933,6 +1933,13 @@ fn command_reads(command: &Value) -> bool {
     }
 }
 
+/// The operators that run JavaScript inside the database process. Rated Full,
+/// not Write: arbitrary code in the server is a different order of thing from
+/// a write, and a Read-write profile would run it with no prompt at all (D-04).
+/// Two rules read this list -- [`out_verdict`] and the filter bar's
+/// `browse::runs_code` -- so an operator added here reaches both.
+const JS_OPERATORS: &[&str] = &["$where", "$function", "$accumulator"];
+
 /// What a `$out`, `$merge` or JavaScript operator anywhere in `value` does.
 /// `$out` replaces its target collection whole, as `CREATE OR REPLACE TABLE …
 /// AS SELECT` does, so it is a drop; `$merge` writes into what is there.
@@ -1947,7 +1954,7 @@ fn out_verdict(value: &Value) -> Verdict {
                 // profile would run it with no prompt at all. This is not
                 // `browse::runs_code`, which also flags a string where `$or`
                 // wants documents -- the filter bar's rule, not this one.
-                "$where" | "$function" | "$accumulator" => Verdict::FULL,
+                operator if JS_OPERATORS.contains(&operator) => Verdict::FULL,
                 _ => Verdict::READ,
             };
             verdict.max(stage).max(out_verdict(value))
