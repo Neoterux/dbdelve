@@ -65,6 +65,10 @@ const CALLS: &[(&str, &str)] = &[
     ("query_to_xml_and_xmlschema", "'select 1', true, false, ''"),
     ("query_to_xmlschema", "'select 1', true, false, ''"),
     ("ts_stat", "'select to_tsvector(''a'')'"),
+    (
+        "ts_rewrite",
+        "'a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery'",
+    ),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -176,6 +180,14 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "sql-text executor carrying a write",
         "SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '')",
+    ),
+    (
+        "sql-text executor with an unnamed text argument",
+        "SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery')",
+    ),
+    (
+        "sql-text executor with an unnamed text argument carrying a write",
+        "SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery')",
     ),
     (
         "control denied name inside a literal with no executor",
