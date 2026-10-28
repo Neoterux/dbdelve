@@ -562,6 +562,17 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // carrier is listed, never the text it carries, and the live
         // differential asks the catalog for that shape so a fifth fails there
         // by name.
+        //
+        // `ts_rewrite(tsquery, text)` is a fifth: its second argument is run
+        // as a query through SPI, so a listed call carried there reaches the
+        // server the same way (reproduced live, once releasing the hold and
+        // once creating a large object with it armed). The catalog gives
+        // neither `ts_rewrite` overload any argument names, so the shape probe
+        // in the live differential cannot see it and an explicit pin holds it
+        // by name instead. The three-argument `ts_rewrite(tsquery, tsquery,
+        // tsquery)` overload runs no text, and the name stops it as well: an
+        // over-classification whose direction is an upgrade prompt, on the
+        // accepted-false-positive list the product sign-off reads.
         denied_functions: &[
             "set_config",
             "nextval",
@@ -604,6 +615,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "query_to_xml_and_xmlschema",
             "query_to_xmlschema",
             "ts_stat",
+            "ts_rewrite",
             "dblink",
             "dblink_exec",
             "dblink_connect",
