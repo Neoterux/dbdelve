@@ -379,10 +379,13 @@ fn kind(command: &Command) -> Option<Kind> {
         ("CONFIG", "HELP") => Read,
         // These two answer with what a Read-only profile should not be handed
         // unasked: `requirepass` and `masterauth`, and every connected
-        // client's address and name. Their siblings reveal nothing of the kind.
-        // The rule is deliberately limited to plaintext secrets and client
-        // enumeration: the password hashes `ACL LIST` and `ACL GETUSER` return,
-        // and the client fields in `ACL LOG` and `SLOWLOG GET`, are knowingly
+        // client's address and name. The line is drawn at them and no wider.
+        // Their siblings stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`,
+        // `ID`, `GETNAME`, `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do
+        // commands elsewhere that do disclose something: the password hashes
+        // `ACL LIST` and `ACL GETUSER` return, and the client fields in
+        // `ACL LOG` and `SLOWLOG GET`. The rule is deliberately limited to
+        // plaintext secrets and client enumeration, and those are knowingly
         // left as reads. Widening it changes what a Read-only profile may run,
         // which is a product decision that has not been made.
         ("CONFIG", "GET") => Write,
@@ -1066,6 +1069,22 @@ mod tests {
             "SET k \"open",
         ] {
             assert_eq!(classify(text), unreadable, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_disclosing_command_has_the_same_verdict_first_or_last_in_a_buffer() {
+        for (first, second) in [
+            ("CONFIG GET requirepass", "GET a"),
+            ("CLIENT LIST", "GET a"),
+        ] {
+            let forward = classify(&format!("{first}\n{second}"));
+            assert_eq!(forward, Verdict::WRITE, "{first} then {second}");
+            assert_eq!(
+                classify(&format!("{second}\n{first}")),
+                forward,
+                "{second} then {first}"
+            );
         }
     }
 
