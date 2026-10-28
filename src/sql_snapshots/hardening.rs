@@ -209,6 +209,26 @@ const SHAPES: &[(&str, &str)] = &[
         "control column named like the duckdb text executor",
         "SELECT t.query FROM t",
     ),
+    (
+        "member form, snowflake sequence pseudo-column",
+        "SELECT seq1.nextval",
+    ),
+    (
+        "column reference to a listed name, not a member form",
+        "SELECT t.setval FROM t",
+    ),
+    (
+        "column reference to a listed lock name, not a member form",
+        "SELECT x.get_lock FROM x",
+    ),
+    (
+        "accepted false positive: listed name as a cte name with a column list",
+        "WITH query(x) AS (SELECT 1) SELECT x FROM query",
+    ),
+    (
+        "accepted false positive: listed name as a derived-table alias with a column list",
+        "SELECT * FROM (SELECT 1, 2) AS query(a, b)",
+    ),
 ];
 
 fn record(out: &mut String, engine: Engine, case: &str, sql: &str) {
