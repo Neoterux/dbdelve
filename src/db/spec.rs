@@ -547,7 +547,8 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // none was reproduced against the dev server, and they control
         // recovery rather than stored data. The live differential asks the
         // server's catalog for the large-object family, so a writer a later
-        // version adds fails there by name.
+        // version adds fails there by name, provided the server it probes is
+        // that later version: the family was checked against Postgres 15.13.
         //
         // A function that executes its text argument as a query reaches any
         // listed call through a name the token scan cannot read, because the
@@ -558,21 +559,36 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // listed functions, which is why the carrier works where
         // `query_to_xml('delete ...')` does not. `query_to_xml`,
         // `query_to_xml_and_xmlschema`, `query_to_xmlschema` and `ts_stat`
-        // are the four the server's catalog shows taking SQL text; the
-        // carrier is listed, never the text it carries, and the live
-        // differential asks the catalog for that shape so a fifth fails there
-        // by name.
+        // are carriers found so far, because the server's catalog names their
+        // text argument `query` or `sqlquery`; the carrier is listed, never
+        // the text it carries. The live differential asks the catalog for
+        // that shape, so a function a later version adds with such an
+        // argument fails there by name.
         //
-        // `ts_rewrite(tsquery, text)` is a fifth: its second argument is run
-        // as a query through SPI, so a listed call carried there reaches the
-        // server the same way (reproduced live, once releasing the hold and
-        // once creating a large object with it armed). The catalog gives
-        // neither `ts_rewrite` overload any argument names, so the shape probe
-        // in the live differential cannot see it and an explicit pin holds it
-        // by name instead. The three-argument `ts_rewrite(tsquery, tsquery,
-        // tsquery)` overload runs no text, and the name stops it as well: an
-        // over-classification whose direction is an upgrade prompt, on the
-        // accepted-false-positive list the product sign-off reads.
+        // `ts_rewrite(tsquery, text)` is another, and the catalog does not
+        // name its text argument: both overloads carry no argument names.
+        // Its second argument is run as a query through SPI, so a listed call
+        // carried there reaches the server the same way (reproduced live,
+        // once releasing the hold and once creating a large object with it
+        // armed). The shape probe cannot see it, so an explicit pin in the
+        // differential holds it by name. The three-argument
+        // `ts_rewrite(tsquery, tsquery, tsquery)` overload runs no text, and
+        // the name stops it as well: an over-classification whose direction
+        // is an upgrade prompt, on the accepted-false-positive list the
+        // product sign-off reads.
+        //
+        // These are the carriers found so far, not a closed set, and the
+        // probe sees only those whose text argument the catalog names. A
+        // type-shape probe (every `pg_catalog` function taking a `text`
+        // argument the catalog leaves unnamed) was measured against Postgres
+        // 15.13 and returned 222 distinct names where this list then held 47;
+        // dispositioning that many by hand would be a second deny-list with
+        // no evidence behind its entries, so the probe keeps its
+        // named-argument query. Extension carriers such as `tablefunc.crosstab`
+        // and `xml2.xpath_table` live outside `pg_catalog`, and a
+        // `pg_catalog` probe is blind to them by design: their absence here is
+        // a boundary of the probe, not a claim about them. The catalog lists
+        // were checked against Postgres 15.13 (Debian 15.13-1.pgdg110+1).
         denied_functions: &[
             "set_config",
             "nextval",

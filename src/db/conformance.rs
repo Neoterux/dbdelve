@@ -755,12 +755,27 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 "{at}: large-object functions on neither the deny-list nor the reads: {unlisted:?}"
             );
 
-            // The executors are found by shape, not by name: what they share
-            // is an argument that is SQL text, which the server records as one
-            // named `query` or `sqlquery`. A name here neither list knows is a
-            // function a later version added, and whether it runs its text is
-            // a decision: one that does goes on the deny-list, one that does
-            // not goes in this array with what its `query` actually is.
+            // The executors found so far are found by shape, not by name: what
+            // they share is an argument that is SQL text, which the server
+            // records as one named `query` or `sqlquery`. A carrier whose text
+            // argument the catalog does not name has no such shape, so this
+            // probe cannot see it; the pin below holds those by name. Measured
+            // against Postgres 15.13 (Debian 15.13-1.pgdg110+1): this query
+            // returns 5 distinct names, one of them carved out below, while
+            // widening it to every `pg_catalog` function taking a `text`
+            // argument the catalog leaves unnamed returns 222. The rule was to
+            // widen only when that population is no larger than the deny-list
+            // (47 entries then), and 222 is not: a carve-out that size would
+            // be a second deny-list with no evidence behind its entries. The
+            // lists were checked against that version, so a later version's
+            // addition fails here by name only when the probe server is that
+            // later version. Extension carriers, such as `tablefunc.crosstab`
+            // and `xml2.xpath_table`, live outside `pg_catalog` and are out of
+            // this probe's reach by design. A name here neither list knows is
+            // a function a later version added, and whether it runs its text
+            // is a decision: one that does goes on the deny-list, one that
+            // does not goes in the array below with what its `query` actually
+            // is.
             let not_run = [
                 // `query` is an OUT column here, the text of the statement a
                 // backend is running; nothing takes it as an argument.
@@ -795,6 +810,19 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 assert!(
                     found.contains(&executor),
                     "{at}: `{executor}` is missing from the server's catalog, so the executors were not probed (found {found:?})"
+                );
+            }
+
+            // Carriers the catalog gives no argument names. The probe above
+            // finds carriers by the shape the catalog records, and one whose
+            // arguments the catalog does not name has no shape to find, so it
+            // is held by name instead: removing one from the deny-list fails
+            // here.
+            let unnamed_carriers = ["ts_rewrite"];
+            for unnamed in unnamed_carriers {
+                assert!(
+                    listed.contains(&unnamed),
+                    "{at}: `{unnamed}` takes SQL text the catalog does not name, and is not on the deny-list"
                 );
             }
         }
