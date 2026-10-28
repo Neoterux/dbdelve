@@ -983,9 +983,15 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // select 1 does not exist"), so it runs no text and listing it would
         // only stop a read. `json_serialize_sql` and `json_deserialize_sql`
         // turn text into JSON and back and run nothing. `duckdb_functions()`
-        // shows no other function with an argument named like a query. Listing
-        // `query` also stops `t.query`, a column of that name, until the
-        // profile is upgraded: the same accepted cost as `t.nextval`.
+        // shows no other function with an argument named like a query. A
+        // listed name followed by a parenthesis is a call and stopped; one
+        // after a period is a column reference and a read, except
+        // `nextval`, which `MEMBER_FORMS` keeps for Snowflake's spelling and
+        // which therefore also stops a column called `t.nextval` here. What
+        // is left of the cost of listing `query` is the name used as a CTE
+        // name or a derived-table alias with a column list, which is followed
+        // by a parenthesis and stopped until the profile is upgraded; both
+        // are recorded in the corpus as accepted false positives.
         denied_functions: &["nextval", "setval", "query", "json_execute_serialized_sql"],
         // Names verified in `duckdb_settings()`. The configuration ratchets
         // (`enable_external_access`, `lock_configuration`) are left off on

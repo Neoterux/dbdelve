@@ -2832,13 +2832,24 @@ fn touches_session(engine: Engine, sql: &str) -> bool {
     false
 }
 
+/// Names an engine can spell as a member with no call at all, which the period
+/// arm of [`calls_denied_function`] reads as the call it stands for. A call is
+/// always followed by a parenthesis, so the arm is needed only for such a
+/// spelling, and the project knows one: Snowflake's sequence pseudo-column,
+/// `seq.nextval`. Any other listed name after a period is an ordinary column
+/// reference and stays a read. The list is one long because that is how many
+/// such spellings are known; another goes here, with a corpus case beside the
+/// `member form` one in `hardening.rs`.
+const MEMBER_FORMS: &[&str] = &["nextval"];
+
 /// Whether a query calls one of the engine's `denied_functions`, wherever the
 /// call sits: the parser puts one in four different nodes (scalar, table,
 /// `LATERAL` table and `TABLE(..)` position), so the tokens are read instead.
 /// Only the last word before the parenthesis is compared, so a schema-qualified
-/// call counts, and a listed word straight after a period counts without one.
-/// A column that merely shares a name keeps its statement in turn, the
-/// conservative side.
+/// call counts, and a word on [`MEMBER_FORMS`] straight after a period counts
+/// without one. A column that merely shares a listed name is a read unless the
+/// name is on that list or is followed by a parenthesis, which is how a
+/// column called `query` on DuckDB is a read and `FROM query(..)` is not.
 ///
 /// Separate from [`SESSION_FUNCTIONS`], which answers what the session keeps;
 /// this answers whether Read-only may run the call. A name may be on both.
@@ -2880,12 +2891,21 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
         .peekable();
     let mut previous = None;
     while let Some(token) = tokens.next() {
-        if let Token::Word(word) = token
-            && denied.contains(&word.value.to_lowercase().as_str())
-            // Snowflake reads a sequence as `seq.nextval`, no call at all.
-            && (tokens.peek() == Some(&&Token::LParen) || previous == Some(&Token::Period))
-        {
-            return true;
+        if let Token::Word(word) = token {
+            let name = word.value.to_lowercase();
+            // Snowflake reads a sequence as `seq.nextval`, no call at all, so
+            // that spelling and only that one is stopped without a
+            // parenthesis. What the narrowing leaves: a listed name used as a
+            // CTE name or a derived-table alias with a column list is still
+            // followed by one and still stopped. Deciding a word's position
+            // from the tokens would be a second parser kept in step with six
+            // dialects by hand, so those are recorded in the corpus instead.
+            if denied.contains(&name.as_str())
+                && (tokens.peek() == Some(&&Token::LParen)
+                    || (previous == Some(&Token::Period) && MEMBER_FORMS.contains(&name.as_str())))
+            {
+                return true;
+            }
         }
         previous = Some(token);
     }
