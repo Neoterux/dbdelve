@@ -2927,10 +2927,18 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
 /// with something else; and it is a pair, so the order of two statements does
 /// not matter.
 ///
-/// What it costs, and what it does not: every other statement it reaches is
-/// already a write through the global-scope arm of [`setting_verdict`], so the
-/// one verdict it moves is the transaction spelling whose scope the parser
-/// discarded.
+/// What it moves, read from the corpus rather than from the intent: the
+/// transaction spelling whose scope the parser discarded, and two shapes that
+/// are not a `SET` statement. A `SELECT` of a column `set` aliased `global`,
+/// written with no `AS` ("ordinary identifiers spelling the scope pair, no SET
+/// statement"), is two adjacent unquoted words and so is raised from a read to
+/// a write. So is a scope word under a plain `EXPLAIN` ("server-wide
+/// transaction under a plain explain"), where `EXPLAIN SET ROLE other` stays a
+/// read because the parser sees the explained statement. Both fail towards a
+/// prompt, never towards a refusal or a run. The cost is accepted: telling an
+/// identifier from a keyword, or looking under an `EXPLAIN`, would mean reading
+/// statement structure from tokens the parser has already discarded. Both
+/// records are in `hardening_settings`.
 ///
 /// A tokenizer failure answers `false`, unlike [`calls_denied_function`]. That
 /// one is only asked on an engine that lists a function; this is asked on every

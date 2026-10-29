@@ -71,6 +71,8 @@ source: src/sql_snapshots.rs
 [postgres] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
 [postgres] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -221,6 +223,8 @@ source: src/sql_snapshots.rs
 [mysql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -353,6 +357,8 @@ source: src/sql_snapshots.rs
 [mariadb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -487,6 +493,8 @@ source: src/sql_snapshots.rs
 [sqlite] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -575,6 +583,8 @@ source: src/sql_snapshots.rs
 [turso] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -663,6 +673,8 @@ source: src/sql_snapshots.rs
 [duckdb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [duckdb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -785,6 +797,8 @@ source: src/sql_snapshots.rs
 [snowflake] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -873,6 +887,8 @@ source: src/sql_snapshots.rs
 [mssql] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -1007,6 +1023,8 @@ source: src/sql_snapshots.rs
 [mongodb] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES DEFAULT => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES utf8mb4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1093,6 +1111,8 @@ source: src/sql_snapshots.rs
 [redis] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[redis] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES utf8mb4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES UTF8MB4 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|

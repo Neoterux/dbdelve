@@ -448,6 +448,14 @@ const SESSION_SHAPES: &[(&str, &str)] = &[
         "two statements, server-wide transaction first",
         "SET GLOBAL TRANSACTION READ ONLY; SELECT 1",
     ),
+    (
+        "ordinary identifiers spelling the scope pair, no SET statement",
+        "SELECT t.set global FROM t",
+    ),
+    (
+        "server-wide transaction under a plain explain",
+        "EXPLAIN SET GLOBAL TRANSACTION READ ONLY",
+    ),
 ];
 
 /// Settings that stay off every allow-list, on the engine that has them, and the
