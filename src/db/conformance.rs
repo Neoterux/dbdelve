@@ -6,6 +6,15 @@
 //! takes in [`suite!`]. Engines are asked only through `Engine` and
 //! `db::Connection`, so a scenario that fails is a finding about the engine,
 //! not something to bend the scenario around.
+//!
+//! The scenarios expect a connection with privilege enough to create and drop
+//! roles, sequences, tables and large objects, which on the compose Postgres
+//! means a superuser, so a failure on a less privileged account is about the
+//! account and not the engine. The database is shared and several scenarios
+//! may run against it at once, which is why every object a scenario creates is
+//! named for that scenario. Each scenario removes its own objects once before
+//! it starts as well as when it ends, so a run stopped by a signal costs a
+//! re-run and not a manual cleanup.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -977,11 +986,16 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
     let insert = sql_insert(engine, schema, canary, "session setting");
     let delete = sql_delete(engine, schema, canary);
     let postgres = engine == Engine::Postgres;
+    // Named for this scenario like the canary row. Queued for removal here,
+    // before the identity-change case creates it, so an interrupted run
+    // removes it and the pre-clean below removes a leftover one.
+    let identity = "dbdelve_session_971";
     let unwind = if postgres {
         vec![
             "RESET ROLE".to_string(),
             "RESET SESSION AUTHORIZATION".to_string(),
             delete.clone(),
+            format!("DROP ROLE IF EXISTS {identity}"),
         ]
     } else {
         vec![delete.clone()]
@@ -1091,11 +1105,14 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
         );
 
         // An identity change leaves the hold armed, so there is no canary to
-        // ask: the session's own answer to who it is has to move instead.
-        let other = cell(
-            "SELECT rolname FROM pg_roles WHERE rolname <> current_user ORDER BY rolname LIMIT 1",
-        );
-        let other = engine.quote_identifier(&other);
+        // ask: the session's own answer to who it is has to move instead. The
+        // identity is created rather than found: the server's own catalog
+        // answers with whichever role sorts first, typically a built-in one
+        // that needs superuser or membership to assume, so the case was
+        // asserting the classifier's verdict against an identity nobody
+        // chose. `NOLOGIN` and granted nothing: it exists to be switched to.
+        let other = engine.quote_identifier(identity);
+        run(&format!("CREATE ROLE {other} NOLOGIN"));
         for (case, statement, undo) in [
             ("a role change", format!("SET ROLE {other}"), "RESET ROLE"),
             (
