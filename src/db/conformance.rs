@@ -568,6 +568,20 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
                 format!("SELECT currval('{schema}.dbdelve_denied_970')"),
             ),
         };
+    // `Cleanup` runs on a panic but not on a kill, so a run stopped by a
+    // signal, an out-of-memory kill or a CI timeout leaves the sequence, the
+    // large objects and the canary row behind, and the first create below then
+    // fails as though the classifier were wrong. Run the unwind list once
+    // before anything is created: it is the scenario's own list rather than a
+    // second one, so an entry added to the cleanup is pre-cleaned without
+    // anyone remembering to. Errors are the normal case here, since on a clean
+    // server every one of these statements has nothing to remove, so they go
+    // through `query` and not `subject.run`, which panics.
+    for statement in &unwind {
+        let _ = subject
+            .connection
+            .query(statement, &CancelToken::default(), Fetch::default());
+    }
     let _cleanup = Cleanup {
         connection: &subject.connection,
         statements: unwind,
