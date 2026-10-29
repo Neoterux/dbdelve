@@ -977,17 +977,28 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
     let insert = sql_insert(engine, schema, canary, "session setting");
     let delete = sql_delete(engine, schema, canary);
     let postgres = engine == Engine::Postgres;
+    let unwind = if postgres {
+        vec![
+            "RESET ROLE".to_string(),
+            "RESET SESSION AUTHORIZATION".to_string(),
+            delete.clone(),
+        ]
+    } else {
+        vec![delete.clone()]
+    };
+    // `Cleanup` runs on a panic but not on a kill, so a stopped run leaves the
+    // canary row behind and the insert below then fails on a duplicate key as
+    // though the classifier were wrong. The unwind list is the cleanup's own,
+    // read once here before anything is written; errors are ignored because
+    // on a clean server there is nothing to remove.
+    for statement in &unwind {
+        let _ = subject
+            .connection
+            .query(statement, &CancelToken::default(), Fetch::default());
+    }
     let _cleanup = Cleanup {
         connection: &subject.connection,
-        statements: if postgres {
-            vec![
-                "RESET ROLE".to_string(),
-                "RESET SESSION AUTHORIZATION".to_string(),
-                delete.clone(),
-            ]
-        } else {
-            vec![delete.clone()]
-        },
+        statements: unwind,
         rollback: true,
         read_write: true,
     };
@@ -1236,9 +1247,21 @@ pub(super) fn executable_comments_agree_with_the_server(subject: &Subject) {
     let create = format!("CREATE TABLE {table} (id INT)");
     let delete = sql_delete(engine, schema, canary);
     let insert = sql_insert(engine, schema, canary, "executable comment");
+    let unwind = vec![delete.clone(), format!("DROP TABLE IF EXISTS {table}")];
+    // `Cleanup` runs on a panic but not on a kill, so a stopped run leaves the
+    // helper table and the canary row behind, and the `CREATE TABLE` below
+    // then fails on a duplicate name as though the classifier were wrong. The
+    // unwind list is the cleanup's own, read once here before anything is
+    // created; errors are ignored because on a clean server there is nothing
+    // to remove.
+    for statement in &unwind {
+        let _ = subject
+            .connection
+            .query(statement, &CancelToken::default(), Fetch::default());
+    }
     let _cleanup = Cleanup {
         connection: &subject.connection,
-        statements: vec![delete.clone(), format!("DROP TABLE IF EXISTS {table}")],
+        statements: unwind,
         rollback: true,
         read_write: true,
     };
