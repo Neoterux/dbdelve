@@ -1071,10 +1071,21 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // identity takes a supplied value.
         // `seq.nextval` is no call at all, which the scan reads off the period
         // before the name. Procedures are `CALL` statements, already Full.
+        // Unlike the Postgres and DuckDB lists, this one was built by documentation:
+        // the `SYSTEM$` control entries come from Snowflake's published function
+        // reference, and none was run, because no live Snowflake account is
+        // reachable from this repository's test environment and the mock in
+        // `snowflake/mock.rs` carries no function catalog. There is no read-only
+        // session to hold the rest, so on this engine the list is the whole
+        // boundary, and it is not an enumerated family: `SYSTEM$` has further
+        // members this list does not name. Listing them from documentation would
+        // be a long list with no evidence behind any entry, so it stays best-effort
+        // in the sense `calls_denied_function` states.
         denied_functions: &[
             "system$cancel_all_queries",
             "system$cancel_query",
             "system$abort_session",
+            "system$abort_transaction",
             "nextval",
             "getnextval",
         ],

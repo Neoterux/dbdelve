@@ -78,6 +78,7 @@ const CALLS: &[(&str, &str)] = &[
     ("system$cancel_all_queries", "1"),
     ("system$cancel_query", "'q'"),
     ("system$abort_session", "1"),
+    ("system$abort_transaction", "1"),
     ("getnextval", "seq1"),
     ("openquery", "srv, 'SELECT 1'"),
     ("openrowset", "'SQLNCLI', 'x', 'DELETE FROM t'"),

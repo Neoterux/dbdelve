@@ -59,6 +59,7 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -167,6 +168,7 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -275,6 +277,7 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -383,6 +386,7 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[sqlite] scalar: SELECT system$abort_transaction(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [sqlite] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -491,6 +495,7 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[turso] scalar: SELECT system$abort_transaction(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [turso] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -599,6 +604,7 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -707,6 +713,7 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] scalar: SELECT system$abort_transaction(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT getnextval(seq1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -815,6 +822,7 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT system$cancel_query('q') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -923,6 +931,7 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT system$abort_transaction(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT getnextval(seq1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1031,6 +1040,7 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT system$abort_session(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] scalar: SELECT system$abort_transaction(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
