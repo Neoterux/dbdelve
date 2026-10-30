@@ -70,6 +70,20 @@ const CALLS: &[(&str, &str)] = &[
         "'a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery'",
     ),
     ("crosstab", "'select ''a''::text, ''b''::text, ''c''::text'"),
+    (
+        "crosstab2",
+        "'select ''a''::text, ''b''::text, ''c''::text'",
+    ),
+    (
+        "crosstab3",
+        "'select ''a''::text, ''b''::text, ''c''::text'",
+    ),
+    (
+        "crosstab4",
+        "'select ''a''::text, ''b''::text, ''c''::text'",
+    ),
+    ("connectby", "'rel', 'k', 'p', '0', 0"),
+    ("xpath_table", "'id', 'doc', 'rel', '/r/a', 'true'"),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -200,6 +214,14 @@ const SHAPES: &[(&str, &str)] = &[
         "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)",
     ),
     (
+        "extension sql-text executor splicing a relation name, carrying a write",
+        "SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int)",
+    ),
+    (
+        "extension sql-text executor splicing a relation and criteria, carrying a write",
+        "SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text)",
+    ),
+    (
         "control column named like an extension carrier",
         "SELECT t.crosstab FROM t",
     ),
@@ -226,6 +248,10 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "member form, snowflake sequence pseudo-column",
         "SELECT seq1.nextval",
+    ),
+    (
+        "accepted false positive: column reference to a listed sequence name, stopped by the member form",
+        "SELECT t.nextval FROM t",
     ),
     (
         "column reference to a listed name, not a member form",
