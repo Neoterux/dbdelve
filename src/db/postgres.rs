@@ -2989,6 +2989,152 @@ mod tests {
         assert_eq!(databases.current.as_deref(), Some("postgres"));
     }
 
+    /// The extension carriers the Postgres deny-list names, run against the
+    /// server with the Read-only hold armed. It works in a database of its own
+    /// because the dev database is shared and an extension is database-wide,
+    /// and it needs a role that can create a database and install an
+    /// untrusted extension, which is a superuser on the compose server. The
+    /// database is dropped before it is created and again when the test ends,
+    /// so a run stopped by a signal costs a re-run and not a manual cleanup.
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_extension_carriers_agree_with_the_server() {
+        use crate::db::{CancelToken as Cancel, Connection as Any};
+        use crate::sql;
+
+        // Named for this test alone, and large objects live per database, so
+        // nothing another scenario writes can collide with the oids below.
+        const SCRATCH: &str = "dbdelve_carriers_975";
+        let at = "live_extension_carriers_agree_with_the_server";
+        let drop_scratch = format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)");
+
+        /// Drops the scratch database when the test ends, panicking or not.
+        /// The result is ignored: the test's own failure is the one worth
+        /// reading.
+        struct Scratch<'a>(&'a Any, String);
+        impl Drop for Scratch<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.query(&self.1, &Cancel::default(), Fetch::default());
+            }
+        }
+
+        let maintenance = live_profile();
+        for statement in [
+            drop_scratch.clone(),
+            format!("CREATE DATABASE {SCRATCH} TEMPLATE template0"),
+        ] {
+            maintenance
+                .query(&statement, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{at}: `{statement}` failed: {error}"));
+        }
+        // Declared after `maintenance` and before the scratch connection, so
+        // it drops between them: the drop's FORCE ends the scratch session.
+        let _scratch = Scratch(&maintenance, drop_scratch);
+        let scratch = Any::Postgres(
+            Connection::open(&ServerConfig {
+                database: SCRATCH.into(),
+                ..live_config()
+            })
+            .expect("the scratch database should open"),
+        );
+
+        let run = |sql: &str| {
+            scratch
+                .query(sql, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{at}: `{sql}` failed: {error}"))
+        };
+        let install = |extension: &str| {
+            scratch
+                .query(
+                    &format!("CREATE EXTENSION {extension}"),
+                    &Cancel::default(),
+                    Fetch::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{at}: CREATE EXTENSION {extension} failed, so its probe did not run: {error}"
+                    )
+                });
+        };
+        let rated = |sql: &str| sql::classify(Engine::Postgres, sql).mode;
+        let above_a_read = |sql: &str| {
+            assert!(
+                rated(sql) > sql::Mode::ReadOnly,
+                "{at}: `{sql}` is rated {:?}, which a Read-only profile would run",
+                rated(sql)
+            );
+        };
+        let hold = |on: bool| {
+            scratch
+                .set_read_only(on)
+                .unwrap_or_else(|error| panic!("{at}: {error}"));
+        };
+        let canary = format!("INSERT INTO {SCRATCH} (id) VALUES (975)");
+        let refused = || {
+            let error = scratch
+                .query(&canary, &Cancel::default(), Fetch::default())
+                .expect_err(&format!("{at}: the hold took a write it should refuse"));
+            assert!(
+                error.message.contains("read-only transaction"),
+                "{at}: refused for another reason: {}",
+                error.message
+            );
+        };
+        // The control: rated a read, runs on the held session, and the hold
+        // is still armed after it. Without it a server that refused
+        // everything would pass.
+        let controlled = || {
+            let control = "SELECT current_setting('search_path')";
+            assert_eq!(
+                rated(control),
+                sql::Mode::ReadOnly,
+                "{at}: control `{control}`"
+            );
+            hold(true);
+            run(control);
+            refused();
+            hold(false);
+        };
+        let cell = |result: &QueryResult| {
+            result
+                .rows
+                .first()
+                .and_then(|row| row.get(0))
+                .unwrap_or_else(|| panic!("{at}: no value came back"))
+                .to_string()
+        };
+
+        install("tablefunc");
+        run(&format!("CREATE TABLE {SCRATCH} (id int)"));
+
+        // `crosstab` releasing the hold: the canary write is refused, the
+        // carrier runs, and the same write then goes through.
+        let disarm = "SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text)";
+        above_a_read(disarm);
+        hold(true);
+        refused();
+        run(disarm);
+        run(&canary);
+        hold(false);
+        controlled();
+        run(&format!("DELETE FROM {SCRATCH} WHERE id = 975"));
+
+        // `crosstab` writing with nothing released. The object lives in the
+        // scratch database and goes with it, so there is no `lo_unlink`.
+        let write = "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)";
+        let read_back = "SELECT convert_from(lo_get(975001), 'UTF8')";
+        above_a_read(write);
+        hold(true);
+        run(write);
+        assert_eq!(
+            cell(&run(read_back)),
+            "abc",
+            "{at}: the object was not created through `crosstab` under the hold: `{write}`"
+        );
+        hold(false);
+        controlled();
+    }
+
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_the_type_probe_leaves_an_open_transaction_alone() {
