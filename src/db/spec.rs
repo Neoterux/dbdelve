@@ -606,8 +606,20 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // way, and have no live case because what they run, they run in
         // another session the local hold never covered. `dblink_open` is
         // listed with them: it declares a cursor over the SQL text it is
-        // handed. The catalog lists were checked against Postgres 15.13
-        // (Debian 15.13-1.pgdg110+1).
+        // handed.
+        //
+        // PostGIS is asked by shape, because it is the extension the dev
+        // server has installed: its SQL and PL/pgSQL members whose source runs
+        // `EXECUTE`. `st_findextent` splices its column argument inside double
+        // quotes unescaped, so a quote closes the identifier and what follows
+        // runs, and it wrote a large object with the hold armed (reproduced
+        // live). The other six members that match escape every argument. The
+        // survey stops there: PostGIS's C members cannot be seen by a catalog
+        // shape, and `postgis_raster`, `postgis_topology` and
+        // `postgis_tiger_geocoder` were not surveyed. A function in an
+        // extension nobody has surveyed stays a read until it is listed, as
+        // an unlisted call does everywhere else. The catalog lists were
+        // checked against Postgres 15.13 (Debian 15.13-1.pgdg110+1).
         denied_functions: &[
             "set_config",
             "nextval",
@@ -663,6 +675,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "dblink_connect_u",
             "dblink_send_query",
             "dblink_open",
+            "st_findextent",
         ],
         // What a user's own `SET` may change on a Read-only profile without
         // asking. Left off on purpose: the hold's own two names, `role` and
