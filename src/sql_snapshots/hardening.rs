@@ -61,6 +61,7 @@ const CALLS: &[(&str, &str)] = &[
     ("dblink_connect", "'c', 'dbname=x'"),
     ("dblink_connect_u", "'c', 'dbname=x'"),
     ("dblink_send_query", "'c', 'SELECT 1'"),
+    ("dblink_open", "'c', 'cur', 'SELECT 1'"),
     ("query_to_xml", "'select 1', true, false, ''"),
     ("query_to_xml_and_xmlschema", "'select 1', true, false, ''"),
     ("query_to_xmlschema", "'select 1', true, false, ''"),
@@ -75,6 +76,7 @@ const CALLS: &[(&str, &str)] = &[
     ("crosstab4", "'select 1, 2, 3'"),
     ("connectby", "'rel', 'k', 'p', '0', 0"),
     ("xpath_table", "'id', 'doc', 'rel', '/r/a', 'true'"),
+    ("st_findextent", "'t', 'a'"),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -211,6 +213,10 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "extension sql-text executor splicing a relation and criteria, carrying a write",
         "SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text)",
+    ),
+    (
+        "extension function splicing an identifier unescaped, carrying a write",
+        "SELECT st_findextent('t', 'a\") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --')",
     ),
     (
         "control column named like an extension carrier",
