@@ -223,10 +223,13 @@ draft of this document. Each is closed in the same release.
   name, runs no text and is not.
 
 The deny-list names functions. A call it does not name stays a read, so the
-list is best-effort inside a `SELECT` and not a boundary. Where an engine holds
-Read-only on the server, that hold is the boundary, and the list is what stops
-the statements that would release it. DuckDB has no such hold, so there the
-classifier's verdict is all there is.
+list is best-effort inside a `SELECT`, and a name missing from it is not a
+small matter. Where an engine holds Read-only on the server, the hold refuses a
+write that goes through the executor, but not a large-object write or a call
+carried inside a carrier's text: both were run with the hold armed and went
+through, so the list is what stops those. SQLite, Turso, DuckDB, Snowflake and
+SQL Server hold nothing on the server, so on those the list is the whole
+boundary and the classifier's verdict is all there is.
 
 ## Affected versions
 
