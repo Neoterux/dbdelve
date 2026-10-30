@@ -69,10 +69,7 @@ const CALLS: &[(&str, &str)] = &[
         "ts_rewrite",
         "'a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery'",
     ),
-    (
-        "crosstab",
-        "'select ''a''::text, ''b''::text, ''c''::text'",
-    ),
+    ("crosstab", "'select ''a''::text, ''b''::text, ''c''::text'"),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
