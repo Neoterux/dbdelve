@@ -574,8 +574,8 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // differential holds it by name. The three-argument
         // `ts_rewrite(tsquery, tsquery, tsquery)` overload runs no text, and
         // the name stops it as well: an over-classification whose direction
-        // is an upgrade prompt, on the accepted-false-positive list the
-        // product sign-off reads.
+        // is an upgrade prompt, one of the accepted false positives listed
+        // in the advisory's `What users will see`.
         //
         // These are the carriers found so far, not a closed set, and the
         // probe sees only those whose text argument the catalog names. A
@@ -1119,7 +1119,13 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // boundary, and it is not an enumerated family: `SYSTEM$` has further
         // members this list does not name. Listing them from documentation would
         // be a long list with no evidence behind any entry, so it stays best-effort
-        // in the sense `calls_denied_function` states.
+        // in the sense `calls_denied_function` states. A prefix rule, stopping
+        // any `system$` word followed by a parenthesis, was weighed and not
+        // taken: it would be a second matching mechanism for one engine where
+        // the list names functions, and it would stop the read-only `SYSTEM$`
+        // helpers on every Read-only profile with no evidence about which
+        // members write. The residual is stated for users in the advisory's
+        // `What users will see`.
         denied_functions: &[
             "system$cancel_all_queries",
             "system$cancel_query",

@@ -793,8 +793,11 @@ pub(super) fn denied_functions_agree_with_the_server(subject: &Subject) {
             // lists were checked against that version, so a later version's
             // addition fails here by name only when the probe server is that
             // later version. Extension carriers, such as `tablefunc.crosstab`
-            // and `xml2.xpath_table`, live outside `pg_catalog` and are out of
-            // this probe's reach by design. A name here neither list knows is
+            // and `xml2.xpath_table`, live outside `pg_catalog` and so outside
+            // this probe; they are listed, and pinned against their own
+            // extension's catalog by
+            // `live_extension_carriers_agree_with_the_server` in
+            // `src/db/postgres.rs`. A name here neither list knows is
             // a function a later version added, and whether it runs its text
             // is a decision: one that does goes on the deny-list, one that
             // does not goes in the array below with what its `query` actually

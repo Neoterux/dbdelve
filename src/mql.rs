@@ -1935,7 +1935,7 @@ fn command_reads(command: &Value) -> bool {
 
 /// The operators that run JavaScript inside the database process. Rated Full,
 /// not Write: arbitrary code in the server is a different order of thing from
-/// a write, and a Read-write profile would run it with no prompt at all (D-04).
+/// a write, and a Read-write profile would run it with no prompt at all.
 /// Two rules read this list -- [`out_verdict`] and the filter bar's
 /// `browse::runs_code` -- so an operator added here reaches both.
 const JS_OPERATORS: &[&str] = &["$where", "$function", "$accumulator"];
@@ -1949,11 +1949,8 @@ fn out_verdict(value: &Value) -> Verdict {
             let stage = match key.as_str() {
                 "$out" => Verdict::destroys(Destructive::Drop),
                 "$merge" => Verdict::WRITE,
-                // Arbitrary JavaScript in the database process is a different
-                // order of thing from a write: rated Write, a Read-write
-                // profile would run it with no prompt at all. This is not
-                // `browse::runs_code`, which also flags a string where `$or`
-                // wants documents -- the filter bar's rule, not this one.
+                // Not `browse::runs_code`, which also flags a string where
+                // `$or` wants documents -- the filter bar's rule, not this one.
                 operator if JS_OPERATORS.contains(&operator) => Verdict::FULL,
                 _ => Verdict::READ,
             };
