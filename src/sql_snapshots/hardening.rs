@@ -70,18 +70,9 @@ const CALLS: &[(&str, &str)] = &[
         "'a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery'",
     ),
     ("crosstab", "'select ''a''::text, ''b''::text, ''c''::text'"),
-    (
-        "crosstab2",
-        "'select ''a''::text, ''b''::text, ''c''::text'",
-    ),
-    (
-        "crosstab3",
-        "'select ''a''::text, ''b''::text, ''c''::text'",
-    ),
-    (
-        "crosstab4",
-        "'select ''a''::text, ''b''::text, ''c''::text'",
-    ),
+    ("crosstab2", "'select 1, 2, 3'"),
+    ("crosstab3", "'select 1, 2, 3'"),
+    ("crosstab4", "'select 1, 2, 3'"),
     ("connectby", "'rel', 'k', 'p', '0', 0"),
     ("xpath_table", "'id', 'doc', 'rel', '/r/a', 'true'"),
     ("get_lock", "'k', 1"),
