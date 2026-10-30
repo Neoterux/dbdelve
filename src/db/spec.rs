@@ -602,8 +602,12 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // `xpath_table` splices its relation and criteria the same way
         // (reproduced writing a large object under the armed hold). The rest
         // of each extension's members are carved out by name in the live test
-        // with what each does instead. The catalog lists were checked against
-        // Postgres 15.13 (Debian 15.13-1.pgdg110+1).
+        // with what each does instead. The `dblink` names are pinned the same
+        // way, and have no live case because what they run, they run in
+        // another session the local hold never covered. `dblink_open` is
+        // listed with them: it declares a cursor over the SQL text it is
+        // handed. The catalog lists were checked against Postgres 15.13
+        // (Debian 15.13-1.pgdg110+1).
         denied_functions: &[
             "set_config",
             "nextval",
@@ -658,6 +662,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "dblink_connect",
             "dblink_connect_u",
             "dblink_send_query",
+            "dblink_open",
         ],
         // What a user's own `SET` may change on a Read-only profile without
         // asking. Left off on purpose: the hold's own two names, `role` and

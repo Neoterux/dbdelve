@@ -3100,6 +3100,7 @@ mod tests {
 
         install("CREATE EXTENSION tablefunc");
         install("CREATE EXTENSION xml2");
+        install("CREATE EXTENSION dblink");
         run(&format!("CREATE TABLE {SCRATCH} (id int)"));
 
         // `crosstab` releasing the hold: the canary write is refused, the
@@ -3243,6 +3244,54 @@ mod tests {
                 // Applies a stylesheet to a document string and runs no SQL
                 // text.
                 "xslt_process",
+            ],
+        );
+        // Measured against the same server with `dblink` 1.2: 21 distinct
+        // names, six of them carriers. No live case: what these run, they run
+        // in a second session the local hold never covered, so a differential
+        // against the hold would prove nothing about them. Their listing
+        // rests on the catalog and the install script. The carve-outs either
+        // act only on a connection or cursor that a listed call opened, which
+        // may have been opened before the profile was lowered to Read-only,
+        // or build or report text and run none.
+        pin(
+            "dblink",
+            &[
+                "dblink",
+                "dblink_exec",
+                "dblink_connect",
+                "dblink_connect_u",
+                "dblink_send_query",
+                "dblink_open",
+            ],
+            &[
+                // Return statement text built from a relation's key columns
+                // and values. They run nothing.
+                "dblink_build_sql_delete",
+                "dblink_build_sql_insert",
+                "dblink_build_sql_update",
+                // Act on a named connection or cursor that a listed call
+                // opened: cancel its running query, close its cursor, fetch
+                // from its cursor, collect the result of its sent query.
+                "dblink_cancel_query",
+                "dblink_close",
+                "dblink_fetch",
+                "dblink_get_result",
+                "dblink_disconnect",
+                // Report on a connection: its state, its last error, its
+                // pending notifications, and which connections are open.
+                "dblink_is_busy",
+                "dblink_error_message",
+                "dblink_get_notify",
+                "dblink_get_connections",
+                // Returns the text of the session's own current query.
+                "dblink_current_query",
+                // Reads a local relation's primary-key columns from the
+                // catalog.
+                "dblink_get_pkey",
+                // Checks the options of a foreign server definition when the
+                // server is created.
+                "dblink_fdw_validator",
             ],
         );
     }
