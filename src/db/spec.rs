@@ -584,11 +584,19 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // 15.13 and returned 222 distinct names where this list then held 47;
         // dispositioning that many by hand would be a second deny-list with
         // no evidence behind its entries, so the probe keeps its
-        // named-argument query. Extension carriers such as `tablefunc.crosstab`
-        // and `xml2.xpath_table` live outside `pg_catalog`, and a
-        // `pg_catalog` probe is blind to them by design: their absence here is
-        // a boundary of the probe, not a claim about them. The catalog lists
-        // were checked against Postgres 15.13 (Debian 15.13-1.pgdg110+1).
+        // named-argument query.
+        //
+        // `tablefunc`'s `crosstab` runs its source query through SPI, so a
+        // listed call carried there reaches the server (reproduced on the
+        // compose Postgres 15.13 in a scratch database, once releasing the
+        // hold and once writing a large object with it armed). It lives in an
+        // extension outside `pg_catalog`, so neither catalog probe in
+        // `conformance.rs` can see it; `live_extension_carriers_agree_with_the_server`
+        // in `src/db/postgres.rs` pins it against the extension's own catalog
+        // instead. Listing it means a `crosstab` pivot asks for Read-write on
+        // a Read-only profile, an accepted cost recorded in the advisory. The
+        // catalog lists were checked against Postgres 15.13 (Debian
+        // 15.13-1.pgdg110+1).
         denied_functions: &[
             "set_config",
             "nextval",
@@ -632,6 +640,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "query_to_xmlschema",
             "ts_stat",
             "ts_rewrite",
+            "crosstab",
             "dblink",
             "dblink_exec",
             "dblink_connect",
