@@ -69,6 +69,10 @@ const CALLS: &[(&str, &str)] = &[
         "ts_rewrite",
         "'a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery'",
     ),
+    (
+        "crosstab",
+        "'select ''a''::text, ''b''::text, ''c''::text'",
+    ),
     ("get_lock", "'k', 1"),
     ("release_lock", "'k'"),
     ("release_all_locks", ""),
@@ -189,6 +193,18 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "sql-text executor with an unnamed text argument carrying a write",
         "SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery')",
+    ),
+    (
+        "extension sql-text executor carrying a disarm",
+        "SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text)",
+    ),
+    (
+        "extension sql-text executor carrying a write",
+        "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)",
+    ),
+    (
+        "control column named like an extension carrier",
+        "SELECT t.crosstab FROM t",
     ),
     (
         "control denied name inside a literal with no executor",
