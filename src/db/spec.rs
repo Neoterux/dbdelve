@@ -594,9 +594,16 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // `conformance.rs` can see it; `live_extension_carriers_agree_with_the_server`
         // in `src/db/postgres.rs` pins it against the extension's own catalog
         // instead. Listing it means a `crosstab` pivot asks for Read-write on
-        // a Read-only profile, an accepted cost recorded in the advisory. The
-        // catalog lists were checked against Postgres 15.13 (Debian
-        // 15.13-1.pgdg110+1).
+        // a Read-only profile, an accepted cost recorded in the advisory.
+        // `crosstab2` to `crosstab4` are `crosstab` with fixed result types and
+        // the same implementation. `tablefunc`'s `connectby` splices its
+        // relation and column arguments into the query it runs, so a
+        // parenthesised `select` given as the relation runs. `xml2`'s
+        // `xpath_table` splices its relation and criteria the same way
+        // (reproduced writing a large object under the armed hold). The rest
+        // of each extension's members are carved out by name in the live test
+        // with what each does instead. The catalog lists were checked against
+        // Postgres 15.13 (Debian 15.13-1.pgdg110+1).
         denied_functions: &[
             "set_config",
             "nextval",
@@ -641,6 +648,11 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "ts_stat",
             "ts_rewrite",
             "crosstab",
+            "crosstab2",
+            "crosstab3",
+            "crosstab4",
+            "connectby",
+            "xpath_table",
             "dblink",
             "dblink_exec",
             "dblink_connect",
