@@ -51,9 +51,9 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -172,9 +172,9 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -293,9 +293,9 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -414,9 +414,9 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -535,9 +535,9 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -656,9 +656,9 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -777,9 +777,9 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -898,9 +898,9 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1019,9 +1019,9 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[mongodb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1140,9 +1140,9 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[redis] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[redis] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
-[redis] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|

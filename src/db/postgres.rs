@@ -3043,17 +3043,11 @@ mod tests {
                 .query(sql, &Cancel::default(), Fetch::default())
                 .unwrap_or_else(|error| panic!("{at}: `{sql}` failed: {error}"))
         };
-        let install = |extension: &str| {
+        let install = |statement: &str| {
             scratch
-                .query(
-                    &format!("CREATE EXTENSION {extension}"),
-                    &Cancel::default(),
-                    Fetch::default(),
-                )
+                .query(statement, &Cancel::default(), Fetch::default())
                 .unwrap_or_else(|error| {
-                    panic!(
-                        "{at}: CREATE EXTENSION {extension} failed, so its probe did not run: {error}"
-                    )
+                    panic!("{at}: `{statement}` failed, so its probe did not run: {error}")
                 });
         };
         let rated = |sql: &str| sql::classify(Engine::Postgres, sql).mode;
@@ -3104,7 +3098,8 @@ mod tests {
                 .to_string()
         };
 
-        install("tablefunc");
+        install("CREATE EXTENSION tablefunc");
+        install("CREATE EXTENSION xml2");
         run(&format!("CREATE TABLE {SCRATCH} (id int)"));
 
         // `crosstab` releasing the hold: the canary write is refused, the
@@ -3119,20 +3114,137 @@ mod tests {
         controlled();
         run(&format!("DELETE FROM {SCRATCH} WHERE id = 975"));
 
-        // `crosstab` writing with nothing released. The object lives in the
-        // scratch database and goes with it, so there is no `lo_unlink`.
-        let write = "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)";
-        let read_back = "SELECT convert_from(lo_get(975001), 'UTF8')";
-        above_a_read(write);
-        hold(true);
-        run(write);
-        assert_eq!(
-            cell(&run(read_back)),
-            "abc",
-            "{at}: the object was not created through `crosstab` under the hold: `{write}`"
+        // Every case arms the hold, runs, asserts, lowers the hold and runs
+        // the control before the next begins, so the order of the cases
+        // decides nothing. The objects live in the scratch database and go
+        // with it, so there is no `lo_unlink`.
+        let carried_write = |case: &str, write: &str, oid: u32| {
+            let read_back = format!("SELECT convert_from(lo_get({oid}), 'UTF8')");
+            above_a_read(write);
+            hold(true);
+            run(write);
+            assert_eq!(
+                cell(&run(&read_back)),
+                "abc",
+                "{at}: the object was not created through {case} under the hold: `{write}`"
+            );
+            hold(false);
+            controlled();
+        };
+
+        // `crosstab` writing with nothing released.
+        carried_write(
+            "`crosstab`",
+            "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)",
+            975001,
         );
-        hold(false);
-        controlled();
+        // `connectby` splices its relation argument into the query it runs.
+        // The start value finds no child row, so the carried call runs once:
+        // a second run would fail on the oid the first had just created.
+        carried_write(
+            "`connectby`",
+            "SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int)",
+            975002,
+        );
+        // `xpath_table` splices its relation and criteria the same way.
+        carried_write(
+            "`xpath_table`",
+            "SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text)",
+            975003,
+        );
+
+        // The catalog is the authority on what an extension owns. A name that
+        // neither list knows fails here by name, which is the point rather
+        // than a flake: a later version added a function, and what it does is
+        // a decision. An empty answer or one missing a carrier fails too, so
+        // a server without the extension cannot satisfy the pin. The names are
+        // inlined because `query` binds nothing.
+        let owned = |extension: &str| -> Vec<String> {
+            run(&format!(
+                "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::regclass \
+                 AND d.objid = p.oid AND d.deptype = 'e' \
+                 JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+                 WHERE e.extname = '{extension}' ORDER BY 1"
+            ))
+            .rows
+            .iter()
+            .filter_map(|row| row.get(0).map(str::to_string))
+            .collect()
+        };
+        let listed = Engine::Postgres.spec().sql.denied_functions;
+        let pin = |extension: &str, carriers: &[&str], carved_out: &[&str]| {
+            let members = owned(extension);
+            assert!(
+                !members.is_empty(),
+                "{at}: the catalog lists no function owned by {extension}"
+            );
+            for carrier in carriers {
+                assert!(
+                    members.iter().any(|name| name == carrier),
+                    "{at}: {extension} does not own `{carrier}`: {members:?}"
+                );
+                assert!(
+                    listed.contains(carrier),
+                    "{at}: `{carrier}` is a carrier owned by {extension} and is not on the deny-list"
+                );
+            }
+            let unknown: Vec<_> = members
+                .iter()
+                .filter(|name| {
+                    !listed.contains(&name.as_str()) && !carved_out.contains(&name.as_str())
+                })
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "{at}: functions owned by {extension} on neither the deny-list nor the carve-out: {unknown:?}"
+            );
+        };
+
+        // Measured against Postgres 15.13 (Debian 15.13-1.pgdg110+1) with
+        // `tablefunc` 1.0: 6 distinct names, 5 of them carriers above. A
+        // member a later version adds fails here by name, provided the server
+        // tested is that later version.
+        pin(
+            "tablefunc",
+            &[
+                "crosstab",
+                "crosstab2",
+                "crosstab3",
+                "crosstab4",
+                "connectby",
+            ],
+            &[
+                // Returns rows of normally distributed random numbers from
+                // its numeric arguments and runs no SQL text.
+                "normal_rand",
+            ],
+        );
+        // Measured against the same server with `xml2` 1.1: 9 distinct
+        // names, one a carrier. Every other member takes a document and an
+        // XPath expression or stylesheet as strings and returns a value
+        // computed from them. None runs SQL text.
+        pin(
+            "xml2",
+            &["xpath_table"],
+            &[
+                // Checks that a string is well-formed XML.
+                "xml_valid",
+                // Escapes the characters XML reserves in a string.
+                "xml_encode_special_chars",
+                // Evaluate an XPath expression against a document string and
+                // return the result as text, a node set, a number, a boolean
+                // or a list.
+                "xpath_string",
+                "xpath_nodeset",
+                "xpath_number",
+                "xpath_bool",
+                "xpath_list",
+                // Applies a stylesheet to a document string and runs no SQL
+                // text.
+                "xslt_process",
+            ],
+        );
     }
 
     #[test]
