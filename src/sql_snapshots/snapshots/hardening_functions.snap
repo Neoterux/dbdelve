@@ -51,6 +51,11 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -103,6 +108,8 @@ source: src/sql_snapshots.rs
 [postgres] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -110,6 +117,7 @@ source: src/sql_snapshots.rs
 [postgres] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -164,6 +172,11 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -216,6 +229,8 @@ source: src/sql_snapshots.rs
 [mysql] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -223,6 +238,7 @@ source: src/sql_snapshots.rs
 [mysql] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -277,6 +293,11 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -329,6 +350,8 @@ source: src/sql_snapshots.rs
 [mariadb] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -336,6 +359,7 @@ source: src/sql_snapshots.rs
 [mariadb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mariadb] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -390,6 +414,11 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -442,6 +471,8 @@ source: src/sql_snapshots.rs
 [sqlite] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -449,6 +480,7 @@ source: src/sql_snapshots.rs
 [sqlite] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -503,6 +535,11 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -555,6 +592,8 @@ source: src/sql_snapshots.rs
 [turso] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -562,6 +601,7 @@ source: src/sql_snapshots.rs
 [turso] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -616,6 +656,11 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -668,6 +713,8 @@ source: src/sql_snapshots.rs
 [duckdb] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -675,6 +722,7 @@ source: src/sql_snapshots.rs
 [duckdb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[duckdb] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -729,6 +777,11 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -781,6 +834,8 @@ source: src/sql_snapshots.rs
 [snowflake] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -788,6 +843,7 @@ source: src/sql_snapshots.rs
 [snowflake] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[snowflake] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -842,6 +898,11 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -894,6 +955,8 @@ source: src/sql_snapshots.rs
 [mssql] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -901,6 +964,7 @@ source: src/sql_snapshots.rs
 [mssql] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -955,6 +1019,11 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_all_locks() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1007,6 +1076,8 @@ source: src/sql_snapshots.rs
 [mongodb] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1014,6 +1085,7 @@ source: src/sql_snapshots.rs
 [mongodb] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1068,6 +1140,11 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab2('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab3('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT crosstab4('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1120,6 +1197,8 @@ source: src/sql_snapshots.rs
 [redis] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1127,6 +1206,7 @@ source: src/sql_snapshots.rs
 [redis] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[redis] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
