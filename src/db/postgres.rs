@@ -3101,6 +3101,7 @@ mod tests {
         install("CREATE EXTENSION tablefunc");
         install("CREATE EXTENSION xml2");
         install("CREATE EXTENSION dblink");
+        install("CREATE EXTENSION postgis");
         run(&format!("CREATE TABLE {SCRATCH} (id int)"));
 
         // `crosstab` releasing the hold: the canary write is refused, the
@@ -3153,6 +3154,17 @@ mod tests {
             "SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text)",
             975003,
         );
+        // PostGIS's `st_findextent` concatenates its column argument inside
+        // double quotes with no escaping, so a quote in the argument closes
+        // the identifier and what follows is SQL. It is declared STABLE, so
+        // its `EXECUTE` runs in SPI's read-only mode, which refuses DML and
+        // none of the listed functions. Listed only because this write read
+        // back as `abc` with the hold armed.
+        carried_write(
+            "`st_findextent`",
+            "SELECT st_findextent('t', 'a\") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --')",
+            975004,
+        );
 
         // The catalog is the authority on what an extension owns. A name that
         // neither list knows fails here by name, which is the point rather
@@ -3160,13 +3172,14 @@ mod tests {
         // a decision. An empty answer or one missing a carrier fails too, so
         // a server without the extension cannot satisfy the pin. The names are
         // inlined because `query` binds nothing.
-        let owned = |extension: &str| -> Vec<String> {
+        let owned = |extension: &str, shape: &str| -> Vec<String> {
             run(&format!(
                 "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
                  JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::regclass \
                  AND d.objid = p.oid AND d.deptype = 'e' \
                  JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
-                 WHERE e.extname = '{extension}' ORDER BY 1"
+                 JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+                 WHERE e.extname = '{extension}' AND ({shape}) ORDER BY 1"
             ))
             .rows
             .iter()
@@ -3174,8 +3187,8 @@ mod tests {
             .collect()
         };
         let listed = Engine::Postgres.spec().sql.denied_functions;
-        let pin = |extension: &str, carriers: &[&str], carved_out: &[&str]| {
-            let members = owned(extension);
+        let pin = |extension: &str, shape: &str, carriers: &[&str], carved_out: &[&str]| {
+            let members = owned(extension, shape);
             assert!(
                 !members.is_empty(),
                 "{at}: the catalog lists no function owned by {extension}"
@@ -3208,6 +3221,7 @@ mod tests {
         // tested is that later version.
         pin(
             "tablefunc",
+            "TRUE",
             &[
                 "crosstab",
                 "crosstab2",
@@ -3227,6 +3241,7 @@ mod tests {
         // computed from them. None runs SQL text.
         pin(
             "xml2",
+            "TRUE",
             &["xpath_table"],
             &[
                 // Checks that a string is well-formed XML.
@@ -3256,6 +3271,7 @@ mod tests {
         // or build or report text and run none.
         pin(
             "dblink",
+            "TRUE",
             &[
                 "dblink",
                 "dblink_exec",
@@ -3292,6 +3308,36 @@ mod tests {
                 // Checks the options of a foreign server definition when the
                 // server is created.
                 "dblink_fdw_validator",
+            ],
+        );
+        // PostGIS 3.5.2 (`pg_extension.extversion`) owns 563 distinct
+        // function names. The probe asks for the ones written in SQL or
+        // PL/pgSQL whose source runs `EXECUTE`, and returned 7: `st_findextent`
+        // above and the six carved out below. Its boundary is that shape: a C
+        // member that runs text is outside it, and the PostGIS extensions the
+        // dev server does not install (`postgis_raster`, `postgis_topology`,
+        // `postgis_tiger_geocoder`, `postgis_sfcgal`) were neither installed
+        // nor surveyed here, so this is not a closure of PostGIS. A member a
+        // later version adds in this shape fails here by name.
+        pin(
+            "postgis",
+            "l.lanname IN ('plpgsql', 'sql') AND p.prosrc ~* 'execute'",
+            &["st_findextent"],
+            &[
+                // Each of these splices its arguments through `quote_ident`,
+                // `quote_literal` or `format`'s `%I`, so a quote in an
+                // argument stays inside the identifier or literal, and each
+                // runs DDL or a catalog lookup that the hold refuses.
+                "addgeometrycolumn",
+                "dropgeometrycolumn",
+                "dropgeometrytable",
+                "populate_geometry_columns",
+                // Runs `CREATE EXTENSION` and `ALTER EXTENSION` for the
+                // installed PostGIS extensions, with each name through `%I`.
+                "postgis_extensions_upgrade",
+                // Alters a constraint and updates a column through
+                // `quote_ident`; its new SRID is an integer.
+                "updategeometrysrid",
             ],
         );
     }
