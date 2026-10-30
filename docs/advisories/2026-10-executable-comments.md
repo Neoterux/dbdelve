@@ -141,6 +141,24 @@ reaches the classifier whole and is no longer a plain read.
 - A call to a listed function (`set_config`, `nextval`, the advisory locks, the
   large-object writers, the named-lock calls and the rest of the class above)
   asks for Read-write.
+- A `crosstab` pivot, and a call to any other listed extension carrier, asks
+  for Read-write on a Read-only Postgres profile. A grid whose statement calls
+  one is no longer re-run on refresh, as with `nextval`.
+- Some statements that do nothing the list fears are over-classified. These
+  are accepted false positives:
+  - the three-argument `ts_rewrite(tsquery, tsquery, tsquery)` runs no text and
+    is stopped by its name;
+  - on DuckDB, `query` used as a CTE name (`WITH query(x) AS ...`) or as a
+    derived-table alias with a column list;
+  - a qualified column named `nextval` (`t.nextval`) on every engine whose list
+    names `nextval`;
+  - `SELECT t.set global FROM t` with no `AS`, and a scope word under a plain
+    `EXPLAIN` (`EXPLAIN SET GLOBAL TRANSACTION READ ONLY`), both raised to
+    Read-write.
+- On Snowflake, the four `SYSTEM$` controls on the list were taken from
+  Snowflake's published reference and not run. Snowflake holds no Read-only
+  session, so any other `SYSTEM$` function is rated a read and runs on a
+  Read-only profile.
 - MongoDB `$where`, `$function` and `$accumulator` need Full.
 - Redis `CONFIG GET` and `CLIENT LIST` need Read-write: neither writes anything,
   and both return what a Read-only profile should not hand out, such as a
@@ -210,12 +228,51 @@ draft of this document. Each is closed in the same release.
   The large object was removed with `lo_unlink` afterwards. Closed by plan
   01-10, which lists `ts_rewrite`.
 
-  The carriers listed are the ones found so far, and the probe that checks the
-  list against the server's catalog sees only those whose text argument the
-  catalog names, which is why `ts_rewrite` was missed by it; it is held by name
-  instead. Extension carriers such as `tablefunc.crosstab` and
-  `xml2.xpath_table` live outside `pg_catalog` and are outside that probe by
-  design. Plan 01-08 listed the executors the catalog names; the record of the changed verdicts
+  The same holds for functions in extensions outside `pg_catalog`.
+  `tablefunc`'s `crosstab` family and `connectby`, and `xml2`'s `xpath_table`,
+  run text they are handed, or splice it into a query, through the server's
+  SPI. The verifier installed both extensions in scratch databases on the
+  compose Postgres 15.13 and, with `default_transaction_read_only` set to `on`,
+  ran these statements:
+  - `SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(980002, ''abc''::bytea)::text') AS t(r text, c text)`
+    created a large object while the hold was armed.
+  - `SELECT * FROM crosstab('select set_config(''default_transaction_read_only'',''off'',false), ''a'', ''b''') AS t(r text, c text)`
+    followed by `SHOW default_transaction_read_only` answered `off`: the hold
+    was released.
+  - `SELECT * FROM xpath_table('id','doc','(select 1 as id, (select lo_from_bytea(980003,''abc''::bytea))::text as doc) s','/r/a','true') AS t(id int, a text)`
+    created a large object while the hold was armed.
+  - `connectby`, given a parenthesised `select` calling `lo_from_bytea` as its
+    relation, ran that call inside the hold: the verifier's second iteration
+    failed with a duplicate key on the object the first had just created. Its
+    record gives the relation (`'(select lo_from_bytea(980010, ''x''::bytea)) q, kid'`)
+    and elides the remaining arguments. Plan 01-15's live test later ran
+    `SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int)`
+    with the hold armed, and the object was written.
+
+  Each of the large-object writes is a write on a Read-only profile, not only a
+  release of the hold. The scratch databases were dropped afterwards, and the
+  large objects went with them.
+
+  Closed by plan 01-15, which lists `crosstab`, `crosstab2`, `crosstab3`,
+  `crosstab4`, `connectby` and `xpath_table`, adds `dblink_open` to the `dblink`
+  names already listed, and lists PostGIS's `st_findextent`. `dblink_open` was
+  listed from reading the extension's catalog: it declares a cursor over the SQL
+  text it is handed, in a second session the local hold never covered, and no
+  statement of it was run. `st_findextent` was reproduced: with the hold armed,
+  `SELECT st_findextent('t', 'a") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --')`
+  wrote a large object that read back as `abc`, in a scratch database the live
+  test creates and drops.
+
+  The carriers listed are the ones found so far. The probe that checks the list
+  against the server's catalog sees only those whose text argument the catalog
+  names, which is why `ts_rewrite` was missed by it and is held by name instead.
+  Extension carriers are pinned against their own extension's catalog by a live
+  test plan 01-15 added, for the extensions it surveyed: `tablefunc`, `xml2`,
+  `dblink`, and PostGIS as the compose server installs it. The PostGIS
+  extensions that server does not install (`postgis_raster`, `postgis_topology`,
+  `postgis_tiger_geocoder`) and every other extension were not surveyed, and a
+  function in an unsurveyed extension stays a read until it is listed.
+  Plan 01-08 listed the executors the catalog names; the record of the changed verdicts
   is `hardening_functions` in `src/sql_snapshots/snapshots/`. Plan 01-09 asked
   the same question of DuckDB on the embedded build the tests use
   (`v2.0.0-dev88614`): `query` and `json_execute_serialized_sql` ran their text
