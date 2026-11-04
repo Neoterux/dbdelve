@@ -21,16 +21,26 @@
     )
 )]
 
+use std::cmp::Ordering;
+
 use super::{
     Plan, PlanNode, WASTEFUL_MIN_REMOVED,
     analysis::{Analysis, Basis, Direction, Finding, percent_text},
     wasteful,
 };
 
-/// `plan` as compact text, from the `analysis` built over it. At most
-/// `max_nodes` nodes are chosen; see the module's truncation line.
-pub(crate) fn compact(plan: &Plan, analysis: &Analysis, _max_nodes: usize) -> String {
-    let mut lines = vec!["truncated: none".to_string(), header(plan, analysis)];
+/// `plan` as compact text, from the `analysis` built over it. When the plan has
+/// more than `max_nodes` nodes, the `max_nodes` heaviest are kept with every
+/// ancestor of each, so the shape of the tree survives and the heaviest node is
+/// never the one cut; the first line says so, and each kept node that lost
+/// descendants says how many.
+pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> String {
+    let kept = kept(plan, analysis, max_nodes);
+    let shown = kept.iter().filter(|kept| **kept).count();
+    let mut lines = vec![
+        truncation(plan, analysis, max_nodes, shown),
+        header(plan, analysis),
+    ];
     if analysis.findings.is_empty() {
         lines.push("findings: none".to_string());
     } else {
@@ -42,18 +52,87 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, _max_nodes: usize) -> St
                 .map(|finding| finding_line(plan, analysis, *finding)),
         );
     }
-    if plan.nodes.is_empty() {
+    if shown == 0 {
         lines.push("tree: none".to_string());
     } else {
         lines.push("tree:".to_string());
-        for index in 0..plan.nodes.len() {
-            lines.push(node_line(plan, analysis, index));
-            lines.extend(detail_lines(plan, index));
+        // The kept nodes on the path down to the node being read, each with its
+        // child indent and how many of its descendants were dropped. The first
+        // entry stands for the plan itself, whose dropped roots are counted too.
+        let mut open: Vec<(usize, usize)> = vec![(0, 0)];
+        let not_shown = |(child_depth, dropped): (usize, usize)| {
+            (dropped > 0).then(|| format!("{}... {dropped} nodes not shown", indent(child_depth)))
+        };
+        for (index, node) in plan.nodes.iter().enumerate() {
+            while open.len() > 1 && open.last().is_some_and(|(child, _)| *child > node.depth) {
+                lines.extend(open.pop().and_then(not_shown));
+            }
+            if kept[index] {
+                open.push((node.depth + 1, 0));
+                lines.push(node_line(plan, analysis, index));
+                lines.extend(detail_lines(plan, index));
+            } else if let Some((_, dropped)) = open.last_mut() {
+                *dropped += 1;
+            }
+        }
+        while let Some(entry) = open.pop() {
+            lines.extend(not_shown(entry));
         }
     }
     let mut text = lines.join("\n");
     text.push('\n');
     text
+}
+
+/// The first line: whether anything was cut and by what rule.
+fn truncation(plan: &Plan, analysis: &Analysis, max_nodes: usize, shown: usize) -> String {
+    let nodes = plan.nodes.len();
+    if max_nodes >= nodes {
+        return "truncated: none".to_string();
+    }
+    let rule = match analysis.basis {
+        Basis::Measured => format!("top {max_nodes} by self time, with their ancestors"),
+        Basis::PlannerCost => format!("top {max_nodes} by self cost, with their ancestors"),
+        Basis::Structure => format!("first {max_nodes} in plan order"),
+    };
+    format!("truncated: kept {shown} of {nodes} nodes ({rule})")
+}
+
+/// Which nodes to print: the `max_nodes` with the highest value, ties in the
+/// plan's order and nodes with no value last, and every ancestor of each. A plan
+/// with no values ranks nothing, so it keeps the first `max_nodes` as printed.
+fn kept(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Vec<bool> {
+    let mut ranked: Vec<usize> = (0..plan.nodes.len()).collect();
+    // A stable sort, so equal values stay in document order.
+    ranked.sort_by(
+        |a, b| match (analysis.nodes[*a].value, analysis.nodes[*b].value) {
+            (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    );
+    let mut kept = vec![false; plan.nodes.len()];
+    for index in ranked.into_iter().take(max_nodes) {
+        // A node already kept as an ancestor has had its own ancestors kept
+        // too, and so has the first kept ancestor the walk below meets.
+        if std::mem::replace(&mut kept[index], true) {
+            continue;
+        }
+        let mut depth = plan.nodes[index].depth;
+        for above in (0..index).rev() {
+            if depth == 0 {
+                break;
+            }
+            if plan.nodes[above].depth < depth {
+                if std::mem::replace(&mut kept[above], true) {
+                    break;
+                }
+                depth = plan.nodes[above].depth;
+            }
+        }
+    }
+    kept
 }
 
 /// The `plan:` line: what the numbers are, in `key=value` pairs.
@@ -279,6 +358,15 @@ mod tests {
     /// The compact form of a Postgres plan, untruncated.
     fn whole(plan: &Plan) -> String {
         compact(plan, &Analysis::new(plan, Engine::Postgres), usize::MAX)
+    }
+
+    const LARGE: &str = include_str!("../testdata/plan-postgres-large.txt");
+
+    /// The plan-order index of the node a tree line starts, when it starts one.
+    fn node_index(line: &str) -> Option<usize> {
+        let digits = line.trim_start().strip_prefix('n')?;
+        let end = digits.find(|c: char| !c.is_ascii_digit())?;
+        digits[..end].parse().ok()
     }
 
     /// The lines between a column-0 `start` line and the next column-0 line.
@@ -540,6 +628,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn truncation_keeps_the_slowest_nodes_and_their_ancestors() {
+        let plan = one_column(LARGE);
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let out = compact(&plan, &analysis, 8);
+        let nodes = plan.nodes.len();
+
+        // The expectation is worked out here the long way: the heaviest eight,
+        // then each one's parent, and its parent's, up to a root.
+        let mut ranked: Vec<usize> = (0..nodes).collect();
+        let value = |index: usize| analysis.nodes[index].value.unwrap_or(f64::MIN);
+        ranked.sort_by(|a, b| value(*b).total_cmp(&value(*a)).then(a.cmp(b)));
+        let mut expected = vec![false; nodes];
+        for &selected in &ranked[..8] {
+            let mut at = Some(selected);
+            while let Some(index) = at {
+                expected[index] = true;
+                at = (0..index)
+                    .rev()
+                    .find(|above| plan.nodes[*above].depth < plan.nodes[index].depth);
+            }
+        }
+        let tree: Vec<&str> = out.lines().skip_while(|line| *line != "tree:").collect();
+        let shown: Vec<usize> = tree.iter().filter_map(|line| node_index(line)).collect();
+        let want: Vec<usize> = (0..nodes).filter(|index| expected[*index]).collect();
+        assert_eq!(shown, want);
+        assert!(shown.len() > 8 && shown.len() < nodes);
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                format!(
+                    "truncated: kept {} of {nodes} nodes (top 8 by self time, with their ancestors)",
+                    shown.len()
+                )
+                .as_str()
+            )
+        );
+
+        // Every node is either printed or counted by the line that says so.
+        let not_shown: Vec<usize> = tree
+            .iter()
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix("... ")?
+                    .strip_suffix(" nodes not shown")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        assert!(!not_shown.is_empty());
+        assert_eq!(shown.len() + not_shown.iter().sum::<usize>(), nodes);
+        assert_eq!(
+            out,
+            include_str!("../testdata/plan-postgres-large.truncated.compact.txt")
+        );
+
+        // Equal values keep the earlier node, and a dropped root is counted.
+        let node = |label: &str| PlanNode {
+            label: label.to_string(),
+            actual: Some(Actual {
+                startup_ms: 0.0,
+                total_ms: 2.0,
+                rows: 1.0,
+                loops: 1.0,
+            }),
+            self_ms: Some(2.0),
+            ..PlanNode::default()
+        };
+        let tied = Plan {
+            nodes: vec![node("first"), node("second"), node("third")],
+            ..Plan::default()
+        };
+        let out = compact(&tied, &Analysis::new(&tied, Engine::Postgres), 2);
+        assert_eq!(
+            out.lines().next(),
+            Some("truncated: kept 2 of 3 nodes (top 2 by self time, with their ancestors)")
+        );
+        assert!(out.contains("n0 first") && out.contains("n1 second") && !out.contains("third"));
+        assert!(out.ends_with("  ... 1 nodes not shown\n"));
+    }
+
+    #[test]
+    fn the_large_fixture_serializes_to_a_pinned_byte_length() {
+        let out = whole(&one_column(LARGE));
+        // Plan 02-06's `02-TOKEN-BUDGET.md` measures this text. A change to this
+        // number means that measured token count is stale.
+        assert_eq!(out.len(), 15302);
+        assert_eq!(
+            out,
+            include_str!("../testdata/plan-postgres-large.compact.txt")
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_or_a_zero_cap_serializes_without_a_panic() {
+        let empty = Plan::default();
+        let out = compact(&empty, &Analysis::new(&empty, Engine::Postgres), 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "truncated: none");
+        assert!(lines[1].starts_with("plan: engine=postgres analyzed=no basis=structure-only "));
+        assert_eq!(lines[2..], ["findings: none", "tree: none"]);
+        assert!(out.is_ascii());
+
+        let plan = one_column(LARGE);
+        let nodes = plan.nodes.len();
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let none = compact(&plan, &analysis, 0);
+        assert!(none.starts_with(&format!("truncated: kept 0 of {nodes} nodes")));
+        assert!(none.ends_with("tree: none\n"));
+
+        let every = compact(&plan, &analysis, nodes);
+        assert!(every.starts_with("truncated: none\n"));
+        assert_eq!(every, compact(&plan, &analysis, usize::MAX));
+        let one_short = compact(&plan, &analysis, nodes - 1);
+        assert!(one_short.starts_with("truncated: kept "));
+    }
+
     /// Not a check: serializes the plan in `DBDELVE_PLAN_FILE` the way a Postgres
     /// plan lands, untruncated or at `DBDELVE_COMPACT_CAP`, and writes it to
     /// `DBDELVE_COMPACT_OUT`. Plan 02-06 measures that text, and the golden files
@@ -558,13 +764,8 @@ mod tests {
         std::fs::write(var("DBDELVE_COMPACT_OUT"), &compact).expect("the output writes");
         let kept = compact
             .lines()
-            .filter(|line| line.trim_start().starts_with('n') && line.starts_with("  "))
-            .filter(|line| {
-                line.trim_start()
-                    .as_bytes()
-                    .get(1)
-                    .is_some_and(u8::is_ascii_digit)
-            })
+            .skip_while(|line| *line != "tree:")
+            .filter(|line| node_index(line).is_some())
             .count();
         println!(
             "nodes={} kept={kept} bytes={}",
