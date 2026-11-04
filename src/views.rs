@@ -42,7 +42,10 @@ use crate::{
     },
     db,
     db::{Engine, ExplainMode, RoutineKind},
-    explain::{self, LabelPart, analysis::Basis},
+    explain::{
+        self, LabelPart,
+        analysis::{Basis, Tier, percent_text},
+    },
     explorer::ROW_LIMITS,
     filter::{Conjunction, FilterRow, Operator},
     icons::icon,
@@ -422,18 +425,6 @@ fn render_plan(
     // What every bar is a share of. A plan with nothing to weigh its nodes by
     // has no total, so it draws none.
     let total = analysis.total;
-    // The slowest node earns the one warm colour in the pane. Scanning for it
-    // is the reason most people open a plan at all.
-    let slowest = total.and_then(|_| {
-        plan.nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| node.self_ms.map(|ms| (index, ms)))
-            .filter(|(_, ms)| *ms > 0.0)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(index, _)| index)
-    });
-
     let metric = |label: &'static str, value: String, tone: gpui::Hsla| {
         div()
             .flex()
@@ -443,8 +434,7 @@ fn render_plan(
     };
 
     let rows = plan.nodes.iter().enumerate().map(|(index, node)| {
-        let hottest = slowest == Some(index);
-        let share = analysis.nodes[index].share.unwrap_or(0.0);
+        let drawn = &analysis.nodes[index];
 
         div()
             .flex()
@@ -453,34 +443,45 @@ fn render_plan(
             .px(px(layout::SPACE_SM))
             .py(px(layout::SPACE_XS))
             .rounded(px(layout::RADIUS_CONTROL))
-            .when(hottest, |row| row.bg(t.element_hover))
             // The bar column is fixed and leads the row, so every bar starts at
-            // the same x and the longest one is found by looking down an edge
-            // rather than by reading. It is drawn only where the plan carried
-            // timings at all -- SQLite reports none, and an empty track on every
-            // row of its plans is a column of nothing to read past.
+            // the same x and the heaviest one is found by looking down an edge
+            // rather than by reading. It is drawn only where the plan has
+            // something to weigh its nodes by -- SQLite reports nothing, and an
+            // empty track on every row of its plans is a column of nothing to
+            // read past. The percentage is printed beside the bar because a
+            // colour alone is not something every reader can tell apart.
             .children(total.map(|_| {
+                let tone = drawn.tier.map(|tier| tier_colour(tier, &t));
                 div()
-                    .w(px(72.))
-                    .min_w(px(72.))
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
                     .flex_shrink_0()
-                    .pt(px(4.))
+                    .pt(px(1.))
                     .child(
                         div()
-                            .w_full()
+                            .w(px(64.))
+                            .min_w(px(64.))
                             .h(px(6.))
                             .rounded(px(3.))
                             .bg(t.element_active)
-                            .child(
+                            .children(drawn.share.zip(tone).map(|(share, tone)| {
                                 div()
                                     .h_full()
                                     .rounded(px(3.))
                                     .w(gpui::relative(share as f32))
-                                    .bg(match hottest {
-                                        true => t.danger,
-                                        false => t.accent,
-                                    }),
-                            ),
+                                    .bg(tone)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(46.))
+                            .min_w(px(46.))
+                            .flex()
+                            .justify_end()
+                            .text_size(px(layout::chrome(layout::TEXT_XS)))
+                            .text_color(t.text_muted)
+                            .children(drawn.share.map(|share| div().child(percent_text(share)))),
                     )
             }))
             .child(
@@ -505,10 +506,7 @@ fn render_plan(
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(match hottest {
-                                true => t.danger,
-                                false => t.text,
-                            })
+                            .text_color(t.text)
                             .child(plan_label(&node.label, &t)),
                     )
                     .children(node.detail.iter().map(|line| {
@@ -539,7 +537,7 @@ fn render_plan(
                                     t.success.into(),
                                 )
                             }))
-                            .children(analysis.nodes[index].misestimate.map(|miss| {
+                            .children(drawn.misestimate.map(|miss| {
                                 div().text_color(t.danger).child(format!(
                                     "×{} misestimate",
                                     group_thousands(miss.factor.round() as u64)
@@ -556,14 +554,14 @@ fn render_plan(
                                     t.syntax_number.into(),
                                 )
                             }))
-                            .children(
-                                analysis.nodes[index]
-                                    .value
-                                    .filter(|_| analysis.basis == Basis::Measured)
-                                    .map(|ms| {
-                                        metric("self", format!("{ms:.3} ms"), t.text_muted.into())
-                                    }),
-                            ),
+                            .children(drawn.value.map(|value| match analysis.basis {
+                                Basis::Measured => {
+                                    metric("self", format!("{value:.3} ms"), t.text_muted.into())
+                                }
+                                _ => {
+                                    metric("self", format!("cost {value:.2}"), t.text_muted.into())
+                                }
+                            })),
                     ),
             )
     });
@@ -674,6 +672,18 @@ fn render_plan(
                 .children(rows),
         )
         .into_any_element()
+}
+
+/// The colour a tier is drawn in: one hue ramp from the quiet text colour up to
+/// the danger colour, so that the order reads in every theme. The two middle
+/// steps are the danger colour thinned over the plane the pane sits on.
+fn tier_colour(tier: Tier, t: &Theme) -> Hsla {
+    match tier {
+        Tier::Quiet => t.text_faint.into(),
+        Tier::Warm => t.danger.over(t.bg, 0.40).into(),
+        Tier::Hot => t.danger.over(t.bg, 0.70).into(),
+        Tier::Danger => t.danger.into(),
+    }
 }
 
 /// A plan line, bounded. The server will happily print every output column of a

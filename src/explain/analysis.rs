@@ -379,10 +379,6 @@ fn own_costs(nodes: &[PlanNode]) -> Vec<Option<f64>> {
 /// above 90 %, which is Danger and would print `90.0%`, a figure that is Hot, so
 /// there the next tenth is printed. Works in whole tenths so that a `{:.1}`
 /// format never rounds a floored value again.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drawn by the plan view from plan 02-04")
-)]
 pub(crate) fn percent_text(share: f64) -> String {
     let mut tenths = (share.clamp(0.0, 1.0) * 1000.0).floor() as u32;
     if tenths == 900 && Tier::of_share(share) == Tier::Danger {
