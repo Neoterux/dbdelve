@@ -657,6 +657,12 @@ pub fn is_expression(key: &str) -> bool {
     )
 }
 
+/// The least a node must have thrown away, per loop, for [`wasteful`] to say it
+/// threw away far more than it kept. It must also have thrown away more than it
+/// kept: the compact form prints this number and that rule as the fact it
+/// states.
+pub(crate) const WASTEFUL_MIN_REMOVED: f64 = 1000.0;
+
 /// Whether a `Rows Removed by …` qualifier says the node threw away far more
 /// than it kept. Both counts are per loop, as Postgres prints them.
 // ponytail: more removed than kept, and at least a thousand; a per-operator
@@ -669,7 +675,7 @@ pub fn wasteful(line: &str, actual: Option<Actual>) -> bool {
         return false;
     };
     key.starts_with("Rows Removed by ")
-        && removed >= 1000.0
+        && removed >= WASTEFUL_MIN_REMOVED
         && removed > actual.map_or(0.0, |actual| actual.rows)
 }
 

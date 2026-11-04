@@ -22,20 +22,34 @@
 )]
 
 use super::{
-    Plan,
-    analysis::{Analysis, Basis, percent_text},
+    Plan, PlanNode, WASTEFUL_MIN_REMOVED,
+    analysis::{Analysis, Basis, Direction, Finding, percent_text},
+    wasteful,
 };
 
 /// `plan` as compact text, from the `analysis` built over it. At most
 /// `max_nodes` nodes are chosen; see the module's truncation line.
 pub(crate) fn compact(plan: &Plan, analysis: &Analysis, _max_nodes: usize) -> String {
     let mut lines = vec!["truncated: none".to_string(), header(plan, analysis)];
-    lines.push("findings:".to_string());
+    if analysis.findings.is_empty() {
+        lines.push("findings: none".to_string());
+    } else {
+        lines.push("findings:".to_string());
+        lines.extend(
+            analysis
+                .findings
+                .iter()
+                .map(|finding| finding_line(plan, analysis, *finding)),
+        );
+    }
     if plan.nodes.is_empty() {
         lines.push("tree: none".to_string());
     } else {
         lines.push("tree:".to_string());
-        lines.extend((0..plan.nodes.len()).map(|index| node_line(plan, analysis, index)));
+        for index in 0..plan.nodes.len() {
+            lines.push(node_line(plan, analysis, index));
+            lines.extend(detail_lines(plan, index));
+        }
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -82,6 +96,47 @@ fn header(plan: &Plan, analysis: &Analysis) -> String {
     line
 }
 
+/// One finding on one line: the node, why it is worth reading, and its label.
+fn finding_line(plan: &Plan, analysis: &Analysis, finding: Finding) -> String {
+    match finding {
+        Finding::Hot(index) => {
+            let reading = &analysis.nodes[index];
+            let mut line = format!("  n{index} hot");
+            if let Some(share) = reading.share {
+                line.push_str(&format!(" {}", percent_text(share)));
+            }
+            if let Some(value) = reading.value {
+                line.push_str(&format!(" {}", weight(analysis, value)));
+            }
+            line.push_str(&format!(" {}", one_line(&plan.nodes[index].label)));
+            line
+        }
+        Finding::Misestimated(index) => {
+            let node = &plan.nodes[index];
+            let mut line = format!("  n{index} misestimate");
+            if let Some(missed) = analysis.nodes[index].misestimate {
+                line.push_str(&format!(
+                    " {} x{}",
+                    match missed.direction {
+                        Direction::Under => "under",
+                        Direction::Over => "over",
+                    },
+                    number(missed.factor.floor()),
+                ));
+            }
+            let loops = loops(node);
+            if let Some(estimated) = node.estimated {
+                line.push_str(&format!(" est={}", number(estimated.rows * loops)));
+            }
+            if let Some(actual) = node.actual {
+                line.push_str(&format!(" act={}", number(actual.rows * loops)));
+            }
+            line.push_str(&format!(" {}", one_line(&node.label)));
+            line
+        }
+    }
+}
+
 /// One node on one line, indented by its depth.
 fn node_line(plan: &Plan, analysis: &Analysis, index: usize) -> String {
     let node = &plan.nodes[index];
@@ -93,18 +148,12 @@ fn node_line(plan: &Plan, analysis: &Analysis, index: usize) -> String {
     line.push(' ');
     line.push_str(&one_line(&node.label));
     if let Some(value) = reading.value {
-        let measured = analysis.basis == Basis::Measured;
-        line.push_str(&format!(
-            " {}={}{}",
-            if measured { "self" } else { "cost" },
-            number(value),
-            if measured { "ms" } else { "" },
-        ));
+        line.push_str(&format!(" {}", weight(analysis, value)));
     }
     if let Some(share) = reading.share {
         line.push_str(&format!(" {}", percent_text(share)));
     }
-    let loops = node.actual.map_or(1.0, |actual| actual.loops);
+    let loops = loops(node);
     if let Some(estimated) = node.estimated {
         line.push_str(&format!(" est={}", number(estimated.rows * loops)));
     }
@@ -119,6 +168,52 @@ fn node_line(plan: &Plan, analysis: &Analysis, index: usize) -> String {
         line.push_str(&format!(" parallel={}workers", parallel.workers));
     }
     line
+}
+
+/// A node's own weight as its key says what it is: milliseconds of its own on a
+/// measured plan, its own planner cost, in the engine's units, otherwise.
+fn weight(analysis: &Analysis, value: f64) -> String {
+    match analysis.basis {
+        Basis::Measured => format!("self={}ms", number(value)),
+        _ => format!("cost={}", number(value)),
+    }
+}
+
+/// How many times a node ran. Postgres prints both row counts per loop, so a
+/// total is a count times this.
+fn loops(node: &PlanNode) -> f64 {
+    node.actual.map_or(1.0, |actual| actual.loops)
+}
+
+/// The lines a node printed under itself, verbatim. A `Rows Removed by` line
+/// also gets its total over the loops, and the fact that it threw away more than
+/// it kept when [`wasteful`] says so.
+fn detail_lines(plan: &Plan, index: usize) -> Vec<String> {
+    let node = &plan.nodes[index];
+    node.detail
+        .iter()
+        .map(|detail| {
+            let mut line = format!("{}  | {}", indent(node.depth), one_line(detail));
+            let removed = detail
+                .split_once(": ")
+                .filter(|(key, _)| key.starts_with("Rows Removed by "))
+                .and_then(|(_, value)| value.trim().parse::<f64>().ok());
+            if let (Some(removed), Some(actual)) = (removed, node.actual) {
+                line.push_str(&format!(
+                    "  [total {} over {} loops]",
+                    number(removed * actual.loops),
+                    number(actual.loops)
+                ));
+            }
+            if wasteful(detail, node.actual) {
+                line.push_str(&format!(
+                    "  [fact: removed >= {} and more than kept, per loop]",
+                    number(WASTEFUL_MIN_REMOVED)
+                ));
+            }
+            line
+        })
+        .collect()
 }
 
 /// The indentation of a tree line at `depth`: two spaces, so that no line of
@@ -173,8 +268,27 @@ fn number(figure: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Actual, parse};
     use super::*;
     use crate::db::{Engine, rows};
+
+    const PARALLEL: &str = include_str!("../testdata/plan-postgres-parallel.txt");
+    const CTE: &str = include_str!("../testdata/plan-postgres-cte-subplan.txt");
+    const SPILL: &str = include_str!("../testdata/plan-postgres-spill.txt");
+
+    /// The compact form of a Postgres plan, untruncated.
+    fn whole(plan: &Plan) -> String {
+        compact(plan, &Analysis::new(plan, Engine::Postgres), usize::MAX)
+    }
+
+    /// The lines between a column-0 `start` line and the next column-0 line.
+    fn block<'a>(text: &'a str, start: &str) -> Vec<&'a str> {
+        text.lines()
+            .skip_while(|line| !line.starts_with(start))
+            .skip(1)
+            .take_while(|line| line.starts_with(' '))
+            .collect()
+    }
 
     fn one_column(text: &str) -> Plan {
         super::super::parse(
@@ -193,8 +307,237 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "truncated: none");
         assert!(lines[1].starts_with("plan: engine=postgres analyzed=yes basis=measured"));
-        let at = |key: &str| lines.iter().position(|line| *line == key);
+        let at = |key: &str| lines.iter().position(|line| line.starts_with(key));
         assert!(at("findings:") < at("tree:"));
+    }
+
+    #[test]
+    fn a_compact_plan_keeps_loops_rows_removed_analysis_and_cost_unit() {
+        let text = whole(&one_column(PARALLEL));
+        assert!(text.contains(" loops=3"));
+        assert!(text.contains("(x 3 loops)"));
+        assert!(text.contains("| Rows Removed by Filter: 33337  [total 100011 over 3 loops]"));
+        assert!(text.contains(" analyzed=yes "));
+        assert!(text.contains(" cost_unit=\"planner cost, arbitrary units\""));
+        assert!(text.contains(" time_unit=\"measured (ms)\""));
+    }
+
+    #[test]
+    fn findings_come_before_the_tree_and_name_hot_and_misestimated_nodes() {
+        for text in [PARALLEL, CTE, SPILL] {
+            let plan = one_column(text);
+            let analysis = Analysis::new(&plan, Engine::Postgres);
+            let out = compact(&plan, &analysis, usize::MAX);
+            let at = |key: &str| out.lines().position(|line| line.starts_with(key));
+            assert!(at("findings:") < at("tree:"));
+            assert!(!analysis.findings.is_empty());
+            let findings = block(&out, "findings:");
+            assert_eq!(findings.len(), analysis.findings.len());
+            for finding in &analysis.findings {
+                let prefix = match finding {
+                    Finding::Hot(index) => format!("  n{index} hot "),
+                    Finding::Misestimated(index) => format!("  n{index} misestimate "),
+                };
+                assert_eq!(
+                    findings
+                        .iter()
+                        .filter(|line| line.starts_with(&prefix))
+                        .count(),
+                    1,
+                    "{prefix}"
+                );
+            }
+        }
+
+        // The scan under the inner `Limit` read one row of the 169400 it
+        // expected, which is the `Limit` and not the planner.
+        let plan = one_column(SPILL);
+        let scan = plan
+            .nodes
+            .iter()
+            .position(|node| node.estimated.is_some_and(|e| e.rows == 169_400.0))
+            .expect("the spill fixture has the scan under its Limit");
+        let out = whole(&plan);
+        assert!(!out.contains(&format!("n{scan} misestimate")));
+        assert!(!out.contains("misestimate"));
+    }
+
+    #[test]
+    fn the_wasteful_rule_is_a_fact_with_its_threshold_and_never_a_finding() {
+        let node = |removed: u32| {
+            format!(
+                "Seq Scan on t  (cost=0.00..10.00 rows=10 width=4) (actual time=0.010..1.000 rows=5 loops=2)\n  Filter: (a > 1)\n  Rows Removed by Filter: {removed}"
+            )
+        };
+        let wasteful = whole(&one_column(&node(5000)));
+        assert!(wasteful.contains(
+            "| Rows Removed by Filter: 5000  [total 10000 over 2 loops]  [fact: removed >= 1000 and more than kept, per loop]"
+        ));
+        let findings = block(&wasteful, "findings:").join("\n");
+        assert!(!findings.contains("fact:") && !findings.contains("wasteful"));
+
+        let small = whole(&one_column(&node(3)));
+        assert!(small.contains("| Rows Removed by Filter: 3  [total 6 over 2 loops]"));
+        assert!(!small.contains("fact:"));
+
+        // 33337 is far fewer than the 299997 rows that node kept.
+        assert!(!whole(&one_column(PARALLEL)).contains("fact:"));
+        // 948358 against 1632 kept is the other way.
+        assert!(whole(&one_column(CTE)).contains("[fact: removed >= 1000 and more than kept"));
+    }
+
+    #[test]
+    fn server_text_cannot_start_a_line_of_its_own() {
+        let plan = Plan {
+            nodes: vec![PlanNode {
+                depth: 0,
+                label: "Seq Scan on t\nfindings: n0 hot 100.0%".to_string(),
+                detail: vec!["Filter: x\r\ntree:".to_string()],
+                heading: Some("CTE c\n\u{2028}plan: x".to_string()),
+                actual: Some(Actual {
+                    startup_ms: 0.0,
+                    total_ms: 1.0,
+                    rows: 1.0,
+                    loops: 1.0,
+                }),
+                self_ms: Some(1.0),
+                ..PlanNode::default()
+            }],
+            summary: vec![
+                (
+                    "Execution Time".to_string(),
+                    "1 ms\nfindings: n0 hot 100.0%".to_string(),
+                ),
+                (
+                    "Planning Time".to_string(),
+                    "2 ms\" analyzed=\"no".to_string(),
+                ),
+            ],
+            text: String::new(),
+        };
+        let out = whole(&plan);
+        let starting = |key: &str| out.lines().filter(|line| line.starts_with(key)).count();
+        assert_eq!(starting("findings:"), 1);
+        assert_eq!(starting("tree:"), 1);
+        assert_eq!(starting("plan:"), 1);
+        assert_eq!(starting("truncated:"), 1);
+        let header = out.lines().nth(1).expect("a header line");
+        assert!(header.starts_with("plan: "));
+        assert!(header.contains("execution=\"1 ms findings: n0 hot 100.0%\""));
+        assert!(header.contains("planning=\"2 ms\\\" analyzed=\\\"no\""));
+        assert!(
+            out.lines()
+                .skip_while(|line| *line != "tree:")
+                .skip(1)
+                .all(|line| line.starts_with(' ') || line.starts_with('n'))
+        );
+        // A backslash is escaped too, so it cannot escape the closing quote.
+        let mut plan = plan;
+        plan.summary[1].1 = "2 ms\\".to_string();
+        assert!(whole(&plan).contains("planning=\"2 ms\\\\\""));
+    }
+
+    #[test]
+    fn conditions_are_kept_verbatim() {
+        for text in [CTE, SPILL] {
+            let plan = one_column(text);
+            let out = whole(&plan);
+            let conditions: Vec<&String> = plan
+                .nodes
+                .iter()
+                .flat_map(|node| &node.detail)
+                .filter(|line| {
+                    ["Filter:", "Index Cond:", "Hash Cond:"]
+                        .iter()
+                        .any(|k| line.starts_with(k))
+                })
+                .collect();
+            assert!(!conditions.is_empty());
+            for condition in conditions {
+                assert!(out.contains(&format!("| {condition}")), "{condition}");
+            }
+            assert!(out.contains(" conditions=verbatim"));
+            let lower = out.to_lowercase();
+            for word in ["redact", "sanitiz", "masked"] {
+                assert!(!lower.contains(word));
+            }
+        }
+    }
+
+    #[test]
+    fn a_planner_cost_or_structure_plan_says_so_in_its_header() {
+        // The same plan as `EXPLAIN` without `ANALYZE` prints it.
+        let mut plain = String::new();
+        for line in PARALLEL.lines() {
+            match line.find(" (actual ") {
+                Some(at) => plain.push_str(&line[..at]),
+                None => plain.push_str(line),
+            }
+            plain.push('\n');
+        }
+        let out = whole(&one_column(&plain));
+        let header = out.lines().nth(1).expect("a header line");
+        assert!(header.contains(" analyzed=no basis=planner-cost "));
+        let total = header
+            .split(' ')
+            .find_map(|word| word.strip_prefix("total="))
+            .expect("a total");
+        assert!(total.parse::<f64>().is_ok(), "{total}");
+        assert!(out.contains(" cost="));
+        assert!(!out.contains(" self="));
+
+        let sqlite = parse(
+            &["id", "parent", "notused", "detail"].map(String::from),
+            &rows(vec![
+                vec![
+                    Some("3".into()),
+                    Some("0".into()),
+                    Some("0".into()),
+                    Some("SCAN accounts".into()),
+                ],
+                vec![
+                    Some("9".into()),
+                    Some("3".into()),
+                    Some("0".into()),
+                    Some("USE TEMP B-TREE FOR ORDER BY".into()),
+                ],
+            ]),
+        );
+        let out = compact(&sqlite, &Analysis::new(&sqlite, Engine::Sqlite), usize::MAX);
+        let header = out.lines().nth(1).expect("a header line");
+        assert!(header.contains(" basis=structure-only time_unit=none cost_unit=none total=none "));
+        assert!(header.contains("analyzed=no"));
+        assert!(out.contains("n0 SCAN accounts"));
+        let tree = block(&out, "tree:");
+        assert_eq!(tree.len(), 2);
+        assert!(
+            tree.iter()
+                .all(|line| !line.contains("self=") && !line.contains("cost="))
+        );
+    }
+
+    #[test]
+    fn every_fixture_serializes_to_its_golden_text() {
+        for (text, golden) in [
+            (
+                PARALLEL,
+                include_str!("../testdata/plan-postgres-parallel.compact.txt"),
+            ),
+            (
+                CTE,
+                include_str!("../testdata/plan-postgres-cte-subplan.compact.txt"),
+            ),
+            (
+                SPILL,
+                include_str!("../testdata/plan-postgres-spill.compact.txt"),
+            ),
+        ] {
+            // Asserted first, so that the ASCII check below is about the serializer.
+            assert!(text.is_ascii());
+            let out = whole(&one_column(text));
+            assert_eq!(out, golden);
+            assert!(out.is_ascii());
+        }
     }
 
     /// Not a check: serializes the plan in `DBDELVE_PLAN_FILE` the way a Postgres
