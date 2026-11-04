@@ -261,11 +261,15 @@ fn findings(nodes: &[NodeAnalysis]) -> Vec<Finding> {
 /// is read as one so neither side divides by it.
 fn misestimate(nodes: &[PlanNode], index: usize) -> Option<Misestimate> {
     let node = &nodes[index];
-    let estimated = node.estimated?.rows.max(1.0);
-    let actual = node.actual?.rows.max(1.0);
+    let (estimated, actual) = (node.estimated?.rows, node.actual?.rows);
+    // A count that is NaN or too large for a float to hold is text the server
+    // got wrong, not a figure to draw a chip from.
+    if !estimated.is_finite() || !actual.is_finite() {
+        return None;
+    }
+    let (estimated, actual) = (estimated.max(1.0), actual.max(1.0));
     let factor = (actual / estimated).max(estimated / actual);
-    // Counts too large for a float to hold divide into infinity or NaN.
-    let tier = Tier::of_misestimate(factor).filter(|_| factor.is_finite())?;
+    let tier = Tier::of_misestimate(factor)?;
     let direction = if actual > estimated {
         Direction::Under
     } else {
@@ -855,7 +859,8 @@ mod tests {
         // Counts too large for a float to hold are no figure at all.
         assert_eq!(missed(1.0, f64::INFINITY), None);
         assert_eq!(missed(f64::INFINITY, f64::INFINITY), None);
-        assert_eq!(missed(f64::NAN, 50.0), Some((50.0, Under, Tier::Warm)));
+        assert_eq!(missed(f64::NAN, 50.0), None);
+        assert_eq!(missed(50.0, f64::NAN), None);
 
         for (factor, tier) in [
             (9.99, None),
