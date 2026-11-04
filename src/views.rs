@@ -42,7 +42,7 @@ use crate::{
     },
     db,
     db::{Engine, ExplainMode, RoutineKind},
-    explain::{self, LabelPart},
+    explain::{self, LabelPart, analysis::Basis},
     explorer::ROW_LIMITS,
     filter::{Conjunction, FilterRow, Operator},
     icons::icon,
@@ -539,10 +539,10 @@ fn render_plan(
                                     t.success.into(),
                                 )
                             }))
-                            .children(plan.misestimate(index).map(|factor| {
+                            .children(analysis.nodes[index].misestimate.map(|miss| {
                                 div().text_color(t.danger).child(format!(
                                     "×{} misestimate",
-                                    group_thousands(factor.round() as u64)
+                                    group_thousands(miss.factor.round() as u64)
                                 ))
                             }))
                             .children(node.estimated.map(|estimated| {
@@ -556,9 +556,14 @@ fn render_plan(
                                     t.syntax_number.into(),
                                 )
                             }))
-                            .children(node.self_ms.filter(|_| total.is_some()).map(|ms| {
-                                metric("self", format!("{ms:.3} ms"), t.text_muted.into())
-                            })),
+                            .children(
+                                analysis.nodes[index]
+                                    .value
+                                    .filter(|_| analysis.basis == Basis::Measured)
+                                    .map(|ms| {
+                                        metric("self", format!("{ms:.3} ms"), t.text_muted.into())
+                                    }),
+                            ),
                     ),
             )
     });

@@ -11,7 +11,7 @@
 //! Every figure is scoped to the plan it was built from. Nothing here is shared
 //! between plans, so no share is ever a fraction of another plan's total.
 
-use super::{Plan, PlanNode};
+use super::{Plan, PlanNode, gathers};
 use crate::db::Engine;
 
 /// A plan's reading: what its numbers are, how heavy each node is, and what is
@@ -26,8 +26,18 @@ pub(crate) struct Analysis {
     /// What every share is a share of, on both bases. `None` when there is
     /// nothing to divide by: a plan without numbers, or one that sums to zero.
     pub(crate) total: Option<f64>,
+    /// The `Execution Time` the server reported for the whole statement. Kept
+    /// apart from `total`, which is the share denominator.
+    pub(crate) execution_ms: Option<f64>,
+    /// Measured time that belongs to no node: JIT, or the executor's setup and
+    /// teardown. Present only when the reported execution time exceeds the
+    /// nodes' total by more than 1 % of it.
+    pub(crate) outside_nodes_ms: Option<f64>,
     /// One per plan node, in the plan's order.
     pub(crate) nodes: Vec<NodeAnalysis>,
+    /// What to look at first: Hot and Danger nodes by share, then misestimated
+    /// nodes by factor, ties in the plan's order.
+    pub(crate) findings: Vec<Finding>,
 }
 
 /// Where a plan's numbers come from, decided by what the plan carries and not
@@ -50,6 +60,44 @@ pub(crate) struct NodeAnalysis {
     /// `value` over the plan's total, in `0.0..=1.0`.
     pub(crate) share: Option<f64>,
     pub(crate) tier: Option<Tier>,
+    /// How far the planner's row count was from what happened, when it was off
+    /// by ten times or more and the node did not simply stop early.
+    pub(crate) misestimate: Option<Misestimate>,
+    /// Set on a `Gather` and every node beneath it.
+    pub(crate) parallel: Option<Parallel>,
+}
+
+/// A row estimate that missed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Misestimate {
+    /// How many times over or under, at least 10.
+    pub(crate) factor: f64,
+    pub(crate) direction: Direction,
+    pub(crate) tier: Tier,
+}
+
+/// Which way the planner was wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// More rows than it expected.
+    Under,
+    /// Fewer rows than it expected.
+    Over,
+}
+
+/// A node run by parallel workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Parallel {
+    pub(crate) workers: u32,
+    /// The `Gather` itself, as opposed to a node running in its workers.
+    pub(crate) gathers: bool,
+}
+
+/// A node worth reading first, by index into the plan's nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finding {
+    Hot(usize),
+    Misestimated(usize),
 }
 
 /// How loudly a figure is drawn. The same four names serve a node's share of
@@ -76,6 +124,20 @@ impl Tier {
             Self::Hot
         } else {
             Self::Danger
+        }
+    }
+
+    /// The tier of a misestimate's factor: none below 10x, Warm to below 100x,
+    /// Hot through exactly 1000x, Danger only above.
+    pub(crate) fn of_misestimate(factor: f64) -> Option<Self> {
+        if factor < 10.0 {
+            None
+        } else if factor < 100.0 {
+            Some(Self::Warm)
+        } else if factor <= 1000.0 {
+            Some(Self::Hot)
+        } else {
+            Some(Self::Danger)
         }
     }
 }
@@ -120,9 +182,11 @@ impl Analysis {
         }
         .filter(|total| total.is_finite() && *total > 0.0);
 
-        let nodes = values
+        let parallel = parallel_nodes(&plan.nodes);
+        let nodes: Vec<NodeAnalysis> = values
             .into_iter()
-            .map(|value| {
+            .enumerate()
+            .map(|(index, value)| {
                 // Bounded so malformed server text cannot draw past the track.
                 let share = value
                     .zip(total)
@@ -131,18 +195,149 @@ impl Analysis {
                     value,
                     share,
                     tier: share.map(Tier::of_share),
+                    misestimate: misestimate(&plan.nodes, index),
+                    parallel: parallel[index],
                 }
             })
             .collect();
+
+        let execution_ms = plan
+            .summary
+            .iter()
+            .find(|(label, _)| label.eq_ignore_ascii_case("Execution Time"))
+            .and_then(|(_, value)| value.split_whitespace().next()?.parse::<f64>().ok())
+            .filter(|ms| ms.is_finite());
+        let outside_nodes_ms = execution_ms
+            .zip(total)
+            .filter(|_| basis == Basis::Measured)
+            .filter(|(execution, total)| execution - total > total * 0.01)
+            .map(|(execution, total)| execution - total);
 
         Self {
             engine,
             basis,
             label: label(engine, basis),
             total,
+            execution_ms,
+            outside_nodes_ms,
+            findings: findings(&nodes),
             nodes,
         }
     }
+}
+
+/// Hot and Danger nodes by share, then misestimated nodes by factor, each
+/// stable so that ties stay in the plan's order.
+fn findings(nodes: &[NodeAnalysis]) -> Vec<Finding> {
+    let mut hot: Vec<(usize, f64)> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.tier, Some(Tier::Hot | Tier::Danger)))
+        .filter_map(|(index, node)| Some((index, node.share?)))
+        .collect();
+    hot.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut missed: Vec<(usize, f64)> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| Some((index, node.misestimate?.factor)))
+        .collect();
+    missed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hot.into_iter()
+        .map(|(index, _)| Finding::Hot(index))
+        .chain(
+            missed
+                .into_iter()
+                .map(|(index, _)| Finding::Misestimated(index)),
+        )
+        .collect()
+}
+
+/// How far a node's row count was from the planner's, unless it only ran short
+/// because an ancestor stopped pulling rows. Estimates are for running to
+/// completion, so a scan under a `Limit`, or on a semi or anti join's inner
+/// side, reads as a huge overestimate on a healthy plan.
+///
+/// Postgres reports both counts per loop, so they compare as they stand; zero
+/// is read as one so neither side divides by it.
+fn misestimate(nodes: &[PlanNode], index: usize) -> Option<Misestimate> {
+    let node = &nodes[index];
+    let estimated = node.estimated?.rows.max(1.0);
+    let actual = node.actual?.rows.max(1.0);
+    let factor = (actual / estimated).max(estimated / actual);
+    // Counts too large for a float to hold divide into infinity or NaN.
+    let tier = Tier::of_misestimate(factor).filter(|_| factor.is_finite())?;
+    let direction = if actual > estimated {
+        Direction::Under
+    } else {
+        Direction::Over
+    };
+
+    let mut depth = node.depth;
+    let stopped = nodes[..index].iter().rev().any(|ancestor| {
+        let is_ancestor = ancestor.depth < depth;
+        depth = depth.min(ancestor.depth);
+        let label = ancestor.label.to_lowercase();
+        is_ancestor
+            && (label.starts_with("limit")
+                || label.contains("semi join")
+                || label.contains("anti join"))
+    });
+    (!(direction == Direction::Over && stopped)).then_some(Misestimate {
+        factor,
+        direction,
+        tier,
+    })
+}
+
+/// A `Gather` and everything beneath it ran in workers. The count is what the
+/// `Gather` says it launched, and failing that the participants its child ran
+/// in, less the leader.
+fn parallel_nodes(nodes: &[PlanNode]) -> Vec<Option<Parallel>> {
+    // The depth of each `Gather` on the path down to the node, and its workers.
+    let mut open: Vec<(usize, u32)> = Vec::new();
+    let mut marks = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        while open.last().is_some_and(|(depth, _)| *depth >= node.depth) {
+            open.pop();
+        }
+        let inside = open.last().map(|(_, workers)| Parallel {
+            workers: *workers,
+            gathers: false,
+        });
+        marks.push(
+            match gathers(node).then(|| workers_of(nodes, index)).flatten() {
+                Some(workers) => {
+                    open.push((node.depth, workers));
+                    Some(Parallel {
+                        workers,
+                        gathers: true,
+                    })
+                }
+                None => inside,
+            },
+        );
+    }
+    marks
+}
+
+fn workers_of(nodes: &[PlanNode], gather: usize) -> Option<u32> {
+    let node = &nodes[gather];
+    let launched = node.detail.iter().find_map(|line| {
+        line.strip_prefix("Workers Launched:")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
+    launched.or_else(|| {
+        let loops = nodes[gather + 1..]
+            .iter()
+            .take_while(|below| below.depth > node.depth)
+            .find(|below| below.depth == node.depth + 1)?
+            .actual?
+            .loops;
+        // The leader is one of the participants, and is not a worker.
+        (loops.is_finite() && loops >= 1.0).then_some((loops - 1.0) as u32)
+    })
 }
 
 /// Each node's own planner cost: its `total_cost` less its direct children's,
@@ -606,5 +801,244 @@ mod tests {
         let second = Analysis::new(&one_column(HASH_JOIN), Engine::Postgres);
         assert_eq!(first, second);
         assert_eq!(big.nodes[0].share, Some(1.0));
+    }
+
+    /// A node that estimated `estimated` rows and returned `actual`.
+    fn node(label: &str, depth: usize, estimated: f64, actual: f64) -> PlanNode {
+        PlanNode {
+            label: label.into(),
+            depth,
+            estimated: Some(explain::Estimated {
+                startup_cost: 0.0,
+                total_cost: 1.0,
+                rows: estimated,
+                width: 0,
+            }),
+            actual: Some(explain::Actual {
+                startup_ms: 0.0,
+                total_ms: 1.0,
+                rows: actual,
+                loops: 1.0,
+            }),
+            ..PlanNode::default()
+        }
+    }
+
+    fn missed(estimated: f64, actual: f64) -> Option<(f64, Direction, Tier)> {
+        let plan = Plan {
+            nodes: vec![node("Seq Scan on t", 0, estimated, actual)],
+            ..Plan::default()
+        };
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        analysis.nodes[0]
+            .misestimate
+            .map(|miss| (miss.factor, miss.direction, miss.tier))
+    }
+
+    #[test]
+    fn a_misestimate_names_its_direction_and_order_of_magnitude() {
+        use Direction::{Over, Under};
+        assert_eq!(missed(10.0, 1000.0), Some((100.0, Under, Tier::Hot)));
+        assert_eq!(missed(5000.0, 50.0), Some((100.0, Over, Tier::Hot)));
+        // Zero is read as one, so nothing divides by it.
+        assert_eq!(missed(0.0, 20.0), Some((20.0, Under, Tier::Warm)));
+        assert_eq!(missed(1.0, 0.0), None);
+        assert_eq!(missed(100.0, 1000.0), Some((10.0, Under, Tier::Warm)));
+        assert_eq!(missed(100.0, 999.0), None);
+        let (factor, direction, tier) = missed(10.0, 999.0).unwrap();
+        assert!((factor - 99.9).abs() < 1e-9);
+        assert_eq!((direction, tier), (Under, Tier::Warm));
+        // Exactly 1000x is the top of Hot; only more than that is Danger.
+        assert_eq!(missed(1.0, 1000.0), Some((1000.0, Under, Tier::Hot)));
+        assert_eq!(missed(1.0, 1000.5), Some((1000.5, Under, Tier::Danger)));
+        assert_eq!(missed(1000.0, 1.0), Some((1000.0, Over, Tier::Hot)));
+        // Counts too large for a float to hold are no figure at all.
+        assert_eq!(missed(1.0, f64::INFINITY), None);
+        assert_eq!(missed(f64::INFINITY, f64::INFINITY), None);
+        assert_eq!(missed(f64::NAN, 50.0), Some((50.0, Under, Tier::Warm)));
+
+        for (factor, tier) in [
+            (9.99, None),
+            (10.0, Some(Tier::Warm)),
+            (99.99, Some(Tier::Warm)),
+            (100.0, Some(Tier::Hot)),
+            (1000.0, Some(Tier::Hot)),
+            (1000.01, Some(Tier::Danger)),
+        ] {
+            assert_eq!(Tier::of_misestimate(factor), tier, "{factor}");
+        }
+        assert_eq!(
+            Analysis::new(&Plan::default(), Engine::Postgres).findings,
+            []
+        );
+    }
+
+    #[test]
+    fn a_short_scan_under_a_limit_or_semi_join_is_not_a_misestimate() {
+        let miss = |nodes: Vec<PlanNode>, index: usize| {
+            let plan = Plan {
+                nodes,
+                ..Plan::default()
+            };
+            Analysis::new(&plan, Engine::Postgres).nodes[index]
+                .misestimate
+                .map(|miss| miss.factor)
+        };
+        let limit = vec![
+            node("Limit", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(limit, 1), None);
+        let mysql = vec![
+            node("Limit: 10 row(s)", 0, 10.0, 10.0),
+            node("Table scan on big", 1, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(mysql, 1), None);
+        let semi = vec![
+            node("Nested Loop Semi Join", 0, 5.0, 5.0),
+            node("Seq Scan on a", 1, 5.0, 5.0),
+            node("Hash Anti Join", 1, 5.0, 5.0),
+            node("Index Scan on b", 2, 100_000.0, 1.0),
+        ];
+        assert_eq!(miss(semi, 3), None);
+        // Stopping early explains too few rows, never too many.
+        let overshoot = vec![
+            node("Limit", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 10.0, 5000.0),
+        ];
+        assert_eq!(miss(overshoot, 1), Some(500.0));
+        // A `Limit` beside the node, not above it, explains nothing.
+        let sibling = vec![
+            node("Append", 0, 1.0, 1.0),
+            node("Limit", 1, 10.0, 10.0),
+            node("Seq Scan on a", 2, 10.0, 10.0),
+            node("Seq Scan on b", 1, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(sibling, 3), Some(100_000.0));
+        let plain = vec![
+            node("Sort", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(plain, 1), Some(100_000.0));
+    }
+
+    #[test]
+    fn a_parallel_subtree_is_marked_with_its_workers() {
+        let plan = one_column(include_str!("../testdata/plan-postgres-parallel.txt"));
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let gather = plan.nodes.iter().position(gathers).unwrap();
+        let depth = plan.nodes[gather].depth;
+
+        assert_eq!(
+            analysis.nodes[gather].parallel,
+            Some(Parallel {
+                workers: 2,
+                gathers: true
+            })
+        );
+        for (index, node) in plan.nodes.iter().enumerate() {
+            let inside = index > gather && node.depth > depth && {
+                plan.nodes[gather + 1..index]
+                    .iter()
+                    .all(|between| between.depth > depth)
+            };
+            match (index == gather, inside) {
+                (true, _) => {}
+                (false, true) => assert_eq!(
+                    analysis.nodes[index].parallel,
+                    Some(Parallel {
+                        workers: 2,
+                        gathers: false
+                    }),
+                    "{}",
+                    node.label
+                ),
+                (false, false) => {
+                    assert_eq!(analysis.nodes[index].parallel, None, "{}", node.label)
+                }
+            }
+        }
+        assert!(
+            analysis
+                .nodes
+                .iter()
+                .any(|node| node.parallel.is_some_and(|p| !p.gathers))
+        );
+
+        // With no `Workers Launched` line the workers are the participants its
+        // child ran in, less the leader.
+        let bare = one_column(
+            "Gather  (actual time=0.000..9.000 rows=1 loops=1)
+  ->  Parallel Seq Scan on t  (actual time=0.000..8.000 rows=1 loops=3)",
+        );
+        let analysis = Analysis::new(&bare, Engine::Postgres);
+        assert_eq!(analysis.nodes[0].parallel.map(|p| p.workers), Some(2));
+        assert_eq!(analysis.nodes[1].parallel.map(|p| p.gathers), Some(false));
+    }
+
+    #[test]
+    fn findings_list_hot_nodes_then_misestimates_in_a_stable_order() {
+        let plan = one_column(
+            "Append  (actual time=0.000..10.000 rows=1 loops=1)
+  ->  Seq Scan on a  (cost=0.00..1.00 rows=100 width=1) (actual time=0.000..5.000 rows=10 loops=1)
+  ->  Seq Scan on b  (cost=0.00..1.00 rows=1 width=1) (actual time=0.000..5.000 rows=1000 loops=1)
+  ->  Seq Scan on c  (cost=0.00..1.00 rows=1 width=1) (actual time=0.000..0.000 rows=10 loops=1)",
+        );
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        // `a` and `b` share the time equally and tie; `b`'s miss is the largest
+        // and `a` and `c` tie on theirs.
+        assert_eq!(
+            analysis.findings,
+            [
+                Finding::Hot(1),
+                Finding::Hot(2),
+                Finding::Misestimated(2),
+                Finding::Misestimated(1),
+                Finding::Misestimated(3),
+            ]
+        );
+
+        let danger = one_column("Seq Scan on a  (actual time=0.000..2.000 rows=1 loops=1)");
+        assert_eq!(
+            Analysis::new(&danger, Engine::Postgres).findings,
+            [Finding::Hot(0)]
+        );
+        let quiet = one_column(HASH_JOIN);
+        assert_eq!(
+            Analysis::new(&quiet, Engine::Postgres).findings,
+            [Finding::Hot(2)]
+        );
+    }
+
+    #[test]
+    fn time_spent_outside_every_node_is_reported() {
+        let plan = one_column(include_str!("../testdata/plan-postgres-cte-subplan.txt"));
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let execution = analysis
+            .execution_ms
+            .expect("the fixture reports an Execution Time");
+        let total = analysis.total.unwrap();
+        let outside = analysis
+            .outside_nodes_ms
+            .expect("JIT time sits outside every node");
+        assert!(outside > 0.0);
+        assert!((outside - (execution - total)).abs() < 0.01);
+
+        // Inside one percent of the total is rounding, not a missing node.
+        let close = one_column(
+            "Seq Scan on a  (actual time=0.000..100.000 rows=1 loops=1)
+Execution Time: 100.5 ms",
+        );
+        let analysis = Analysis::new(&close, Engine::Postgres);
+        assert_eq!(analysis.execution_ms, Some(100.5));
+        assert_eq!(analysis.outside_nodes_ms, None);
+        let apart = one_column(
+            "Seq Scan on a  (actual time=0.000..100.000 rows=1 loops=1)
+Execution Time: 102 ms",
+        );
+        assert_eq!(
+            Analysis::new(&apart, Engine::Postgres).outside_nodes_ms,
+            Some(2.0)
+        );
     }
 }
