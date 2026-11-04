@@ -13,6 +13,8 @@
 //! no sense becomes a node carrying its own raw text, and a metric that does
 //! not parse stays in the label where the user can still read it.
 
+pub(crate) mod analysis;
+
 use crate::db::Row;
 
 /// A parsed EXPLAIN, ready to render.
@@ -76,7 +78,7 @@ pub struct Actual {
 impl Actual {
     /// The time the node took across every loop, which is what a parent's own
     /// total already contains and so what a parent subtracts.
-    fn inclusive_ms(&self) -> f64 {
+    pub(crate) fn inclusive_ms(&self) -> f64 {
         self.total_ms * self.loops
     }
 }
