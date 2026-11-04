@@ -39,6 +39,10 @@ pub struct PlanNode {
     /// The qualifier lines printed under the node — `Filter: …`,
     /// `Index Cond: …`, `Buffers: …` — verbatim and in order.
     pub detail: Vec<String>,
+    /// The `SubPlan 2` / `InitPlan 1 (returns $0)` / `CTE big` line that
+    /// introduced this node, verbatim. Postgres prints it above the subtree it
+    /// owns, one level off from the owner's ordinary children.
+    pub heading: Option<String>,
     /// `cost=0.00..35.50 rows=2550 width=4`, when the plan carried estimates.
     pub estimated: Option<Estimated>,
     /// `actual time=0.01..0.02 rows=10 loops=1`, when it was an ANALYZE.
@@ -327,6 +331,9 @@ fn parse_indented(text: String) -> Plan {
     // is that path's length, which holds for Postgres' 2-then-4 steps, MySQL's
     // 4 and SQLite's 3 without any of them being written down here.
     let mut ancestors: Vec<usize> = Vec::new();
+    // A `SubPlan` / `InitPlan` / `CTE` line, held until the next line says
+    // whether it introduces a node: its column, and the line itself.
+    let mut heading: Option<(usize, String)> = None;
 
     for line in text.lines() {
         let line = line.trim_end();
@@ -338,7 +345,21 @@ fn parse_indented(text: String) -> Plan {
         if nodes.is_empty() && line.trim().eq_ignore_ascii_case("QUERY PLAN") {
             continue;
         }
-        let (indent, body, opens_node) = strip_marker(line);
+        let (mut indent, body, opens_node) = strip_marker(line);
+
+        // The subtree under a heading is drawn two columns deeper than the
+        // owner's ordinary children, so read at the heading's own column it is
+        // their sibling. A heading that is not followed by that arrow keeps
+        // the old reading: a line of the node above.
+        let mut introduced = None;
+        if let Some((column, text)) = heading.take() {
+            if opens_node && indent == column + 2 {
+                indent = column;
+                introduced = Some(text);
+            } else if let Some(node) = nodes.last_mut() {
+                node.detail.push(text);
+            }
+        }
 
         if opens_node || nodes.is_empty() {
             while ancestors.last().is_some_and(|last| *last >= indent) {
@@ -348,19 +369,35 @@ fn parse_indented(text: String) -> Plan {
             nodes.push(PlanNode {
                 depth: ancestors.len(),
                 label,
-                detail: Vec::new(),
+                heading: introduced,
                 estimated,
                 actual,
-                self_ms: None,
+                ..PlanNode::default()
             });
             ancestors.push(indent);
         } else if indent == 0
             && let Some((label, value)) = body.split_once(':')
         {
             summary.push((label.trim().to_string(), value.trim().to_string()));
+        } else if indent > 0
+            && let Some((_, value)) = summary.last_mut()
+        {
+            // `Planning:` and `JIT:` print their figures on indented lines
+            // after the plan; they belong to the summary, not to the last node.
+            if !value.is_empty() {
+                value.push_str("; ");
+            }
+            value.push_str(body);
+        } else if indent > 0 && is_heading(body) {
+            heading = Some((indent, body.to_string()));
         } else if let Some(node) = nodes.last_mut() {
             node.detail.push(body.to_string());
         }
+    }
+    if let Some((_, text)) = heading
+        && let Some(node) = nodes.last_mut()
+    {
+        node.detail.push(text);
     }
 
     fill_self_ms(&mut nodes);
@@ -376,6 +413,13 @@ fn parse_indented(text: String) -> Plan {
         total_ms,
         text,
     }
+}
+
+/// Whether a line is one of Postgres' headers over a subtree it owns.
+fn is_heading(body: &str) -> bool {
+    ["SubPlan ", "InitPlan ", "CTE "]
+        .iter()
+        .any(|prefix| body.starts_with(prefix))
 }
 
 /// The indent column, the line without its tree drawing, and whether that
@@ -483,8 +527,9 @@ pub(crate) fn gathers(node: &PlanNode) -> bool {
 /// and is what its children's divided times are taken out of.
 // ponytail: the divisor is an average over the workers, so a skewed split
 // reads a little off. The upgrade is the per-worker lines `VERBOSE` prints.
-// ponytail: each Gather scans down for its first child; plans are tens of
-// nodes, and a child index built in one pass is the upgrade if one ever is not.
+// ponytail: each Gather scans down for its first child and each CTE scans the
+// whole plan for its consumer; plans are tens of nodes, and a name-to-consumer
+// map built in one pass is the upgrade if one ever is not.
 fn fill_self_ms(nodes: &mut [PlanNode]) {
     // The depth of each Gather on the path down to the node, and its divisor.
     let mut gathered: Vec<(usize, f64)> = Vec::new();
@@ -527,11 +572,32 @@ fn fill_self_ms(nodes: &mut [PlanNode]) {
         path.push(index);
     }
 
+    // What each node's children cost. A CTE is read when its first consumer
+    // asks for a row, so the producer's time is inside that consumer's own and
+    // is taken out of it, not out of the node the CTE is printed under. With
+    // no consumer to be found it stays where it is printed.
+    // Assumed, not read from the server: the first consumer in document order
+    // is the one that started it (RESEARCH A2). It held on every captured
+    // plan, where it was checked by self times adding up to the root's time.
     let mut children = vec![0.0; nodes.len()];
-    for (index, owner) in parent.iter().enumerate() {
-        if let Some(owner) = owner {
-            children[*owner] += wall[index].unwrap_or_default();
-        }
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(owner) = parent[index] else {
+            continue;
+        };
+        let consumer = node
+            .heading
+            .as_deref()
+            .and_then(|heading| heading.strip_prefix("CTE "))
+            .and_then(|name| {
+                let scan = format!("CTE Scan on {}", name.trim());
+                nodes.iter().position(|other| {
+                    other
+                        .label
+                        .strip_prefix(&scan)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                })
+            });
+        children[consumer.unwrap_or(owner)] += wall[index].unwrap_or_default();
     }
 
     for (index, node) in nodes.iter_mut().enumerate() {
@@ -1219,6 +1285,14 @@ Planning Time: broken"#,
         assert_eq!(plain.misestimate(1), Some(100_000.0));
     }
 
+    /// The nearest node above `index` that is shallower: the one it hangs from.
+    fn parent_of(plan: &Plan, index: usize) -> Option<usize> {
+        let depth = plan.nodes[index].depth;
+        plan.nodes[..index]
+            .iter()
+            .rposition(|node| node.depth < depth)
+    }
+
     /// Every node's own time adds up to the clock time of the nodes at the top.
     /// This is the property that makes a bar a share of something: a parent
     /// clamped to zero, or a producer counted twice, breaks it.
@@ -1242,6 +1316,29 @@ Planning Time: broken"#,
             (own - wall).abs() <= slack,
             "self times add up to {own} ms of a {wall} ms root"
         );
+    }
+
+    /// Every line the server printed is somewhere in the plan: a node's label,
+    /// one of its details or its heading, or the summary. Nothing is dropped.
+    #[track_caller]
+    fn assert_nothing_dropped(text: &str) {
+        let plan = one_column(text);
+        for line in text.lines().map(str::trim_end) {
+            if line.trim().is_empty() || line.trim().eq_ignore_ascii_case("QUERY PLAN") {
+                continue;
+            }
+            let (_, body, _) = strip_marker(line);
+            let (label, _, _) = split_metrics(body);
+            let (name, value) = body.split_once(':').unwrap_or((body, ""));
+            let found = plan.nodes.iter().any(|node| {
+                node.label == label
+                    || node.detail.iter().any(|detail| detail == body)
+                    || node.heading.as_deref() == Some(body)
+            }) || plan.summary.iter().any(|(entry, text)| {
+                (entry == name.trim() && text.starts_with(value.trim())) || text.contains(body)
+            });
+            assert!(found, "dropped: {line:?}");
+        }
     }
 
     #[test]
@@ -1277,6 +1374,175 @@ Planning Time: broken"#,
             assert!(node.self_ms.unwrap() <= wall, "{}", node.label);
         }
         assert_self_sums_to_root(&plan);
+    }
+
+    #[test]
+    fn a_subplan_is_a_child_of_the_node_that_runs_it() {
+        let plan = one_column(include_str!("testdata/plan-postgres-cte-subplan.txt"));
+        let at = plan
+            .nodes
+            .iter()
+            .position(|node| {
+                node.heading
+                    .as_deref()
+                    .is_some_and(|heading| heading.starts_with("SubPlan"))
+            })
+            .unwrap();
+        let owner = parent_of(&plan, at).unwrap();
+        assert_eq!(plan.nodes[at].depth, plan.nodes[owner].depth + 1);
+        // The owner's ordinary child sits beside it, not above it.
+        assert!(plan.nodes.iter().enumerate().any(|(index, node)| {
+            index != at
+                && node.heading.is_none()
+                && node.depth == plan.nodes[at].depth
+                && parent_of(&plan, index) == Some(owner)
+        }));
+        assert!(plan.nodes[owner].self_ms.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn a_heading_arrow_is_read_at_the_headings_own_column() {
+        let plan = one_column(
+            r#"Result  (cost=0.00..1.00 rows=1 width=4) (actual time=0.000..10.000 rows=1 loops=1)
+  ->  Seq Scan on a  (cost=0.00..1.00 rows=1 width=4) (actual time=0.000..2.000 rows=1 loops=1)
+  SubPlan 1
+    ->  Aggregate  (cost=0.00..1.00 rows=1 width=4) (actual time=0.000..3.000 rows=1 loops=1)
+  SubPlan 2
+    ->  Aggregate  (cost=0.00..1.00 rows=1 width=4) (actual time=0.000..4.000 rows=1 loops=1)"#,
+        );
+        let shape: Vec<(usize, Option<&str>)> = plan
+            .nodes
+            .iter()
+            .map(|node| (node.depth, node.heading.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, None),
+                (1, None),
+                (1, Some("SubPlan 1")),
+                (1, Some("SubPlan 2")),
+            ]
+        );
+        assert!(plan.nodes.iter().all(|node| node.detail.is_empty()));
+        close(plan.nodes[0].self_ms, 10.0 - 2.0 - 3.0 - 4.0);
+        assert_self_sums_to_root(&plan);
+    }
+
+    #[test]
+    fn a_cte_is_read_as_a_child_of_its_owner_and_timed_inside_its_first_consumer() {
+        let plan = one_column(include_str!("testdata/plan-postgres-cte-subplan.txt"));
+        let producer = plan
+            .nodes
+            .iter()
+            .position(|node| {
+                node.heading
+                    .as_deref()
+                    .is_some_and(|heading| heading.starts_with("CTE "))
+            })
+            .unwrap();
+        assert_eq!(parent_of(&plan, producer), Some(0));
+        assert_eq!(plan.nodes[producer].depth, 1);
+
+        let consumer = plan
+            .nodes
+            .iter()
+            .position(|node| node.label.starts_with("CTE Scan on big"))
+            .unwrap();
+        let producer_ms = plan.nodes[producer].actual.unwrap().inclusive_ms();
+        close(
+            plan.nodes[consumer].self_ms,
+            plan.nodes[consumer].actual.unwrap().inclusive_ms() - producer_ms,
+        );
+        assert!(plan.nodes[consumer].self_ms.unwrap() < producer_ms);
+
+        for node in &plan.nodes {
+            assert!(
+                node.detail
+                    .iter()
+                    .all(|line| !is_heading(line) && !line.starts_with("CTE")),
+                "{:?}",
+                node.detail
+            );
+        }
+        assert_self_sums_to_root(&plan);
+    }
+
+    #[test]
+    fn a_cte_read_twice_is_credited_to_the_first_consumer_in_document_order() {
+        let text = |first: &str, between: &str| {
+            format!(
+                r#"Append  (actual time=0.000..30.000 rows=1 loops=1)
+{between}  ->  CTE Scan on big {first}  (actual time=0.000..8.000 rows=1 loops=1)
+  ->  CTE Scan on big other  (actual time=0.000..6.000 rows=1 loops=1)
+  CTE big
+    ->  Seq Scan on t  (actual time=0.000..5.000 rows=1 loops=1)"#
+            )
+        };
+        let plan = one_column(&text("a", ""));
+        let credited: Vec<(&str, Option<f64>)> = plan
+            .nodes
+            .iter()
+            .map(|node| (node.label.as_str(), node.self_ms))
+            .collect();
+        assert_eq!(credited[1], ("CTE Scan on big a", Some(3.0)));
+        assert_eq!(credited[2], ("CTE Scan on big other", Some(6.0)));
+        close(plan.nodes[0].self_ms, 30.0 - 8.0 - 6.0);
+        assert_self_sums_to_root(&plan);
+
+        // An unrelated sibling before it moves nothing: the first `CTE Scan on
+        // big` in the text is still the one credited.
+        let plan = one_column(&text(
+            "a",
+            "  ->  Seq Scan on u  (actual time=0.000..1.000 rows=1 loops=1)\n",
+        ));
+        let credited = plan
+            .nodes
+            .iter()
+            .find(|node| node.label == "CTE Scan on big a")
+            .unwrap();
+        close(credited.self_ms, 3.0);
+        assert_self_sums_to_root(&plan);
+    }
+
+    #[test]
+    fn planning_and_jit_lines_belong_to_the_summary_not_to_a_node() {
+        let plan = one_column(include_str!("testdata/plan-postgres-cte-subplan.txt"));
+        let entry = |label: &str| {
+            plan.summary
+                .iter()
+                .find(|(name, _)| name == label)
+                .map(|(_, value)| value.as_str())
+                .unwrap()
+        };
+        let planning = entry("Planning");
+        assert!(planning.contains("Buffers:"), "{planning}");
+        let jit = entry("JIT");
+        assert!(
+            jit.contains("Functions:") && jit.contains("Timing:"),
+            "{jit}"
+        );
+
+        let last = plan.nodes.last().unwrap();
+        assert!(last.detail.iter().all(|line| {
+            !["Functions:", "Options:", "Timing:"]
+                .iter()
+                .any(|key| line.starts_with(key))
+                && !planning.contains(line.as_str())
+        }));
+    }
+
+    #[test]
+    fn every_plan_fixture_has_self_times_that_sum_to_its_root() {
+        for text in [
+            include_str!("testdata/plan-postgres-parallel.txt"),
+            include_str!("testdata/plan-postgres-cte-subplan.txt"),
+            include_str!("testdata/plan-postgres-spill.txt"),
+            include_str!("testdata/plan-postgres-large.txt"),
+        ] {
+            assert_self_sums_to_root(&one_column(text));
+            assert_nothing_dropped(text);
+        }
     }
 
     #[test]
