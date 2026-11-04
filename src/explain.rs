@@ -470,31 +470,74 @@ fn pair(value: &str) -> Option<(f64, f64)> {
     }
 }
 
-fn fill_self_ms(nodes: &mut [PlanNode]) {
-    let inclusive: Vec<Option<f64>> = nodes
-        .iter()
-        .map(|node| node.actual.map(|actual| actual.inclusive_ms()))
-        .collect();
+/// Whether a node runs its children in workers: `Gather` and `Gather Merge`.
+/// Its children's times overlap, so they are read in wall time.
+pub(crate) fn gathers(node: &PlanNode) -> bool {
+    node.label.starts_with("Gather")
+}
 
-    // ponytail: rescanning forward for each node is quadratic; plans are tens
-    // of lines, and a child-index pass is the upgrade if one ever is not.
-    for index in 0..nodes.len() {
-        let Some(own) = inclusive[index] else {
-            continue;
-        };
-        let depth = nodes[index].depth;
-        let mut children = 0.0;
-        for (sibling, node) in nodes.iter().enumerate().skip(index + 1) {
-            if node.depth <= depth {
-                break;
-            }
-            if node.depth == depth + 1 {
-                children += inclusive[sibling].unwrap_or_default();
+/// What a node cost by the clock: its own time less what its children cost.
+/// Below a `Gather` every time is divided by the number of participants, the
+/// `loops` of the Gather's direct child, because the workers ran at once.
+/// The Gather itself ran once, in the leader, so it keeps its own time whole
+/// and is what its children's divided times are taken out of.
+// ponytail: the divisor is an average over the workers, so a skewed split
+// reads a little off. The upgrade is the per-worker lines `VERBOSE` prints.
+// ponytail: each Gather scans down for its first child; plans are tens of
+// nodes, and a child index built in one pass is the upgrade if one ever is not.
+fn fill_self_ms(nodes: &mut [PlanNode]) {
+    // The depth of each Gather on the path down to the node, and its divisor.
+    let mut gathered: Vec<(usize, f64)> = Vec::new();
+    let mut wall: Vec<Option<f64>> = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        while gathered
+            .last()
+            .is_some_and(|(depth, _)| *depth >= node.depth)
+        {
+            gathered.pop();
+        }
+        let divisor = gathered.last().map_or(1.0, |(_, workers)| *workers);
+        wall.push(node.actual.map(|actual| actual.inclusive_ms() / divisor));
+        if gathers(node) {
+            let child = nodes[index + 1..]
+                .iter()
+                .take_while(|below| below.depth > node.depth)
+                .find(|below| below.depth == node.depth + 1)
+                .and_then(|below| below.actual);
+            if let Some(workers) = child
+                .map(|actual| actual.loops)
+                .filter(|loops| *loops >= 1.0)
+            {
+                gathered.push((node.depth, workers));
             }
         }
+    }
+
+    // The node each one hangs from: the nearest one above it that is shallower.
+    let mut path: Vec<usize> = Vec::new();
+    let mut parent: Vec<Option<usize>> = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        while path
+            .last()
+            .is_some_and(|last| nodes[*last].depth >= node.depth)
+        {
+            path.pop();
+        }
+        parent.push(path.last().copied());
+        path.push(index);
+    }
+
+    let mut children = vec![0.0; nodes.len()];
+    for (index, owner) in parent.iter().enumerate() {
+        if let Some(owner) = owner {
+            children[*owner] += wall[index].unwrap_or_default();
+        }
+    }
+
+    for (index, node) in nodes.iter_mut().enumerate() {
         // Estimates and loop averaging make small negatives normal, and a
         // negative bar is nonsense.
-        nodes[index].self_ms = Some((own - children).max(0.0));
+        node.self_ms = wall[index].map(|own| (own - children[index]).max(0.0));
     }
 }
 
@@ -1174,6 +1217,66 @@ Planning Time: broken"#,
             node("Seq Scan on big", 1, 1_000_000, 10.0),
         ]);
         assert_eq!(plain.misestimate(1), Some(100_000.0));
+    }
+
+    /// Every node's own time adds up to the clock time of the nodes at the top.
+    /// This is the property that makes a bar a share of something: a parent
+    /// clamped to zero, or a producer counted twice, breaks it.
+    #[track_caller]
+    fn assert_self_sums_to_root(plan: &Plan) {
+        assert!(
+            plan.nodes
+                .iter()
+                .all(|node| node.actual.is_none() || node.self_ms.is_some()),
+            "a timed node has no self time"
+        );
+        let wall: f64 = plan
+            .nodes
+            .iter()
+            .filter(|node| node.depth == 0)
+            .filter_map(|node| Some(node.actual?.inclusive_ms()))
+            .sum();
+        let own: f64 = plan.nodes.iter().filter_map(|node| node.self_ms).sum();
+        let slack = (wall * 0.01).max(0.5);
+        assert!(
+            (own - wall).abs() <= slack,
+            "self times add up to {own} ms of a {wall} ms root"
+        );
+    }
+
+    #[test]
+    fn a_parallel_plan_attributes_its_workers_by_wall_time() {
+        let plan = one_column(include_str!("testdata/plan-postgres-parallel.txt"));
+        let at = plan.nodes.iter().position(gathers).unwrap();
+        let gather = &plan.nodes[at];
+        let below: Vec<&PlanNode> = plan.nodes[at + 1..]
+            .iter()
+            .take_while(|node| node.depth > gather.depth)
+            .collect();
+        let children: Vec<&&PlanNode> = below
+            .iter()
+            .filter(|node| node.depth == gather.depth + 1)
+            .collect();
+
+        // Two workers and the leader.
+        let workers = children[0].actual.unwrap().loops;
+        assert_eq!(workers, 3.0);
+        let own = gather.actual.unwrap().inclusive_ms();
+        let taken: f64 = children
+            .iter()
+            .map(|node| node.actual.unwrap().inclusive_ms() / workers)
+            .sum();
+        assert!(
+            own > taken,
+            "the fixture's Gather must outlast its children"
+        );
+        close(gather.self_ms, own - taken);
+
+        let wall = plan.nodes[0].actual.unwrap().inclusive_ms();
+        for node in below {
+            assert!(node.self_ms.unwrap() <= wall, "{}", node.label);
+        }
+        assert_self_sums_to_root(&plan);
     }
 
     #[test]
