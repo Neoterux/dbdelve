@@ -9846,6 +9846,38 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_reads_its_listed_settings_and_stops_the_rest() {
+        use crate::sql_snapshots::hardening::set_statement;
+
+        let ch = Engine::ClickHouse;
+        assert_eq!(classify(ch, "SET max_threads = 1").mode, Mode::ReadOnly);
+        // `readonly` is what the driver's per-request hold is made of, and `x`
+        // is on no list: neither is left for the server's `readonly=2` to
+        // refuse.
+        for sql in ["SET readonly = 0", "SET x = 1"] {
+            assert!(is_stopped(ch, sql), "{sql}");
+        }
+        for name in ch.spec().sql.plain_settings {
+            let sql = set_statement(ch, name);
+            assert!(is_plain_read(ch, &sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_raise_reaches_a_statement_read_by_its_first_keyword() {
+        let ch = Engine::ClickHouse;
+        // ClickHouse is read statement by statement, a path that once returned
+        // before the raise: a scope pair the text spells, here as identifiers,
+        // is rated above Read-only on every SQL engine, this one included.
+        assert!(classify(ch, "SELECT t.set global FROM t").mode >= Mode::ReadWrite);
+        // A statement `sqlparser` cannot read keeps its first keyword's rating
+        // and stays unreadable, at the mode the one construction gives.
+        let verdict = classify(ch, "SELECT garbage ) (");
+        assert!(verdict.destructive.contains(&Destructive::Unreadable));
+        assert_eq!(verdict.mode, unreadable_verdict(ch).mode);
+    }
+
+    #[test]
     fn every_allow_listed_setting_stays_a_read_on_its_engine_unless_server_wide() {
         use crate::sql_snapshots::hardening::set_statement;
 
