@@ -53,12 +53,13 @@ pub struct PlanNode {
 }
 
 /// What the planner guessed. MySQL prints one cost and no width, so
-/// `startup_cost` and `total_cost` are the same number and `width` is 0.
+/// `startup_cost` and `total_cost` are the same number and `width` is 0. `rows`
+/// is a float because MySQL estimates fractions (`rows=1.73`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Estimated {
     pub startup_cost: f64,
     pub total_cost: f64,
-    pub rows: u64,
+    pub rows: f64,
     pub width: u64,
 }
 
@@ -463,7 +464,7 @@ fn cut<T>(label: &mut String, open: &str, parse: fn(&str) -> Option<T>) -> Optio
 fn parse_estimated(inner: &str) -> Option<Estimated> {
     let mut fields = inner.split_whitespace();
     let (startup_cost, total_cost) = pair(fields.next()?)?;
-    let (mut rows, mut width) = (0, 0);
+    let (mut rows, mut width) = (0.0, 0);
     for field in fields {
         if let Some(value) = field.strip_prefix("rows=") {
             rows = value.parse().ok()?;
@@ -615,7 +616,7 @@ impl Plan {
     pub fn misestimate(&self, index: usize) -> Option<f64> {
         let node = &self.nodes[index];
         let factor = node.misestimate()?;
-        let under = node.actual?.rows < node.estimated?.rows as f64;
+        let under = node.actual?.rows < node.estimated?.rows;
         let mut depth = node.depth;
         let stopped = self.nodes[..index].iter().rev().any(|ancestor| {
             let is_ancestor = ancestor.depth < depth;
@@ -635,7 +636,7 @@ impl PlanNode {
     /// off by ten or more. Postgres reports both per loop, so they compare
     /// as they stand; zero is read as one so neither side divides by it.
     pub fn misestimate(&self) -> Option<f64> {
-        let estimated = (self.estimated?.rows as f64).max(1.0);
+        let estimated = self.estimated?.rows.max(1.0);
         let actual = self.actual?.rows.max(1.0);
         let factor = (actual / estimated).max(estimated / actual);
         (factor >= 10.0).then_some(factor)
@@ -950,7 +951,7 @@ Execution Time: 0.041 ms"#,
             Some(Estimated {
                 startup_cost: 0.00,
                 total_cost: 35.50,
-                rows: 2550,
+                rows: 2550.0,
                 width: 8,
             })
         );
@@ -1023,7 +1024,7 @@ Execution Time: 0.041 ms"#,
             Some(Estimated {
                 startup_cost: 2.50,
                 total_cost: 2.50,
-                rows: 12,
+                rows: 12.0,
                 width: 0,
             })
         );
@@ -1202,7 +1203,7 @@ Planning Time: broken"#,
 
     #[test]
     fn a_tenfold_miss_either_way_is_a_misestimate() {
-        let node = |estimated: u64, actual: f64| PlanNode {
+        let node = |estimated: f64, actual: f64| PlanNode {
             estimated: Some(Estimated {
                 startup_cost: 0.0,
                 total_cost: 1.0,
@@ -1217,18 +1218,18 @@ Planning Time: broken"#,
             }),
             ..PlanNode::default()
         };
-        assert_eq!(node(10, 1000.0).misestimate(), Some(100.0));
-        assert_eq!(node(5000, 50.0).misestimate(), Some(100.0));
+        assert_eq!(node(10.0, 1000.0).misestimate(), Some(100.0));
+        assert_eq!(node(5000.0, 50.0).misestimate(), Some(100.0));
         // Zero is read as one, so nothing divides by it.
-        assert_eq!(node(1, 0.0).misestimate(), None);
-        assert_eq!(node(0, 20.0).misestimate(), Some(20.0));
-        assert_eq!(node(10, 99.0).misestimate(), None);
+        assert_eq!(node(1.0, 0.0).misestimate(), None);
+        assert_eq!(node(0.0, 20.0).misestimate(), Some(20.0));
+        assert_eq!(node(10.0, 99.0).misestimate(), None);
         assert_eq!(PlanNode::default().misestimate(), None);
     }
 
     #[test]
     fn a_parent_that_stops_early_explains_a_short_scan() {
-        let node = |label: &str, depth: usize, estimated: u64, actual: f64| PlanNode {
+        let node = |label: &str, depth: usize, estimated: f64, actual: f64| PlanNode {
             label: label.into(),
             depth,
             estimated: Some(Estimated {
@@ -1250,37 +1251,37 @@ Planning Time: broken"#,
             ..Plan::default()
         };
         let limit = plan(vec![
-            node("Limit", 0, 10, 10.0),
-            node("Seq Scan on big", 1, 1_000_000, 10.0),
+            node("Limit", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
         ]);
         assert_eq!(limit.misestimate(1), None);
         let mysql = plan(vec![
-            node("Limit: 10 row(s)", 0, 10, 10.0),
-            node("Table scan on big", 1, 1_000_000, 10.0),
+            node("Limit: 10 row(s)", 0, 10.0, 10.0),
+            node("Table scan on big", 1, 1_000_000.0, 10.0),
         ]);
         assert_eq!(mysql.misestimate(1), None);
         let semi = plan(vec![
-            node("Nested Loop Semi Join", 0, 5, 5.0),
-            node("Seq Scan on a", 1, 5, 5.0),
-            node("Hash Anti Join", 1, 5, 5.0),
-            node("Index Scan on b", 2, 100_000, 1.0),
+            node("Nested Loop Semi Join", 0, 5.0, 5.0),
+            node("Seq Scan on a", 1, 5.0, 5.0),
+            node("Hash Anti Join", 1, 5.0, 5.0),
+            node("Index Scan on b", 2, 100_000.0, 1.0),
         ]);
         assert_eq!(semi.misestimate(3), None);
         let overshoot = plan(vec![
-            node("Limit", 0, 10, 10.0),
-            node("Seq Scan on big", 1, 10, 5000.0),
+            node("Limit", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 10.0, 5000.0),
         ]);
         assert_eq!(overshoot.misestimate(1), Some(500.0));
         let sibling = plan(vec![
-            node("Append", 0, 1, 1.0),
-            node("Limit", 1, 10, 10.0),
-            node("Seq Scan on a", 2, 10, 10.0),
-            node("Seq Scan on b", 1, 1_000_000, 10.0),
+            node("Append", 0, 1.0, 1.0),
+            node("Limit", 1, 10.0, 10.0),
+            node("Seq Scan on a", 2, 10.0, 10.0),
+            node("Seq Scan on b", 1, 1_000_000.0, 10.0),
         ]);
         assert_eq!(sibling.misestimate(3), Some(100_000.0));
         let plain = plan(vec![
-            node("Sort", 0, 10, 10.0),
-            node("Seq Scan on big", 1, 1_000_000, 10.0),
+            node("Sort", 0, 10.0, 10.0),
+            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
         ]);
         assert_eq!(plain.misestimate(1), Some(100_000.0));
     }
@@ -1543,6 +1544,81 @@ Planning Time: broken"#,
             assert_self_sums_to_root(&one_column(text));
             assert_nothing_dropped(text);
         }
+    }
+
+    #[test]
+    fn a_fractional_estimate_still_parses() {
+        let plan = one_column("-> Group aggregate: count(0)  (cost=3.8 rows=1.73)");
+        assert_eq!(plan.nodes[0].label, "Group aggregate: count(0)");
+        assert_eq!(
+            plan.nodes[0].estimated,
+            Some(Estimated {
+                startup_cost: 3.8,
+                total_cost: 3.8,
+                rows: 1.73,
+                width: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_two_decimal_actual_row_count_parses() {
+        let plan = one_column(
+            "Seq Scan on t  (cost=0.00..15.00 rows=1000 width=4) (actual time=0.010..0.200 rows=1000.00 loops=1)",
+        );
+        assert_eq!(plan.nodes[0].actual.map(|actual| actual.rows), Some(1000.0));
+        assert_eq!(
+            plan.nodes[0].estimated.map(|estimated| estimated.rows),
+            Some(1000.0)
+        );
+    }
+
+    #[test]
+    fn a_heading_nobody_follows_loses_nothing_and_panics_nowhere() {
+        let checked = |text: &str| {
+            assert_nothing_dropped(text);
+            one_column(text)
+        };
+        let root =
+            "Result  (cost=0.00..1.00 rows=1 width=4) (actual time=0.000..1.000 rows=1 loops=1)";
+
+        // Nothing after it: it stays a line of the node above.
+        let plan = checked(&format!("{root}\n  SubPlan 1"));
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(plan.nodes[0].detail, ["SubPlan 1"]);
+
+        // An arrow at the wrong depth is an ordinary node, and the heading
+        // is still there.
+        let plan = checked(&format!(
+            "{root}\n  InitPlan 1 (returns $0)\n        ->  Seq Scan on t  (cost=0.00..1.00 rows=1 width=4)"
+        ));
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.nodes[0].detail, ["InitPlan 1 (returns $0)"]);
+        assert_eq!(plan.nodes[1].heading, None);
+
+        // Two headings with no arrow between them keep both.
+        let plan = checked(&format!("{root}\n  SubPlan 1\n  CTE c"));
+        assert_eq!(plan.nodes[0].detail, ["SubPlan 1", "CTE c"]);
+
+        // A plan that is only a heading.
+        let plan = checked("SubPlan 1");
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(plan.nodes[0].label, "SubPlan 1");
+
+        // Text a summary line cannot hold in UTF-8 arrives as replacement
+        // characters, and is kept.
+        let plan = checked(&format!("{root}\nJIT:\n  \u{fffd}\u{fffd}"));
+        assert_eq!(
+            plan.summary,
+            [("JIT".to_string(), "\u{fffd}\u{fffd}".to_string())]
+        );
+
+        // A count too large for a float to hold.
+        let plan = checked(
+            "Seq Scan on t  (cost=0.00..1.00 rows=1e999 width=4) (actual time=0.000..1.000 rows=1e999 loops=1)",
+        );
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(plan.nodes[0].misestimate(), None);
     }
 
     #[test]
