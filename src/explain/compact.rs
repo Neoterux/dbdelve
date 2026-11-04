@@ -33,7 +33,8 @@ use super::{
 /// more than `max_nodes` nodes, the `max_nodes` heaviest are kept with every
 /// ancestor of each, so the shape of the tree survives and the heaviest node is
 /// never the one cut; the first line says so, and each kept node that lost
-/// descendants says how many.
+/// descendants says how many. A finding on a node that was cut is counted, not
+/// listed.
 pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> String {
     let kept = kept(plan, analysis, max_nodes);
     let shown = kept.iter().filter(|kept| **kept).count();
@@ -41,16 +42,30 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Str
         truncation(plan, analysis, max_nodes, shown),
         header(plan, analysis),
     ];
+    // A finding is only as good as the node it names, and that node has to be
+    // in the tree below for the line to be checked against it. One on a node
+    // that was cut is counted and left out, so the list is no longer than the
+    // tree is.
+    let (shown_findings, left_out): (Vec<Finding>, Vec<Finding>) = analysis
+        .findings
+        .iter()
+        .partition(|finding| kept[node_of(**finding)]);
     if analysis.findings.is_empty() {
         lines.push("findings: none".to_string());
     } else {
         lines.push("findings:".to_string());
         lines.extend(
-            analysis
-                .findings
+            shown_findings
                 .iter()
                 .map(|finding| finding_line(plan, analysis, *finding)),
         );
+        if !left_out.is_empty() {
+            let count = left_out.len();
+            lines.push(format!(
+                "  ... {count} finding{} on nodes not shown",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
     }
     if shown == 0 {
         lines.push("tree: none".to_string());
@@ -173,6 +188,13 @@ fn header(plan: &Plan, analysis: &Analysis) -> String {
     }
     line.push_str(" conditions=verbatim");
     line
+}
+
+/// The node a finding is about.
+fn node_of(finding: Finding) -> usize {
+    match finding {
+        Finding::Hot(index) | Finding::Misestimated(index) => index,
+    }
 }
 
 /// One finding on one line: the node, why it is worth reading, and its label.
@@ -602,6 +624,37 @@ mod tests {
             tree.iter()
                 .all(|line| !line.contains("self=") && !line.contains("cost="))
         );
+    }
+
+    #[test]
+    fn a_finding_on_a_node_the_truncation_cut_is_counted_and_not_named() {
+        let plan = one_column(
+            "Nested Loop  (cost=0.00..100.00 rows=10 width=4) (actual time=0.010..50.000 rows=10 loops=1)\n  ->  Seq Scan on heavy  (cost=0.00..90.00 rows=10 width=4) (actual time=0.010..49.000 rows=10 loops=1)\n  ->  Seq Scan on cold  (cost=0.00..1.00 rows=1 width=4) (actual time=0.001..0.002 rows=5000 loops=1)\n",
+        );
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let cold = 2;
+        assert!(analysis.findings.contains(&Finding::Misestimated(cold)));
+
+        // Uncut, the misestimated leaf is listed as before.
+        let all = whole(&plan);
+        assert!(
+            block(&all, "findings:")
+                .iter()
+                .any(|line| line.starts_with(&format!("  n{cold} misestimate under ")))
+        );
+
+        let out = compact(&plan, &analysis, 1);
+        let tree = block(&out, "tree:");
+        let shown: Vec<usize> = tree.iter().filter_map(|line| node_index(line)).collect();
+        assert!(!shown.contains(&cold));
+        let findings = block(&out, "findings:");
+        for line in &findings {
+            if let Some(index) = node_index(line) {
+                assert!(shown.contains(&index), "{line}");
+            }
+        }
+        assert!(!out.contains(&format!("n{cold} misestimate")));
+        assert_eq!(findings.last(), Some(&"  ... 1 finding on nodes not shown"));
     }
 
     #[test]
