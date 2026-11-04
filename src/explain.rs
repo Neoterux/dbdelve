@@ -14,6 +14,7 @@
 //! not parse stays in the label where the user can still read it.
 
 pub(crate) mod analysis;
+pub(crate) mod compact;
 
 use crate::db::Row;
 
