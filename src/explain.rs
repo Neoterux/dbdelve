@@ -435,8 +435,11 @@ fn split_metrics(line: &str) -> (String, Option<Estimated>, Option<Actual>) {
     (label, estimated, actual)
 }
 
+/// The metrics are the last parentheticals of a line, so the match is the
+/// rightmost one: the text before them can hold the same words, as in a MySQL
+/// `Index lookup on t using idx_cost (cost=a.cost)`.
 fn cut<T>(label: &mut String, open: &str, parse: fn(&str) -> Option<T>) -> Option<T> {
-    let start = label.find(open)?;
+    let start = label.rfind(open)?;
     let close = start + label[start..].find(')')?;
     let parsed = parse(&label[start + open.len()..close])?;
     label.replace_range(start..=close, "");
@@ -991,6 +994,43 @@ Execution Time: 0.041 ms"#,
         );
         close(Analysis::new(&plan, Engine::MySql).total, 0.030);
         close(plan.nodes[0].self_ms, 0.030 - 0.025);
+    }
+
+    #[test]
+    fn a_node_label_that_holds_a_cost_parenthetical_keeps_its_real_metrics() {
+        let plan = parse(
+            &["EXPLAIN".to_string()],
+            &rows(vec![vec![Some(
+                "-> Index lookup on t using idx_cost (cost=a.cost)  (cost=0.35 rows=1) (actual time=0.010..0.012 rows=1 loops=1)\n    -> Index lookup on u using idx (cost=5)  (cost=2.50 rows=12)\n"
+                    .to_string(),
+            )]]),
+        );
+
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(
+            plan.nodes[0].label,
+            "Index lookup on t using idx_cost (cost=a.cost)"
+        );
+        assert_eq!(
+            plan.nodes[0].estimated,
+            Some(Estimated {
+                startup_cost: 0.35,
+                total_cost: 0.35,
+                rows: 1.0,
+                width: 0,
+            })
+        );
+        assert!(plan.nodes[0].actual.is_some());
+        assert_eq!(plan.nodes[1].label, "Index lookup on u using idx (cost=5)");
+        assert_eq!(
+            plan.nodes[1].estimated,
+            Some(Estimated {
+                startup_cost: 2.50,
+                total_cost: 2.50,
+                rows: 12.0,
+                width: 0,
+            })
+        );
     }
 
     #[test]
