@@ -638,14 +638,46 @@ fn render_plan(
                         .text_color(t.text_muted)
                         .child(one_line(sql)),
                 )
-                .children(plan.summary.iter().map(|(label, value)| {
+                // Time the server measured that no node carries, so that bars
+                // summing to less than the statement's own time are explained
+                // rather than looking like a mistake. Both figures are set
+                // together, and zipping them needs no unwrap.
+                .children(
+                    analysis
+                        .outside_nodes_ms
+                        .zip(analysis.execution_ms)
+                        .map(|(outside, execution)| {
+                            plan_chip(
+                                plan_id("plan-outside", scope, 0),
+                                format!("not in any node {outside:.1} ms"),
+                                t.text_muted.into(),
+                                format!(
+                                    "Execution Time was {execution:.3} ms; the nodes' times add up to {:.3} ms",
+                                    execution - outside
+                                ),
+                            )
+                            .flex_shrink_0()
+                        }),
+                )
+                .children(plan.summary.iter().enumerate().map(|(index, (label, value))| {
+                    // A `JIT` or `Planning` line can run to a paragraph, and the
+                    // header is one line. The whole value is a hover away.
+                    let clipped = clip_summary(value);
+                    let shown = clipped.clone().unwrap_or_else(|| value.clone());
                     div()
+                        .id(plan_id("plan-summary", scope, index))
                         .flex_shrink_0()
                         .flex()
                         .gap(px(layout::SPACE_XS))
                         .text_size(px(layout::chrome(layout::TEXT_XS)))
                         .child(div().text_color(t.text_faint).child(label.clone()))
-                        .child(div().text_color(t.text).child(value.clone()))
+                        .child(div().text_color(t.text).child(shown))
+                        .when(clipped.is_some(), |entry| {
+                            let whole = format!("{label} {value}");
+                            entry.tooltip(move |window, cx| {
+                                Tooltip::new(whole.clone()).build(window, cx)
+                            })
+                        })
                 }))
                 .child(match plan_copied {
                     true => div()
@@ -731,6 +763,16 @@ fn plan_chip(id: gpui::ElementId, text: String, tone: Hsla, tooltip: String) -> 
         .bg(tone.opacity(0.12))
         .child(text)
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+}
+
+/// How much of a summary value the header draws before it clips.
+const SUMMARY_LIMIT: usize = 40;
+
+/// A summary value cut to [`SUMMARY_LIMIT`] characters and an ellipsis, or
+/// `None` when it already fits and nothing is dropped.
+fn clip_summary(value: &str) -> Option<String> {
+    let (at, _) = value.char_indices().nth(SUMMARY_LIMIT)?;
+    Some(format!("{}…", &value[..at]))
 }
 
 /// `↓ ×340` when the planner expected fewer rows than it got, `↑ ×12` when it
@@ -4033,5 +4075,23 @@ mod tests {
                 "{factor} printed as {printed}"
             );
         }
+    }
+
+    #[test]
+    fn a_long_summary_value_is_clipped_to_forty_characters_and_a_short_one_is_not() {
+        let long = "Functions: 12 · Options: Inlining false, Optimization false, Expressions true";
+        let clipped = clip_summary(long).expect("longer than forty characters");
+        assert_eq!(clipped.chars().count(), 41);
+        assert!(clipped.ends_with('…'));
+        assert!(long.starts_with(&clipped[..clipped.len() - '…'.len_utf8()]));
+
+        let exactly_forty = "x".repeat(40);
+        assert_eq!(clip_summary(&exactly_forty), None);
+        assert_eq!(clip_summary("0.123 ms"), None);
+        // Multi-byte characters are counted, not their bytes.
+        assert_eq!(
+            clip_summary(&"é".repeat(41)),
+            Some(format!("{}…", "é".repeat(40)))
+        );
     }
 }
