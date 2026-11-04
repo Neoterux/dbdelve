@@ -413,11 +413,15 @@ fn render_plan(
     let code = fonts(cx).editor.clone();
     let syntax = cx.theme().highlight_theme.clone();
     let Explained {
-        plan, mode, sql, ..
+        plan,
+        analysis,
+        mode,
+        sql,
+        ..
     } = explained;
-    // What every bar is a share of. A plan with no timings draws none, and the
-    // guard against zero is what keeps a 0ms plan from dividing by it.
-    let total = plan.total_ms.filter(|total| *total > 0.0);
+    // What every bar is a share of. A plan with nothing to weigh its nodes by
+    // has no total, so it draws none.
+    let total = analysis.total;
     // The slowest node earns the one warm colour in the pane. Scanning for it
     // is the reason most people open a plan at all.
     let slowest = total.and_then(|_| {
@@ -440,10 +444,7 @@ fn render_plan(
 
     let rows = plan.nodes.iter().enumerate().map(|(index, node)| {
         let hottest = slowest == Some(index);
-        let share = match (node.self_ms, total) {
-            (Some(ms), Some(total)) => (ms / total).clamp(0.0, 1.0),
-            _ => 0.0,
-        };
+        let share = analysis.nodes[index].share.unwrap_or(0.0);
 
         div()
             .flex()
@@ -593,6 +594,14 @@ fn render_plan(
                         .flex_shrink_0()
                         .font_weight(FontWeight::MEDIUM)
                         .child(mode.label()),
+                )
+                // What the figures below are: which engine printed them, and
+                // whether they are measurements, the planner's cost or neither.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(t.text_muted)
+                        .child(analysis.label.clone()),
                 )
                 .child(
                     div()
