@@ -538,23 +538,16 @@ fn render_plan(
                                     t.success.into(),
                                 )
                             }))
-                            .children(
-                                drawn
-                                    .parallel
-                                    .filter(|parallel| parallel.gathers)
-                                    .map(|parallel| {
-                                        plan_chip(
-                                            plan_id("plan-parallel", scope, index),
-                                            format!("parallel ×{} workers", parallel.workers),
-                                            t.text_muted.into(),
-                                            format!(
-                                                "Times below are per-worker averages over {} participants: {} workers and the leader",
-                                                parallel.workers + 1,
-                                                parallel.workers
-                                            ),
-                                        )
-                                    }),
-                            )
+                            .children(drawn.parallel.filter(|parallel| parallel.gathers).map(
+                                |parallel| {
+                                    plan_chip(
+                                        plan_id("plan-parallel", scope, index),
+                                        format!("parallel ×{} workers", parallel.workers),
+                                        t.text_muted.into(),
+                                        parallel_tooltip(parallel.workers),
+                                    )
+                                },
+                            ))
                             .children(drawn.misestimate.map(|miss| {
                                 plan_chip(
                                     plan_id("plan-miss", scope, index),
@@ -740,6 +733,16 @@ fn tier_colour(tier: Tier, t: &Theme) -> Hsla {
         Tier::Hot => t.danger.over(t.bg, 0.70).into(),
         Tier::Danger => t.danger.into(),
     }
+}
+
+/// What the parallel chip says about its workers. The count is read from the
+/// server's plan text, so it can be as large as a `u32`, and the leader is
+/// added without overflowing it.
+fn parallel_tooltip(workers: u32) -> String {
+    format!(
+        "Times below are per-worker averages over {} participants: {workers} workers and the leader",
+        u64::from(workers) + 1,
+    )
 }
 
 /// An id for an element of the plan pane that carries a tooltip, from the tab
@@ -3880,6 +3883,16 @@ mod tests {
     use lsp_types::CompletionItem;
 
     use super::*;
+
+    #[test]
+    fn a_parallel_chip_for_the_largest_worker_count_counts_the_leader_without_overflow() {
+        assert_eq!(
+            parallel_tooltip(u32::MAX),
+            "Times below are per-worker averages over 4294967296 participants: \
+             4294967295 workers and the leader"
+        );
+        assert!(parallel_tooltip(2).contains("over 3 participants: 2 workers"));
+    }
 
     struct CompletionEditors {
         query: Entity<EditorState>,
