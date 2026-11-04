@@ -550,7 +550,7 @@ fn render_plan(
                                     format!(
                                         "cost {:.2} · {} rows",
                                         estimated.total_cost,
-                                        group_thousands(estimated.rows)
+                                        round_count(estimated.rows)
                                     ),
                                     t.syntax_number.into(),
                                 )
