@@ -26,8 +26,6 @@ pub struct Plan {
     /// The trailing `Planning Time: … ms` / `Execution Time: … ms` style lines,
     /// as label and value.
     pub summary: Vec<(String, String)>,
-    /// What the bars are a share of. `None` when the plan carried no timings.
-    pub total_ms: Option<f64>,
     /// The server's plan exactly as it arrived.
     pub text: String,
 }
@@ -199,18 +197,6 @@ fn parse_document(columns: &[String], rows: &[Row]) -> Option<Plan> {
     }
 
     fill_self_ms(&mut plan.nodes);
-    plan.total_ms = plan
-        .nodes
-        .first()
-        .and_then(|node| Some(node.actual?.inclusive_ms()))
-        .or_else(|| {
-            millis(
-                reply
-                    .get_document("executionStats")
-                    .ok()?
-                    .get("executionTimeMillis")?,
-            )
-        });
     plan.text = serde_json::to_string_pretty(&reply).unwrap_or_default();
     Some(plan)
 }
@@ -404,16 +390,10 @@ fn parse_indented(text: String) -> Plan {
     }
 
     fill_self_ms(&mut nodes);
-    let total_ms = summary
-        .iter()
-        .find(|(label, _)| label.eq_ignore_ascii_case("Execution Time"))
-        .and_then(|(_, value)| value.split_whitespace().next()?.parse().ok())
-        .or_else(|| Some(nodes.first()?.actual?.inclusive_ms()));
 
     Plan {
         nodes,
         summary,
-        total_ms,
         text,
     }
 }
@@ -610,41 +590,6 @@ fn fill_self_ms(nodes: &mut [PlanNode]) {
     }
 }
 
-impl Plan {
-    /// The node's `misestimate`, unless it only ran short because an ancestor
-    /// stopped pulling rows. Estimates are for running to completion, so a
-    /// scan under a `Limit` or a semi/anti join's inner side reads as a
-    /// huge overestimate on a healthy plan.
-    pub fn misestimate(&self, index: usize) -> Option<f64> {
-        let node = &self.nodes[index];
-        let factor = node.misestimate()?;
-        let under = node.actual?.rows < node.estimated?.rows;
-        let mut depth = node.depth;
-        let stopped = self.nodes[..index].iter().rev().any(|ancestor| {
-            let is_ancestor = ancestor.depth < depth;
-            depth = depth.min(ancestor.depth);
-            let label = ancestor.label.to_lowercase();
-            is_ancestor
-                && (label.starts_with("limit")
-                    || label.contains("semi join")
-                    || label.contains("anti join"))
-        });
-        (!(under && stopped)).then_some(factor)
-    }
-}
-
-impl PlanNode {
-    /// How many times over or under the planner's row count was, when it was
-    /// off by ten or more. Postgres reports both per loop, so they compare
-    /// as they stand; zero is read as one so neither side divides by it.
-    pub fn misestimate(&self) -> Option<f64> {
-        let estimated = self.estimated?.rows.max(1.0);
-        let actual = self.actual?.rows.max(1.0);
-        let factor = (actual / estimated).max(estimated / actual);
-        (factor >= 10.0).then_some(factor)
-    }
-}
-
 /// What a stretch of a node's label names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelPart {
@@ -754,7 +699,8 @@ pub fn numbers(text: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::rows;
+    use crate::db::{Engine, rows};
+    use analysis::{Analysis, Basis};
 
     fn one_column(text: &str) -> Plan {
         parse(
@@ -812,7 +758,7 @@ mod tests {
         close(plan.nodes[0].self_ms, 1.0);
         close(plan.nodes[1].self_ms, 2.0);
         close(plan.nodes[2].self_ms, 1.0);
-        close(plan.total_ms, 4.0);
+        close(Analysis::new(&plan, Engine::MongoDb).total, 4.0);
         assert_eq!(
             plan.summary,
             [
@@ -833,7 +779,8 @@ mod tests {
         assert_eq!(plan.nodes.len(), 3);
         assert_eq!(plan.nodes[1].detail, [r#"filter: {"plan":{"$eq":"free"}}"#]);
         assert!(plan.nodes.iter().all(|node| node.actual.is_none()));
-        assert_eq!(plan.total_ms, None);
+        // No stage carries a time, so nothing is weighed (D-20).
+        assert_eq!(Analysis::new(&plan, Engine::MongoDb).total, None);
         assert!(plan.summary.is_empty());
     }
 
@@ -862,7 +809,7 @@ mod tests {
         close(plan.nodes[0].self_ms, 1.0);
         close(plan.nodes[1].self_ms, 0.0);
         close(plan.nodes[2].self_ms, 3.0);
-        close(plan.total_ms, 6.0);
+        close(Analysis::new(&plan, Engine::MongoDb).total, 6.0);
     }
 
     #[test]
@@ -974,9 +921,11 @@ Execution Time: 0.041 ms"#,
                 ("Execution Time".to_string(), "0.041 ms".to_string()),
             ]
         );
-        // The reported execution time wins over the root's own, because it is
-        // the number the user is shown.
-        close(plan.total_ms, 0.041);
+        // The reported execution time is kept as `execution_ms`; it is no
+        // longer the share denominator, which is the root's own inclusive time.
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        close(analysis.execution_ms, 0.041);
+        close(analysis.total, 0.019);
         assert!(plan.text.starts_with("Limit  (cost="));
     }
 
@@ -994,7 +943,10 @@ Execution Time: 0.041 ms"#,
         close(plan.nodes[1].self_ms, 0.4);
         close(plan.nodes[0].self_ms, 1.0 - 0.4 - 0.2);
         // Without an Execution Time line the root's inclusive time is the whole.
-        close(plan.total_ms, 1.0);
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        close(analysis.total, 1.0);
+        assert_eq!(analysis.execution_ms, None);
+        assert_eq!(analysis.outside_nodes_ms, None);
 
         let impossible = one_column(
             r#"Nested Loop  (actual time=0.000..1.000 rows=1 loops=1)
@@ -1030,7 +982,7 @@ Execution Time: 0.041 ms"#,
                 width: 0,
             })
         );
-        close(plan.total_ms, 0.030);
+        close(Analysis::new(&plan, Engine::MySql).total, 0.030);
         close(plan.nodes[0].self_ms, 0.030 - 0.025);
     }
 
@@ -1067,7 +1019,7 @@ Execution Time: 0.041 ms"#,
                 (0, "USE TEMP B-TREE FOR ORDER BY"),
             ]
         );
-        assert_eq!(plan.total_ms, None);
+        assert_eq!(Analysis::new(&plan, Engine::Sqlite).total, None);
         assert!(plan.summary.is_empty());
         assert!(plan.nodes.iter().all(|node| node.actual.is_none()));
         assert!(plan.nodes.iter().all(|node| node.self_ms.is_none()));
@@ -1117,7 +1069,11 @@ Planning Time: broken"#,
             plan.summary,
             vec![("Planning Time".to_string(), "broken".to_string())]
         );
-        assert_eq!(plan.total_ms, None);
+        // The unreadable `actual whatever` yields no time; the one readable
+        // `cost=` may still give a cost basis.
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        assert_eq!(analysis.execution_ms, None);
+        assert_ne!(analysis.basis, Basis::Measured);
 
         assert_eq!(parse(&[], &[]), Plan::default());
         assert_eq!(one_column("").nodes, Vec::new());
@@ -1201,91 +1157,6 @@ Planning Time: broken"#,
         assert!(!wasteful("Rows Removed by Filter: 999", kept(0.0)));
         assert!(!wasteful("Filter: (balance > 100000)", kept(0.0)));
         assert!(!wasteful("Rows Removed by Filter: lots", kept(0.0)));
-    }
-
-    #[test]
-    fn a_tenfold_miss_either_way_is_a_misestimate() {
-        let node = |estimated: f64, actual: f64| PlanNode {
-            estimated: Some(Estimated {
-                startup_cost: 0.0,
-                total_cost: 1.0,
-                rows: estimated,
-                width: 0,
-            }),
-            actual: Some(Actual {
-                startup_ms: 0.0,
-                total_ms: 1.0,
-                rows: actual,
-                loops: 1.0,
-            }),
-            ..PlanNode::default()
-        };
-        assert_eq!(node(10.0, 1000.0).misestimate(), Some(100.0));
-        assert_eq!(node(5000.0, 50.0).misestimate(), Some(100.0));
-        // Zero is read as one, so nothing divides by it.
-        assert_eq!(node(1.0, 0.0).misestimate(), None);
-        assert_eq!(node(0.0, 20.0).misestimate(), Some(20.0));
-        assert_eq!(node(10.0, 99.0).misestimate(), None);
-        assert_eq!(PlanNode::default().misestimate(), None);
-    }
-
-    #[test]
-    fn a_parent_that_stops_early_explains_a_short_scan() {
-        let node = |label: &str, depth: usize, estimated: f64, actual: f64| PlanNode {
-            label: label.into(),
-            depth,
-            estimated: Some(Estimated {
-                startup_cost: 0.0,
-                total_cost: 1.0,
-                rows: estimated,
-                width: 0,
-            }),
-            actual: Some(Actual {
-                startup_ms: 0.0,
-                total_ms: 1.0,
-                rows: actual,
-                loops: 1.0,
-            }),
-            ..PlanNode::default()
-        };
-        let plan = |nodes| Plan {
-            nodes,
-            ..Plan::default()
-        };
-        let limit = plan(vec![
-            node("Limit", 0, 10.0, 10.0),
-            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
-        ]);
-        assert_eq!(limit.misestimate(1), None);
-        let mysql = plan(vec![
-            node("Limit: 10 row(s)", 0, 10.0, 10.0),
-            node("Table scan on big", 1, 1_000_000.0, 10.0),
-        ]);
-        assert_eq!(mysql.misestimate(1), None);
-        let semi = plan(vec![
-            node("Nested Loop Semi Join", 0, 5.0, 5.0),
-            node("Seq Scan on a", 1, 5.0, 5.0),
-            node("Hash Anti Join", 1, 5.0, 5.0),
-            node("Index Scan on b", 2, 100_000.0, 1.0),
-        ]);
-        assert_eq!(semi.misestimate(3), None);
-        let overshoot = plan(vec![
-            node("Limit", 0, 10.0, 10.0),
-            node("Seq Scan on big", 1, 10.0, 5000.0),
-        ]);
-        assert_eq!(overshoot.misestimate(1), Some(500.0));
-        let sibling = plan(vec![
-            node("Append", 0, 1.0, 1.0),
-            node("Limit", 1, 10.0, 10.0),
-            node("Seq Scan on a", 2, 10.0, 10.0),
-            node("Seq Scan on b", 1, 1_000_000.0, 10.0),
-        ]);
-        assert_eq!(sibling.misestimate(3), Some(100_000.0));
-        let plain = plan(vec![
-            node("Sort", 0, 10.0, 10.0),
-            node("Seq Scan on big", 1, 1_000_000.0, 10.0),
-        ]);
-        assert_eq!(plain.misestimate(1), Some(100_000.0));
     }
 
     /// The nearest node above `index` that is shallower: the one it hangs from.
@@ -1620,7 +1491,10 @@ Planning Time: broken"#,
             "Seq Scan on t  (cost=0.00..1.00 rows=1e999 width=4) (actual time=0.000..1.000 rows=1e999 loops=1)",
         );
         assert_eq!(plan.nodes.len(), 1);
-        assert_eq!(plan.nodes[0].misestimate(), None);
+        assert_eq!(
+            Analysis::new(&plan, Engine::Postgres).nodes[0].misestimate,
+            None
+        );
     }
 
     #[test]
