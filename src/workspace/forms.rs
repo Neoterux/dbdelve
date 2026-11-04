@@ -5,17 +5,26 @@
 
 use std::time::Duration;
 
-use gpui::{Animation, AnimationExt, StyledText, ease_out_quint};
+use gpui::{Animation, AnimationExt, Div, PathPromptOptions, StyledText, ease_out_quint};
+use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::spinner::Spinner;
+use gpui_component::{ActiveTheme, Sizable};
 
+use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
+use crate::actions::{ConfirmDialog, NextDialogButton, PreviousDialogButton, TickDialogBox};
 use crate::connection_form::ConnectionTest;
-use crate::explorer::{drop_sql, select_top_sql, truncate_sql};
+use crate::explorer::{
+    Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase, Shortcuts,
+    is_schema_row, landing, relation_copies, saved_query,
+};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
+use crate::session::PendingDelete;
 use crate::sql::{Destructive, Stop};
-use crate::ui::Status;
+use crate::ui::{Status, code_lines, raised_card, row_icon_tinted};
 
 impl Workspace {
     pub(crate) fn render_connection_form(
@@ -252,6 +261,7 @@ impl Workspace {
                     mono_field(&form.path),
                     t,
                 )
+                .child(browse_button("browse-path", &form.path, t, cx))
                 .into_any_element(),
             ),
             // No encryption row: the transport is HTTPS and always verified,
@@ -274,7 +284,13 @@ impl Workspace {
                     } else {
                         bare(input)
                     };
-                    connection.push(field_row(id, label, input, control, t).into_any_element());
+                    connection.push(
+                        field_row(id, label, input, control, t)
+                            .when(id == "private-key", |row| {
+                                row.child(browse_button("browse-private-key", input, t, cx))
+                            })
+                            .into_any_element(),
+                    );
                 }
             }
             Fields::Server => {
@@ -329,6 +345,12 @@ impl Workspace {
                     ]
                     .map(IntoElement::into_any_element),
                 );
+                if form.engine.takes_service() {
+                    connection.push(
+                        field_row("service", "Service", &form.service, bare(&form.service), t)
+                            .into_any_element(),
+                    );
+                }
                 if form.engine.takes_options() {
                     connection.push(
                         field_row(
@@ -351,16 +373,17 @@ impl Workspace {
                     "Encryption",
                     // Five words do not say which ones check who answered,
                     // and that is the whole difference between them.
-                    Some(form.sslmode.explanation().into()),
+                    Some(form.encryption_explanation(cx).into()),
                     self.sslmode_dropdown(cx),
                     t,
                 )
                 .into_any_element(),
             );
-            // Only where it is consulted: on `require` a certificate file
-            // changes nothing, and a field that changes nothing reads as
-            // though it does.
-            if form.sslmode.checks_certificate() {
+            // Only where it is consulted: with no service, a certificate file
+            // on `require` changes nothing, and a field that changes nothing
+            // reads as though it does. Beside a service it makes `require`
+            // check, and the service may be what sets a verifying mode.
+            if form.shows_root_certificate(cx) {
                 security.push(
                     field_row(
                         "root-certificate",
@@ -369,6 +392,12 @@ impl Workspace {
                         mono_field(&form.root_certificate),
                         t,
                     )
+                    .child(browse_button(
+                        "browse-root-certificate",
+                        &form.root_certificate,
+                        t,
+                        cx,
+                    ))
                     .into_any_element(),
                 );
             }
@@ -405,7 +434,13 @@ impl Workspace {
                         "Identity file",
                         &form.ssh_identity_file,
                         mono_field(&form.ssh_identity_file),
-                    ),
+                    )
+                    .child(browse_button(
+                        "browse-identity-file",
+                        &form.ssh_identity_file,
+                        t,
+                        cx,
+                    )),
                 ];
                 security.extend(
                     rows.into_iter()
@@ -647,6 +682,48 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The native Open dialog, for a file found rather than typed into
+    /// `input`. A dismissed dialog leaves the field as it was.
+    fn browse_into(
+        &mut self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let chosen = chosen.await;
+            _ = workspace.update_in(cx, |workspace, window, cx| match chosen {
+                Ok(Ok(Some(paths))) => {
+                    let (Some(path), Some(form)) = (paths.into_iter().next(), &mut workspace.form)
+                    else {
+                        return;
+                    };
+                    // The dialog does not hold the window: by now the form may
+                    // be another one, or its field gone with the engine or a
+                    // switch, and the pick no longer has anywhere to go.
+                    if !shown_file_fields(form, cx).contains(&&input) {
+                        return;
+                    }
+                    let path = path.to_string_lossy().into_owned();
+                    input.update(cx, |input, cx| input.set_value(path, window, cx));
+                    form.needs_focus = Some(input);
+                    // A pass was for the file that was there before.
+                    form.test = None;
+                    cx.notify();
+                }
+                Ok(Err(error)) => workspace.note(error.to_string(), cx),
+                Ok(Ok(None)) | Err(_) => {}
+            });
+        })
+        .detach();
+    }
+
     /// Closes the form without saving, from its × or its Cancel.
     pub(crate) fn close_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
@@ -656,30 +733,330 @@ impl Workspace {
 
     /// Where an import's connections go, asked before any is added: a new
     /// project named for the client by default, one already made, or none.
+    /// The dialogs, under a focus of their own that the one going up takes
+    /// from whatever held the keyboard: left in the editor or the grid behind
+    /// it, `enter` went on editing what the dialog covers.
+    pub(crate) fn dialog_layer(
+        &self,
+        dialogs: impl IntoIterator<Item = (&'static str, Option<AnyElement>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (names, dialogs): (Vec<_>, Vec<_>) = dialogs
+            .into_iter()
+            .filter_map(|(name, dialog)| Some((name, dialog?)))
+            .unzip();
+        let front = names.last().copied();
+        let behind = self.dialog_in_front.replace(front);
+        let raised = behind != front;
+        if dialogs.is_empty() {
+            // The last one closing unmounts the keyboard with it. Handed back
+            // only after the frame, and only if nothing took it during it:
+            // Edit anyway puts it in the cell input the grid opens as it draws.
+            if self.dialog_focus.contains_focused(window, cx) {
+                let stranded = window.focused(cx);
+                cx.on_next_frame(window, move |workspace, window, cx| {
+                    let before = workspace.focus_before_dialog.take();
+                    if window.focused(cx) != stranded {
+                        return;
+                    }
+                    // Back where it was taken from while that is still drawn:
+                    // a cell input the mode prompt went up over waits there
+                    // for the `enter` that commits it.
+                    match (before, workspace.form.as_mut()) {
+                        (Some(before), _) if workspace.focus.contains(&before, window) => {
+                            before.focus(window, cx)
+                        }
+                        (_, Some(form)) => form.needs_focus = Some(form.lead_field()),
+                        (_, None) => workspace.refocus_front(),
+                    }
+                    cx.notify();
+                });
+            }
+            return None;
+        }
+        if behind.is_none() && !self.dialog_focus.contains_focused(window, cx) {
+            self.focus_before_dialog.replace(window.focused(cx));
+        }
+        if raised {
+            // Every dialog opens on its primary button, as a native one does.
+            // The ring is drawn by the dialogs above, before this ran.
+            self.dialog_choice.set(0);
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+        }
+        // The palette is stacked over the dialogs and holds the keyboard
+        // itself. A field inside the dialog in front keeps it, but not one in
+        // a dialog another has just gone up over, or come down off with the
+        // focused button in it.
+        if self.palette.is_none() && (raised || !self.dialog_focus.contains_focused(window, cx)) {
+            self.dialog_focus.focus(window, cx);
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .track_focus(&self.dialog_focus)
+                .key_context("Dialog")
+                .on_action(cx.listener(Self::confirm_dialog))
+                .on_action(cx.listener(|workspace, _: &TickDialogBox, window, cx| {
+                    let ringed = workspace.dialog_checkbox()
+                        && workspace.dialog_choice.get() + 1 == workspace.dialog_buttons();
+                    match ringed {
+                        true => workspace.confirm_dialog(&ConfirmDialog, window, cx),
+                        false => cx.propagate(),
+                    }
+                }))
+                .on_action(
+                    cx.listener(|workspace, _: &PreviousDialogButton, window, cx| {
+                        workspace.step_dialog_button(true, window, cx);
+                    }),
+                )
+                .on_action(cx.listener(|workspace, _: &NextDialogButton, window, cx| {
+                    workspace.step_dialog_button(false, window, cx);
+                }))
+                .children(dialogs)
+                .into_any_element(),
+        )
+    }
+
+    /// A dialog's button in the ring that marks the one `enter` presses,
+    /// counted from the right so the primary is 0. Every button wears the
+    /// frame, pulled out by its own width, so moving the ring moves nothing.
+    pub(crate) fn choice(
+        &self,
+        dialog: &'static str,
+        from_right: usize,
+        button: impl IntoElement,
+        t: Theme,
+    ) -> Div {
+        let chosen =
+            self.dialog_in_front.get() == Some(dialog) && self.dialog_choice.get() == from_right;
+        div()
+            .debug_selector(|| format!("{dialog}-{from_right}"))
+            .m(px(-2.))
+            .p(px(1.))
+            .border_1()
+            .rounded(px(layout::RADIUS_CONTROL + 2.))
+            .border_color(match chosen {
+                true => t.accent.into(),
+                false => gpui::transparent_black(),
+            })
+            .child(button)
+    }
+
+    /// How many controls the dialog in front has to move the ring across:
+    /// its buttons, then its "Don't ask again" box or its project, which sit
+    /// left of and above them. None for the import, a form with fields and
+    /// lists of its own, which Tab moves the keyboard itself through.
+    fn dialog_buttons(&self) -> usize {
+        let checkbox = usize::from(self.dialog_checkbox());
+        match self.dialog_in_front.get() {
+            Some("stale-edit") => {
+                let editing = self
+                    .profile()
+                    .and_then(|profile| profile.session.stale_edit.as_ref())
+                    .is_some_and(|stale| stale.resume.is_some());
+                if editing { 3 + checkbox } else { 2 }
+            }
+            Some("import-choice") => 3,
+            Some("pending-export") => {
+                let all = self
+                    .profile()
+                    .and_then(|profile| profile.session.pending_export.as_ref())
+                    .is_some_and(|pending| pending.every_row.is_ok());
+                if all { 3 } else { 2 }
+            }
+            Some("import-rows") | None => 0,
+            Some(_) => 2 + checkbox,
+        }
+    }
+
+    /// Whether the dialog in front offers to stop asking: the run prompt over
+    /// a kind that can be silenced, and the stale-edit prompt over an edit.
+    pub(crate) fn dialog_checkbox(&self) -> bool {
+        let Some(profile) = self.profile() else {
+            return false;
+        };
+        match self.dialog_in_front.get() {
+            Some("pending-run") => profile
+                .session
+                .pending_run
+                .as_ref()
+                .and_then(|pending| sql::gate(&pending.verdict, profile.mode, &profile.confirmed))
+                .is_some_and(|stop| matches!(stop, Stop::Confirm(kind) if kind.suppressible())),
+            Some("stale-edit") => profile
+                .session
+                .stale_edit
+                .as_ref()
+                .is_some_and(|stale| stale.resume.is_some()),
+            _ => false,
+        }
+    }
+
+    fn step_dialog_button(&mut self, leftward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let buttons = self.dialog_buttons();
+        if buttons == 0 {
+            self.step_dialog_focus(leftward, window, cx);
+            return;
+        }
+        // The ring is where the keyboard is, so the layer takes it back from
+        // anything inside that took it, or `enter` would go there instead.
+        if !self.dialog_focus.is_focused(window) {
+            self.dialog_focus.focus(window, cx);
+        }
+        let choice = self.dialog_choice.get();
+        self.dialog_choice.set(match leftward {
+            true => (choice + 1) % buttons,
+            false => (choice + buttons - 1) % buttons,
+        });
+        cx.notify();
+    }
+
+    /// Tab order through the import's controls, kept inside the dialog. Its
+    /// preview grid and its SQL are passed over: each binds `tab` itself, and
+    /// once in either the keyboard could never Tab back out.
+    fn step_dialog_focus(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let passed_over = self
+            .profile()
+            .and_then(|profile| profile.session.import_rows.as_ref())
+            .map(|dialog| vec![dialog.preview.focus_handle(cx), dialog.sql.focus_handle(cx)])
+            .unwrap_or_default();
+        let mut first = None;
+        loop {
+            match backward {
+                true => window.focus_prev(cx),
+                false => window.focus_next(cx),
+            }
+            let focused = window.focused(cx);
+            let landed = self.dialog_focus.contains_focused(window, cx)
+                && !passed_over
+                    .iter()
+                    .any(|handle| handle.contains_focused(window, cx));
+            if landed || focused.is_none() {
+                break;
+            }
+            match &first {
+                None => first = focused,
+                Some(first) if Some(first) == focused.as_ref() => {
+                    self.dialog_focus.focus(window, cx);
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        cx.notify();
+    }
+
+    /// `enter` presses the button the ring is on, in the dialog drawn in
+    /// front, and ticks or unticks its box -- wherever focus is inside it.
+    /// The import has no ring: a control there that holds focus itself takes
+    /// the key as it would anywhere.
+    pub(crate) fn confirm_dialog(
+        &mut self,
+        _: &ConfirmDialog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dialog_buttons() == 0 && !self.dialog_focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let choice = self.dialog_choice.get();
+        let Some(dialog) = self.dialog_in_front.get() else {
+            return;
+        };
+        let session = self.profile().map(|profile| &profile.session);
+        let editing = session
+            .and_then(|session| session.stale_edit.as_ref())
+            .is_some_and(|stale| stale.resume.is_some());
+        let deleting = session.and_then(|session| session.pending_delete.clone());
+        let running = session.is_some_and(|session| {
+            matches!(session.active_query(), Some(QueryState::Running { .. }))
+        });
+        let every_row = session
+            .and_then(|session| session.pending_export.as_ref())
+            .is_some_and(|pending| pending.every_row.is_ok());
+        match (dialog, choice) {
+            ("import-choice", 0) => self.confirm_import(window, cx),
+            ("import-choice", 2) => self.open_palette(PaletteMode::ImportProject, window, cx),
+            ("import-choice", _) => {
+                self.pending_import = None;
+                cx.notify();
+            }
+            ("stale-edit", 3) if editing => self.toggle_stale_dont_ask(cx),
+            ("stale-edit", 0) if editing => self.edit_stale_anyway(window, cx),
+            ("stale-edit", 0) => self.refresh_stale(window, cx),
+            ("stale-edit", 1) if editing => self.refresh_stale(window, cx),
+            ("stale-edit", _) => _ = self.cancel_stale_edit(cx),
+            ("queue-failure", 0) => self.continue_queue(cx),
+            ("queue-failure", _) => self.stop_queue(cx),
+            ("pending-run", 2) => self.toggle_dont_ask(cx),
+            ("pending-export", 0) => self.answer_pending_export(every_row, cx),
+            ("pending-export", 1) if every_row => self.answer_pending_export(false, cx),
+            ("pending-export", _) => _ = self.cancel_pending_export(cx),
+            ("pending-run", 0) => self.approve_pending_run(cx),
+            ("pending-run", _) => self.cancel_pending_run(cx),
+            ("discard", 0) => self.confirm_discard_close(window, cx),
+            ("discard", _) => _ = self.cancel_discard_close(cx),
+            ("delete", 0) => match deleting {
+                Some(PendingDelete::Query(name)) => self.delete_saved_query(name, window, cx),
+                Some(PendingDelete::Folder(name, _)) => self.delete_folder(name, cx),
+                None => {}
+            },
+            ("delete", _) => _ = self.cancel_delete_query(cx),
+            // The button is disabled while the batch runs.
+            ("apply-review", 0) if !running => self.run_apply_review(cx),
+            ("apply-review", 1) => _ = self.close_apply_review(cx),
+            _ => {}
+        }
+    }
+
+    /// Where an import's connections can go, a group per separator: a new
+    /// project named for the client unless one already is, the projects
+    /// there are, and none.
+    pub(crate) fn import_destinations(&self) -> Option<Vec<Vec<Option<String>>>> {
+        let pending = self.pending_import.as_ref()?;
+        let known = self.projects.iter().map(|project| project.name.clone());
+        let suggested = format!("Imported from {}", pending.source.label());
+        let mut groups = Vec::new();
+        if !self
+            .projects
+            .iter()
+            .any(|project| project.name == suggested)
+        {
+            groups.push(vec![Some(suggested)]);
+        }
+        if !self.projects.is_empty() {
+            groups.push(known.map(Some).collect());
+        }
+        groups.push(vec![None]);
+        Some(groups)
+    }
+
+    pub(crate) fn set_import_project(&mut self, project: Option<String>) {
+        if let Some(pending) = &mut self.pending_import {
+            pending.project = project;
+        }
+    }
+
+    /// Whether picking `project` for the import makes it.
+    pub(crate) fn import_makes(&self, project: &Option<String>) -> bool {
+        project
+            .as_ref()
+            .is_some_and(|name| !self.projects.iter().any(|known| &known.name == name))
+    }
+
     pub(crate) fn render_import_choice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
         let pending = self.pending_import.as_ref()?;
         let source = pending.source.label();
-        let known = self
-            .projects
+        let groups = self.import_destinations()?;
+        let new: Vec<Option<String>> = groups
             .iter()
-            .map(|project| project.name.clone())
-            .collect::<Vec<_>>();
-        let suggested = format!("Imported from {source}");
-        let mut groups = Vec::new();
-        if !known.contains(&suggested) {
-            groups.push(vec![Some(suggested)]);
-        }
-        if !known.is_empty() {
-            groups.push(known.iter().cloned().map(Some).collect());
-        }
-        groups.push(vec![None]);
-        let new = {
-            let known = known.clone();
-            move |project: &Option<String>| {
-                project.as_ref().is_some_and(|name| !known.contains(name))
-            }
-        };
+            .flatten()
+            .filter(|project| self.import_makes(project))
+            .cloned()
+            .collect();
         let marked = new.clone();
         let picker = Self::dropdown(
             "import-project",
@@ -687,22 +1064,18 @@ impl Workspace {
             groups,
             move |project| match project {
                 None => "No project".into(),
-                Some(name) if new(project) => format!("{name} (new project)").into(),
+                Some(name) if new.contains(project) => format!("{name} (new project)").into(),
                 Some(name) => name.clone().into(),
             },
             move |project| {
                 let path = match project {
                     None => return None,
-                    Some(_) if marked(project) => icon::PLUS,
+                    Some(_) if marked.contains(project) => icon::PLUS,
                     Some(_) => icon::PROJECT,
                 };
                 Some(row_icon(t, path).into_any_element())
             },
-            |workspace, project, _, _| {
-                if let Some(pending) = &mut workspace.pending_import {
-                    pending.project = project;
-                }
-            },
+            |workspace, project, _, _| workspace.set_import_project(project),
             cx,
         );
         let count = pending.fresh;
@@ -728,40 +1101,55 @@ impl Workspace {
                                 .text_color(t.text_muted)
                                 .child("Choose the project they join."),
                         )
-                        .child(self.labelled_field("Project", picker, cx))
+                        .child(self.choice(
+                            "import-choice",
+                            2,
+                            self.labelled_field("Project", picker, cx),
+                            t,
+                        ))
                         .child(
                             div()
                                 .flex()
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-import",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "import-choice",
+                                        1,
+                                        button(
+                                            "cancel-import",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            cx.listener(|workspace, _, _, cx| {
+                                                workspace.pending_import = None;
+                                                cx.notify();
+                                            }),
+                                        ),
                                         t,
-                                    )
-                                    .on_click(cx.listener(
-                                        |workspace, _, _, cx| {
-                                            workspace.pending_import = None;
-                                            cx.notify();
-                                        },
-                                    )),
+                                    ),
                                 )
                                 .child(
-                                    button(
-                                        "confirm-import",
-                                        "Import",
-                                        Tone::Primary,
-                                        Control::Standard,
+                                    self.choice(
+                                        "import-choice",
+                                        0,
+                                        button(
+                                            "confirm-import",
+                                            "Import",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            cx.listener(|workspace, _, window, cx| {
+                                                workspace.confirm_import(window, cx);
+                                            }),
+                                        ),
                                         t,
-                                    )
-                                    .on_click(cx.listener(
-                                        |workspace, _, window, cx| {
-                                            workspace.confirm_import(window, cx);
-                                        },
-                                    )),
+                                    ),
                                 ),
                         ),
                 )
@@ -793,6 +1181,7 @@ impl Workspace {
     pub(crate) fn render_reference_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
         let popup = self.reference_popup.as_ref()?;
+        let at = popup.at?;
         let rows: Vec<AnyElement> = match &popup.choices {
             None => vec![note(t, "Checking…")],
             Some(choices) if choices.is_empty() => {
@@ -826,8 +1215,9 @@ impl Workspace {
                         .hover(|row| row.bg(t.element_hover))
                         .child(label.clone())
                         .on_click(cx.listener(move |workspace, _, window, cx| {
-                            workspace.reference_popup = None;
-                            workspace.open_reference(&OpenReference { index }, window, cx);
+                            if let Some(popup) = workspace.reference_popup.take() {
+                                workspace.open_listed_reference(&popup.source, index, window, cx);
+                            }
                         }))
                         .into_any_element()
                 })
@@ -843,8 +1233,8 @@ impl Workspace {
                 .child(
                     div()
                         .absolute()
-                        .left(popup.at.x)
-                        .top(popup.at.y)
+                        .left(at.x)
+                        .top(at.y)
                         .min_w(px(180.))
                         .max_w(px(420.))
                         .p(px(layout::SPACE_XS))
@@ -902,35 +1292,48 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-discard-close",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "discard",
+                                        1,
+                                        button(
+                                            "cancel-discard-close",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                    workspace.cancel_discard_close(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = cancel_workspace.update(cx, |workspace, cx| {
-                                                workspace.cancel_discard_close(cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .child(
-                                    button(
-                                        "confirm-discard-close",
-                                        "Discard",
-                                        Tone::Danger,
-                                        Control::Standard,
+                                    self.choice(
+                                        "discard",
+                                        0,
+                                        button(
+                                            "confirm-discard-close",
+                                            "Discard",
+                                            Tone::Danger,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                _ = discard_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.confirm_discard_close(window, cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = discard_workspace.update(cx, |workspace, cx| {
-                                                workspace.confirm_discard_close(window, cx);
-                                            });
-                                        },
                                     ),
                                 ),
                         ),
@@ -939,13 +1342,33 @@ impl Workspace {
         )
     }
 
-    /// What `cmd+w` asks before it takes a saved query with the tab.
-    pub(crate) fn render_close_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// What Delete asks before a saved query's file goes, since nothing
+    /// brings it back, or before a folder holding anything goes.
+    pub(crate) fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
-        let name = self.profile()?.session.pending_close.clone()?;
+        let session = &self.profile()?.session;
+        let deleting = session.pending_delete.clone()?;
+        let (heading, question) = match &deleting {
+            PendingDelete::Query(name) if session.tab_holding(name).is_some() => (
+                "Delete query",
+                format!("Delete {name}? Its tab is closed too. This cannot be undone."),
+            ),
+            PendingDelete::Query(name) => (
+                "Delete query",
+                format!("Delete {name}? This cannot be undone."),
+            ),
+            PendingDelete::Folder(name, held) => (
+                "Delete folder",
+                format!(
+                    "Delete {name}? Only the folder goes: the {held} {} in it {} listed \
+                     everywhere else.",
+                    if *held == 1 { "item" } else { "items" },
+                    if *held == 1 { "stays" } else { "stay" },
+                ),
+            ),
+        };
         let cancel_workspace = cx.entity().downgrade();
         let delete_workspace = cancel_workspace.clone();
-        let deleted = name.clone();
 
         Some(
             div()
@@ -957,17 +1380,12 @@ impl Workspace {
                 .justify_center()
                 .child(
                     dialog(t)
-                        .child(section_label(t, "Close query"))
+                        .child(section_label(t, heading))
                         .child(
                             div()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
-                                // The whole point of the dialog: a saved query
-                                // is listed while its file exists, so closing
-                                // its tab and deleting it are one act.
-                                .child(format!(
-                                    "{name} is a saved query. Closing its tab deletes it."
-                                )),
+                                .child(question),
                         )
                         .child(
                             div()
@@ -975,39 +1393,51 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-close-tab",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "delete",
+                                        1,
+                                        button(
+                                            "cancel-delete-query",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                    workspace.cancel_delete_query(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = cancel_workspace.update(cx, |workspace, cx| {
-                                                workspace.cancel_close_tab(cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .child(
-                                    button(
-                                        "confirm-close-tab",
-                                        "Delete",
-                                        Tone::Danger,
-                                        Control::Standard,
+                                    self.choice(
+                                        "delete",
+                                        0,
+                                        button(
+                                            "confirm-delete-query",
+                                            "Delete",
+                                            Tone::Danger,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                _ = delete_workspace.update(cx, |workspace, cx| {
+                                                    match deleting.clone() {
+                                                        PendingDelete::Query(name) => workspace
+                                                            .delete_saved_query(name, window, cx),
+                                                        PendingDelete::Folder(name, _) => {
+                                                            workspace.delete_folder(name, cx)
+                                                        }
+                                                    }
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = delete_workspace.update(cx, |workspace, cx| {
-                                                workspace.delete_saved_query(
-                                                    deleted.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        },
                                     ),
                                 ),
                         ),
@@ -1030,26 +1460,31 @@ impl Workspace {
         let stop = sql::gate(&pending.verdict, profile.mode, &profile.confirmed)?;
         let name = profile.name.clone();
         let current_mode = profile.mode.label();
-        let sql = pending.resume.as_ref().map(|resume| resume.sql.clone());
+        let syntax = profile.config.engine().syntax();
+        let sql = pending
+            .resume
+            .as_ref()
+            .map(|resume| code_lines(&resume.sql, syntax, &cx.theme().highlight_theme));
+        let code = fonts(cx).editor.clone();
         let dont_ask = pending.dont_ask;
 
         let (title, message, confirm, tone) = match stop {
             Stop::Upgrade(needed) => (
                 "Mode",
-                // `Destructive::Unreadable` only reaches `Upgrade` on an engine
-                // with no server-side read-only setting to fall back on
-                // (`Engine::holds_read_only`): there is nothing stopping a
-                // write it cannot parse, so the reason is worth spelling out
-                // rather than reading like an ordinary mode shortfall.
+                // `Destructive::Unreadable` only reaches `Upgrade` where the
+                // server's read-only setting cannot be relied on to stop a
+                // write dbdelve cannot parse (`Engine::unreadable_reason`), so
+                // the reason is worth spelling out rather than reading like an
+                // ordinary mode shortfall.
                 if pending
                     .verdict
                     .destructive
                     .contains(&Destructive::Unreadable)
                 {
                     format!(
-                        "{name} is in {current_mode} mode. dbdelve can't parse this, and \
-                         this database has no server-side read-only setting to stop it if \
-                         it writes, so it needs {}.",
+                        "{name} is in {current_mode} mode. dbdelve can't parse this, and {}, \
+                         so it needs {}.",
+                        profile.config.engine().unreadable_reason(),
                         needed.label()
                     )
                 } else {
@@ -1114,28 +1549,34 @@ impl Workspace {
                                 .p(px(layout::SPACE_SM))
                                 .rounded(px(layout::RADIUS_CONTROL))
                                 .bg(t.surface)
+                                .font_family(code)
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text)
-                                .child(sql)
+                                .children(sql.into_iter().map(|line| div().child(line)))
                         }))
                         // Never for `Unreadable`: silencing it would cover
                         // every future typo along with it, on the strength of
                         // one decision about one of them.
                         .children(match stop {
                             Stop::Confirm(kind) if kind.suppressible() => Some(
-                                Checkbox::new("dont-ask-again")
-                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                    .font_weight(FontWeight::BOLD)
-                                    .label(format!(
-                                        "Don't ask again for {} on {name}",
-                                        kind.label()
-                                    ))
-                                    .checked(dont_ask)
-                                    .on_click(move |_, _, cx| {
-                                        _ = tick.update(cx, |workspace, cx| {
-                                            workspace.toggle_dont_ask(cx);
-                                        });
-                                    }),
+                                self.choice(
+                                    "pending-run",
+                                    2,
+                                    Checkbox::new("dont-ask-again")
+                                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                        .font_weight(FontWeight::BOLD)
+                                        .label(format!(
+                                            "Don't ask again for {} on {name}",
+                                            kind.label()
+                                        ))
+                                        .checked(dont_ask)
+                                        .on_click(move |_, _, cx| {
+                                            _ = tick.update(cx, |workspace, cx| {
+                                                workspace.toggle_dont_ask(cx);
+                                            });
+                                        }),
+                                    t,
+                                ),
                             ),
                             _ => None,
                         })
@@ -1145,35 +1586,45 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-pending-run",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "pending-run",
+                                        1,
+                                        button(
+                                            "cancel-pending-run",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel.update(cx, |workspace, cx| {
+                                                    workspace.cancel_pending_run(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = cancel.update(cx, |workspace, cx| {
-                                                workspace.cancel_pending_run(cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .child(
-                                    button(
-                                        "approve-pending-run",
-                                        confirm,
-                                        tone,
-                                        Control::Standard,
+                                    self.choice(
+                                        "pending-run",
+                                        0,
+                                        button(
+                                            "approve-pending-run",
+                                            confirm,
+                                            tone,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = approve.update(cx, |workspace, cx| {
+                                                    workspace.approve_pending_run(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = approve.update(cx, |workspace, cx| {
-                                                workspace.approve_pending_run(cx);
-                                            });
-                                        },
                                     ),
                                 ),
                         ),
@@ -1249,27 +1700,45 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button("stop-queue", "Stop", Tone::Quiet, Control::Standard, t)
-                                        .on_click(move |_, _, cx| {
-                                            _ = stop.update(cx, |workspace, cx| {
-                                                workspace.stop_queue(cx);
-                                            });
-                                        }),
+                                    self.choice(
+                                        "queue-failure",
+                                        1,
+                                        button(
+                                            "stop-queue",
+                                            "Stop",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = stop.update(cx, |workspace, cx| {
+                                                    workspace.stop_queue(cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
                                 )
                                 .child(
-                                    button(
-                                        "continue-queue",
-                                        "Continue",
-                                        Tone::Primary,
-                                        Control::Standard,
+                                    self.choice(
+                                        "queue-failure",
+                                        0,
+                                        button(
+                                            "continue-queue",
+                                            "Continue",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = carry_on.update(cx, |workspace, cx| {
+                                                    workspace.continue_queue(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = carry_on.update(cx, |workspace, cx| {
-                                                workspace.continue_queue(cx);
-                                            });
-                                        },
                                     ),
                                 ),
                         ),
@@ -1298,7 +1767,15 @@ impl Workspace {
         let refresh_sql = profile
             .session
             .active_query_tab()
-            .and_then(|tab| tab.last_query.clone());
+            .and_then(|tab| tab.last_query.as_deref())
+            .map(|sql| {
+                code_lines(
+                    sql,
+                    profile.config.engine().syntax(),
+                    &cx.theme().highlight_theme,
+                )
+            });
+        let code = fonts(cx).editor.clone();
 
         let cancel = cx.entity().downgrade();
         let refresh = cancel.clone();
@@ -1355,22 +1832,28 @@ impl Workspace {
                                         .p(px(layout::SPACE_SM))
                                         .rounded(px(layout::RADIUS_CONTROL))
                                         .bg(t.surface)
+                                        .font_family(code)
                                         .text_size(px(layout::chrome(layout::TEXT_SM)))
                                         .text_color(t.text)
-                                        .child(sql),
+                                        .children(sql.into_iter().map(|line| div().child(line))),
                                 )
                         }))
                         .children(editing.then(|| {
-                            Checkbox::new("dont-ask-stale")
-                                .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                .font_weight(FontWeight::BOLD)
-                                .label("Don't ask again for this connection")
-                                .checked(dont_ask)
-                                .on_click(move |_, _, cx| {
-                                    _ = tick.update(cx, |workspace, cx| {
-                                        workspace.toggle_stale_dont_ask(cx);
-                                    });
-                                })
+                            self.choice(
+                                "stale-edit",
+                                3,
+                                Checkbox::new("dont-ask-stale")
+                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                    .font_weight(FontWeight::BOLD)
+                                    .label("Don't ask again for this connection")
+                                    .checked(dont_ask)
+                                    .on_click(move |_, _, cx| {
+                                        _ = tick.update(cx, |workspace, cx| {
+                                            workspace.toggle_stale_dont_ask(cx);
+                                        });
+                                    }),
+                                t,
+                            )
                         }))
                         .child(
                             div()
@@ -1378,54 +1861,69 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-stale-edit",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "stale-edit",
+                                        if editing { 2 } else { 1 },
+                                        button(
+                                            "cancel-stale-edit",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel.update(cx, |workspace, cx| {
+                                                    workspace.cancel_stale_edit(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = cancel.update(cx, |workspace, cx| {
-                                                workspace.cancel_stale_edit(cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .child(
-                                    button(
-                                        "refresh-stale-edit",
-                                        "Refresh",
-                                        match editing {
-                                            true => Tone::Quiet,
-                                            false => Tone::Primary,
-                                        },
-                                        Control::Standard,
+                                    self.choice(
+                                        "stale-edit",
+                                        usize::from(editing),
+                                        button(
+                                            "refresh-stale-edit",
+                                            "Refresh",
+                                            match editing {
+                                                true => Tone::Quiet,
+                                                false => Tone::Primary,
+                                            },
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                _ = refresh.update(cx, |workspace, cx| {
+                                                    workspace.refresh_stale(window, cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = refresh.update(cx, |workspace, cx| {
-                                                workspace.refresh_stale(window, cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .children(editing.then(|| {
-                                    button(
-                                        "approve-stale-edit",
-                                        "Edit anyway",
-                                        Tone::Primary,
-                                        Control::Standard,
+                                    self.choice(
+                                        "stale-edit",
+                                        0,
+                                        button(
+                                            "approve-stale-edit",
+                                            "Edit anyway",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                _ = approve.update(cx, |workspace, cx| {
+                                                    workspace.edit_stale_anyway(window, cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = approve.update(cx, |workspace, cx| {
-                                                workspace.edit_stale_anyway(window, cx);
-                                            });
-                                        },
                                     )
                                 })),
                         ),
@@ -1462,7 +1960,11 @@ impl Workspace {
             profile.session.active_query(),
             Some(QueryState::Running { .. })
         );
-        let lines: Vec<String> = review.sql.lines().map(str::to_string).collect();
+        let lines = code_lines(
+            &review.sql,
+            profile.config.engine().syntax(),
+            &cx.theme().highlight_theme,
+        );
         let cancel_workspace = cx.entity().downgrade();
         let run_workspace = cancel_workspace.clone();
 
@@ -1485,10 +1987,20 @@ impl Workspace {
                                 .smooth_scroll(&smooth_scoped("apply-review-sql", &scope, cx))
                                 .font_family(code)
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                // Line by line: a single child carrying newlines
-                                // is one run of text to the layout.
                                 .children(lines.into_iter().map(|line| div().child(line))),
                         )
+                        .children((!review.notes.is_empty()).then(|| {
+                            div()
+                                .id("apply-review-notes")
+                                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(layout::SPACE_SM))
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .children(review.notes.iter().map(|note| div().child(note.clone())))
+                        }))
                         .children(error.map(|message| {
                             div()
                                 .id("apply-review-error")
@@ -1504,19 +2016,24 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    button(
-                                        "cancel-apply",
-                                        "Cancel",
-                                        Tone::Quiet,
-                                        Control::Standard,
+                                    self.choice(
+                                        "apply-review",
+                                        1,
+                                        button(
+                                            "cancel-apply",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                    workspace.close_apply_review(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = cancel_workspace.update(cx, |workspace, cx| {
-                                                workspace.close_apply_review(cx);
-                                            });
-                                        },
                                     ),
                                 )
                                 .child(
@@ -1524,20 +2041,25 @@ impl Workspace {
                                     // disabled fill is the only thing that
                                     // dims and our pinned label would stay
                                     // bright over it.
-                                    button(
-                                        "run-apply",
-                                        "Run",
-                                        if running { Tone::Quiet } else { Tone::Primary },
-                                        Control::Standard,
+                                    self.choice(
+                                        "apply-review",
+                                        0,
+                                        button(
+                                            "run-apply",
+                                            "Run",
+                                            if running { Tone::Quiet } else { Tone::Primary },
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .disabled(running)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = run_workspace.update(cx, |workspace, cx| {
+                                                    workspace.run_apply_review(cx);
+                                                });
+                                            },
+                                        ),
                                         t,
-                                    )
-                                    .disabled(running)
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = run_workspace.update(cx, |workspace, cx| {
-                                                workspace.run_apply_review(cx);
-                                            });
-                                        },
                                     ),
                                 ),
                         ),
@@ -1621,7 +2143,8 @@ impl Workspace {
     }
 
     /// The database the connection is on and, where the engine has one, the
-    /// active schema, each a step after the connection that opens its picker.
+    /// active schema, each a step after the connection that opens its picker,
+    /// and the way to read what they hold again.
     pub(crate) fn render_breadcrumb(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *theme(cx);
         let Some(profile) = self.profile() else {
@@ -1667,15 +2190,18 @@ impl Workspace {
                 .into_any_element(),
             );
         }
+        steps.push(self.render_refresh_schema(profile, t).into_any_element());
         steps
     }
 
     /// Rename and delete, revealed by hovering a row grouped as
-    /// `project-row-{index}`, or held in view while the delete is armed.
+    /// `project-row-{index}`, and held in view while the keyboard is on one
+    /// of them or the delete is armed.
     pub(super) fn project_actions(
         &self,
         index: usize,
         name: &str,
+        window: &Window,
         t: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1684,11 +2210,14 @@ impl Workspace {
         let rename_name = name.to_string();
         let delete_name = name.to_string();
         let pending = self.pending_project_deletion.as_deref() == Some(name);
+        let held = self.welcome_project_focus(index, cx);
+        let focused = held.contains_focused(window, cx);
         div()
+            .track_focus(&held)
             .flex()
             .items_center()
             .gap(px(layout::SPACE_XS))
-            .when(!pending, |actions| {
+            .when(!pending && !focused, |actions| {
                 actions
                     .opacity(0.)
                     .group_hover(format!("project-row-{index}"), |style| style.opacity(1.))
@@ -1735,6 +2264,35 @@ impl Workspace {
             )
     }
 
+    /// Dispatches what the shortcut does, so the two cannot come apart.
+    fn render_refresh_schema(&self, profile: &Profile, t: Theme) -> Button {
+        if profile.refreshing_schema() {
+            return ui::control("refresh-schema", Tone::Quiet, Control::Compact)
+                .w(px(Control::Compact.height()))
+                .p_0()
+                .loading(true)
+                .child(
+                    Spinner::new()
+                        .with_size(px(layout::chrome(layout::ICON_SIZE)))
+                        .color(Tone::Quiet.ink(t).into()),
+                );
+        }
+        let hint = ui::chord_hint("refresh_connection", &self.settings.custom_keybindings);
+        let tooltip = match hint.is_empty() {
+            true => "Refresh schema".to_string(),
+            false => format!("Refresh schema  {hint}"),
+        };
+        icon_button(
+            "refresh-schema",
+            icon::REFRESH,
+            Tone::Quiet,
+            Control::Compact,
+            t,
+        )
+        .tooltip(tooltip)
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(RefreshConnection), cx))
+    }
+
     pub(crate) fn render_explorer(
         &self,
         profile: &Profile,
@@ -1744,221 +2302,494 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let leaves = profile.session.explorer_leaves.clone();
         let highlights = profile.session.explorer_highlights.clone();
+        let shortcuts = profile.session.explorer_shortcuts.clone();
+        let menu_shortcuts = shortcuts.clone();
+        let profile_id = profile.id.clone();
         let menu_leaves = leaves.clone();
         let menu_workspace = workspace.clone();
         let active_schema = profile.active_schema().map(gpui::SharedString::from);
         let menu_schema = active_schema.clone();
         let picks_schema = profile.config.engine().picks_schema();
-        let content = match &profile.catalog {
-            CatalogState::Loading => div()
-                .p(px(layout::SPACE_MD))
-                .text_color(t.text_muted)
-                .child("Loading database objects…")
-                .into_any_element(),
-            CatalogState::Failed(message) => div()
-                .p(px(layout::SPACE_MD))
-                .text_color(t.danger)
-                .child(message.clone())
-                .into_any_element(),
-            CatalogState::Loaded(catalog, _) if catalog.schemas.is_empty() => div()
-                .p(px(layout::SPACE_MD))
-                .text_color(t.text_muted)
-                .child("No database objects found.")
-                .into_any_element(),
-            CatalogState::Loaded(..) => {
-                render_tree(
-                    &profile.session.explorer_tree,
-                    move |index, entry, _, _, cx| {
-                        let t = *theme(cx);
-                        let leaf = leaves.get(entry.item().id.as_str()).copied();
-                        let label = entry.item().label.clone();
-                        let active = leaf.is_none()
-                            && entry.depth() == 0
-                            && active_schema.as_ref() == Some(&label);
-                        let matched = highlights
-                            .get(entry.item().id.as_str())
-                            .map_or(&[][..], Vec::as_slice);
-                        // Three ranks, three weights: a schema owns the column, a
-                        // category only labels the run of objects under it, and the
-                        // objects themselves are what the eye is actually hunting for.
-                        let (label, row) = match (leaf, entry.depth()) {
-                            (Some(_), _) => (
-                                highlighted(label, matched, t),
-                                ListItem::new(index).text_color(t.text),
-                            ),
-                            (None, 0) => (
-                                highlighted(label, matched, t),
-                                ListItem::new(index)
-                                    .text_color(t.text)
-                                    .font_weight(FontWeight::SEMIBOLD),
-                            ),
-                            (None, _) => (
-                                StyledText::new(label.to_uppercase()),
-                                ListItem::new(index)
-                                    .text_color(t.text_faint)
-                                    .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                    .font_weight(FontWeight::MEDIUM),
-                            ),
-                        };
-                        // A folder shows which way it is facing; an object shows what
-                        // kind of object it is. Both occupy the same slot, so the
-                        // labels line up down the column either way.
-                        let row_icon_path = match leaf {
-                            Some(leaf) => object_icon(leaf.kind),
-                            None if entry.is_expanded() => icon::CHEVRON_DOWN,
-                            None => icon::CHEVRON_RIGHT,
-                        };
-                        let row = row
-                            .mx(px(layout::SPACE_XS))
-                            .rounded(px(layout::RADIUS_CONTROL))
-                            // `ListItem` sizes its text in `rems`, which tracks
-                            // the library's 16 rather than dbdelve's body size.
-                            .text_size(px(layout::chrome(layout::TEXT_MD)))
-                            .pl(px(
-                                layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(layout::SPACE_SM))
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(row_icon(t, row_icon_path))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(label),
-                                    )
-                                    .when(active, |row| {
-                                        row.child(
-                                            div()
-                                                .flex_none()
-                                                .whitespace_nowrap()
-                                                .text_color(t.text_faint)
-                                                .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                                .font_weight(FontWeight::NORMAL)
-                                                .child("active"),
-                                        )
-                                    })
-                                    .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
-                                        row.child(
-                                            div()
-                                                .flex_none()
-                                                .whitespace_nowrap()
-                                                .text_color(t.text_faint)
-                                                .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                                .child(human_bytes(size)),
-                                        )
-                                    }),
-                            );
-                        let Some(leaf) = leaf else {
-                            return row;
-                        };
-                        let workspace = workspace.clone();
-                        // Every opened object gets a tab that stays until it is
-                        // closed, so a second click on the same row is the same
-                        // gesture as the first.
-                        row.on_click(move |_, window, cx| {
-                            _ = workspace.update(cx, |workspace, cx| {
-                                workspace.open_explorer_target(leaf.target, window, cx);
-                            });
-                        })
-                    },
-                )
-                .context_menu(move |_, entry, menu, _, cx| {
-                    let Some(leaf) = menu_leaves.get(entry.item().id.as_str()).copied() else {
-                        if !picks_schema || entry.depth() != 0 {
-                            return menu;
+        let drop_line = self.explorer_drop.clone();
+        let open_queries: HashSet<String> = profile
+            .session
+            .queries
+            .iter()
+            .filter_map(|tab| tab.open_query.clone())
+            .collect();
+        let renaming = profile.session.query_rename.as_ref().map(|rename| {
+            (
+                rename.row.clone(),
+                rename.input.clone(),
+                rename.error.clone(),
+            )
+        });
+        let message = match &profile.catalog {
+            CatalogState::Loading => Some(("Loading database objects…".to_string(), t.text_muted)),
+            CatalogState::Failed(message) => Some((message.clone(), t.danger)),
+            CatalogState::Loaded(catalog, _) if catalog.schemas.is_empty() => {
+                Some(("No database objects found.".to_string(), t.text_muted))
+            }
+            CatalogState::Loaded(..) => None,
+        };
+        let tree = explorer_drawn(profile).then(|| {
+            render_tree(
+                &profile.session.explorer_tree,
+                move |index, entry, _, _, cx| {
+                    let t = *theme(cx);
+                    let id = entry.item().id.as_str();
+                    let leaf = leaves.get(id).copied();
+                    let shortcut = shortcuts.get(id);
+                    let missing = matches!(shortcut, Some(Shortcut::Member { missing: true, .. }));
+                    let query = saved_query(id)
+                        .or_else(|| shortcut.and_then(Shortcut::query))
+                        .map(str::to_string);
+                    let pinned_group = id == PINNED_GROUP;
+                    let group = id == QUERIES_GROUP || pinned_group;
+                    // A shortcut is listed away from its schema, which is
+                    // then all that tells two of the same name apart.
+                    let schema = match shortcut {
+                        Some(Shortcut::Member {
+                            member: Member::Object(object),
+                            ..
+                        }) => Some(object.schema.clone()),
+                        _ => None,
+                    };
+                    let label = entry.item().label.clone();
+                    let drag_label = label.clone();
+                    let line = drop_line
+                        .as_ref()
+                        .filter(|(row, _)| row.as_str() == id && cx.has_active_drag())
+                        .map(|(_, after)| *after);
+                    let active = is_schema_row(entry.item().id.as_str())
+                        && active_schema.as_ref() == Some(&label);
+                    let open = query
+                        .as_ref()
+                        .is_some_and(|name| open_queries.contains(name));
+                    let rename = renaming.as_ref().filter(|(row, ..)| row.as_str() == id);
+                    let matched = highlights
+                        .get(entry.item().id.as_str())
+                        .map_or(&[][..], Vec::as_slice);
+                    // Three ranks, three weights: a schema owns the column, a
+                    // category only labels the run of objects under it, and the
+                    // objects themselves are what the eye is actually hunting for.
+                    let (label, row) = match (leaf, entry.depth()) {
+                        // Should be there and is not: greyed, and opens nothing.
+                        _ if missing => (
+                            highlighted(label, matched, t),
+                            ListItem::new(index).text_color(t.text_muted),
+                        ),
+                        (Some(_), _) => (
+                            highlighted(label, matched, t),
+                            ListItem::new(index).text_color(t.text),
+                        ),
+                        _ if query.is_some() || matches!(shortcut, Some(Shortcut::Folder(_))) => (
+                            highlighted(label, matched, t),
+                            ListItem::new(index).text_color(t.text),
+                        ),
+                        (None, 0) if !group => (
+                            highlighted(label, matched, t),
+                            ListItem::new(index)
+                                .text_color(t.text)
+                                .font_weight(FontWeight::SEMIBOLD),
+                        ),
+                        (None, _) => (
+                            StyledText::new(label.to_uppercase()),
+                            ListItem::new(index)
+                                .text_color(t.text_faint)
+                                .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                .font_weight(FontWeight::MEDIUM),
+                        ),
+                    };
+                    // A folder shows which way it is facing; an object shows what
+                    // kind of object it is. Both occupy the same slot, so the
+                    // labels line up down the column either way.
+                    let row_icon_path = match (leaf, shortcut) {
+                        (Some(leaf), _) => object_icon(leaf.kind),
+                        (
+                            None,
+                            Some(Shortcut::Member {
+                                member: Member::Object(object),
+                                ..
+                            }),
+                        ) => object_icon(object.kind),
+                        _ if query.is_some() || missing => icon::SAVED_QUERY,
+                        (None, Some(Shortcut::Folder(_)))
+                            if entry.is_folder() && entry.is_expanded() =>
+                        {
+                            icon::FOLDER_OPEN
                         }
-                        let workspace = menu_workspace.clone();
-                        let schema = entry.item().label.to_string();
-                        return menu.item(
-                            PopupMenuItem::new("Set as Active Schema")
-                                .checked(menu_schema.as_ref() == Some(&entry.item().label))
-                                .on_click(move |_, _, cx| {
-                                    let schema = schema.clone();
-                                    _ = workspace.update(cx, |workspace, cx| {
-                                        workspace.set_schema(schema, cx);
-                                    });
+                        (None, Some(Shortcut::Folder(_))) => icon::FOLDER,
+                        _ if entry.is_expanded() => icon::CHEVRON_DOWN,
+                        _ => icon::CHEVRON_RIGHT,
+                    };
+                    let row = row
+                        .mx(px(layout::SPACE_XS))
+                        .rounded(px(layout::RADIUS_CONTROL))
+                        // `ListItem` sizes its text in `rems`, which tracks
+                        // the library's 16 rather than dbdelve's body size.
+                        .text_size(px(layout::chrome(layout::TEXT_MD)))
+                        .pl(px(
+                            layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
+                        ))
+                        .child(
+                            div()
+                                .relative()
+                                .flex()
+                                .items_center()
+                                .gap(px(layout::SPACE_SM))
+                                .min_w_0()
+                                .flex_1()
+                                .child(match missing {
+                                    true => {
+                                        row_icon_tinted(t, row_icon_path, None).into_any_element()
+                                    }
+                                    false => row_icon(t, row_icon_path).into_any_element(),
+                                })
+                                .child(match rename {
+                                    Some((_, input, error)) => {
+                                        rename_field(label, input, error.clone(), t)
+                                    }
+                                    // The tree gives every row the height of its
+                                    // first, which this is once anything is pinned:
+                                    // the empty text keeps it a line tall rather
+                                    // than an icon tall.
+                                    None if pinned_group => div()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .child(row_icon(t, icon::PIN))
+                                        .child("\u{200B}"),
+                                    None => div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(label),
+                                })
+                                .when_some(schema.filter(|_| rename.is_none()), |row, schema| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .whitespace_nowrap()
+                                            .text_color(t.text_faint)
+                                            .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .child(schema),
+                                    )
+                                })
+                                .when(rename.is_none() && (active || open), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .whitespace_nowrap()
+                                            .text_color(t.text_faint)
+                                            .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .child(if open { "open" } else { "active" }),
+                                    )
+                                })
+                                .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .whitespace_nowrap()
+                                            .text_color(t.text_faint)
+                                            .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                            .child(human_bytes(size)),
+                                    )
+                                })
+                                .when_some(line, |row, after| {
+                                    // Out through `ListItem`'s own `py_1` to
+                                    // the row's edge.
+                                    let edge = gpui::rems(-0.25);
+                                    row.child(
+                                        div()
+                                            .absolute()
+                                            .left_0()
+                                            .right_0()
+                                            .h(px(2.))
+                                            .rounded(px(1.))
+                                            .bg(t.accent)
+                                            .map(|line| match after {
+                                                true => line.bottom(edge),
+                                                false => line.top(edge),
+                                            }),
+                                    )
                                 }),
-                        );
+                        )
+                        .debug_selector(move || format!("explorer-row-{index}"));
+                    // A drag that starts while the database is not known
+                    // carries nothing, as the menus offer nothing then.
+                    let dragged = match (shortcut, &query, leaf) {
+                        _ if rename.is_some() => None,
+                        (Some(shortcut), _, _) => Some(shortcut.pin()),
+                        (None, Some(name), _) => Some(Pin::Member(Member::Query(name.clone()))),
+                        (None, None, Some(leaf)) => workspace
+                            .upgrade()
+                            .and_then(|workspace| workspace.read(cx).member_at(leaf.target))
+                            .map(Pin::Member),
+                        _ => None,
                     };
-                    let Some(workspace) = menu_workspace.upgrade() else {
+                    let row = match dragged {
+                        Some(pin) => {
+                            let workspace = workspace.clone();
+                            let dragged = DragShortcut {
+                                profile: profile_id.clone(),
+                                pin,
+                                from: shortcut.and_then(|shortcut| shortcut.container(id)),
+                                label: drag_label,
+                            };
+                            row.on_drag(dragged, move |dragged, grab, _, cx| {
+                                _ = workspace.update(cx, |workspace, _| {
+                                    workspace.explorer_drop = None;
+                                });
+                                cx.new(|_| DragLabel {
+                                    label: dragged.label.clone(),
+                                    grab,
+                                })
+                            })
+                        }
+                        None => row,
+                    };
+                    let row = match rename.is_none() && (pinned_group || shortcut.is_some()) {
+                        true => drop_target(
+                            row,
+                            entry.item().id.clone(),
+                            shortcut.cloned(),
+                            &workspace,
+                            t,
+                        ),
+                        false => row,
+                    };
+                    // A click inside the field is the field's.
+                    if rename.is_some() || missing {
+                        return row;
+                    }
+                    if let Some(name) = query {
+                        let workspace = workspace.clone();
+                        return row.on_click(move |_, window, cx| {
+                            _ = workspace.update(cx, |workspace, cx| {
+                                workspace.open_saved_query(name.clone(), window, cx);
+                            });
+                        });
+                    }
+                    let Some(leaf) = leaf else {
+                        return row;
+                    };
+                    let workspace = workspace.clone();
+                    // Every opened object gets a tab that stays until it is
+                    // closed, so a second click on the same row is the same
+                    // gesture as the first.
+                    row.on_click(move |_, window, cx| {
+                        _ = workspace.update(cx, |workspace, cx| {
+                            workspace.open_explorer_target(leaf.target, window, cx);
+                        });
+                    })
+                },
+            )
+            .context_menu(move |_, entry, menu, window, cx| {
+                let id = entry.item().id.clone();
+                let shortcut = menu_shortcuts.get(id.as_ref()).cloned();
+                let shortcuts = menu_workspace
+                    .upgrade()
+                    .and_then(|workspace| {
+                        workspace
+                            .read(cx)
+                            .profile()
+                            .map(|profile| profile.shortcuts.clone())
+                    })
+                    .unwrap_or_default();
+                let held_in = match &shortcut {
+                    Some(Shortcut::Member { folder, .. }) => folder.clone(),
+                    _ => None,
+                };
+                match &shortcut {
+                    Some(Shortcut::Folder(name)) => {
+                        let pinned = shortcuts.pinned(&Pin::Folder(name.clone()));
+                        return folder_menu(menu, name, id, pinned, &menu_workspace);
+                    }
+                    Some(Shortcut::Member {
+                        member,
+                        missing: true,
+                        ..
+                    }) => {
+                        return removal_items(menu, member, held_in, &shortcuts, &menu_workspace);
+                    }
+                    _ => {}
+                }
+                if id.as_ref() == PINNED_GROUP {
+                    let workspace = menu_workspace.clone();
+                    return menu.item(PopupMenuItem::new("New Folder…").on_click(
+                        move |_, window, cx| {
+                            _ = workspace.update(cx, |workspace, cx| {
+                                workspace.new_folder(None, window, cx);
+                            });
+                        },
+                    ));
+                }
+                let query = saved_query(&id)
+                    .or_else(|| shortcut.as_ref().and_then(Shortcut::query))
+                    .map(str::to_string);
+                if let Some(name) = query {
+                    let menu = saved_query_menu(menu, &name, id, &menu_workspace);
+                    let member = Member::Query(name);
+                    return shortcut_menu(
+                        menu,
+                        member,
+                        held_in,
+                        &shortcuts,
+                        &menu_workspace,
+                        window,
+                        cx,
+                    );
+                }
+                let Some(leaf) = menu_leaves.get(id.as_ref()).copied() else {
+                    if !picks_schema || !is_schema_row(entry.item().id.as_str()) {
                         return menu;
+                    }
+                    let workspace = menu_workspace.clone();
+                    let schema = entry.item().label.to_string();
+                    return menu.item(
+                        PopupMenuItem::new("Set as Active Schema")
+                            .checked(menu_schema.as_ref() == Some(&entry.item().label))
+                            .on_click(move |_, _, cx| {
+                                let schema = schema.clone();
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.set_schema(schema, cx);
+                                });
+                            }),
+                    );
+                };
+                let Some(workspace) = menu_workspace.upgrade() else {
+                    return menu;
+                };
+                let workspace = workspace.read(cx);
+                let member = workspace.member_at(leaf.target);
+                let unknown = workspace.profile().is_some_and(|profile| {
+                    profile.shortcut_database() == ShortcutDatabase::Unknown
+                });
+                let with_shortcuts =
+                    |menu: PopupMenu, window: &mut Window, cx: &mut App| match member.clone() {
+                        Some(member) => shortcut_menu(
+                            menu,
+                            member,
+                            held_in.clone(),
+                            &shortcuts,
+                            &menu_workspace,
+                            window,
+                            cx,
+                        ),
+                        None if unknown => unknown_database_items(menu),
+                        None => menu,
                     };
-                    let workspace = workspace.read(cx);
-                    let Some((schema, relation, kind)) = workspace.relation_at(leaf.target) else {
-                        return menu;
-                    };
-                    let engine = workspace.engine();
-                    let copy = |label: &'static str, text: String| {
-                        PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                        })
-                    };
-                    let ddl_workspace = menu_workspace.clone();
-                    let ddl_names = (schema.clone(), relation.clone());
-                    let open = |label: &'static str, structure: bool| {
-                        let workspace = menu_workspace.clone();
+                // A routine offers what a folder or a pin does, and no more.
+                let Some((schema, relation, kind)) = workspace.relation_at(leaf.target) else {
+                    return with_shortcuts(menu, window, cx);
+                };
+                let engine = workspace.engine();
+                let copy = |label: &'static str, text: String| {
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    })
+                };
+                let ddl_workspace = menu_workspace.clone();
+                let ddl_names = (schema.clone(), relation.clone());
+                let open = |label: &'static str, structure: bool| {
+                    let workspace = menu_workspace.clone();
+                    let (schema, relation) = (schema.clone(), relation.clone());
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
                         let (schema, relation) = (schema.clone(), relation.clone());
-                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        _ = workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .open_relation_view(schema, relation, kind, structure, window, cx);
+                        });
+                    })
+                };
+                let import_workspace = menu_workspace.clone();
+                let import_names = (schema.clone(), relation.clone());
+                let export_workspace = menu_workspace.clone();
+                let export_names = (schema.clone(), relation.clone());
+                // Built here rather than through `PopupMenu::submenu`, for the
+                // reason the grid's "Copy Rows As" gives: that wants the menu's
+                // own context, and a tree hands over its own.
+                let exports = PopupMenu::build(window, cx, move |submenu, _, _| {
+                    let export = |label: &'static str, format: FileAs| {
+                        let workspace = export_workspace.clone();
+                        let (schema, relation) = export_names.clone();
+                        PopupMenuItem::new(label).on_click(move |_, _, cx| {
                             let (schema, relation) = (schema.clone(), relation.clone());
                             _ = workspace.update(cx, |workspace, cx| {
-                                workspace.open_relation_view(
-                                    schema, relation, kind, structure, window, cx,
-                                );
+                                workspace.export_relation(format, schema, relation, cx);
                             });
                         })
                     };
-                    let import_workspace = menu_workspace.clone();
-                    let import_names = (schema.clone(), relation.clone());
-                    let mut menu = menu
-                        .item(open("Open Data", false))
-                        .item(open("Open Structure", true));
-                    if engine.takes_imports(kind) {
-                        menu = menu.item(PopupMenuItem::new("Import Rows…").on_click(
-                            move |_, window, cx| {
-                                let (schema, relation) = import_names.clone();
-                                _ = import_workspace.update(cx, |workspace, cx| {
-                                    workspace.import_rows_into(schema, relation, window, cx);
-                                });
-                            },
-                        ));
+                    let submenu = submenu
+                        .item(export("CSV", FileAs::Rows(Format::Csv)))
+                        .item(export("JSON", FileAs::Rows(Format::Json)));
+                    match engine.syntax() {
+                        db::Syntax::Sql => submenu.item(export("SQL", FileAs::Inserts)),
+                        _ => submenu,
                     }
-                    let menu = menu
-                        .separator()
-                        .when(engine.copies_ddl(), |menu| {
-                            menu.item(PopupMenuItem::new("Copy DDL").on_click(move |_, _, cx| {
-                                let (schema, relation) = ddl_names.clone();
-                                _ = ddl_workspace.update(cx, |workspace, cx| {
-                                    workspace.copy_ddl(schema, relation, kind, cx);
-                                });
-                            }))
-                        })
-                        .when_some(select_top_sql(engine, &schema, &relation), |menu, sql| {
-                            menu.item(copy("Copy SELECT (Top 100)", sql))
-                        })
-                        .separator()
-                        .when_some(drop_sql(engine, &schema, &relation, kind), |menu, sql| {
-                            menu.item(copy("Copy DROP", sql))
-                        });
-                    if matches!(kind, RelationKind::Table | RelationKind::PartitionedTable) {
-                        menu.item(copy(
-                            "Copy TRUNCATE",
-                            truncate_sql(engine, &schema, &relation),
-                        ))
-                    } else {
-                        menu
-                    }
-                })
-                .into_any_element()
-            }
-        };
+                });
+                let mut menu = menu
+                    .item(open("Open Data", false))
+                    .item(open("Open Structure", true));
+                if engine.takes_imports(kind) {
+                    menu = menu.item(PopupMenuItem::new("Import Rows…").on_click(
+                        move |_, window, cx| {
+                            let (schema, relation) = import_names.clone();
+                            _ = import_workspace.update(cx, |workspace, cx| {
+                                workspace.import_rows_into(schema, relation, window, cx);
+                            });
+                        },
+                    ));
+                }
+                menu = menu.item(PopupMenuItem::submenu("Export", exports));
+                let menu = relation_copies(engine, &schema, &relation, kind)
+                    .into_iter()
+                    .fold(menu, |menu, group| {
+                        group
+                            .into_iter()
+                            .fold(menu.separator(), |menu, (label, text)| match text {
+                                Some(text) => menu.item(copy(label, text)),
+                                None => {
+                                    let (workspace, names) =
+                                        (ddl_workspace.clone(), ddl_names.clone());
+                                    menu.item(PopupMenuItem::new(label).on_click(
+                                        move |_, _, cx| {
+                                            let (schema, relation) = names.clone();
+                                            _ = workspace.update(cx, |workspace, cx| {
+                                                workspace.copy_ddl(schema, relation, kind, cx);
+                                            });
+                                        },
+                                    ))
+                                }
+                            })
+                    });
+                with_shortcuts(menu, window, cx)
+            })
+        });
+        let content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(message.map(|(message, color)| {
+                div()
+                    .p(px(layout::SPACE_MD))
+                    .text_color(color)
+                    .child(message)
+            }))
+            .children(tree.map(|tree| {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .key_context("Explorer")
+                    .track_focus(&self.explorer_focus)
+                    .on_action(cx.listener(Self::open_sidebar_item))
+                    .child(tree)
+            }));
 
         div()
             .size_full()
@@ -1996,6 +2827,311 @@ impl Workspace {
             )
             .child(div().flex_1().min_h_0().child(content))
     }
+}
+
+/// What a saved query's row offers on a right click: what its tab offers, for
+/// a query that may have no tab open.
+fn saved_query_menu(
+    menu: PopupMenu,
+    name: &str,
+    row: gpui::SharedString,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenu {
+    let action =
+        |label: &'static str,
+         act: fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)| {
+            let workspace = workspace.clone();
+            let name = name.to_string();
+            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                _ = workspace.update(cx, |workspace, cx| act(workspace, name.clone(), window, cx));
+            })
+        };
+    menu.item(action("Open", |workspace, name, window, cx| {
+        workspace.open_saved_query(name, window, cx)
+    }))
+    .item({
+        let workspace = workspace.clone();
+        let name = name.to_string();
+        PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.start_query_rename(name.clone(), row.clone(), window, cx)
+            });
+        })
+    })
+    .separator()
+    .item(action("Delete…", |workspace, name, _, cx| {
+        workspace.ask_delete_saved_query(name, cx)
+    }))
+}
+
+/// What a folder's row offers.
+fn folder_menu(
+    menu: PopupMenu,
+    name: &str,
+    row: gpui::SharedString,
+    pinned: bool,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenu {
+    let (rename, name) = ((workspace.clone(), name.to_string()), name.to_string());
+    let delete = (workspace.clone(), name.clone());
+    menu.item(
+        PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+            let (workspace, name) = &rename;
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.start_rename(name.clone(), true, row.clone(), window, cx)
+            });
+        }),
+    )
+    .item(pin_item(pinned, Pin::Folder(name), workspace))
+    .separator()
+    .item(PopupMenuItem::new("Delete…").on_click(move |_, _, cx| {
+        let (workspace, name) = &delete;
+        _ = workspace.update(cx, |workspace, cx| {
+            workspace.ask_delete_folder(name.clone(), cx)
+        });
+    }))
+}
+
+/// What every object's and saved query's row offers for folders and pins,
+/// wherever the row is drawn: "Add to Folder" with a check on each folder it
+/// is in, which toggles, and Pin or Unpin.
+fn shortcut_menu(
+    menu: PopupMenu,
+    member: Member,
+    held_in: Option<String>,
+    shortcuts: &Shortcuts,
+    workspace: &gpui::WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> PopupMenu {
+    let mut folders: Vec<(String, bool)> = shortcuts
+        .folders
+        .iter()
+        .map(|folder| (folder.name.clone(), shortcuts.holds(&folder.name, &member)))
+        .collect();
+    folders.sort_by_cached_key(|(name, _)| name.to_lowercase());
+    let (submenu_workspace, submenu_member) = (workspace.clone(), member.clone());
+    // Built here rather than through `PopupMenu::submenu`, as "Export" is.
+    let submenu = PopupMenu::build(window, cx, move |submenu, _, _| {
+        let toggle = |name: &String, held: bool| {
+            let (workspace, member, name) = (
+                submenu_workspace.clone(),
+                submenu_member.clone(),
+                name.clone(),
+            );
+            PopupMenuItem::new(name.clone())
+                .checked(held)
+                .on_click(move |_, _, cx| {
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_in_folder(name.clone(), member.clone(), cx)
+                    });
+                })
+        };
+        let submenu = folders.iter().fold(submenu, |submenu, (name, held)| {
+            submenu.item(toggle(name, *held))
+        });
+        let submenu = match folders.is_empty() {
+            true => submenu,
+            false => submenu.separator(),
+        };
+        submenu.item(
+            PopupMenuItem::new("New Folder…").on_click(move |_, window, cx| {
+                _ = submenu_workspace.update(cx, |workspace, cx| {
+                    workspace.new_folder(Some(submenu_member.clone()), window, cx)
+                });
+            }),
+        )
+    });
+    let pin = Pin::Member(member.clone());
+    let menu = menu
+        .separator()
+        .item(PopupMenuItem::submenu("Add to Folder", submenu))
+        .item(pin_item(shortcuts.pinned(&pin), pin, workspace));
+    match held_in {
+        Some(folder) => menu.item(remove_item(folder, member, workspace)),
+        None => menu,
+    }
+}
+
+/// Folders and pins, greyed while the database an object is in is not known:
+/// a shortcut made without it would open the same name in any database.
+fn unknown_database_items(menu: PopupMenu) -> PopupMenu {
+    menu.separator()
+        .item(PopupMenuItem::new("Add to Folder").disabled(true))
+        .item(PopupMenuItem::new("Pin").disabled(true))
+        .label("The database is not known yet.")
+}
+
+/// All a missing member's row offers: taking it out of where it is listed.
+fn removal_items(
+    menu: PopupMenu,
+    member: &Member,
+    held_in: Option<String>,
+    shortcuts: &Shortcuts,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenu {
+    let pin = Pin::Member(member.clone());
+    let menu = match held_in {
+        Some(folder) => menu.item(remove_item(folder, member.clone(), workspace)),
+        None => menu,
+    };
+    match shortcuts.pinned(&pin) {
+        true => menu.item(pin_item(true, pin, workspace)),
+        false => menu,
+    }
+}
+
+/// A row in a folder or the Pinned group, or the group itself, taking a
+/// dragged shortcut: a folder's row and the group's light up, and a member's
+/// draws the line between its neighbours where the drop would go.
+fn drop_target(
+    row: ListItem,
+    id: gpui::SharedString,
+    shortcut: Option<Shortcut>,
+    workspace: &gpui::WeakEntity<Workspace>,
+    t: Theme,
+) -> ListItem {
+    let land = {
+        let id = id.clone();
+        std::rc::Rc::new(move |dragged: &Pin, after: bool| {
+            landing(&id, shortcut.as_ref(), dragged, after)
+        })
+    };
+    let (moved, dropped) = (workspace.clone(), workspace.clone());
+    row.can_drop({
+        let land = land.clone();
+        move |dragged, _, _| {
+            dragged
+                .downcast_ref::<DragShortcut>()
+                .is_some_and(|dragged| land(&dragged.pin, false).is_some())
+        }
+    })
+    .drag_over::<DragShortcut>({
+        let land = land.clone();
+        move |style, dragged, _, _| match land(&dragged.pin, false) {
+            Some(Landing::Folder(_) | Landing::Pinned) => style.bg(t.element_active),
+            _ => style,
+        }
+    })
+    // Every row hears every move, so each says only whether it is the one
+    // under the pointer.
+    .on_drag_move::<DragShortcut>({
+        let (land, row) = (land.clone(), id.clone());
+        move |event, _, cx| {
+            let (position, bounds) = (event.event.position, event.bounds);
+            let after = position.y > bounds.center().y;
+            let beside = bounds.contains(&position)
+                && matches!(
+                    land(&event.drag(cx).pin, after),
+                    Some(Landing::Beside { .. })
+                );
+            _ = moved.update(cx, |workspace, cx| {
+                workspace.hover_drop(&row, beside.then_some(after), cx)
+            });
+        }
+    })
+    .on_drop(move |dragged: &DragShortcut, _, cx| {
+        _ = dropped.update(cx, |workspace, cx| {
+            let after = workspace
+                .explorer_drop
+                .as_ref()
+                .is_some_and(|(row, after)| *row == id && *after);
+            if let Some(landing) = land(&dragged.pin, after) {
+                workspace.drop_shortcut(dragged, landing, cx);
+            }
+        });
+    })
+}
+
+fn pin_item(pinned: bool, pin: Pin, workspace: &gpui::WeakEntity<Workspace>) -> PopupMenuItem {
+    let workspace = workspace.clone();
+    PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" }).on_click(move |_, _, cx| {
+        _ = workspace.update(cx, |workspace, cx| workspace.toggle_pin(pin.clone(), cx));
+    })
+}
+
+fn remove_item(
+    folder: String,
+    member: Member,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenuItem {
+    let workspace = workspace.clone();
+    PopupMenuItem::new("Remove from Folder").on_click(move |_, _, cx| {
+        _ = workspace.update(cx, |workspace, cx| {
+            workspace.toggle_in_folder(folder.clone(), member.clone(), cx)
+        });
+    })
+}
+
+/// A saved query's name as a field, laid over the label it replaces. The
+/// label stays, unseen, to hold the row's height: the tree's rows are all as
+/// tall as its first, and a field taller than a label would push nothing but
+/// spill over its neighbours. A refusal floats under the field for the same
+/// reason.
+fn rename_field(
+    label: StyledText,
+    input: &Entity<InputState>,
+    error: Option<String>,
+    t: Theme,
+) -> gpui::Div {
+    let field = div()
+        .relative()
+        .w_full()
+        .h(px(layout::chrome(layout::CONTROL_HEIGHT_INLINE)))
+        .flex()
+        .items_center()
+        .rounded(px(layout::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if error.is_some() { t.danger } else { t.accent })
+        .bg(t.bg)
+        .child(
+            Input::new(input)
+                .appearance(false)
+                .h_full()
+                .px(px(layout::SPACE_XS))
+                .py_0()
+                .text_size(px(layout::chrome(layout::TEXT_MD))),
+        )
+        .children(error.map(|message| {
+            div()
+                .absolute()
+                .top_full()
+                .left_0()
+                .mt(px(2.))
+                .child(gpui::deferred(
+                    gpui::anchored()
+                        .snap_to_window_with_margin(px(layout::SPACE_SM))
+                        .child(raised_card(
+                            div()
+                                .max_w(px(layout::SIDEBAR_DEFAULT_WIDTH))
+                                .px(px(layout::SPACE_SM))
+                                .py(px(layout::SPACE_XS))
+                                .rounded(px(layout::RADIUS_CONTROL))
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.danger)
+                                .child(message),
+                            t,
+                        )),
+                ))
+        }));
+    div()
+        .flex_1()
+        .min_w_0()
+        .relative()
+        .child(div().invisible().whitespace_nowrap().child(label))
+        .child(
+            // Out by the field's own inset, so the name does not move as the
+            // row turns into it.
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(-(layout::SPACE_XS + 1.)))
+                .right_0()
+                .flex()
+                .items_center()
+                .child(field),
+        )
 }
 
 fn note(t: Theme, text: &'static str) -> AnyElement {
@@ -2129,6 +3265,39 @@ fn bare(input: &Entity<InputState>) -> Input {
     Input::new(input).appearance(false).p_0()
 }
 
+/// The path fields the form is drawing, each with a [`browse_button`].
+fn shown_file_fields<'a>(form: &'a ConnectionForm, cx: &App) -> Vec<&'a Entity<InputState>> {
+    match form.engine.fields() {
+        Fields::File => vec![&form.path],
+        Fields::Account => vec![&form.private_key],
+        Fields::Server => {
+            let mut shown = Vec::new();
+            if form.shows_root_certificate(cx) {
+                shown.push(&form.root_certificate);
+            }
+            if form.ssh {
+                shown.push(&form.ssh_identity_file);
+            }
+            shown
+        }
+    }
+}
+
+fn browse_button(
+    id: &'static str,
+    input: &Entity<InputState>,
+    t: Theme,
+    cx: &Context<Workspace>,
+) -> gpui_component::button::Button {
+    let input = input.clone();
+    icon_button(id, icon::BROWSE, Tone::Quiet, Control::Compact, t)
+        .ml(px(layout::SPACE_SM))
+        .tooltip("Choose a file")
+        .on_click(cx.listener(move |workspace, _, window, cx| {
+            workspace.browse_into(input.clone(), window, cx);
+        }))
+}
+
 /// A port after its host, behind a hairline and the colon that joins the two
 /// in a URL.
 fn port_field(input: &Entity<InputState>, t: Theme) -> gpui::Div {
@@ -2162,4 +3331,13 @@ fn revealed(row: gpui::Div, index: usize, animate: bool) -> AnyElement {
             |row, delta| row.opacity(delta).top(px(-SSH_REVEAL_PX * (1. - delta))),
         )
         .into_any_element()
+}
+
+/// Whether the sidebar draws its tree: with a catalog that lists something,
+/// and while the catalog is away too, so a connection that is down or still
+/// loading has its saved queries, folders and pins within reach.
+pub(super) fn explorer_drawn(profile: &Profile) -> bool {
+    matches!(&profile.catalog, CatalogState::Loaded(catalog, _) if !catalog.schemas.is_empty())
+        || !profile.session.saved_queries.is_empty()
+        || profile.shortcuts != Shortcuts::default()
 }

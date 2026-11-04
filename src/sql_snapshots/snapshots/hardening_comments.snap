@@ -407,6 +407,64 @@ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] nested block comment: /* /* n */ */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [snowflake] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[clickhouse] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment alone, five digits: /*M!10010 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment alone, line break after the version: /*M!100100
+DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment after an ordinary statement: SELECT 1; /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment after an ordinary statement, own line: SELECT 1;
+/*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding a truncate: /*M!100100 TRUNCATE TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding an unfiltered delete: /*M!100100 DELETE FROM t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding a write: /*M!100100 INSERT INTO t VALUES (1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding a read: /*M!100100 SELECT 1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding the write access mode: /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding the write access mode after a statement: SELECT 1; /*M!100100 SET SESSION TRANSACTION READ WRITE */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding the hold name: /*M!100100 SET SESSION transaction_read_only = 0 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment holding a denied call: /*M!100100 SELECT get_lock('k', 1) */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] fragment that changes the statement around it: SELECT 1 /*M!100100 INTO @y */ FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] fragment that only extends the statement around it: SELECT 2 /*M!100100 +1 */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment fused with a bare statement: /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment, lower-case marker: /*m!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment with a multi-byte character in the body: /*M!100100 SELECT 'é' */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment with a multi-byte character where the digits end: /*M!100100é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment with a multi-byte character straight after the marker: /*M!é DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment with full-width digits: /*M!１００１００ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] executable comment, empty: /*M!*/ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] four-digit version, a plain comment on the server: /*M!1234 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] space before the digits: /*M! 100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] bang before the letter: /*!M100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] the form both servers execute: /*!50000 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] the form only the older server executes: /*!50700 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] marker inside a string literal: SELECT '/*M!100100 DROP TABLE t */' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] marker after a line comment: -- /*M!100100 DROP TABLE t */
+SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] marker after a hash comment: # /*M!100100 DROP TABLE t */
+SELECT 1 => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] marker inside an ordinary block comment: /* /*M!100100 DROP TABLE t */ SELECT 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[clickhouse] unterminated executable comment: /*M!100100 DROP TABLE t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[clickhouse] nested executable comment: /*M!100100 /*M!100100 SELECT 7 */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] dump header, the version no server reaches: /*M!999999\- enable the sandbox mode */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] ordinary block comment before a read: /* c */ SELECT 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] empty:  => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] whitespace only:   
+	 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] lone semicolon: ; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] two semicolons: ;; => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] semicolon then comment: ; -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] line comment: -- c => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] block comment: /* c */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] block comment after a line comment: -- a
+/* b */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] hash line comment: # c => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] hash line comment, line break: # c
+ => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] hash line comment after a block comment: /* a */ # c => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] nested block comment: /* /* n */ */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] nested block comment hiding a statement: /* /* n */ DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] batch separator only: GO => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mssql] executable comment alone, destructive: /*M!100100 DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] executable comment alone, no version: /*M!DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] executable comment alone, version glued to the code: /*M!100100DROP TABLE t */ => |classify=ReadOnly [] gate ro=None rw=None full=None|

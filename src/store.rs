@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::db::{EditTarget, Engine, ExplainMode, RelationKind, Row, SshTunnel};
+use crate::db::{
+    DbError, EditTarget, Engine, ExplainMode, QueryResult, RelationKind, Row, SshTunnel, Stopped,
+};
 
 const PROFILES_FILE: &str = "profiles.toml";
 /// The release variant's name. Both the support directory and the keychain
@@ -86,6 +88,10 @@ pub struct StoredProfile {
     /// what every profile written before it could be picked connected with.
     #[serde(default)]
     pub schema: Option<String>,
+    /// The connection service file section a Postgres profile names. Absent
+    /// is every other profile, which spells out where it connects.
+    #[serde(default)]
+    pub service: Option<String>,
     /// The editor's zoom, back when it was a per-profile setting. Read only:
     /// the live value is [`StoredSettings::editor_font_size`] now, and this is
     /// what the migration seeds it from for anyone upgrading -- dropping the
@@ -141,6 +147,77 @@ pub struct StoredProfile {
     pub open_queries: Vec<StoredQueryTab>,
     #[serde(default)]
     pub open_objects: Vec<StoredObject>,
+    /// The explorer's folders and pins, both after the tables above. Left out
+    /// when empty, so a profile without any is written as it always was.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "readable_entries"
+    )]
+    pub folders: Vec<StoredFolder>,
+    /// In the order they were pinned.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "readable_entries"
+    )]
+    pub pins: Vec<StoredShortcut>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct StoredFolder {
+    pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "readable_entries"
+    )]
+    pub members: Vec<StoredShortcut>,
+}
+
+/// Every entry this build can read, less those it cannot: a folder or a pin
+/// is only grouping, and one bad entry moving the whole file aside would cost
+/// every connection in it.
+fn readable_entries<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry<T> {
+        Read(T),
+        Unread(IgnoredAny),
+    }
+    Ok(Vec::<Entry<T>>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Read(entry) => Some(entry),
+            Entry::Unread(_) => None,
+        })
+        .collect())
+}
+
+/// One entry in a folder or the pins: a saved query by `query`, a folder by
+/// `folder` (a pin only), or else a database object. Every field optional
+/// rather than an enum, so an entry a newer build wrote costs that entry, not
+/// the file: the loader drops what it cannot read.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct StoredShortcut {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// Only where the catalog is one database's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `explorer::ObjectKind::slug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// One query buffer in the strip. The SQL itself is not here: a saved buffer
@@ -317,6 +394,11 @@ pub struct StoredGrid {
     /// written before plans were kept, which restores with none.
     #[serde(default)]
     pub plan: Option<StoredPlan>,
+    /// What the server said running the statement behind these rows -- or
+    /// behind no rows at all, which is the one reason a snapshot is written
+    /// with no columns.
+    #[serde(default)]
+    pub messages: Vec<String>,
 }
 
 /// What rebuilds a query tab's plan: the rows `explain::parse` read it from,
@@ -394,6 +476,8 @@ pub struct StoredSettings {
     pub color_titlebar: Option<bool>,
     #[serde(default)]
     pub client_sort: Option<bool>,
+    #[serde(default)]
+    pub qualify_completions: Option<bool>,
     /// Whether the first-run greeting has played. Absent in a file written
     /// before there was one.
     #[serde(default)]
@@ -989,7 +1073,56 @@ pub fn delete_queries(profile_id: &str) -> Result<(), String> {
 
 pub fn delete_query(profile_id: &str, name: &str) -> Result<(), String> {
     let path = query_path(profile_id, name)?;
-    fs::remove_file(&path).map_err(|error| format!("Could not delete {}: {error}", path.display()))
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", path.display())),
+    }
+}
+
+/// Write `sql` as `name`, moving the query's file there first when this
+/// renames `previous`.
+///
+/// The text is written under the old name before a rename, so a move that
+/// fails leaves it where it was. New saves and renames install their target
+/// atomically without replacing another file: directory enumeration is only
+/// an early name-conflict check, not protection against an unseen target.
+/// The native rename also handles case-only changes when both names address
+/// the same entry, without treating case variants as interchangeable files.
+pub fn save_query_as(
+    profile_id: &str,
+    previous: Option<&str>,
+    name: &str,
+    sql: &str,
+) -> Result<(), String> {
+    if let Some(taken) = saved_queries(profile_id)
+        .into_iter()
+        .find(|taken| Some(taken.as_str()) != previous && same_query_name(taken, name))
+    {
+        return Err(format!("A query named {taken} already exists."));
+    }
+    match previous {
+        Some(previous) if previous != name => {
+            write_query(profile_id, previous, sql)?;
+            let from = query_path(profile_id, previous)?;
+            let to = query_path(profile_id, name)?;
+            rename_query(&from, &to).map_err(|error| {
+                format!(
+                    "Could not rename {} to {}: {error}",
+                    from.display(),
+                    to.display()
+                )
+            })
+        }
+        Some(_) => write_query(profile_id, name, sql),
+        None => write_file_with(&query_path(profile_id, name)?, sql, rename_query),
+    }
+}
+
+/// Whether two query names would name one file on a filesystem that ignores
+/// case, which macOS's and Windows's do by default.
+pub fn same_query_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 pub fn validate_query_name(name: &str) -> Result<(), String> {
@@ -1030,19 +1163,110 @@ pub fn delete_scratch(profile_id: &str, tab: u64) -> Result<(), String> {
     }
 }
 
-/// One statement on its way into a profile's history, newest at the end.
+/// How much of a failed run's error a history line keeps. The file is read
+/// whole on every connect, and a server can answer with pages of context.
+const HISTORY_ERROR_CHARS: usize = 500;
+
+/// One run of a statement, as the history keeps it.
 ///
-/// A JSON string per line rather than the SQL itself: a statement holds
-/// newlines, semicolons and comments, so there is no separator to put between
-/// two of them that is not also SQL. Appended rather than rewritten, so a run
-/// costs one write and no history can be lost to a rewrite that failed
-/// halfway -- see [`compact_history`] for the one rewrite that does happen.
-pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
+/// Everything but the statement is optional, and omitted from the line when
+/// unknown: a line from before runs were timed is a bare statement, and a run
+/// whose answer never came back (the app quit under it) has only its start.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub sql: String,
+    /// When the run was sent, in milliseconds since the epoch. With `sql`, what
+    /// names the run: its outcome is written under the same pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+    /// How long it took, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    /// How many rows it returned, for a statement that returns any columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// The server's row count, for a statement that returned no columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected: Option<u64>,
+    /// Whether the row limit kept fewer rows than it returned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+}
+
+/// A history line as either build wrote it: a bare statement before runs were
+/// timed, an entry after.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HistoryLine {
+    Bare(String),
+    Entry(HistoryEntry),
+}
+
+impl HistoryEntry {
+    /// A run about to be sent, stamped with the wall clock: it is read back
+    /// across launches, which an `Instant` cannot be.
+    pub fn started(sql: impl Into<String>) -> Self {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        Self {
+            sql: sql.into(),
+            at: Some(at),
+            ..Self::default()
+        }
+    }
+
+    /// This run, answered with `result`. Rows only for a statement with
+    /// columns: the server's count is the answer to one without, and a
+    /// `SELECT` that came back empty still returned zero rows.
+    pub fn succeeded(&self, result: &QueryResult) -> Self {
+        let returned = !result.columns.is_empty();
+        Self {
+            ms: Some(result.elapsed.as_millis() as u64),
+            rows: returned.then(|| result.total_rows() as u64),
+            affected: result.rows_affected.filter(|_| !returned),
+            capped: result.capped_from.is_some() || result.stopped == Some(Stopped::AtLimit),
+            cancelled: result.stopped == Some(Stopped::Cancelled),
+            ..self.clone()
+        }
+    }
+
+    /// This run, ended by `error`. A cancel keeps no error: it is the stop the
+    /// user asked for, not something the statement got wrong.
+    pub fn failed(&self, error: &DbError, elapsed: std::time::Duration, cancelled: bool) -> Self {
+        Self {
+            ms: Some(elapsed.as_millis() as u64),
+            error: (!cancelled).then(|| error.message.chars().take(HISTORY_ERROR_CHARS).collect()),
+            cancelled,
+            ..self.clone()
+        }
+    }
+}
+
+/// One run on its way into a profile's history, newest at the end.
+///
+/// JSON per line rather than the SQL itself: a statement holds newlines,
+/// semicolons and comments, so there is no separator to put between two of
+/// them that is not also SQL. Appended rather than rewritten, so a run costs
+/// one write and no history can be lost to a rewrite that failed halfway --
+/// see [`compact_history`] for the one rewrite that does happen.
+///
+/// A run is written twice, as it is sent and again as it lands, the second
+/// line carrying the outcome under the same `sql` and `at`. Reading keeps a
+/// statement's latest run, the later line of it, so the outcome supersedes
+/// the start without either line naming the other, and a run whose answer
+/// never came still has its start. Rewriting the start line in place instead
+/// would make every run a rewrite of the file.
+pub fn append_history(profile_id: &str, entry: &HistoryEntry) -> Result<(), String> {
     let directory = query_directory(profile_id)?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
     let path = directory.join(HISTORY_FILE);
-    let line = serde_json::to_string(sql)
+    let line = serde_json::to_string(entry)
         .map_err(|error| format!("Could not encode the statement: {error}"))?;
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -1065,9 +1289,11 @@ pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
 /// that fails halfway leaves the history it was trimming intact.
 ///
 /// The rewrite is what [`decode_history`] would have returned anyway -- newest
-/// first, each statement once -- put back oldest first so a later read walks
-/// it the same way. Failures are dropped: the history is still correct to read,
-/// it just costs the disk it already had.
+/// first, each statement once, with what is known of its last run -- put back
+/// oldest first so a later read walks it the same way. A bare line goes back
+/// as an entry holding only its statement, which reads the same. Failures are
+/// dropped: the history is still correct to read, it just costs the disk it
+/// already had.
 fn compact_history(path: &Path) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
@@ -1076,8 +1302,8 @@ fn compact_history(path: &Path) {
         return;
     }
     let mut kept = String::new();
-    for sql in decode_history(&text).iter().rev() {
-        let Ok(line) = serde_json::to_string(sql) else {
+    for entry in decode_history(&text).iter().rev() {
+        let Ok(line) = serde_json::to_string(entry) else {
             return;
         };
         kept.push_str(&line);
@@ -1086,10 +1312,10 @@ fn compact_history(path: &Path) {
     let _ = write_file(path, &kept);
 }
 
-/// What this profile has run, newest first and each statement once. A missing
-/// or unreadable file reads as no history: there is nothing here that the user
-/// wrote and cannot get back another way.
-pub fn history(profile_id: &str) -> Vec<String> {
+/// What this profile has run, newest first and each statement once, with what
+/// is known of its last run. A missing or unreadable file reads as no history:
+/// there is nothing here that the user wrote and cannot get back another way.
+pub fn history(profile_id: &str) -> Vec<HistoryEntry> {
     let Ok(directory) = query_directory(profile_id) else {
         return Vec::new();
     };
@@ -1102,13 +1328,39 @@ pub fn history(profile_id: &str) -> Vec<String> {
 /// A line that will not decode is skipped rather than ending the read: the file
 /// is appended to on every run, and the half-written last line a crash leaves
 /// behind is not a reason to lose everything before it.
-fn decode_history(text: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    text.lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<String>(line).ok())
-        .filter(|sql| seen.insert(sql.clone()))
+///
+/// Each statement is its latest run, by `at` rather than by line: two runs of
+/// one statement can land in either order, and the earlier one's outcome,
+/// written last, must not stand in for the run after it. A tie is one run, and
+/// its later line is its outcome. A line with no `at`, from before runs were
+/// timed, is older than any that has one. Statements are ordered by where that
+/// run's line is, newest first, which is the order
+/// [`crate::sql::remember_statement`] keeps them in as they are run.
+fn decode_history(text: &str) -> Vec<HistoryEntry> {
+    let mut latest: HashMap<String, (usize, HistoryEntry)> = HashMap::new();
+    let lines = text.lines().enumerate().filter_map(|(at_line, line)| {
+        let entry = match serde_json::from_str(line).ok()? {
+            HistoryLine::Bare(sql) => HistoryEntry {
+                sql,
+                ..HistoryEntry::default()
+            },
+            HistoryLine::Entry(entry) => entry,
+        };
+        Some((at_line, entry))
+    });
+    for (at_line, entry) in lines {
+        match latest.get(&entry.sql) {
+            Some((_, kept)) if kept.at > entry.at => {}
+            _ => {
+                latest.insert(entry.sql.clone(), (at_line, entry));
+            }
+        }
+    }
+    let mut kept: Vec<_> = latest.into_values().collect();
+    kept.sort_by_key(|(at_line, _)| std::cmp::Reverse(*at_line));
+    kept.into_iter()
         .take(HISTORY_DEPTH)
+        .map(|(_, entry)| entry)
         .collect()
 }
 
@@ -1160,6 +1412,7 @@ pub fn write_grid(profile_id: &str, key: &str, grid: &StoredGrid) -> Result<(), 
             data_types: grid.data_types.clone(),
             cell_types: grid.cell_types.iter().take(GRID_ROW_CAP).cloned().collect(),
             plan: grid.plan.clone(),
+            messages: grid.messages.clone(),
         };
         &capped
     } else {
@@ -1310,7 +1563,7 @@ fn variant_name() -> Result<String, String> {
 /// macOS keeps Application Support, where every install before this already
 /// has its data. Linux follows the XDG base directory spec. Windows uses the
 /// roaming profile, which follows the user the way Application Support does.
-fn dbdelve_directory() -> Result<PathBuf, String> {
+pub(crate) fn dbdelve_directory() -> Result<PathBuf, String> {
     Ok(data_root()?.join(variant_name()?))
 }
 
@@ -1410,26 +1663,106 @@ fn read_file(path: &Path) -> Result<Option<String>, String> {
 }
 
 pub(crate) fn write_file(path: &Path, contents: &str) -> Result<(), String> {
+    write_file_with(path, contents, |from, to| fs::rename(from, to))
+}
+
+fn write_file_with(
+    path: &Path,
+    contents: &str,
+    install: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, contents)
-        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
-    // Set before the rename, not after: the rename is what makes this the file
-    // at `path`, so a mode applied afterward would leave it world-readable for
-    // however long the two steps are apart.
-    let written = secure(&temporary).and_then(|()| {
-        fs::rename(&temporary, path)
-            .map_err(|error| format!("Could not replace {}: {error}", path.display()))
-    });
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+    // Each writer owns its staging file, even across application instances.
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("Could not create {}: {error}", temporary.display()))?;
+    let written = file
+        .write_all(contents.as_bytes())
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))
+        .and_then(|()| secure(&temporary))
+        .and_then(|()| {
+            drop(file);
+            install(&temporary, path)
+                .map_err(|error| format!("Could not replace {}: {error}", path.display()))
+        });
     if written.is_err() {
         // Nothing reads a leftover temporary, and every failed write would
         // otherwise leave one behind for good.
         let _ = fs::remove_file(&temporary);
     }
     written
+}
+
+/// The filesystem, not a preceding existence check, decides whether the
+/// destination is free or is the source entry under different casing.
+fn rename_query(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both paths are valid NUL-terminated strings for this call.
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both paths are NUL-terminated; omitting REPLACE_EXISTING
+        // makes the move refuse an occupied destination.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "An atomic no-overwrite query rename is unavailable on this platform.",
+        ))
+    }
 }
 
 /// Where the theme files a user drops in, and the themes imported from other
@@ -1541,7 +1874,7 @@ fn secure(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::rows;
     use crate::theme::ConnectionColor;
@@ -1675,9 +2008,9 @@ mod tests {
     const PLUGIN: &str = r#"
 [[profiles]]
 id = "ch"
-name = "ClickHouse prod"
-engine = "plugin:clickhouse"
-speaks = "clickhouse"
+name = "Oracle prod"
+engine = "plugin:oracle"
+speaks = "oracle"
 created = 2026-10-01T09:00:00Z
 statement_timeout = 30
 
@@ -1710,7 +2043,7 @@ later = "kept"
         let gone = &list.unavailable[0];
         assert_eq!(
             (gone.id.as_str(), gone.name.as_str(), gone.engine.as_str()),
-            ("ch", "ClickHouse prod", "plugin:clickhouse")
+            ("ch", "Oracle prod", "plugin:oracle")
         );
         // Table equality, so the datetime must come back a Datetime, not its string.
         let before: toml::Table = toml::from_str(PLUGIN).unwrap();
@@ -1724,10 +2057,10 @@ later = "kept"
 
 [[profiles]]
 created = 2026-10-01T09:00:00Z
-engine = "plugin:clickhouse"
+engine = "plugin:oracle"
 id = "ch"
-name = "ClickHouse prod"
-speaks = "clickhouse"
+name = "Oracle prod"
+speaks = "oracle"
 statement_timeout = 30
 
 [profiles.fields]
@@ -2031,7 +2364,7 @@ id = 0
     #[test]
     fn an_unavailable_profile_needs_an_id_and_a_name() {
         assert!(decode_profiles(&PLUGIN.replace("id = \"ch\"\n", "")).is_err());
-        assert!(decode_profiles(&PLUGIN.replace("name = \"ClickHouse prod\"\n", "")).is_err());
+        assert!(decode_profiles(&PLUGIN.replace("name = \"Oracle prod\"\n", "")).is_err());
     }
 
     #[test]
@@ -2075,10 +2408,10 @@ id = 0
     #[test]
     fn a_file_the_mixed_reader_cannot_hold_reads_as_it_does_today() {
         // A toml::Table cannot hold a u64 above i64::MAX, so the mixed pass fails
-        // and the file falls back to today's decode: clickhouse is a profile again
+        // and the file falls back to today's decode: an unknown engine is a profile again
         // (restore reads it as Postgres with its notice, as today).
         let text = stub("a", "postgres")
-            + &stub("c", "clickhouse")
+            + &stub("c", "zz-unknown")
             + "next_query_id = 18446744073709551615\n";
         assert_eq!(decode_profiles(&text), decoded_as_before(&text));
         assert!(decode_profiles(&text).unwrap().unavailable.is_empty());
@@ -2123,14 +2456,20 @@ id = 0
 
     /// `HOME` is process-wide and the tests run in threads, so the ones that
     /// touch the disk take turns and each gets its own directory to be the
-    /// whole of dbdelve's storage for the length of the test. Windows reads
+    /// whole of dbdelve's storage for the length of the test. The directory
+    /// names the process too: nextest runs every test in a process of its own,
+    /// where the counter always starts at one. Windows reads
     /// `APPDATA` instead, so that is pointed at the same temporary root.
-    fn with_home<T>(body: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_home<T>(body: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 
         let mut counter = LOCK.lock().unwrap_or_else(|error| error.into_inner());
         *counter += 1;
-        let home = std::env::temp_dir().join(format!("dbdelve-store-test-{}", *counter));
+        let home = std::env::temp_dir().join(format!(
+            "dbdelve-store-test-{}-{}",
+            std::process::id(),
+            *counter
+        ));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).expect("the test home must be creatable");
 
@@ -2282,6 +2621,7 @@ user = "shayan"
                 options: None,
                 login_database: None,
                 schema: None,
+                service: None,
                 editor_font_size: None,
                 statement_timeout: Some(30),
                 next_query_id: Some(1),
@@ -2292,6 +2632,8 @@ user = "shayan"
                 ssh: None,
                 open_queries: Vec::new(),
                 open_objects: Vec::new(),
+                folders: Vec::new(),
+                pins: Vec::new(),
             };
 
             save_profiles(&ProfileList {
@@ -2332,6 +2674,7 @@ user = "shayan"
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: Some(16.0),
             statement_timeout: Some(30),
             next_query_id: Some(7),
@@ -2369,6 +2712,8 @@ user = "shayan"
                     bars: Vec::new(),
                 },
             ],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -2460,6 +2805,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: None,
             next_query_id: Some(0),
@@ -2470,7 +2816,159 @@ open_objects = []
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
+            folders: Vec::new(),
+            pins: Vec::new(),
         }
+    }
+
+    fn written_alone(profile: StoredProfile) -> String {
+        encode_profiles(&ProfileList {
+            profiles: vec![profile],
+            active: None,
+            fonts: None,
+            settings: None,
+            projects: Vec::new(),
+            unavailable: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_profile_without_folders_or_pins_is_written_as_it_always_was() {
+        let text = written_alone(a_stored_profile());
+        assert!(
+            !text.contains("folders") && !text.contains("pins"),
+            "{text}"
+        );
+        // And a file from before they existed reads back and writes the same.
+        assert_eq!(
+            written_alone(decode_profiles(&text).unwrap().profiles.remove(0)),
+            text
+        );
+    }
+
+    #[test]
+    fn folders_and_pins_survive_the_round_trip_after_the_open_objects() {
+        let object = |schema: &str, name: &str, kind: &str| StoredShortcut {
+            database: Some("dbdelve_dev".into()),
+            schema: Some(schema.into()),
+            name: Some(name.into()),
+            kind: Some(kind.into()),
+            ..StoredShortcut::default()
+        };
+        let query = StoredShortcut {
+            query: Some("daily".into()),
+            ..StoredShortcut::default()
+        };
+        let profile = StoredProfile {
+            open_objects: vec![StoredObject {
+                schema: "public".into(),
+                name: "accounts".into(),
+                routine: false,
+                structure: false,
+                kind: RelationKind::Table,
+                filter: String::new(),
+                filters: Vec::new(),
+                active: true,
+                filter_engine: None,
+                origin: None,
+                bars: Vec::new(),
+            }],
+            folders: vec![
+                StoredFolder {
+                    name: "a/b".into(),
+                    members: vec![
+                        object("public", "accounts", "table"),
+                        object("public", "total(integer)", "function"),
+                        query.clone(),
+                    ],
+                },
+                StoredFolder {
+                    name: "Empty".into(),
+                    members: Vec::new(),
+                },
+            ],
+            pins: vec![
+                StoredShortcut {
+                    folder: Some("a/b".into()),
+                    ..StoredShortcut::default()
+                },
+                query,
+            ],
+            ..a_stored_profile()
+        };
+        let text = written_alone(profile.clone());
+        assert!(
+            text.find("[[profiles.open_objects]]") < text.find("[[profiles.folders]]"),
+            "{text}"
+        );
+        assert_eq!(decode_profiles(&text).unwrap().profiles, [profile]);
+    }
+
+    #[test]
+    fn a_folder_or_pin_this_build_cannot_read_costs_that_entry_alone() {
+        let text = r#"
+[[profiles]]
+id = "local"
+name = "local"
+host = "localhost"
+database = "postgres"
+user = "shayan"
+
+[[profiles.folders]]
+members = []
+
+[[profiles.folders]]
+name = "Hot"
+
+[[profiles.folders.members]]
+query = 123
+
+[[profiles.folders.members]]
+query = "daily"
+
+[[profiles.pins]]
+query = 123
+
+[[profiles.pins]]
+folder = "Hot"
+"#;
+        let profile = decode_profiles(text).unwrap().profiles.remove(0);
+        let daily = StoredShortcut {
+            query: Some("daily".into()),
+            ..StoredShortcut::default()
+        };
+        assert_eq!(
+            profile.folders,
+            [StoredFolder {
+                name: "Hot".into(),
+                members: vec![daily],
+            }]
+        );
+        assert_eq!(
+            profile.pins,
+            [StoredShortcut {
+                folder: Some("Hot".into()),
+                ..StoredShortcut::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unavailable_profiles_folders_and_pins_go_back_as_they_came() {
+        let text = format!(
+            "{}\n[[profiles.folders]]\nname = \"Hot\"\n\n[[profiles.folders.members]]\n\
+             schema = \"default\"\nname = \"events\"\nkind = \"sequence\"\n\n\
+             [[profiles.pins]]\nfolder = \"Hot\"\n",
+            PLUGIN.trim_end()
+        );
+        let list = decode_profiles(&text).unwrap();
+        assert_eq!(list.unavailable.len(), 1);
+        let written = encode_profiles(&list).unwrap();
+        for line in ["name = \"Hot\"", "kind = \"sequence\"", "folder = \"Hot\""] {
+            assert!(written.contains(line), "{line} in:\n{written}");
+        }
+        assert_eq!(decode_profiles(&written).unwrap(), list);
     }
 
     #[test]
@@ -2548,6 +3046,28 @@ open_objects = []
     }
 
     #[test]
+    fn a_service_survives_the_round_trip_through_toml_with_no_host() {
+        let profile = StoredProfile {
+            host: String::new(),
+            user: String::new(),
+            service: Some("harness".into()),
+            ..a_stored_profile()
+        };
+        let file = ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            projects: Vec::new(),
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
     fn no_tunnel_is_not_written_as_an_empty_section() {
         let file = ProfileFile {
             fonts: None,
@@ -2585,6 +3105,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: None,
             next_query_id: Some(0),
@@ -2607,6 +3128,8 @@ open_objects = []
                 active: true,
                 bars: Vec::new(),
             }],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -2659,6 +3182,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: Some(14.0),
             statement_timeout: None,
             next_query_id: Some(7),
@@ -2681,6 +3205,8 @@ open_objects = []
                 active: true,
                 bars: Vec::new(),
             }],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let file = ProfileFile {
             active: None,
@@ -2719,6 +3245,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: Some(60),
             next_query_id: Some(1),
@@ -2729,6 +3256,8 @@ open_objects = []
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let file = ProfileFile {
             active: None,
@@ -2826,6 +3355,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: Some(30),
             next_query_id: Some(7),
@@ -2848,6 +3378,8 @@ open_objects = []
                 active: true,
                 bars: Vec::new(),
             }],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             active: None,
@@ -2909,6 +3441,7 @@ open_objects = []
                 check_for_updates: Some(false),
                 color_titlebar: Some(false),
                 client_sort: Some(true),
+                qualify_completions: Some(true),
                 welcomed: Some(true),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
@@ -2946,6 +3479,7 @@ open_objects = []
                     options: None,
                     login_database: None,
                     schema: None,
+                    service: None,
                     editor_font_size: None,
                     statement_timeout: Some(30),
                     next_query_id: Some(2),
@@ -2956,6 +3490,8 @@ open_objects = []
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
+                    folders: Vec::new(),
+                    pins: Vec::new(),
                 },
                 StoredProfile {
                     id: "local".into(),
@@ -2976,6 +3512,7 @@ open_objects = []
                     options: None,
                     login_database: None,
                     schema: None,
+                    service: None,
                     editor_font_size: None,
                     statement_timeout: None,
                     next_query_id: None,
@@ -2986,6 +3523,8 @@ open_objects = []
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
+                    folders: Vec::new(),
+                    pins: Vec::new(),
                 },
             ],
         };
@@ -3099,16 +3638,110 @@ open_objects = []
         );
 
         assert_eq!(
-            decode_history(&text),
+            statements(&decode_history(&text)),
             ["SELECT 1", "SELECT\n  *\nFROM accounts; -- all"]
         );
+    }
+
+    fn statements(entries: &[HistoryEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.sql.as_str()).collect()
+    }
+
+    fn ran(sql: &str, at: u64) -> HistoryEntry {
+        HistoryEntry {
+            sql: sql.into(),
+            at: Some(at),
+            ..HistoryEntry::default()
+        }
+    }
+
+    #[test]
+    fn a_history_written_before_runs_were_timed_reads_beside_one_written_after() {
+        let finished = HistoryEntry {
+            ms: Some(18),
+            rows: Some(42),
+            ..ran("SELECT 2", 1_000)
+        };
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::to_string("SELECT 1").unwrap(),
+            serde_json::to_string(&finished).unwrap(),
+        );
+
+        let entries = decode_history(&text);
+        assert_eq!(entries[0], finished);
+        assert_eq!(
+            entries[1],
+            HistoryEntry {
+                sql: "SELECT 1".into(),
+                ..HistoryEntry::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_runs_outcome_supersedes_its_start_and_an_unanswered_run_keeps_its_start() {
+        let failed = HistoryEntry {
+            ms: Some(5),
+            error: Some("no such table: t".into()),
+            ..ran("SELECT * FROM t", 2_000)
+        };
+        let text = [
+            ran("SELECT * FROM t", 2_000),
+            ran("SELECT 1", 3_000),
+            failed.clone(),
+        ]
+        .iter()
+        .map(|entry| serde_json::to_string(entry).unwrap() + "\n")
+        .collect::<String>();
+
+        assert_eq!(decode_history(&text), [failed, ran("SELECT 1", 3_000)]);
+    }
+
+    #[test]
+    fn an_earlier_run_that_lands_last_never_stands_in_for_the_later_one() {
+        let done = |at| HistoryEntry {
+            ms: Some(at),
+            ..ran("SELECT 1", at)
+        };
+        let text = [
+            ran("SELECT 1", 1_000),
+            ran("SELECT 1", 2_000),
+            done(2_000),
+            ran("SELECT 2", 3_000),
+            done(1_000),
+            HistoryEntry {
+                sql: "SELECT 1".into(),
+                ..HistoryEntry::default()
+            },
+        ]
+        .iter()
+        .map(|entry| serde_json::to_string(entry).unwrap() + "\n")
+        .collect::<String>();
+
+        assert_eq!(decode_history(&text), [ran("SELECT 2", 3_000), done(2_000)]);
+    }
+
+    #[test]
+    fn a_cancelled_run_keeps_no_error_and_a_long_one_is_cut() {
+        let error = DbError {
+            message: "x".repeat(HISTORY_ERROR_CHARS * 2),
+            position: None,
+        };
+        let start = ran("SELECT 1", 0);
+        let failed = start.failed(&error, std::time::Duration::from_millis(7), false);
+        assert_eq!(failed.error.unwrap().len(), HISTORY_ERROR_CHARS);
+        assert_eq!(failed.ms, Some(7));
+
+        let cancelled = start.failed(&error, std::time::Duration::ZERO, true);
+        assert!(cancelled.cancelled && cancelled.error.is_none());
     }
 
     #[test]
     fn a_half_written_line_does_not_take_the_history_with_it() {
         let text = format!("{}\n\"SELECT 2", serde_json::to_string("SELECT 1").unwrap());
 
-        assert_eq!(decode_history(&text), ["SELECT 1"]);
+        assert_eq!(statements(&decode_history(&text)), ["SELECT 1"]);
     }
 
     #[test]
@@ -3117,8 +3750,13 @@ open_objects = []
             // One past the slack, so the last append is the one that has to
             // trip the compaction.
             let runs = HISTORY_SLACK + 1;
+            // Every run timed, so the rewrite has something to keep.
             for n in 0..runs {
-                append_history("dev", &format!("SELECT {n}")).unwrap();
+                let entry = HistoryEntry {
+                    ms: Some(n as u64),
+                    ..ran(&format!("SELECT {n}"), n as u64)
+                };
+                append_history("dev", &entry).unwrap();
             }
 
             let path = query_directory("dev").unwrap().join(HISTORY_FILE);
@@ -3129,9 +3767,16 @@ open_objects = []
             // newest HISTORY_DEPTH runs and not some older window of them.
             let read_back = history("dev");
             assert_eq!(read_back.len(), HISTORY_DEPTH);
-            assert_eq!(read_back[0], format!("SELECT {}", runs - 1));
+            let newest = (runs - 1) as u64;
             assert_eq!(
-                read_back[HISTORY_DEPTH - 1],
+                read_back[0],
+                HistoryEntry {
+                    ms: Some(newest),
+                    ..ran(&format!("SELECT {newest}"), newest)
+                }
+            );
+            assert_eq!(
+                read_back[HISTORY_DEPTH - 1].sql,
                 format!("SELECT {}", runs - HISTORY_DEPTH)
             );
 
@@ -3246,6 +3891,165 @@ open_objects = []
     }
 
     #[test]
+    fn the_saved_queries_are_every_query_file_and_no_scratch_buffer() {
+        // The sidebar lists this whether or not a tab is open, so a scratch
+        // file beside the queries must never read as one of them.
+        with_home(|| {
+            write_query("dev", "signups", "SELECT 2").expect("a query must write");
+            write_query("dev", "daily", "SELECT 1").expect("a query must write");
+            write_scratch("dev", 3, "SELECT 3").expect("tab 3 must write");
+
+            assert_eq!(saved_queries("dev"), ["daily", "signups"]);
+
+            delete_query("dev", "daily").expect("a query must delete");
+            assert_eq!(saved_queries("dev"), ["signups"]);
+            assert_eq!(read_scratch("dev", 3), Ok(Some("SELECT 3".to_string())));
+        });
+    }
+
+    /// Make `name`'s file unwritable and undeletable as a file, by putting
+    /// a directory where it would go.
+    fn block(profile_id: &str, file: &str) {
+        let path = query_directory(profile_id)
+            .expect("the id must be safe")
+            .join(file);
+        fs::create_dir_all(path.join("held")).expect("the blocker must be creatable");
+    }
+
+    #[test]
+    fn deleting_a_query_already_removed_outside_the_app_succeeds() {
+        with_home(|| {
+            write_query("dev", "daily", "SELECT 1").expect("a query must write");
+            fs::remove_file(query_path("dev", "daily").unwrap()).unwrap();
+            assert_eq!(delete_query("dev", "daily"), Ok(()));
+            assert_eq!(saved_queries("dev"), Vec::<String>::new());
+        });
+    }
+
+    #[test]
+    fn deleting_an_undeletable_query_reports_the_failure() {
+        with_home(|| {
+            block("dev", "daily.sql");
+            assert!(delete_query("dev", "daily").is_err());
+            assert_eq!(saved_queries("dev"), ["daily"]);
+        });
+    }
+
+    #[test]
+    fn a_rename_moves_the_file_and_a_failed_one_changes_nothing() {
+        with_home(|| {
+            write_query("dev", "daily", "SELECT 1").expect("a query must write");
+            assert_eq!(
+                save_query_as("dev", Some("daily"), "nightly", "SELECT 1 -- edited"),
+                Ok(())
+            );
+            assert_eq!(saved_queries("dev"), ["nightly"]);
+            assert_eq!(
+                read_query("dev", "nightly"),
+                Ok(Some("SELECT 1 -- edited".to_string()))
+            );
+
+            // An old name that will not take the text stops the rename.
+            block("dev", "held.sql");
+            assert!(save_query_as("dev", Some("held"), "kept", "SELECT 2").is_err());
+            assert_eq!(read_query("dev", "kept"), Ok(None));
+        });
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_case_keeps_the_text() {
+        // On a case-insensitive filesystem the two names are one file: a
+        // write under the new name and a delete of the old one deletes both.
+        with_home(|| {
+            write_query("dev", "daily", "SELECT 1").expect("a query must write");
+
+            assert_eq!(
+                save_query_as("dev", Some("daily"), "Daily", "SELECT 1"),
+                Ok(())
+            );
+
+            assert_eq!(saved_queries("dev"), ["Daily"]);
+            assert_eq!(read_query("dev", "Daily"), Ok(Some("SELECT 1".to_string())));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_or_renaming_never_overwrites_a_query_hidden_by_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            write_query("dev", "daily", "SELECT 1").unwrap();
+            write_query("dev", "other", "SELECT 2").unwrap();
+            let directory = query_directory("dev").unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+            let hidden = fs::read_dir(&directory).is_err();
+            let saved = save_query_as("dev", None, "daily", "SELECT 9");
+            let renamed = save_query_as("dev", Some("other"), "daily", "SELECT 3");
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+            assert!(saved.is_err());
+            assert!(renamed.is_err());
+            assert_eq!(read_query("dev", "daily"), Ok(Some("SELECT 1".into())));
+            if hidden {
+                assert_eq!(read_query("dev", "other"), Ok(Some("SELECT 3".into())));
+            }
+        });
+    }
+
+    #[test]
+    fn racing_new_query_writes_install_only_one_complete_buffer() {
+        with_home(|| {
+            let path = query_path("dev", "daily").unwrap();
+            let ready = std::sync::Barrier::new(2);
+            let results = std::thread::scope(|scope| {
+                let writers: Vec<_> = ["SELECT 1", "SELECT 2"]
+                    .into_iter()
+                    .map(|sql| {
+                        let path = &path;
+                        let ready = &ready;
+                        scope.spawn(move || {
+                            let result = write_file_with(path, sql, |from, to| {
+                                ready.wait();
+                                rename_query(from, to)
+                            });
+                            (sql, result)
+                        })
+                    })
+                    .collect();
+                writers
+                    .into_iter()
+                    .map(|writer| writer.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let winners: Vec<_> = results
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .collect();
+            assert_eq!(winners.len(), 1);
+            assert_eq!(fs::read_to_string(&path).unwrap(), winners[0].0);
+            assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_name_another_query_has_in_another_case_is_refused() {
+        with_home(|| {
+            write_query("dev", "daily", "SELECT 1").expect("a query must write");
+            write_query("dev", "weekly", "SELECT 7").expect("a query must write");
+
+            assert!(save_query_as("dev", Some("daily"), "WEEKLY", "SELECT 1").is_err());
+            assert!(save_query_as("dev", None, "Weekly", "SELECT 9").is_err());
+
+            assert_eq!(
+                read_query("dev", "weekly"),
+                Ok(Some("SELECT 7".to_string()))
+            );
+            assert_eq!(read_query("dev", "daily"), Ok(Some("SELECT 1".to_string())));
+        });
+    }
+
+    #[test]
     fn deleting_one_tabs_scratch_leaves_the_others() {
         with_home(|| {
             write_scratch("dev", 0, "SELECT 0").expect("tab 0 must write");
@@ -3338,6 +4142,7 @@ open_objects = []
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: Some(15.0),
             statement_timeout: Some(30),
             next_query_id: Some(7),
@@ -3373,6 +4178,8 @@ open_objects = []
                 active: true,
                 bars: Vec::new(),
             }],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             active: Some("dev".into()),
@@ -3422,6 +4229,7 @@ open_objects = []
                 data_types: Vec::new(),
                 cell_types: Vec::new(),
                 plan: None,
+                messages: Vec::new(),
             };
             let live_query = query_grid_key(0);
             let live_object = object_grid_key("public", "accounts", "");
@@ -3475,10 +4283,12 @@ open_objects = []
                     table: "accounts".into(),
                     columns: vec![Some("id".into()), None],
                     keys: vec![0],
+                    ..Default::default()
                 }),
                 data_types: vec![Some("int4".into()), None],
                 cell_types: Vec::new(),
                 plan: None,
+                messages: Vec::new(),
             };
             let key = query_grid_key(9);
             write_grid("dev", &key, &small).expect("a small grid must write");
@@ -3515,6 +4325,7 @@ open_objects = []
                 data_types: Vec::new(),
                 cell_types: Vec::new(),
                 plan: None,
+                messages: Vec::new(),
             };
             let big_key = query_grid_key(10);
             write_grid("dev", &big_key, &oversized).expect("an oversized grid must write");
@@ -3568,6 +4379,7 @@ open_objects = []
                 data_types: Vec::new(),
                 cell_types: Vec::new(),
                 plan: None,
+                messages: Vec::new(),
             };
             let key = object_grid_key("public", "accounts", "");
             write_grid("dev", &key, &filtered).expect("a filtered grid must write");
@@ -3692,6 +4504,7 @@ name = \"accounts\"
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: None,
             next_query_id: Some(0),
@@ -3735,6 +4548,8 @@ name = \"accounts\"
                     }],
                 },
             ],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -3802,6 +4617,7 @@ name = \"accounts\"
             options: None,
             login_database: None,
             schema: None,
+            service: None,
             editor_font_size: None,
             statement_timeout: None,
             next_query_id: Some(0),
@@ -3812,6 +4628,8 @@ name = \"accounts\"
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![object],
+            folders: Vec::new(),
+            pins: Vec::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             fonts: None,

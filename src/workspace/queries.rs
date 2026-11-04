@@ -11,7 +11,10 @@ use crate::db::{Feed, Fetch, QueryResult, Row, Stopped};
 use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
-use crate::session::{Finished, Lane, PendingRun, Queue, Resume, Step, TabKey, next_step};
+use crate::session::{
+    Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume, Step,
+    TabKey, next_step, query_name_refusal,
+};
 
 impl Workspace {
     /// Edits sitting in the visible grid, waiting to be written back. Read off
@@ -276,6 +279,11 @@ impl Workspace {
         .detach();
         self.custom_limit = Some((target, input));
         self.custom_limit_needs_focus = true;
+        // A tab asking for the keyboard back, as closing the palette does,
+        // would take it after the field and blur it shut.
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = false;
+        }
         cx.notify();
     }
 
@@ -327,6 +335,16 @@ impl Workspace {
         let Some(editor) = profile.session.editor(tab) else {
             return;
         };
+        // Here and not where each statement goes out, which a queue does once
+        // per statement: someone reading its messages stays on them while the
+        // rest arrive.
+        if let Tab::Query(id) = tab
+            && let Some(query) = self
+                .profile_mut()
+                .and_then(|profile| profile.session.query_tab_mut(id))
+        {
+            query.showing_messages = false;
+        }
 
         // A selection holding more than one statement runs each of them in
         // turn, keeping every result. Anything else -- one selected statement,
@@ -902,26 +920,33 @@ impl Workspace {
         let Tab::Query(id) = tab else {
             return;
         };
-        let Some(queue) = self
+        let Some(query) = self
             .profile_mut()
             .and_then(|profile| profile.session.query_tab_mut(id))
-            .and_then(|query| query.queue.as_mut())
         else {
             return;
         };
-        // The in-flight slot is only a chip while something is in it, and a
-        // statement not yet sent has nothing to show.
-        let last = queue.done.len();
-        if index > last
-            || (index == last && !queue.awaiting)
-            || queue
-                .done
-                .get(index)
-                .is_some_and(|finished| matches!(finished.state, QueryState::Idle))
-        {
-            return;
-        }
-        let switched = std::mem::replace(&mut queue.showing, index) != index;
+        let switched = match &mut query.queue {
+            Some(queue) => {
+                // The in-flight slot is only a chip while something is in it,
+                // and a statement not yet sent has nothing to show.
+                let last = queue.done.len();
+                if index > last
+                    || (index == last && !queue.awaiting)
+                    || queue
+                        .done
+                        .get(index)
+                        .is_some_and(|finished| matches!(finished.state, QueryState::Idle))
+                {
+                    return;
+                }
+                std::mem::replace(&mut queue.showing, index) != index
+            }
+            // With no queue the switcher is there for the Messages chip, and
+            // the slot is the one result beside it.
+            None => false,
+        };
+        query.showing_messages = false;
         // The form was built from the rows it was opened over, which can be
         // another table's, and a review's batch is refreshed by whichever
         // result is on screen when it runs.
@@ -930,6 +955,109 @@ impl Workspace {
             profile.session.drop_apply_review_of(tab);
         }
         cx.notify();
+    }
+
+    /// Show the run's server messages in place of the result the switcher
+    /// had selected, which stays selected to come back to.
+    pub(crate) fn show_messages(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let Tab::Query(id) = tab else {
+            return;
+        };
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Some(query) = profile.session.query_tab_mut(id) else {
+            return;
+        };
+        if query.messages().is_empty() || std::mem::replace(&mut query.showing_messages, true) {
+            return;
+        }
+        // The grid and any form beside it unmount, and whichever of them held
+        // focus would take the window's only dispatch path with it.
+        profile.session.editor_needs_focus = true;
+        cx.notify();
+    }
+
+    pub(crate) fn next_result(
+        &mut self,
+        _: &NextResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_result(1, window, cx);
+    }
+
+    pub(crate) fn previous_result(
+        &mut self,
+        _: &PreviousResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_result(-1, window, cx);
+    }
+
+    /// The switcher's chips from the keyboard, Messages among them, through
+    /// the doors a click on each goes through.
+    fn step_result(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+        else {
+            return;
+        };
+        let id = Tab::Query(tab.id);
+        let in_grid = tab.shown().1.focus_handle(cx).contains_focused(window, cx);
+        match crate::session::stepped(&tab.switcher_chips(), tab.switcher_selected(), step) {
+            Some(Some(index)) => self.show_queued_result(id, index, cx),
+            Some(None) => self.show_messages(id, cx),
+            None => return,
+        }
+        // A chord pressed in the grid it just swapped out would leave the
+        // keyboard on a grid no longer on screen, with no dispatch path.
+        if in_grid && let Some(crate::session::Focus::Grid(grid)) = self.front_grid(cx) {
+            grid.update(cx, |table, cx| {
+                crate::result_grid::take_keyboard(table, window, cx)
+            });
+            if let Some(profile) = self.profile_mut() {
+                profile.session.editor_needs_focus = false;
+            }
+            cx.notify();
+            return;
+        }
+        self.refocus_front();
+    }
+
+    /// The Messages chip, and back off it to the result it stood in for.
+    pub(crate) fn toggle_messages(
+        &mut self,
+        _: &ShowMessages,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+        else {
+            return;
+        };
+        let id = Tab::Query(tab.id);
+        match tab.switcher_selected() {
+            Some(_) => self.show_messages(id, cx),
+            None => {
+                let showing = tab.queue.as_ref().map_or(0, |queue| queue.showing);
+                self.show_queued_result(id, showing, cx);
+            }
+        }
+        self.refocus_front();
+    }
+
+    pub(crate) fn copy_plan_action(
+        &mut self,
+        _: &CopyPlan,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_plan(cx);
     }
 
     /// Abandon the rest of a queue stopped by a failed statement, leaving
@@ -1108,6 +1236,21 @@ impl Workspace {
             return;
         }
         tab.showing_plan = showing;
+        // Either half is asked for by name, so neither leaves Messages over it.
+        let switched = match showing {
+            true => tab.show_slot(),
+            false => {
+                tab.showing_messages = false;
+                false
+            }
+        };
+        if switched {
+            profile
+                .session
+                .insert_form
+                .take_if(|form| form.tab == Tab::Query(id));
+            profile.session.drop_apply_review_of(Tab::Query(id));
+        }
         cx.notify();
     }
 
@@ -1148,9 +1291,7 @@ impl Workspace {
         {
             return;
         }
-        // A named query is written on every swap and on quit, so calling this
-        // on one is a confirmation rather than a decision. Only a buffer with
-        // nowhere to go has to ask for a name.
+        // Only a buffer with nowhere to go has to ask for a name.
         if self.named() {
             match self.persist_buffer(cx) {
                 Ok(()) => self.note("Saved query.".into(), cx),
@@ -1211,10 +1352,6 @@ impl Workspace {
             .value()
             .trim()
             .to_string();
-        if let Err(message) = store::validate_query_name(&name) {
-            self.note(message, cx);
-            return;
-        }
         let id = profile.id.clone();
         let tab = profile.session.active;
         let Some(editor) = profile.session.editor(tab) else {
@@ -1230,40 +1367,43 @@ impl Workspace {
                 .and_then(|tab| tab.open_query.clone()),
             Tab::Object(_) => None,
         };
-        if previous.as_deref() != Some(name.as_str())
-            && profile.session.saved_queries.contains(&name)
+        if let Some(message) =
+            query_name_refusal(&name, previous.as_deref(), &profile.session.saved_queries)
         {
-            self.note(format!("A query named {name} already exists."), cx);
+            self.note(message, cx);
             return;
         }
 
         let sql = editor.read(cx).value().to_string();
-        if let Err(message) = store::write_query(&id, &name, &sql) {
+        if let Err(message) = store::save_query_as(&id, previous.as_deref(), &name, &sql) {
             self.note(message, cx);
             return;
         }
+        let scratch_error = match tab {
+            Tab::Query(tab) => store::delete_scratch(&id, tab).err(),
+            Tab::Object(_) => None,
+        };
         let chip = match (tab, &previous) {
             (Tab::Query(_), Some(previous)) => Some(TabKey::Saved(previous.clone())),
             (Tab::Query(id), None) => Some(TabKey::Unsaved(id)),
             (Tab::Object(_), _) => None,
         };
-        // Written first, then the old name dropped: a failed delete leaves two
-        // copies, which is recoverable, and the other order loses the query.
-        if let Some(previous) = previous.filter(|previous| previous != &name)
-            && let Err(message) = store::delete_query(&id, &previous)
-        {
-            self.note(message, cx);
-        }
 
         if let Some(profile) = self.profile_mut() {
-            // Before the list it reads moves: the chip's old key is only in the
-            // strip until then.
+            // Before the tab takes its new name: the chip's old key is only in
+            // the strip until then.
             if let Some(from) = chip {
                 profile.session.rekey(&from, TabKey::Saved(name.clone()));
             }
-            profile.session.saved_queries = store::saved_queries(&id);
             profile.session.naming = false;
+            if let Some(previous) = &previous {
+                profile.shortcuts.rename_query(previous, &name);
+            }
         }
+        if previous.is_some() {
+            self.remember_profiles(cx);
+        }
+        self.reload_saved_queries(cx);
         // Naming a relation's buffer is how it stops being a relation's buffer:
         // it leaves the object world entirely and becomes a saved query, which
         // is the only place a name means anything.
@@ -1281,9 +1421,10 @@ impl Workspace {
                 }
             }
         }
-        if let Some(profile) = self.profile_mut() {
-            profile.session.notice = Some(format!("Saved {name}."));
-        }
+        self.note(
+            scratch_error.unwrap_or_else(|| format!("Saved {name}.")),
+            cx,
+        );
         self.remember_profiles(cx);
         cx.notify();
     }
@@ -1334,16 +1475,37 @@ impl Workspace {
         self.activate_tab(Tab::Query(id), window, cx);
     }
 
-    /// Close an unsaved buffer. Its scratch file goes with it: an unnamed
-    /// buffer is its text, and closing one is discarding both.
+    /// Close a query tab. An unsaved buffer's scratch file goes with it: an
+    /// unnamed buffer is its text, and closing one is discarding both. A saved
+    /// query's text is written to its file first and the file stays, so the
+    /// query is still in the sidebar; a write that fails keeps the tab open.
     pub(crate) fn close_buffer(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(tab) = profile.session.query_tab(id) else {
+            return;
+        };
+        if let Some(name) = &tab.open_query {
+            let sql = tab.editor.read(cx).value().to_string();
+            if let Err(message) = store::write_query(&profile.id, name, &sql) {
+                self.note(message, cx);
+                return;
+            }
+        }
+        self.remove_query_tab(id, window, cx);
+    }
+
+    /// Take a query tab out of the strip, its text written or not: closing
+    /// writes it first, deleting its query does not.
+    fn remove_query_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        let position = profile.session.queries.iter().position(|tab| tab.id == id);
-        let Some(position) = position else {
+        let Some(position) = profile.session.queries.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let saved = profile.session.queries[position].open_query.is_some();
         self.stop_run(Tab::Query(id), cx);
         let Some(profile) = self.profile_mut() else {
             return;
@@ -1357,7 +1519,7 @@ impl Workspace {
             self.front_after_close(fallback, window, cx);
         }
 
-        if let Err(message) = store::delete_scratch(&profile_id, id) {
+        if !saved && let Err(message) = store::delete_scratch(&profile_id, id) {
             self.note(message, cx);
         }
         // The tab is gone, so its snapshot has nothing left to come back to --
@@ -1396,9 +1558,8 @@ impl Workspace {
         match store::read_query(&profile_id, &name) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                profile.session.saved_queries = store::saved_queries(&profile_id);
                 profile.session.notice = Some(format!("{name} no longer exists."));
-                cx.notify();
+                self.reload_saved_queries(cx);
                 return;
             }
             Err(message) => {
@@ -1416,7 +1577,7 @@ impl Workspace {
             &profile_id,
             &store::StoredQueryTab {
                 id,
-                name: Some(name),
+                name: Some(name.clone()),
                 active: true,
                 queued_results: 0,
             },
@@ -1431,6 +1592,7 @@ impl Workspace {
         };
         profile.session.queries.push(tab);
         profile.session.notice = notice;
+        profile.session.place_last(TabKey::Saved(name));
         self.install_completions(&profile_id, cx);
         self.activate_tab(Tab::Query(id), window, cx);
     }
@@ -1528,10 +1690,182 @@ impl Workspace {
         }
     }
 
-    /// The chip's own delete: the first click arms it and the second one means
-    /// it. Quieter than the dialog `cmd+w` raises, because the trash icon is
-    /// already an unambiguous ask and the tab it belongs to is right there.
-    pub(crate) fn arm_delete_saved_query(
+    /// Turn a saved query's sidebar row into a field holding its name, all
+    /// of it selected. `enter` renames, and `escape` or a click elsewhere
+    /// leaves it as it was.
+    pub(crate) fn start_query_rename(
+        &mut self,
+        name: String,
+        row: gpui::SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_rename(name, false, row, window, cx);
+    }
+
+    /// The field over a saved query's row or a folder's.
+    pub(crate) fn start_rename(
+        &mut self,
+        name: String,
+        folder: bool,
+        row: gpui::SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = if folder { "Folder name" } else { "Query name" };
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder(placeholder);
+            input.set_value(name.clone(), window, cx);
+            input
+        });
+        cx.subscribe_in(
+            &input,
+            window,
+            |workspace, input, event: &InputEvent, _, cx| {
+                let Some(rename) = workspace
+                    .profile_mut()
+                    .and_then(|profile| profile.session.query_rename.as_mut())
+                    .filter(|rename| rename.input == *input)
+                else {
+                    return;
+                };
+                match event {
+                    InputEvent::PressEnter { .. } => workspace.commit_query_rename(cx),
+                    InputEvent::Change => {
+                        if rename.error.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::Blur => {
+                        workspace.drop_query_rename();
+                        cx.notify();
+                    }
+                    InputEvent::Focus => {}
+                }
+            },
+        )
+        .detach();
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        profile.session.query_rename = Some(QueryRename {
+            name,
+            folder,
+            row,
+            input,
+            error: None,
+        });
+        profile.session.query_rename_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Rename the query the sidebar's field is over to what it holds, through
+    /// the same checks and store call as the tab's own rename, so a tab
+    /// holding it follows the new name.
+    pub(crate) fn commit_query_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(rename) = profile.session.query_rename.as_ref() else {
+            return;
+        };
+        let (previous, typed) = (
+            rename.name.clone(),
+            rename.input.read(cx).value().trim().to_string(),
+        );
+        if typed == previous {
+            self.end_query_rename(cx);
+            return;
+        }
+        if rename.folder {
+            self.commit_folder_rename(previous, typed, cx);
+            return;
+        }
+        let id = profile.id.clone();
+        let holder = profile.session.tab_holding(&previous);
+        let refused = query_name_refusal(&typed, Some(&previous), &profile.session.saved_queries);
+        // An open tab's text is the query's, written or not: renaming it is
+        // what the tab's own rename would write.
+        let sql = match refused {
+            Some(message) => Err(message),
+            None => match holder.and_then(|tab| profile.session.query_tab(tab)) {
+                Some(tab) => Ok(tab.editor.read(cx).value().to_string()),
+                None => store::read_query(&id, &previous)
+                    .and_then(|sql| sql.ok_or_else(|| format!("{previous} no longer exists."))),
+            },
+        };
+        let written = sql.and_then(|sql| store::save_query_as(&id, Some(&previous), &typed, &sql));
+        match written {
+            Ok(()) => {}
+            Err(message) => {
+                if let Some(rename) = self
+                    .profile_mut()
+                    .and_then(|profile| profile.session.query_rename.as_mut())
+                {
+                    rename.error = Some(message);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(profile) = self.profile_mut() {
+            if let Some(holder) = holder {
+                profile.session.rekey(
+                    &TabKey::Saved(previous.clone()),
+                    TabKey::Saved(typed.clone()),
+                );
+                if let Some(tab) = profile.session.query_tab_mut(holder) {
+                    tab.open_query = Some(typed.clone());
+                }
+            }
+            profile.session.notice = Some(format!("Renamed {previous} to {typed}."));
+            profile.shortcuts.rename_query(&previous, &typed);
+        }
+        self.end_query_rename(cx);
+        self.reload_saved_queries(cx);
+        self.remember_profiles(cx);
+    }
+
+    /// `escape` over the sidebar's rename field: the name stays as it was.
+    pub(crate) fn cancel_query_rename(&mut self, cx: &mut Context<Self>) -> bool {
+        let renaming = self
+            .profile()
+            .is_some_and(|profile| profile.session.query_rename.is_some());
+        if renaming {
+            self.end_query_rename(cx);
+        }
+        renaming
+    }
+
+    /// Put the field away while it holds focus, and hand the keyboard back:
+    /// an unmounted field keeps the window's focus, and every binding with it.
+    pub(crate) fn end_query_rename(&mut self, cx: &mut Context<Self>) {
+        self.drop_query_rename();
+        self.refocus_front();
+        cx.notify();
+    }
+
+    fn drop_query_rename(&mut self) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.query_rename = None;
+            profile.session.query_rename_needs_focus = false;
+        }
+    }
+
+    /// Raise the dialog that asks before a saved query is deleted. The one
+    /// way in from the sidebar and the palette alike.
+    pub(crate) fn ask_delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        profile.session.pending_delete = Some(PendingDelete::Query(name));
+        cx.notify();
+    }
+
+    /// Delete a saved query's file, and close the tab holding it: the query
+    /// is gone, and its text with it. A tab with cell edits nobody applied
+    /// asks first, as any close does, and the file stays until it is told.
+    pub(crate) fn delete_saved_query(
         &mut self,
         name: String,
         window: &mut Window,
@@ -1540,15 +1874,24 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        if profile.session.pending_delete.as_deref() != Some(&name) {
-            profile.session.pending_delete = Some(name);
+        profile.session.pending_delete = None;
+        let holder = profile.session.tab_holding(&name).map(Tab::Query);
+        if let Some(tab) = holder.filter(|tab| self.has_unapplied_edits(*tab, cx)) {
+            if let Some(profile) = self.profile_mut() {
+                profile.session.pending_discard = Some(PendingDiscard {
+                    tab,
+                    deleting: Some(name),
+                });
+            }
             cx.notify();
             return;
         }
-        self.delete_saved_query(name, window, cx);
+        self.delete_saved_query_now(name, window, cx);
+        self.refocus_front();
     }
 
-    pub(crate) fn delete_saved_query(
+    /// The delete itself, once nothing is left to ask.
+    pub(crate) fn delete_saved_query_now(
         &mut self,
         name: String,
         window: &mut Window,
@@ -1558,44 +1901,31 @@ impl Workspace {
             return;
         };
         let id = profile.id.clone();
-        // Read before the delete, because afterwards nothing on the session
-        // still points at the file and only this says which tab did.
-        let was_open = profile.session.tab_holding(&name);
-        let in_front = was_open
-            .map(Tab::Query)
-            .filter(|open| profile.session.active == *open)
-            .map(|open| profile.session.fallback(open));
+        let holder = profile.session.tab_holding(&name);
         if let Err(message) = store::delete_query(&id, &name) {
             self.note(message, cx);
             return;
         }
-        // Here, once the file is gone, and not when `cmd+w` asked: answering
-        // Cancel to that leaves the tab, and its statement, running.
-        if let Some(open) = was_open {
-            self.stop_run(Tab::Query(open), cx);
+        if let Some(holder) = holder {
+            self.remove_query_tab(holder, window, cx);
         }
         if let Some(profile) = self.profile_mut() {
-            profile.session.saved_queries = store::saved_queries(&id);
-            profile.session.pending_delete = None;
-            profile.session.pending_close = None;
             profile.session.notice = Some(format!("Deleted {name}."));
-
-            // The tab goes with the file. Its text was the query, and the query
-            // is what was deleted -- keeping it in an untitled buffer would
-            // leave `cmd+w` looking like it had done nothing.
-            if let Some(open) = was_open {
-                profile.session.queries.retain(|tab| tab.id != open);
-                profile.session.forget(Tab::Query(open));
-                // With the tab, as in `close_buffer`: a snapshot with no
-                // tab left to come back to is rows the next buffer to be
-                // handed this id would show as its own.
-                let _ = store::remove_grid(&id, &store::query_grid_key(open));
-            }
+            profile.shortcuts.forget_query(&name);
         }
-        if let Some(fallback) = in_front {
-            self.front_after_close(fallback, window, cx);
-        }
+        self.reload_saved_queries(cx);
         self.remember_profiles(cx);
+    }
+
+    /// Read the profile in front's query files again, for a list that changed
+    /// on disk, and redraw the sidebar that lists them.
+    pub(crate) fn reload_saved_queries(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let id = profile.id.clone();
+        profile.session.saved_queries = store::saved_queries(&id);
+        self.refresh_query_library(&id, cx);
         cx.notify();
     }
 
@@ -1644,6 +1974,7 @@ impl Workspace {
                     }),
                     verdict,
                     dont_ask: false,
+                    commit_cell: false,
                 });
             }
             cx.notify();
@@ -1856,7 +2187,13 @@ impl Workspace {
         // grammar cannot read; its sort is read from the spelling it was
         // generated in. A buffer's statement is read as typed.
         let keys = match tab {
-            Tab::Object(_) => sql::order_by(engine, &sql::unpaged(&sql)),
+            Tab::Object(object) => {
+                let before_paging = (engine.spec().sql.paging
+                    == crate::db::Paging::LimitOffsetByKey)
+                    .then(|| self.statement_before_paging(object, &sql))
+                    .flatten();
+                sql::order_by(engine, &before_paging.unwrap_or_else(|| sql::unpaged(&sql)))
+            }
             Tab::Query(_) => sql::order_by(engine, &sql),
         };
         let sortable = keys.is_some();
@@ -1885,18 +2222,6 @@ impl Workspace {
             let ran = statement.as_ref().or(explained.as_ref());
             tab.ran_from = tab.sent_from.take().filter(|(_, sent)| Some(sent) == ran);
         }
-        // Recorded on the way out rather than on the way back: the history is
-        // what the user ran, and a statement that failed is exactly the one
-        // worth getting back. Only the buffer's — a relation's preview is SQL
-        // dbdelve wrote, and nobody asked to keep it.
-        if let Some(statement) = &statement
-            && let Some(profile) = self.issued_to(&id, generation)
-        {
-            // A line that could not be written is not worth a notice on every
-            // run: the statement is still in the buffer, so nothing is lost.
-            let _ = store::append_history(&profile.id, statement);
-            remember_statement(&mut profile.session.history, statement);
-        }
         // Everything an object tab runs is dbdelve's, and a query tab runs
         // dbdelve's statement only when an edit is applied from its grid, the
         // one run that carries a refresh -- bar a `Return`, which the user's
@@ -1905,6 +2230,27 @@ impl Workspace {
             || refresh
                 .as_ref()
                 .is_some_and(|refresh| !matches!(refresh, Refresh::Return));
+        // Recorded on the way out rather than on the way back: the history is
+        // what the user ran, and a statement that failed is exactly the one
+        // worth getting back. Only the buffer's — a relation's preview is SQL
+        // dbdelve wrote, and nobody asked to keep it. Nor an edit reviewed
+        // rather than appended: recalled into a buffer, it would run without
+        // the count that guards it. Its outcome is written as it lands, under
+        // the same rules, since only a run recorded here has one to record.
+        let recorded = match &statement {
+            Some(statement) if !(generated && engine.reviews_query_edits()) => {
+                self.issued_to(&id, generation).map(|profile| {
+                    let entry = store::HistoryEntry::started(statement.as_str());
+                    // A line that could not be written is not worth a notice
+                    // on every run: the statement is still in the buffer, so
+                    // nothing is lost.
+                    let _ = store::append_history(&profile.id, &entry);
+                    remember_statement(&mut profile.session.history, entry.clone());
+                    entry
+                })
+            }
+            _ => None,
+        };
         // Marked on the way out, like the history: a statement that failed
         // part way may still have opened a transaction.
         if !generated && let Some(profile) = self.issued_to(&id, generation) {
@@ -2008,12 +2354,20 @@ impl Workspace {
 
         cx.spawn(async move |workspace, cx| {
             let (result, lost) = query_task.await;
+            // Told before anything below asks whether the session or the tab
+            // the run was for is still there: a run closed or reconnected under
+            // still ran, and what it came to is history. The tab's own outcome,
+            // which counts the rows it streamed, replaces this one when the
+            // tab is there to count them.
+            let mut unrecorded = recorded
+                .as_ref()
+                .map(|entry| answered(entry, &result, feed.is_some(), started.elapsed(), engine));
             workspace
                 .update(cx, |workspace, cx| {
                     // The plan is carried out of this block rather than stored
                     // inside it: `slot` holds the session borrowed, and the tab
                     // it belongs on has to be reached through the same session.
-                    let (succeeded, produced_grid, plan, rest, notice) = {
+                    let (succeeded, produced_grid, plan, rest, notice, landed) = {
                         let Some(profile) = workspace.issued_to(&id, generation) else {
                             workspace.drop_stale_run(&id, tab, lane.as_ref(), cx);
                             return;
@@ -2069,6 +2423,11 @@ impl Workspace {
                         // Not a write's, which the cancel undid, and not when
                         // something other than the cancel ended it. Whatever
                         // the cancel cost besides is said either way.
+                        let ran = statement.as_deref().unwrap_or_default();
+                        // Read before the cost is appended to the message,
+                        // which is what the engine's cancel is told by.
+                        let cancel_landed = cancelled
+                            && matches!(&result, Err(error) if db::is_cancel(engine, error));
                         let result = match result {
                             Err(error)
                                 if cancelled
@@ -2080,12 +2439,12 @@ impl Workspace {
                                     columns: results.read(cx).delegate().result().columns.clone(),
                                     elapsed: started.elapsed(),
                                     stopped: Some(Stopped::Cancelled),
-                                    notice: db::cancel_cost(engine, &error, true),
+                                    notice: db::cancel_cost(engine, &error, true, ran),
                                     ..QueryResult::default()
                                 })
                             }
                             Err(mut error) if cancelled && db::is_cancel(engine, &error) => {
-                                if let Some(cost) = db::cancel_cost(engine, &error, reads_only)
+                                if let Some(cost) = db::cancel_cost(engine, &error, reads_only, ran)
                                     && cost != error.message
                                 {
                                     error.message = format!("{}\n\n{cost}", error.message);
@@ -2099,11 +2458,12 @@ impl Workspace {
                             // returning its rows, so nothing here reaches the
                             // grid: it keeps whatever the last real run put in
                             // it, which is what the Data tab flips back to.
-                            Ok(result) if explain.is_some() => {
+                            Ok(mut result) if explain.is_some() => {
                                 let mode = explain.unwrap_or_default();
                                 *state = QueryState::Explained {
                                     elapsed: result.elapsed,
                                     mode,
+                                    messages: std::mem::take(&mut result.messages),
                                 };
                                 let columns: Vec<String> = result
                                     .columns
@@ -2112,7 +2472,9 @@ impl Workspace {
                                     .collect();
                                 let plan = explain::parse(&columns, &result.rows);
                                 let answer = (plan, columns, result.rows);
-                                (true, false, Some(answer), Vec::new(), result.notice)
+                                // The Explain command's run is dbdelve's
+                                // prefix, never recorded.
+                                (true, false, Some(answer), Vec::new(), result.notice, None)
                             }
                             Ok(mut result) => {
                                 // Rows that streamed in were scrolled through as
@@ -2186,11 +2548,14 @@ impl Workspace {
                                         Vec::new(),
                                     )
                                 });
+                                let landed =
+                                    recorded.as_ref().map(|entry| entry.succeeded(&result));
                                 *state = QueryState::Complete {
                                     rows: result.total_rows(),
                                     bytes: result.bytes,
                                     elapsed: result.elapsed,
                                     rows_affected: result.rows_affected,
+                                    messages: std::mem::take(&mut result.messages),
                                 };
                                 let produced_grid = !result.columns.is_empty();
                                 // Sorted in memory as it lands, the rows move
@@ -2240,7 +2605,7 @@ impl Workspace {
                                 if feed.is_some() {
                                     render_aside(&results, engine, cx);
                                 }
-                                (true, produced_grid, plan, rest, notice)
+                                (true, produced_grid, plan, rest, notice, landed)
                             }
                             Err(mut error) => {
                                 // Rows of a statement that failed part way are
@@ -2254,6 +2619,9 @@ impl Workspace {
                                         }
                                     });
                                 }
+                                let landed = recorded.as_ref().map(|entry| {
+                                    entry.failed(&error, started.elapsed(), cancel_landed)
+                                });
                                 // Into the user's statement, not the prefix
                                 // dbdelve put in front of it, which is on no
                                 // screen to count from.
@@ -2267,11 +2635,16 @@ impl Workspace {
                                     Some(previous) if cancelled => previous,
                                     _ => QueryState::Failed(error),
                                 };
-                                (false, false, None, Vec::new(), None)
+                                (false, false, None, Vec::new(), None, landed)
                             }
                         }
                     };
 
+                    if let Some(landed) = landed {
+                        unrecorded = None;
+                        let _ = store::append_history(&id, &landed);
+                        workspace.remember_run(&id, landed);
+                    }
                     if keep_rows
                         && let Some(profile) = workspace.issued_to(&id, generation)
                         && profile.session.notice.as_deref() == Some(Self::REFRESHING)
@@ -2324,6 +2697,14 @@ impl Workspace {
                                 rows,
                             });
                             tab.showing_plan = true;
+                            // The form and review were for another result.
+                            if tab.show_slot() {
+                                profile
+                                    .session
+                                    .insert_form
+                                    .take_if(|form| form.tab == Tab::Query(query));
+                                profile.session.drop_apply_review_of(Tab::Query(query));
+                            }
                         }
                         // Nothing left to read once the batch it was showing has
                         // run. Only this tab's: another tab's is still unread.
@@ -2407,8 +2788,26 @@ impl Workspace {
                     }
                 })
                 .ok();
+            if let Some(entry) = unrecorded {
+                let _ = store::append_history(&id, &entry);
+                workspace
+                    .update(cx, |workspace, _| workspace.remember_run(&id, entry))
+                    .ok();
+            }
         })
         .detach();
+    }
+
+    /// A run's outcome into the history of the profile that sent it, by id
+    /// alone: a reconnect retires the session's generation, not its history.
+    pub(crate) fn remember_run(&mut self, profile_id: &str, entry: store::HistoryEntry) {
+        if let Some(profile) = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+        {
+            remember_statement(&mut profile.session.history, entry);
+        }
     }
 
     /// A result dropped because its generation was retired -- a reconnect or a
@@ -3001,9 +3400,77 @@ fn pour(
     changed
 }
 
+/// What a run came to, told from its answer alone, for a run whose tab or
+/// session went while it ran. Rows that streamed went to a grid nobody reads
+/// any more, so a streamed result's count is left unknown rather than
+/// undercounted, unless the row limit already said how many there were. With
+/// the tab gone there is no state to say a Cancel was asked for, so the
+/// engine's own cancel wording is what tells one.
+pub(super) fn answered(
+    entry: &store::HistoryEntry,
+    result: &Result<QueryResult, DbError>,
+    streamed: bool,
+    elapsed: std::time::Duration,
+    engine: Engine,
+) -> store::HistoryEntry {
+    match result {
+        Ok(result) => {
+            let mut landed = entry.succeeded(result);
+            if streamed && result.capped_from.is_none() {
+                landed.rows = None;
+            }
+            landed
+        }
+        Err(error) => entry.failed(error, elapsed, db::is_cancel(engine, error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_answered_without_its_tab_keeps_only_what_the_answer_says() {
+        let entry = store::HistoryEntry::started("select 1");
+        let streamed = QueryResult {
+            columns: vec![db::Column::default()],
+            elapsed: std::time::Duration::from_millis(9),
+            ..QueryResult::default()
+        };
+        let landed = answered(
+            &entry,
+            &Ok(streamed.clone()),
+            true,
+            Default::default(),
+            Engine::Sqlite,
+        );
+        assert_eq!((landed.rows, landed.ms), (None, Some(9)));
+        let capped = QueryResult {
+            capped_from: Some(7),
+            ..streamed
+        };
+        let landed = answered(
+            &entry,
+            &Ok(capped),
+            true,
+            Default::default(),
+            Engine::Sqlite,
+        );
+        assert_eq!(landed.rows, Some(7));
+
+        let interrupted = DbError {
+            message: "interrupted".into(),
+            position: None,
+        };
+        let landed = answered(
+            &entry,
+            &Err(interrupted),
+            false,
+            Default::default(),
+            Engine::Sqlite,
+        );
+        assert!(landed.cancelled && landed.error.is_none());
+    }
 
     /// `text` with `|` marking the caret, or `[` `]` the selection, toggled.
     fn toggle(text: &str, marker: &str) -> Option<String> {

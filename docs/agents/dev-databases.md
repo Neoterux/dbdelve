@@ -5,9 +5,28 @@ on its welcome surface, where New connection takes one of the development
 database URLs listed in `AGENTS.md`.
 
 The ports can be moved with `DBDELVE_POSTGRES_PORT`, `DBDELVE_MYSQL_PORT`,
-`DBDELVE_MARIADB_PORT`, `DBDELVE_MSSQL_PORT`, `DBDELVE_REDIS_PORT` and `DBDELVE_MONGO_PORT`. The SQL Server image is
+`DBDELVE_MARIADB_PORT`, `DBDELVE_MSSQL_PORT`, `DBDELVE_REDIS_PORT`, `DBDELVE_MONGO_PORT` and
+`DBDELVE_CLICKHOUSE_PORT`. The SQL Server image is
 `linux/amd64` only, so on Apple silicon it runs under emulation and takes a
 while to come up.
+
+The ClickHouse container (`clickhouse-server:26.8`, built from
+`dev/clickhouse/` with its seed baked in, so no bind mount records a worktree
+path) serves the HTTP interface on 58123 and has no TLS listener, so the
+TLS modes are tested offline only. The seed makes `conformance`, `accounts`,
+`events` (partitioned, about a million rows), a view, a materialized view and
+its target, a dictionary, the `analytics` database, the `edit_*` tables
+(lightweight, heavy, projection, duplicates, summing), the `dbdelve_reader`
+(`readonly = 1`) and `dbdelve_noalter` users, and `type_gallery` last: its
+healthcheck counts the two rows of `type_gallery`, so a half-seeded container
+is not healthy. The live tests are `cargo test clickhouse -- --include-ignored`.
+
+The ClickHouse HTTP mock releases a completed execution's session before its
+complete response becomes observable, including a zero-length body's headers.
+Releasing after socket shutdown races the client's next request and invents a
+`SESSION_IS_LOCKED`. A stall after an entire non-chunked body is complete too;
+incomplete delayed or stalled executions hold their session until they finish
+or are stopped.
 
 Snowflake has no container. Its unit tests need nothing, and neither do its
 mock tests: `snowflake/mock.rs` is a loopback HTTP server replaying responses
@@ -61,13 +80,18 @@ reseeds from scratch instead of colliding with what it left behind.
 
 The `live_` tests are `#[ignore]`d and read `PGHOST`, `PGPORT`, `PGDATABASE`,
 `PGUSER`, `PGPASSWORD`, `dbdelve_MYSQL_URL`, `dbdelve_MARIADB_URL`,
-`dbdelve_MSSQL_URL`, `dbdelve_REDIS_URL`, `dbdelve_MONGO_URL`, `dbdelve_SQLITE_PATH`, `dbdelve_TURSO_PATH` and `dbdelve_SSH_CONFIG` (the
+`dbdelve_MSSQL_URL`, `dbdelve_REDIS_URL`, `dbdelve_MONGO_URL`, `dbdelve_CLICKHOUSE_URL`, `dbdelve_SQLITE_PATH`, `dbdelve_TURSO_PATH` and `dbdelve_SSH_CONFIG` (the
 lowercase prefix is what they read; the last points `live_ssh_*` at the
 config `dev/ssh/setup.sh` generates, an `ssh -F` rather than a connection
-string); the `tests` job in `ci.yml` has the values
+string); the `linux` job in `ci.yml` has the values
 for the dev databases. It has no Snowflake account, so it skips the Snowflake
-live tests but for the one that needs none; the mock tests stand in for them. CI lints on Linux, macOS and Windows, runs the live tests
-on Linux, and runs the unit tests on Windows too, since the storage tests are
-what exercise the `APPDATA` paths. `compose.yaml` and `dev/**` are in the
+live tests but for the one that needs none; the mock tests stand in for them.
+CI has one job per platform: each lints and runs the unit tests (on Windows the
+storage tests are what exercise the `APPDATA` paths), and Linux alone runs the
+live tests, since macOS runners have no Docker. They run under nextest there,
+which retries a failing `live_` test twice and reports one that then passes as
+flaky rather than as a pass (`.config/nextest.toml`); nothing else is retried.
+The renderers' pixel tests run when a PR changes `vendor/`, and on every push
+to main. `compose.yaml` and `dev/**` are in the
 workflow's own path filters, so a change to a dev container or a seed script
 runs CI too, not only a change under `src/`.

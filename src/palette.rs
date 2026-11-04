@@ -38,27 +38,35 @@ use gpui_component::{
 
 use crate::{
     Workspace,
+    actions::LimitTarget,
     actions::{
-        PaletteNext, PaletteNextScope, PalettePrevious, PalettePreviousScope, PaletteRowActions,
-        PaletteScopeLeft, PaletteScopeRight,
+        PaletteHistoryFilter, PaletteHistorySort, PaletteNext, PaletteNextScope, PalettePrevious,
+        PalettePreviousScope, PaletteRowActions, PaletteScopeLeft, PaletteScopeRight,
     },
-    db::{ConnectionConfig, Engine, ExplainMode, RelationKind, RoutineKind},
+    db::{ConnectionConfig, Engine, ExplainMode, RelationKind, RoutineKind, Syntax},
+    explorer::ROW_LIMITS,
     explorer::{ExplorerTarget, ObjectKind},
-    export::Format,
+    export::{FileAs, Format, RowsAs},
     fuzzy::{Fuzzy, Query},
     icons::icon,
     import::Source,
-    session::{CatalogState, ObjectBody, Profile, QueryState, Tab, routine_name},
-    store::StoredProject,
+    session::{
+        CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
+        routine_name,
+    },
+    sql,
+    store::{HistoryEntry, StoredProject},
+    structure_grid::Section,
     theme::{
         Appearance, ConnectionColor, FontSlot, Fonts, Theme, fonts, install_theme, layout,
         popup_theme, theme, user,
     },
     ui::{
-        Control, Tone, chord_for, highlighted, icon_button, key_chip, keycap_parts, keycaps,
-        kind_color, object_icon, one_line, raised_card, row_icon_tinted, search_field, status_dot,
+        Control, Tone, chord_for, group_thousands, highlighted, icon_button, key_chip,
+        keycap_parts, keycaps, kind_color, object_icon, one_line, raised_card, row_icon_tinted,
+        search_field, status_dot,
     },
-    workspace::opacity_for,
+    workspace::{ReferenceSource, opacity_for},
 };
 
 /// How many rows each group shows under All, which is for reaching across
@@ -146,8 +154,16 @@ pub enum Mode {
     Schema,
     /// The columns of the grid in front, to jump to one of them.
     Columns,
+    /// The row limits the tab in front's menu offers, and a number of one's
+    /// own.
+    RowLimit,
     /// Every engine, to pick the connection form's.
     Engine,
+    /// Where the connections an import is asking about go.
+    ImportProject,
+    /// The relations holding rows that reference the key in the active cell,
+    /// as the arrow on it lists them.
+    References,
     /// What can be done to one connection, by index into the profiles, and to
     /// the project it is in.
     ConnectionActions(usize),
@@ -160,6 +176,8 @@ pub enum Mode {
     NameProject(Option<usize>),
     /// Every project, to rename or delete one.
     Projects(ProjectVerb),
+    /// Every saved query, to delete one.
+    DeleteQuery,
     /// The one row that removes a connection or deletes a project, so a
     /// keystroke aimed at something else never does.
     Confirm(Target),
@@ -199,13 +217,17 @@ impl Mode {
             Mode::Database => "Switch database…",
             Mode::Schema => "Switch schema…",
             Mode::Columns => "Go to a column…",
+            Mode::RowLimit => "Set the row limit…",
             Mode::Engine => "Pick an engine…",
+            Mode::ImportProject => "Choose the project they join…",
+            Mode::References => "Open a referencing table…",
             Mode::ConnectionActions(_) | Mode::ProjectActions(_) => "Pick an action…",
             Mode::MoveToProject(_) => "Move to a project…",
             Mode::NameProject(None) => "Name the new project…",
             Mode::NameProject(Some(_)) => "Rename the project…",
             Mode::Projects(ProjectVerb::Rename) => "Rename a project…",
             Mode::Projects(ProjectVerb::Delete) => "Delete a project…",
+            Mode::DeleteQuery => "Delete a saved query…",
             Mode::Confirm(Target::Connection(_) | Target::Unavailable(_)) => {
                 "Remove this connection?"
             }
@@ -226,7 +248,11 @@ impl Mode {
             Mode::Database => "Databases",
             Mode::Schema => "Schemas",
             Mode::Columns => "Columns",
+            Mode::RowLimit => "Row limit",
             Mode::Engine => "Engines",
+            Mode::ImportProject => "Project",
+            Mode::References => "Referenced by",
+            Mode::DeleteQuery => "Delete query",
             Mode::ConnectionActions(_) => "Connection",
             Mode::ProjectActions(_) => "Project",
             Mode::MoveToProject(_) => "Move to project",
@@ -246,12 +272,12 @@ impl Mode {
             | Mode::ConnectionActions(_)
             | Mode::ProjectActions(_) => "Run",
             Mode::Search(Scope::Connections) => "Switch",
-            Mode::Search(_) | Mode::Columns => "Open",
+            Mode::Search(_) | Mode::Columns | Mode::References => "Open",
             Mode::MoveToProject(_) => "Move",
             Mode::NameProject(None) => "Create",
             Mode::NameProject(Some(_)) => "Rename",
             Mode::Confirm(Target::Connection(_) | Target::Unavailable(_)) => "Remove",
-            Mode::Confirm(Target::Project(_)) => "Delete",
+            Mode::Confirm(Target::Project(_)) | Mode::DeleteQuery => "Delete",
             _ => "Select",
         }
     }
@@ -280,6 +306,11 @@ pub enum Command {
     ShowPlan(bool),
     SaveQuery,
     RenameQuery,
+    /// Put the palette back up over the saved queries, to delete one.
+    PickQueryToDelete,
+    /// Ask before deleting this saved query, in the dialog the sidebar's
+    /// Delete raises.
+    DeleteQuery(String),
     /// Narrow the palette to the History scope. The one command that keeps the
     /// palette up rather than doing something behind it.
     QueryHistory,
@@ -316,8 +347,10 @@ pub enum Command {
     PreviousEdit,
     /// The format here only picks the extension the save dialog suggests. What
     /// the file is written as is read back off the path the user confirmed, so
-    /// these two rows are one code path — see `export::Format::for_path`.
-    ExportResults(Format),
+    /// these rows are one code path — see `export::FileAs::for_path`.
+    ExportResults(FileAs),
+    /// Stop the export of every row this connection is running.
+    CancelExport,
     CopyRow,
     CopyResults(Format),
     SwitchProfile(usize),
@@ -357,6 +390,7 @@ pub enum Command {
     DeleteProject(String),
     ImportConnections(Source),
     RefreshConnection,
+    Reconnect,
     /// Put the palette back up over the theme list.
     SelectTheme,
     /// For the side a light or dark theme list was opened for, if any.
@@ -375,16 +409,64 @@ pub enum Command {
     PickFont(FontSlot),
     SetFont(FontSlot, String),
     ToggleSidebar,
+    FocusSidebar,
+    ToggleResultsFocus,
     ToggleRowPanel,
     ToggleRowEdit,
     ResetEditorZoom,
     OpenSettings,
     /// Pick data files to open in DuckDB.
     OpenDataFiles,
+    /// Pick SQL files to open in new query tabs on the connection in front.
+    OpenSqlFiles,
     /// Put the palette up over the columns of the grid in front.
     GoToColumn,
     /// Scroll the grid in front to this column, by index into its columns.
     RevealColumn(usize),
+    /// Stop what the tab in front is running, or counting.
+    CancelQuery,
+    CycleMode,
+    SetMode(sql::Mode),
+    ResetConfirmations,
+    /// The cell menu's column verbs, on the active cell's column.
+    HideColumn,
+    TogglePinColumn,
+    ShowAllColumns,
+    /// A click on the active cell's header.
+    SortActiveColumn,
+    /// The status bar's Client (`true`) or Server.
+    SetViewSorting(bool),
+    /// The explorer menu's Copy DDL, for the relation in front.
+    CopyDdl,
+    /// The explorer menu's other copies: put this on the clipboard, and
+    /// nothing else.
+    CopyText(String),
+    CopyRows(RowsAs),
+    FollowForeignKey,
+    /// Add a filter bar and put the cursor in it.
+    AddFilter,
+    ToggleNextJoin,
+    /// Put the palette back up over the relations that reference the key in
+    /// the active cell, once they have been asked whether they hold a row.
+    ShowReferences,
+    /// By index into the `referenced_by` of the key it was listed for.
+    OpenReference(Box<ReferenceSource>, usize),
+    /// `None` is No project.
+    SetImportProject(Option<String>),
+    /// Put the palette back up over the row limits.
+    PickRowLimit,
+    SetRowLimit(Option<usize>),
+    /// Put up the row limit's own field, as the menu's Custom… does.
+    CustomRowLimit,
+    MoveTabLeft,
+    MoveTabRight,
+    NextResult,
+    PreviousResult,
+    ToggleMessages,
+    CopyPlan,
+    ShowStructureSection(Section),
+    /// Open the release page, as the update pill's link does.
+    DownloadUpdate(String),
 }
 
 struct Item {
@@ -417,7 +499,124 @@ struct Item {
     in_all: bool,
     /// The header the row sits under.
     group: Group,
+    /// What History filters and sorts a row by.
+    ran: Ran,
     command: Command,
+}
+
+/// How a run ended, for History's filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// What History knows of a row's last run. All `None` for a statement from
+/// before runs were timed, and for one whose answer never came back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ran {
+    outcome: Option<Outcome>,
+    ms: Option<u64>,
+    rows: Option<u64>,
+}
+
+impl Ran {
+    fn of(entry: &HistoryEntry) -> Self {
+        let outcome = if entry.error.is_some() {
+            Some(Outcome::Failed)
+        } else if entry.cancelled {
+            Some(Outcome::Cancelled)
+        } else {
+            entry.ms.map(|_| Outcome::Succeeded)
+        };
+        Self {
+            outcome,
+            ms: entry.ms,
+            rows: entry.rows,
+        }
+    }
+}
+
+/// Which runs History lists. A cancelled run is neither a success nor a
+/// failure, so only All lists it, and so a run that never answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryStatus {
+    #[default]
+    All,
+    Succeeded,
+    Failed,
+}
+
+impl HistoryStatus {
+    const ALL: [HistoryStatus; 3] = [
+        HistoryStatus::All,
+        HistoryStatus::Succeeded,
+        HistoryStatus::Failed,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            HistoryStatus::All => "All",
+            HistoryStatus::Succeeded => "Succeeded",
+            HistoryStatus::Failed => "Failed",
+        }
+    }
+
+    fn admits(self, outcome: Option<Outcome>) -> bool {
+        match self {
+            HistoryStatus::All => true,
+            HistoryStatus::Succeeded => outcome == Some(Outcome::Succeeded),
+            HistoryStatus::Failed => outcome == Some(Outcome::Failed),
+        }
+    }
+}
+
+/// The order History lists its rows in. Newest is the order the list is
+/// already in, by match while something is typed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryOrder {
+    #[default]
+    Newest,
+    Slowest,
+    MostRows,
+}
+
+impl HistoryOrder {
+    const ALL: [HistoryOrder; 3] = [
+        HistoryOrder::Newest,
+        HistoryOrder::Slowest,
+        HistoryOrder::MostRows,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            HistoryOrder::Newest => "Newest",
+            HistoryOrder::Slowest => "Slowest",
+            HistoryOrder::MostRows => "Most rows",
+        }
+    }
+
+    fn key(self, ran: Ran) -> Option<u64> {
+        match self {
+            HistoryOrder::Newest => None,
+            HistoryOrder::Slowest => ran.ms,
+            HistoryOrder::MostRows => ran.rows,
+        }
+    }
+}
+
+/// The step after `current` in `all`, wrapping, for a chord that cycles.
+fn next_of<T: Copy + PartialEq>(all: &[T], current: T) -> T {
+    let at = all.iter().position(|each| *each == current).unwrap_or(0);
+    all[(at + 1) % all.len()]
+}
+
+/// History's filter and order, as the palette holds them while it is open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryView {
+    pub status: HistoryStatus,
+    pub order: HistoryOrder,
 }
 
 /// Which group a row is in. Told apart by what the group is, never by what its
@@ -449,6 +648,7 @@ impl Item {
             scope: Scope::Commands,
             in_all: true,
             group: Group::Bare,
+            ran: Ran::default(),
             command,
         }
     }
@@ -507,6 +707,11 @@ impl Item {
         self.in_all = false;
         self
     }
+
+    fn ran(mut self, ran: Ran) -> Self {
+        self.ran = ran;
+        self
+    }
 }
 
 /// One line of the list: a group's header, or a row by its index into the
@@ -535,6 +740,10 @@ struct Arranged {
 ///
 /// A row is scored on its label and on each of its other texts apart, the
 /// best of them counting, so a match never runs from one into the next.
+///
+/// History alone keeps to `history`'s filter, and its order other than Newest
+/// puts the rows that match in that order, those without the measure last
+/// and in the order they would otherwise have had.
 fn arrange(
     items: &[Item],
     scope: Option<Scope>,
@@ -542,19 +751,29 @@ fn arrange(
     fuzzy: &mut Fuzzy,
     recents: &[(Scope, String)],
     collapsed: &HashSet<String>,
+    history: HistoryView,
 ) -> Arranged {
     if scope == Some(Scope::Connections) {
         return tree(items, query, fuzzy, collapsed);
     }
-    let ranked = fuzzy.rank(
+    let mut ranked = fuzzy.rank(
         query,
         items.iter().enumerate().filter(|(_, item)| match scope {
             None | Some(Scope::All) => item.in_all,
+            Some(Scope::History) => {
+                item.scope == Scope::History && history.status.admits(item.ran.outcome)
+            }
             Some(scope) => item.scope == scope,
         }),
         |(_, item)| &item.label,
         |(_, item)| &item.also,
     );
+    if scope == Some(Scope::History) && history.order != HistoryOrder::Newest {
+        ranked.sort_by_key(|((_, item), _)| match history.order.key(item.ran) {
+            Some(key) => (false, std::cmp::Reverse(key)),
+            None => (true, std::cmp::Reverse(0)),
+        });
+    }
 
     let recent: Vec<usize> = if query.is_empty()
         && matches!(scope, Some(Scope::All | Scope::Commands | Scope::Objects))
@@ -778,6 +997,8 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
             command,
             Command::Confirm(_)
                 | Command::PickProject(ProjectVerb::Delete)
+                | Command::PickQueryToDelete
+                | Command::DeleteQuery(_)
                 | Command::RemoveConnection(_)
                 | Command::RemoveUnavailable(_)
                 | Command::DeleteProject(_)
@@ -896,8 +1117,11 @@ pub struct Palette {
     collapsed: HashSet<String>,
     /// The chords drawn in the footer and the field, read from the keymap so a
     /// rebind shows up here too: previous row, next row, scope left, scope
-    /// right, close, row actions.
-    hint_chords: [Option<String>; 6],
+    /// right, close, row actions, History's filter, History's order.
+    hint_chords: [Option<String>; 8],
+    /// History's filter and order. Not kept past the palette: a filter left
+    /// on from last time would hide runs from someone who forgot setting it.
+    history: HistoryView,
     naming: Option<Naming>,
     /// The mode the palette opened in, for [`stroke`].
     opened: Mode,
@@ -952,6 +1176,7 @@ impl Palette {
                 .map(|profile| move_items(index, &profile.id, &workspace.projects))
                 .unwrap_or_default(),
             (Mode::Projects(verb), _) => project_items(verb, &workspace.projects),
+            (Mode::DeleteQuery, Some(profile)) => delete_query_items(profile),
             (Mode::Confirm(target), _) => confirm_items(workspace, target),
             (Mode::NameProject(_), _) => Vec::new(),
             (Mode::Search(_), Some(profile)) => search_items(workspace, profile, cx),
@@ -959,9 +1184,11 @@ impl Palette {
             (Mode::Database, Some(profile)) => database_items(profile),
             (Mode::Schema, Some(profile)) => schema_items(profile),
             (Mode::Columns, Some(profile)) => column_items(profile, cx),
+            (Mode::RowLimit, Some(profile)) => row_limit_items(&profile.session),
+            (Mode::Search(_), None) => welcome_items(workspace),
             (Mode::Engine, _) => engine_items(workspace),
-            // With no connection to open, only those this build cannot.
-            (Mode::Search(Scope::Connections), None) => connection_items(workspace),
+            (Mode::ImportProject, _) => import_project_items(workspace),
+            (Mode::References, _) => reference_items(workspace),
             (_, None) => Vec::new(),
         };
         let import_pending = workspace.pending_import.is_some();
@@ -1010,8 +1237,11 @@ impl Palette {
                 "palette_scope_right",
                 "show_editor",
                 "palette_row_actions",
+                "palette_history_filter",
+                "palette_history_sort",
             ]
             .map(|id| chord_for(id, &workspace.settings.custom_keybindings)),
+            history: HistoryView::default(),
             naming,
             opened: mode,
             workspace: handle,
@@ -1092,6 +1322,7 @@ impl Palette {
                 &mut self.fuzzy,
                 &self.recents,
                 &self.collapsed,
+                self.history,
             )
         };
         self.rows = rows;
@@ -1216,6 +1447,26 @@ impl Palette {
     fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let row = step(&self.rows, self.selected, delta);
         self.select(row, true, window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn history(&self) -> HistoryView {
+        self.history
+    }
+
+    fn set_history(&mut self, history: HistoryView, cx: &mut Context<Self>) {
+        self.history = history;
+        self.rearrange();
+        cx.notify();
+    }
+
+    /// The chords that cycle History's filter and order mean nothing in
+    /// another scope, so there they are handed on to the field.
+    fn cycle_history(&mut self, step: fn(HistoryView) -> HistoryView, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Search(Scope::History) => self.set_history(step(self.history), cx),
+            _ => cx.propagate(),
+        }
     }
 
     fn cycle_scope(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1481,7 +1732,10 @@ impl Palette {
                             div()
                                 .flex_shrink_0()
                                 .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                .text_color(t.text_faint)
+                                .text_color(match item.ran.outcome {
+                                    Some(Outcome::Failed) => t.danger,
+                                    _ => t.text_faint,
+                                })
                                 .child(item.hint.clone()),
                         )
                     })
@@ -1577,6 +1831,84 @@ impl Palette {
             .children(pills)
     }
 
+    /// History's filter and order, as pills under the scopes: the same control
+    /// as a scope, since each is one choice of a few made at a glance.
+    fn render_history_bar(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = |text: &'static str| {
+            div()
+                .text_size(px(layout::chrome(layout::TEXT_XS)))
+                .text_color(t.text_muted)
+                .mr(px(layout::SPACE_XS))
+                .child(text)
+        };
+        let statuses = HistoryStatus::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| {
+                scope_pill(
+                    ("palette-history-status", index),
+                    status.title(),
+                    status == self.history.status,
+                    t,
+                )
+                .on_click(cx.listener(move |palette, _, _, cx| {
+                    palette.set_history(
+                        HistoryView {
+                            status,
+                            ..palette.history
+                        },
+                        cx,
+                    );
+                }))
+            });
+        let orders = HistoryOrder::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, order)| {
+                scope_pill(
+                    ("palette-history-order", index),
+                    order.title(),
+                    order == self.history.order,
+                    t,
+                )
+                .on_click(cx.listener(move |palette, _, _, cx| {
+                    palette.set_history(
+                        HistoryView {
+                            order,
+                            ..palette.history
+                        },
+                        cx,
+                    );
+                }))
+            });
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(layout::SPACE_XS))
+            .px(px(layout::SPACE_MD))
+            .py(px(layout::SPACE_SM))
+            .border_b_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .child(label("Status"))
+                    .children(statuses),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .child(label("Sort"))
+                    .children(orders),
+            )
+    }
+
     fn render_empty(&self, t: Theme) -> impl IntoElement {
         let (title, line) = match self.mode {
             Mode::NameProject(_) => match self.naming.as_ref().and_then(|n| n.refusal.clone()) {
@@ -1600,6 +1932,10 @@ impl Palette {
             Mode::Search(Scope::Objects) if self.catalog_loading => (
                 "Loading database objects…".to_string(),
                 "They are listed here as soon as they arrive.".to_string(),
+            ),
+            Mode::Search(Scope::History) if self.history.status != HistoryStatus::All => (
+                format!("No {} runs", self.history.status.title().to_lowercase()),
+                "Show All to see every statement.".to_string(),
             ),
             Mode::Search(Scope::Connections) if self.import_pending => (
                 "Connections are on hold".to_string(),
@@ -1650,8 +1986,17 @@ impl Palette {
     }
 
     fn render_footer(&self, t: Theme) -> impl IntoElement {
-        let [previous, next, left, right, close, actions] =
-            self.hint_chords.each_ref().map(Option::as_deref);
+        let [
+            previous,
+            next,
+            left,
+            right,
+            close,
+            actions,
+            history_filter,
+            history_sort,
+        ] = self.hint_chords.each_ref().map(Option::as_deref);
+        let in_history = self.mode == Mode::Search(Scope::History);
         div()
             .flex()
             .items_center()
@@ -1673,6 +2018,11 @@ impl Palette {
                     })
                     .when(matches!(self.mode, Mode::Search(_)), |hints| {
                         hints.child(footer_hint(&[left, right], "Scope", t))
+                    })
+                    .when(in_history, |hints| {
+                        hints
+                            .child(footer_hint(&[history_filter], "Status", t))
+                            .child(footer_hint(&[history_sort], "Sort", t))
                     }),
             )
             .child(footer_hint(&[close], "Close", t))
@@ -1687,9 +2037,16 @@ impl Render for Palette {
         let width = layout::PALETTE_WIDTH
             .min(viewport.width.as_f32() - 2. * layout::SPACE_LG)
             .max(0.);
-        let list_height =
-            (viewport.height.as_f32() - top - layout::chrome(layout::PALETTE_CHROME_HEIGHT))
-                .clamp(layout::PALETTE_MIN_HEIGHT, layout::PALETTE_MAX_HEIGHT);
+        let in_history = self.mode == Mode::Search(Scope::History);
+        let history_bar = match in_history {
+            true => layout::chrome(layout::CONTROL_HEIGHT_COMPACT) + 2. * layout::SPACE_SM,
+            false => 0.,
+        };
+        let list_height = (viewport.height.as_f32()
+            - top
+            - layout::chrome(layout::PALETTE_CHROME_HEIGHT)
+            - history_bar)
+            .clamp(layout::PALETTE_MIN_HEIGHT, layout::PALETTE_MAX_HEIGHT);
 
         let list = if self.rows.is_empty() {
             self.render_empty(t).into_any_element()
@@ -1781,6 +2138,24 @@ impl Render for Palette {
                         palette.arrow(1, window, cx)
                     }))
                     .on_action(cx.listener(|palette, _: &PaletteRowActions, _, cx| palette.act(cx)))
+                    .on_action(cx.listener(|palette, _: &PaletteHistoryFilter, _, cx| {
+                        palette.cycle_history(
+                            |view| HistoryView {
+                                status: next_of(&HistoryStatus::ALL, view.status),
+                                ..view
+                            },
+                            cx,
+                        )
+                    }))
+                    .on_action(cx.listener(|palette, _: &PaletteHistorySort, _, cx| {
+                        palette.cycle_history(
+                            |view| HistoryView {
+                                order: next_of(&HistoryOrder::ALL, view.order),
+                                ..view
+                            },
+                            cx,
+                        )
+                    }))
                     .child(
                         search_field(
                             icon(icon::SEARCH)
@@ -1796,6 +2171,9 @@ impl Render for Palette {
                         ),
                     )
                     .child(self.render_scopes(t, cx))
+                    .when(in_history, |card| {
+                        card.child(self.render_history_bar(t, cx))
+                    })
                     .child(list)
                     .child(self.render_footer(t)),
             )
@@ -1892,6 +2270,26 @@ fn query_items(profile: &Profile) -> Vec<Item> {
         .collect()
 }
 
+/// Every saved query, open or not, each raising the delete dialog.
+fn delete_query_items(profile: &Profile) -> Vec<Item> {
+    profile
+        .session
+        .saved_queries
+        .iter()
+        .map(|name| {
+            Item::new(
+                name.clone(),
+                icon::SAVED_QUERY,
+                Command::DeleteQuery(name.clone()),
+            )
+            .hint(match profile.session.tab_holding(name) {
+                Some(_) => "open",
+                None => "query",
+            })
+        })
+        .collect()
+}
+
 /// Every relation and routine in the catalog, schema by schema.
 fn object_items(profile: &Profile) -> Vec<Item> {
     let CatalogState::Loaded(catalog, _) = &profile.catalog else {
@@ -1960,13 +2358,18 @@ fn row_verb(mode: Mode, item: Option<&Item>, collapsed: &HashSet<String>) -> &'s
 
 /// The palette a mode opens with no connection to open: the theme lists, the
 /// engine list and the font lists, as on the welcome surface, the connection
-/// form and the settings panel, and while there are connections this build
-/// cannot open, the Connections scope that lists them, and the one row that
-/// removes one.
+/// form and the settings panel, the welcome surface's own verbs, and while
+/// there are connections this build cannot open, the Connections scope that
+/// lists them, and the one row that removes one.
 pub fn without_a_connection(mode: Mode, unavailable: bool) -> Option<Mode> {
     match mode {
-        Mode::Theme(_) | Mode::ImportTheme(..) | Mode::Engine | Mode::Font(_) => Some(mode),
+        Mode::Theme(_)
+        | Mode::ImportTheme(..)
+        | Mode::Engine
+        | Mode::Font(_)
+        | Mode::ImportProject => Some(mode),
         Mode::Search(_) if unavailable => Some(Mode::Search(Scope::Connections)),
+        Mode::Search(Scope::Commands | Scope::All) => Some(mode),
         Mode::Confirm(Target::Unavailable(_)) if unavailable => Some(mode),
         _ => None,
     }
@@ -2268,6 +2671,66 @@ fn move_items(index: usize, id: &str, projects: &[StoredProject]) -> Vec<Item> {
     .collect()
 }
 
+/// Where an import's connections can go, as its dialog's list offers them.
+fn import_project_items(workspace: &Workspace) -> Vec<Item> {
+    let picked = workspace
+        .pending_import
+        .as_ref()
+        .map(|pending| pending.project.clone());
+    workspace
+        .import_destinations()
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .map(|project| {
+            let hint = if picked.as_ref() == Some(&project) {
+                "current"
+            } else {
+                ""
+            };
+            let (label, icon) = match &project {
+                None => (NO_PROJECT.to_string(), icon::LEAVE_PROJECT),
+                Some(name) if workspace.import_makes(&project) => {
+                    (format!("{name} (new project)"), icon::PLUS)
+                }
+                Some(name) => (name.clone(), icon::PROJECT),
+            };
+            Item::new(label, icon, Command::SetImportProject(project)).hint(hint)
+        })
+        .collect()
+}
+
+/// Where [`import_project_items`] lists the project picked so far, for the
+/// palette to open on.
+pub(crate) fn picked_import_row(workspace: &Workspace) -> Option<usize> {
+    import_project_items(workspace)
+        .iter()
+        .position(|item| item.hint.as_ref() == "current")
+}
+
+/// The relations the last reference check found rows in. One whose check
+/// failed is listed too, saying so, as the arrow's list shows it; opening it
+/// runs the same filtered read.
+fn reference_items(workspace: &Workspace) -> Vec<Item> {
+    let Some(popup) = workspace.reference_popup.as_ref() else {
+        return Vec::new();
+    };
+    let source = Box::new(popup.source.clone());
+    popup
+        .choices
+        .iter()
+        .flatten()
+        .map(|(index, label, answer)| {
+            let command = Command::OpenReference(source.clone(), *index);
+            let item = Item::new(label.to_string(), icon::TABLE, command);
+            match answer {
+                Ok(()) => item,
+                Err(message) => item.hint(format!("Could not check: {message}")).muted(),
+            }
+        })
+        .collect()
+}
+
 /// Where [`move_items`] lists the connection's own project, for the palette
 /// to open on.
 pub(crate) fn current_project_row(
@@ -2400,8 +2863,12 @@ fn column_items(profile: &Profile, cx: &App) -> Vec<Item> {
         .collect()
 }
 
-/// Every statement this profile has run, newest first.
+/// Every statement this profile has run, newest first, each with when it last
+/// ran and how that went.
 fn history_items(profile: &Profile) -> Vec<Item> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
     profile
         .session
         .history
@@ -2409,16 +2876,95 @@ fn history_items(profile: &Profile) -> Vec<Item> {
         // The label is what the matcher scores as well as what the row reads
         // as, so collapsing the whitespace is also what makes `select from
         // accounts` find a statement whose `FROM` was on its own line.
-        .map(|sql| {
+        .map(|entry| {
             Item::new(
-                one_line(sql),
+                one_line(&entry.sql),
                 icon::HISTORY,
-                Command::RecallStatement(sql.clone()),
+                Command::RecallStatement(entry.sql.clone()),
             )
             .mono()
             .scope(Scope::History)
+            .hint(history_hint(entry, now))
+            .ran(Ran::of(entry))
         })
         .collect()
+}
+
+/// A run, at a glance: when, what it came to, and how long it took. Empty for
+/// a statement from before runs were timed, which has none of the three.
+fn history_hint(entry: &HistoryEntry, now: u64) -> String {
+    let outcome = if entry.error.is_some() {
+        Some("failed".to_string())
+    } else if entry.cancelled {
+        Some("cancelled".to_string())
+    } else if let Some(rows) = entry.rows {
+        Some(match rows {
+            1 => "1 row".to_string(),
+            rows => format!("{} rows", group_thousands(rows)),
+        })
+    } else {
+        entry
+            .affected
+            .map(|affected| format!("{} affected", group_thousands(affected)))
+    };
+    let capped = (entry.capped && entry.error.is_none()).then(|| "capped".to_string());
+    [
+        entry.at.map(|at| ago(at, now)),
+        outcome,
+        capped,
+        entry.ms.map(took),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+/// How long before `now` a run started, coarser the further back it was.
+///
+/// ponytail: past a week it is the date in UTC, since `time` is built here
+/// without the local offset; a run near midnight can read a day off. Enable
+/// `local-offset` (or ask the platform) if that is ever noticed.
+fn ago(at: u64, now: u64) -> String {
+    const MINUTE: u64 = 60_000;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let since = now.saturating_sub(at);
+    match since {
+        _ if since < MINUTE => "just now".to_string(),
+        _ if since < HOUR => format!("{}m ago", since / MINUTE),
+        _ if since < DAY => format!("{}h ago", since / HOUR),
+        _ if since < 2 * DAY => "yesterday".to_string(),
+        _ if since < 7 * DAY => format!("{}d ago", since / DAY),
+        _ => {
+            let date = |ms: u64| {
+                time::OffsetDateTime::from_unix_timestamp((ms / 1_000) as i64)
+                    .map(|moment| moment.date())
+                    .ok()
+            };
+            match (date(at), date(now)) {
+                (Some(then), Some(today)) => {
+                    let month = &then.month().to_string()[..3];
+                    match then.year() == today.year() {
+                        true => format!("{month} {}", then.day()),
+                        false => format!("{month} {}, {}", then.day(), then.year()),
+                    }
+                }
+                _ => format!("{}d ago", since / DAY),
+            }
+        }
+    }
+}
+
+/// A run's duration in the unit it is read in: milliseconds for the quick
+/// ones, seconds to one place, then minutes.
+fn took(ms: u64) -> String {
+    match ms {
+        _ if ms < 1_000 => format!("{ms} ms"),
+        _ if ms < 60_000 => format!("{:.1} s", ms as f64 / 1_000.),
+        _ if ms < 3_600_000 => format!("{}m {}s", ms / 60_000, ms % 60_000 / 1_000),
+        _ => format!("{}h {}m", ms / 3_600_000, ms % 3_600_000 / 60_000),
+    }
 }
 
 /// Every family the text system can resolve, for one slot.
@@ -2635,6 +3181,191 @@ fn schema_items(profile: &Profile) -> Vec<Item> {
         .collect()
 }
 
+/// The row limit in force on the tab in front, and whose it is, where the
+/// tab draws a menu for one: a query tab's toolbar, or a preview's status
+/// bar while its rows are not loading.
+pub(crate) fn row_limit_target(session: &Session) -> Option<(LimitTarget, Option<usize>)> {
+    if let Some(tab) = session.active_query_tab() {
+        return (!session.naming).then_some((LimitTarget::Query(tab.id), tab.row_limit));
+    }
+    let tab = session.active_object()?;
+    match &tab.body {
+        ObjectBody::Relation { limit, .. } if !session.running(session.active) => {
+            Some((LimitTarget::Relation(tab.id), *limit))
+        }
+        _ => None,
+    }
+}
+
+fn rows_label(rows: usize) -> String {
+    format!("{} rows", group_thousands(rows as u64))
+}
+
+/// What the row limit menu offers, the limit in force marked current.
+fn row_limit_items(session: &Session) -> Vec<Item> {
+    let Some((_, limit)) = row_limit_target(session) else {
+        return Vec::new();
+    };
+    let current = |rows: Option<usize>| if limit == rows { "current" } else { "" };
+    let custom = limit.filter(|rows| !ROW_LIMITS.contains(rows));
+    let custom_label = match custom {
+        Some(rows) => format!("Custom ({})…", group_thousands(rows as u64)),
+        None => "Custom…".to_string(),
+    };
+    std::iter::once(
+        Item::new("No limit", icon::TABLE, Command::SetRowLimit(None)).hint(current(None)),
+    )
+    .chain(ROW_LIMITS.into_iter().map(|rows| {
+        Item::new(
+            rows_label(rows),
+            icon::TABLE,
+            Command::SetRowLimit(Some(rows)),
+        )
+        .hint(current(Some(rows)))
+    }))
+    .chain(std::iter::once(
+        Item::new(custom_label, icon::RENAME, Command::CustomRowLimit).hint(if custom.is_some() {
+            "current"
+        } else {
+            ""
+        }),
+    ))
+    .collect()
+}
+
+/// Where [`row_limit_items`] lists the limit in force, for the palette to
+/// open on.
+pub(crate) fn active_row_limit_row(profile: &Profile) -> Option<usize> {
+    row_limit_items(&profile.session)
+        .iter()
+        .position(|item| item.hint.as_ref() == "current")
+}
+
+fn mode_icon(mode: sql::Mode) -> &'static str {
+    match mode {
+        sql::Mode::ReadOnly => icon::READ_ONLY,
+        sql::Mode::ReadWrite => icon::READ_WRITE,
+        sql::Mode::Full => icon::FULL_ACCESS,
+    }
+}
+
+/// The welcome surface's verbs, and the connections this build cannot open
+/// when there are any: what a palette can reach with no connection.
+fn welcome_items(workspace: &Workspace) -> Vec<Item> {
+    let overrides = &workspace.settings.custom_keybindings;
+    let mut items = starting_items(overrides);
+    items.extend(appearance_items(overrides));
+    if !workspace.unavailable.is_empty() {
+        items.extend(connection_items(workspace));
+    }
+    items
+}
+
+fn command(label: &str, icon: &'static str, command: Command, group: &'static str) -> Item {
+    Item::new(label, icon, command).group(Group::Named(group))
+}
+
+fn with_chord(item: Item, id: &str, overrides: &HashMap<String, String>) -> Item {
+    item.keys(chord_for(id, overrides))
+}
+
+/// New connection, a data file opened in DuckDB, New project, and the
+/// imports this machine has something to import from.
+fn starting_items(overrides: &HashMap<String, String>) -> Vec<Item> {
+    let mut items = vec![
+        with_chord(
+            command(
+                "New connection…",
+                icon::PLUS,
+                Command::NewConnection,
+                CONNECTION,
+            ),
+            "new_connection",
+            overrides,
+        ),
+        command(
+            "Open data file (CSV, Excel, Parquet, JSON)…",
+            icon::TABLE,
+            Command::OpenDataFiles,
+            CONNECTION,
+        ),
+        with_chord(
+            command(
+                "New project…",
+                icon::ADD_TO_PROJECT,
+                Command::NewProject,
+                CONNECTION,
+            ),
+            "new_project",
+            overrides,
+        ),
+    ];
+    items.extend(import_connection_items(overrides));
+    items
+}
+
+fn import_connection_items(overrides: &HashMap<String, String>) -> Vec<Item> {
+    [
+        (
+            Source::DBeaver,
+            "Import connections from DBeaver…",
+            "import_dbeaver",
+        ),
+        (
+            Source::TablePlus,
+            "Import connections from TablePlus…",
+            "import_tableplus",
+        ),
+    ]
+    .into_iter()
+    .filter(|(source, ..)| source.found())
+    .map(|(source, label, id)| {
+        with_chord(
+            command(
+                label,
+                icon::PLUS,
+                Command::ImportConnections(source),
+                CONNECTION,
+            ),
+            id,
+            overrides,
+        )
+    })
+    .collect()
+}
+
+/// The theme and font lists, and Settings.
+fn appearance_items(overrides: &HashMap<String, String>) -> Vec<Item> {
+    let mut items = vec![with_chord(
+        command(
+            "Select theme…",
+            icon::THEME,
+            Command::SelectTheme,
+            APPEARANCE,
+        ),
+        "cycle_theme",
+        overrides,
+    )];
+    for (label, slot) in [
+        ("Chrome font…", FontSlot::Chrome),
+        ("Editor font…", FontSlot::Editor),
+        ("Grid font…", FontSlot::Grid),
+    ] {
+        items.push(command(
+            label,
+            icon::FONT,
+            Command::PickFont(slot),
+            APPEARANCE,
+        ));
+    }
+    items.push(with_chord(
+        command("Settings", icon::SETTINGS, Command::OpenSettings, WINDOW),
+        "open_settings",
+        overrides,
+    ));
+    items
+}
+
 const QUERY: &str = "Query";
 const ROWS: &str = "Rows";
 const CELL: &str = "Cell";
@@ -2653,15 +3384,20 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     // Every cap here is the chord the action actually holds, so a rebind shows
     // up in the palette rather than only in settings.
     let overrides = &workspace.settings.custom_keybindings;
-    let command = |label: &str, icon: &'static str, command: Command, group: &'static str| {
-        Item::new(label, icon, command).group(Group::Named(group))
-    };
-    let bound = |item: Item, id: &str| item.keys(chord_for(id, overrides));
+    let bound = |item: Item, id: &str| with_chord(item, id, overrides);
     let runnable = session.editor(session.active).is_some();
     let mut items = vec![bound(
         command("New query", icon::SCRATCH_QUERY, Command::NewQuery, QUERY),
         "new_query",
     )];
+    if profile.config.engine().syntax() == Syntax::Sql {
+        items.push(command(
+            "Open SQL file…",
+            icon::SCRATCH_QUERY,
+            Command::OpenSqlFiles,
+            QUERY,
+        ));
+    }
 
     if runnable {
         items.push(bound(
@@ -2692,10 +3428,19 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         if let Some(tab) = session.active_query_tab()
             && tab.flips_to_plan()
         {
-            items.push(match tab.showing_plan {
+            items.push(match tab.plan_shown().is_some() {
                 true => command("Show data", icon::TABLE, Command::ShowPlan(false), QUERY),
                 false => command("Show plan", icon::PLAN, Command::ShowPlan(true), QUERY),
             });
+        }
+        if session
+            .active_query_tab()
+            .is_some_and(|tab| tab.plan_shown().is_some())
+        {
+            items.push(bound(
+                command("Copy plan", icon::COPY, Command::CopyPlan, QUERY),
+                "copy_plan",
+            ));
         }
         if session.open_query().is_some() {
             items.push(command(
@@ -2710,6 +3455,33 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 "rename_query_tab",
             ));
         }
+    }
+
+    // Where the status bar offers its Cancel: a run in flight, or a count.
+    let counting = session.active_object().is_some_and(|tab| {
+        matches!(
+            tab.body,
+            ObjectBody::Relation {
+                count: RowCount::Counting { .. },
+                ..
+            }
+        )
+    });
+    if session.running(session.active) || counting {
+        items.push(bound(
+            command("Cancel query", icon::CLOSE, Command::CancelQuery, QUERY),
+            "cancel_query",
+        ));
+    }
+
+    // Not gated on a query tab: a saved query need not be open to be deleted.
+    if !session.saved_queries.is_empty() {
+        items.push(command(
+            "Delete saved query…",
+            icon::DELETE,
+            Command::PickQueryToDelete,
+            QUERY,
+        ));
     }
 
     // Not gated on the query tab being in front: recalling a statement brings
@@ -2746,11 +3518,31 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     }
 
     if let Some(tab) = session.active_object() {
-        if matches!(tab.body, ObjectBody::Structure { .. }) {
+        if let ObjectBody::Structure {
+            structure, grid, ..
+        } = &tab.body
+        {
             items.push(bound(
                 command("Show data", icon::TABLE, Command::ShowStructure(false), TAB),
                 "toggle_structure",
             ));
+            // The chips above the structure, less the one already showing.
+            if let StructureState::Loaded(structure) = structure {
+                let shown = grid.read(cx).delegate().section();
+                items.extend(
+                    Section::ALL
+                        .into_iter()
+                        .filter(|section| *section != shown && section.offered(structure))
+                        .map(|section| {
+                            command(
+                                &format!("Structure: {}", section.label()),
+                                icon::STRUCTURE,
+                                Command::ShowStructureSection(section),
+                                TAB,
+                            )
+                        }),
+                );
+            }
             items.push(bound(
                 command(
                     "Refresh structure",
@@ -2764,6 +3556,8 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         if let ObjectBody::Relation {
             query,
             filter,
+            filters,
+            next_join,
             limit,
             offset,
             count,
@@ -2823,6 +3617,22 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 Command::FilterRows,
                 ROWS,
             ));
+            // With no bar yet, Filter rows… adds the first.
+            if !filters.is_empty() {
+                items.push(bound(
+                    command("Add filter", icon::PLUS, Command::AddFilter, ROWS),
+                    "add_filter",
+                ));
+                items.push(bound(
+                    command(
+                        &format!("Join the next filter with {}", next_join.toggled().as_str()),
+                        icon::CHOOSE,
+                        Command::ToggleNextJoin,
+                        ROWS,
+                    ),
+                    "toggle_next_join",
+                ));
+            }
             // A row that would do nothing is worse than no row at all.
             if !filter.is_empty() {
                 items.push(command(
@@ -2854,9 +3664,68 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 ));
             }
         }
+        // The explorer's menu for this relation, clipboard and all.
+        if let ObjectKind::Relation(kind) = tab.kind {
+            let engine = profile.config.engine();
+            items.extend(
+                crate::explorer::relation_copies(engine, &tab.schema, &tab.name, kind)
+                    .into_iter()
+                    .flatten()
+                    .map(|(label, text)| {
+                        let copies = match text {
+                            Some(text) => Command::CopyText(text),
+                            None => Command::CopyDdl,
+                        };
+                        command(label, icon::COPY, copies, TAB).detail(tab.name.clone())
+                    }),
+            );
+        }
         items.push(bound(
             command("Close tab", icon::CLOSE, Command::CloseObject(tab.id), TAB),
             "close_tab",
+        ));
+    }
+
+    if let Some((_, limit)) = row_limit_target(session) {
+        items.push(
+            command("Set row limit…", icon::TABLE, Command::PickRowLimit, ROWS)
+                .hint(limit.map_or_else(|| "No limit".to_string(), rows_label)),
+        );
+    }
+
+    let strip = session.strip_tabs();
+    if let Some(at) = strip.iter().position(|tab| *tab == session.active) {
+        if at > 0 {
+            items.push(bound(
+                command(
+                    "Move tab left",
+                    icon::CHEVRON_LEFT,
+                    Command::MoveTabLeft,
+                    TAB,
+                ),
+                "move_tab_left",
+            ));
+        }
+        if at + 1 < strip.len() {
+            items.push(bound(
+                command(
+                    "Move tab right",
+                    icon::CHEVRON_RIGHT,
+                    Command::MoveTabRight,
+                    TAB,
+                ),
+                "move_tab_right",
+            ));
+        }
+    }
+
+    // Wherever the user is standing: the export runs apart from every tab.
+    if session.exporting.is_some() {
+        items.push(command(
+            "Cancel export",
+            icon::CLOSE,
+            Command::CancelExport,
+            RESULTS,
         ));
     }
 
@@ -2875,15 +3744,23 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         items.push(command(
             "Export results as CSV…",
             icon::SAVE,
-            Command::ExportResults(Format::Csv),
+            Command::ExportResults(FileAs::Rows(Format::Csv)),
             RESULTS,
         ));
         items.push(command(
             "Export results as JSON…",
             icon::SAVE,
-            Command::ExportResults(Format::Json),
+            Command::ExportResults(FileAs::Rows(Format::Json)),
             RESULTS,
         ));
+        if profile.config.engine().syntax() == Syntax::Sql {
+            items.push(command(
+                "Export results as SQL…",
+                icon::SAVE,
+                Command::ExportResults(FileAs::Inserts),
+                RESULTS,
+            ));
+        }
         items.push(bound(
             command(
                 "Copy results as TSV",
@@ -2901,10 +3778,174 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         ));
     }
 
+    // The switcher's chips, where it is drawn.
+    if let Some(tab) = session.active_query_tab() {
+        let chips = tab.switcher_chips();
+        if !chips.is_empty() {
+            items.push(bound(
+                command(
+                    "Next result",
+                    icon::CHEVRON_RIGHT,
+                    Command::NextResult,
+                    RESULTS,
+                ),
+                "next_result",
+            ));
+            items.push(bound(
+                command(
+                    "Previous result",
+                    icon::CHEVRON_LEFT,
+                    Command::PreviousResult,
+                    RESULTS,
+                ),
+                "previous_result",
+            ));
+        }
+        if chips.contains(&None) {
+            let label = match tab.switcher_selected() {
+                Some(_) => "Show messages",
+                None => "Show result",
+            };
+            items.push(bound(
+                command(label, icon::HISTORY, Command::ToggleMessages, RESULTS),
+                "show_messages",
+            ));
+        }
+    }
+
     if workspace.has_active_cell(cx) {
         items.push(bound(
             command("Copy row", icon::COPY, Command::CopyRow, RESULTS),
             "copy_row",
+        ));
+    }
+
+    // The cell menu's own entries, offered where it offers them: on a grid
+    // on screen, which a plan or the messages stand in front of.
+    let grid_shown = session
+        .active_query_tab()
+        .is_none_or(|tab| tab.plan_shown().is_none() && !tab.messages_shown());
+    let shown_grid = session
+        .active_results()
+        .filter(|_| grid_shown)
+        .map(|results| results.read(cx).delegate());
+    if let Some(grid) = shown_grid
+        && let Some((row, col)) = grid.active()
+        && let Some(name) = grid.columns().get(col).map(|column| column.name.clone())
+    {
+        let rows = match grid.selected_row_indices().len() {
+            0 | 1 => "row",
+            _ => "rows",
+        };
+        let engine = profile.config.engine();
+        for kind in RowsAs::ALL
+            .into_iter()
+            .filter(|kind| kind.offered_on(engine))
+        {
+            let (shape, id) = match kind {
+                RowsAs::Text => ("text", "copy_rows_text"),
+                RowsAs::Csv => ("CSV", "copy_rows_csv"),
+                RowsAs::CsvWithHeader => ("CSV with header", "copy_rows_csv_header"),
+                RowsAs::Json => ("JSON", "copy_rows_json"),
+                RowsAs::InsertSql => ("INSERT SQL", "copy_rows_insert"),
+            };
+            items.push(bound(
+                command(
+                    &format!("Copy {rows} as {shape}"),
+                    icon::COPY,
+                    Command::CopyRows(kind),
+                    RESULTS,
+                ),
+                id,
+            ));
+        }
+        if grid.follows_a_key(col) && grid.cell(row, col).is_some() {
+            items.push(bound(
+                command(
+                    "Follow foreign key",
+                    icon::FOLLOW_KEY,
+                    Command::FollowForeignKey,
+                    CELL,
+                ),
+                "follow_foreign_key",
+            ));
+        } else if let Some(opens) = grid.opens(row) {
+            items.push(bound(
+                command(
+                    &format!("Open \u{201c}{opens}\u{201d}"),
+                    icon::FOLLOW_KEY,
+                    Command::FollowForeignKey,
+                    CELL,
+                ),
+                "follow_foreign_key",
+            ));
+        }
+        if grid.is_referenced(row, col) {
+            items.push(bound(
+                command(
+                    "Show references…",
+                    icon::REFERENCED_BY,
+                    Command::ShowReferences,
+                    CELL,
+                ),
+                "show_references",
+            ));
+        }
+        items.push(bound(
+            command(
+                &format!("Sort by \u{201c}{name}\u{201d}"),
+                icon::SORTABLE,
+                Command::SortActiveColumn,
+                RESULTS,
+            ),
+            "sort_active_column",
+        ));
+        if grid.columns().len() - grid.hidden_columns() > 1 {
+            items.push(bound(
+                command(
+                    &format!("Hide column \u{201c}{name}\u{201d}"),
+                    icon::CLOSE,
+                    Command::HideColumn,
+                    RESULTS,
+                ),
+                "hide_column",
+            ));
+        }
+        let pin = match grid.is_pinned(col) {
+            true => format!("Unpin column \u{201c}{name}\u{201d}"),
+            false => format!("Pin column \u{201c}{name}\u{201d} to the left"),
+        };
+        items.push(bound(
+            command(&pin, icon::CHEVRON_LEFT, Command::TogglePinColumn, RESULTS),
+            "toggle_pin_column",
+        ));
+    }
+    // The status bar's Server and Client, as the one that is not in force.
+    if let Some(client) = crate::views::view_sorts_on_client(profile, cx) {
+        let label = match client {
+            true => "Sort on the server",
+            false => "Sort on the client",
+        };
+        items.push(command(
+            label,
+            icon::SORTABLE,
+            Command::SetViewSorting(!client),
+            RESULTS,
+        ));
+    }
+    // Not the active cell's: the columns come back whichever cell is ringed.
+    if let Some(hidden) = shown_grid
+        .map(|grid| grid.hidden_columns())
+        .filter(|hidden| *hidden > 0)
+    {
+        items.push(bound(
+            command(
+                &format!("Show all columns ({hidden} hidden)"),
+                icon::VIEW,
+                Command::ShowAllColumns,
+                RESULTS,
+            ),
+            "show_all_columns",
         ));
     }
 
@@ -2981,30 +4022,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         ));
     }
 
-    items.push(bound(
-        command(
-            "New connection…",
-            icon::PLUS,
-            Command::NewConnection,
-            CONNECTION,
-        ),
-        "new_connection",
-    ));
-    items.push(command(
-        "Open data file (CSV, Excel, Parquet, JSON)…",
-        icon::TABLE,
-        Command::OpenDataFiles,
-        CONNECTION,
-    ));
-    items.push(bound(
-        command(
-            "New project…",
-            icon::ADD_TO_PROJECT,
-            Command::NewProject,
-            CONNECTION,
-        ),
-        "new_project",
-    ));
+    items.extend(starting_items(overrides));
     // The active connection's share of what the Connections scope offers
     // every connection on its row's actions, for whoever looks for the verb.
     let active = workspace.active;
@@ -3043,6 +4061,49 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         Command::Confirm(Target::Connection(active)),
         CONNECTION,
     ));
+    items.push(bound(
+        command(
+            "Cycle access level",
+            mode_icon(profile.mode.next()),
+            Command::CycleMode,
+            CONNECTION,
+        ),
+        "cycle_mode",
+    ));
+    for (mode, id) in sql::Mode::ALL.into_iter().zip([
+        "set_mode_read_only",
+        "set_mode_read_write",
+        "set_mode_full",
+    ]) {
+        items.push(bound(
+            command(
+                &format!("Access level: {}", mode.label()),
+                mode_icon(mode),
+                Command::SetMode(mode),
+                CONNECTION,
+            )
+            .hint(if mode == profile.mode { "current" } else { "" }),
+            id,
+        ));
+    }
+    // As the titlebar's menu offers it: only once something was silenced.
+    let silenced = profile
+        .confirmed
+        .iter()
+        .map(|kind| kind.label())
+        .chain(profile.confirmed_stale.then_some("stale rows"))
+        .collect::<Vec<_>>();
+    if !silenced.is_empty() {
+        items.push(bound(
+            command(
+                &format!("Reset silenced confirmations ({})", silenced.join(", ")),
+                icon::RESET,
+                Command::ResetConfirmations,
+                CONNECTION,
+            ),
+            "reset_confirmations",
+        ));
+    }
     if !workspace.projects.is_empty() {
         items.push(command(
             "Rename project…",
@@ -3057,36 +4118,22 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             PROJECT,
         ));
     }
-    if Source::DBeaver.found() {
-        items.push(bound(
-            command(
-                "Import connections from DBeaver…",
-                icon::PLUS,
-                Command::ImportConnections(Source::DBeaver),
-                CONNECTION,
-            ),
-            "import_dbeaver",
-        ));
-    }
-    if Source::TablePlus.found() {
-        items.push(bound(
-            command(
-                "Import connections from TablePlus…",
-                icon::PLUS,
-                Command::ImportConnections(Source::TablePlus),
-                CONNECTION,
-            ),
-            "import_tableplus",
-        ));
-    }
     items.push(bound(
         command(
-            "Refresh connection",
-            icon::DATABASE,
+            "Refresh schema",
+            icon::REFRESH,
             Command::RefreshConnection,
             CONNECTION,
         ),
         "refresh_connection",
+    ));
+    // For a socket that hangs rather than fails, which nothing else can tell
+    // from a slow server. A refresh keeps the session; this is the way out of it.
+    items.push(command(
+        "Reconnect",
+        icon::DATABASE,
+        Command::Reconnect,
+        CONNECTION,
     ));
     if profile.config.engine().switches_database() {
         items.push(bound(
@@ -3107,31 +4154,15 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             CONNECTION,
         ));
     }
-    items.push(bound(
-        command(
-            "Select theme…",
-            icon::THEME,
-            Command::SelectTheme,
-            APPEARANCE,
-        ),
-        "cycle_theme",
-    ));
-    for (label, slot) in [
-        ("Chrome font…", FontSlot::Chrome),
-        ("Editor font…", FontSlot::Editor),
-        ("Grid font…", FontSlot::Grid),
-    ] {
+    items.extend(appearance_items(overrides));
+    if let Some(release) = &workspace.newer_release {
         items.push(command(
-            label,
-            icon::FONT,
-            Command::PickFont(slot),
-            APPEARANCE,
+            &format!("Download dbdelve {}", release.version),
+            icon::LINK,
+            Command::DownloadUpdate(release.url.clone()),
+            WINDOW,
         ));
     }
-    items.push(bound(
-        command("Settings", icon::SETTINGS, Command::OpenSettings, WINDOW),
-        "open_settings",
-    ));
     // One row rather than a Show/Hide pair: the palette is built from the
     // session, which does not know whether the column is folded.
     items.push(bound(
@@ -3143,6 +4174,26 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         ),
         "toggle_sidebar",
     ));
+    items.push(bound(
+        command(
+            "Focus sidebar",
+            icon::SIDEBAR,
+            Command::FocusSidebar,
+            WINDOW,
+        ),
+        "focus_sidebar",
+    ));
+    if session.active_results().is_some() || session.active_object().is_some() {
+        items.push(bound(
+            command(
+                "Focus results",
+                icon::ROW_PANEL,
+                Command::ToggleResultsFocus,
+                WINDOW,
+            ),
+            "toggle_results_focus",
+        ));
+    }
     items.push(bound(
         command(
             "Toggle row panel",
@@ -3196,10 +4247,15 @@ fn beside_import(command: &Command) -> bool {
             | Command::PickProject(_)
             | Command::ImportConnections(_)
             | Command::RefreshConnection
+            | Command::Reconnect
             | Command::SelectTheme
             | Command::PickFont(_)
             | Command::OpenSettings
             | Command::ToggleSidebar
+            | Command::CycleMode
+            | Command::SetMode(_)
+            | Command::ResetConfirmations
+            | Command::DownloadUpdate(_)
     )
 }
 
@@ -3210,6 +4266,7 @@ fn kind_label(kind: ObjectKind) -> &'static str {
         ObjectKind::Relation(RelationKind::View) => "view",
         ObjectKind::Relation(RelationKind::MaterializedView) => "materialized view",
         ObjectKind::Relation(RelationKind::ForeignTable) => "foreign table",
+        ObjectKind::Relation(RelationKind::Dictionary) => "dictionary",
         ObjectKind::Routine(RoutineKind::Function) => "function",
         ObjectKind::Routine(RoutineKind::Procedure) => "procedure",
     }
@@ -3254,6 +4311,7 @@ mod tests {
             &mut Fuzzy::new(),
             &recents,
             &HashSet::new(),
+            HistoryView::default(),
         );
         labels(items, &arranged.rows)
     }
@@ -3362,6 +4420,7 @@ mod tests {
             &mut Fuzzy::new(),
             &recents,
             &HashSet::new(),
+            HistoryView::default(),
         )
         .rows;
         assert_eq!(rows[..2], [Row::Header(RECENT_GROUP.into()), Row::Item(1)]);
@@ -3398,6 +4457,7 @@ mod tests {
             &mut Fuzzy::new(),
             &recents,
             &HashSet::new(),
+            HistoryView::default(),
         )
         .rows;
         assert_eq!(
@@ -3527,6 +4587,157 @@ mod tests {
         );
     }
 
+    fn run(sql: &str, outcome: Option<Outcome>, ms: Option<u64>, rows: Option<u64>) -> Item {
+        item(sql, Scope::History, "").ran(Ran { outcome, ms, rows })
+    }
+
+    fn history(
+        items: &[Item],
+        query: &str,
+        status: HistoryStatus,
+        order: HistoryOrder,
+    ) -> Vec<String> {
+        let rows = arrange(
+            items,
+            Some(Scope::History),
+            &Query::new(query),
+            &mut Fuzzy::new(),
+            &[],
+            &HashSet::new(),
+            HistoryView { status, order },
+        )
+        .rows;
+        labels(items, &rows)
+    }
+
+    #[test]
+    fn history_filters_by_how_a_run_ended_and_sorts_with_the_unmeasured_last() {
+        use HistoryOrder::*;
+        use HistoryStatus::*;
+        let items = [
+            run("select fast", Some(Outcome::Succeeded), Some(5), Some(900)),
+            run("select broken", Some(Outcome::Failed), Some(40), None),
+            run("select legacy", None, None, None),
+            run("select slow", Some(Outcome::Succeeded), Some(800), Some(3)),
+            run(
+                "select stopped",
+                Some(Outcome::Cancelled),
+                Some(2_000),
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            history(&items, "", All, Newest),
+            [
+                "select fast",
+                "select broken",
+                "select legacy",
+                "select slow",
+                "select stopped"
+            ]
+        );
+        assert_eq!(
+            history(&items, "", Succeeded, Newest),
+            ["select fast", "select slow"]
+        );
+        assert_eq!(history(&items, "", Failed, Newest), ["select broken"]);
+        assert_eq!(
+            history(&items, "", All, Slowest),
+            [
+                "select stopped",
+                "select slow",
+                "select broken",
+                "select fast",
+                "select legacy"
+            ]
+        );
+        // Ties and the unmeasured keep the order they had, newest first.
+        assert_eq!(
+            history(&items, "", All, MostRows),
+            [
+                "select fast",
+                "select slow",
+                "select broken",
+                "select legacy",
+                "select stopped"
+            ]
+        );
+        // What is typed still decides which rows are listed.
+        assert_eq!(history(&items, "slow", All, MostRows), ["select slow"]);
+        // Under All the history keeps its own order, whatever History is set to.
+        let all = arrange(
+            &items,
+            Some(Scope::All),
+            &Query::new(""),
+            &mut Fuzzy::new(),
+            &[],
+            &HashSet::new(),
+            HistoryView {
+                status: Failed,
+                order: Slowest,
+            },
+        )
+        .rows;
+        assert_eq!(labels(&items, &all)[1], "select fast");
+    }
+
+    #[test]
+    fn a_runs_hint_says_when_what_it_came_to_and_how_long() {
+        let minute = 60_000;
+        let now = 1_761_900_000_000; // 2025-10-31
+        let at = |ago: u64| HistoryEntry {
+            sql: "select 1".into(),
+            at: Some(now - ago),
+            ..HistoryEntry::default()
+        };
+        let hint = |entry: HistoryEntry| history_hint(&entry, now);
+
+        assert_eq!(hint(HistoryEntry::default()), "");
+        assert_eq!(hint(at(0)), "just now");
+        assert_eq!(
+            hint(HistoryEntry {
+                rows: Some(1),
+                ms: Some(18),
+                ..at(3 * minute)
+            }),
+            "3m ago · 1 row · 18 ms"
+        );
+        assert_eq!(
+            hint(HistoryEntry {
+                rows: Some(1_000),
+                capped: true,
+                ms: Some(1_250),
+                ..at(2 * 60 * minute)
+            }),
+            "2h ago · 1,000 rows · capped · 1.2 s"
+        );
+        assert_eq!(
+            hint(HistoryEntry {
+                affected: Some(5),
+                ms: Some(123_000),
+                ..at(30 * 60 * minute)
+            }),
+            "yesterday · 5 affected · 2m 3s"
+        );
+        assert_eq!(
+            hint(HistoryEntry {
+                error: Some("no such table".into()),
+                ms: Some(4),
+                ..at(3 * 24 * 60 * minute)
+            }),
+            "3d ago · failed · 4 ms"
+        );
+        assert_eq!(
+            hint(HistoryEntry {
+                cancelled: true,
+                ..at(20 * 24 * 60 * minute)
+            }),
+            "Oct 11 · cancelled"
+        );
+        assert_eq!(hint(at(400 * 24 * 60 * minute)), "Sep 26, 2024");
+    }
+
     #[test]
     fn the_filter_rows_are_found_by_the_word_the_user_would_type() {
         // A palette row nobody can find by typing the obvious word is a row
@@ -3582,7 +4793,7 @@ mod tests {
         rows.push(Listed {
             unavailable: Some((0, "Needs the odbc plugin".into())),
             logo: icon::DATABASE,
-            ..listed("ch", "ClickHouse", "")
+            ..listed("ch", "Oracle", "")
         });
         projects[0].connections.push("ch".into());
         (rows, projects)
@@ -3592,10 +4803,7 @@ mod tests {
     fn an_unavailable_connection_is_listed_greyed_in_its_project() {
         let (rows, projects) = with_unavailable();
         let items = listed_connections(&rows, &projects, 0);
-        let row = items
-            .iter()
-            .find(|item| item.label == "ClickHouse")
-            .unwrap();
+        let row = items.iter().find(|item| item.label == "Oracle").unwrap();
         assert!(matches!(
             row.command,
             Command::Confirm(Target::Unavailable(0))
@@ -3622,18 +4830,22 @@ mod tests {
                 &HashSet::new(),
             )
         };
-        assert_eq!(verb("ClickHouse"), "Remove");
+        assert_eq!(verb("Oracle"), "Remove");
         assert_eq!(verb("Orders"), "Switch");
     }
 
     #[test]
-    fn with_no_connection_only_unavailable_ones_open_beside_themes_engines_and_fonts() {
+    fn with_no_connection_the_welcome_verbs_and_unavailable_ones_open_beside_themes_engines_and_fonts()
+     {
         let open = |mode, unavailable| without_a_connection(mode, unavailable);
         assert!(open(Mode::Engine, false) == Some(Mode::Engine));
         assert!(open(Mode::Theme(None), false) == Some(Mode::Theme(None)));
         assert!(open(Mode::Font(FontSlot::Grid), false) == Some(Mode::Font(FontSlot::Grid)));
+        for mode in [Mode::Search(Scope::Commands), Mode::Search(Scope::All)] {
+            assert!(open(mode, false) == Some(mode));
+        }
         for mode in [
-            Mode::Search(Scope::Commands),
+            Mode::Search(Scope::Objects),
             Mode::Search(Scope::Connections),
             Mode::Confirm(Target::Unavailable(0)),
         ] {
@@ -3677,6 +4889,7 @@ mod tests {
             &mut Fuzzy::new(),
             &[],
             &collapsed,
+            HistoryView::default(),
         );
         let drawn = rows
             .iter()

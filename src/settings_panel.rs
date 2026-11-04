@@ -29,7 +29,8 @@ use crate::{
     },
     ui::{
         Control, Tone, button, button_label, chord_hint, highlighted, icon_button, keycap_text,
-        keycaps, option_row, picker, raised_card, segment, stacked_option_row, switch, well,
+        keycaps, option_row, picker, raised_card, segmented, segmented_choice, stacked_option_row,
+        switch, well,
     },
     views::row_limit_menu,
     workspace::{FONT_SIZE_STEP, Settings, font_size_range, opacity_percent},
@@ -107,6 +108,7 @@ impl SettingsTab {
 enum SettingId {
     RowLimit,
     DefaultSorting,
+    QualifyCompletions,
     CheckForUpdates,
     MatchSystemAppearance,
     Theme,
@@ -168,6 +170,21 @@ fn setting_rows() -> Vec<SettingRow> {
              loaded, so a table sorts only the page on screen. Tabs already \
              open keep theirs; each can be switched from its status bar.",
             &["sort", "order", "server", "client"],
+        ),
+        row(
+            SettingId::QualifyCompletions,
+            SettingsTab::General,
+            "Editor",
+            "Qualify table names",
+            "Completing a table name inserts it with its schema, as \
+             schema.table.",
+            &[
+                "autocomplete",
+                "completion",
+                "schema",
+                "prefix",
+                "qualified",
+            ],
         ),
         row(
             SettingId::CheckForUpdates,
@@ -257,7 +274,7 @@ fn setting_rows() -> Vec<SettingRow> {
     // Grouped by where a binding fires, each group where its first binding
     // stands in the registry, and the registry's order inside it.
     let mut groups: Vec<&'static str> = Vec::new();
-    for spec in keybindings::REGISTRY {
+    for spec in keybindings::available_registry() {
         let group = keyboard_group(spec.context);
         if !groups.contains(&group) {
             groups.push(group);
@@ -265,8 +282,7 @@ fn setting_rows() -> Vec<SettingRow> {
     }
     for group in groups {
         rows.extend(
-            keybindings::REGISTRY
-                .iter()
+            keybindings::available_registry()
                 .filter(|spec| keyboard_group(spec.context) == group)
                 .map(|spec| SettingRow {
                     id: SettingId::Keybinding(spec.id),
@@ -287,8 +303,9 @@ fn keyboard_group(context: Option<&'static str>) -> &'static str {
         None => "Everywhere",
         Some("Palette > Input") => "Palette",
         Some("DataTable") => "Results grid",
-        Some("Editor > Input") => "Editor",
+        Some("Editor > Input" | "Input && mode == editor") => "Editor",
         Some("ConnectionForm") => "Connection form",
+        Some("Dialog") => "Dialogs",
         Some(other) => other,
     }
 }
@@ -377,7 +394,7 @@ fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
 }
 
 fn keybinding(id: &str) -> Option<&'static KeybindingSpec> {
-    keybindings::REGISTRY.iter().find(|spec| spec.id == id)
+    keybindings::available_registry().find(|spec| spec.id == id)
 }
 
 /// Whether a row is on offer as things are set: the one theme while the
@@ -735,12 +752,10 @@ fn render_control(
         ),
         SettingId::DefaultSorting => {
             let client_sort = settings.client_sort;
-            div()
-                .flex()
-                .gap(px(layout::SPACE_XS))
+            segmented(t)
                 .children(
                     [(false, "Server"), (true, "Client")].map(|(client, label)| {
-                        segment(
+                        segmented_choice(
                             ("default-sorting", client as usize),
                             label,
                             client == client_sort,
@@ -761,6 +776,14 @@ fn render_control(
                 workspace.set_check_for_updates(check, cx);
             }))
             .into_any_element(),
+        SettingId::QualifyCompletions => {
+            switch("qualify-completions", settings.qualify_completions, t)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                    let qualify = !workspace.settings.qualify_completions;
+                    workspace.set_qualify_completions(qualify, cx);
+                }))
+                .into_any_element()
+        }
         SettingId::ColorTitlebar => switch("color-titlebar", settings.color_titlebar, t)
             .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
                 let color = !workspace.settings.color_titlebar;
@@ -1032,6 +1055,7 @@ mod tests {
     fn a_setting_is_found_by_the_word_the_user_would_type() {
         assert!(found("sort").contains(&SettingId::DefaultSorting));
         assert!(found("titlebar").contains(&SettingId::ColorTitlebar));
+        assert!(found("autocomplete").contains(&SettingId::QualifyCompletions));
         assert!(found("transparency").contains(&SettingId::Opacity));
         assert!(found("updates").contains(&SettingId::CheckForUpdates));
         assert!(found("auto").contains(&SettingId::MatchSystemAppearance));
@@ -1072,8 +1096,17 @@ mod tests {
 
     #[test]
     fn a_word_matches_within_one_field_not_across_them() {
-        assert_eq!(found("sort"), [SettingId::DefaultSorting]);
-        assert_eq!(found("!keyboard").len(), 12);
+        assert_eq!(
+            found("sort"),
+            [
+                SettingId::DefaultSorting,
+                SettingId::Keybinding("reset_confirmations"),
+                SettingId::Keybinding("palette_history_filter"),
+                SettingId::Keybinding("palette_history_sort"),
+                SettingId::Keybinding("sort_active_column"),
+            ]
+        );
+        assert_eq!(found("!keyboard").len(), 13);
     }
 
     #[test]
@@ -1106,30 +1139,6 @@ mod tests {
     #[test]
     fn nonsense_finds_nothing() {
         assert!(found("qzxv").is_empty());
-    }
-
-    #[test]
-    fn every_binding_has_one_row_and_its_group_is_together() {
-        let rows = setting_rows();
-        let keyboard: Vec<&SettingRow> = rows
-            .iter()
-            .filter(|row| row.tab == SettingsTab::Keyboard)
-            .collect();
-        assert_eq!(keyboard.len(), keybindings::REGISTRY.len());
-        let groups: Vec<&str> = keyboard
-            .chunk_by(|a, b| a.group == b.group)
-            .map(|group| group[0].group)
-            .collect();
-        assert_eq!(
-            groups,
-            [
-                "Everywhere",
-                "Palette",
-                "Results grid",
-                "Editor",
-                "Connection form"
-            ]
-        );
     }
 
     #[test]

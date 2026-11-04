@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use futures_util::{FutureExt, StreamExt, future::Fuse};
+use futures_util::{Stream, StreamExt, stream};
 use geozero::{CoordDimensions, ToWkt, wkb::Ewkb};
 use tokio::runtime::Runtime;
 use tokio_postgres::{
-    CancelToken, NoTls, SimpleQueryMessage, SimpleQueryStream, config::Host, error::SqlState,
+    AsyncMessage, CancelToken, NoTls, SimpleQueryMessage, SimpleQueryStream, config::Host,
+    error::SqlState,
 };
 
 use crate::tls;
@@ -23,6 +24,9 @@ use super::{
     assemble_structure, create_table, non_utf8_error, optional_cell, plain_error, required_cell,
     terminated,
 };
+
+mod pgpass;
+mod service;
 
 /// The port the server listens on when the profile does not say.
 pub(super) const DEFAULT_PORT: u16 = 5432;
@@ -222,9 +226,31 @@ WHERE namespace.nspname = {schema}
 ORDER BY attribute.attnum
 ";
 
+// A key column's own rendering leaves out its order, which `indoption` holds:
+// bit 1 for DESC, bit 2 for NULLS FIRST, each spelled only where it is not the
+// default for the direction. Columns past `indnkeyatts` are INCLUDE columns.
 const STRUCTURE_INDEXES_SQL: &str = "
 SELECT
     index_class.relname AS object_name,
+    CASE
+        WHEN index_entry.indisprimary THEN 'primary'
+        WHEN index_entry.indisunique THEN 'unique'
+        ELSE 'plain'
+    END AS index_kind,
+    (
+        SELECT string_agg(
+            pg_catalog.pg_get_indexdef(index_entry.indexrelid, key, true)
+                || CASE index_entry.indoption[key - 1] & 3
+                    WHEN 1 THEN ' DESC NULLS LAST'
+                    WHEN 2 THEN ' NULLS FIRST'
+                    WHEN 3 THEN ' DESC'
+                    ELSE ''
+                END,
+            chr(31) ORDER BY key
+        )
+        FROM generate_series(1, index_entry.indnkeyatts) AS key
+    ) AS index_columns,
+    pg_catalog.pg_get_expr(index_entry.indpred, index_entry.indrelid, true) AS index_predicate,
     pg_catalog.pg_get_indexdef(index_entry.indexrelid) AS definition
 FROM pg_catalog.pg_index AS index_entry
 JOIN pg_catalog.pg_class AS index_class
@@ -383,56 +409,100 @@ const SIDE_TIMEOUT_SECONDS: u32 = 2;
 /// before they are shown untyped, to be restyled once it answers.
 const TYPES_PATIENCE: Duration = Duration::from_secs(1);
 
-pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
+/// What a Postgres profile connects with: a server engine's fields plus the
+/// connection service that fills in what they leave blank.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostgresConfig {
+    /// `host` and `user` may be blank beside a `service`, which answers for them.
+    pub server: ServerConfig,
+    /// libpq's `service`: a section of a connection service file.
+    pub service: Option<String>,
+}
+
+impl PostgresConfig {
+    pub fn endpoint(&self) -> String {
+        match &self.service {
+            Some(service) if self.server.host.is_empty() => match self.server.port {
+                Some(port) => format!("service {service}:{port}"),
+                None => format!("service {service}"),
+            },
+            _ => self.server.endpoint(),
+        }
+    }
+
+    /// The server to reach, read as a connection opens: before the tunnel, TLS
+    /// and the password file, which all use what a service can supply.
+    pub fn resolved(&self) -> Result<ServerConfig, DbError> {
+        service::resolved(self).map_err(plain_error)
+    }
+}
+
+pub fn config_from_url(url: &str) -> Result<PostgresConfig, String> {
     let url_parts =
         url::Url::parse(url).map_err(|error| format!("Connection URL is invalid: {error}"))?;
     let has_explicit_port = url_parts.port().is_some()
         || url_parts
             .query_pairs()
             .any(|(key, _)| key.as_ref() == "port");
-    // The two keys dbdelve owns come out of the URL before the driver sees
-    // it. Its parser has a fixed key list and refuses anything outside it,
-    // so `sslrootcert` would die as "invalid connection string" and so
-    // would `sslmode=verify-full` — naming neither the option nor the
-    // reason. dbdelve carries both itself and re-emits an `sslmode` the
-    // driver does know.
+    // The keys dbdelve owns come out of the URL before the driver sees it.
+    // Its parser has a fixed key list and refuses anything outside it, so
+    // `sslrootcert` would die as "invalid connection string" and so would
+    // `sslmode=verify-full` — naming neither the option nor the reason.
+    // dbdelve carries them itself and re-emits an `sslmode` the driver does
+    // know.
     let mut sslmode = tls::SslMode::default();
     let mut root_certificate = None;
+    let mut service = None;
     let mut passed_through = Vec::new();
     for (key, value) in url_parts.query_pairs() {
         match key.as_ref() {
             "sslmode" => sslmode = tls::SslMode::parse(value.as_ref())?,
+            // The driver has no such key, and what a service sets is read on
+            // connect: see `service`.
+            "service" => service = Some(value.trim().to_string()).filter(|s| !s.is_empty()),
             "sslrootcert" => {
                 root_certificate = Some(value.trim().to_string()).filter(|p| !p.is_empty());
             }
             _ => passed_through.push((key.into_owned(), value.into_owned())),
         }
     }
-    let mut without_tls_keys = url_parts.clone();
-    without_tls_keys.set_query(None);
+    let mut for_driver = url_parts.clone();
+    for_driver.set_query(None);
     {
-        let mut query = without_tls_keys.query_pairs_mut();
+        let mut query = for_driver.query_pairs_mut();
         for (key, value) in &passed_through {
             query.append_pair(key, value);
         }
     }
-    let parsed: tokio_postgres::Config = without_tls_keys
+    let parsed: tokio_postgres::Config = for_driver
         .as_str()
         .parse()
         .map_err(|error| format!("Connection URL is invalid: {error}"))?;
+    // Rule 6: a profile has no way to hold "not said", so `prefer`, the default,
+    // reads as that beside a service and the service's own mode would replace it.
+    if service.is_some()
+        && sslmode == tls::SslMode::Prefer
+        && url_parts.query_pairs().any(|(key, _)| key == "sslmode")
+    {
+        return Err(
+            "sslmode=prefer cannot be stated beside a service: leave it out, or name another mode."
+                .into(),
+        );
+    }
     let host = match parsed.get_hosts() {
         [Host::Tcp(host)] => host.clone(),
+        [] if service.is_some() => String::new(),
         [] => return Err("Connection URL does not contain a host.".into()),
         #[cfg(unix)]
         [Host::Unix(_)] => return Err("Connection URL contains a Unix socket host.".into()),
         _ => return Err("Connection URL contains more than one host.".into()),
     };
     let database = parsed.get_dbname().unwrap_or_default().to_string();
-    let user = parsed
-        .get_user()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Connection URL does not contain a username.".to_string())?
-        .to_string();
+    let user = match parsed.get_user().filter(|value| !value.is_empty()) {
+        Some(user) => user.to_string(),
+        None if service.is_some() => String::new(),
+        None => return Err("Connection URL does not contain a username.".into()),
+    };
     let password = parsed
         .get_password()
         .map(|password| {
@@ -443,23 +513,26 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
         .transpose()?
         .unwrap_or_default();
 
-    Ok(ServerConfig {
-        host,
-        // Last wins, as in libpq: the driver's URL parser takes a port
-        // from the host section first -- 5432 when there is none -- and
-        // then pushes any `?port=` value after it.
-        port: has_explicit_port
-            .then(|| parsed.get_ports().last().copied())
-            .flatten(),
-        database,
-        user,
-        password,
-        sslmode,
-        root_certificate,
-        // A URL has nowhere to say it; the form is where it is set.
-        statement_timeout: 0,
-        ssh: None,
-        schema: None,
+    Ok(PostgresConfig {
+        server: ServerConfig {
+            host,
+            // Last wins, as in libpq: the driver's URL parser takes a port
+            // from the host section first -- 5432 when there is none -- and
+            // then pushes any `?port=` value after it.
+            port: has_explicit_port
+                .then(|| parsed.get_ports().last().copied())
+                .flatten(),
+            database,
+            user,
+            password,
+            sslmode,
+            root_certificate,
+            // A URL has nowhere to say it; the form is where it is set.
+            statement_timeout: 0,
+            ssh: None,
+            schema: None,
+        },
+        service,
     })
 }
 
@@ -469,16 +542,9 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
 /// that a username containing `@` or a password containing a space is
 /// passed through intact instead of truncating the string.
 fn connection_string(server: &ServerConfig) -> String {
-    // An empty `dbname` would have the server pick the user's name, often a
-    // database that does not exist; `postgres` is what createdb connects to.
-    let dbname = if server.database.is_empty() {
-        "postgres"
-    } else {
-        &server.database
-    };
     let mut parts = vec![
         format!("host={}", quote(&server.host)),
-        format!("dbname={}", quote(dbname)),
+        format!("dbname={}", quote(dbname(server))),
         format!("user={}", quote(&server.user)),
     ];
     if let Some(port) = server.port {
@@ -554,6 +620,29 @@ fn set_search_path(client: &mut Client, schema: &str) -> Result<(), DbError> {
 
 /// The server's own name, which TLS verifies, dialled at the tunnel's address
 /// through `hostaddr`, which the certificate check never sees.
+/// An empty `dbname` would have the server pick the user's name, often a
+/// database that does not exist; `postgres` is what createdb connects to.
+fn dbname(server: &ServerConfig) -> &str {
+    if server.database.is_empty() {
+        "postgres"
+    } else {
+        &server.database
+    }
+}
+
+/// The profile's own host and port, not the tunnel's local end: those are
+/// what a `.pgpass` line written for the server names.
+fn password_file(server: &ServerConfig) -> Option<pgpass::Lookup> {
+    server.password.is_empty().then(|| {
+        pgpass::lookup(
+            &server.host,
+            server.port.unwrap_or(DEFAULT_PORT),
+            dbname(server),
+            &server.user,
+        )
+    })
+}
+
 fn tunnelled_string(server: &ServerConfig, dial: SocketAddr) -> String {
     let dialled = ServerConfig {
         port: Some(dial.port()),
@@ -569,7 +658,9 @@ fn quote(value: &str) -> String {
 
 type Error = tokio_postgres::Error;
 /// The driver's half of a connection, whose type differs with the TLS stream.
-type Socket = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+/// Read as a stream of its messages rather than awaited as a future: awaiting
+/// it logs each notice and drops it.
+type Socket = Pin<Box<dyn Stream<Item = Result<AsyncMessage, Error>> + Send>>;
 
 /// tokio-postgres on a current-thread runtime of its own, driven only while a
 /// call blocks on it: what the `postgres` crate does, which offers no way to
@@ -584,7 +675,10 @@ struct Client {
 
 struct Driver {
     runtime: Runtime,
-    connection: Fuse<Socket>,
+    /// `None` once the connection has ended, cleanly or with an error.
+    connection: Option<Socket>,
+    /// The server's notices, as psql prints them, in the order they came.
+    notices: Vec<String>,
 }
 
 impl Driver {
@@ -594,10 +688,25 @@ impl Driver {
     /// closed", not the server's FATAL, as it was under the `postgres` crate.
     fn block_on<T>(&mut self, future: impl Future<Output = T>) -> Result<T, Error> {
         let mut future = pin!(future);
-        let connection = &mut self.connection;
-        self.runtime.block_on(poll_fn(|cx| {
-            if let Poll::Ready(Err(error)) = connection.poll_unpin(cx) {
-                return Poll::Ready(Err(error));
+        let Self {
+            runtime,
+            connection,
+            notices,
+        } = self;
+        runtime.block_on(poll_fn(|cx| {
+            while let Some(socket) = connection {
+                match socket.poll_next_unpin(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(Ok(AsyncMessage::Notice(notice)))) => {
+                        notices.push(notice_text(&notice));
+                    }
+                    Poll::Ready(Some(Ok(_))) => {}
+                    Poll::Ready(Some(Err(error))) => {
+                        *connection = None;
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Ready(None) => *connection = None,
+                }
             }
             future.as_mut().poll(cx).map(Ok)
         }))
@@ -606,18 +715,30 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        use futures_util::future::FusedFuture;
-        // A finished `Fuse` is pending forever, so waiting on one would sit out
-        // the whole grace period.
-        if self.connection.is_terminated() {
+        // An ended connection is pending forever, so waiting on one would sit
+        // out the whole grace period.
+        let Some(connection) = &mut self.connection else {
             return;
-        }
-        let connection = &mut self.connection;
+        };
+        let ended = async { while let Some(Ok(_)) = connection.next().await {} };
         // Built inside the runtime: a timer outside one has no clock to read.
         let _ = self
             .runtime
-            .block_on(async { tokio::time::timeout(Duration::from_secs(1), connection).await });
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), ended).await });
     }
+}
+
+/// psql's layout: the severity, then any `DETAIL` and `HINT` on lines of their
+/// own.
+fn notice_text(notice: &tokio_postgres::error::DbError) -> String {
+    let mut text = format!("{}:  {}", notice.severity(), notice.message());
+    if let Some(detail) = notice.detail() {
+        text.push_str(&format!("\nDETAIL:  {detail}"));
+    }
+    if let Some(hint) = notice.hint() {
+        text.push_str(&format!("\nHINT:  {hint}"));
+    }
+    text
 }
 
 /// A live connection. Cloneable so a background task can take one without
@@ -636,7 +757,7 @@ pub struct Connection {
     cancel: CancelToken,
     /// The same connector the client was built with, because cancelling opens a
     /// second socket to the same server and an `sslmode` is never quietly
-    /// weakened for it either (AGENTS.md, hard rule 7).
+    /// weakened for it either (AGENTS.md, hard rule 6).
     connector: Option<tls::MakeRustlsConnect>,
     /// The server process behind the client, for asking after the statement
     /// it is running from another connection. `None` if it would not say.
@@ -644,6 +765,9 @@ pub struct Connection {
     /// The schema the server's own `search_path` put the session in, read
     /// before a picked one is set. None if it would not say, or names none.
     current_schema: Option<String>,
+    /// The database this session is on, which a service may have named where
+    /// the profile left it blank. A session stays on the one it opened.
+    current_database: String,
     /// A second session to the same server, for what has to be asked while
     /// this one is busy with a statement's rows: its column types, and
     /// whether it can be stopped at the row limit. Opened the first time it
@@ -666,6 +790,10 @@ impl Connection {
         tunnelled(server, DEFAULT_PORT, |tunnel| Self::connect(server, tunnel))
     }
 
+    pub fn current_database(&self) -> &str {
+        &self.current_database
+    }
+
     /// Open the side session now, so the first run's types and stop do not
     /// wait out its connect.
     pub fn warm(&self) {
@@ -682,9 +810,19 @@ impl Connection {
                 message,
                 position: None,
             })?;
+        let password_file = password_file(server);
+        // Only for this connect: the profile keeps its blank password, so the
+        // file is read again by the next one and never reaches the Keychain.
+        let signing_in = match &password_file {
+            Some(pgpass::Lookup::Found { password, .. }) => &ServerConfig {
+                password: password.clone(),
+                ..server.clone()
+            },
+            _ => server,
+        };
         let string = match &tunnel {
-            None => connection_string(server),
-            Some(tunnel) => tunnelled_string(server, tunnel.dial()?),
+            None => connection_string(signing_in),
+            Some(tunnel) => tunnelled_string(signing_in, tunnel.dial()?),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -693,17 +831,34 @@ impl Connection {
         let (client, connection) = match &connector {
             None => runtime
                 .block_on(tokio_postgres::connect(&string, NoTls))
-                .map(|(client, connection)| (client, Box::pin(connection) as Socket)),
+                .map(|(client, mut connection)| {
+                    let socket = stream::poll_fn(move |cx| connection.poll_message(cx));
+                    (client, Box::pin(socket) as Socket)
+                }),
             Some(connector) => runtime
                 .block_on(tokio_postgres::connect(&string, connector.clone()))
-                .map(|(client, connection)| (client, Box::pin(connection) as Socket)),
+                .map(|(client, mut connection)| {
+                    let socket = stream::poll_fn(move |cx| connection.poll_message(cx));
+                    (client, Box::pin(socket) as Socket)
+                }),
         }
-        .map_err(|error| connect_error(&error, server))?;
+        .map_err(|error| {
+            let mut failure = connect_error(&error, server);
+            if let Some(note) = password_file
+                .as_ref()
+                .and_then(|lookup| lookup.note(&error))
+            {
+                failure.message.push('\n');
+                failure.message.push_str(&note);
+            }
+            failure
+        })?;
         let mut client = Client {
             client,
             driver: Driver {
                 runtime,
-                connection: connection.fuse(),
+                connection: Some(connection),
+                notices: Vec::new(),
             },
         };
         let row =
@@ -730,6 +885,7 @@ impl Connection {
             cancel: client.client.cancel_token(),
             pid,
             current_schema,
+            current_database: dbname(server).to_string(),
             side: Arc::default(),
             connector,
             client: Arc::new(Mutex::new(client)),
@@ -865,6 +1021,7 @@ impl Connection {
             driver,
         } = &mut *client;
         let failed = |error: Error| query_error(&error, sql);
+        driver.notices.clear();
         let mut messages = Box::pin(
             driver
                 .block_on(inner.simple_query_raw(sql))
@@ -889,7 +1046,11 @@ impl Connection {
                 .map_err(failed)??;
         }
         drop(messages);
+        let notices = std::mem::take(&mut driver.notices);
         let (mut result, commands) = assembly.finish();
+        if typed {
+            result.messages = notices;
+        }
 
         // Types are learned after the statement ran, and only from a single
         // statement that returned columns. A refused `Parse` is an error
@@ -1107,9 +1268,10 @@ impl Connection {
         let view = match kind {
             RelationKind::View => Some("VIEW"),
             RelationKind::MaterializedView => Some("MATERIALIZED VIEW"),
-            RelationKind::Table | RelationKind::PartitionedTable | RelationKind::ForeignTable => {
-                None
-            }
+            RelationKind::Table
+            | RelationKind::PartitionedTable
+            | RelationKind::ForeignTable
+            | RelationKind::Dictionary => None,
         };
         if let Some(view) = view {
             let result = self.internal_query(&format!(
@@ -1331,6 +1493,7 @@ fn resolve_edit_target(probed: &[ProbedColumn], table: &KeyedTable) -> Option<Ed
             })
             .collect(),
         keys,
+        ..Default::default()
     })
 }
 
@@ -1700,7 +1863,7 @@ fn io_source(error: &tokio_postgres::Error) -> Option<&std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ForeignKey, RelationKind, RoutineKind, SslMode, result, rows};
+    use crate::db::{ForeignKey, IndexKind, RelationKind, RoutineKind, SslMode, result, rows};
 
     fn config() -> ServerConfig {
         ServerConfig {
@@ -1839,6 +2002,142 @@ mod tests {
         assert!(
             set_search_path_sql(r#"it's "odd" \here"#).contains(r#"E'"it''s ""odd"" \\here"'"#)
         );
+    }
+
+    /// Run again in a child process, for the same reason as the password file
+    /// test below: `PGSERVICEFILE` has to be set before it starts, and the file
+    /// holds the live password.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_profile_naming_a_service_connects_where_the_file_says() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        const CHILD: &str = "DBDELVE_PGSERVICE_CHILD";
+        let name =
+            "db::postgres::tests::live_a_profile_naming_a_service_connects_where_the_file_says";
+        if std::env::var_os(CHILD).is_none() {
+            let directory =
+                std::env::temp_dir().join(format!("dbdelve-pgservice-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .expect("the private directory should create");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--include-ignored", "--nocapture"])
+                .env(CHILD, "1")
+                .env("PGSERVICEFILE", directory.join("pg_service.conf"))
+                .status()
+                .expect("the child test should run");
+            let _ = std::fs::remove_dir_all(&directory);
+            assert!(status.success());
+            return;
+        }
+
+        let config = live_config();
+        let file = std::env::var_os("PGSERVICEFILE").unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "[unrelated]\nhost=nowhere.invalid\n\n[harness]\nhost={}\nport={}\n\
+                 dbname={}\nuser={}\npassword={}\nsslmode={}\n",
+                config.host,
+                config.port.unwrap_or(DEFAULT_PORT),
+                config.database,
+                config.user,
+                config.password,
+                config.sslmode.as_str(),
+            ),
+        )
+        .expect("the service file should write");
+
+        let named = |service: &str| {
+            crate::db::ConnectionConfig::Postgres(PostgresConfig {
+                service: Some(service.into()),
+                ..PostgresConfig::default()
+            })
+        };
+        let opened = crate::db::Connection::open(named("harness"))
+            .expect("the service should say where to connect");
+        assert_eq!(opened.spelled_database(), Some(config.database.as_str()));
+        let failure = crate::db::Connection::open(named("absent"))
+            .err()
+            .expect("an unknown service should fail")
+            .message;
+        assert!(failure.contains("absent"), "{failure}");
+    }
+
+    /// Run again in a child process, `PGPASSFILE` set before it starts: a
+    /// `set_var` here would race every other test thread reading the
+    /// environment. The file sits in a directory only this user can enter,
+    /// since it holds the live password.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_blank_password_signs_in_from_the_password_file() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        const CHILD: &str = "DBDELVE_PGPASS_CHILD";
+        let name = "db::postgres::tests::live_a_blank_password_signs_in_from_the_password_file";
+        if std::env::var_os(CHILD).is_none() {
+            let directory =
+                std::env::temp_dir().join(format!("dbdelve-pgpass-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .expect("the private directory should create");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--include-ignored", "--nocapture"])
+                .env(CHILD, "1")
+                .env("PGPASSFILE", directory.join("pgpass"))
+                .status()
+                .expect("the child test should run");
+            let _ = std::fs::remove_dir_all(&directory);
+            assert!(status.success());
+            return;
+        }
+
+        let config = live_config();
+        let file = std::path::PathBuf::from(std::env::var_os("PGPASSFILE").unwrap());
+        let field = |value: &str| value.replace('\\', r"\\").replace(':', r"\:");
+        let write = |password: &str, mode: u32| {
+            let line = format!(
+                "# rotated nightly\n{}:{}:*:{}:{}\n",
+                field(&config.host),
+                config.port.unwrap_or(DEFAULT_PORT),
+                field(&config.user),
+                field(password)
+            );
+            std::fs::write(&file, line).expect("the password file should write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode))
+                .expect("the password file should chmod");
+        };
+        let blank = ServerConfig {
+            password: String::new(),
+            ..config.clone()
+        };
+        let failure = || {
+            Connection::open(&blank)
+                .err()
+                .expect("the connection should fail")
+                .message
+        };
+
+        write(&config.password, 0o600);
+        Connection::open(&blank).expect("the file's password should sign in");
+
+        write("rotated-away", 0o600);
+        let rejected = failure();
+        assert!(
+            rejected.ends_with(&format!("The password came from {}.", file.display())),
+            "{rejected}"
+        );
+
+        write("never-read", 0o644);
+        let skipped = failure();
+        assert!(skipped.contains("is readable by other users"), "{skipped}");
     }
 
     #[test]
@@ -2027,17 +2326,20 @@ mod tests {
 
         assert_eq!(
             config,
-            ServerConfig {
-                host: "db.example.test".into(),
-                port: None,
-                database: "dbdelve_test".into(),
-                user: "person@example.com".into(),
-                password: String::new(),
-                sslmode: SslMode::default(),
-                root_certificate: None,
-                statement_timeout: 0,
-                ssh: None,
-                schema: None,
+            PostgresConfig {
+                server: ServerConfig {
+                    host: "db.example.test".into(),
+                    port: None,
+                    database: "dbdelve_test".into(),
+                    user: "person@example.com".into(),
+                    password: String::new(),
+                    sslmode: SslMode::default(),
+                    root_certificate: None,
+                    statement_timeout: 0,
+                    ssh: None,
+                    schema: None,
+                },
+                service: None,
             }
         );
     }
@@ -2048,8 +2350,8 @@ mod tests {
             config_from_url("postgres://someone:pa%20ss@db.example.test:8432/dbdelve_demo")
                 .unwrap();
 
-        assert_eq!(config.port, Some(8432));
-        assert_eq!(config.password, "pa ss");
+        assert_eq!(config.server.port, Some(8432));
+        assert_eq!(config.server.password, "pa ss");
     }
 
     #[test]
@@ -2067,7 +2369,11 @@ mod tests {
             ("verify-full", SslMode::VerifyFull),
         ] {
             let url = format!("postgresql://someone@db.example.test/dbdelve_test?sslmode={mode}");
-            assert_eq!(config_from_url(&url).unwrap().sslmode, expected, "{url}");
+            assert_eq!(
+                config_from_url(&url).unwrap().server.sslmode,
+                expected,
+                "{url}"
+            );
         }
     }
 
@@ -2083,10 +2389,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.sslmode, SslMode::VerifyFull);
-        assert_eq!(config.root_certificate.as_deref(), Some("/tmp/rds.pem"));
-        assert_eq!(config.port, Some(5433));
-        assert_eq!(config.user, "someone");
+        assert_eq!(config.server.sslmode, SslMode::VerifyFull);
+        assert_eq!(
+            config.server.root_certificate.as_deref(),
+            Some("/tmp/rds.pem")
+        );
+        assert_eq!(config.server.port, Some(5433));
+        assert_eq!(config.server.user, "someone");
     }
 
     #[test]
@@ -2095,6 +2404,50 @@ mod tests {
             config_from_url("postgresql://someone@db.example.test/dbdelve_test?sslmode=allow")
                 .unwrap_err()
                 .contains("allow")
+        );
+    }
+
+    #[test]
+    fn a_url_naming_a_service_needs_nothing_else() {
+        for scheme in ["postgres", "postgresql"] {
+            let config = config_from_url(&format!("{scheme}://?service=harness")).unwrap();
+            assert_eq!(config.service.as_deref(), Some("harness"));
+            assert_eq!(
+                (config.server.host.as_str(), config.server.user.as_str()),
+                ("", "")
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_naming_a_service_keeps_what_it_states_beside_it() {
+        let config = config_from_url(
+            "postgresql://ada@db.example.test:6432/orders?service=harness&sslmode=require",
+        )
+        .unwrap();
+        assert_eq!(config.service.as_deref(), Some("harness"));
+        assert_eq!(config.server.host, "db.example.test");
+        assert_eq!(config.server.port, Some(6432));
+        assert_eq!(config.server.database, "orders");
+        assert_eq!(config.server.user, "ada");
+        assert_eq!(config.server.sslmode, SslMode::Require);
+    }
+
+    #[test]
+    fn a_url_cannot_state_the_mode_that_means_unsaid_beside_a_service() {
+        assert!(
+            config_from_url("postgresql://?service=harness&sslmode=prefer")
+                .unwrap_err()
+                .contains("prefer")
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_blank_service_still_has_to_say_where() {
+        assert!(
+            config_from_url("postgresql://?service=")
+                .unwrap_err()
+                .contains("host")
         );
     }
 
@@ -2118,7 +2471,7 @@ mod tests {
                 Some(6000),
             ),
         ] {
-            assert_eq!(config_from_url(url).unwrap().port, expected, "{url}");
+            assert_eq!(config_from_url(url).unwrap().server.port, expected, "{url}");
         }
     }
 
@@ -2412,6 +2765,42 @@ mod tests {
             error.message
         );
         assert!(connection.query("SELECT 1", Fetch::default()).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_runs_notices_come_back_with_it_and_only_with_it() {
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        let raised = connection
+            .query(
+                "DO $$ BEGIN RAISE NOTICE 'made it'; \
+                 RAISE WARNING 'careful' USING HINT = 'look'; END $$",
+                Fetch::default(),
+            )
+            .expect("the block should run");
+        assert_eq!(
+            raised.messages,
+            ["NOTICE:  made it", "WARNING:  careful\nHINT:  look"]
+        );
+
+        let dropped = connection
+            .query("DROP TABLE IF EXISTS no_such_163", Fetch::default())
+            .expect("the drop should run");
+        assert_eq!(
+            dropped.messages,
+            [r#"NOTICE:  table "no_such_163" does not exist, skipping"#]
+        );
+
+        connection
+            .query(
+                "DO $$ BEGIN RAISE NOTICE 'left behind'; RAISE EXCEPTION 'boom'; END $$",
+                Fetch::default(),
+            )
+            .expect_err("the block should fail");
+        let plain = connection
+            .query("SELECT 1", Fetch::default())
+            .expect("the select should run");
+        assert!(plain.messages.is_empty(), "{:?}", plain.messages);
     }
 
     fn live_profile() -> super::super::Connection {
@@ -3767,8 +4156,8 @@ mod tests {
     #[test]
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_structure_round_trip() {
-        let structure = Connection::open(&live_config())
-            .expect("connection should open")
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        let structure = connection
             .structure("public", "accounts")
             .expect("structure should load");
 
@@ -3801,7 +4190,45 @@ mod tests {
                 .iter()
                 .any(|constraint| constraint.definition.starts_with("PRIMARY KEY"))
         );
-        assert!(!structure.indexes.is_empty(), "the primary key is an index");
+        let kinds: Vec<_> = structure
+            .indexes
+            .iter()
+            .map(|index| (index.name.as_str(), index.kind, index.columns.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    "accounts_external_id_key",
+                    IndexKind::Unique,
+                    vec!["external_id".into()]
+                ),
+                ("accounts_pkey", IndexKind::Primary, vec!["id".into()]),
+            ]
+        );
+
+        connection
+            .query(
+                "DROP TABLE IF EXISTS dbdelve_test_indexes; \
+                 CREATE TABLE dbdelve_test_indexes (id bigint, email text, note text); \
+                 CREATE INDEX dbdelve_test_indexes_partial \
+                     ON dbdelve_test_indexes (lower(email), id DESC) INCLUDE (note) \
+                     WHERE coalesce(note, 'a, b') <> ''",
+                Fetch::default(),
+            )
+            .expect("the fixture table should be created");
+        let fixture = connection.structure("public", "dbdelve_test_indexes");
+        connection
+            .query("DROP TABLE dbdelve_test_indexes", Fetch::default())
+            .expect("the fixture table should be cleaned up");
+        let index = &fixture.expect("structure should load").indexes[0];
+        assert_eq!(index.kind, IndexKind::Plain);
+        assert_eq!(index.columns, ["lower(email)", "id DESC"]);
+        assert_eq!(
+            index.predicate.as_deref(),
+            Some("COALESCE(note, 'a, b'::text) <> ''::text")
+        );
+        assert!(index.definition.contains("INCLUDE (note)"), "{index:?}");
     }
 
     #[test]

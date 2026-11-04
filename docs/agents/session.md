@@ -71,11 +71,16 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   open, the window is the welcome surface (`Workspace::render_welcome`): New
   project, New connection, each project with an Add connection of its own, and
   a Theme row whose button opens the theme palette, so a first launch can
-  leave the opaque default before connecting anywhere.
+  leave the opaque default before connecting anywhere. ⌘⇧P there opens
+  Commands on the surface's own verbs (`palette::welcome_items`: new
+  connection, data file, project, imports, themes, fonts, Settings), and
+  nothing that needs a connection is listed.
   Importing from DBeaver or TablePlus starts there too, or from the File menu
   and the palette once connections exist, never from over the connection form
   (its root does not answer `ImportConnections`, so nothing typed into it is
-  lost); before anything is added,
+  lost). Import deduplication treats a blank port as the engine default only
+  without a service: beside one, the file supplies it, so even an explicit
+  default port can name a different server. Before anything is added,
   `render_import_choice` asks which project the new connections join
   (`PendingImport`): "Imported from <client>" by default, made if it is new
   and joined if not, an existing project, or none. While it asks, the
@@ -98,6 +103,37 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   instead does not work: that is checked against the last frame, where the
   field that just closed still sat inside the same `track_focus` floor, and a
   window left focused on a dead field has every binding dead.
+- **The keyboard has a route between every surface of a tab.** Toggle
+  Editor / Results Focus (`secondary-k r`) moves it between the buffer and the
+  grid in front (`Workspace::front_grid`: one drawn, with a row in it; a plan
+  or the run's messages have nothing to step through, so it stays put), and
+  `result_grid::take_keyboard` hands the library the ring's row so its arrows
+  step from where the ring is. A structure tab's grid takes focus like a data
+  tab's, its handle held by the loading line until the grid is drawn, and a
+  relation's by the message that stands in for an empty result. Focus
+  Sidebar (`secondary-k e`) puts the keyboard in the explorer's tree, which
+  the library draws with a handle of its own; `Workspace::explorer_focus`
+  wraps it so `escape` and Toggle Sidebar can tell the keyboard is in there.
+- **The e2e harness (`src/workspace/e2e.rs`) has gotchas.** A test never
+  waits on a statement that is still running: a running tab re-arms its clock
+  and streaming timers, the test scheduler fires them at once, and
+  `run_until_parked` (so `simulate_keystrokes` too) never returns. Assert on
+  what a chord resolves to instead, or run to completion first.
+  `simulate_keystrokes` sends key-down only, so a focused button, which clicks
+  on release, needs `press` (down and up). A queue of plain reads runs each on
+  a connection of its own, on threads the scheduler does not own, so a test
+  that runs more than one statement calls `cx.executor().allow_parking()`
+  first. Focus moves that wait for the next frame need `settle`.
+- **A dialog's keyboard is its ring** (`Workspace::dialog_layer`): the layer
+  holds focus, and `left`/`right`/`tab` step a ring across its buttons and
+  then its one other control, the "Don't ask again" box (`enter` or `space`
+  ticks it) or the import question's project (`enter` lists the projects in
+  the palette). `space` never presses a button: a space typed on as a prompt
+  takes the keyboard would otherwise press Run. Import Rows has fields and
+  lists of its own, so it has no ring: Tab moves real focus through it,
+  kept inside the dialog and passing over the preview grid and the SQL,
+  which bind `tab` themselves and would never let it out, and `enter`
+  propagates to whatever control holds focus, so in a field it never imports.
 - **A profile owns a `Session`**, and a session owns two lists of tabs:
   `queries: Vec<QueryTab>` and `objects: Vec<ObjectTab>`. `Tab` is
   `Query(u64) | Object(u64)` and `active: Tab` says which is in front.
@@ -110,6 +146,18 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   a query's error, where the failure is already being read. `ui::status_dot` draws a
   profile's state the same way in the status bar and on each connection row in
   the palette.
+- **Refresh keeps the session; only a dead one is replaced.**
+  `RefreshConnection`, from `Cmd+Shift+R`, the palette and the titlebar's button
+  alike, runs `Workspace::refresh_schema`: the relations and routines are read
+  and land together, sizes follow, and the object tabs go stale as they do on a
+  reconnect. An open transaction, a `SET` and a temporary table survive it: the
+  read runs over the open session, or beside it during a transaction, which a
+  failed read would otherwise abort. The sidebar keeps its rows, folds and
+  selection because `explorer::tree` ids rows by name. A failed read leaves
+  everything as it was and says why, unless `Connection::is_lost` says the
+  session is gone, when it reconnects. With no session at all it connects, which is how
+  `ui::reconnect_button` still works through the same action. The palette's
+  Reconnect is the explicit replacement, for a socket that hangs.
 - **A profile's database is the one it opens, and Select Database moves it.**
   On an engine where `Engine::switches_database`, `Workspace::set_database`
   writes the picked name into the profile's config, persists it and
@@ -223,6 +271,47 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   landed and `land_lane` gives the slot the last statement's result, as a
   queue run in turn leaves it. The slot streams nothing meanwhile, so the
   status bar reads the statement on screen instead (`Queue::at_once`).
+- **A run's server messages ride on `QueryState::Complete { messages }`**, so
+  they follow the state wherever it goes: into a queue's `done`, through a
+  lend and back, onto a restored tab. `QueryTab::messages` reads them
+  statement by statement (the slot's live state for the slot, `done` for the
+  rest), and the switcher offers a Messages chip once any statement said
+  something, with or without a queue.
+- **History is what a buffer sent, each statement once, with its last run.**
+  `store::HistoryEntry` is a line per event in `.history.jsonl`: one as a run
+  is sent (`sql` and `at`) and one as it lands, under the same pair, with its
+  time, rows or server count, cap, error (cut to 500 characters) or cancel.
+  Reading keeps each statement's latest run by `at`, the later line on a tie
+  and an untimed line below any timed one, so the outcome supersedes the
+  start with no id between them, an earlier run of the same statement that
+  lands last never stands in for the later one, the file stays append-only,
+  and a run the app quit under keeps its start. The session's list
+  (`sql::remember_statement`) keeps the same rule. A line from before runs were timed is a
+  bare JSON string and reads as an entry with only its statement. Only a run
+  recorded as it was sent gets an outcome, so the rules for what is history
+  (`execute_unchecked`) are the rules for both lines, and each statement of a
+  queue lands its own. The outcome is written before anything asks whether
+  the tab, the count or the session it ran for is still there, since a run
+  closed or reconnected under still ran; with no tab to count what streamed,
+  its rows are left unknown (`queries::answered`). The palette's History scope hints each row with these
+  (`history_hint`), and offers a Status filter (a cancelled run is neither
+  Succeeded nor Failed) and a Sort (Newest is the list's own order, by match
+  while typing; Slowest and Most rows put unmeasured runs last). `secondary-k f`
+  and `secondary-k o` cycle them, scoped to `Palette > Input`: an Option
+  chord types a character on macOS and would take it from the field, and the
+  unscoped `secondary-shift-f` (Format Query), `secondary-shift-s` and
+  `secondary-k s` would each win over a scoped binding. Both
+  reset when the palette opens, so a filter left on cannot hide a run later.
+- **`showing_messages` is a tab flag beside `showing_plan`, not a value of
+  `Queue::showing`.** Selecting Messages leaves the selected result to return
+  to, and a no-queue run can still offer the chip. It resets when a run
+  starts, not per statement, and is read through `messages_shown`, so a flag
+  left on over a run that said nothing falls back to the result. While shown it
+  stands in for the result, so `query_insert_target` yields nothing.
+- **`write_grids` saves a column-less statement when it has messages**
+  (`StoredGrid::messages`, `serde(default)` for older snapshots), so what the
+  server said survives a restart; otherwise a statement with no columns writes
+  no snapshot.
 - **`Queue::awaiting` is load-bearing.** A finished queue stays on the tab so
   its results can still be switched between, and every completion on that tab
   reaches `advance_queue`. Without the flag an ordinary Run, a header sort or
@@ -247,10 +336,89 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   on one empty buffer instead. `active` may
   then name a tab that is gone, which every lookup by id already answers with
   `None`, and focus falls back to the window so the bindings that open a tab
-  still work. Deleting the saved query in a tab closes that tab.
+  still work.
+- **Closing a tab never deletes a saved query.** The strip holds open tabs
+  only; every query file a profile has is listed in the sidebar's Queries
+  group and the palette, open or not (`Session::saved_queries`). Closing a
+  saved query's tab writes its text to its file and keeps the file; only an
+  explicit Delete (the sidebar row's menu, or "Delete saved query…" in the
+  palette, both through one dialog) removes it. Deleting a query whose tab is
+  open closes that tab, its text with it; a tab holding cell edits nobody
+  applied asks first, as any close does (`PendingDiscard::deleting`), and the
+  file stays until it is told. A file already removed outside the app counts
+  as deleted, so its stale library row and open tab can still be removed.
+  Rename… on a sidebar row turns the row into a field
+  (`Session::query_rename`) that renames through `store::save_query_as`,
+  the tab's own path, so an open tab follows the name. A rename is one native
+  atomic no-overwrite move, never a write under the new name and a delete of
+  the old one: on a case-insensitive filesystem `daily` and `Daily` are one
+  file. A name taken in any case is refused. New saves also install their
+  target without replacing an existing entry; a missed directory listing is
+  not permission to overwrite it. Staging files are private to each writer.
+- **Folders and pins are shortcuts** (`explorer::Shortcuts` on `Profile`,
+  stored as the profile's `folders` and `pins`, left out when empty). Adding
+  an object or a saved query to a folder, or pinning it, leaves its row where
+  it was: the schemas always list the whole catalog, so an item can be in
+  several folders and deleting a folder loses only the grouping. Folders are
+  flat and their names unique per connection in any case. The sidebar lists
+  Pinned (in the user's order; a pinned folder moves there with what it
+  holds), then the other folders by name, then Queries, then the schemas. A
+  shortcut's row id is everything it is named by (database, kind and the row
+  it repeats) behind `pinned/` or its folder's `folder:{len}:{name}/`, the
+  length keeping a name with a `/` from running into its members' ids, so no
+  two members share a row, folds survive a rebuild, and the row opens through
+  the same `ExplorerLeaf`. An object is named by schema, name and kind, and by
+  its database only where `Engine::catalog_is_per_database`: `public.users`
+  is in every Postgres database, so without it a folder would show another
+  database's table after Select Database, while MySQL, MariaDB and ClickHouse
+  list every database as a schema already, and keying on the session's
+  database there would hide shortcuts whose objects are still listed. A member
+  of another database is left out, not greyed. The database is the one the
+  shown catalog was read from where the catalog says (`Catalog::database`,
+  DuckDB's, read under the same lock as its objects), ahead of the database
+  list and the profile: a user's `USE` moves a DuckDB session without the
+  profile hearing of it, and a shortcut names what the sidebar shows. SQL
+  Server needs none, since it moves a `USE` back. While a per-database engine's
+  database is not known, nothing is named by it (Add to Folder and Pin are
+  greyed on objects) and no member naming one is shown: a shortcut without
+  its database would match any. One stored without a database there is
+  greyed, never matched, for the same reason. One the catalog or the saved
+  queries no longer list stays, greyed, offering only Remove from Folder and
+  Unpin: a dropped table may come back and a permission be granted, and
+  losing the user's grouping to a refresh would be worse than a grey row. A
+  saved query is named by its name alone; a rename follows it into folders
+  and pins and a delete takes it out. A duplicated connection takes the
+  folders and pins less its saved queries, which a duplicate does not copy.
+  New Folder makes one under an unused name and opens the rename field on its
+  row, named after it exists so the field has a row to sit on; a filter is
+  cleared first, since a field focused on a row the filter hides takes the
+  keyboard nowhere.
+  Any object, saved query or folder row drags (`DragShortcut`, a static
+  label for its preview); the state change is `Shortcuts::drop_on`. Dropped
+  on a folder's row, a member taken out of another folder moves, and one from
+  anywhere else (the schemas, Queries, Pinned) is added and stays where it
+  was: a folder is shortcuts, so taking a row out of the schema tree is never
+  what a drop does, while a folder-to-folder drag is the one place a copy
+  would leave behind something nobody asked to keep. On the Pinned group's
+  row anything is pinned; on a member's row in a folder or Pinned it goes
+  before or after that row by the pointer's half, which on a folder means
+  added or moved there by the same rule. A folder holds no folders, so a
+  folder dropped on a pinned folder is reordered among the pins. Nothing
+  lands where no row takes it, and an object dragged while its database is
+  unknown carries nothing. The Pinned group exists only while something is
+  pinned, so pinning the first thing is the menu's.
 - **A named buffer persists to its query file, an unnamed one to its own
-  `.scratch-{id}.sql`.** Every buffer is written on quit, not just the visible
-  one. `store::read_scratch(id, 0)` migrates the single `.scratch.sql` an older
+  `.scratch-{id}.sql`.** Edits stay in memory until Save, a connection switch,
+  opening another query, or normal quit/window close persists the buffers.
+  Closing a saved query's tab also writes it before the tab is removed.
+  Writes are synchronous at those boundaries; typing schedules no disk
+  writes, timers or retries. There are no background buffer writes to order
+  against rename or deletion, so neither needs a per-tab write gate.
+  A crash or forced termination can lose edits since the last write.
+  Giving an unnamed tab a query name removes that tab's old scratch only
+  after the query write succeeds. A cleanup error stays visible without
+  undoing the saved query, and a failed query write keeps the scratch.
+  `store::read_scratch(id, 0)` migrates the single `.scratch.sql` an older
   build left behind, and `StoredProfile::open_query` is still read for the same
   reason and never written.
 - **Grids are snapshotted to disk and restored on relaunch.** The first edit on
@@ -337,6 +505,17 @@ The provider is a snapshot, replaced whole when the catalog reloads
 (`Workspace::install_completions`), and installed on every buffer rather than
 the visible one.
 
+A raw filter bar completes too, through `FilterCompletions`: a `WHERE` names no
+relation, so the tab's schema and relation are handed to the same provider as
+its scope, whose columns lead the list. The name is never written into the text
+the scan reads, where a `'`, a `--` or a space in it would read as a literal, a
+comment or two names. On MongoDB the text is read inside `db.c.find(`, since a
+document is only one inside a call, and the ranges are shifted back. A Redis
+filter is a `MATCH` glob and completes nothing. `install_completions` reaches
+every raw bar as well, from `Session::completions`, the provider it last built,
+which is also where a bar turned raw later takes it from. A new bar starts raw:
+one waiting on a column ignores whatever is typed into it.
+
 ## Storage and platforms
 
 - **Storage** is decided in `store.rs`: Application Support on macOS,
@@ -357,12 +536,19 @@ the visible one.
   Ctrl elsewhere. Never `cmd-`: on Linux that is Super, which the window manager
   takes first. Every binding is rebindable from Settings (`keybindings.rs`), and
   a rebind takes effect on the next launch.
+  Minimize is macOS-only; its Cmd-M default yields to any valid override
+  starting with Cmd-M, including a multi-stroke chord.
+  Collision checks compare parsed keystrokes (`secondary-m` and `cmd-m` are
+  equivalent there), and Settings reads the same effective chords as startup,
+  so a suppressed Minimize default is shown as unbound, not as a conflict.
 
 ## The connection form
 
 Pick the engine first, from the searchable picker the engine pill in the form's header opens; it decides which fields exist.
 Then paste a URL into the form's URL row, which fills the fields as it lands (one
-typed rather than pasted fills them on Enter), or fill the fields in.
+typed rather than pasted fills them on Enter), or fill the fields in. Where
+`Engine::takes_service`, a service stands in for the host and username, which
+are otherwise required; what it leaves unset fails on connect, naming the key.
 `secondary-enter` connects, or saves an edit (`submit_connection`, scoped to
 `ConnectionForm`): it is Run Query's chord, and the unscoped Run Query reaches
 the form first, finds no handler there and lets it through

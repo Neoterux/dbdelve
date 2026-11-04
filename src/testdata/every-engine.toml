@@ -18,6 +18,7 @@ opacity = 0.85
 check_for_updates = false
 color_titlebar = true
 client_sort = false
+qualify_completions = true
 welcomed = true
 
 # One entry each: both are HashMaps, and a second entry would make the
@@ -124,6 +125,7 @@ host = "localhost"
 database = "postgres"
 user = "postgres"
 engine = "postgresql"
+service = "reports"
 
 [[profiles]]
 id = "mysql"
@@ -254,3 +256,19 @@ user = "default"
 sslmode = "disable"
 engine = "redis"
 color = "red"
+
+[[profiles]]
+id = "clk"
+name = "ClickHouse events"
+host = "ch.internal"
+port = 8443
+database = "analytics"
+user = "ada"
+sslmode = "verify-full"
+root_certificate = "/certs/ch.pem"
+engine = "clickhouse"
+statement_timeout = 45
+
+[profiles.ssh]
+host = "bastion.internal"
+user = "jump"

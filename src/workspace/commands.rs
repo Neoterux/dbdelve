@@ -4,6 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
+use crate::actions::{FocusSidebar, ToggleResultsFocus};
 use crate::keybindings;
 
 impl Workspace {
@@ -103,6 +104,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.relay_columns(cx, |grid| grid.show_all_columns());
+    }
+
+    /// A click on the active cell's header, sort refusals and all.
+    pub(crate) fn sort_active_column(
+        &mut self,
+        _: &SortActiveColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(column) = self.active_column(cx) {
+            self.sort_column(&SortColumn { column }, window, cx);
+        }
     }
 
     pub(crate) fn reveal_column_named(
@@ -233,6 +246,10 @@ impl Workspace {
                     .position(|name| Some(name) == databases.current.as_ref())
             }),
             PaletteMode::Engine => crate::palette::active_engine_row(self),
+            PaletteMode::RowLimit => self
+                .profile()
+                .and_then(crate::palette::active_row_limit_row),
+            PaletteMode::ImportProject => crate::palette::picked_import_row(self),
             _ => None,
         };
         // A list put up in place of one opened from the panel, or by a row
@@ -551,8 +568,7 @@ impl Workspace {
     /// truth both here and in the row that shows what's currently bound.
     pub(crate) fn apply_rebind(&mut self, id: &'static str, chord: String, cx: &mut Context<Self>) {
         self.rebinding = None;
-        let context = keybindings::REGISTRY
-            .iter()
+        let context = keybindings::available_registry()
             .find(|spec| spec.id == id)
             .and_then(|spec| spec.context);
         if let Some(owner) =
@@ -606,6 +622,8 @@ impl Workspace {
             Command::ShowPlan(showing) => self.show_plan(showing, cx),
             Command::SaveQuery => self.save_query(&SaveQuery, window, cx),
             Command::RenameQuery => self.rename_query(window, cx),
+            Command::PickQueryToDelete => self.open_palette(PaletteMode::DeleteQuery, window, cx),
+            Command::DeleteQuery(name) => self.ask_delete_saved_query(name, cx),
             Command::QueryHistory => {
                 self.open_palette(PaletteMode::Search(Scope::History), window, cx)
             }
@@ -619,7 +637,7 @@ impl Workspace {
             Command::ClearFilter => self.clear_filter(&ClearFilter, window, cx),
             Command::NewRow => self.new_row(&NewRow, window, cx),
             Command::ImportRows => self.import_rows(&ImportRows, window, cx),
-            Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), window, cx),
+            Command::CloseObject(id) => self.ask_before_close(Tab::Object(id), window, cx),
             Command::SetNull => self.set_null(&SetNull, window, cx),
             Command::SetEmpty => self.set_empty(&SetEmpty, window, cx),
             Command::SetDefault => self.set_default(&SetDefault, window, cx),
@@ -629,6 +647,7 @@ impl Workspace {
             Command::NextEdit => self.next_edit(&NextEdit, window, cx),
             Command::PreviousEdit => self.previous_edit(&PreviousEdit, window, cx),
             Command::ExportResults(format) => self.export_results(format, cx),
+            Command::CancelExport => self.cancel_export(cx),
             Command::CopyRow => self.copy_row(&CopyRow, window, cx),
             Command::CopyResults(format) => self.copy_results_as(format, cx),
             Command::SwitchProfile(index) => self.activate(index, cx),
@@ -664,7 +683,11 @@ impl Workspace {
             Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
             Command::NewProject => self.new_project(&NewProject, window, cx),
             Command::ImportConnections(source) => self.import_connections(source, window, cx),
-            Command::RefreshConnection => self.reconnect(self.active, cx),
+            Command::RefreshConnection => {
+                self.clear_notice();
+                self.refresh_schema(cx);
+            }
+            Command::Reconnect => self.reconnect(self.active, cx),
             Command::SelectTheme => self.select_theme(&SelectTheme, window, cx),
             Command::SelectDatabase => self.select_database(&SelectDatabase, window, cx),
             Command::SetDatabase(name) => self.set_database(name, window, cx),
@@ -686,6 +709,10 @@ impl Workspace {
             Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
+            Command::FocusSidebar => self.focus_sidebar(&FocusSidebar, window, cx),
+            Command::ToggleResultsFocus => {
+                self.toggle_results_focus(&ToggleResultsFocus, window, cx)
+            }
             Command::ToggleRowPanel => self.toggle_row_panel(&ToggleRowPanel, window, cx),
             Command::ToggleRowEdit => self.toggle_row_edit(&ToggleRowEdit, window, cx),
             // Explicit, because the palette still holds focus here and would
@@ -693,8 +720,83 @@ impl Workspace {
             Command::ResetEditorZoom => self.set_zoom(FontSlot::Editor, 100, cx),
             Command::OpenSettings => self.show_settings(window, cx),
             Command::OpenDataFiles => self.pick_data_files(window, cx),
+            Command::OpenSqlFiles => self.pick_sql_files(window, cx),
             Command::GoToColumn => self.go_to_column(&GoToColumn, window, cx),
             Command::RevealColumn(col) => self.reveal_column(col, window, cx),
+            Command::CancelQuery => self.cancel_query(&CancelQuery, window, cx),
+            Command::CycleMode => self.cycle_mode(&CycleMode, window, cx),
+            Command::SetMode(mode) => self.choose_mode(&SetMode { mode }, window, cx),
+            Command::ResetConfirmations => {
+                self.reset_confirmations(&ResetConfirmations, window, cx)
+            }
+            Command::HideColumn => self.hide_column(&HideColumn, window, cx),
+            Command::TogglePinColumn => self.toggle_pin_column(&TogglePinColumn, window, cx),
+            Command::ShowAllColumns => self.show_all_columns(&ShowAllColumns, window, cx),
+            Command::SortActiveColumn => self.sort_active_column(&SortActiveColumn, window, cx),
+            Command::CopyRows(kind) => self.copy_rows(&CopyRows { kind }, window, cx),
+            Command::CopyDdl => {
+                let front = self.profile().and_then(|profile| {
+                    let tab = profile.session.active_object()?;
+                    match tab.kind {
+                        ObjectKind::Relation(kind) => {
+                            Some((tab.schema.clone(), tab.name.clone(), kind))
+                        }
+                        ObjectKind::Routine(_) => None,
+                    }
+                });
+                if let Some((schema, relation, kind)) = front {
+                    self.copy_ddl(schema, relation, kind, cx);
+                }
+            }
+            Command::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            Command::SetViewSorting(client) => self.set_view_sorting(client, window, cx),
+            Command::FollowForeignKey => self.follow_foreign_key(&FollowForeignKey, window, cx),
+            // The button only adds the bar, and the pointer that pressed it
+            // goes on to click into it; the keyboard has to be put there.
+            Command::AddFilter => {
+                self.add_filter(&AddFilter, window, cx);
+                self.focus_filter(window, cx);
+            }
+            Command::ToggleNextJoin => self.toggle_next_join(&ToggleNextJoin, window, cx),
+            Command::ShowReferences => self.show_references(&ShowReferences, window, cx),
+            Command::OpenReference(source, index) => {
+                self.open_listed_reference(&source, index, window, cx)
+            }
+            Command::SetImportProject(project) => {
+                self.set_import_project(project);
+                cx.notify();
+            }
+            Command::PickRowLimit => self.open_palette(PaletteMode::RowLimit, window, cx),
+            Command::SetRowLimit(rows) => {
+                match self
+                    .profile()
+                    .and_then(|profile| crate::palette::row_limit_target(&profile.session))
+                {
+                    Some((LimitTarget::Query(_), _)) => {
+                        self.set_query_limit(&SetQueryLimit { rows }, window, cx)
+                    }
+                    Some((LimitTarget::Relation(_), _)) => {
+                        self.set_row_limit(&SetRowLimit { rows }, window, cx)
+                    }
+                    Some((LimitTarget::Default, _)) | None => {}
+                }
+            }
+            Command::CustomRowLimit => {
+                if let Some((target, _)) = self
+                    .profile()
+                    .and_then(|profile| crate::palette::row_limit_target(&profile.session))
+                {
+                    self.custom_row_limit(&CustomRowLimit { target }, window, cx);
+                }
+            }
+            Command::MoveTabLeft => self.move_tab(-1, cx),
+            Command::MoveTabRight => self.move_tab(1, cx),
+            Command::NextResult => self.next_result(&NextResult, window, cx),
+            Command::PreviousResult => self.previous_result(&PreviousResult, window, cx),
+            Command::ToggleMessages => self.toggle_messages(&ShowMessages, window, cx),
+            Command::CopyPlan => self.copy_plan(cx),
+            Command::ShowStructureSection(section) => self.show_structure_section(section, cx),
+            Command::DownloadUpdate(url) => cx.open_url(&url),
         }
     }
 }

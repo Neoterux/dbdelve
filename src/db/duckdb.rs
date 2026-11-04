@@ -42,6 +42,20 @@ use super::{
     assemble_references, assemble_structure, plain_error, required_cell, terminated,
 };
 
+// Workaround for duckdb-rs#920, fixed upstream by #923 but unreleased past
+// 1.20000.0: the bundled build links its extension autoregister archive after
+// the libduckdb-sys rlib, so GNU ld (aarch64 Linux) has already passed the
+// archive that defines `duckdb_register_static_extensions` when the reference
+// shows up. Referencing it here, ahead of the rlib, pulls the loader in. Drop
+// this once a release carries #923.
+#[used]
+static STATIC_EXTENSION_LOADER: unsafe extern "C" fn() -> std::ffi::c_int = {
+    unsafe extern "C" {
+        fn duckdb_register_static_extensions() -> std::ffi::c_int;
+    }
+    duckdb_register_static_extensions
+};
+
 /// What an empty path means: a database held in memory, gone when the
 /// connection closes. The files it reads stay where they are.
 pub const IN_MEMORY: &str = ":memory:";
@@ -345,10 +359,28 @@ impl Connection {
             .map_err(|error| rolled_back(&connection, sql, error))
     }
 
-    /// The tables and views of the database the connection opened, less the
-    /// catalogs DuckDB keeps for itself.
+    /// The tables and views of the database the connection is on, less the
+    /// catalogs DuckDB keeps for itself, and which database that is: a `USE`
+    /// of the user's moves this connection, so the profile cannot say.
     pub fn catalog(&self) -> Result<Catalog, DbError> {
-        let relations = self.internal_query(
+        let _deadline = self.deadline();
+        let connection = lock(&self.connection)?;
+        // Both under the one lock, so no statement moves the connection
+        // between the database named and the objects listed.
+        let read = |sql: &str| {
+            run(&connection, sql, Fetch::default())
+                .map_err(|error| rolled_back(&connection, sql, error))
+        };
+        let on = read("SELECT current_database() AS database_name")?;
+        let database = match on.rows.first() {
+            Some(row) => required_cell(&on, row, "database_name")?.to_string(),
+            None => {
+                return Err(plain_error(
+                    "Catalog query returned no database_name.".into(),
+                ));
+            }
+        };
+        let relations = read(
             "SELECT schema_name, table_name AS relation_name, 'table' AS relation_kind,
                     estimated_size AS row_estimate
              FROM duckdb_tables()
@@ -359,7 +391,10 @@ impl Connection {
              WHERE NOT internal AND database_name = current_database()
              ORDER BY schema_name, relation_name",
         )?;
-        assemble_catalog(relations, QueryResult::default())
+        Ok(Catalog {
+            database: Some(database),
+            ..assemble_catalog(relations, QueryResult::default())?
+        })
     }
 
     /// DuckDB's macros are functions of a kind, but not ones with a body to
@@ -376,14 +411,23 @@ impl Connection {
         let columns = self.internal_query(&format!(
             "SELECT column_name, lower(data_type) AS data_type,
                         CASE WHEN is_nullable THEN 'yes' ELSE 'no' END AS nullable,
-                        COALESCE(column_default, '') AS column_default
+                        CASE WHEN is_generated
+                             THEN 'GENERATED ALWAYS AS (' || generation_expression || ')'
+                             ELSE COALESCE(column_default, '') END AS column_default
                  FROM duckdb_columns()
                  WHERE database_name = current_database()
                    AND schema_name = {schema_literal} AND table_name = {relation_literal}
                  ORDER BY column_index"
         ))?;
+        // `expressions` is a list printed as text, `[a, 'lower(b)']`, which the
+        // cast reads back, quoting and all. DuckDB has no partial index.
         let indexes = self.internal_query(&format!(
-            "SELECT index_name AS object_name, COALESCE(sql, '') AS definition
+            "SELECT index_name AS object_name,
+                        CASE WHEN is_primary THEN 'primary'
+                             WHEN is_unique THEN 'unique'
+                             ELSE 'plain' END AS index_kind,
+                        array_to_string(expressions::VARCHAR[], chr(31)) AS index_columns,
+                        COALESCE(sql, '') AS definition
                  FROM duckdb_indexes()
                  WHERE database_name = current_database()
                    AND schema_name = {schema_literal} AND table_name = {relation_literal}
@@ -696,6 +740,7 @@ fn edit_target(
         table,
         columns: origins,
         keys,
+        ..Default::default()
     })
 }
 
@@ -842,6 +887,12 @@ fn rolled_back(connection: &duckdb::Connection, sql: &str, error: DbError) -> Db
         message: format!("{}\n\n{outcome}", error.message),
         position: error.position,
     }
+}
+
+/// Arrow prints a blob as bare hex, which a quoted string would store as the
+/// text of that hex.
+pub(super) fn fetched_literal(value: &str, data_type: &str) -> Option<String> {
+    (data_type == "blob").then(|| format!("unhex({})", Engine::DuckDb.quote_literal(value)))
 }
 
 /// `array` in types Arrow's formatter prints the way DuckDB's shell does,
@@ -1182,6 +1233,7 @@ fn query_error(error: duckdb::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::IndexKind;
 
     /// The fixtures beside the other engines' seeds, by absolute path: a
     /// relative one would resolve against wherever the test runner stands.
@@ -1724,6 +1776,7 @@ mod tests {
              CREATE TABLE facturas (id INTEGER PRIMARY KEY,
                                     cliente INTEGER REFERENCES clientes(id));
              CREATE INDEX facturas_cliente ON facturas (cliente);
+             CREATE UNIQUE INDEX facturas_par ON facturas (cliente, coalesce(id, 0));
              CREATE VIEW v AS SELECT id FROM clientes;",
         );
         let catalog = connection.catalog().unwrap();
@@ -1752,11 +1805,25 @@ mod tests {
         let facturas = connection.structure("main", "facturas").unwrap();
         assert_eq!(facturas.primary_key(), ["id"]);
         assert_eq!(facturas.foreign_keys[0].referenced_table, "clientes");
-        assert!(
-            facturas
-                .indexes
-                .iter()
-                .any(|index| index.name == "facturas_cliente")
+        let kinds: Vec<_> = facturas
+            .indexes
+            .iter()
+            .map(|index| (index.name.as_str(), index.kind, index.columns.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    "facturas_cliente",
+                    IndexKind::Plain,
+                    vec!["cliente".to_string()]
+                ),
+                (
+                    "facturas_par",
+                    IndexKind::Unique,
+                    vec!["cliente".into(), "(COALESCE(id, 0))".into()]
+                ),
+            ]
         );
         let references = connection.references("main", "clientes").unwrap();
         assert_eq!(references[0].table, "facturas");
@@ -1867,12 +1934,12 @@ mod tests {
 
     #[test]
     fn an_import_asked_to_skip_duplicates_runs_into_a_table_with_no_key() {
-        use crate::import_rows::{OnDuplicate, Options, Plan, TargetColumn, prepare};
+        use crate::import_rows::{Format, OnDuplicate, Options, Plan, TargetColumn, prepare};
         let connection = memory("CREATE TABLE t AS SELECT 1 AS id, 'a' AS name;");
         let structure = connection.structure("main", "t").unwrap();
         let targets = TargetColumn::from_structure(&structure, Engine::DuckDb);
         let bytes = b"id,name\n2,b\n";
-        let mut options = Options::detected(std::path::Path::new("rows.csv"), bytes);
+        let mut options = Options::detected(Format::Csv, bytes);
         options.on_duplicate = OnDuplicate::Skip;
         let checked = prepare(bytes, &options, &targets, None, Engine::DuckDb)
             .unwrap()
@@ -2051,6 +2118,7 @@ mod tests {
                     keys: vec![first.clone()],
                     types: types.clone(),
                     held: Vec::new(),
+                    ..Default::default()
                 },
                 PendingRow {
                     schema: edit.schema.clone(),
@@ -2059,6 +2127,7 @@ mod tests {
                     keys: vec![second.clone()],
                     types: types.clone(),
                     held: Vec::new(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2171,6 +2240,20 @@ mod tests {
         assert_eq!(at(&connection.alongside().unwrap()), on("memory", "main"));
         assert_eq!(connection.current_database(), "memory");
         assert_eq!(connection.current_schema(), "main");
+    }
+
+    #[test]
+    fn the_catalog_names_the_database_a_use_moved_it_to() {
+        let connection = memory(
+            "CREATE TABLE here (id INTEGER);
+             ATTACH ':memory:' AS other;
+             USE other;
+             CREATE TABLE there (id INTEGER);",
+        );
+        let catalog = connection.catalog().unwrap();
+        assert_eq!(catalog.database.as_deref(), Some("other"));
+        assert_eq!(catalog.schemas[0].relations[0].name, "there");
+        assert_eq!(connection.current_database(), "memory");
     }
 
     #[test]

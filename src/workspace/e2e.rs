@@ -1,0 +1,1881 @@
+//! The app driven the way a person drives it: launched from a saved
+//! `profiles.toml`, typed into, run from the keyboard. GPUI's test platform
+//! has no screen, so these run headless in CI like any other test.
+
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
+
+use gpui::{
+    App, AppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext, Window,
+};
+use gpui_component::Root;
+
+use super::Workspace;
+use crate::{
+    actions::CancelQuery,
+    db::{CancelToken, Engine, Fetch},
+    explorer, keybindings,
+    palette::{Mode as PaletteMode, Scope},
+    session::{CatalogState, ObjectBody, QueryState, QueryTab},
+    store,
+    theme::{self, Fonts},
+};
+
+/// What `main` sets up before the window opens, minus the menu bar and the
+/// panic log, which the test platform has no use for.
+fn launch(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    cx.update(|cx| {
+        cx.text_system()
+            .add_fonts(
+                guic_gpui_assets::BUNDLED_FONTS
+                    .iter()
+                    .map(|font| Cow::Borrowed(*font))
+                    .collect(),
+            )
+            .expect("bundled fonts must be loadable");
+        gpui_component::init(cx);
+        cx.set_global(Fonts::default());
+        theme::user::load();
+        let theme = theme::starting_theme(theme::Appearance::of_system(cx.window_appearance()));
+        theme.apply_to_components(cx);
+        cx.set_global(theme);
+        let overrides = store::peek_profiles()
+            .and_then(|list| list.settings)
+            .and_then(|settings| settings.custom_keybindings)
+            .unwrap_or_default();
+        cx.bind_keys(keybindings::build_bindings(&overrides));
+    });
+    let mut workspace = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| Workspace::new(window, cx));
+        workspace = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    (workspace.expect("the window builds the workspace"), cx)
+}
+
+/// Every write `Workspace` makes on the way out -- buffers on release,
+/// profiles on quit -- has to land while `with_home` still points the store at
+/// the temporary home, not after the test returns and `HOME` is the real one.
+fn quit(workspace: Entity<Workspace>, cx: &mut VisualTestContext) {
+    drop(workspace);
+    // On the app rather than the window: shutting down removes the window.
+    cx.cx.update(|cx| cx.shutdown());
+    cx.cx.run_until_parked();
+}
+
+/// The app launched on one saved SQLite profile, an empty database, with its
+/// query tab in front.
+fn launch_on_sqlite(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    launch_on_sqlite_holding(cx, "")
+}
+
+/// `launch_on_sqlite` over a database `schema` has been run against first.
+fn launch_on_sqlite_holding<'a>(
+    cx: &'a mut TestAppContext,
+    schema: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    // An empty file is an empty database. dbdelve opens a SQLite file
+    // rather than creating one, so it has to be there first.
+    let database = directory.join("e2e.db");
+    std::fs::write(&database, b"").expect("the database file must be creatable");
+    rusqlite::Connection::open(&database)
+        .and_then(|connection| connection.execute_batch(schema))
+        .expect("the schema must apply");
+    std::fs::write(
+        directory.join("profiles.toml"),
+        format!(
+            "active = \"e2e\"\n\
+             [settings]\n\
+             check_for_updates = false\n\
+             [[profiles]]\n\
+             id = \"e2e\"\n\
+             name = \"E2E\"\n\
+             host = \"\"\n\
+             database = \"\"\n\
+             user = \"\"\n\
+             engine = \"sqlite\"\n\
+             path = {:?}\n",
+            database.display().to_string()
+        ),
+    )
+    .expect("profiles.toml must be writable");
+
+    let (workspace, cx) = launch(cx);
+    // CI's live-test job sets `PG*`, which puts an environment profile in
+    // front of the saved one.
+    workspace.update(cx, |workspace, cx| {
+        let index = workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.config.engine() == Engine::Sqlite)
+            .expect("the saved SQLite profile is restored");
+        workspace.activate(index, cx);
+    });
+    cx.run_until_parked();
+    (workspace, cx)
+}
+
+/// The test platform has no frame loop: what the app leaves for the next
+/// frame, such as a dialog handing back the keyboard, waits for this.
+fn settle(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.update(|window, cx| window.simulate_next_frame(cx));
+    cx.run_until_parked();
+}
+
+fn query_tab<T>(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    read: impl FnOnce(&QueryTab, &Window, &App) -> T,
+) -> T {
+    cx.update(|window, cx| {
+        let tab = workspace
+            .read(cx)
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .expect("a fresh profile opens on a query tab");
+        read(tab, window, cx)
+    })
+}
+
+fn buffer(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    query_tab(workspace, cx, |tab, _, cx| {
+        tab.editor.read(cx).value().to_string()
+    })
+}
+
+fn editor_has_keyboard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    query_tab(workspace, cx, |tab, window, cx| {
+        tab.editor.focus_handle(cx).is_focused(window)
+    })
+}
+
+fn grid_has_keyboard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    query_tab(workspace, cx, |tab, window, cx| {
+        tab.results.focus_handle(cx).is_focused(window)
+    })
+}
+
+fn sidebar_has_keyboard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| {
+        workspace
+            .read(cx)
+            .explorer_focus
+            .contains_focused(window, cx)
+    })
+}
+
+fn dialog_has_keyboard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| workspace.read(cx).dialog_focus.is_focused(window))
+}
+
+fn ringed_button(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    workspace.read_with(cx, |workspace, _| workspace.dialog_choice.get())
+}
+
+/// `selec` is no statement `sql::classify` can read, so running it puts up the
+/// run-once prompt instead of reaching the database.
+fn raise_run_once_prompt(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("secondary-enter");
+    settle(cx);
+    workspace.read_with(cx, |workspace, _| {
+        assert_eq!(workspace.dialog_in_front.get(), Some("pending-run"));
+    });
+}
+
+#[gpui::test]
+fn a_query_typed_and_run_from_the_keyboard_lands_its_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+
+        cx.simulate_input("select 1");
+        cx.simulate_keystrokes("secondary-enter");
+        cx.run_until_parked();
+
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { rows, .. } => assert_eq!(*rows, 1),
+            QueryState::Failed(error) => panic!("the query failed: {error}"),
+            _ => panic!("the query never completed"),
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_prompt_takes_the_keyboard_and_hands_it_back_once_answered(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("selec 1");
+        raise_run_once_prompt(&workspace, cx);
+
+        assert!(dialog_has_keyboard(&workspace, cx));
+        assert_eq!(
+            ringed_button(&workspace, cx),
+            0,
+            "the ring starts on Run once"
+        );
+        cx.simulate_input("x");
+        settle(cx);
+        assert_eq!(
+            buffer(&workspace, cx),
+            "selec 1",
+            "the buffer behind took a key"
+        );
+
+        for (keystroke, ringed) in [("left", 1), ("right", 0), ("tab", 1), ("shift-tab", 0)] {
+            cx.simulate_keystrokes(keystroke);
+            settle(cx);
+            assert_eq!(ringed_button(&workspace, cx), ringed, "after {keystroke}");
+        }
+
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(
+            buffer(&workspace, cx),
+            "selec 1",
+            "enter reached the buffer"
+        );
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(
+                matches!(tab.query, QueryState::Failed(_)),
+                "Run once did not run the statement"
+            );
+        });
+        assert!(editor_has_keyboard(&workspace, cx));
+        cx.simulate_input("x");
+        settle(cx);
+        assert_eq!(buffer(&workspace, cx), "selec 1x");
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_prompt_dismissed_from_the_keyboard_hands_it_back_to_the_editor(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("selec 1");
+
+        for (dismiss, typed) in [("tab enter", "x"), ("escape", "y")] {
+            raise_run_once_prompt(&workspace, cx);
+            let before = buffer(&workspace, cx);
+            cx.simulate_keystrokes(dismiss);
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.dialog_in_front.get(),
+                    None,
+                    "{dismiss} left it up"
+                );
+            });
+            query_tab(&workspace, cx, |tab, _, _| {
+                assert!(matches!(tab.query, QueryState::Idle), "{dismiss} ran it");
+            });
+            assert!(editor_has_keyboard(&workspace, cx), "after {dismiss}");
+            cx.simulate_input(typed);
+            settle(cx);
+            assert_eq!(buffer(&workspace, cx), format!("{before}{typed}"));
+        }
+
+        quit(workspace, cx);
+    });
+}
+
+/// A statement that is still running cannot be driven here: its clock ticks
+/// on a timer, which the test scheduler fires at once, so nothing parks until
+/// it ends. What the chord resolves to, and who handles it, is checked
+/// instead, from the editor and from a grid on screen.
+#[gpui::test]
+fn the_cancel_chord_reaches_the_workspace_from_the_editor_and_the_grid(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("select 1");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(matches!(tab.query, QueryState::Complete { .. }));
+        });
+
+        let resolved: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let _observer = cx.update({
+            let resolved = resolved.clone();
+            |_, cx| {
+                cx.observe_keystrokes(move |event, _, _| {
+                    resolved.borrow_mut().push(
+                        event
+                            .action
+                            .as_ref()
+                            .is_some_and(|action| action.as_any().is::<CancelQuery>()),
+                    );
+                })
+            }
+        });
+        let (editor, results) = query_tab(&workspace, cx, |tab, _, _| {
+            (tab.editor.clone(), tab.results.clone())
+        });
+        for in_grid in [false, true] {
+            cx.update(|window, cx| match in_grid {
+                true => results.focus_handle(cx).focus(window, cx),
+                false => editor.focus_handle(cx).focus(window, cx),
+            });
+            settle(cx);
+            cx.update(|window, cx| {
+                let focused = match in_grid {
+                    true => results.focus_handle(cx),
+                    false => editor.focus_handle(cx),
+                };
+                assert!(focused.is_focused(window), "in grid: {in_grid}");
+                assert!(
+                    window.is_action_available(&CancelQuery, cx),
+                    "in grid: {in_grid}"
+                );
+            });
+            resolved.borrow_mut().clear();
+            cx.simulate_keystrokes("secondary-.");
+            assert_eq!(*resolved.borrow(), [true], "in grid: {in_grid}");
+        }
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_move_tab_chords_reorder_the_strip(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        let strip = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().expect("a profile is open").session;
+                (session.strip_tabs(), session.active)
+            })
+        };
+        cx.simulate_keystrokes("secondary-t");
+        settle(cx);
+        let (before, active) = strip(cx);
+        assert_eq!(before.last(), Some(&active), "a new tab opens at the end");
+
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        settle(cx);
+        let (after, _) = strip(cx);
+        assert_eq!(after[before.len() - 2], active);
+
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        settle(cx);
+        assert_eq!(strip(cx).0, before);
+
+        // The right end is a wall.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        settle(cx);
+        assert_eq!(strip(cx).0, before);
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_command_palette_opens_on_the_welcome_surface(cx: &mut TestAppContext) {
+    // A `PG*` connection from the environment opens in place of the welcome
+    // surface, as CI's live-test job sets.
+    if ["PGHOST", "PGPORT", "PGDATABASE", "PGUSER"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return;
+    }
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch(cx);
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| assert!(workspace.profile().is_none()));
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        workspace.read_with(cx, |workspace, cx| {
+            let palette = workspace.palette.as_ref().expect("the palette is up");
+            assert!(palette.read(cx).mode() == PaletteMode::Search(Scope::Commands));
+        });
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| assert!(workspace.palette.is_none()));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn ctrl_space_asks_for_completions_in_the_query_buffer(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        let menu_open = |cx: &mut VisualTestContext| {
+            query_tab(&workspace, cx, |tab, _, cx| {
+                tab.editor.read(cx).completion_menu_state().open
+            })
+        };
+        cx.simulate_input("sel");
+        settle(cx);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert!(!menu_open(cx), "escape left the menu up");
+
+        cx.simulate_keystrokes("ctrl-space");
+        settle(cx);
+        assert!(menu_open(cx));
+        assert_eq!(buffer(&workspace, cx), "sel");
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_keyboard_moves_between_the_buffer_and_its_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("select 1");
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        assert!(
+            editor_has_keyboard(&workspace, cx),
+            "with no rows yet, the buffer keeps it"
+        );
+
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        assert!(grid_has_keyboard(&workspace, cx));
+        query_tab(&workspace, cx, |tab, _, cx| {
+            assert_eq!(tab.results.read(cx).delegate().active(), Some((0, 0)));
+        });
+
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+        cx.simulate_input("x");
+        settle(cx);
+        assert_eq!(buffer(&workspace, cx), "select 1x");
+
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        assert!(grid_has_keyboard(&workspace, cx));
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_sidebar_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        workspace.update(cx, |workspace, _| workspace.sidebar_hidden = true);
+
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| assert!(!workspace.sidebar_hidden));
+        assert!(sidebar_has_keyboard(&workspace, cx));
+
+        // On the schema's row, which folds away its Tables and the table.
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        cx.update(|_, cx| {
+            let tree = &workspace.read(cx).profile().unwrap().session.explorer_tree;
+            assert!(
+                tree.read(cx).entry(1).is_none(),
+                "enter left the schema open"
+            );
+        });
+        assert!(sidebar_has_keyboard(&workspace, cx));
+
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+        cx.simulate_input("x");
+        settle(cx);
+        assert_eq!(buffer(&workspace, cx), "x");
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn enter_opens_a_sidebar_row_and_its_structure_takes_the_keyboard(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (name text); insert into birds values ('wren');",
+        );
+
+        // The schema, its Tables, then the table.
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("down down enter");
+        settle(cx);
+        // Whether the tab in front is the structure, and whether its grid has
+        // the keyboard.
+        let front_grid_has_keyboard = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let tab = workspace
+                    .read(cx)
+                    .profile()
+                    .and_then(|profile| profile.session.active_object())
+                    .expect("an object tab is in front");
+                assert_eq!(tab.name, "birds");
+                match &tab.body {
+                    ObjectBody::Relation { results, .. } => {
+                        (false, results.focus_handle(cx).is_focused(window))
+                    }
+                    ObjectBody::Structure { grid, .. } => {
+                        (true, grid.focus_handle(cx).is_focused(window))
+                    }
+                    ObjectBody::Routine(_) => panic!("birds is a table"),
+                }
+            })
+        };
+        assert_eq!(
+            front_grid_has_keyboard(cx),
+            (false, true),
+            "enter opened the rows"
+        );
+
+        cx.simulate_keystrokes("secondary-shift-d");
+        settle(cx);
+        assert_eq!(front_grid_has_keyboard(cx), (true, true));
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        cx.update(|_, cx| {
+            let workspace = workspace.read(cx);
+            let Some(ObjectBody::Structure { grid, .. }) = workspace
+                .profile()
+                .and_then(|profile| profile.session.active_object())
+                .map(|tab| &tab.body)
+            else {
+                panic!("the structure tab is in front");
+            };
+            assert!(
+                grid.read(cx).delegate().selection_text().is_some(),
+                "the arrow reached the structure grid"
+            );
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// A key pressed and let go: a focused button clicks on the release, which
+/// `simulate_keystrokes` never sends.
+fn press(cx: &mut VisualTestContext, key: &str) {
+    let keystroke = gpui::Keystroke::parse(key).expect("a key the test names");
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(gpui::KeyUpEvent { keystroke });
+    settle(cx);
+}
+
+fn in_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| workspace.read(cx).dialog_focus.contains_focused(window, cx))
+}
+
+fn front_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<&'static str> {
+    workspace.read_with(cx, |workspace, _| workspace.dialog_in_front.get())
+}
+
+fn palette_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<PaletteMode> {
+    workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .palette
+            .as_ref()
+            .map(|palette| palette.read(cx).mode())
+    })
+}
+
+#[gpui::test]
+fn tab_walks_the_import_dialog_and_its_buttons_answer_the_keyboard(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let file = store::dbdelve_directory().unwrap().join("birds.csv");
+        std::fs::write(&file, "name\nwren\n").unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let profile = workspace.profile().unwrap().id.clone();
+            workspace.open_import_file(profile, "main".into(), "birds".into(), file, window, cx);
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("import-rows"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+        let format = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let dialog = workspace.profile().unwrap().session.import_rows.as_ref();
+                dialog.map(|dialog| dialog.options.format)
+            })
+        };
+
+        // Change file…, then the format's CSV and TSV.
+        cx.simulate_keystrokes("tab tab tab");
+        settle(cx);
+        assert!(in_dialog(&workspace, cx));
+        assert!(!dialog_has_keyboard(&workspace, cx));
+        press(cx, "space");
+        assert_eq!(format(cx), Some(crate::import_rows::Format::Tsv));
+
+        // JSON, the header box, then the delimiter's list, which `escape` closes
+        // without taking the dialog down with it.
+        let in_menu = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        cx.simulate_keystrokes("tab tab tab");
+        settle(cx);
+        press(cx, "space");
+        assert!(in_menu(cx), "space opened no list");
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert!(!in_menu(cx));
+        assert_eq!(front_dialog(&workspace, cx), Some("import-rows"));
+
+        // Round and round, never out of the dialog nor into its preview.
+        let preview = workspace.read_with(cx, |workspace, _| {
+            let dialog = workspace.profile().unwrap().session.import_rows.as_ref();
+            dialog.unwrap().preview.clone()
+        });
+        for _ in 0..40 {
+            cx.simulate_keystrokes("tab");
+            settle(cx);
+            assert!(in_dialog(&workspace, cx));
+            cx.update(|window, cx| assert!(!preview.focus_handle(cx).is_focused(window)));
+        }
+
+        // The file is checked a moment after the last change to how it is read.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        settle(cx);
+        let skip_lines = workspace.read_with(cx, |workspace, _| {
+            let dialog = workspace.profile().unwrap().session.import_rows.as_ref();
+            assert_eq!(super::import_dialog::import_blocked(dialog.unwrap()), None);
+            dialog.unwrap().inputs.skip_lines.clone()
+        });
+        cx.update(|window, cx| skip_lines.focus_handle(cx).focus(window, cx));
+        press(cx, "enter");
+        workspace.read_with(cx, |workspace, _| {
+            let dialog = workspace.profile().unwrap().session.import_rows.as_ref();
+            let editing = matches!(dialog.unwrap().phase, crate::session::ImportPhase::Editing);
+            assert!(editing, "enter in a field started the import");
+        });
+
+        // From the dialog's own focus, back to Import and then Cancel.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.dialog_focus.focus(window, cx)
+        });
+        cx.simulate_keystrokes("shift-tab shift-tab");
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_import_question_picks_its_project_from_the_keyboard(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.pending_import = Some(super::PendingImport {
+                source: crate::import::Source::TablePlus,
+                report: crate::import::Report::default(),
+                fresh: 1,
+                project: Some("Imported from TablePlus".into()),
+            });
+            cx.notify();
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("import-choice"));
+        assert_eq!(ringed_button(&workspace, cx), 0);
+
+        cx.simulate_keystrokes("left left");
+        settle(cx);
+        assert_eq!(
+            ringed_button(&workspace, cx),
+            2,
+            "the ring reaches the project"
+        );
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert!(palette_mode(&workspace, cx) == Some(PaletteMode::ImportProject));
+
+        cx.simulate_input("No project");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert!(palette_mode(&workspace, cx).is_none());
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.pending_import.as_ref().unwrap().project, None);
+        });
+        assert_eq!(front_dialog(&workspace, cx), Some("import-choice"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_ring_reaches_dont_ask_again_and_enter_or_space_ticks_it(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::Full, cx)
+        });
+        cx.simulate_input("delete from birds");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("pending-run"));
+        assert_eq!(ringed_button(&workspace, cx), 0, "the ring starts on Run");
+        let dont_ask = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().unwrap().session;
+                session.pending_run.as_ref().map(|pending| pending.dont_ask)
+            })
+        };
+
+        for (keystroke, ringed, ticked) in [
+            // A space typed on as the prompt goes up presses nothing.
+            ("space", 0, false),
+            ("left left", 2, false),
+            ("enter", 2, true),
+            ("space", 2, false),
+            ("enter", 2, true),
+            ("tab", 1, true),
+            ("tab", 0, true),
+            ("tab", 2, true),
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            settle(cx);
+            assert_eq!(ringed_button(&workspace, cx), ringed, "after {keystroke}");
+            assert_eq!(dont_ask(cx), Some(ticked), "after {keystroke}");
+            assert_eq!(front_dialog(&workspace, cx), Some("pending-run"));
+        }
+
+        cx.simulate_keystrokes("right right enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert!(
+                profile
+                    .confirmed
+                    .contains(&crate::sql::Destructive::UnfilteredDelete),
+                "Run ran with the box ticked"
+            );
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// Birds and the sightings that reference them, with the keyboard on the
+/// first bird's key.
+fn launch_on_a_referenced_key(
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let (workspace, cx) = launch_on_sqlite_holding(
+        cx,
+        "create table birds (id integer primary key, name text);
+         create table sightings (id integer primary key, bird integer references birds(id));
+         insert into birds values (1, 'wren');
+         insert into sightings values (1, 1);",
+    );
+    cx.simulate_keystrokes("secondary-k e");
+    settle(cx);
+    cx.simulate_keystrokes("down down enter");
+    settle(cx);
+    assert_eq!(front_object(&workspace, cx).as_deref(), Some("birds"));
+    cx.simulate_keystrokes("down");
+    settle(cx);
+    (workspace, cx)
+}
+
+fn front_object(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| {
+        let session = &workspace.profile().unwrap().session;
+        session.active_object().map(|tab| tab.name.clone())
+    })
+}
+
+fn ask_for_references(cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("secondary-shift-p");
+    settle(cx);
+    cx.simulate_input("Show references");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+}
+
+#[gpui::test]
+fn show_references_lists_the_referencing_tables_in_the_palette(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_a_referenced_key(cx);
+        ask_for_references(cx);
+        assert!(palette_mode(&workspace, cx) == Some(PaletteMode::References));
+
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert!(palette_mode(&workspace, cx).is_none());
+        assert_eq!(front_object(&workspace, cx).as_deref(), Some("sightings"));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn references_listed_for_one_key_never_open_from_another(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text);
+             create table flocks (id integer primary key);
+             create table members (id integer primary key, flock integer references flocks(id));
+             create table sightings (id integer primary key, bird integer references birds(id));
+             insert into birds values (1, 'wren');
+             insert into flocks values (1);
+             insert into members values (1, 1);
+             insert into sightings values (1, 1);",
+        );
+        let active = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.active
+            })
+        };
+        // Flocks' key under the keyboard, then birds'.
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("down down down enter");
+        settle(cx);
+        assert_eq!(front_object(&workspace, cx).as_deref(), Some("flocks"));
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        let flocks = active(cx);
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("up enter");
+        settle(cx);
+        assert_eq!(front_object(&workspace, cx).as_deref(), Some("birds"));
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        let birds = active(cx);
+
+        // Picked once flocks is in front again: its own reference sits at the
+        // same index, and opening it would read members with flocks' key.
+        ask_for_references(cx);
+        assert!(palette_mode(&workspace, cx) == Some(PaletteMode::References));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_tab(flocks, window, cx);
+        });
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(active(cx), flocks);
+        assert_eq!(front_object(&workspace, cx).as_deref(), Some("flocks"));
+
+        // Answered once flocks is in front again.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_tab(birds, window, cx);
+        });
+        settle(cx);
+        let checks_before = workspace.read_with(cx, |workspace, _| workspace.reference_checks);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_references(&crate::actions::ShowReferences, window, cx);
+            workspace.activate_tab(flocks, window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.reference_checks,
+                checks_before + 1,
+                "no lookup started, so nothing stale was tested"
+            );
+        });
+        assert!(
+            palette_mode(&workspace, cx).is_none(),
+            "a stale answer was listed"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.reference_popup.is_none())
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn escape_closes_the_reference_arrows_list(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.reference_popup = Some(super::ReferencePopup {
+                at: Some(gpui::point(gpui::px(10.), gpui::px(10.))),
+                source: super::ReferenceSource {
+                    profile: String::new(),
+                    tab: 0,
+                    column: String::new(),
+                    value: String::new(),
+                    referenced_by: Vec::new(),
+                },
+                choices: Some(Vec::new()),
+                check: 0,
+            });
+            cx.notify();
+        });
+        settle(cx);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.reference_popup.is_none())
+        });
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn tab_reaches_the_default_sorting_choice_in_settings(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_keystrokes("secondary-,");
+        settle(cx);
+        cx.simulate_input("Default sorting");
+        settle(cx);
+        let client_sort =
+            |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.settings.client_sort);
+        assert!(!client_sort(cx));
+
+        // Server, then Client.
+        cx.simulate_keystrokes("tab tab");
+        settle(cx);
+        press(cx, "space");
+        assert!(client_sort(cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn an_existing_cmd_m_binding_can_be_recaptured_in_settings(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("profiles.toml"),
+            "[settings]\ncheck_for_updates = false\n\
+             [settings.custom_keybindings]\nshow_messages = \"secondary-m\"\n",
+        )
+        .unwrap();
+        let (workspace, cx) = launch(cx);
+        cx.simulate_keystrokes("secondary-,");
+        settle(cx);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.start_rebind("show_messages", window, cx);
+            });
+        });
+        settle(cx);
+        cx.simulate_keystrokes("cmd-m");
+        settle(cx);
+        let saved = store::peek_profiles()
+            .unwrap()
+            .settings
+            .unwrap()
+            .custom_keybindings
+            .unwrap();
+        assert_eq!(
+            saved.get("show_messages").map(String::as_str),
+            Some("cmd-m")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn stepping_to_the_next_result_keeps_the_keyboard_in_the_grid(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.executor().allow_parking();
+        cx.simulate_input("select 1; select 2");
+        cx.simulate_keystrokes("secondary-a secondary-enter");
+        settle(cx);
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        let shown = |cx: &mut VisualTestContext| {
+            query_tab(&workspace, cx, |tab, window, cx| {
+                (
+                    tab.switcher_selected(),
+                    tab.shown().1.focus_handle(cx).is_focused(window),
+                )
+            })
+        };
+        assert_eq!(shown(cx), (Some(0), true));
+
+        cx.dispatch_action(crate::actions::NextResult);
+        settle(cx);
+        assert_eq!(shown(cx), (Some(1), true));
+        assert!(!editor_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_palette_switches_who_sorts_the_view(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("select 1 as a");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        let client = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                crate::views::view_sorts_on_client(workspace.profile().unwrap(), cx)
+            })
+        };
+        assert_eq!(client(cx), Some(false));
+
+        for (row, after) in [("Sort on the client", true), ("Sort on the server", false)] {
+            cx.simulate_keystrokes("secondary-shift-p");
+            settle(cx);
+            cx.simulate_input(row);
+            cx.simulate_keystrokes("enter");
+            settle(cx);
+            assert_eq!(client(cx), Some(after), "after {row}");
+        }
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_palette_copies_what_the_explorer_menu_copies(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("down down enter");
+        settle(cx);
+
+        for (row, copied) in [
+            ("Copy SELECT (Top 100)", "SELECT"),
+            ("Copy DROP", "DROP TABLE"),
+        ] {
+            cx.simulate_keystrokes("secondary-shift-p");
+            settle(cx);
+            cx.simulate_input(row);
+            cx.simulate_keystrokes("enter");
+            settle(cx);
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert!(
+                text.contains(copied) && text.contains("birds"),
+                "{row}: {text}"
+            );
+        }
+        // Copied, never run.
+        let tables = rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
+            .and_then(|db| {
+                db.query_row("select count(*) from sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(tables, 1);
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_empty_table_opened_from_the_sidebar_keeps_the_keyboard(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("down down enter");
+        settle(cx);
+        let rows = workspace.read_with(cx, |workspace, cx| {
+            let session = &workspace.profile().unwrap().session;
+            session
+                .active_results()
+                .map(|grid| grid.read(cx).delegate().total_rows())
+        });
+        assert_eq!(rows, Some(0));
+        cx.update(|window, _| assert!(!window.context_stack().is_empty(), "no dispatch path"));
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        assert!(palette_mode(&workspace, cx).is_some());
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn tab_onto_a_welcome_project_shows_its_rename_and_delete(cx: &mut TestAppContext) {
+    if ["PGHOST", "PGPORT", "PGDATABASE", "PGUSER"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return;
+    }
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("profiles.toml"),
+            "[settings]\ncheck_for_updates = false\n[[projects]]\nname = \"Birds\"\n",
+        )
+        .unwrap();
+        let (workspace, cx) = launch(cx);
+        settle(cx);
+        let buttons_have_keyboard = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let buttons = workspace.read(cx).welcome_project_focus.borrow()[0].clone();
+                buttons.contains_focused(window, cx)
+            })
+        };
+        assert!(!buttons_have_keyboard(cx));
+
+        let mut reached = false;
+        for _ in 0..30 {
+            cx.simulate_keystrokes("tab");
+            settle(cx);
+            if buttons_have_keyboard(cx) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "Tab never reached the project's buttons");
+        cx.update(|window, cx| {
+            let buttons = workspace.read(cx).welcome_project_focus.borrow()[0].clone();
+            assert!(
+                !buttons.is_focused(window),
+                "Rename or Delete has it, not their holder"
+            );
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_clicked_box_leaves_the_ring_in_charge_of_the_keyboard(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::Full, cx)
+        });
+        cx.simulate_input("delete from birds");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("pending-run"));
+
+        let box_at = cx
+            .debug_bounds("pending-run-2")
+            .expect("the box is drawn in the ring")
+            .center();
+        cx.simulate_click(box_at, gpui::Modifiers::default());
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            assert!(session.pending_run.as_ref().unwrap().dont_ask);
+        });
+
+        // Round to Run, which `enter` presses rather than the box it would tick.
+        cx.simulate_keystrokes("tab tab tab");
+        settle(cx);
+        assert_eq!(ringed_button(&workspace, cx), 0);
+        assert!(dialog_has_keyboard(&workspace, cx));
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None, "enter pressed nothing");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert!(
+                profile
+                    .confirmed
+                    .contains(&crate::sql::Destructive::UnfilteredDelete)
+            );
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// A session moved on behind the modeless save panel still gets its rows, under
+/// every column they hold, rather than what its connection now says of a table
+/// of that name.
+#[gpui::test]
+fn a_session_changed_behind_the_save_panel_is_not_asked_about_the_table(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let database = directory.join("e2e.duckdb");
+        ::duckdb::Connection::open(&database)
+            .and_then(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+                     twice INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL); \
+                     INSERT INTO t (id) VALUES (1);",
+                )
+            })
+            .expect("the schema must apply");
+        std::fs::write(
+            directory.join("profiles.toml"),
+            format!(
+                "active = \"e2e\"\n\
+                 [settings]\n\
+                 check_for_updates = false\n\
+                 [[profiles]]\n\
+                 id = \"e2e\"\n\
+                 name = \"E2E\"\n\
+                 host = \"\"\n\
+                 database = \"\"\n\
+                 user = \"\"\n\
+                 engine = \"duckdb\"\n\
+                 path = {:?}\n",
+                database.display().to_string()
+            ),
+        )
+        .expect("profiles.toml must be writable");
+        let (workspace, cx) = launch(cx);
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.config.engine() == Engine::DuckDb)
+                .expect("the saved DuckDB profile is restored");
+            workspace.activate(index, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("SELECT * FROM t");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+
+        let mut export = |changed: bool, name: &str| {
+            let path = directory.join(name);
+            workspace.update(cx, |workspace, cx| {
+                workspace.export_results(crate::export::FileAs::Inserts, cx);
+            });
+            settle(cx);
+            if changed {
+                workspace.update(cx, |workspace, _| {
+                    workspace.profile_mut().unwrap().generation += 1;
+                });
+            }
+            let chosen = path.clone();
+            cx.simulate_new_path_selection(|_| Some(chosen));
+            for _ in 0..500 {
+                settle(cx);
+                if path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::fs::read_to_string(&path).expect("the file is written")
+        };
+
+        assert!(!export(false, "same.sql").contains("twice"));
+        assert!(export(true, "changed.sql").contains("twice"));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_export_question_takes_the_keyboard_and_hands_it_back_when_dismissed(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        // Past the default row limit, so the tab holds the first rows only.
+        cx.simulate_input(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5000) \
+             SELECT x FROM n",
+        );
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(
+                matches!(tab.query, QueryState::Complete { .. }),
+                "the query never completed"
+            );
+        });
+
+        for (dismiss, typed) in [("escape", " "), ("tab tab enter", "x")] {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .export_results(crate::export::FileAs::Rows(crate::export::Format::Csv), cx);
+            });
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(workspace.dialog_in_front.get(), Some("pending-export"));
+            });
+            assert!(dialog_has_keyboard(&workspace, cx));
+            assert_eq!(
+                ringed_button(&workspace, cx),
+                0,
+                "the ring starts on Export All Rows"
+            );
+            for (keystroke, ringed) in [
+                ("left", 1),
+                ("left", 2),
+                ("left", 0),
+                ("right", 2),
+                ("right", 1),
+                ("right", 0),
+            ] {
+                cx.simulate_keystrokes(keystroke);
+                settle(cx);
+                assert_eq!(ringed_button(&workspace, cx), ringed, "after {keystroke}");
+            }
+
+            let before = buffer(&workspace, cx);
+            cx.simulate_keystrokes(dismiss);
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.dialog_in_front.get(),
+                    None,
+                    "{dismiss} left it up"
+                );
+                let session = &workspace.profile().unwrap().session;
+                assert!(session.exporting.is_none(), "{dismiss} started an export");
+            });
+            assert!(editor_has_keyboard(&workspace, cx), "after {dismiss}");
+            cx.simulate_input(typed);
+            settle(cx);
+            assert_eq!(buffer(&workspace, cx), format!("{before}{typed}"));
+        }
+
+        quit(workspace, cx);
+    });
+}
+
+fn relation_names(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    workspace.read_with(cx, |workspace, _| {
+        let Some(CatalogState::Loaded(catalog, _)) =
+            workspace.profile().map(|profile| &profile.catalog)
+        else {
+            panic!("the catalog should have loaded");
+        };
+        catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| &schema.relations)
+            .map(|relation| relation.name.clone())
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn the_refresh_shortcut_finds_a_table_made_elsewhere_over_the_same_session(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        settle(cx);
+        assert!(relation_names(&workspace, cx).is_empty());
+        let generation = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().map(|profile| profile.generation)
+        });
+
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        rusqlite::Connection::open(database)
+            .expect("the database should open")
+            .execute_batch("CREATE TABLE made_elsewhere (id INTEGER)")
+            .expect("the table should be created");
+
+        cx.simulate_keystrokes("secondary-shift-r");
+        settle(cx);
+        assert_eq!(relation_names(&workspace, cx), ["made_elsewhere"]);
+
+        // Sent straight to the session, because its table has to stay
+        // uncommitted: only a read beside the session cannot see it, and a
+        // refresh that dropped the session would leave nothing to `COMMIT`.
+        let session = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.profile().and_then(|profile| profile.connection())
+            })
+            .expect("the profile is connected");
+        let run = |sql: &str| {
+            session
+                .query(sql, &CancelToken::default(), Fetch::default())
+                .expect("the statement should run");
+        };
+        run("BEGIN");
+        run("CREATE TABLE not_committed (id INTEGER)");
+        workspace.update(cx, |workspace, _| {
+            if let Some(profile) = workspace.profile_mut() {
+                profile.in_transaction = true;
+            }
+        });
+
+        cx.simulate_keystrokes("secondary-shift-r");
+        settle(cx);
+        assert_eq!(relation_names(&workspace, cx), ["made_elsewhere"]);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the profile is still open");
+            assert_eq!(Some(profile.generation), generation, "it reconnected");
+            assert!(!profile.refreshing_schema());
+            assert_eq!(
+                profile.session.notice.as_deref(),
+                Some("Schema refreshed."),
+                "the read beside the session failed"
+            );
+        });
+
+        run("COMMIT");
+        cx.simulate_keystrokes("secondary-shift-r");
+        settle(cx);
+        let mut names = relation_names(&workspace, cx);
+        names.sort();
+        assert_eq!(names, ["made_elsewhere", "not_committed"]);
+
+        quit(workspace, cx);
+    });
+}
+
+fn history_view(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> crate::palette::HistoryView {
+    workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .palette
+            .as_ref()
+            .expect("the palette is up")
+            .read(cx)
+            .history()
+    })
+}
+
+#[gpui::test]
+fn the_history_scope_filters_and_sorts_its_runs_from_the_keyboard(cx: &mut TestAppContext) {
+    use crate::palette::{HistoryOrder, HistoryStatus, HistoryView};
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("select 1");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let last = &workspace.profile().unwrap().session.history[0];
+            assert_eq!((last.sql.as_str(), last.rows), ("select 1", Some(1)));
+            assert!(last.at.is_some() && last.ms.is_some() && last.error.is_none());
+        });
+
+        // Outside History the chords do nothing.
+        cx.simulate_keystrokes("secondary-p");
+        settle(cx);
+        cx.simulate_keystrokes("secondary-k f secondary-k o");
+        settle(cx);
+        assert_eq!(history_view(&workspace, cx), HistoryView::default());
+
+        cx.simulate_keystrokes("tab tab");
+        settle(cx);
+        assert!(palette_mode(&workspace, cx) == Some(PaletteMode::Search(Scope::History)));
+        cx.simulate_keystrokes("secondary-k f secondary-k o secondary-k o");
+        settle(cx);
+        assert_eq!(
+            history_view(&workspace, cx),
+            HistoryView {
+                status: HistoryStatus::Succeeded,
+                order: HistoryOrder::MostRows,
+            }
+        );
+
+        // A palette opened again starts unfiltered.
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        cx.simulate_keystrokes("secondary-p");
+        settle(cx);
+        assert_eq!(history_view(&workspace, cx), HistoryView::default());
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_count_whose_tab_closed_under_it_still_leaves_its_outcome_in_the_history(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.executor().allow_parking();
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        cx.simulate_keystrokes("down down enter");
+        settle(cx);
+        let object = workspace.read_with(cx, |workspace, _| {
+            match workspace.profile().unwrap().session.active {
+                crate::session::Tab::Object(id) => id,
+                crate::session::Tab::Query(_) => panic!("the table did not open"),
+            }
+        });
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.count_rows(object, cx);
+                workspace.close_object(object, window, cx);
+            })
+        });
+        settle(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            let last = &workspace.profile().unwrap().session.history[0];
+            assert!(last.sql.to_lowercase().contains("count"), "{}", last.sql);
+            assert!(last.ms.is_some(), "the count's outcome was dropped");
+        });
+        let profile =
+            workspace.read_with(cx, |workspace, _| workspace.profile().unwrap().id.clone());
+        assert!(store::history(&profile)[0].ms.is_some());
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_new_folder_takes_its_name_from_the_keyboard_and_hands_it_back(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let leaf =
+                    workspace.profile().unwrap().session.explorer_leaves["relation-main\0birds"];
+                let member = workspace.member_at(leaf.target);
+                assert!(member.is_some(), "the table is nameable");
+                workspace.new_folder(member, window, cx);
+            });
+        });
+        settle(cx);
+        let naming = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let session = &workspace.read(cx).profile().unwrap().session;
+                session
+                    .query_rename
+                    .as_ref()
+                    .map(|rename| rename.input.focus_handle(cx).is_focused(window))
+            })
+        };
+        assert_eq!(
+            naming(cx),
+            Some(true),
+            "the folder's field has the keyboard"
+        );
+
+        cx.simulate_input("Birds");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(naming(cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        cx.update(|_, cx| {
+            let profile = workspace.read(cx).profile().unwrap();
+            let folders = &profile.shortcuts.folders;
+            assert_eq!(folders.len(), 1);
+            assert_eq!(folders[0].name, "Birds");
+            assert_eq!(folders[0].members.len(), 1);
+            let tree = profile.session.explorer_tree.read(cx);
+            let row = tree.entry(0).expect("the folder leads the sidebar");
+            assert_eq!(row.item().label.as_ref(), "Birds");
+            assert_eq!(row.item().children[0].label.as_ref(), "birds");
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_folder_keeps_the_sidebar_drawn_while_the_catalog_is_away(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.update(|_, cx| {
+            workspace.update(cx, |workspace, _| {
+                let profile = workspace.profile_mut().unwrap();
+                profile.catalog = CatalogState::Failed("gone".into());
+                assert!(profile.session.saved_queries.is_empty());
+                assert!(!super::forms::explorer_drawn(profile));
+
+                profile.shortcuts.add_folder("Hot").unwrap();
+                assert!(
+                    super::forms::explorer_drawn(profile),
+                    "its Remove and Unpin are reachable"
+                );
+            });
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// Where the sidebar draws `row`, by its id.
+fn explorer_row(
+    workspace: &Entity<Workspace>,
+    row: &str,
+    cx: &mut VisualTestContext,
+) -> gpui::Bounds<gpui::Pixels> {
+    let index = cx
+        .update(|_, cx| {
+            let tree = workspace
+                .read(cx)
+                .profile()
+                .unwrap()
+                .session
+                .explorer_tree
+                .clone();
+            tree.read(cx).index_of(&row.to_string().into())
+        })
+        .expect("the row is listed");
+    // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+    let selector: &'static str = format!("explorer-row-{index}").leak();
+    cx.debug_bounds(selector).expect("the row is drawn")
+}
+
+/// The id of the row listing `member` in `folder`, or among the pins.
+fn shortcut_row(
+    workspace: &Entity<Workspace>,
+    member: &explorer::Member,
+    folder: Option<&str>,
+    cx: &mut VisualTestContext,
+) -> String {
+    cx.update(|_, cx| {
+        let session = &workspace.read(cx).profile().unwrap().session;
+        let listed = explorer::Shortcut::Member {
+            member: member.clone(),
+            folder: folder.map(str::to_string),
+            missing: false,
+        };
+        session
+            .explorer_shortcuts
+            .iter()
+            .find(|(_, shortcut)| **shortcut == listed)
+            .map(|(row, _)| row.clone())
+            .expect("the shortcut is listed")
+    })
+}
+
+/// A left-button drag from `from` to `to`, frame by frame, as the pointer
+/// would make it.
+fn drag(
+    cx: &mut VisualTestContext,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+) {
+    let none = gpui::Modifiers::default();
+    cx.simulate_mouse_down(from, gpui::MouseButton::Left, none);
+    for at in [from + gpui::point(gpui::px(0.), gpui::px(8.)), to] {
+        cx.simulate_mouse_move(at, gpui::MouseButton::Left, none);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    cx.simulate_mouse_up(to, gpui::MouseButton::Left, none);
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_shortcut_dragged_between_folders_moves_and_one_from_the_schemas_is_added(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let table = "relation-main\0birds";
+        let birds = cx.update(|_, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let leaf = workspace.profile().unwrap().session.explorer_leaves[table];
+                let birds = workspace.member_at(leaf.target).unwrap();
+                let shortcuts = &mut workspace.profile_mut().unwrap().shortcuts;
+                shortcuts.add_folder("Hot").unwrap();
+                shortcuts.add_folder("Cold").unwrap();
+                workspace.toggle_in_folder("Hot".into(), birds.clone(), cx);
+                birds
+            })
+        });
+        settle(cx);
+        let held = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let shortcuts = &workspace.read(cx).profile().unwrap().shortcuts;
+                ["Hot", "Cold"].map(|name| shortcuts.holds(name, &birds))
+            })
+        };
+        let in_hot = shortcut_row(&workspace, &birds, Some("Hot"), cx);
+
+        let from = explorer_row(&workspace, &in_hot, cx).center();
+        let to = explorer_row(&workspace, &explorer::folder_row("Cold"), cx).center();
+        drag(cx, from, to);
+        assert_eq!(
+            held(cx),
+            [false, true],
+            "out of one folder into another moves"
+        );
+
+        let from = explorer_row(&workspace, table, cx).center();
+        let to = explorer_row(&workspace, &explorer::folder_row("Hot"), cx).center();
+        drag(cx, from, to);
+        assert_eq!(held(cx), [true, true], "from the schemas it is added");
+        assert!(
+            sidebar_has_keyboard(&workspace, cx),
+            "the sidebar keeps the keyboard"
+        );
+        assert!(
+            cx.update(|_, cx| workspace
+                .read(cx)
+                .profile()
+                .unwrap()
+                .session
+                .objects
+                .is_empty()),
+            "a drag opens nothing"
+        );
+
+        // Dropped where nothing takes it, a drag changes nothing.
+        let from = explorer_row(&workspace, table, cx).center();
+        drag(cx, from, from + gpui::point(gpui::px(0.), gpui::px(2_000.)));
+        assert_eq!(held(cx), [true, true]);
+
+        let at = explorer_row(&workspace, table, cx).center();
+        cx.simulate_click(at, gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(
+            cx.update(|_, cx| workspace.read(cx).profile().unwrap().session.objects.len()),
+            1,
+            "a click still opens the row"
+        );
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_pin_dropped_on_the_top_half_of_another_goes_before_it(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (name text); create table fish (name text);",
+        );
+        let [birds, fish] = cx.update(|_, cx| {
+            workspace.update(cx, |workspace, cx| {
+                ["birds", "fish"].map(|name| {
+                    let leaf = workspace.profile().unwrap().session.explorer_leaves
+                        [&explorer::relation_row("main", name)];
+                    let member = workspace.member_at(leaf.target).unwrap();
+                    workspace.toggle_pin(explorer::Pin::Member(member.clone()), cx);
+                    member
+                })
+            })
+        });
+        settle(cx);
+
+        let from = explorer_row(&workspace, &shortcut_row(&workspace, &fish, None, cx), cx);
+        let onto = explorer_row(&workspace, &shortcut_row(&workspace, &birds, None, cx), cx);
+        drag(
+            cx,
+            from.center(),
+            onto.origin + gpui::point(gpui::px(20.), gpui::px(2.)),
+        );
+        let pins = cx.update(|_, cx| workspace.read(cx).profile().unwrap().shortcuts.pins.clone());
+        assert_eq!(
+            pins,
+            [explorer::Pin::Member(fish), explorer::Pin::Member(birds)]
+        );
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn pinning_leaves_every_row_its_height(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let table = explorer::relation_row("main", "birds");
+        let unpinned = explorer_row(&workspace, &table, cx).size.height;
+
+        cx.update(|_, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let leaf = workspace.profile().unwrap().session.explorer_leaves[&table];
+                let birds = workspace.member_at(leaf.target).unwrap();
+                workspace.toggle_pin(explorer::Pin::Member(birds), cx);
+            })
+        });
+        settle(cx);
+
+        assert_eq!(explorer_row(&workspace, &table, cx).size.height, unpinned);
+        assert_eq!(
+            explorer_row(&workspace, explorer::PINNED_GROUP, cx)
+                .size
+                .height,
+            unpinned,
+            "the Pinned group, listed first, is the row every row is sized by"
+        );
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_service_launch_does_not_reuse_a_profiles_explicit_port(cx: &mut TestAppContext) {
+    // PGSERVICE must be set before the process starts, not raced against
+    // every other test that reads the environment.
+    const CHILD: &str = "DBDELVE_SERVICE_PORT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "workspace::e2e::a_service_launch_does_not_reuse_a_profiles_explicit_port",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PGSERVICE", "startup-port")
+            .env_remove("PGSERVICEFILE")
+            .env_remove("PGSYSCONFDIR")
+            .status()
+            .expect("the child test should run");
+        assert!(status.success());
+        return;
+    }
+
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("profiles.toml"),
+            "active = \"explicit\"\n\
+             [settings]\n\
+             check_for_updates = false\n\
+             [[profiles]]\n\
+             id = \"explicit\"\n\
+             name = \"Explicit port\"\n\
+             host = \"\"\n\
+             port = 5432\n\
+             database = \"\"\n\
+             user = \"\"\n\
+             service = \"startup-port\"\n\
+             [[profiles]]\n\
+             id = \"inherited\"\n\
+             name = \"Service port\"\n\
+             host = \"\"\n\
+             database = \"\"\n\
+             user = \"\"\n\
+             service = \"startup-port\"\n",
+        )
+        .unwrap();
+        let (workspace, cx) = launch(cx);
+        let active =
+            workspace.read_with(cx, |workspace, _| workspace.profile().unwrap().id.clone());
+        quit(workspace, cx);
+        assert_eq!(active, "inherited");
+    });
+}

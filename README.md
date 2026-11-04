@@ -5,6 +5,11 @@ with GPUI, no Electron and no JVM: instant startup, friendly on your memory,
 and smooth scrolling through large tables where other clients crash or
 introduce limits.
 
+
+## Community
+
+Ideas and discussion on [Discord](https://discord.gg/7PegWzwqCm).
+
 > Early days. Everything listed below works today.
 
 ![DBDelve in Gruvbox Dark Glass: a SELECT on the events table in the editor and its result grid below](assets/screenshots/query-dark.png)
@@ -48,8 +53,8 @@ data lives are all in [docs/install.md](docs/install.md).
 
 ## Supported databases
 
-Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB, Snowflake, SQL Server, MongoDB
-and Redis (and Valkey, KeyDB, Dragonfly).
+Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB, Snowflake, SQL Server, MongoDB,
+Redis (and Valkey, KeyDB, Dragonfly) and ClickHouse.
 
 More engines are planned.
 
@@ -91,7 +96,9 @@ More engines are planned.
   ![Importing events.csv: format options on the left, each file column mapped to a table column, and a preview of the rows](assets/screenshots/import.png)
 
 - **Open a data file** by dropping it on the window: a CSV, Excel, Parquet or
-  JSON file opens in DuckDB, held in memory, as a query you can change.
+  JSON file opens in DuckDB, held in memory, as a query you can change. A
+  `.sql` file opens in a new query tab on the connection you're on, and runs
+  only when you run it.
 
 - **See the query plan** highlighted in its own pane, with bad row estimates
   called out.
@@ -130,9 +137,6 @@ runs each (2026-10-11, M1 Pro, 32 GB):
 \* The whole 1M-row table pulled into memory on purpose, with the row limit
 off. Method and full results in [BENCHMARKS.md](BENCHMARKS.md).
 
-## Community
-
-Ideas and discussion on [Discord](https://discord.gg/upKpusAnS).
 
 ## License
 

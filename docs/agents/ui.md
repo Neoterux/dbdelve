@@ -10,6 +10,10 @@ trait (an anchored menu whose open state the library owns, which is the answer
 to the "GPUI drops view state" hazard under "Animation hazards" below rather than a dropdown of ours),
 `Root` dialog layers, resizable panels, `Spinner`, and the completion popup.
 
+Popup menus use the component theme's chrome font, even when opened from an
+editor or grid. The vendored `PopupMenu` resets the inherited family at its root
+so labels and submenus do not pick up the triggering surface's monospace font.
+
 **Completion is the library's.** `CompletionProvider` is the trait and the
 editor's `lsp.completion_provider` is a public field. No language server is
 involved: `lsp_types` is the vocabulary and nothing starts a process. The editor
@@ -17,10 +21,36 @@ draws the menu itself, so a provider is the whole integration, and `up`, `down`,
 `enter` and `escape` are already routed to the menu when it is open. Do not
 hand-roll a popup beside it.
 
+DBDelve adds Tab acceptance through `views::completion_target`, attached to the
+query buffer and each filter value so the action always names the editor with
+focus, not the tab's runnable buffer. The binding uses `Input && mode == editor`:
+`Editor > Input` depends on the query surface's wrapper and misses raw filters.
+Both contexts apply in a query buffer, so shortcut conflict detection must
+recognize their overlap when completion or Toggle Line Comment is rebound.
+After accepting through the menu's synthetic Enter, stop propagation, because
+the menu propagates and would otherwise run the original keystroke as well.
+With no suggestion, propagate the original stroke to its native binding: Tab
+indents, while a completion shortcut rebound to Enter still submits a filter.
+The filter consumes a propagated native Enter after its submission event so
+the unhandled-keystroke fallback cannot insert a hidden newline.
+
+`ctrl-space` (`show_completions`) dispatches the library's own
+`ShowCompletions`, which it handles but leaves unbound, under the same
+`Input && mode == editor` context. On macOS the system takes that chord first
+while more than one input source is enabled; it can be rebound.
+
 The library binds `escape` scoped to the input; DBDelve's `show_editor` binding
 is unscoped, and an unscoped binding wins at every depth (see "GPUI hazards" in `AGENTS.md`).
 `show_editor` must therefore `cx.propagate()` on the paths where DBDelve has
-nothing stacked to close, or the completion popup cannot be dismissed.
+nothing stacked to close, or the completion popup cannot be dismissed, and
+first of all while a `PopupMenu` holds the keyboard, or `escape` in a
+dropdown takes down the dialog or form under it. Its two
+last stops are focus moves, not dismissals: from the sidebar's tree it hands
+the keyboard to the surface in front, and from a query tab's grid (the table
+itself, never a cell's open input, which is its descendant) to the buffer
+above it, keeping the selection. Both run before the propagate, so on a query
+tab the table's own `escape`, which clears its selection, never sees it; on an
+object tab's grid, with no buffer to go to, it still does.
 
 It does **not** provide a fuzzy matcher, and its `command` palette filters by
 substring in a fixed layout. Both are ours: `src/fuzzy.rs` is the one matcher
