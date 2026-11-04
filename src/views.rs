@@ -493,6 +493,14 @@ fn render_plan(
                     // drawn rules: a rule per level is a lot of ink for a depth
                     // that is usually three.
                     .pl(px(node.depth as f32 * 14.))
+                    // The `CTE big` / `SubPlan 2` line that opens this subtree,
+                    // kept above the node it introduced.
+                    .children(node.heading.as_ref().map(|heading| {
+                        div()
+                            .text_size(px(layout::chrome(layout::TEXT_XS)))
+                            .text_color(t.text_faint)
+                            .child(heading.clone())
+                    }))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
