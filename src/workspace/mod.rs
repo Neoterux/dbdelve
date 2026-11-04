@@ -5,9 +5,13 @@
 //! inherent impl rather than types of their own.
 
 mod commands;
+#[cfg(test)]
+mod e2e;
 mod editing;
+mod exports;
 mod files;
 mod filters;
+mod folders;
 mod forms;
 mod import_dialog;
 mod import_rows;
@@ -67,6 +71,9 @@ pub(crate) struct Settings {
     /// holds rather than by asking the server again. Off by default, which is
     /// how every tab sorted before this was a choice.
     pub(crate) client_sort: bool,
+    /// Whether completing a relation writes it as `schema.relation`, for
+    /// databases whose search path does not reach every schema.
+    pub(crate) qualify_completions: bool,
     /// Whether the first-run greeting has played on the welcome surface.
     pub(crate) welcomed: bool,
     /// Keybinding overrides, keyed by action id. Applied to the keymap on
@@ -103,6 +110,7 @@ impl Default for Settings {
             check_for_updates: true,
             color_titlebar: true,
             client_sort: false,
+            qualify_completions: false,
             welcomed: false,
             custom_keybindings: HashMap::new(),
         }
@@ -254,6 +262,10 @@ pub(crate) struct Workspace {
     pub(crate) grid_zoom: u32,
     pub(crate) shell_split: Entity<ResizableState>,
     pub(crate) tab_strip: crate::tab_drag::TabStrip,
+    /// The sidebar row a dragged shortcut would land beside, and whether
+    /// after it: what draws the insertion line, and what a drop on that row
+    /// reads, since a drop is not told where on the row it was let go.
+    pub(crate) explorer_drop: Option<(gpui::SharedString, bool)>,
     /// Where the sidebar's edge is unless a drag has moved it. The library
     /// rescales every panel by its share when the window changes size, so this
     /// is what puts the sidebar back.
@@ -331,6 +343,21 @@ pub(crate) struct Workspace {
     /// The window's own focus, for the moments when nothing inside it can hold
     /// any. See [`Focus::Window`].
     pub(crate) focus: FocusHandle,
+    /// Around the sidebar's tree, whose own handle the library keeps to
+    /// itself: what tells an `escape` in the tree from one anywhere else.
+    pub(crate) explorer_focus: FocusHandle,
+    /// The dialogs' own, so `enter` answers the one in front instead of
+    /// editing the buffer or the grid it covers.
+    pub(crate) dialog_focus: FocusHandle,
+    /// Which dialog was in front last frame, so a change of it moves the
+    /// keyboard to the one now there.
+    pub(crate) dialog_in_front: std::cell::Cell<Option<&'static str>>,
+    /// The button `enter` presses in it, counted from the right.
+    pub(crate) dialog_choice: std::cell::Cell<usize>,
+    /// What held the keyboard when the first dialog went up.
+    pub(crate) focus_before_dialog: std::cell::RefCell<Option<FocusHandle>>,
+    /// See [`Workspace::welcome_project_focus`].
+    pub(crate) welcome_project_focus: std::cell::RefCell<Vec<FocusHandle>>,
     pub(crate) newer_release: Option<update::Release>,
 }
 
@@ -424,6 +451,7 @@ impl Workspace {
             grid_zoom: 100,
             shell_split: cx.new(|_| ResizableState::default()),
             tab_strip: crate::tab_drag::TabStrip::default(),
+            explorer_drop: None,
             sidebar_width: std::cell::Cell::new(px(layout::SIDEBAR_DEFAULT_WIDTH)),
             sidebar_container: std::cell::Cell::new(px(0.)),
             sidebar_last_size: std::cell::Cell::new(px(layout::SIDEBAR_DEFAULT_WIDTH)),
@@ -461,6 +489,12 @@ impl Workspace {
             theme_before_preview: None,
             opacity_input,
             focus: cx.focus_handle(),
+            explorer_focus: cx.focus_handle(),
+            dialog_focus: cx.focus_handle(),
+            dialog_in_front: std::cell::Cell::default(),
+            dialog_choice: std::cell::Cell::default(),
+            focus_before_dialog: std::cell::RefCell::default(),
+            welcome_project_focus: std::cell::RefCell::default(),
             newer_release: None,
         };
 
@@ -536,6 +570,8 @@ impl Workspace {
                     stored_settings.check_for_updates.unwrap_or(true);
                 workspace.settings.color_titlebar = stored_settings.color_titlebar.unwrap_or(true);
                 workspace.settings.client_sort = stored_settings.client_sort.unwrap_or(false);
+                workspace.settings.qualify_completions =
+                    stored_settings.qualify_completions.unwrap_or(false);
                 workspace.settings.welcomed = welcome::welcomed(
                     stored_settings.welcomed,
                     !profiles.is_empty() || !unavailable.is_empty(),
@@ -580,6 +616,7 @@ impl Workspace {
                 let existing = workspace.profiles.iter().position(|profile| {
                     profile.config.engine() == config.engine()
                         && profile.config.endpoint() == config.endpoint()
+                        && profile.config.service() == config.service()
                         && profile.config.server().map(|server| server.user.as_str())
                             == config.server().map(|server| server.user.as_str())
                 });
@@ -696,16 +733,14 @@ impl Workspace {
         })
         .detach();
 
-        // Buffers are otherwise written only when one is swapped for another,
-        // so without this everything typed since the last swap dies with the
-        // process -- which is the one moment a person expects it to be kept.
+        // Finish writes synchronously: the process is going, and nothing
+        // would wait for background work to finish.
         cx.on_app_quit(|workspace: &mut Self, cx: &mut Context<Self>| {
             workspace.persist_buffers(cx);
             async {}
         })
         .detach();
-        // Closing the window does not quit the application, so without this the
-        // red button is a way to lose everything typed since the last swap.
+        // Window release also persists when the window closes without Quit.
         cx.on_release(|workspace, cx| workspace.persist_buffers(cx))
             .detach();
 
@@ -974,6 +1009,25 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Rebuilt on every profile now rather than at its next catalog load, which
+    /// may be a reconnect away.
+    pub(crate) fn set_qualify_completions(&mut self, qualify: bool, cx: &mut Context<Self>) {
+        if self.settings.qualify_completions == qualify {
+            return;
+        }
+        self.settings.qualify_completions = qualify;
+        let ids: Vec<String> = self
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect();
+        for id in ids {
+            self.install_completions(&id, cx);
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     /// Written through for the same reason the zoom is: a font that resets on
     /// relaunch is a setting the user has to make again every morning.
     pub(crate) fn set_font(&mut self, slot: FontSlot, family: String, cx: &mut Context<Self>) {
@@ -1197,13 +1251,12 @@ impl Render for Workspace {
                     .map(|tab| &tab.body)
                 {
                     Some(ObjectBody::Relation { results, .. }) => Focus::Grid(results.clone()),
+                    Some(ObjectBody::Structure { grid, .. }) => Focus::Structure(grid.clone()),
                     // A routine's tab is read: nothing in it takes a
-                    // keystroke; a structure tab's grid takes focus on a click. The window still has to hold focus, or the
+                    // keystroke. The window still has to hold focus, or the
                     // bindings that leave this tab go with it -- as it does
                     // for the last object tab of all, closed.
-                    Some(ObjectBody::Routine(_) | ObjectBody::Structure { .. }) | None => {
-                        Focus::Window
-                    }
+                    Some(ObjectBody::Routine(_)) | None => Focus::Window,
                 },
             };
             profile.session.editor_needs_focus = false;
@@ -1239,8 +1292,19 @@ impl Render for Workspace {
             Some(Focus::Buffer(editor)) => editor.focus_handle(cx).focus(window, cx),
             Some(Focus::Field(input)) => input.focus_handle(cx).focus(window, cx),
             Some(Focus::Grid(grid)) => grid.focus_handle(cx).focus(window, cx),
+            Some(Focus::Structure(grid)) => grid.focus_handle(cx).focus(window, cx),
             Some(Focus::Window) => self.focus.focus(window, cx),
             None => {}
+        }
+        // After the tab's own focus, which a context menu closing over the
+        // sidebar can ask for in the same frame the row's field opens.
+        if let Some(profile) = self.profile_mut()
+            && std::mem::take(&mut profile.session.query_rename_needs_focus)
+            && let Some(rename) = &profile.session.query_rename
+        {
+            let input = rename.input.clone();
+            input.focus_handle(cx).focus(window, cx);
+            input.update(cx, |input, cx| input.select_all(window, cx));
         }
         if std::mem::take(&mut self.settings_search_needs_focus) && self.settings_open {
             self.settings_search.focus_handle(cx).focus(window, cx);
@@ -1297,14 +1361,18 @@ impl Render for Workspace {
                         .min_h_0()
                         .child(self.render_connection_form(window, cx)),
                 )
-                .children(self.render_import_choice(cx))
+                .children(self.dialog_layer(
+                    [("import-choice", self.render_import_choice(cx))],
+                    window,
+                    cx,
+                ))
                 .children(self.palette.clone());
         }
         let Some(profile) = self.profile() else {
             return div()
                 .id("welcome")
                 // A data file dropped anywhere on the window opens in DuckDB.
-                .on_drop(cx.listener(Self::drop_data_files))
+                .on_drop(cx.listener(Self::drop_files))
                 .size_full()
                 .track_focus(&self.focus)
                 .text_color(t.text)
@@ -1317,6 +1385,9 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
+                .on_action(cx.listener(Self::fuzzy_open))
+                .on_action(cx.listener(Self::command_palette))
+                .on_action(cx.listener(Self::search_everything))
                 .on_action(cx.listener(Self::set_default_row_limit_action))
                 .on_action(cx.listener(Self::custom_row_limit))
                 .on_action(cx.listener(Self::zoom_editor_in))
@@ -1324,7 +1395,11 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::reset_editor_zoom))
                 .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
-                .children(self.render_import_choice(cx))
+                .children(self.dialog_layer(
+                    [("import-choice", self.render_import_choice(cx))],
+                    window,
+                    cx,
+                ))
                 .children(self.palette.clone());
         };
         let failed = matches!(profile.state, ProfileState::Failed(_));
@@ -1472,6 +1547,43 @@ impl Render for Workspace {
                     }
                 }
             });
+        // Read off the writer's counter, on the half-second tick its start set
+        // going: the rows go to the file, never through anything that redraws.
+        let export_status =
+            profile.session.exporting.as_ref().map(|exporting| {
+                let cancelling = exporting
+                    .progress
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let rows = exporting
+                    .progress
+                    .rows
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let workspace = cx.entity().downgrade();
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .child(div().whitespace_nowrap().text_color(t.text_faint).child(
+                        match cancelling {
+                            true => format!("Cancelling the export to {}…", exporting.file),
+                            false => format!(
+                                "Exporting to {}… {} {}",
+                                exporting.file,
+                                group_thousands(rows as u64),
+                                if rows == 1 { "row" } else { "rows" }
+                            ),
+                        },
+                    ))
+                    .children((!cancelling).then(|| {
+                        button("cancel-export", "Cancel", Tone::Quiet, Control::Compact, t)
+                            .on_click(move |_, _, cx| {
+                                _ = workspace
+                                    .update(cx, |workspace, cx| workspace.cancel_export(cx));
+                            })
+                    }))
+            });
         let query_status = match profile.session.active_query() {
             Some(QueryState::Complete {
                 rows,
@@ -1512,7 +1624,7 @@ impl Render for Workspace {
             // the grid, so the count beside them still belongs to whatever ran
             // last. What the run itself is worth saying is how long the server
             // spent answering.
-            Some(QueryState::Explained { elapsed, mode }) => {
+            Some(QueryState::Explained { elapsed, mode, .. }) => {
                 Some(format!("{} · {elapsed:.1?}", mode.label()))
             }
             _ => None,
@@ -1591,6 +1703,7 @@ impl Render for Workspace {
         let copy_workspace = apply_workspace.clone();
         let csv_workspace = apply_workspace.clone();
         let json_workspace = apply_workspace.clone();
+        let sql_workspace = apply_workspace.clone();
         let refresh_workspace = apply_workspace.clone();
         let ddl_workspace = apply_workspace.clone();
         let insert_workspace = apply_workspace.clone();
@@ -1601,6 +1714,7 @@ impl Render for Workspace {
         let bar_has_content = inline_status.is_some()
             || left_stats.is_some()
             || count_control.is_some()
+            || export_status.is_some()
             || notice.is_some()
             || paging.is_some()
             || view_sorting.is_some()
@@ -1644,6 +1758,7 @@ impl Render for Workspace {
                                 .child(stats)
                         }))
                         .children(count_control)
+                        .children(export_status)
                         .children(notice.map(|notice| {
                             div()
                                 .min_w_0()
@@ -1714,7 +1829,7 @@ impl Render for Workspace {
                             })
                         }))
                         // Named, not one button over a menu: the choice is
-                        // between two things, and a control that opens
+                        // between a few things, and a control that opens
                         // another control to ask which is a click spent on
                         // nothing. It also puts the format on screen, which
                         // a lone "Export" left to the file extension.
@@ -1722,7 +1837,7 @@ impl Render for Workspace {
                             button("export-csv", "Export CSV", Tone::Quiet, Control::Compact, t)
                                 .on_click(move |_, _, cx| {
                                     _ = csv_workspace.update(cx, |workspace, cx| {
-                                        workspace.export_results(Format::Csv, cx);
+                                        workspace.export_results(FileAs::Rows(Format::Csv), cx);
                                     });
                                 })
                         }))
@@ -1736,10 +1851,30 @@ impl Render for Workspace {
                             )
                             .on_click(move |_, _, cx| {
                                 _ = json_workspace.update(cx, |workspace, cx| {
-                                    workspace.export_results(Format::Json, cx);
+                                    workspace.export_results(FileAs::Rows(Format::Json), cx);
                                 });
                             })
                         }))
+                        .children(
+                            (show_result_actions && engine.syntax() == db::Syntax::Sql).then(
+                                || {
+                                    button(
+                                        "export-sql",
+                                        "Export SQL",
+                                        Tone::Quiet,
+                                        Control::Compact,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = sql_workspace.update(cx, |workspace, cx| {
+                                                workspace.export_results(FileAs::Inserts, cx);
+                                            });
+                                        },
+                                    )
+                                },
+                            ),
+                        )
                         .children(structure_copies.map(|(ddl, insert)| {
                             div()
                                 .flex()
@@ -1937,7 +2072,7 @@ impl Render for Workspace {
         div()
             .id("workspace")
             // A data file dropped anywhere on the window opens in DuckDB.
-            .on_drop(cx.listener(Self::drop_data_files))
+            .on_drop(cx.listener(Self::drop_files))
             .relative()
             // The floor under the focus, so a surface with nothing focusable
             // on it still has a dispatch path for the workspace's own
@@ -1957,6 +2092,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::previous_profile))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
+            .on_action(cx.listener(Self::move_tab_left))
+            .on_action(cx.listener(Self::move_tab_right))
             .on_action(cx.listener(Self::open_connection_form))
             .on_action(cx.listener(Self::new_project))
             .on_action(cx.listener(Self::import_from))
@@ -1972,6 +2109,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::rollback_transaction))
             .on_action(cx.listener(Self::switch_connection))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
             // Unregistered under the import dialog, which stops only the
             // mouse: these act on the tab it covers, out of sight, and their
@@ -1987,6 +2125,11 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::next_edit))
                     .on_action(cx.listener(Self::previous_edit))
                     .on_action(cx.listener(Self::sort_column))
+                    .on_action(cx.listener(Self::sort_active_column))
+                    .on_action(cx.listener(Self::next_result))
+                    .on_action(cx.listener(Self::previous_result))
+                    .on_action(cx.listener(Self::toggle_messages))
+                    .on_action(cx.listener(Self::copy_plan_action))
                     .on_action(cx.listener(Self::set_row_limit))
                     .on_action(cx.listener(Self::set_query_limit))
                     .on_action(cx.listener(Self::custom_row_limit))
@@ -2008,7 +2151,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::toggle_row_panel))
                     .on_action(cx.listener(Self::toggle_row_edit))
                     .on_action(cx.listener(Self::toggle_structure))
-                    .on_action(cx.listener(Self::accept_completion))
+                    .on_action(cx.listener(Self::toggle_results_focus))
             })
             .size_full()
             // The shell is the frost: titlebar, sidebar and status bar paint
@@ -2110,14 +2253,21 @@ impl Render for Workspace {
                 ],
             ))
             .child(self.beside_settings(main_pane, cx))
-            .children(self.render_apply_review(cx))
-            .children(self.render_import_rows(window, cx))
-            .children(self.render_close_confirmation(cx))
-            .children(self.render_discard_confirmation(cx))
-            .children(self.render_pending_run(cx))
-            .children(self.render_queue_failure(cx))
-            .children(self.render_stale_edit(cx))
-            .children(self.render_import_choice(cx))
+            .children(self.dialog_layer(
+                [
+                    ("apply-review", self.render_apply_review(cx)),
+                    ("import-rows", self.render_import_rows(window, cx)),
+                    ("delete", self.render_delete_confirmation(cx)),
+                    ("discard", self.render_discard_confirmation(cx)),
+                    ("pending-export", self.render_pending_export(cx)),
+                    ("pending-run", self.render_pending_run(cx)),
+                    ("queue-failure", self.render_queue_failure(cx)),
+                    ("stale-edit", self.render_stale_edit(cx)),
+                    ("import-choice", self.render_import_choice(cx)),
+                ],
+                window,
+                cx,
+            ))
             .children(self.palette.clone())
             .children(self.render_reference_popup(cx))
     }
@@ -2127,11 +2277,29 @@ impl Render for Workspace {
 /// `referenced_by`: a row was found in it, or its check failed with this error.
 pub(crate) type ReferenceAnswer = (usize, gpui::SharedString, Result<(), String>);
 
+/// The key a reference lookup was asked about: its profile, its tab, its column and value,
+/// and the references its structure listed, which an answer's indices point
+/// into. An answer or a pick is acted on only while the grid in front still
+/// says the same, so neither can land on another tab, key or refreshed
+/// structure.
+#[derive(Clone, PartialEq)]
+pub(crate) struct ReferenceSource {
+    // Tab ids count from zero in every profile, so the tab alone does not say
+    // which connection was asked.
+    profile: String,
+    tab: u64,
+    column: String,
+    value: String,
+    referenced_by: Vec<crate::db::Reference>,
+}
+
 /// What a reference arrow opened: where it hangs, and the relations that turned
 /// out to hold rows for the key, or whose check failed with the error it gave.
 /// `None` while the lookup is still out.
 pub(crate) struct ReferencePopup {
-    pub(crate) at: gpui::Point<gpui::Pixels>,
+    /// `None` when the keyboard asked, which puts the answer in the palette.
+    pub(crate) at: Option<gpui::Point<gpui::Pixels>>,
+    pub(crate) source: ReferenceSource,
     pub(crate) choices: Option<Vec<ReferenceAnswer>>,
     check: u64,
 }

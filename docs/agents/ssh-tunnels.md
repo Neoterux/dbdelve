@@ -29,6 +29,10 @@ already set up on the machine.
   reconnect to *that* path on this machine, past the tunnel entirely. Nowhere
   does `server.host` get rewritten to `127.0.0.1` to make a driver happy; the
   places above are the only ones a tunnel's address reaches.
+  ClickHouse's `ureq` agent takes a resolver (`TunnelResolver`) that dials the
+  tunnel for every socket it opens and returns the loopback address, while the
+  URI keeps the real host, so SNI and the hostname check use the real name and
+  `verify-full` works through a tunnel.
 - **Readiness is read off `ssh -v`'s own lines, not a TCP probe.** `-v`'s
   `debug1: Local forwarding listening on 127.0.0.1 port <port>.` fires once
   the listener is bound, but ssh prints it before the session behind it is
@@ -60,12 +64,10 @@ already set up on the machine.
   background past `Drop` and the watchdog, and an existing control master
   would take the forward over from a process DBDelve never held a handle to
   — either way the tunnel would outlive the connection.
-- **`accept-new` is added only where nothing already decided host-key
-  checking.** `host_keys_left_to_default` runs `ssh -G` over the same
-  arguments and adds `StrictHostKeyChecking=accept-new` only when it answers
-  `stricthostkeychecking ask` — ssh's own default when no config, alias or
-  command-line option set it. A config that sets it explicitly, to `yes` or
-  to `accept-new` itself, is left exactly as it is.
+- **An effective `ask` becomes `accept-new`.** `host_key_checking_is_ask`
+  runs `ssh -G` over the same arguments. Its output does not distinguish
+  default `ask` from explicit `ask`, so both receive the override. Other
+  values are preserved; if `ssh -G` fails, no override is added.
 - **`Tunnel::dial` re-checks the process before every use** — every fresh
   connect, every cancel's second socket (Postgres's `CancelToken`, MySQL's
   `KILL QUERY` connection), every SQL Server reconnect — with `try_wait()`

@@ -1,6 +1,6 @@
 [package]
 name = "dbdelve"
-version = "0.5.1"
+version = "0.6.2"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A fast, native, multi-engine database client"
@@ -87,7 +87,7 @@ duckdb = { version = "=1.20000.0", default-features = false, features = [
 # Spreadsheets for DuckDB's `read_xlsx` (`db::xlsx`): DuckDB's own excel
 # extension is not one libduckdb-sys can link in, and a download at run time is
 # not something a database client should need to open a file.
-calamine = { version = "=0.36.1", features = ["dates"] }
+calamine = { version = "=0.37.0", features = ["dates"] }
 # A DuckDB `UUID` arrives as its sixteen bytes and a `BIGNUM` as its digits in
 # base 256; see `db::duckdb::printable`.
 uuid = "=1.24.1"
@@ -147,10 +147,12 @@ tokio-postgres-rustls = { version = "0.14", default-features = false, features =
     "ring",
 ] }
 
-# Snowflake. It publishes no Rust driver, and the community ones are tokio plus
-# reqwest, so this speaks its documented SQL REST API over a blocking client --
-# the same "blocking, owns no runtime GPUI has to host" rule as the three
-# drivers above.
+# Snowflake and ClickHouse. Snowflake publishes no Rust driver, and the
+# community ones are tokio plus reqwest, so this speaks its documented SQL REST
+# API over a blocking client -- the same "blocking, owns no runtime GPUI has to
+# host" rule as the three drivers above. ClickHouse is raw HTTP on the same
+# client, with `ureq::unversioned` for the tunnel resolver and the watched
+# transport; that module is not semver-covered, which the exact pin makes safe.
 #
 # Default features off for the usual reason, though here they happen to be the
 # right ones: `rustls` is ureq's spelling of rustls *on ring* with webpki-roots,
@@ -189,6 +191,10 @@ cbc = "=0.1.2"
 # 0.23 the other engines share. Pure Rust and still on `ring`, so no second
 # crypto library, but a second copy of the TLS stack all the same, and one
 # `tls.rs` cannot configure: tiberius builds its own rustls config.
+#
+# A bump must re-check `INFO_TOKEN_LINE` in mssql.rs: the server's `PRINT`
+# and informational messages are told from environment changes by the line of
+# tiberius's source that logs them.
 tiberius = { version = "=0.12.3", default-features = false, features = [
     "tds73",
     "rustls",
@@ -208,6 +214,12 @@ tokio = { version = "=1.53.1", default-features = false, features = [
 tokio-util = { version = "=0.7.19", default-features = false, features = ["compat"] }
 # `try_next` over tiberius's result stream. Already linked through tiberius.
 futures-util = { version = "=0.3.34", default-features = false }
+# Where tiberius puts the server's `PRINT` and informational messages: it
+# decodes them, leaves them out of the result stream and logs them, so
+# mssql.rs subscribes for the length of a submission. Pinned to the version
+# already locked, with the default features tiberius already enables, so
+# naming it adds no copy.
+tracing = "=0.1.44"
 
 # MongoDB. The official driver, async on tokio like tiberius and driven the
 # same way: each connection owns a runtime and every call is a `block_on` on
@@ -253,6 +265,11 @@ nucleo-matcher = "=0.3.1"
 # back into the text they cover. Already in the graph through it; pinned to the
 # locked version so naming it links no second copy.
 unicode-segmentation = "=1.13.3"
+# ClickHouse's result reader: `memmem` finds the exception frame a server
+# appends to a body across read boundaries, and `memchr_iter` counts the rows
+# of a result being drained. Already in the graph through nucleo-matcher and
+# the regex stack; pinned to the locked version so naming it links no second copy.
+memchr = "=2.8.3"
 
 serde = { version = "1", features = ["derive"] }
 # `raw_value` lets Import Rows keep a JSON number's own text (`import_rows::Json`),
@@ -335,24 +352,27 @@ gpui_platform = { version = "=0.3.9", package = "gpui-pre-platform", features = 
 ] }
 
 [dev-dependencies]
+# Headless keyboard regressions exercise GPUI's real focus and action dispatch.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 # The SQL snapshots are the net that lets the engine-spec refactor prove it
 # changed no generated statement by one character. insta brings the diff,
 # accept and CI-strict behaviour instead of hand-rolled golden files; no
 # default features, so the colored-diff console stack stays out.
 insta = { version = "=1.49.0", default-features = false }
 
-# The Job Object that ends an SSH tunnel's ssh.exe when DBDelve exits, however
-# it exits: Windows has no pipe-closing watchdog like the `sh` one on Unix.
-# Pinned to the version already locked, so naming it adds no copy.
+# The Job Object that ends an SSH tunnel's ssh.exe when DBDelve exits, and
+# MoveFileExW for atomic no-overwrite query renames. Pinned to the version
+# already locked, so naming it adds no copy.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
 ] }
 
-# The Unix side of the same: `pthread_sigmask`, so the ssh a background thread
-# starts still dies when told to. Pinned to the version already locked.
+# pthread_sigmask for SSH shutdown and native no-overwrite query renames.
+# Pinned to the version already locked.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
 

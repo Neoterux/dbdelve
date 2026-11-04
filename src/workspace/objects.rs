@@ -87,6 +87,7 @@ impl Workspace {
 
         let id = profile.session.next_object_id;
         profile.session.next_object_id += 1;
+        let completions = profile.session.filter_completions(engine, &schema, &name);
         // A data tab for the relation has already read this definition, and
         // reading it again is several statements -- on Snowflake, a warehouse
         // woken -- for the same answer. Recorded as asked, so `load_relation`
@@ -113,7 +114,7 @@ impl Workspace {
         let body = match opened {
             OpenedObject::Routine { routine, .. } => ObjectBody::Routine(routine),
             OpenedObject::Structure { origin, .. } => {
-                let grid = structure_grid::new_grid(window, cx);
+                let grid = structure_grid::new_grid(engine.syntax(), window, cx);
                 if let Some(loaded) = &known {
                     let section = grid.read(cx).delegate().section();
                     structure_grid::show(&grid, loaded, section, cx);
@@ -129,7 +130,7 @@ impl Workspace {
             } => {
                 let filters = filters
                     .into_iter()
-                    .map(|bar| filter_row(engine, id, bar, window, cx))
+                    .map(|bar| filter_row(engine, id, bar, completions.clone(), window, cx))
                     .collect();
                 ObjectBody::Relation {
                     structure: StructureState::Loading,
@@ -149,6 +150,7 @@ impl Workspace {
                     row_panel_filter: Default::default(),
                     row_panel_split: cx.new(|_| ResizableState::default()),
                     count: RowCount::Unasked,
+                    sent_from: None,
                 }
             }
         };
@@ -247,6 +249,7 @@ impl Workspace {
             stale,
             structure,
             count,
+            sent_from,
             ..
         } = &mut tab.body
         else {
@@ -281,6 +284,7 @@ impl Workspace {
         let paged = sql::is_generated_select(engine, &sql)
             .then(|| sql::paged(engine, &sql, &key))
             .flatten();
+        *sent_from = paged.clone().map(|paged| (paged, sql.clone()));
         let Some(sql) = paged else {
             // Spent all the same. Left standing, it would have `load_relation`
             // load the structure and try again on every visit to the tab, for
@@ -306,6 +310,24 @@ impl Workspace {
             *query = QueryState::Idle;
         }
         self.execute_and_then(sql, Tab::Object(id), None, keep_rows, None, cx);
+    }
+
+    /// The statement a preview was paged from, when `sent` is the one it last
+    /// sent: anything else, such as the edit a refresh runs, was not paged.
+    pub(crate) fn statement_before_paging(&self, object: u64, sent: &str) -> Option<String> {
+        let tab = self
+            .profile()?
+            .session
+            .objects
+            .iter()
+            .find(|tab| tab.id == object)?;
+        match &tab.body {
+            ObjectBody::Relation {
+                sent_from: Some((paged, before)),
+                ..
+            } if paged == sent => Some(before.clone()),
+            _ => None,
+        }
     }
 
     /// Count the rows under a relation tab's filter, because the user asked.
@@ -368,8 +390,9 @@ impl Workspace {
             cancel: cancel.clone(),
             cancelling: false,
         };
-        let _ = store::append_history(&profile_id, &sql);
-        remember_statement(&mut profile.session.history, &sql);
+        let recorded = store::HistoryEntry::started(sql.as_str());
+        let _ = store::append_history(&profile_id, &recorded);
+        remember_statement(&mut profile.session.history, recorded.clone());
         cx.notify();
 
         let task = cx
@@ -377,7 +400,13 @@ impl Workspace {
             .spawn(async move { connection.generated(&sql, &cancel, None, None) });
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
+            // Before the checks below: a filter changed or a tab closed under
+            // the count drops its answer from the tab, not from the history.
+            let landed =
+                super::queries::answered(&recorded, &result, false, started.elapsed(), engine);
+            let _ = store::append_history(&profile_id, &landed);
             _ = workspace.update(cx, |workspace, cx| {
+                workspace.remember_run(&profile_id, landed);
                 // By id alone, so a reconnect that retired this run still
                 // takes its "Counting…" down rather than leaving it forever.
                 let Some(profile) = workspace
@@ -562,11 +591,12 @@ impl Workspace {
         };
         let profile_id = profile.id.clone();
         let generation = profile.generation;
-        let request = {
-            let issued = profile.session.structure_requests.entry(id).or_default();
-            *issued += 1;
-            *issued
-        };
+        // Numbered across tabs and refreshes: a refresh forgets what was asked
+        // on a connection it keeps, and a number used again would let an answer
+        // from before it pass for the one after.
+        profile.session.last_structure_request += 1;
+        let request = profile.session.last_structure_request;
+        profile.session.structure_requests.insert(id, request);
         let key = (schema.clone(), relation.clone());
         let structure_task = cx.background_executor().spawn(async move {
             let mut structure = connection.structure(&schema, &relation)?;
@@ -796,12 +826,60 @@ impl Workspace {
     /// the structure says -- that is every relation that *could* -- but which
     /// hold a row for this value, so each candidate is asked for one row and
     /// only the ones that answer are listed, beside any whose check failed.
+    /// Asked from the keyboard, with no arrow to hang a list off, the answer
+    /// is put up in the palette instead.
+    /// The key in the active cell of the relation in front, as a reference
+    /// lookup names it.
+    pub(crate) fn reference_source(&self, cx: &App) -> Option<ReferenceSource> {
+        let profile = self.profile()?;
+        let tab = profile.session.active_object()?;
+        let ObjectBody::Relation {
+            structure: StructureState::Loaded(structure),
+            results,
+            ..
+        } = &tab.body
+        else {
+            return None;
+        };
+        let grid = results.read(cx).delegate();
+        let (_, col) = grid.active()?;
+        Some(ReferenceSource {
+            profile: profile.id.clone(),
+            tab: tab.id,
+            column: grid.columns().get(col)?.name.clone(),
+            value: grid.active_value()?.to_string(),
+            referenced_by: structure.referenced_by.clone(),
+        })
+    }
+
+    /// A relation picked from a lookup's answer, opened only if the grid in
+    /// front is still on the key it was asked about.
+    pub(crate) fn open_listed_reference(
+        &mut self,
+        source: &ReferenceSource,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reference_source(cx).as_ref() != Some(source) {
+            self.note(
+                "The key these references were listed for is no longer in front.".into(),
+                cx,
+            );
+            return;
+        }
+        self.open_reference(&OpenReference { index }, window, cx);
+    }
+
     pub(crate) fn show_references(
         &mut self,
         _: &ShowReferences,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(source) = self.reference_source(cx) else {
+            return;
+        };
         let engine = self.engine();
         let Some(profile) = self.profile() else {
             return;
@@ -821,6 +899,7 @@ impl Workspace {
         else {
             return;
         };
+        let at = results.update(cx, |table, _| table.delegate_mut().take_reference_anchor());
         let grid = results.read(cx);
         let grid = grid.delegate();
         let Some((_, col)) = grid.active() else {
@@ -829,7 +908,7 @@ impl Workspace {
         let Some(name) = grid.columns().get(col).map(|column| column.name.clone()) else {
             return;
         };
-        let (Some(value), Some(at)) = (grid.active_value(), grid.reference_anchor()) else {
+        let Some(value) = grid.active_value() else {
             return;
         };
         let candidates: Vec<(usize, gpui::SharedString, Option<String>)> = grid
@@ -860,6 +939,7 @@ impl Workspace {
         let check = self.reference_checks;
         self.reference_popup = Some(ReferencePopup {
             at,
+            source,
             choices: None,
             check,
         });
@@ -885,18 +965,43 @@ impl Workspace {
                     .collect(),
             )
         });
-        cx.spawn(async move |workspace, cx| {
+        cx.spawn_in(window, async move |workspace, cx| {
             let found = task.await;
-            _ = workspace.update(cx, |workspace, cx| {
+            _ = workspace.update_in(cx, |workspace, window, cx| {
                 if workspace.issued_to(&profile_id, generation).is_none() {
                     return;
                 }
-                if let Some(popup) = &mut workspace.reference_popup
-                    && popup.check == check
-                {
-                    popup.choices = Some(found);
+                let current = workspace.reference_source(cx);
+                let Some(popup) = workspace
+                    .reference_popup
+                    .as_mut()
+                    .filter(|popup| popup.check == check)
+                else {
+                    return;
+                };
+                if current.as_ref() != Some(&popup.source) {
+                    workspace.reference_popup = None;
                     cx.notify();
+                    return;
                 }
+                let keyboard = popup.at.is_none();
+                popup.choices = Some(found);
+                cx.notify();
+                if !keyboard {
+                    return;
+                }
+                let listed = workspace
+                    .reference_popup
+                    .as_ref()
+                    .and_then(|popup| popup.choices.as_ref())
+                    .is_some_and(|choices| !choices.is_empty());
+                // Not over a palette put up meanwhile for something else.
+                if listed && workspace.palette.is_none() {
+                    workspace.open_palette(PaletteMode::References, window, cx);
+                } else if !listed {
+                    workspace.note("No rows reference this key.".into(), cx);
+                }
+                workspace.reference_popup = None;
             });
         })
         .detach();
@@ -1300,6 +1405,11 @@ impl Workspace {
                     if let Some((plan, showing)) = Explained::restored(&snapshot) {
                         query_tab.plan = Some(plan);
                         query_tab.showing_plan = showing;
+                        // A restored queue's results are copies, none of them
+                        // the slot the plan was asked of.
+                        if showing {
+                            query_tab.show_slot();
+                        }
                     }
                     query_tab.last_query = snapshot.last_query;
                 }
@@ -1698,6 +1808,7 @@ mod tests {
                         _ => Vec::new(),
                     },
                 }],
+                database: None,
             },
             routines,
         )

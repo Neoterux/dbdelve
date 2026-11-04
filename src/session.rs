@@ -9,11 +9,11 @@
 //! These were plain types at the crate root. They moved out whole; nothing
 //! changed but their visibility.
 
-use std::{collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
 
-use gpui::{App, AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, SharedString, Window};
 use gpui_component::{
-    input::{EditorState, InputEvent, InputState},
+    input::{CompletionProvider, EditorState, InputEvent, InputState},
     resizable::ResizableState,
     table::TableState,
     tree::TreeState,
@@ -26,7 +26,9 @@ use crate::{
         ExplainMode, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax,
     },
     explain::{self, Plan},
-    explorer::{ExplorerLeaf, ObjectKind},
+    explorer::{
+        ExplorerLeaf, Member, ObjectKind, ObjectRef, Pin, Shortcut, ShortcutDatabase, Shortcuts,
+    },
     filter::{
         Conjunction, FilterBar, FilterRow, applied_filters, filter_bars, restored_filter,
         stored_filter,
@@ -74,6 +76,10 @@ pub(crate) struct Profile {
     /// it does -- a `SET`, `USE` or temporary table. Cleared on connect.
     pub(crate) session_changed: bool,
     pub(crate) catalog: CatalogState,
+    /// The generation a schema refresh was started on. Compared rather than
+    /// cleared, so a reconnect that drops the refresh's answer takes the
+    /// refresh with it.
+    pub(crate) schema_refresh: Option<u64>,
     /// What the server listed the last time Select Database asked.
     pub(crate) databases: Databases,
     /// Whether the connection opened on another database than the one the
@@ -81,7 +87,26 @@ pub(crate) struct Profile {
     /// is left of that database goes on the next frame, which has the window
     /// a connect does not, as on a switch.
     pub(crate) left_database: bool,
+    /// The explorer's folders and pins.
+    pub(crate) shortcuts: Shortcuts,
     pub(crate) session: Session,
+}
+
+/// See [`Profile::shortcut_database`]. The shown catalog's own word comes
+/// first: a `USE` of the user's can move the session it was read on without
+/// the profile hearing of it, and a shortcut names what the sidebar shows.
+fn shortcut_database(
+    engine: Engine,
+    shown: Option<&Catalog>,
+    active: impl FnOnce() -> Option<String>,
+) -> ShortcutDatabase {
+    if !engine.catalog_is_per_database() {
+        return ShortcutDatabase::Unnamed;
+    }
+    shown
+        .and_then(|catalog| catalog.database.clone())
+        .or_else(active)
+        .map_or(ShortcutDatabase::Unknown, ShortcutDatabase::On)
 }
 
 impl Profile {
@@ -113,17 +138,36 @@ impl Profile {
     }
 
     /// The database the connection is on: as last listed, else as the
-    /// profile names it, else the one it opened on.
+    /// server spelled it on connecting, else as the profile names it, else
+    /// the one it opened on. The server's spelling before the profile's, so
+    /// a folder names the database as the list will once it comes.
     pub(crate) fn active_database(&self) -> Option<String> {
-        let opened = match &self.state {
-            ProfileState::Connected(connection) => connection.current_database(),
+        let connection = match &self.state {
+            ProfileState::Connected(connection) => Some(connection),
             _ => None,
         };
         self.databases
             .current
             .clone()
+            .or_else(|| connection?.spelled_database().map(str::to_string))
             .or_else(|| self.config.database_name())
-            .or_else(|| opened.map(str::to_string))
+            .or_else(|| connection?.current_database().map(str::to_string))
+    }
+
+    /// The database a folder or a pin names its objects by, where the
+    /// catalog is one database's. Where it lists every database as a schema,
+    /// none: keying on the one the session is on would hide every shortcut
+    /// after a switch, though the catalog still lists them all.
+    pub(crate) fn shortcut_database(&self) -> ShortcutDatabase {
+        let shown = match &self.catalog {
+            CatalogState::Loaded(catalog, _) => Some(catalog),
+            _ => None,
+        };
+        shortcut_database(self.config.engine(), shown, || self.active_database())
+    }
+
+    pub(crate) fn refreshing_schema(&self) -> bool {
+        self.schema_refresh == Some(self.generation)
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -180,6 +224,7 @@ impl Profile {
                 .unwrap_or_default(),
             sslmode: server.map(|server| server.sslmode.as_str().to_string()),
             root_certificate: server.and_then(|server| server.root_certificate.clone()),
+            service: self.config.service().map(str::to_string),
             engine: Some(self.config.engine().as_str().to_string()),
             path: match &self.config {
                 ConnectionConfig::Sqlite { path, .. }
@@ -222,8 +267,94 @@ impl Profile {
                 .map(|tab| tab.stored(self.session.active == Tab::Query(tab.id)))
                 .collect(),
             open_objects,
+            folders: self
+                .shortcuts
+                .folders
+                .iter()
+                .map(|folder| store::StoredFolder {
+                    name: folder.name.clone(),
+                    members: folder.members.iter().map(stored_member).collect(),
+                })
+                .collect(),
+            pins: self
+                .shortcuts
+                .pins
+                .iter()
+                .map(|pin| match pin {
+                    Pin::Member(member) => stored_member(member),
+                    Pin::Folder(name) => store::StoredShortcut {
+                        folder: Some(name.clone()),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
         }
     }
+}
+
+fn stored_member(member: &Member) -> store::StoredShortcut {
+    match member {
+        Member::Query(name) => store::StoredShortcut {
+            query: Some(name.clone()),
+            ..Default::default()
+        },
+        Member::Object(object) => store::StoredShortcut {
+            database: object.database.clone(),
+            schema: Some(object.schema.clone()),
+            name: Some(object.name.clone()),
+            kind: Some(object.kind.slug().to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+fn restored_member(stored: &store::StoredShortcut) -> Option<Member> {
+    if let Some(name) = &stored.query {
+        return Some(Member::Query(name.clone()));
+    }
+    Some(Member::Object(ObjectRef {
+        database: stored.database.clone(),
+        schema: stored.schema.clone()?,
+        name: stored.name.clone()?,
+        kind: ObjectKind::from_slug(stored.kind.as_deref()?)?,
+    }))
+}
+
+/// A profile's folders and pins as read back, less any entry this build
+/// cannot read and any that repeats one before it, which a hand-edited file
+/// can hold and the tree cannot: an id may be in it once.
+pub(crate) fn restored_shortcuts(
+    folders: &[store::StoredFolder],
+    pins: &[store::StoredShortcut],
+) -> Shortcuts {
+    let mut shortcuts = Shortcuts::default();
+    for folder in folders {
+        if shortcuts.add_folder(folder.name.trim()).is_err() {
+            continue;
+        }
+        let name = folder.name.trim();
+        for member in folder.members.iter().filter_map(restored_member) {
+            if !shortcuts.holds(name, &member) {
+                shortcuts.toggle(name, member);
+            }
+        }
+    }
+    for stored in pins {
+        let pin = match &stored.folder {
+            Some(name) if shortcuts.folder(name.trim()).is_some() => {
+                Pin::Folder(name.trim().to_string())
+            }
+            Some(_) => continue,
+            None => match restored_member(stored) {
+                Some(member) => Pin::Member(member),
+                None => continue,
+            },
+        };
+        if !shortcuts.pinned(&pin) {
+            shortcuts.toggle_pin(pin);
+        }
+    }
+    shortcuts
 }
 
 pub(crate) enum ProfileState {
@@ -263,23 +394,31 @@ pub(crate) struct Session {
     /// question about yet. A relation lands here the first time a statement
     /// names it, so what is held is bounded by what was written.
     pub(crate) completion_columns: completion::ColumnCache,
+    /// What every editor on this connection completes from, as
+    /// `Workspace::install_completions` last built it. Kept for a filter bar
+    /// turned raw after that, which completes from the same one.
+    pub(crate) completions: Option<Rc<completion::SchemaCompletions>>,
     pub(crate) explorer_filter: Entity<InputState>,
     pub(crate) explorer_tree: Entity<TreeState>,
     pub(crate) explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,
     /// The matched characters of each row's name, by tree item id, as
     /// [`crate::explorer::ExplorerTree::highlights`] built them.
     pub(crate) explorer_highlights: Arc<HashMap<String, Vec<Range<usize>>>>,
+    pub(crate) explorer_shortcuts: Arc<HashMap<String, Shortcut>>,
     /// `cmd+enter` reaches the workspace only through the focused element's
     /// dispatch path, so an unfocused editor makes the primary keystroke dead.
     pub(crate) editor_needs_focus: bool,
     /// The same hazard for the name field: an unfocused input asks for a name
     /// nobody can type into.
     pub(crate) save_name_needs_focus: bool,
+    /// Every query file this profile has, open in a tab or not: what the
+    /// sidebar's Queries group and the palette list.
     pub(crate) saved_queries: Vec<String>,
-    /// The statements this profile has run, newest first. Held rather than read
-    /// off disk when the palette opens, for the reason `saved_queries` is: the
-    /// list is wanted while a list is being built, which is a frame.
-    pub(crate) history: Vec<String>,
+    /// The statements this profile has run, newest first, each with what is
+    /// known of its last run. Held rather than read off disk when the palette
+    /// opens, for the reason `saved_queries` is: the list is wanted while a
+    /// list is being built, which is a frame.
+    pub(crate) history: Vec<store::HistoryEntry>,
     pub(crate) save_name: Entity<InputState>,
     /// The page in front, and where to jump to once it is typed over: see
     /// `sync_page_input`. One field for the window, because only the relation
@@ -289,19 +428,15 @@ pub(crate) struct Session {
     /// from one that is being typed over.
     pub(crate) page_shown: usize,
     pub(crate) naming: bool,
-    pub(crate) pending_delete: Option<String>,
-    /// The saved query `cmd+w` is asking about.
-    ///
-    /// A saved query has no closed state — it is in the strip while its file
-    /// exists and gone when it does not — so closing its tab is deleting it,
-    /// and it is the one tab that says so before it goes. Separate from
-    /// `pending_delete`, which is the chip's own quieter two-click arming.
-    pub(crate) pending_close: Option<String>,
-    /// The close `cmd+w` is asking about, because the tab it names holds cell
-    /// edits nobody has applied. Held as the target rather than the tab, so
-    /// confirming runs exactly the close the keystroke had decided on --
-    /// including a saved query's own second question.
-    pub(crate) pending_discard: Option<CloseTarget>,
+    /// The saved query the delete dialog is asking about.
+    pub(crate) pending_delete: Option<PendingDelete>,
+    /// The sidebar row a saved query is being renamed in.
+    pub(crate) query_rename: Option<QueryRename>,
+    /// The same hazard as `save_name_needs_focus`, for the row's field.
+    pub(crate) query_rename_needs_focus: bool,
+    /// The tab a close is asking about, because it holds cell edits nobody
+    /// has applied.
+    pub(crate) pending_discard: Option<PendingDiscard>,
     pub(crate) notice: Option<String>,
     /// The generated batch a relation tab is showing before it runs. That tab
     /// has no buffer to put SQL in, so the modal is where the statement is on
@@ -316,6 +451,11 @@ pub(crate) struct Session {
     pub(crate) import_rows: Option<ImportDialog>,
     /// The statement the mode check stopped, held until the user answers.
     pub(crate) pending_run: Option<PendingRun>,
+    /// An export asked for over rows that are not the whole result, held
+    /// until the user says which rows it writes.
+    pub(crate) pending_export: Option<PendingExport>,
+    /// The export of every row this connection is running, at most one.
+    pub(crate) exporting: Option<Exporting>,
     /// The query tab whose queue stopped on a failed statement, held until
     /// the user says whether the rest of it still runs. Nothing after the
     /// failure is sent from here without an explicit Continue.
@@ -331,6 +471,7 @@ pub(crate) struct Session {
     /// put the older definition back. A completion that is not the newest
     /// issued for its tab is dropped.
     pub(crate) structure_requests: HashMap<u64, u64>,
+    pub(crate) last_structure_request: u64,
 }
 
 /// A generated statement waiting to be read and run.
@@ -343,6 +484,8 @@ pub(crate) struct ApplyReview {
     /// the confirmation lying about what it confirms.
     pub(crate) title: &'static str,
     pub(crate) sql: String,
+    /// What the engine adds about running `sql`, one paragraph each.
+    pub(crate) notes: Vec<String>,
 }
 
 impl ApplyReview {
@@ -530,6 +673,45 @@ pub(crate) struct PendingRun {
     pub(crate) verdict: Verdict,
     /// The "don't ask again" tick, which only the Confirm shape shows.
     pub(crate) dont_ask: bool,
+    /// The mode refused a grid cell's commit, whose input waits open behind
+    /// the prompt: raising the mode carries the commit through.
+    pub(crate) commit_cell: bool,
+}
+
+/// Export over a grid holding less than its result, waiting on the dialog
+/// that asks whether to write the rows shown or fetch every row again.
+pub(crate) struct PendingExport {
+    pub(crate) format: crate::export::FileAs,
+    /// The tab it was asked over.
+    pub(crate) tab: Tab,
+    pub(crate) showing: usize,
+    /// What the tab is showing, in the dialog's words.
+    pub(crate) situation: String,
+    /// What Export All Rows runs, or why it is not offered.
+    pub(crate) every_row: Result<Refetch, &'static str>,
+}
+
+/// The statement an export of every row runs: a query tab's as the user
+/// typed it, or a relation tab's regenerated without its limit.
+#[derive(Clone)]
+pub(crate) struct Refetch {
+    pub(crate) sql: String,
+    pub(crate) generated: bool,
+}
+
+/// An export of every row, running on a connection of its own.
+pub(crate) struct Exporting {
+    /// The file's name, for the status bar.
+    pub(crate) file: String,
+    pub(crate) started: std::time::Instant,
+    pub(crate) progress: Arc<ExportProgress>,
+}
+
+/// What the export's writer and the status bar share.
+#[derive(Default)]
+pub(crate) struct ExportProgress {
+    pub(crate) rows: std::sync::atomic::AtomicUsize,
+    pub(crate) cancelled: std::sync::atomic::AtomicBool,
 }
 
 /// The `confirmed` slug that silences [`StaleEdit`]'s prompt.
@@ -554,6 +736,23 @@ pub(crate) enum StaleResume {
 }
 
 impl Session {
+    /// What a raw filter bar on `schema`'s `relation` completes from: nothing until the
+    /// catalog has loaded, and nothing on an engine whose raw filter is not
+    /// one the schema can complete.
+    pub(crate) fn filter_completions(
+        &self,
+        engine: Engine,
+        schema: &str,
+        relation: &str,
+    ) -> Option<Rc<dyn CompletionProvider>> {
+        let provider = completion::FilterCompletions::new(
+            engine.syntax(),
+            self.completions.clone()?,
+            (schema.to_string(), relation.to_string()),
+        )?;
+        Some(Rc::new(provider))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: String,
@@ -567,7 +766,7 @@ impl Session {
         cx: &mut Context<Workspace>,
     ) -> Self {
         let explorer_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter queries and objects…"));
         cx.subscribe(&explorer_filter, {
             let id = id.clone();
             move |workspace, _, event: &InputEvent, cx| {
@@ -605,15 +804,7 @@ impl Session {
         .detach();
 
         let saved_queries = store::saved_queries(&id);
-        // A tab naming a query whose file has gone comes back as the unsaved
-        // buffer it now is, rather than as a tab pointing at nothing.
-        let stored_queries = stored_queries
-            .into_iter()
-            .map(|mut stored| {
-                stored.name = stored.name.filter(|name| saved_queries.contains(name));
-                stored
-            })
-            .collect::<Vec<_>>();
+        let stored_queries = unsaved_where_gone(stored_queries, &saved_queries);
         // No tab is a state a profile can be in: closing the last one leaves
         // the strip empty, and it comes back empty.
         let active = stored_queries
@@ -643,10 +834,12 @@ impl Session {
             next_object_id: 0,
             pending_objects,
             completion_columns: completion::ColumnCache::default(),
+            completions: None,
             explorer_filter,
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
             explorer_leaves: Arc::new(HashMap::new()),
             explorer_highlights: Arc::new(HashMap::new()),
+            explorer_shortcuts: Arc::new(HashMap::new()),
             editor_needs_focus: true,
             save_name_needs_focus: false,
             saved_queries,
@@ -656,16 +849,20 @@ impl Session {
             page_shown: 0,
             naming: false,
             pending_delete: None,
-            pending_close: None,
+            query_rename: None,
+            query_rename_needs_focus: false,
             pending_discard: None,
             notice,
             apply_review: None,
             insert_form: None,
             import_rows: None,
             pending_run: None,
+            pending_export: None,
+            exporting: None,
             queue_failure: None,
             stale_edit: None,
             structure_requests: HashMap::new(),
+            last_structure_request: 0,
         }
     }
 
@@ -726,18 +923,20 @@ impl Session {
     }
 
     /// Every chip the strip draws, left to right: the dragged order first,
-    /// then anything newer than it in the default one -- unsaved buffers, saved
-    /// queries, objects.
+    /// then anything newer than it in the default one.
     pub(crate) fn strip_order(&self) -> Vec<TabKey> {
-        let chips: Vec<TabKey> = self
-            .queries
-            .iter()
-            .filter(|tab| tab.open_query.is_none())
-            .map(|tab| TabKey::Unsaved(tab.id))
-            .chain(self.saved_queries.iter().cloned().map(TabKey::Saved))
-            .chain(self.objects.iter().map(|tab| TabKey::Object(tab.id)))
-            .collect();
-        strip_order(chips, &self.tab_order)
+        strip_order(self.default_chips(), &self.tab_order)
+    }
+
+    /// One chip per open tab, in the order a strip nobody has dragged shows
+    /// them.
+    pub(crate) fn default_chips(&self) -> Vec<TabKey> {
+        default_chips(
+            self.queries
+                .iter()
+                .map(|tab| (tab.id, tab.open_query.as_deref())),
+            self.objects.iter().map(|tab| tab.id),
+        )
     }
 
     /// Put a chip just opened at the right end of the strip as it is drawn.
@@ -747,6 +946,26 @@ impl Session {
     /// onto that would put the newest chip ahead of all of them.
     pub(crate) fn place_last(&mut self, key: TabKey) {
         self.tab_order = placed_last(self.strip_order(), key);
+    }
+
+    /// Swap the chip in front with its neighbour, as dropping it one slot
+    /// over would. Whether it moved: the end of the strip is a wall.
+    pub(crate) fn move_active_tab(&mut self, step: isize) -> bool {
+        let order = self.strip_order();
+        let Some(key) = order
+            .iter()
+            .find(|key| self.tab_of(key) == Some(self.active))
+            .cloned()
+        else {
+            return false;
+        };
+        match moved(order, &key, step) {
+            Some(order) => {
+                self.tab_order = order;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Give a chip its new key where it stands, for a buffer whose name is
@@ -759,8 +978,7 @@ impl Session {
         self.tab_order = order;
     }
 
-    /// The tabs behind the strip's chips, left to right. A saved query with
-    /// no buffer open is a chip with no tab, and is not here.
+    /// The tabs behind the strip's chips, left to right.
     pub(crate) fn strip_tabs(&self) -> Vec<Tab> {
         self.strip_order()
             .iter()
@@ -841,7 +1059,7 @@ impl Session {
     /// tab shows its plan, which stands in for those rows.
     pub(crate) fn query_insert_target(&self, cx: &App) -> Option<InsertTarget> {
         self.active_query_tab()
-            .filter(|tab| !tab.showing_plan)?
+            .filter(|tab| tab.plan_shown().is_none() && !tab.messages_shown())?
             .shown()
             .1
             .read(cx)
@@ -849,14 +1067,23 @@ impl Session {
             .insert_target()
     }
 
-    /// Every buffer highlighted and prompted for `syntax`, once an edit has
-    /// moved the profile to an engine written in another language.
+    /// Every buffer and structure grid highlighted (and every buffer prompted)
+    /// for `syntax`, once an edit has moved the profile to an engine written in
+    /// another language.
     pub(crate) fn set_syntax(&self, syntax: Syntax, window: &mut Window, cx: &mut App) {
         for tab in &self.queries {
             tab.editor.update(cx, |editor, cx| {
                 editor.set_highlighter(syntax.highlighter(), cx);
                 editor.set_placeholder(syntax.placeholder(), window, cx);
             });
+        }
+        for tab in &self.objects {
+            if let ObjectBody::Structure { grid, .. } = &tab.body {
+                grid.update(cx, |table, cx| {
+                    table.delegate_mut().set_syntax(syntax);
+                    cx.notify();
+                });
+            }
         }
     }
 
@@ -1002,15 +1229,64 @@ impl Session {
     /// clicked.
     pub(crate) fn clear_prompts(&mut self) {
         self.pending_delete = None;
-        self.pending_close = None;
+        self.query_rename = None;
+        self.query_rename_needs_focus = false;
         self.pending_discard = None;
         self.naming = false;
         self.save_name_needs_focus = false;
         // A stopped statement must not survive a tab or profile switch and get
         // confirmed against a connection it was never aimed at.
         self.pending_run = None;
+        self.pending_export = None;
         self.stale_edit = None;
     }
+}
+
+/// A saved query's sidebar row turned into a field holding its name.
+pub(crate) struct QueryRename {
+    /// The name it has on disk now, or the folder's name.
+    pub(crate) name: String,
+    /// A folder's name rather than a saved query's.
+    pub(crate) folder: bool,
+    /// The row the field is drawn over, by id: a saved query can be listed
+    /// in several places, and the field belongs in the one it was asked from.
+    pub(crate) row: SharedString,
+    pub(crate) input: Entity<InputState>,
+    /// Why the name typed was refused, until it is typed over.
+    pub(crate) error: Option<String>,
+}
+
+/// Why `name` cannot be what a saved query is saved or renamed as, if it
+/// cannot. `keeping` is the query's own name on a rename, which it may keep.
+pub(crate) fn query_name_refusal(
+    name: &str,
+    keeping: Option<&str>,
+    saved_queries: &[String],
+) -> Option<String> {
+    if let Err(message) = store::validate_query_name(name) {
+        return Some(message);
+    }
+    // Any case: on a filesystem that ignores it, a query that differs only
+    // by case is the same file, and saving over it would replace it.
+    saved_queries
+        .iter()
+        .find(|saved| Some(saved.as_str()) != keeping && store::same_query_name(saved, name))
+        .map(|saved| format!("A query named {saved} already exists."))
+}
+
+/// What the Delete dialog asks about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingDelete {
+    Query(String),
+    /// A folder and how many it holds: one holding nothing goes unasked.
+    Folder(String, usize),
+}
+
+/// A close held up by the unapplied-edits question, and the saved query to
+/// delete once the tab goes, when deleting it is what closes the tab.
+pub(crate) struct PendingDiscard {
+    pub(crate) tab: Tab,
+    pub(crate) deleting: Option<String>,
 }
 
 /// What takes focus when a surface comes to the front. A buffer, a field and a
@@ -1021,6 +1297,7 @@ pub(crate) enum Focus {
     /// gpui-component 0.8 splits the code editor off from the plain input.
     Field(Entity<InputState>),
     Grid(Entity<TableState<ResultGrid>>),
+    Structure(Entity<TableState<StructureGrid>>),
     /// The window itself, for a surface with nothing in it to type into. Not a
     /// no-op: a keystroke only reaches the workspace along the focused
     /// element's dispatch path, so focusing nothing at all is what makes every
@@ -1065,8 +1342,8 @@ impl Tab {
     }
 }
 
-/// A chip of the tab strip, which is not the same set as `Tab`: a saved query
-/// is listed whether or not a buffer holds it.
+/// A chip of the tab strip. A saved query's is keyed by its name rather than
+/// its tab, which is what lets a rename keep the chip where it stands.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TabKey {
     Unsaved(u64),
@@ -1074,31 +1351,20 @@ pub(crate) enum TabKey {
     Object(u64),
 }
 
-/// What `cmd+w` has to do with the surface in front of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CloseTarget {
-    /// Close it. It is a view onto something the database still holds, and
-    /// reopening it costs a click.
-    Object(u64),
-    /// Ask first. A saved query is listed while its file exists and gone when
-    /// it does not, so closing its tab is deleting it.
-    SavedQuery(String),
-    /// Close it. An unsaved buffer is a scratch pad someone is done with; its text goes with it, which is what closing an
-    /// unnamed buffer means everywhere else.
-    Buffer(u64),
-}
-
-impl CloseTarget {
-    /// The tab this close takes out of the strip. A saved query names its file
-    /// rather than its tab, so the strip is what says which tab that is -- and
-    /// `None` is a saved query with no tab open, which no close comes from.
-    pub(crate) fn tab(&self, session: &Session) -> Option<Tab> {
-        match self {
-            Self::Object(id) => Some(Tab::Object(*id)),
-            Self::Buffer(id) => Some(Tab::Query(*id)),
-            Self::SavedQuery(name) => session.tab_holding(name).map(Tab::Query),
-        }
-    }
+/// Unsaved buffers, then saved queries, then objects, each kind in the order
+/// its tabs were opened. A saved query is a chip only while a tab holds it:
+/// the sidebar is where the rest are listed.
+fn default_chips<'a>(
+    queries: impl Iterator<Item = (u64, Option<&'a str>)> + Clone,
+    objects: impl Iterator<Item = u64>,
+) -> Vec<TabKey> {
+    queries
+        .clone()
+        .filter(|(_, name)| name.is_none())
+        .map(|(id, _)| TabKey::Unsaved(id))
+        .chain(queries.filter_map(|(_, name)| name.map(|name| TabKey::Saved(name.to_string()))))
+        .chain(objects.map(TabKey::Object))
+        .collect()
 }
 
 /// `chips` in default order, rearranged by the order the strip was last left
@@ -1120,6 +1386,22 @@ fn placed_last(mut order: Vec<TabKey>, key: TabKey) -> Vec<TabKey> {
     order
 }
 
+fn moved(mut order: Vec<TabKey>, key: &TabKey, step: isize) -> Option<Vec<TabKey>> {
+    let at = order.iter().position(|candidate| candidate == key)?;
+    let to = at.checked_add_signed(step).filter(|to| *to < order.len())?;
+    order.swap(at, to);
+    Some(order)
+}
+
+/// The chip `step` places from `current` among `chips`, wrapping at either
+/// end as cycling tabs does.
+pub(crate) fn stepped<T: PartialEq + Copy>(chips: &[T], current: T, step: isize) -> Option<T> {
+    let at = chips.iter().position(|chip| *chip == current).unwrap_or(0) as isize;
+    chips
+        .get((at + step).rem_euclid(chips.len().max(1) as isize) as usize)
+        .copied()
+}
+
 /// The tab beside `closing` on the left, or on the right when it was the
 /// first: the chip the eye is already next to.
 fn neighbour(tabs: &[Tab], closing: Tab) -> Option<Tab> {
@@ -1128,14 +1410,6 @@ fn neighbour(tabs: &[Tab], closing: Tab) -> Option<Tab> {
         .and_then(|left| tabs.get(left))
         .or(tabs.get(at + 1))
         .copied()
-}
-
-pub(crate) fn close_target(active: Tab, open_query: Option<&str>) -> CloseTarget {
-    match (active, open_query) {
-        (Tab::Object(id), _) => CloseTarget::Object(id),
-        (Tab::Query(_), Some(name)) => CloseTarget::SavedQuery(name.to_string()),
-        (Tab::Query(id), None) => CloseTarget::Buffer(id),
-    }
 }
 
 /// Who orders a view's rows on a header click. Per view, because a table read
@@ -1265,6 +1539,11 @@ pub(crate) struct QueryTab {
     /// from `plan.is_some()`: a plan that has been read and flipped away from
     /// is still worth keeping to flip back to.
     pub(crate) showing_plan: bool,
+    /// Whether the switcher's Messages chip is selected, in place of whichever
+    /// result `queue.showing` names. A flag beside the index rather than a
+    /// value of it, so selecting Messages leaves the result to come back to,
+    /// and so a run with no queue at all can still offer it.
+    pub(crate) showing_messages: bool,
     /// The multi-statement run this tab is part way through, or `None` for an
     /// ordinary single-statement run. `query` and `results` stay what they
     /// always were -- the slot being run or shown right now -- and the
@@ -1493,6 +1772,7 @@ impl<G: Clone> Queue<G> {
                         bytes: set.bytes,
                         elapsed: set.elapsed,
                         rows_affected: set.rows_affected,
+                        messages: Vec::new(),
                     },
                     grid: grid.clone(),
                 },
@@ -1504,6 +1784,25 @@ impl<G: Clone> Queue<G> {
         }
         (extra, dropped)
     }
+}
+
+impl<G: PartialEq> Queue<G> {
+    /// Where the tab's slot sits in the strip: its entry in `done`, or one
+    /// past the end for a slot that is none of them, which `QueryTab::shown`
+    /// reads as the slot itself.
+    pub(crate) fn slot_index(&self, slot: &G) -> usize {
+        self.done
+            .iter()
+            .position(|finished| finished.grid == *slot)
+            .unwrap_or(self.done.len())
+    }
+}
+
+/// Whether the plan is what the pane shows. Messages selected over it win, as
+/// the chip the user last picked; and only over the slot's result, the one
+/// the plan was asked of, so picking another of a queue's results shows it.
+pub(crate) fn plan_in_front(showing_plan: bool, messages_shown: bool, on_slot: bool) -> bool {
+    showing_plan && !messages_shown && on_slot
 }
 
 /// `QueryTab::lend`, over the fields it touches so it is checkable without
@@ -1583,6 +1882,48 @@ fn apply_refresh<G: Clone + PartialEq>(
         }
         None => last_query.cloned().map(Refresh::Statement),
     }
+}
+
+/// One statement's share of a run's server messages.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Said<'a> {
+    /// Where its chip sits in the switcher.
+    pub(crate) index: usize,
+    pub(crate) sql: &'a str,
+    pub(crate) messages: &'a [String],
+}
+
+/// `QueryTab::messages`, over the fields it reads so it is checkable without
+/// a window: each of a queue's results, read as its chip reads it, or with no
+/// queue the slot's own, and only those the server said something during.
+fn run_messages<'a, G: PartialEq>(
+    queue: Option<&'a Queue<G>>,
+    (results, query): (&G, &'a QueryState),
+    ran: Option<&'a str>,
+) -> Vec<Said<'a>> {
+    let said: Vec<Said<'a>> = match queue {
+        Some(queue) => queue
+            .done
+            .iter()
+            .enumerate()
+            .map(|(index, finished)| Said {
+                index,
+                sql: &finished.sql,
+                messages: match finished.grid == *results {
+                    true => query.messages(),
+                    false => finished.state.messages(),
+                },
+            })
+            .collect(),
+        None => vec![Said {
+            index: 0,
+            sql: ran.unwrap_or_default(),
+            messages: query.messages(),
+        }],
+    };
+    said.into_iter()
+        .filter(|said| !said.messages.is_empty())
+        .collect()
 }
 
 const QUERY_LABEL_LIMIT: usize = 32;
@@ -1665,6 +2006,78 @@ impl QueryTab {
         }
     }
 
+    /// What the server said during this tab's run, statement by statement.
+    pub(crate) fn messages(&self) -> Vec<Said<'_>> {
+        run_messages(
+            self.queue.as_ref(),
+            (&self.results, &self.query),
+            self.ran_from.as_ref().map(|(_, sql)| sql.as_str()),
+        )
+    }
+
+    /// What the result switcher's chips select, left to right: a result by
+    /// its index, then `None` for Messages. A statement not yet sent is not
+    /// one, and neither is anything while the switcher is not drawn.
+    pub(crate) fn switcher_chips(&self) -> Vec<Option<usize>> {
+        let mut chips: Vec<Option<usize>> = match &self.queue {
+            Some(queue) => queue
+                .done
+                .iter()
+                .enumerate()
+                .filter(|(_, finished)| !matches!(self.state_of(finished), QueryState::Idle))
+                .map(|(index, _)| Some(index))
+                .chain(queue.awaiting.then_some(Some(queue.done.len())))
+                .collect(),
+            None => vec![Some(0)],
+        };
+        if self.messages().is_empty() {
+            if self.queue.is_none() {
+                return Vec::new();
+            }
+        } else {
+            chips.push(None);
+        }
+        if chips.len() < 2 {
+            return Vec::new();
+        }
+        chips
+    }
+
+    /// The switcher chip selected, in the terms of [`QueryTab::switcher_chips`].
+    pub(crate) fn switcher_selected(&self) -> Option<usize> {
+        match self.messages_shown() {
+            true => None,
+            false => Some(self.queue.as_ref().map_or(0, |queue| queue.showing)),
+        }
+    }
+
+    /// Whether the pane is showing the run's messages rather than a result.
+    /// Read through the messages themselves, so Messages left selected over a
+    /// run that has since said nothing falls back to its result rather than
+    /// an empty list.
+    pub(crate) fn messages_shown(&self) -> bool {
+        self.showing_messages && !self.messages().is_empty()
+    }
+
+    /// The plan, when it is what the results pane shows (`plan_in_front`).
+    pub(crate) fn plan_shown(&self) -> Option<&Explained> {
+        let on_slot = *self.shown().1 == self.results;
+        plan_in_front(self.showing_plan, self.messages_shown(), on_slot)
+            .then_some(self.plan.as_ref())
+            .flatten()
+    }
+
+    /// Bring the slot's result to the front, for a plan of it to be read.
+    /// Whether that moved the switcher off another result.
+    pub(crate) fn show_slot(&mut self) -> bool {
+        self.showing_messages = false;
+        let Some(queue) = &mut self.queue else {
+            return false;
+        };
+        let slot = queue.slot_index(&self.results);
+        std::mem::replace(&mut queue.showing, slot) != slot
+    }
+
     /// Make the queue's result at `index` the slot, for a run on its rows.
     pub(crate) fn lend(&mut self, index: usize) {
         lend_slot(
@@ -1705,24 +2118,20 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> (Self, Option<String>) {
-        let text = match &stored.name {
-            Some(name) => store::read_query(profile_id, name),
-            None => store::read_scratch(profile_id, stored.id),
+        let (sql, notice) = match stored_text(profile_id, stored) {
+            Ok(sql) => (sql, None),
+            Err(message) => (None, Some(message)),
         };
-        let (sql, notice) = match text {
-            Ok(sql) => (sql.unwrap_or_default(), None),
-            Err(message) => (String::new(), Some(message)),
-        };
-
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(engine.syntax().highlighter())
+                .soft_wrap(false)
+                .placeholder(engine.syntax().placeholder())
+                .default_value(sql.unwrap_or_default())
+        });
         let tab = Self {
             id: stored.id,
-            editor: cx.new(|cx| {
-                EditorState::new(window, cx)
-                    .language(engine.syntax().highlighter())
-                    .soft_wrap(false)
-                    .placeholder(engine.syntax().placeholder())
-                    .default_value(sql)
-            }),
+            editor,
             results: result_grid::new_grid(window, cx),
             query: QueryState::Idle,
             open_query: stored.name.clone(),
@@ -1740,6 +2149,7 @@ impl QueryTab {
             sorting: sorting.on(engine),
             row_limit,
             showing_plan: false,
+            showing_messages: false,
             row_panel_folded: false,
             row_panel_editing: false,
             row_panel_filter: Default::default(),
@@ -2048,6 +2458,10 @@ pub(crate) enum ObjectBody {
         /// `COUNT(*)` under the current `filter`, run only when the user asks:
         /// on a large table it is a full scan holding the connection.
         count: RowCount,
+        /// The statement last sent, with the one it was paged from. An engine
+        /// that pages by key writes the key's `ORDER BY` into the first, which
+        /// the headers must not show as a sort the user chose.
+        sent_from: Option<(String, String)>,
     },
     /// A relation's definition, opened only when asked for. It runs no query:
     /// the structure is all it loads.
@@ -2148,13 +2562,15 @@ pub(crate) fn show_snapshot(
 ///
 /// `rows` is the result's own size, which can be larger than the rows the grid
 /// holds: a snapshot is capped. `row_readout` is what says so, and
-/// `export_results` refuses rather than writing a short file.
+/// `export_results` asks which rows to write rather than writing a short file
+/// unasked.
 pub(crate) fn restored_state(grid: &store::StoredGrid) -> QueryState {
     QueryState::Complete {
         rows: grid.total_rows,
         bytes: 0,
         elapsed: std::time::Duration::ZERO,
         rows_affected: None,
+        messages: grid.messages.clone(),
     }
 }
 
@@ -2198,6 +2614,11 @@ pub(crate) enum QueryState {
         bytes: usize,
         elapsed: std::time::Duration,
         rows_affected: Option<u64>,
+        /// What the server said while running it (`QueryResult::messages`).
+        /// On the state rather than the grid so it goes wherever the state
+        /// goes: into a queue's `done`, through a lend and back, and onto a
+        /// restored tab.
+        messages: Vec<String>,
     },
     /// An `EXPLAIN` came back. Its own variant rather than a `Complete` because
     /// the rows it returned are not results and never reach the grid: the grid
@@ -2207,16 +2628,55 @@ pub(crate) enum QueryState {
     Explained {
         elapsed: std::time::Duration,
         mode: ExplainMode,
+        /// As `Complete`'s: an `EXPLAIN ANALYZE` runs the statement, and
+        /// whatever it raises is said while it does.
+        messages: Vec<String>,
     },
     Failed(DbError),
+}
+
+/// The stored tabs, each naming a query whose file has gone turned into the
+/// unsaved buffer it now is, rather than a tab pointing at nothing: a file
+/// removed outside DBDelve, since deleting one inside it closes its tab.
+fn unsaved_where_gone(
+    stored: Vec<store::StoredQueryTab>,
+    saved_queries: &[String],
+) -> Vec<store::StoredQueryTab> {
+    stored
+        .into_iter()
+        .map(|mut stored| {
+            stored.name = stored.name.filter(|name| saved_queries.contains(name));
+            stored
+        })
+        .collect()
+}
+
+/// The text a stored tab comes back with: its query's file when it names
+/// one, its own scratch file when not.
+fn stored_text(profile_id: &str, stored: &store::StoredQueryTab) -> Result<Option<String>, String> {
+    match &stored.name {
+        Some(name) => store::read_query(profile_id, name),
+        None => store::read_scratch(profile_id, stored.id),
+    }
+}
+
+impl QueryState {
+    pub(crate) fn messages(&self) -> &[String] {
+        match self {
+            QueryState::Complete { messages, .. } | QueryState::Explained { messages, .. } => {
+                messages
+            }
+            _ => &[],
+        }
+    }
 }
 
 /// Write every one of a profile's buffers back to whichever file it came from.
 ///
 /// All of them rather than the one in front: a buffer that is not visible is
-/// still someone's unsaved work, and a tab switch is no longer the moment it
-/// gets written. The first failure is the one reported and the rest are still
-/// attempted — a full disk must not cost more buffers than it has to.
+/// still someone's unsaved work. The first failure is the one reported and
+/// the rest are still attempted — a full disk must not cost more buffers
+/// than it has to.
 pub(crate) fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
     let mut failure = None;
     for tab in &profile.session.queries {
@@ -2260,7 +2720,8 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
                 continue;
             }
             let grid = finished.grid.read(cx).delegate().stored();
-            if grid.columns.is_empty() {
+            let messages = tab.state_of(finished).messages();
+            if grid.columns.is_empty() && messages.is_empty() {
                 continue;
             }
             let _ = store::write_grid(
@@ -2268,6 +2729,7 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
                 &store::queued_grid_key(tab.id, index),
                 &store::StoredGrid {
                     last_query: Some(finished.sql.clone()),
+                    messages: messages.to_vec(),
                     ..grid
                 },
             );
@@ -2279,10 +2741,12 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
             continue;
         }
         let grid = tab.results.read(cx).delegate().stored();
-        // A statement that returned no columns produced no grid to keep. A
-        // write can still return one (`RETURNING`, or any MongoDB reply), so a
-        // restored grid's `last_query` is not safe to re-run as it stands.
-        if grid.columns.is_empty() && !explained {
+        let messages = tab.query.messages();
+        // A statement that returned no columns produced no grid to keep, only
+        // whatever the server said running it. A write can still return one
+        // (`RETURNING`, or any MongoDB reply), so a restored grid's
+        // `last_query` is not safe to re-run as it stands.
+        if grid.columns.is_empty() && !explained && messages.is_empty() {
             continue;
         }
         let _ = store::write_grid(
@@ -2295,6 +2759,7 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
                     .plan
                     .as_ref()
                     .map(|explained| explained.stored(tab.showing_plan)),
+                messages: messages.to_vec(),
                 ..grid
             },
         );
@@ -2370,7 +2835,83 @@ mod tests {
             tab,
             title: "Apply edits",
             sql: "UPDATE t SET a = 1".into(),
+            notes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_shortcut_names_the_database_the_shown_catalog_was_read_from() {
+        let read_from = |database: Option<&str>| Catalog {
+            database: database.map(str::to_string),
+            ..Catalog::default()
+        };
+        let opened_on = || Some("memory".to_string());
+        // A user's `USE other` then a refresh: the catalog is `other`'s,
+        // whatever the profile was opened or picked on.
+        assert_eq!(
+            shortcut_database(Engine::DuckDb, Some(&read_from(Some("other"))), opened_on),
+            ShortcutDatabase::On("other".into())
+        );
+        assert_eq!(
+            shortcut_database(Engine::DuckDb, Some(&read_from(None)), opened_on),
+            ShortcutDatabase::On("memory".into())
+        );
+        assert_eq!(
+            shortcut_database(Engine::DuckDb, None, || None),
+            ShortcutDatabase::Unknown
+        );
+        assert_eq!(
+            shortcut_database(Engine::MySql, Some(&read_from(Some("other"))), opened_on),
+            ShortcutDatabase::Unnamed
+        );
+    }
+
+    #[test]
+    fn shortcuts_read_back_less_what_cannot_be_read_or_repeats() {
+        let entry =
+            |query: Option<&str>, folder: Option<&str>, kind: Option<&str>| store::StoredShortcut {
+                query: query.map(str::to_string),
+                folder: folder.map(str::to_string),
+                schema: Some("public".into()),
+                name: Some("accounts".into()),
+                kind: kind.map(str::to_string),
+                ..Default::default()
+            };
+        let folders = [
+            store::StoredFolder {
+                name: "Hot".into(),
+                members: vec![
+                    entry(None, None, Some("table")),
+                    entry(None, None, Some("view")),
+                    entry(None, None, Some("sequence")),
+                    entry(Some("daily"), None, None),
+                ],
+            },
+            store::StoredFolder {
+                name: "hot".into(),
+                members: Vec::new(),
+            },
+        ];
+        let pins = [
+            entry(None, Some("Hot"), None),
+            entry(None, Some("Gone"), None),
+            entry(Some("daily"), None, None),
+            entry(Some("daily"), None, None),
+        ];
+        let shortcuts = restored_shortcuts(&folders, &pins);
+
+        assert_eq!(shortcuts.folders.len(), 1);
+        let held = &shortcuts.folders[0].members;
+        // A table and a view of one name are two objects.
+        assert_eq!(held.len(), 3, "{held:?}");
+        assert_eq!(held[2], Member::Query("daily".into()));
+        assert_eq!(
+            shortcuts.pins,
+            [
+                Pin::Folder("Hot".into()),
+                Pin::Member(Member::Query("daily".into()))
+            ]
+        );
     }
 
     #[test]
@@ -2588,6 +3129,7 @@ mod tests {
         let settings: store::StoredSettings =
             toml::from_str("color_titlebar = true").expect("older settings must still decode");
         assert_eq!(settings.client_sort, None);
+        assert_eq!(settings.qualify_completions, None);
         assert_eq!(
             Sorting::new(settings.client_sort.unwrap_or(false)),
             Sorting::Server
@@ -2721,6 +3263,7 @@ mod tests {
             bytes: 1,
             elapsed: std::time::Duration::ZERO,
             rows_affected: None,
+            messages: Vec::new(),
         };
         let mut queue = Queue {
             sql: String::new(),
@@ -2767,12 +3310,135 @@ mod tests {
         assert_eq!((extra.len(), dropped), (0, 1));
     }
 
+    #[test]
+    fn a_runs_messages_stay_with_the_statements_that_said_them() {
+        let said = |messages: &[&str]| QueryState::Complete {
+            rows: 0,
+            bytes: 0,
+            elapsed: std::time::Duration::ZERO,
+            rows_affected: Some(0),
+            messages: messages.iter().map(|message| message.to_string()).collect(),
+        };
+        let entry = |sql: &str, start: usize, state: QueryState, grid: usize| Finished {
+            sql: sql.into(),
+            start,
+            state,
+            grid,
+        };
+        let mut queue = Queue {
+            sql: String::new(),
+            remaining: Vec::new(),
+            done: vec![
+                entry("CREATE TABLE t (n int)", 0, said(&["created"]), 10),
+                entry("SELECT 1", 30, said(&[]), 11),
+                // The slot's: its live state is the one read, not what was
+                // left here when it landed.
+                entry("PRINT 'done'", 60, said(&["stale"]), 12),
+            ],
+            showing: 1,
+            awaiting: false,
+            spare: vec![13],
+        };
+        // A batch's later sets carry none: the batch's are on its first.
+        queue.land_sets(1, 0, vec![QueryResult::default()]);
+        assert!(queue.done[1].state.messages().is_empty());
+
+        let slot = said(&["done", "twice"]);
+        let strings = |messages: &[&str]| -> Vec<String> {
+            messages.iter().map(|message| message.to_string()).collect()
+        };
+        let (created, done) = (strings(&["created"]), strings(&["done", "twice"]));
+        assert_eq!(
+            run_messages(Some(&queue), (&12, &slot), None),
+            [
+                Said {
+                    index: 0,
+                    sql: "CREATE TABLE t (n int)",
+                    messages: &created,
+                },
+                Said {
+                    index: 3,
+                    sql: "PRINT 'done'",
+                    messages: &done,
+                },
+            ]
+        );
+
+        // With no queue, the slot is the whole run.
+        assert_eq!(
+            run_messages::<usize>(None, (&12, &slot), Some("PRINT 'done'")),
+            [Said {
+                index: 0,
+                sql: "PRINT 'done'",
+                messages: &done,
+            }]
+        );
+        // A run that said nothing, or has not finished, offers no Messages.
+        assert!(run_messages::<usize>(None, (&12, &said(&[])), Some("SELECT 1")).is_empty());
+        let running = QueryState::Running {
+            started: std::time::Instant::now(),
+            cancelling: None,
+            cancel: CancelToken::default(),
+        };
+        assert!(run_messages::<usize>(None, (&12, &running), Some("SELECT 1")).is_empty());
+    }
+
+    #[test]
+    fn a_plan_gives_way_to_messages_and_to_another_results_chip() {
+        // Messages picked over the plan win; picking the plan's own result
+        // chip clears them and shows the plan again.
+        assert!(plan_in_front(true, false, true));
+        assert!(!plan_in_front(true, true, true));
+        // Another of a queue's results is shown as rows, plan or no plan.
+        assert!(!plan_in_front(true, false, false));
+        assert!(!plan_in_front(false, false, true));
+
+        // A typed `EXPLAIN ANALYZE` reaches the switcher with what it raised.
+        let notice = vec!["NOTICE: f() ran".to_string()];
+        let explained = QueryState::Explained {
+            elapsed: std::time::Duration::ZERO,
+            mode: ExplainMode::Analyze,
+            messages: notice.clone(),
+        };
+        assert_eq!(
+            run_messages::<usize>(None, (&0, &explained), Some("EXPLAIN ANALYZE SELECT f()")),
+            [Said {
+                index: 0,
+                sql: "EXPLAIN ANALYZE SELECT f()",
+                messages: &notice,
+            }]
+        );
+
+        // The slot is found wherever it sits in the strip, and a slot that is
+        // none of its results is the one past the end.
+        let queue = finished_queue(0);
+        assert_eq!(queue.slot_index(&12), 2);
+        assert_eq!(queue.slot_index(&99), queue.done.len());
+    }
+
+    #[test]
+    fn a_snapshot_keeps_its_messages_and_one_from_before_them_has_none() {
+        let older: store::StoredGrid =
+            serde_json::from_str(r#"{"columns": [], "rows": [], "total_rows": 0}"#)
+                .expect("an older snapshot must still decode");
+        assert!(restored_state(&older).messages().is_empty());
+
+        let said = store::StoredGrid {
+            messages: vec!["Changed database context to 'dbdelve_dev'.".into()],
+            ..older
+        };
+        let read: store::StoredGrid =
+            serde_json::from_str(&serde_json::to_string(&said).unwrap()).unwrap();
+        assert_eq!(restored_state(&read).messages(), said.messages);
+    }
+
     fn finished_queue(showing: usize) -> Queue<usize> {
         let complete = QueryState::Complete {
             rows: 1,
             bytes: 1,
             elapsed: std::time::Duration::ZERO,
             rows_affected: None,
+            messages: Vec::new(),
         };
         // A batch at 0 that answered with two sets, then a statement at 40,
         // whose grid is the slot's.
@@ -2872,6 +3538,7 @@ mod tests {
             bytes: 1,
             elapsed: std::time::Duration::ZERO,
             rows_affected: None,
+            messages: Vec::new(),
         };
         let queue = |done| Queue {
             sql: String::new(),
@@ -3055,20 +3722,59 @@ mod tests {
     }
 
     #[test]
-    fn only_the_tab_that_is_a_file_is_asked_about_before_it_closes() {
-        let saved = |name: &str| CloseTarget::SavedQuery(name.to_string());
+    fn a_tab_whose_query_was_deleted_comes_back_as_an_unsaved_buffer() {
+        store::tests::with_home(|| {
+            store::write_query("dev", "daily", "SELECT 1").expect("a query must write");
+            let open = store::StoredQueryTab {
+                id: 3,
+                name: Some("daily".into()),
+                active: true,
+                queued_results: 0,
+            };
+            assert_eq!(stored_text("dev", &open), Ok(Some("SELECT 1".to_string())));
 
-        assert_eq!(close_target(Tab::Object(3), None), CloseTarget::Object(3));
-        assert_eq!(close_target(Tab::Query(0), Some("daily")), saved("daily"));
-        // Any unsaved buffer, the last one too, is a scratch pad someone is
-        // done with: it goes without a question, the way an unnamed buffer
-        // does everywhere.
-        assert_eq!(close_target(Tab::Query(7), None), CloseTarget::Buffer(7));
-        // What the query tab happens to be holding says nothing about an
-        // object tab, which is the one in front.
+            store::delete_query("dev", "daily").expect("the delete must go through");
+
+            let restored = unsaved_where_gone(vec![open], &store::saved_queries("dev"));
+            assert_eq!(restored[0].name, None);
+            assert_eq!(stored_text("dev", &restored[0]), Ok(None));
+        });
+    }
+
+    #[test]
+    fn a_query_name_is_refused_when_taken_but_a_rename_may_keep_its_own() {
+        let saved = ["daily".to_string(), "weekly".to_string()];
+        assert_eq!(query_name_refusal("monthly", Some("daily"), &saved), None);
+        assert_eq!(query_name_refusal("daily", Some("daily"), &saved), None);
         assert_eq!(
-            close_target(Tab::Object(3), Some("daily")),
-            CloseTarget::Object(3)
+            query_name_refusal("weekly", Some("daily"), &saved).as_deref(),
+            Some("A query named weekly already exists.")
+        );
+        assert!(query_name_refusal("weekly", None, &saved).is_some());
+        // A name another query has in another case is that query's file.
+        assert_eq!(
+            query_name_refusal("WEEKLY", Some("daily"), &saved).as_deref(),
+            Some("A query named weekly already exists.")
+        );
+        assert_eq!(query_name_refusal("Daily", Some("daily"), &saved), None);
+        assert!(query_name_refusal(".hidden", None, &saved).is_some());
+        assert!(query_name_refusal("  ", None, &saved).is_some());
+    }
+
+    #[test]
+    fn a_saved_query_is_a_chip_only_while_a_tab_holds_it() {
+        // The strip draws open tabs and nothing else: a query closed is still
+        // on disk and in the sidebar, but takes no room here.
+        let queries = [(0, None), (1, Some("daily")), (2, None), (3, Some("adhoc"))];
+        assert_eq!(
+            default_chips(queries.into_iter(), [4].into_iter()),
+            [
+                TabKey::Unsaved(0),
+                TabKey::Unsaved(2),
+                TabKey::Saved("daily".into()),
+                TabKey::Saved("adhoc".into()),
+                TabKey::Object(4),
+            ]
         );
     }
 
@@ -3096,6 +3802,39 @@ mod tests {
             strip_order(chips, &order),
             [restored, vec![TabKey::Unsaved(1), TabKey::Object(1)]].concat()
         );
+    }
+
+    #[test]
+    fn a_tab_moves_one_slot_and_stops_at_either_end() {
+        let order = vec![TabKey::Unsaved(0), TabKey::Object(1), TabKey::Unsaved(2)];
+        assert_eq!(
+            moved(order.clone(), &TabKey::Object(1), 1),
+            Some(vec![
+                TabKey::Unsaved(0),
+                TabKey::Unsaved(2),
+                TabKey::Object(1)
+            ])
+        );
+        assert_eq!(
+            moved(order.clone(), &TabKey::Object(1), -1),
+            Some(vec![
+                TabKey::Object(1),
+                TabKey::Unsaved(0),
+                TabKey::Unsaved(2)
+            ])
+        );
+        assert_eq!(moved(order.clone(), &TabKey::Unsaved(0), -1), None);
+        assert_eq!(moved(order, &TabKey::Unsaved(2), 1), None);
+    }
+
+    #[test]
+    fn stepping_through_the_switcher_wraps_at_either_end() {
+        let chips = [Some(0), Some(2), None];
+        assert_eq!(stepped(&chips, Some(0), 1), Some(Some(2)));
+        assert_eq!(stepped(&chips, None, 1), Some(Some(0)));
+        assert_eq!(stepped(&chips, Some(0), -1), Some(None));
+        // A selection the chips no longer offer steps from the first.
+        assert_eq!(stepped(&chips, Some(1), 1), Some(Some(2)));
     }
 
     #[test]
@@ -3135,6 +3874,7 @@ mod tests {
             bytes: 0,
             elapsed: std::time::Duration::ZERO,
             rows_affected: None,
+            messages: Vec::new(),
         };
         assert!(refreshing(Tab::Object(3), Some(&running)));
         assert!(!refreshing(Tab::Object(3), Some(&landed)));

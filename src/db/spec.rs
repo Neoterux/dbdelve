@@ -6,7 +6,10 @@
 //! spec only says which spelling that code picks. A new engine that fits the
 //! existing strategies is one more value here and its driver.
 
-use super::{ColumnDefinition, Fields, RelationKind, Syntax, mongo, mssql, mysql, postgres, redis};
+use super::{
+    ColumnDefinition, Fields, RelationKind, Syntax, clickhouse, duckdb, mongo, mssql, mysql,
+    postgres, redis,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineSpec {
@@ -27,10 +30,17 @@ pub struct EngineSpec {
     pub layout: Fields,
     pub default_port: Option<u16>,
     pub takes_options: bool,
+    pub takes_service: bool,
     pub resolves_srv: bool,
     pub system_databases: &'static [&'static str],
     /// Exact type names read as bytes beyond the families every engine shares.
     pub binary_types: &'static [&'static str],
+    /// Exact lower-cased type names that are numbers beyond the families every
+    /// engine shares, without their precision.
+    pub numeric_types: &'static [&'static str],
+    /// Wrappers that leave what a type holds unchanged, by the name that opens
+    /// them: `nullable` for `Nullable(UInt64)`.
+    pub type_wrappers: &'static [&'static str],
     pub hints: Hints,
     /// Meaningful only where `syntax` is [`Syntax::Sql`].
     pub sql: SqlSpec,
@@ -41,6 +51,10 @@ pub struct EngineSpec {
 impl EngineSpec {
     pub fn quote_identifier(&self, identifier: &str) -> String {
         let quote = self.sql.identifier_quote.character();
+        let identifier = match self.sql.identifier_backslash_escapes {
+            true => identifier.replace('\\', r"\\"),
+            false => identifier.to_string(),
+        };
         format!(
             "{quote}{}{quote}",
             identifier.replace(quote, &format!("{quote}{quote}"))
@@ -55,7 +69,13 @@ impl EngineSpec {
             .strip_prefix(quote)
             .and_then(|rest| rest.strip_suffix(quote))
         {
-            Some(inner) => inner.replace(&format!("{quote}{quote}"), &quote.to_string()),
+            Some(inner) => {
+                let inner = inner.replace(&format!("{quote}{quote}"), &quote.to_string());
+                match self.sql.identifier_backslash_escapes {
+                    true => inner.replace(r"\\", "\\"),
+                    false => inner,
+                }
+            }
             None => expression.to_string(),
         }
     }
@@ -77,6 +97,33 @@ impl EngineSpec {
         format!("{national}'{}'", value.replace('\'', "''"))
     }
 
+    /// `value` pieced together around its NULs, or `None` with none to spell.
+    pub fn text_around_nul(&self, value: &str, data_type: Option<&str>) -> Option<String> {
+        let joiner = match self.sql.nul_text {
+            NulText::Unspelled => return None,
+            NulText::PipedChar => " || char(0) || ",
+            NulText::PipedChr => " || chr(0) || ",
+            NulText::AddedNchar => " + NCHAR(0) + ",
+        };
+        value.contains('\0').then(|| {
+            let text = value
+                .split('\0')
+                .map(|part| self.quote_value(part, data_type))
+                .collect::<Vec<_>>();
+            match self.sql.nul_text {
+                // Without a `max` operand, `+` stops at 4,000 characters.
+                NulText::AddedNchar => {
+                    format!(
+                        "CAST({} AS nvarchar(max)){joiner}{}",
+                        text[0],
+                        text[1..].join(joiner)
+                    )
+                }
+                _ => text.join(joiner),
+            }
+        })
+    }
+
     pub fn quote_value(&self, value: &str, data_type: Option<&str>) -> String {
         data_type
             .zip(self.hooks.quote_value)
@@ -93,6 +140,24 @@ impl EngineSpec {
             || name.contains("blob")
             || name.contains("binary")
             || self.binary_types.contains(&name.as_str())
+    }
+
+    /// [`Engine::is_numeric_type`](super::Engine::is_numeric_type). Wrappers
+    /// come off first, so `Nullable(UInt64)` answers as `UInt64` does.
+    pub fn is_numeric_type(&self, data_type: &str) -> bool {
+        let mut name = data_type.to_ascii_lowercase();
+        while let Some(inner) = self
+            .type_wrappers
+            .iter()
+            .find_map(|wrapper| unwrap_type_wrapper(&name, wrapper))
+        {
+            name = inner.to_string();
+        }
+        let base = name
+            .split_once('(')
+            .map_or(name.as_str(), |(base, _)| base)
+            .trim();
+        super::is_numeric_type(&name) || self.numeric_types.contains(&base)
     }
 
     /// [`Engine::writes_back`](super::Engine::writes_back). The ability is
@@ -112,17 +177,38 @@ impl EngineSpec {
 
     /// [`Engine::generates`](super::Engine::generates).
     pub fn generates(&self, column: &ColumnDefinition) -> bool {
-        let Some(default) = column.default.as_deref() else {
-            return false;
-        };
-        self.sql
-            .generated_defaults
-            .iter()
-            .any(|marker| match *marker {
-                DefaultMarker::Exact(exact) => default == exact,
-                DefaultMarker::Prefix(prefix) => default.starts_with(prefix),
-            })
+        marked(column, self.sql.generated_defaults)
     }
+
+    /// Whether the server numbers `column` itself, where a row written back
+    /// keeps the number it had.
+    pub fn numbers(&self, column: &ColumnDefinition) -> bool {
+        marked(column, self.sql.identity_defaults)
+    }
+
+    /// Whether the server works `column` out from the rest of its row, so
+    /// that a value for it has nowhere to go.
+    pub fn computes(&self, column: &ColumnDefinition) -> bool {
+        let data_type = column.data_type.to_ascii_lowercase();
+        self.sql.computed_types.contains(&data_type.as_str())
+            || (self.generates(column) && !self.numbers(column))
+    }
+}
+
+fn marked(column: &ColumnDefinition, markers: &[DefaultMarker]) -> bool {
+    column.default.as_deref().is_some_and(|default| {
+        markers.iter().any(|marker| match *marker {
+            DefaultMarker::Exact(exact) => default == exact,
+            DefaultMarker::Prefix(prefix) => default.starts_with(prefix),
+        })
+    })
+}
+
+fn unwrap_type_wrapper<'a>(name: &'a str, wrapper: &str) -> Option<&'a str> {
+    name.strip_prefix(wrapper)?
+        .strip_prefix('(')?
+        .strip_suffix(')')
+        .map(str::trim)
 }
 
 /// What the connection form says a blank field means.
@@ -131,7 +217,8 @@ pub struct Hints {
     pub name: &'static str,
     pub host: &'static str,
     /// What a blank database connects to (`ConnectionConfig::database_name`)
-    /// where the engine has one; elsewhere it leaves the server to pick.
+    /// where the engine has one; elsewhere it leaves the server to pick. The
+    /// form says the service answers instead where one is typed.
     pub database: &'static str,
     pub user: &'static str,
     pub path: &'static str,
@@ -147,6 +234,20 @@ impl Hints {
     };
 }
 
+/// How a text is pieced together around a NUL, on an engine whose text can
+/// hold one and whose literal cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NulText {
+    /// Nothing to spell: the text cannot hold one, or a literal already can.
+    Unspelled,
+    /// `'a' || char(0) || 'b'`
+    PipedChar,
+    /// `'a' || chr(0) || 'b'`
+    PipedChr,
+    /// `CAST(N'a' AS nvarchar(max)) + NCHAR(0) + N'b'`
+    AddedNchar,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SqlSpec {
     pub identifier_quote: IdentifierQuote,
@@ -155,6 +256,15 @@ pub struct SqlSpec {
     /// because `standard_conforming_strings` is on by default, and SQLite has
     /// no such notion at all.
     pub backslash_escapes: bool,
+    /// Whether a backslash inside a quoted identifier escapes the character
+    /// after it, so a literal one has to survive as two.
+    pub identifier_backslash_escapes: bool,
+    /// Whether a bare name is read as upper case, as the standard has it,
+    /// rather than lower. A server that folds neither way is treated as
+    /// folding down: quoting a name it would have matched bare costs nothing.
+    pub identifier_folds_upper: bool,
+    /// How a NUL in text is written, where a literal has no escape for it.
+    pub nul_text: NulText,
     /// String literals are written `N'…'`, because a bare one is converted to
     /// the database's code page first, and a character it lacks arrives as `?`.
     pub national_strings: bool,
@@ -169,6 +279,7 @@ pub struct SqlSpec {
     pub select_top: SelectTop,
     pub truncate: Truncate,
     pub foreign_table: ForeignTable,
+    pub materialized_view: MaterializedViewDrop,
     pub count_all: CountAll,
     /// The word that opens a transaction.
     pub transaction: Transaction,
@@ -179,6 +290,13 @@ pub struct SqlSpec {
     /// The markers the structure queries write into a column's default for
     /// one the server fills itself.
     pub generated_defaults: &'static [DefaultMarker],
+    /// Which of `generated_defaults` are an identity's rather than a computed
+    /// column's.
+    pub identity_defaults: &'static [DefaultMarker],
+    /// What an `INSERT` has to say for a value to reach an identity column.
+    pub identity_insert: IdentityInsert,
+    /// Types the server writes itself, with no default to say so.
+    pub computed_types: &'static [&'static str],
     pub statement_split: StatementSplit,
     pub explain_plan: Option<ExplainPrefix>,
     pub explain_analyze: Option<ExplainPrefix>,
@@ -188,6 +306,12 @@ pub struct SqlSpec {
     pub regex: RegexMatch,
     pub substring: SubstringMatch,
     pub read_only_session: ReadOnlySession,
+    pub unreadable_floor: UnreadableFloor,
+    /// The table engines a `CREATE TABLE … ENGINE =` may name and stay a
+    /// write: those that keep their rows in the database. Any other engine
+    /// reads or writes somewhere else (a URL, a file, another server), so it
+    /// needs Full. `None` where the `ENGINE` option is not read at all.
+    pub local_table_engines: Option<&'static [&'static str]>,
     /// Nothing outlives one request, so no statement leaves state behind.
     pub stateless_requests: bool,
     /// Functions whose effect the server-side Read-only hold does not stop, so
@@ -203,12 +327,21 @@ pub struct SqlSpec {
     /// listed. Lower-case, matched case-insensitively against the name once its
     /// `@@` prefix and scope part are gone.
     pub plain_settings: &'static [&'static str],
+    /// Whether a transaction can be opened at all. Without one a generated
+    /// multi-row batch is not bracketed, whatever `transaction` says.
+    pub transactions: bool,
+    /// Whether the write gate reads the terms a row named by every value
+    /// carries: `toString(c) = '…'` and `c IS NULL`.
+    pub row_terms: bool,
 }
 
 impl SqlSpec {
     pub const ANSI: Self = Self {
         identifier_quote: IdentifierQuote::Double,
         backslash_escapes: false,
+        identifier_backslash_escapes: false,
+        identifier_folds_upper: false,
+        nul_text: NulText::Unspelled,
         national_strings: false,
         literal_offsets: true,
         boolean_literal: BooleanLiteral::TrueFalse,
@@ -217,11 +350,15 @@ impl SqlSpec {
         select_top: SelectTop::Limit,
         truncate: Truncate::Truncate,
         foreign_table: ForeignTable::Foreign,
+        materialized_view: MaterializedViewDrop::MaterializedView,
         count_all: CountAll::Count,
         transaction: Transaction::Begin,
         implicit_transaction: false,
         skip_duplicates: SkipDuplicates::None,
         generated_defaults: &[],
+        identity_defaults: &[],
+        identity_insert: IdentityInsert::Plain,
+        computed_types: &[],
         statement_split: StatementSplit::Semicolon,
         explain_plan: None,
         explain_analyze: None,
@@ -231,15 +368,19 @@ impl SqlSpec {
         regex: RegexMatch::None,
         substring: SubstringMatch::Like,
         read_only_session: ReadOnlySession::None,
+        unreadable_floor: UnreadableFloor::None,
+        local_table_engines: None,
         stateless_requests: false,
         denied_functions: &[],
         plain_settings: &[],
+        transactions: true,
+        row_terms: false,
     };
 
     /// The word that opens a transaction around a generated multi-statement
     /// batch, or `None` where one submission is already atomic.
     pub fn transaction_opening(&self) -> Option<&'static str> {
-        (!self.implicit_transaction).then(|| self.transaction.opening())
+        (self.transactions && !self.implicit_transaction).then(|| self.transaction.opening())
     }
 }
 
@@ -297,6 +438,10 @@ pub enum Paging {
     /// repeat or skip rows from one page to the next, so a preview's first
     /// page waits for the structure that names the key.
     OffsetFetch,
+    /// `LIMIT … OFFSET …` as the default, but a page of an unsorted preview is
+    /// not stable without an `ORDER BY` (parallel reads, background merges), so
+    /// the relation's key orders it and the first page waits for the structure.
+    LimitOffsetByKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +461,16 @@ pub enum Truncate {
 pub enum ForeignTable {
     Foreign,
     External,
+    /// ClickHouse has no foreign table, so the kind drops as a table.
+    Table,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterializedViewDrop {
+    MaterializedView,
+    /// ClickHouse's `DROP MATERIALIZED VIEW` is a syntax error; its
+    /// materialized views drop with `DROP VIEW`.
+    View,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,6 +532,15 @@ pub enum DefaultMarker {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityInsert {
+    Plain,
+    /// `OVERRIDING SYSTEM VALUE`, in the statement.
+    Overriding,
+    /// `SET IDENTITY_INSERT`, on the session, around the statements.
+    SessionSwitch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementSplit {
     Semicolon,
     /// T-SQL batches separated by `GO` lines.
@@ -412,6 +576,7 @@ pub enum ParserDialect {
     DuckDb,
     Snowflake,
     MsSql,
+    ClickHouse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,6 +597,9 @@ pub enum RegexMatch {
     RegexpInstr,
     RegexpMatches,
     RegexpCount,
+    /// ClickHouse's `match` reads text only, so the column goes through
+    /// `toString`. Unanchored, like `~`.
+    Match,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +611,9 @@ pub enum SubstringMatch {
     /// or a number has no `instr`.
     InstrCast,
     Contains,
+    /// `LIKE` over `toString(column)`: ClickHouse's `LIKE` takes only a string
+    /// or a `FixedString`, and `toString` keeps `Nullable`, so a NULL stays NULL.
+    LikeToString,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +621,19 @@ pub enum ReadOnlySession {
     None,
     DefaultTransaction,
     SessionTransaction,
+    /// Sent as settings on each request rather than on a session. The user's
+    /// own statement can still try to lift it, so the server's refusal is
+    /// what stops that.
+    PerRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadableFloor {
+    /// A statement the parser cannot read is `Unreadable` and nothing more.
+    None,
+    /// A statement the parser cannot read is placed by its first keyword, and
+    /// one whose first keyword is unknown fails closed.
+    FirstKeyword,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -464,6 +648,9 @@ pub struct Abilities {
     pub copies_ddl: bool,
     pub switches_database: bool,
     pub switches_database_in_session: bool,
+    /// The catalog lists every database on the server, each as a schema,
+    /// rather than the one the connection is on.
+    pub catalog_lists_databases: bool,
     pub picks_schema: bool,
     pub exact_row_estimates: bool,
     pub schema_switch_waits_for_transaction: bool,
@@ -482,6 +669,7 @@ impl Abilities {
         copies_ddl: false,
         switches_database: false,
         switches_database_in_session: false,
+        catalog_lists_databases: false,
         picks_schema: false,
         exact_row_estimates: false,
         schema_switch_waits_for_transaction: false,
@@ -495,10 +683,26 @@ pub struct Hooks {
     /// A literal for a value bound for a column of `data_type`, or `None` to
     /// fall back to the plain literal.
     pub quote_value: Option<fn(value: &str, data_type: &str) -> Option<String>>,
+    /// A literal for a value the driver itself rendered, written back by an
+    /// `INSERT`, or `None` for what [`Self::quote_value`] and the shared shapes
+    /// make of it.
+    pub fetched_literal: Option<fn(value: &str, data_type: &str) -> Option<String>>,
+    /// The whole predicate term naming a row's value in `column` (`None` for a
+    /// NULL), for an engine whose rows are named by every value. `None` from the
+    /// hook means the value cannot be matched, so the row is not written.
+    pub match_value: Option<MatchValue>,
 }
 
+/// A hook spelling one column's term in a row's predicate: the column, its value
+/// (`None` for NULL) and its type.
+pub type MatchValue = fn(column: &str, value: Option<&str>, data_type: &str) -> Option<String>;
+
 impl Hooks {
-    pub const NONE: Self = Self { quote_value: None };
+    pub const NONE: Self = Self {
+        quote_value: None,
+        fetched_literal: None,
+        match_value: None,
+    };
 }
 
 pub(crate) const POSTGRES: EngineSpec = EngineSpec {
@@ -512,10 +716,13 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(postgres::DEFAULT_PORT),
     takes_options: false,
+    takes_service: true,
     resolves_srv: false,
     // `postgres` is an ordinary database people work in.
     system_databases: &[],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints {
         database: "postgres",
         ..Hints::DEFAULT
@@ -528,6 +735,8 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             needs_unique_key: false,
         },
         generated_defaults: &[DefaultMarker::Prefix("GENERATED ALWAYS AS ")],
+        identity_defaults: &[DefaultMarker::Exact("GENERATED ALWAYS AS IDENTITY")],
+        identity_insert: IdentityInsert::Overriding,
         explain_plan: Some(ExplainPrefix::Explain),
         explain_analyze: Some(ExplainPrefix::ExplainAnalyze),
         typed_explain: TypedExplain::Postgres,
@@ -736,9 +945,12 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(mysql::DEFAULT_PORT),
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &["information_schema", "mysql", "performance_schema", "sys"],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints::DEFAULT,
     sql: SqlSpec {
         identifier_quote: IdentifierQuote::Backtick,
@@ -751,10 +963,11 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
             DefaultMarker::Exact("AUTO_INCREMENT"),
             DefaultMarker::Prefix("GENERATED ALWAYS AS ("),
         ],
+        identity_defaults: &[DefaultMarker::Exact("AUTO_INCREMENT")],
         explain_plan: Some(ExplainPrefix::Explain),
         // Since 8.0.18. Server versions are not detected: an older server
         // refuses the statement and says so, which is the error the user needs
-        // and is hard rule 6's business rather than a version check's.
+        // and is the server's to word rather than a version check's.
         explain_analyze: Some(ExplainPrefix::ExplainAnalyze),
         typed_explain: TypedExplain::MySql,
         parser_dialect: ParserDialect::MySql,
@@ -797,9 +1010,13 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         copies_ddl: true,
         switches_database: true,
         // No `picks_schema`: the database is the schema.
+        catalog_lists_databases: true,
         ..Abilities::NONE
     },
-    hooks: Hooks::NONE,
+    hooks: Hooks {
+        fetched_literal: Some(mysql::fetched_literal),
+        ..Hooks::NONE
+    },
 };
 
 pub(crate) const MARIADB: EngineSpec = EngineSpec {
@@ -814,9 +1031,12 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(mysql::DEFAULT_PORT),
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &["information_schema", "mysql", "performance_schema", "sys"],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints::DEFAULT,
     sql: SqlSpec {
         identifier_quote: IdentifierQuote::Backtick,
@@ -830,6 +1050,7 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
             DefaultMarker::Exact("AUTO_INCREMENT"),
             DefaultMarker::Prefix("GENERATED ALWAYS AS ("),
         ],
+        identity_defaults: &[DefaultMarker::Exact("AUTO_INCREMENT")],
         explain_plan: Some(ExplainPrefix::Explain),
         // MariaDB has no `EXPLAIN ANALYZE` and spells the same thing `ANALYZE`
         // with no `EXPLAIN`.
@@ -881,9 +1102,13 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         assigns_default: true,
         copies_ddl: true,
         switches_database: true,
+        catalog_lists_databases: true,
         ..Abilities::NONE
     },
-    hooks: Hooks::NONE,
+    hooks: Hooks {
+        fetched_literal: Some(mysql::fetched_literal),
+        ..Hooks::NONE
+    },
 };
 
 pub(crate) const SQLITE: EngineSpec = EngineSpec {
@@ -897,11 +1122,15 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
     layout: Fields::File,
     default_port: None,
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints::DEFAULT,
     sql: SqlSpec {
+        nul_text: NulText::PipedChar,
         boolean_literal: BooleanLiteral::OneZero,
         truncate: Truncate::DeleteFrom,
         skip_duplicates: SkipDuplicates::OnConflictDoNothing {
@@ -950,11 +1179,15 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
     layout: Fields::File,
     default_port: None,
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints::DEFAULT,
     sql: SqlSpec {
+        nul_text: NulText::PipedChar,
         boolean_literal: BooleanLiteral::OneZero,
         truncate: Truncate::DeleteFrom,
         skip_duplicates: SkipDuplicates::OnConflictDoNothing {
@@ -991,17 +1224,22 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
     layout: Fields::File,
     default_port: None,
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints {
         path: "Blank for a database in memory",
         ..Hints::DEFAULT
     },
     sql: SqlSpec {
+        nul_text: NulText::PipedChr,
         skip_duplicates: SkipDuplicates::OnConflictDoNothing {
             needs_unique_key: true,
         },
+        generated_defaults: &[DefaultMarker::Prefix("GENERATED ALWAYS AS (")],
         parser_dialect: ParserDialect::DuckDb,
         regex: RegexMatch::RegexpMatches,
         substring: SubstringMatch::InstrCast,
@@ -1068,7 +1306,10 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         picks_schema: true,
         ..Abilities::NONE
     },
-    hooks: Hooks::NONE,
+    hooks: Hooks {
+        fetched_literal: Some(duckdb::fetched_literal),
+        ..Hooks::NONE
+    },
 };
 
 pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
@@ -1082,11 +1323,14 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
     layout: Fields::Account,
     default_port: None,
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     // The account usage share every account has. `SNOWFLAKE_SAMPLE_DATA` is a
     // share too, but one people query.
     system_databases: &["SNOWFLAKE"],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints {
         host: "Implied by the account",
         database: "Required",
@@ -1098,6 +1342,7 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
     sql: SqlSpec {
         // Unconditionally.
         backslash_escapes: true,
+        identifier_folds_upper: true,
         foreign_table: ForeignTable::External,
         parser_dialect: ParserDialect::Snowflake,
         regex: RegexMatch::RegexpCount,
@@ -1172,13 +1417,17 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(mssql::DEFAULT_PORT),
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &["master", "tempdb", "model", "msdb"],
     // `image` is the legacy binary type here; elsewhere it is a name anyone
     // may give a column or a domain, and a SQLite `image` column holds text.
     binary_types: &["image", "rowversion", "timestamp"],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints::DEFAULT,
     sql: SqlSpec {
+        nul_text: NulText::AddedNchar,
         national_strings: true,
         boolean_literal: BooleanLiteral::OneZero,
         params: Params::AtP,
@@ -1194,6 +1443,9 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
             DefaultMarker::Prefix("IDENTITY("),
             DefaultMarker::Prefix("AS "),
         ],
+        identity_defaults: &[DefaultMarker::Prefix("IDENTITY(")],
+        identity_insert: IdentityInsert::SessionSwitch,
+        computed_types: &["rowversion", "timestamp"],
         statement_split: StatementSplit::Batches,
         parser_dialect: ParserDialect::MsSql,
         format_dialect: FormatDialect::SqlServer,
@@ -1248,6 +1500,8 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
     },
     hooks: Hooks {
         quote_value: Some(mssql::typed_literal),
+        fetched_literal: None,
+        match_value: None,
     },
 };
 
@@ -1262,9 +1516,12 @@ pub(crate) const MONGODB: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(mongo::DEFAULT_PORT),
     takes_options: true,
+    takes_service: false,
     resolves_srv: true,
     system_databases: &["admin", "local", "config"],
     binary_types: &["bindata"],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints {
         user: "Optional",
         ..Hints::DEFAULT
@@ -1299,9 +1556,12 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
     layout: Fields::Server,
     default_port: Some(redis::DEFAULT_PORT),
     takes_options: false,
+    takes_service: false,
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
+    numeric_types: &[],
+    type_wrappers: &[],
     hints: Hints {
         name: "Named after the host",
         database: "0",
@@ -1325,4 +1585,160 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
         ..Abilities::NONE
     },
     hooks: Hooks::NONE,
+};
+
+pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
+    id: "clickhouse",
+    label: "ClickHouse",
+    schemes: &["clickhouse"],
+    file_extensions: &[],
+    logo: "icons/engine-clickhouse.svg",
+    brand: 0xFFCC01,
+    syntax: Syntax::Sql,
+    layout: Fields::Server,
+    default_port: Some(clickhouse::DEFAULT_PORT),
+    takes_options: false,
+    takes_service: false,
+    resolves_srv: false,
+    system_databases: &["system", "INFORMATION_SCHEMA", "information_schema"],
+    binary_types: &[],
+    numeric_types: &[
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "int128",
+        "int256",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uint128",
+        "uint256",
+        "float32",
+        "float64",
+        "bfloat16",
+        "decimal32",
+        "decimal64",
+        "decimal128",
+        "decimal256",
+    ],
+    type_wrappers: &["nullable", "lowcardinality"],
+    hints: Hints {
+        database: "default",
+        user: "default",
+        ..Hints::DEFAULT
+    },
+    sql: SqlSpec {
+        identifier_quote: IdentifierQuote::Backtick,
+        backslash_escapes: true,
+        // Quoted identifiers read backslash escapes as strings do.
+        identifier_backslash_escapes: true,
+        literal_offsets: false,
+        paging: Paging::LimitOffsetByKey,
+        generated_defaults: &[
+            DefaultMarker::Prefix("MATERIALIZED "),
+            DefaultMarker::Prefix("ALIAS "),
+        ],
+        foreign_table: ForeignTable::Table,
+        materialized_view: MaterializedViewDrop::View,
+        parser_dialect: ParserDialect::ClickHouse,
+        read_only_session: ReadOnlySession::PerRequest,
+        unreadable_floor: UnreadableFloor::FirstKeyword,
+        local_table_engines: Some(&[
+            "MergeTree",
+            "ReplacingMergeTree",
+            "SummingMergeTree",
+            "AggregatingMergeTree",
+            "CollapsingMergeTree",
+            "VersionedCollapsingMergeTree",
+            "GraphiteMergeTree",
+            "CoalescingMergeTree",
+            "ReplicatedMergeTree",
+            "ReplicatedReplacingMergeTree",
+            "ReplicatedSummingMergeTree",
+            "ReplicatedAggregatingMergeTree",
+            "ReplicatedCollapsingMergeTree",
+            "ReplicatedVersionedCollapsingMergeTree",
+            "ReplicatedGraphiteMergeTree",
+            "ReplicatedCoalescingMergeTree",
+            "SharedMergeTree",
+            "SharedReplacingMergeTree",
+            "SharedSummingMergeTree",
+            "SharedAggregatingMergeTree",
+            "SharedCollapsingMergeTree",
+            "SharedVersionedCollapsingMergeTree",
+            "SharedGraphiteMergeTree",
+            "SharedCoalescingMergeTree",
+            "Log",
+            "TinyLog",
+            "StripeLog",
+            "Memory",
+            "Null",
+            "Set",
+            "Join",
+            "Buffer",
+            "Merge",
+            "Dictionary",
+            "EmbeddedRocksDB",
+            "GenerateRandom",
+        ]),
+        regex: RegexMatch::Match,
+        substring: SubstringMatch::LikeToString,
+        row_terms: true,
+        transactions: false,
+        // `EXPLAIN` alone is `EXPLAIN PLAN`, which never executes its statement;
+        // there is no analyzing form, and no `skip_duplicates`: there is no
+        // clause that skips a row on a key, because there is no unique key.
+        explain_plan: Some(ExplainPrefix::Explain),
+        // Empty is a position here, not the default: no ClickHouse function
+        // writes from inside a `SELECT`. The table functions that reach outside
+        // the database (`url`, `s3`, `remote`, `executable`) are plain reads by
+        // the owner's decision (`docs/agents/engines.md`), and `INSERT INTO
+        // FUNCTION` is Full by statement in `spec_verdict`, so neither belongs
+        // on a list of calls to raise.
+        denied_functions: &[],
+        // What a user's own `SET` may change on a Read-only profile without
+        // asking, chosen as Postgres's and DuckDB's lists are: navigation and
+        // comfort. `readonly=2` already refuses a change to `readonly`, but it
+        // is the driver's per-request hold, so the verdict does not lean on it
+        // and the name stays off. Left off on purpose, each for its own reason:
+        // `readonly` and `max_execution_time` (the driver sends both on a
+        // request, and the second is the bound a profile's timeout sets),
+        // `format_tsv_null_representation` and `enable_http_compression` (the
+        // driver decodes its answers by them), every `allow_*` switch (each
+        // turns a server check off), and anything that changes who the session
+        // is or how text is lexed. A name not listed is stopped rather than
+        // assumed harmless.
+        plain_settings: &[
+            // Parallelism and block size change how fast a read runs, not what
+            // it reads.
+            "max_threads",
+            "max_block_size",
+            // A cap on one query's memory, the counterpart of DuckDB's
+            // `memory_limit`.
+            "max_memory_usage",
+            // How a time is shown, the counterpart of Postgres's `timezone`.
+            "session_timezone",
+            // A label in the server's query log, the counterpart of Postgres's
+            // `application_name`.
+            "log_comment",
+        ],
+        ..SqlSpec::ANSI
+    },
+    abilities: Abilities {
+        edits: true,
+        inserts: true,
+        inserts_into_views: true,
+        imports: true,
+        copies_ddl: true,
+        switches_database: true,
+        catalog_lists_databases: true,
+        chunk_refusal: Some("ClickHouse has no transaction, so each chunk is kept as it lands."),
+        ..Abilities::NONE
+    },
+    hooks: Hooks {
+        match_value: Some(clickhouse::match_value),
+        ..Hooks::NONE
+    },
 };

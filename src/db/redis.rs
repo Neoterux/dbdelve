@@ -627,6 +627,7 @@ impl Connection {
                 }],
                 routines: Vec::new(),
             }],
+            database: None,
         })
     }
 
@@ -1141,6 +1142,7 @@ fn edit_target(command: &Command, result: &QueryResult, database: &str) -> Optio
             .map(|name| Some(name.to_string()).filter(|name| !name.is_empty()))
             .collect(),
         keys: keys.to_vec(),
+        ..Default::default()
     })
 }
 
@@ -3303,7 +3305,7 @@ mod tests {
     }
 
     fn deletion(grid: &crate::result_grid::ResultGrid, row: usize) -> String {
-        let (schema, table, keys) = grid.row_key(row).unwrap();
+        let (schema, table, keys, _) = grid.row_key(row).unwrap();
         let keys: Vec<(&str, &str)> = keys
             .iter()
             .map(|(column, value)| (column.as_str(), value.as_str()))

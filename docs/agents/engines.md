@@ -47,9 +47,10 @@ Decided, and not to be re-litigated:
   plus overrides, so a field it leaves alone is the shared behaviour and the
   writers in `sql.rs`, `filter.rs` and `explorer.rs` read the spec, not the
   engine. Its `Abilities` start from `Abilities::NONE`, the read-only tier, and
-  switch on only what the engine does. The one hook, `Hooks::quote_value`,
-  covers a literal that depends on the column's type (SQL Server) and returns
-  `None` to fall back to `quote_literal`. A spec field is a bool, a strategy
+  switch on only what the engine does. `Hooks::quote_value` covers a literal
+  that depends on the column's type (SQL Server) and returns `None` to fall back
+  to `quote_literal`; `Hooks::fetched_literal` does the same for a value the
+  driver rendered, written back by an exported `INSERT`. A spec field is a bool, a strategy
   enum or a list of names DBDelve's own code reads, never SQL text. Per-engine
   snapshots in `src/sql_snapshots` hold the generated text, and
   `fake_spec.rs` shows a spec nobody wrote an arm for generating SQL.
@@ -162,7 +163,8 @@ Decided, and not to be re-litigated:
   SQLite has no such setting and gets a wall-clock timer firing
   `sqlite3_interrupt`, which counts waiting on a lock the same as scanning; SQL
   Server has none either and gets a timer around the run, which stops the
-  statement the way Cancel does. It goes in at connect and never into the
+  statement the way Cancel does; ClickHouse's is `max_execution_time` on each
+  request, with a client bound behind it (see its entry below). It goes in at connect and never into the
   user's submission (`AGENTS.md` hard rule 1, and on Postgres a `SET` inside their submission
   would be scoped to the implicit transaction around it). It therefore bounds
   DBDelve's own catalog and structure queries too, which is intended. On SQL
@@ -196,6 +198,24 @@ Decided, and not to be re-litigated:
   Either way `db::cancel_cost` says what the cancel cost: SQL Server's session
   reset, Postgres's aborted transaction, a SQLite write's rolled-back
   transaction.
+- **A Postgres profile can name a libpq service** (`service=` in a URL, the
+  form's Service field, `PGSERVICE` at launch), held on `PostgresConfig` beside
+  its `ServerConfig`, as `MongoConfig` holds Mongo's own settings, because no
+  other engine has one. `PostgresConfig::resolved` reads the file as a connection
+  opens and hands `postgres::Connection::open` a complete `ServerConfig`, before
+  the tunnel, TLS and `.pgpass`, so a password in it never reaches the profile or
+  the Keychain, and that connection's side sessions keep what it read.
+  What the profile states wins, then the service, then the `PG*` variables, and a
+  setting DBDelve cannot carry is refused by name rather than dropped.
+  An endpoint with no host still retains an explicit port beside its service:
+  startup matching must not replace a service's port with a saved override.
+  `ServerConfig::sslmode` has no "unset", so the default `prefer` means the
+  service's mode decides, `disable` included, and a URL stating `sslmode=prefer`
+  beside a service is refused. The form's selector cannot show it, so the line
+  under it says so: a service profile showing Prefer connects in whatever mode
+  its service or `PGSSLMODE` sets. libpq checks a root certificate on any
+  encrypted connection, so `require` with one reads as `verify-ca`, which the
+  line under Require says too, and `prefer` with one is refused.
 - **Postgres's side session** (describe, and the check before a stop at the
   limit) opens with a 2-second `statement_timeout`, and neither ever blocks
   the run on it: a describe waits its turn there on a thread of its own, and a
@@ -211,6 +231,21 @@ Decided, and not to be re-litigated:
   batch, rolling back what it had open (`live_a_cancel_stops_the_statement_on_the_server_and_reconnects`
   proves the statement behind a `WAITFOR` never runs). The session does not
   survive, so the run reconnects and its error says what was lost.
+- **Postgres's notices are read off the connection with `poll_message`**, not
+  by awaiting it as a future: the future impl logs each notice and drops it.
+  The driver buffers them as psql prints them (severity, then `DETAIL` and
+  `HINT` lines). The buffer is cleared before the user's statement and taken
+  right after it, before the describe or edit-target queries, so those cannot
+  leak theirs in; they land in `QueryResult::messages` for typed runs only.
+- **MySQL and MariaDB warnings are `SHOW WARNINGS`, run only when the
+  connection's warning count is non-zero**, so a clean statement costs no
+  extra round trip. It runs after the row counts and edit target are read, and
+  it lists only the last statement's. A multi-statement submission therefore
+  gets one lead message counting the earlier statements' warnings, which the
+  server no longer lists. A non-final `SELECT`'s count is not exposed by the
+  driver, so its warnings are not counted. `SHOW WARNINGS` leaves
+  `ROW_COUNT()` at -1 for whatever the user runs next; that is accepted, as
+  the mysql client's `\W` accepts it, because the warnings' text is the point.
 - **Explain** is `EXPLAIN` / `EXPLAIN ANALYZE` on Postgres and MySQL,
   `EXPLAIN` / `ANALYZE` on MariaDB, and `EXPLAIN QUERY PLAN` on SQLite, which
   has no analyze form, so that mode is not offered there
@@ -219,7 +254,10 @@ Decided, and not to be re-litigated:
   does. SQL Server offers neither: its plans come from `SET SHOWPLAN_XML`, a
   session switch that must be a batch of its own, which is not a prefix on a
   copy of the statement. Server versions are not detected: an older server
-  refuses the statement and says so. `sqlparser`
+  refuses the statement and says so. On ClickHouse DBDelve offers plain
+  `EXPLAIN` only, not the server's `EXPLAIN ANALYZE` (26.7+): its `EXPLAIN`
+  plans the statement and never runs it, and its rows stay in the grid.
+  `sqlparser`
   cannot read MariaDB's `ANALYZE <statement>`, so on MariaDB `sql::classify`
   reads it as `EXPLAIN ANALYZE <statement>`, classified by the statement it
   runs as MySQL's is. Only when a `SELECT`, `WITH`, `INSERT`, `REPLACE`,
@@ -236,7 +274,8 @@ Decided, and not to be re-litigated:
   where `DEFAULT` is not an expression.
 - **Read-only has no server-side backstop on SQLite, DuckDB, Snowflake or SQL
   Server.** Postgres gets `default_transaction_read_only`, MySQL `SET SESSION
-  TRANSACTION READ ONLY`. So on the other four, Read-only refuses a statement `sql::classify` cannot
+  TRANSACTION READ ONLY`, ClickHouse `readonly=2` on each request. So on the
+  other four, Read-only refuses a statement `sql::classify` cannot
   read rather than offering to run it once (`Engine::holds_read_only`).
 - **Snowflake has no session, because it is spoken to over its SQL REST API.**
   It publishes no Rust driver. Each submission is one HTTPS request, so nothing
@@ -314,8 +353,17 @@ Decided, and not to be re-litigated:
 - **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
   SQLite keeps them only in the `CREATE TABLE` text; MySQL's
   `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.
+- **An index's kind, key and partial condition come from the catalog, never
+  from parsing its definition** (`db::Index`). A key crosses `assemble_structure`
+  joined by `chr(31)`, since `, ` splits `coalesce(a, b)`. Where a catalog falls
+  short: SQLite names no expression key and keeps a partial condition only in
+  the `CREATE INDEX` text, so both are read from it; MySQL's `EXPRESSION`
+  (8.0.13+) is read inside a `/*!80013 */` comment, which MariaDB, lacking the
+  column, skips; DuckDB keeps no key order; ClickHouse's keys are split at
+  top-level commas and are all plain; MongoDB's key reads `email`, `created -1`,
+  `title text`, and its `partialFilterExpression` is the condition.
 - **MySQL verifies certificates against `webpki-roots`**, not the platform
-  trust store the Postgres path reads. It fails loudly, which `AGENTS.md` hard rule 7 permits.
+  trust store the Postgres path reads. It fails loudly, which `AGENTS.md` hard rule 6 permits.
 - **SQL Server identifiers are double-quoted, not bracketed.** The grammar
   every gate parses with has no `[name]` and its pin does not move; the login
   tiberius sends turns `QUOTED_IDENTIFIER` on, so `"name"` is an identifier.
@@ -385,6 +433,17 @@ Decided, and not to be re-litigated:
   rather than silently. A batch that returns one set after all leaves a queue
   of one result, which `advance_queue` drops, so an ordinary run is exactly
   what it always was.
+- **SQL Server's messages (`PRINT`, `RAISERROR` at severity 10 or less, a
+  `USE`'s "Changed database context") are heard, not read.** tiberius 0.12.3
+  drops INFO tokens from its stream and only logs a `tracing` event, so
+  `Session::fetching` runs the submission's own drain under a scoped
+  subscriber (`Heard`) and puts what it heard in `QueryResult::messages`. The
+  callsite is picked by `INFO_TOKEN_LINE`, because the environment-change
+  events share its target and shape; the exact `=0.12.3` pin is what keeps
+  that line right, so a tiberius bump must re-check it (the live message tests
+  catch a wrong one). Internal trips never listen, so dbdelve's own `USE` and
+  describes say nothing. Messages from a submission that fails are lost with
+  the error.
 - **SQL Server edit targets come from a describe**, as Postgres's do:
   `sys.dm_exec_describe_first_result_set` in mode 2 (a view is its own source,
   and has no key), after the statement ran, only when it returned exactly one
@@ -423,7 +482,7 @@ Decided, and not to be re-litigated:
   encrypt, and only after a failed handshake (`negotiation_failed`): a refused
   login or a connect that timed out fails the same way again, so neither
   retries. `verify-ca` checks the hostname too, since tiberius cannot switch
-  that alone off: stricter, which `AGENTS.md` hard rule 7 permits. A named root certificate must
+  that alone off: stricter, which `AGENTS.md` hard rule 6 permits. A named root certificate must
   be one certificate.
 - **An error from inside a procedure, trigger or function carries no position.**
   `token.procedure()` names it when one raised the error; the line the server
@@ -617,3 +676,166 @@ Decided, and not to be re-litigated:
   `WATCH` of its own, a list item's write, is refused while it is set: its
   `EXEC` or `UNWATCH` would clear the user's along with its own.
 
+- **ClickHouse is spoken to over its HTTP interface with `ureq`, and every
+  result is asked for as `TabSeparatedWithNamesAndTypes`.** One `POST` per
+  statement, the statement as the body byte for byte, `default_format` in the
+  URL (`clickhouse.rs`, `FORMAT`). Native TCP is out of scope, and the
+  `clickhouse` crate is HTTP too but hands back raw bytes for a result whose
+  columns are not known at compile time, with TLS that would bypass `tls.rs`.
+  Auth is the `X-ClickHouse-User` and `-Key` headers, never the URL, so an `@`
+  in a user name needs no escaping. The port is blank to 8123, or 8443 under
+  `require` and `verify-*`; `verify-ca` is verified as `verify-full`, which
+  `ureq` forces and hard rule 6 permits.
+- **Read-only is `readonly=2` on every request, and the classifier fills what
+  that does not hold.** `ReadOnlySession::PerRequest`: `set_read_only` flips a
+  flag the driver reads per request, and `readonly=2` cannot be lifted by a
+  `SET` or a statement's own `SETTINGS`. It is not a backstop for everything:
+  `BACKUP` is unchecked and `RESTORE` is refused only at `readonly=1`. So an
+  unparseable statement is read by its first keyword (`UnreadableFloor::
+  FirstKeyword`, `sql::by_statement`, `first_keyword_verdict`): `SELECT`, `WITH`,
+  `SHOW`, `DESCRIBE`, `EXISTS`, `EXPLAIN`, `CHECK`, `WATCH`, `USE` and `SET`
+  are Read-only and run once on confirmation; `INSERT`, `UPDATE` and `DELETE`
+  are Read-write; DDL, access control, `SYSTEM`, `KILL`, `BACKUP` and
+  `RESTORE` are Full; anything else fails closed to Read-write. A
+  submission where the tokenizer and the server's lexer may part ways
+  (`sql::misread`) needs Full, and an `OUTFILE` is Full. A user already
+  `readonly` on the server is never sent the setting.
+- **A table function in a `SELECT` is a plain read; `INSERT INTO FUNCTION`
+  needs Full.** `url()`, `s3()`, `remote()` and `executable()` change nothing
+  in the database, and `executable()` runs only what an admin placed on the
+  server (owner decision). An `INSERT INTO FUNCTION` writes outside the
+  database, and only ClickHouse's dialect parses it
+  (`TableObject::TableFunction`, in `sql::spec_verdict`), as does a `CREATE
+  TABLE` with an external or file `ENGINE`.
+- **The user's statements share one session; DBDelve's own use none.** A
+  session runs one query at a time, so `Connection::query` runs on the
+  profile's session behind a mutex and `generated`, `internal_query` and every
+  `KILL` go without one, never queued behind a long run. `query_alongside` is
+  sessionless under the run's hold. A new session sends `USE <db>` as its own
+  request under the run's Cancel (`Kind::Enter`), because the `database`
+  parameter does not persist into a session. A session the server expired is
+  `SESSION_NOT_FOUND`: the statement did not run, and the error says to run
+  it again, since re-running silently could land in the wrong database.
+- **Cancel is `KILL QUERY … SYNC` by a `query_id` DBDelve chose, retried until
+  it lands.** The id is on the token before the `POST` reaches the server, so
+  a `KILL` can arrive first and match nothing: `Connection::cancel` sends it
+  again every 100 ms until a row answers or the request returns, and after 10 s
+  aborts the local read and says the statement may still be running
+  (`stop`, `settle`, `kill`). Dropping the connection stops nothing, so every
+  stop and every abandonment is a `KILL`. A read stopped at the row limit is
+  closed and killed the same way; one that cannot be stopped is drained
+  through the exception-aware reader and counted. The error is normalised to
+  `CANCELLED` so `is_cancel` reads it, only when the token asked: another
+  user's `KILL` keeps the server's words.
+- **A timeout is `max_execution_time` per request, and the guarantee is the
+  client's.** The server's setting is best effort and does not bound a
+  mutation's background work. So a request also gets a client bound of the
+  timeout plus slack, as the whole wait for a response (`Bounds::user`) and
+  as the longest silence between bytes (`Watched`, in `http.rs`), and hitting
+  it `KILL`s the query. With no timeout the user's statements have no bound and
+  Cancel is the remedy; DBDelve's own catalog requests get 120 s. What is sent
+  is decided once at connect from `system.settings` and checked by a
+  validation request, so a `readonly=1` user whose profile pins another
+  `max_execution_time` fails the connect in the server's words (`facts`).
+- **Results are read by type, and a late error is told from data.** TSV's
+  escapes are undone for scalars; `Array`, `Tuple`, `Map` and the geo types
+  arrive as ClickHouse literal text already and are kept raw; `Variant`,
+  `Dynamic` and `JSON` are shown as the server sent them, so a string variant
+  holding a tab shows `\t` (`tsv::Decoder`, `Unescape`). Bytes that are not
+  UTF-8 and every `AggregateFunction` are `0x` and hex. Totals and extremes
+  are further result sets. A body can end in an exception after a 200: the
+  server tags it, and `Framed` finds the tag across reads; a server before 25.11
+  has no tag, and a line that looks like `Code: N. DB::Exception:` and cannot
+  be a row is held until it is shown to be one (`Untagged`). A cut body is an
+  error, never a short result.
+- **An unsorted preview pages in key order.** `LIMIT/OFFSET` without an
+  `ORDER BY` is not stable in ClickHouse, so `Paging::LimitOffsetByKey` has
+  `sql::paged` splice the key (`PRIMARY KEY`, from `system.tables`) in before
+  the `LIMIT`; a header sort is read back from the statement before paging.
+  A key holding an expression gives none, and that preview stays unordered.
+- **Filters go through `toString`.** `LIKE` takes only a string, so a substring
+  is `toString(col) LIKE …` and a regex `match(toString(col), …)`
+  (`SubstringMatch::LikeToString`, `RegexMatch::Match`), which keeps a NULL
+  NULL and answers on every type.
+- **A dictionary is its own `RelationKind`, and a materialized view drops with
+  `DROP VIEW`.** Copy DROP writes `DROP DICTIONARY` and Copy TRUNCATE is not
+  offered; `DROP MATERIALIZED VIEW` is a syntax error. A foreign table drops as
+  a table.
+- **ClickHouse has no unique key, so a row is named by every value it was read
+  with, and each write is guarded** (`AGENTS.md` hard rules 1 and 2). `PRIMARY
+  KEY` is a sparse index and feeds paging only. A term is `col = '…'` where the
+  type converts a literal exactly, `toString(col) = '…'` for floats,
+  decimals, `DateTime`, `DateTime64`, `Array`, `Tuple`, `Map` and geo, and `col
+  IS NULL` (`clickhouse::match_value`, `edit::spelling`). A `DateTime` is
+  matched as text because the hour a clock goes back is shown twice and a
+  literal names only one instant. A row with an `AggregateFunction`, `Variant`,
+  `Dynamic` or `JSON` value, bytes shown as hex or a NUL cannot be matched and
+  is read-only, saying why (`QueryResult::read_only_reason`). Before each
+  `UPDATE`, `DELETE` or `ALTER … UPDATE`, `Connection::guarded_write` runs
+  `sql::row_guard`, a `COUNT(*)` with the write's own predicate cut from the
+  tree the gate reads, and refuses a count other than one: a duplicate not yet
+  merged is refused. Another client can still insert an identical row between
+  the count and the write; nothing in ClickHouse closes that window.
+- **A query tab's result has an edit target when its statement provably reads
+  one table's own rows** (owner decision): `edit::query_shape` over
+  `sql::table_read_or_why` admits one plain `SELECT` of columns or `*` with
+  `WHERE`, `PREWHERE`, `ORDER BY`, `LIMIT` (`BY` too) or `SAMPLE`, and refuses
+  every other shape in words (`Unread`, `edit::unread`); `FINAL` is found among
+  the bare words, since the grammar takes it for a table alias. `edit::origins`
+  maps each result column back: a `*` by the header's names, a name as written,
+  and any alias or qualifier that is also a column's name refuses, because the
+  server reads that name as the alias everywhere (`SELECT a AS b, b` is `a`
+  twice) and `t.x` can be a field of a column `t`. Names compare
+  case-sensitively there, each result column must carry its column's type (a
+  bare `inf` is the literal), and an `ALIAS` column, computed as it is read,
+  refuses. A
+  subset of columns names a row by those alone, which the guard keeps to one
+  row. An unqualified name is resolved on the request's own session
+  (`Connection::resolve`: `currentDatabase()`, and refused as a temporary
+  table of the session's), never guessed from `USE`s seen.
+- **A query tab's rows read after a `SET` are not matched.** The guard and the
+  write stay sessionless, so the rendered text they compare must be the
+  sessionless rendering: `Session::set` is raised by any user statement that
+  opens with `SET` or `EXECUTE` (`sets_session`, past comments) and cleared
+  only with the session. Running the guard on the session instead was
+  rejected: `SET final = 1` or `apply_deleted_mask = 0` would make its count
+  disagree with the rows a write touches. A run at once and a preview are
+  sessionless and unaffected.
+- **A query tab's edits are reviewed, never appended**
+  (`Engine::reviews_query_edits`, true where `row_terms` is): a statement left
+  in the buffer, or in the history, would run without its guard when run
+  again. Delete row is offered on a query tab for the same engines
+  (`edits_query_rows`).
+- **Edit targets exist for MergeTree-family tables only, and the spelling is
+  decided at describe time.** Once per table per connection
+  (`Connection::describe`, forgotten when a statement that changes a table
+  starts and again when it ends) from `system.tables`, `system.columns` and
+  `system.merge_tree_settings`. Lightweight `UPDATE` when the server's
+  `enable_lightweight_update` is on, the engine can and both
+  `enable_block_number_column` and `enable_block_offset_column` are set;
+  otherwise `ALTER TABLE … UPDATE … SETTINGS mutations_sync = 2`, which
+  rewrites parts and returns once every replica has applied it. Sorting-key,
+  primary-key and partition-key columns, `MATERIALIZED`, `ALIAS` and
+  `AggregateFunction` columns cannot be set, and a `Map` cannot be edited, only
+  inserted: the server casts a string to one nowhere an assignment reaches.
+  Delete is the lightweight `DELETE`, withheld on a table with projections when
+  `lightweight_mutation_projection_mode` is `throw`. Values go as quoted text
+  and the server converts them (`input_format_values_interpret_expressions`).
+- **There is no transaction.** `SqlSpec::transactions` is false, so a batch is
+  not bracketed; it stops at its first refusal or error and the error says how
+  many edits were applied and stay. Import Rows chunks stay as they land
+  (`chunk_refusal`), and a cancelled mutation is said to keep running
+  (`db::cancel_cost`). The review notes say how rows are matched, what a
+  mutation costs and what stays (`review_notes`).
+- **A refused lightweight `UPDATE` gets one line added, never a rewrite.** When
+  the server refuses a typed `UPDATE` for want of the block columns
+  (`NOT_IMPLEMENTED`, "Lightweight updates are not supported"), the error keeps
+  the server's words and adds the `ALTER TABLE … UPDATE … SETTINGS
+  mutations_sync = 2` line (`edit::hinted`). The statement is the user's and
+  is not changed.
+- **The importers read two names.** DBeaver's provider `clickhouse` and
+  TablePlus's driver `ClickHouse`; a DBeaver connection given by a JDBC URL
+  is skipped, since DBDelve cannot read one for this engine. DBeaver's
+  provider id is from its source and unverified against a real file, and only
+  the first entry of TablePlus's TLS dropdown is known; any other comes in as
+  verify-full rather than something it may be stronger than.

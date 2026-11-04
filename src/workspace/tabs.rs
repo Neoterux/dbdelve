@@ -4,6 +4,8 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
+use crate::actions::{FocusSidebar, OpenSidebarItem, ToggleResultsFocus};
+use crate::session::PendingDiscard;
 use crate::tab_drag::{self, Drag, Slot};
 
 /// How tall an Edit mode input grows before it scrolls instead.
@@ -13,11 +15,117 @@ impl Workspace {
     pub(crate) fn toggle_sidebar(
         &mut self,
         _: &ToggleSidebar,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.sidebar_hidden = !self.sidebar_hidden;
+        // Put away with the keyboard inside it, the sidebar would take the
+        // window's only dispatch path with it.
+        let held = self.explorer_focus.contains_focused(window, cx)
+            || self.profile().is_some_and(|profile| {
+                profile
+                    .session
+                    .explorer_filter
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            });
+        if self.sidebar_hidden && held {
+            self.refocus_front();
+        }
         cx.notify();
+    }
+
+    /// The sidebar's tree takes the keyboard, the sidebar shown if it was put
+    /// away, on the row of the tab in front -- or the row last selected, or
+    /// the first.
+    pub(crate) fn focus_sidebar(
+        &mut self,
+        _: &FocusSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Over a modal the stroke is the modal's: taking the keyboard out from
+        // under one would leave it on screen with no way to answer it.
+        if self.palette.is_some() || self.dialog_in_front.get().is_some() || self.form.is_some() {
+            return;
+        }
+        self.sidebar_hidden = false;
+        cx.notify();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        // A handle no element tracks is a window with no dispatch path.
+        if !super::forms::explorer_drawn(profile) {
+            return;
+        }
+        let session = &profile.session;
+        let front = match session.active_object() {
+            Some(tab) => self.catalog().and_then(|catalog| {
+                crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)
+            }),
+            None => session
+                .active_query_tab()
+                .and_then(|tab| tab.open_query.as_deref())
+                .map(crate::explorer::query_row),
+        };
+        let tree = session.explorer_tree.clone();
+        tree.update(cx, |tree, cx| {
+            let front = front.map(gpui::SharedString::from).and_then(|id| {
+                tree.reveal_item(&id, gpui::ScrollStrategy::Center, cx);
+                tree.index_of(&id)
+            });
+            let row = front.or(tree.selected_index()).or(tree.entry(0).map(|_| 0));
+            tree.set_selected_index(row, cx);
+            if let Some(row) = row {
+                tree.scroll_to_item(row, gpui::ScrollStrategy::Center);
+            }
+            tree.focus(window, cx);
+        });
+        // A hand-back asked for earlier, as the palette asks on closing, would
+        // take the keyboard straight back.
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = false;
+        }
+    }
+
+    /// `enter` on the sidebar's selected row: what a click on it does.
+    pub(crate) fn open_sidebar_item(
+        &mut self,
+        _: &OpenSidebarItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some((id, folder)) = profile
+            .session
+            .explorer_tree
+            .read(cx)
+            .selected_entry()
+            .map(|entry| (entry.item().id.clone(), entry.is_folder()))
+        else {
+            return;
+        };
+        let leaf = profile.session.explorer_leaves.get(id.as_ref()).copied();
+        let query = crate::explorer::saved_query(&id).or_else(|| {
+            profile
+                .session
+                .explorer_shortcuts
+                .get(id.as_ref())
+                .and_then(|shortcut| shortcut.query())
+        });
+        if let Some(name) = query {
+            self.open_saved_query(name.to_string(), window, cx);
+        } else if let Some(leaf) = leaf {
+            self.open_explorer_target(leaf.target, window, cx);
+        } else if folder {
+            // Folding is the tree's own, behind its `Confirm`.
+            window.dispatch_action(
+                Box::new(gpui_base::actions::Confirm { secondary: false }),
+                cx,
+            );
+        }
     }
 
     pub(crate) fn toggle_row_panel(
@@ -411,6 +519,43 @@ impl Workspace {
         self.cycle_tab(-1, window, cx);
     }
 
+    pub(crate) fn move_tab_left(
+        &mut self,
+        _: &MoveTabLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_tab(-1, cx);
+    }
+
+    pub(crate) fn move_tab_right(
+        &mut self,
+        _: &MoveTabRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_tab(1, cx);
+    }
+
+    /// The keyboard's drag: the chip in front trades places with its
+    /// neighbour, and the strip keeps the order as a drop does.
+    pub(crate) fn move_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some(session) = self.profile_mut().map(|profile| &mut profile.session) else {
+            return;
+        };
+        if !session.move_active_tab(step) {
+            return;
+        }
+        if let Some(index) = session
+            .strip_order()
+            .iter()
+            .position(|key| session.tab_of(key) == Some(session.active))
+        {
+            crate::scroller::scroll_to("tab-strip", "", index, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn select_theme(
         &mut self,
         _: &SelectTheme,
@@ -615,7 +760,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A menu open from a dropdown or a cell closes on its own `escape`,
+        // which this unscoped binding would otherwise beat to it and take
+        // the dialog or form under the menu down instead.
+        if window
+            .context_stack()
+            .iter()
+            .any(|context| context.contains("PopupMenu"))
+        {
+            cx.propagate();
+            return;
+        }
         if self.close_palette(window, cx) {
+            return;
+        }
+        if self.reference_popup.take().is_some() {
+            cx.notify();
             return;
         }
         if self.pending_import.take().is_some() {
@@ -645,10 +805,11 @@ impl Workspace {
         }
         // Whatever is in front, in the order it is stacked: the palette paints
         // over the stale-edit prompt, the stopped-run prompt and the run
-        // prompt, which paint over the discard-close confirmation, which
-        // paints over the close confirmation, which paints over the import
-        // dialog, which paints over the apply review, which paints over the
-        // surface and the settings panel beside it -- so `escape` backs out
+        // prompt, which paint over the export question, which paints over the
+        // discard-close confirmation, which paints over the delete
+        // confirmation, which paints over the import dialog, which paints
+        // over the apply review, which paints over the surface and the
+        // settings panel beside it -- so `escape` backs out
         // of them in that order, one at a time. The palette stays first so
         // that picking a font from inside settings closes the font list and
         // leaves the panel it was opened from standing.
@@ -666,10 +827,16 @@ impl Workspace {
             self.cancel_pending_run(cx);
             return;
         }
+        if self.cancel_pending_export(cx) {
+            return;
+        }
         if self.cancel_discard_close(cx) {
             return;
         }
-        if self.cancel_close_tab(cx) {
+        if self.cancel_delete_query(cx) {
+            return;
+        }
+        if self.cancel_query_rename(cx) {
             return;
         }
         if self.close_import(cx) {
@@ -710,6 +877,26 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // The tree has nothing to back out of, so `escape` there leaves it for
+        // the surface in front, as leaving any field does.
+        if self.explorer_focus.contains_focused(window, cx) {
+            self.refocus_front();
+            cx.notify();
+            return;
+        }
+        // From the rows back to the statement above them. The grid itself, not
+        // a cell's open input, which is a descendant of it and whose `escape`
+        // cancels the edit.
+        if let Some(session) = self.profile().map(|profile| &profile.session)
+            && let Some(editor) = session.editor(session.active)
+            && session
+                .active_results()
+                .is_some_and(|grid| grid.focus_handle(cx).is_focused(window))
+        {
+            editor.focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
         // Nothing of dbdelve's is stacked over the tab, so the keystroke is not
         // ours. Handing it on is what lets the completion popup close and a
         // grid cell's input cancel its edit; this binding is unscoped and would
@@ -718,45 +905,78 @@ impl Workspace {
         cx.propagate();
     }
 
-    /// `tab` takes the highlighted suggestion, and indents when there is none
-    /// to take.
-    pub(crate) fn accept_completion(
+    /// Between the buffer and the rows it ran: to whichever the keyboard is
+    /// not in. On an object tab, which has no buffer, to its grid.
+    pub(crate) fn toggle_results_focus(
         &mut self,
-        _: &AcceptCompletion,
+        _: &ToggleResultsFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self
-            .profile()
-            .and_then(|profile| profile.session.editor(profile.session.active))
-        else {
+        if self.palette.is_some() || self.dialog_in_front.get().is_some() || self.form.is_some() {
+            return;
+        }
+        let Some(session) = self.profile().map(|profile| &profile.session) else {
             return;
         };
-        // Through the mode trait: gpui-base 0.8 keeps the inherent method
-        // `pub(crate)`, and this is the only public way to offer the menu an action.
-        let accepted = editor.update(cx, |editor, cx| {
-            EditorMode::handle_context_menu_action(
-                editor,
-                Box::new(Enter {
-                    secondary: false,
-                    shift: false,
-                }),
-                window,
-                cx,
-            )
-        });
-        if !accepted {
-            window.dispatch_action(Box::new(IndentInline), cx);
+        let editor = session.editor(session.active);
+        let in_rows = session
+            .active_results()
+            .is_some_and(|grid| grid.focus_handle(cx).contains_focused(window, cx));
+        let target = match (in_rows, editor) {
+            (true, Some(editor)) => Focus::Buffer(editor),
+            (_, editor) => match (self.front_grid(cx), editor) {
+                (Some(grid), _) => grid,
+                (None, Some(editor)) => Focus::Buffer(editor),
+                (None, None) => return,
+            },
+        };
+        match target {
+            Focus::Grid(grid) => grid.update(cx, |table, cx| {
+                crate::result_grid::take_keyboard(table, window, cx)
+            }),
+            Focus::Structure(grid) => grid.focus_handle(cx).focus(window, cx),
+            Focus::Buffer(editor) => editor.focus_handle(cx).focus(window, cx),
+            Focus::Field(_) | Focus::Window => return,
+        }
+        // A hand-back asked for earlier would take the keyboard straight back.
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = false;
+        }
+        cx.notify();
+    }
+
+    /// The grid in front that can take the keyboard: one drawn, with a row for
+    /// the ring to sit on. A plan, the run's messages, or the line standing in
+    /// for rows that never came, has nothing in it to step through.
+    pub(super) fn front_grid(&self, cx: &App) -> Option<Focus> {
+        let session = &self.profile()?.session;
+        let has_rows = |grid: &Entity<gpui_component::table::TableState<ResultGrid>>| {
+            !grid.read(cx).delegate().result().rows.is_empty()
+        };
+        let Some(tab) = session.active_object() else {
+            let tab = session.active_query_tab()?;
+            let (state, grid) = tab.shown();
+            let drawn = tab.plan_shown().is_none()
+                && !tab.messages_shown()
+                && matches!(
+                    state,
+                    QueryState::Running { .. } | QueryState::Complete { .. }
+                );
+            return (drawn && has_rows(grid)).then(|| Focus::Grid(grid.clone()));
+        };
+        match &tab.body {
+            ObjectBody::Relation { query, results, .. } => {
+                (!matches!(query, QueryState::Failed(_)) && has_rows(results))
+                    .then(|| Focus::Grid(results.clone()))
+            }
+            ObjectBody::Structure { grid, .. } => Some(Focus::Structure(grid.clone())),
+            ObjectBody::Routine(_) => None,
         }
     }
 
-    /// `cmd+w` on whatever surface is in front.
-    ///
-    /// An object tab closes: it is a view onto something the database still
-    /// holds, and reopening it costs a click. A saved query is a file, and
-    /// closing its tab is deleting that file — the strip has no room for a
-    /// query that exists but is not listed — so that one asks first. The
-    /// scratch buffer has no closed state at all and is left alone.
+    /// `cmd+w` on whatever surface is in front. Closing never deletes a saved
+    /// query: the sidebar still lists it, and only its own Delete removes it.
     pub(crate) fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         // The palette is over the tab and holds the keyboard: a stroke that
         // reached here through it would close a tab nobody was looking at.
@@ -770,8 +990,8 @@ impl Workspace {
         if session.active_query_tab().is_none() && session.active_object().is_none() {
             return;
         }
-        let target = close_target(session.active, session.open_query());
-        self.ask_before_close(target, window, cx);
+        let tab = session.active;
+        self.ask_before_close(tab, window, cx);
     }
 
     /// Close a tab, asking first if it holds cell edits nobody has applied.
@@ -782,46 +1002,37 @@ impl Workspace {
     /// none.
     pub(crate) fn ask_before_close(
         &mut self,
-        target: CloseTarget,
+        tab: Tab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let unapplied = self.profile().is_some_and(|profile| {
-            target
-                .tab(&profile.session)
-                .and_then(|tab| profile.session.results(tab))
-                .is_some_and(|results| results.read(cx).delegate().has_pending())
-        });
-        if !unapplied {
-            self.close_now(target, window, cx);
+        if !self.has_unapplied_edits(tab, cx) {
+            self.close_now(tab, window, cx);
             return;
         }
         if let Some(profile) = self.profile_mut() {
-            profile.session.pending_discard = Some(target);
+            profile.session.pending_discard = Some(PendingDiscard {
+                tab,
+                deleting: None,
+            });
         }
         cx.notify();
     }
 
-    /// Carry out a close that has been decided on. A saved query asks its own
-    /// question from here: closing its tab deletes its file.
-    ///
-    /// Nothing is stopped here: each close stops its tab's statement as the
-    /// tab goes, and a saved query's goes only once its delete is confirmed.
-    pub(crate) fn close_now(
-        &mut self,
-        target: CloseTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match target {
-            CloseTarget::Object(id) => self.close_object(id, window, cx),
-            CloseTarget::Buffer(id) => self.close_buffer(id, window, cx),
-            CloseTarget::SavedQuery(name) => {
-                if let Some(profile) = self.profile_mut() {
-                    profile.session.pending_close = Some(name);
-                }
-                cx.notify();
-            }
+    pub(crate) fn has_unapplied_edits(&self, tab: Tab, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            profile
+                .session
+                .results(tab)
+                .is_some_and(|results| results.read(cx).delegate().has_pending())
+        })
+    }
+
+    /// Carry out a close that has been decided on.
+    pub(crate) fn close_now(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        match tab {
+            Tab::Object(id) => self.close_object(id, window, cx),
+            Tab::Query(id) => self.close_buffer(id, window, cx),
         }
     }
 
@@ -875,13 +1086,17 @@ impl Workspace {
 
     /// Close the tab the discard prompt was raised over, edits and all.
     pub(crate) fn confirm_discard_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self
+        let Some(discard) = self
             .profile_mut()
             .and_then(|profile| profile.session.pending_discard.take())
         else {
             return;
         };
-        self.close_now(target, window, cx);
+        match discard.deleting {
+            Some(name) => self.delete_saved_query_now(name, window, cx),
+            None => self.close_now(discard.tab, window, cx),
+        }
+        self.refocus_front();
     }
 
     pub(crate) fn cancel_discard_close(&mut self, cx: &mut Context<Self>) -> bool {
@@ -890,17 +1105,19 @@ impl Workspace {
             .and_then(|profile| profile.session.pending_discard.take())
             .is_some();
         if cancelled {
+            self.refocus_front();
             cx.notify();
         }
         cancelled
     }
 
-    pub(crate) fn cancel_close_tab(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn cancel_delete_query(&mut self, cx: &mut Context<Self>) -> bool {
         let cancelled = self
             .profile_mut()
-            .and_then(|profile| profile.session.pending_close.take())
+            .and_then(|profile| profile.session.pending_delete.take())
             .is_some();
         if cancelled {
+            self.refocus_front();
             cx.notify();
         }
         cancelled

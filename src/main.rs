@@ -47,26 +47,24 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Root,
-    input::{
-        CompletionProvider, EditorMode, EditorState, Enter, IndentInline, Input, InputEvent,
-        InputModeKind, InputState, Position,
-    },
+    input::{CompletionProvider, EditorState, Input, InputEvent, InputState, Position},
     list::ListItem,
     resizable::{ResizableState, h_resizable, resizable_panel},
     tree::tree as render_tree,
 };
 
 use actions::{
-    AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette,
-    CommitTransaction, CopyCell, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode,
-    DeleteRow, DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen,
-    GoToColumn, HideColumn, ImportConnections, ImportRows, LimitTarget, NewConnection, NewProject,
-    NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextTab, OpenReference, OpenSettings,
-    PreviousEdit, PreviousPage, PreviousProfile, PreviousTab, Quit, RefreshConnection,
-    RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom,
-    RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
-    SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw,
-    SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowReferences,
+    AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CommitTransaction,
+    CopyCell, CopyPlan, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode, DeleteRow,
+    DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
+    HideColumn, ImportConnections, ImportRows, LimitTarget, Minimize, MoveTabLeft, MoveTabRight,
+    NewConnection, NewProject, NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult,
+    NextTab, OpenReference, OpenSettings, PreviousEdit, PreviousPage, PreviousProfile,
+    PreviousResult, PreviousTab, Quit, RefreshConnection, RefreshRelation, RemoveFilter,
+    RequestWriteMode, ResetConfirmations, ResetEditorZoom, RollbackTransaction, RunQuery,
+    SaveQuery, SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit,
+    SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit,
+    SetRowLimit, ShowAllColumns, ShowEditor, ShowMessages, ShowReferences, SortActiveColumn,
     SortColumn, SubmitConnection, SwitchConnection, ToggleAutoCommit, ToggleComment,
     ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit, ToggleRowPanel,
     ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
@@ -75,10 +73,10 @@ use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
 use db::{
     CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine, ExplainMode,
-    Fields, RelationKind, ServerConfig, SnowflakeConfig, SslMode,
+    Fields, PostgresConfig, RelationKind, ServerConfig, SnowflakeConfig, SslMode,
 };
 use explorer::{ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, tree as build_explorer_tree};
-use export::Format;
+use export::{FileAs, Format};
 use filter::{
     Conjunction, FilterBar, FilterRow, Operator, changed_filter, cycle, derived_filter,
     filter_bars, filter_row, foreign_key_filter, reference_filter, relation_sql, restored_filter,
@@ -88,17 +86,17 @@ use icons::{Icons, icon};
 use palette::{Command, Mode as PaletteMode, Palette, PaletteEvent, Scope, Stroke};
 use result_grid::{NewValue, ResultGrid};
 use session::{
-    ApplyReview, CatalogState, CloseTarget, Explained, Focus, InsertField, InsertForm, ObjectBody,
-    ObjectTab, OpenedObject, Profile, ProfileState, QueryState, QueryTab, Refresh, Routines,
-    RowCount, Session, Sorting, StructureState, Tab, TabKey, close_target, insert_value,
-    matching_tab, relation_kind, restored_state, show_snapshot,
+    ApplyReview, CatalogState, Explained, Focus, InsertField, InsertForm, ObjectBody, ObjectTab,
+    OpenedObject, Profile, ProfileState, QueryState, QueryTab, Refresh, Routines, RowCount,
+    Session, Sorting, StructureState, Tab, TabKey, insert_value, matching_tab, relation_kind,
+    restored_state, show_snapshot,
 };
 use sql::{Buffer, SortKey};
 use theme::{ConnectionColor, FontSlot, Fonts, Theme, fonts, layout, popup_theme, theme};
 use ui::{
     Control, Tone, button, button_label, dialog, engine_logo, frosted_card, group_thousands,
     highlighted, human_bytes, icon_button, object_icon, one_line, relative_age, row_icon,
-    row_readout, section_label, segment, titlebar,
+    row_readout, section_label, segmented_choice, titlebar,
 };
 use workspace::Workspace;
 
@@ -106,10 +104,28 @@ use workspace::Workspace;
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
 
 fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, String> {
-    let host = std::env::var("PGHOST").ok();
-    let port = std::env::var("PGPORT").ok();
-    let database = std::env::var("PGDATABASE").ok();
-    let user = std::env::var("PGUSER").ok();
+    connection_config_from(&|name| std::env::var(name).ok())
+}
+
+/// [`connection_config_from_environment`] with its variables handed in, since
+/// the tests cannot set them without racing every other thread that reads the
+/// environment.
+fn connection_config_from(
+    variable: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<ConnectionConfig>, String> {
+    let host = variable("PGHOST");
+    let port = variable("PGPORT");
+    let database = variable("PGDATABASE");
+    let user = variable("PGUSER");
+
+    // Ranked above the variables below, as in libpq, which leaves them to
+    // fill what it does not set: `postgres::service` reads them on connect.
+    if let Some(service) = variable("PGSERVICE").filter(|s| !s.is_empty()) {
+        return Ok(Some(ConnectionConfig::Postgres(PostgresConfig {
+            service: Some(service),
+            ..PostgresConfig::default()
+        })));
+    }
 
     if [&host, &port, &database, &user]
         .iter()
@@ -136,12 +152,11 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         ));
     };
 
-    let sslmode = match std::env::var("PGSSLMODE") {
-        Ok(sslmode) => SslMode::parse(&sslmode)?,
-        Err(_) => SslMode::default(),
+    let sslmode = match variable("PGSSLMODE") {
+        Some(sslmode) => SslMode::parse(&sslmode)?,
+        None => SslMode::default(),
     };
-    let root_certificate = std::env::var("PGSSLROOTCERT")
-        .ok()
+    let root_certificate = variable("PGSSLROOTCERT")
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty());
 
@@ -155,12 +170,12 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
     // The `PG*` variables configure a Postgres profile and are not generalised.
     // dbdelve is a generic client, not a generic environment reader, and there is
     // no convention for the other engines to read.
-    Ok(Some(ConnectionConfig::Postgres(ServerConfig {
+    Ok(Some(ConnectionConfig::postgres(ServerConfig {
         host,
         port,
         database,
         user,
-        password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        password: variable("PGPASSWORD").unwrap_or_default(),
         sslmode,
         root_certificate,
         // No `PG*` variable means it, and dbdelve is not inventing one.
@@ -289,6 +304,15 @@ fn main() {
             // Edit menu -- dbdelve does not own cut, copy and paste, the focused
             // field does, and a menu claiming them would take them from it.
             cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+            cx.on_action(|_: &Minimize, cx: &mut App| {
+                cx.defer(|cx| {
+                    if let Some(window) = cx.active_window() {
+                        window
+                            .update(cx, |_, window, _| window.minimize_window())
+                            .ok();
+                    }
+                });
+            });
             cx.set_menus(app_menus(false));
 
             // The platform titlebar is kept only for its window buttons on macOS:
@@ -320,7 +344,12 @@ fn main() {
                 // by nothing else, so without this the app runs with a blank
                 // icon however well the .desktop file is installed. It has to
                 // equal the entry's basename.
-                app_id: Some("dbdelve".into()),
+                app_id: Some(
+                    std::env::var("DBDELVE_APP_ID")
+                        .ok()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| "dbdelve".into()),
+                ),
                 ..Default::default()
             };
 
@@ -428,4 +457,36 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
             ],
         },
     ]
+    .into_iter()
+    .chain(cfg!(target_os = "macos").then(|| Menu {
+        name: "Window".into(),
+        disabled: false,
+        items: vec![MenuItem::action("Minimize", Minimize)],
+    }))
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connection_config_from;
+
+    #[test]
+    fn pgservice_outranks_the_variables_and_leaves_them_for_connect() {
+        let config = connection_config_from(&|name| match name {
+            "PGSERVICE" => Some("harness".to_string()),
+            "PGHOST" => Some("from.variable".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.service(), Some("harness"));
+        assert_eq!(config.server().unwrap().host, "");
+    }
+
+    #[test]
+    fn an_empty_pgservice_names_nothing() {
+        let config =
+            connection_config_from(&|name| (name == "PGSERVICE").then(String::new)).unwrap();
+        assert_eq!(config, None);
+    }
 }

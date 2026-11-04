@@ -22,23 +22,31 @@ use std::collections::HashMap;
 
 use gpui::{KeyBinding, Keystroke};
 
+use gpui_component::input::ShowCompletions;
+
 use crate::{
     actions::{
         AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab,
-        CommandPalette, CommitTransaction, CopyCell, CopyResults, CopyRow, CycleMode, DeleteRow,
-        DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
-        ImportConnections, ImportRows, NewConnection, NewProject, NewQuery, NewRow, NextEdit,
-        NextPage, NextProfile, NextTab, OpenSettings, PaletteNext, PaletteNextScope,
-        PalettePrevious, PalettePreviousScope, PaletteRowActions, PaletteScopeLeft,
-        PaletteScopeRight, PreviousEdit, PreviousPage, PreviousProfile, PreviousTab, Quit,
-        RefreshConnection, RefreshRelation, ResetEditorZoom, RollbackTransaction, RunQuery,
-        SaveQuery, SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetEmpty, SetNull,
-        ShowEditor, SubmitConnection, SwitchConnection, ToggleAutoCommit, ToggleComment,
-        ToggleNextJoin, ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure,
-        ZoomEditorIn, ZoomEditorOut,
+        CommandPalette, CommitTransaction, ConfirmDialog, CopyCell, CopyPlan, CopyResults, CopyRow,
+        CopyRows, CycleMode, DeleteRow, DiscardEdits, EditCell, ExplainQuery, FocusSidebar,
+        FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn, ImportConnections,
+        ImportRows, Minimize, MoveTabLeft, MoveTabRight, NewConnection, NewProject, NewQuery,
+        NewRow, NextDialogButton, NextEdit, NextPage, NextProfile, NextResult, NextTab,
+        OpenSettings, OpenSidebarItem, PaletteHistoryFilter, PaletteHistorySort, PaletteNext,
+        PaletteNextScope, PalettePrevious, PalettePreviousScope, PaletteRowActions,
+        PaletteScopeLeft, PaletteScopeRight, PreviousDialogButton, PreviousEdit, PreviousPage,
+        PreviousProfile, PreviousResult, PreviousTab, Quit, RefreshConnection, RefreshRelation,
+        ResetConfirmations, ResetEditorZoom, RollbackTransaction, RunQuery, SaveQuery,
+        SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetEmpty, SetMode, SetNull,
+        ShowAllColumns, ShowEditor, ShowMessages, ShowReferences, SortActiveColumn,
+        SubmitConnection, SwitchConnection, TickDialogBox, ToggleAutoCommit, ToggleComment,
+        ToggleNextJoin, TogglePinColumn, ToggleResultsFocus, ToggleRowEdit, ToggleRowPanel,
+        ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
     },
     db::ExplainMode,
+    export::RowsAs,
     import::Source,
+    sql::Mode,
 };
 
 /// One entry in the registry.
@@ -47,13 +55,16 @@ pub(crate) struct KeybindingSpec {
     /// override, so treat it as append-only.
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
-    /// `None` means global. Two bindings in different, specific contexts
-    /// never conflict -- see [`contexts_overlap`].
+    /// `None` means global. Scoped bindings can still share a focus path --
+    /// see [`contexts_overlap`].
     pub(crate) context: Option<&'static str>,
     /// More than one only for `zoom_editor_in`, which ships both the shifted
     /// and unshifted key so `+` reads the same on every layout. An override
     /// replaces the whole list with a single chord.
     pub(crate) defaults: &'static [&'static str],
+    /// Platform-specific actions stay out of the keymap and Settings on other
+    /// platforms.
+    pub(crate) macos_only: bool,
 }
 
 /// Whether `key` is a modifier held on its own. GPUI reports one as a
@@ -76,17 +87,54 @@ pub(crate) fn is_parseable(chord: &str) -> bool {
 // The action is matched as a token sequence rather than an `ident` so that one
 // carrying a field can be bound too: `expr` cannot be followed by the closing
 // paren of the row, and every action is spelled here as a literal value.
-macro_rules! registry {
-    ($(($id:literal, $label:literal, $context:expr, [$($default:literal),*], $($action:tt)+)),* $(,)?) => {
-        pub(crate) const REGISTRY: &[KeybindingSpec] = &[
-            $(
-                KeybindingSpec {
-                    id: $id,
-                    label: $label,
-                    context: $context,
-                    defaults: &[$($default),*],
+macro_rules! registry_spec {
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], @macos, $($action:tt)+)) => {
+        KeybindingSpec {
+            id: $id,
+            label: $label,
+            context: $context,
+            defaults: &[$($default),*],
+            macos_only: true,
+        }
+    };
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], $($action:tt)+)) => {
+        KeybindingSpec {
+            id: $id,
+            label: $label,
+            context: $context,
+            defaults: &[$($default),*],
+            macos_only: false,
+        }
+    };
+}
+
+macro_rules! registry_binding {
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], @macos, $($action:tt)+), $overrides:ident, $bindings:ident) => {
+        if cfg!(target_os = "macos") {
+            let spec = registry_spec!(($id, $label, $context, [$($default),*], @macos, $($action)+));
+            for chord in chords_for(&spec, $overrides) {
+                $bindings.push(KeyBinding::new(chord, $($action)+, $context));
+            }
+        }
+    };
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], $($action:tt)+), $overrides:ident, $bindings:ident) => {
+        match $overrides.get($id) {
+            Some(chord) if is_parseable(chord) => {
+                $bindings.push(KeyBinding::new(chord, $($action)+, $context))
+            }
+            _ => {
+                for default in [$($default),*] {
+                    $bindings.push(KeyBinding::new(default, $($action)+, $context));
                 }
-            ),*
+            }
+        }
+    };
+}
+
+macro_rules! registry {
+    ($(($($entry:tt)+)),* $(,)?) => {
+        pub(crate) const REGISTRY: &[KeybindingSpec] = &[
+            $(registry_spec!(($($entry)+))),*
         ];
 
         /// Every `KeyBinding` GPUI should register at startup: a user's
@@ -94,16 +142,7 @@ macro_rules! registry {
         pub(crate) fn build_bindings(overrides: &HashMap<String, String>) -> Vec<KeyBinding> {
             let mut bindings = Vec::new();
             $(
-                match overrides.get($id) {
-                    Some(chord) if is_parseable(chord) => {
-                        bindings.push(KeyBinding::new(chord, $($action)+, $context))
-                    }
-                    _ => {
-                        for default in [$($default),*] {
-                            bindings.push(KeyBinding::new(default, $($action)+, $context));
-                        }
-                    }
-                }
+                registry_binding!(($($entry)+), overrides, bindings);
             )*
             bindings
         }
@@ -124,7 +163,7 @@ registry! {
     ("new_project", "New Project", None, [], NewProject),
     ("close_tab", "Close Tab", None, ["secondary-w"], CloseTab),
     ("refresh_relation", "Refresh Rows", None, ["secondary-r"], RefreshRelation),
-    ("refresh_connection", "Refresh Connection", None, ["secondary-shift-r"], RefreshConnection),
+    ("refresh_connection", "Refresh Schema", None, ["secondary-shift-r"], RefreshConnection),
     ("next_tab", "Next Tab", None, ["ctrl-tab"], NextTab),
     ("previous_tab", "Previous Tab", None, ["ctrl-shift-tab"], PreviousTab),
     ("next_profile", "Next Connection", None, ["ctrl-`"], NextProfile),
@@ -155,6 +194,12 @@ registry! {
     ("palette_scope_left", "Palette: Arrow to Previous Scope", Some("Palette > Input"), ["left"], PaletteScopeLeft),
     ("palette_scope_right", "Palette: Arrow to Next Scope", Some("Palette > Input"), ["right"], PaletteScopeRight),
     ("palette_row_actions", "Palette: Row Actions", Some("Palette > Input"), ["shift-enter"], PaletteRowActions),
+    // Alt and a letter, which neither the field nor any unscoped binding
+    // holds: `secondary-f` is the field's search and `secondary-shift-f`
+    // Format Query, which as an unscoped binding would win over these. Outside
+    // History they are handed on to the field.
+    ("palette_history_filter", "Palette: Cycle History Status", Some("Palette > Input"), ["secondary-k f"], PaletteHistoryFilter),
+    ("palette_history_sort", "Palette: Cycle History Sort", Some("Palette > Input"), ["secondary-k o"], PaletteHistorySort),
     ("zoom_editor_in", "Zoom In", None, ["secondary-+", "secondary-="], ZoomEditorIn),
     ("zoom_editor_out", "Zoom Out", None, ["secondary--"], ZoomEditorOut),
     ("reset_editor_zoom", "Reset Zoom", None, ["secondary-0"], ResetEditorZoom),
@@ -165,19 +210,44 @@ registry! {
     // this unreachable there. Clearing a cell with the delete key is the
     // gesture anyway, and it collides with nothing on any platform.
     ("set_null", "Set Cell to NULL", Some("DataTable"), ["secondary-backspace"], SetNull),
-    ("accept_completion", "Accept Completion", Some("Editor > Input"), ["tab"], AcceptCompletion),
+    ("accept_completion", "Accept Completion", Some("Input && mode == editor"), ["tab"], AcceptCompletion),
     ("toggle_comment", "Toggle Line Comment", Some("Editor > Input"), ["secondary-/"], ToggleComment),
     // Run Query's chord, which reaches the form first and finds nothing to
     // run there: see `INERT_IN`.
     ("submit_connection", "Connect or Save Connection", Some("ConnectionForm"), ["secondary-enter"], SubmitConnection),
+    ("confirm_dialog", "Dialog: Press Selected Button", Some("Dialog"), ["enter"], ConfirmDialog),
+    // Not the buttons': a space typed into a prompt that has just taken the
+    // keyboard must never press Run.
+    ("tick_dialog_box", "Dialog: Tick Selected Box", Some("Dialog"), ["space"], TickDialogBox),
+    ("previous_dialog_button", "Dialog: Previous Button", Some("Dialog"), ["left", "shift-tab"], PreviousDialogButton),
+    ("next_dialog_button", "Dialog: Next Button", Some("Dialog"), ["right", "tab"], NextDialogButton),
     ("toggle_sidebar", "Toggle Sidebar", None, ["secondary-shift-s"], ToggleSidebar),
     ("toggle_row_panel", "Toggle Row Panel", None, ["secondary-shift-i"], ToggleRowPanel),
     ("toggle_row_edit", "Toggle Row Panel Edit Mode", None, ["secondary-shift-e"], ToggleRowEdit),
     ("toggle_structure", "Toggle Data / Structure", None, ["secondary-shift-d"], ToggleStructure),
+    ("toggle_results_focus", "Toggle Editor / Results Focus", None, ["secondary-k r"], ToggleResultsFocus),
+    ("focus_sidebar", "Focus Sidebar", None, ["secondary-k e"], FocusSidebar),
+    ("open_sidebar_item", "Sidebar: Open Selected", Some("Explorer"), ["enter"], OpenSidebarItem),
     ("quit", "Quit dbdelve", None, ["secondary-q"], Quit),
+    // AppKit only wires Window > Minimize through the application menu on
+    // macOS. Its default is omitted when a configured binding already owns it.
+    ("minimize", "Minimize Window", None, ["cmd-m"], @macos, Minimize),
+    // macOS's own stop chord. Unscoped, so it beats the input's `cmd-.` code
+    // actions, which no editor here offers.
+    ("cancel_query", "Cancel Query", None, ["secondary-."], CancelQuery),
+    ("move_tab_left", "Move Tab Left", None, ["ctrl-shift-pageup"], MoveTabLeft),
+    ("move_tab_right", "Move Tab Right", None, ["ctrl-shift-pagedown"], MoveTabRight),
+    ("show_completions", "Show Completions", Some("Input && mode == editor"), ["ctrl-space"], ShowCompletions),
     // Click or command-palette only today; listed so they can be given a
     // chord for the first time.
-    ("cancel_query", "Cancel Query", None, [], CancelQuery),
+    ("set_mode_read_only", "Access Level: Read-only", None, [], SetMode { mode: Mode::ReadOnly }),
+    ("set_mode_read_write", "Access Level: Read-write", None, [], SetMode { mode: Mode::ReadWrite }),
+    ("set_mode_full", "Access Level: Full", None, [], SetMode { mode: Mode::Full }),
+    ("reset_confirmations", "Reset Silenced Confirmations", None, [], ResetConfirmations),
+    ("next_result", "Next Result", None, [], NextResult),
+    ("previous_result", "Previous Result", None, [], PreviousResult),
+    ("show_messages", "Toggle Messages", None, [], ShowMessages),
+    ("copy_plan", "Copy Plan", None, [], CopyPlan),
     ("next_page", "Next Page", None, [], NextPage),
     ("previous_page", "Previous Page", None, [], PreviousPage),
     ("clear_filter", "Clear Filter", None, [], ClearFilter),
@@ -191,7 +261,17 @@ registry! {
     ("set_default", "Set Cell to Default", Some("DataTable"), [], SetDefault),
     ("copy_row", "Copy Row", Some("DataTable"), [], CopyRow),
     ("copy_results", "Copy Results", Some("DataTable"), [], CopyResults),
+    ("copy_rows_text", "Copy Row as Text", Some("DataTable"), [], CopyRows { kind: RowsAs::Text }),
+    ("copy_rows_csv", "Copy Row as CSV", Some("DataTable"), [], CopyRows { kind: RowsAs::Csv }),
+    ("copy_rows_csv_header", "Copy Row as CSV with Header", Some("DataTable"), [], CopyRows { kind: RowsAs::CsvWithHeader }),
+    ("copy_rows_json", "Copy Row as JSON", Some("DataTable"), [], CopyRows { kind: RowsAs::Json }),
+    ("copy_rows_insert", "Copy Row as INSERT SQL", Some("DataTable"), [], CopyRows { kind: RowsAs::InsertSql }),
+    ("hide_column", "Hide Column", Some("DataTable"), [], HideColumn),
+    ("toggle_pin_column", "Pin or Unpin Column", Some("DataTable"), [], TogglePinColumn),
+    ("show_all_columns", "Show All Columns", Some("DataTable"), [], ShowAllColumns),
+    ("sort_active_column", "Sort by Column", Some("DataTable"), [], SortActiveColumn),
     ("follow_foreign_key", "Follow Foreign Key", None, [], FollowForeignKey),
+    ("show_references", "Show References", Some("DataTable"), [], ShowReferences),
     ("delete_row", "Delete Row", None, [], DeleteRow),
     ("discard_edits", "Discard Edits", None, [], DiscardEdits),
     ("next_edit", "Next Edit", None, [], NextEdit),
@@ -200,12 +280,21 @@ registry! {
     ("import_tableplus", "Import Connections from TablePlus", None, [], ImportConnections { source: Source::TablePlus }),
 }
 
-/// Whether a binding scoped to `a` and one scoped to `b` could both be live
-/// at once. Two different, specific contexts never overlap; anything global
-/// (`None`) does, because a global binding fires regardless of focus.
+/// The bindings that exist on this platform. macOS-only actions stay out of
+/// Settings and out of conflict checks everywhere else.
+pub(crate) fn available_registry() -> impl Iterator<Item = &'static KeybindingSpec> {
+    REGISTRY
+        .iter()
+        .filter(|spec| !spec.macos_only || cfg!(target_os = "macos"))
+}
+
+/// Whether both bindings can apply at the same focus path. The query editor
+/// supplies both the surface's wrapper and the widget's editor-mode context.
 fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, _) | (_, None) => true,
+        (Some("Editor > Input"), Some("Input && mode == editor"))
+        | (Some("Input && mode == editor"), Some("Editor > Input")) => true,
         (Some(a), Some(b)) => a == b,
     }
 }
@@ -222,6 +311,18 @@ fn inert(id: &str, context: Option<&str>) -> bool {
         .any(|&(action, within)| action == id && Some(within) == context)
 }
 
+fn same_chord(a: &str, b: &str) -> bool {
+    let mut a = a.split_whitespace().map(Keystroke::parse);
+    let mut b = b.split_whitespace().map(Keystroke::parse);
+    loop {
+        match (a.next(), b.next()) {
+            (Some(Ok(a)), Some(Ok(b))) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// The chords currently in force for `spec`: its override if it has one,
 /// its shipped defaults otherwise.
 pub(crate) fn chords_for<'a>(
@@ -229,8 +330,23 @@ pub(crate) fn chords_for<'a>(
     overrides: &'a HashMap<String, String>,
 ) -> Vec<&'a str> {
     match overrides.get(spec.id) {
-        Some(chord) => vec![chord.as_str()],
-        None => spec.defaults.to_vec(),
+        Some(chord) if is_parseable(chord) => vec![chord.as_str()],
+        _ if spec.id == "minimize"
+            && available_registry().any(|other| {
+                other.id != spec.id
+                    && overrides.get(other.id).is_some_and(|chord| {
+                        is_parseable(chord)
+                            && chord.split_whitespace().next().is_some_and(|first| {
+                                spec.defaults
+                                    .iter()
+                                    .any(|default| same_chord(first, default))
+                            })
+                    })
+            }) =>
+        {
+            Vec::new()
+        }
+        _ => spec.defaults.to_vec(),
     }
 }
 
@@ -244,14 +360,15 @@ pub(crate) fn conflict(
     exclude_id: &str,
     overrides: &HashMap<String, String>,
 ) -> Option<&'static str> {
-    REGISTRY
-        .iter()
+    available_registry()
         .find(|spec| {
             spec.id != exclude_id
                 && contexts_overlap(spec.context, context)
                 && !inert(spec.id, context)
                 && !inert(exclude_id, spec.context)
-                && chords_for(spec, overrides).contains(&chord)
+                && chords_for(spec, overrides)
+                    .iter()
+                    .any(|bound| same_chord(bound, chord))
         })
         .map(|spec| spec.label)
 }
@@ -276,11 +393,31 @@ mod tests {
         assert_eq!(
             conflict(
                 "enter",
-                Some("Editor > Input"),
+                Some("Input && mode == editor"),
                 "accept_completion",
                 &overrides
             ),
             None
+        );
+    }
+
+    #[test]
+    fn completion_and_comment_overrides_conflict_in_the_query_editor() {
+        let completion = available_registry()
+            .find(|spec| spec.id == "accept_completion")
+            .unwrap();
+        let comment = available_registry()
+            .find(|spec| spec.id == "toggle_comment")
+            .unwrap();
+        let overrides = HashMap::from([(comment.id.to_string(), "tab".to_string())]);
+        assert_eq!(
+            conflict("tab", completion.context, completion.id, &overrides),
+            Some(comment.label)
+        );
+        let overrides = HashMap::from([(completion.id.to_string(), "secondary-/".to_string())]);
+        assert_eq!(
+            conflict("secondary-/", comment.context, comment.id, &overrides),
+            Some(completion.label)
         );
     }
 
@@ -314,7 +451,7 @@ mod tests {
     #[test]
     fn no_shipped_default_collides_with_another() {
         let overrides = HashMap::new();
-        for spec in REGISTRY {
+        for spec in available_registry() {
             for chord in spec.defaults {
                 assert_eq!(
                     conflict(chord, spec.context, spec.id, &overrides),
@@ -324,6 +461,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_cmd_m_override_keeps_its_chord_until_removed() {
+        let minimize = available_registry()
+            .find(|spec| spec.id == "minimize")
+            .unwrap();
+        for chord in ["cmd-m", "secondary-m"] {
+            let mut overrides = HashMap::from([("run_query".to_string(), chord.to_string())]);
+            let keymap = gpui::Keymap::new(build_bindings(&overrides));
+            let (bindings, _) =
+                keymap.bindings_for_input(&[Keystroke::parse("cmd-m").unwrap()], &[]);
+            assert!(bindings[0].action().partial_eq(&RunQuery));
+            assert!(chords_for(minimize, &overrides).is_empty());
+            assert_eq!(conflict("cmd-m", None, "run_query", &overrides), None);
+            assert_eq!(
+                conflict("cmd-m", None, "new_query", &overrides),
+                Some("Run Query")
+            );
+
+            overrides.remove("run_query");
+            let keymap = gpui::Keymap::new(build_bindings(&overrides));
+            let (bindings, _) =
+                keymap.bindings_for_input(&[Keystroke::parse("cmd-m").unwrap()], &[]);
+            assert!(bindings[0].action().partial_eq(&Minimize));
+            assert_eq!(chords_for(minimize, &overrides), vec!["cmd-m"]);
+            assert_eq!(
+                conflict("secondary-m", None, "run_query", &overrides),
+                Some("Minimize Window")
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_m_prefix_yields_only_to_valid_multistroke_overrides() {
+        let first = Keystroke::parse("cmd-m").unwrap();
+        for chord in ["cmd-m k", "secondary-m k"] {
+            let overrides = HashMap::from([("run_query".to_string(), chord.to_string())]);
+            let keymap = gpui::Keymap::new(build_bindings(&overrides));
+            let (bindings, pending) = keymap.bindings_for_input(std::slice::from_ref(&first), &[]);
+            assert!(pending);
+            assert!(bindings.is_empty());
+            let (bindings, pending) =
+                keymap.bindings_for_input(&[first.clone(), Keystroke::parse("k").unwrap()], &[]);
+            assert!(!pending);
+            assert!(bindings[0].action().partial_eq(&RunQuery));
+        }
+
+        let overrides = HashMap::from([("run_query".to_string(), "cmd-m bad-key".to_string())]);
+        let keymap = gpui::Keymap::new(build_bindings(&overrides));
+        let (bindings, pending) = keymap.bindings_for_input(&[first], &[]);
+        assert!(!pending);
+        assert!(bindings[0].action().partial_eq(&Minimize));
     }
 
     #[test]

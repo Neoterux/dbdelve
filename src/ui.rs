@@ -13,15 +13,16 @@ use gpui::{
 use gpui_component::{
     InteractiveElementExt, POPOVER_BLUR,
     button::{Button, ButtonCustomVariant, ButtonVariants},
-    input::{Input, InputState},
+    highlighter::{HighlightTheme, SyntaxHighlighter},
+    input::{Input, InputState, Rope},
     kbd::Kbd,
 };
 
-use std::{collections::HashMap, ops::Range};
+use std::{cell::RefCell, collections::HashMap, ops::Range};
 
 use crate::{
     actions::RefreshConnection,
-    db::{Engine, RelationKind, RoutineKind},
+    db::{Engine, RelationKind, RoutineKind, Syntax},
     explorer::ObjectKind,
     icons::icon,
     keybindings,
@@ -41,6 +42,7 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         ObjectKind::Relation(RelationKind::View) => icon::VIEW,
         ObjectKind::Relation(RelationKind::MaterializedView) => icon::MATERIALIZED_VIEW,
         ObjectKind::Relation(RelationKind::ForeignTable) => icon::FOREIGN_TABLE,
+        ObjectKind::Relation(RelationKind::Dictionary) => icon::TABLE,
         ObjectKind::Routine(RoutineKind::Function) => icon::FUNCTION,
         ObjectKind::Routine(RoutineKind::Procedure) => icon::PROCEDURE,
     }
@@ -62,6 +64,92 @@ pub(crate) fn highlighted(
         return text;
     }
     text.with_highlights(ranges.iter().map(|range| (range.clone(), style)))
+}
+
+/// What a piece of code is to its grammar, which reads an expression on its
+/// own as a broken statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Code {
+    Statement,
+    Expression,
+}
+
+thread_local! {
+    // Building one compiles the grammar's highlight query, which is far too
+    // slow to pay for every expression on every frame it is drawn.
+    static HIGHLIGHTERS: RefCell<HashMap<&'static str, SyntaxHighlighter>> =
+        RefCell::default();
+}
+
+/// `text` highlighted as the editor would highlight it in `syntax`. An SQL
+/// expression is parsed behind a `SELECT `; what the grammar still cannot read
+/// is left unstyled, never dropped.
+pub(crate) fn code_highlights(
+    text: &str,
+    syntax: Syntax,
+    code: Code,
+    theme: &HighlightTheme,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let (prefix, suffix) = match (syntax, code) {
+        // A bare `{` opens a block, so a document is read as the object it is.
+        (Syntax::Mongo, _) => ("(", ")"),
+        (Syntax::Sql, Code::Expression) => ("SELECT ", ""),
+        _ => ("", ""),
+    };
+    let wrapped = format!("{prefix}{text}{suffix}");
+    let grammar = syntax.highlighter();
+    HIGHLIGHTERS
+        .with_borrow_mut(|highlighters| {
+            let highlighter = highlighters
+                .entry(grammar)
+                .or_insert_with(|| SyntaxHighlighter::new(grammar));
+            highlighter.update(None, &Rope::from_str(&wrapped), None);
+            highlighter.styles(&(prefix.len()..prefix.len() + text.len()), theme)
+        })
+        .into_iter()
+        .map(|(range, style)| {
+            (
+                range.start.saturating_sub(prefix.len())..range.end.saturating_sub(prefix.len()),
+                style,
+            )
+        })
+        .filter(|(range, _)| !range.is_empty())
+        .collect()
+}
+
+/// A statement as the editor colours it, one run per line: a single run
+/// carrying newlines is one line to the layout.
+pub(crate) fn code_lines(text: &str, syntax: Syntax, theme: &HighlightTheme) -> Vec<StyledText> {
+    split_highlights(text, &code_highlights(text, syntax, Code::Statement, theme))
+        .into_iter()
+        .map(|(line, runs)| StyledText::new(line.to_string()).with_highlights(runs))
+        .collect()
+}
+
+type Highlights = Vec<(Range<usize>, HighlightStyle)>;
+
+/// `highlights` over `text` cut at its line breaks, each run re-based onto
+/// its own line, so a comment or string spanning lines keeps its colour on
+/// every one.
+fn split_highlights<'a>(
+    text: &'a str,
+    highlights: &[(Range<usize>, HighlightStyle)],
+) -> Vec<(&'a str, Highlights)> {
+    text.lines()
+        .map(|line| {
+            let start = line.as_ptr() as usize - text.as_ptr() as usize;
+            let end = start + line.len();
+            let runs = highlights
+                .iter()
+                .filter_map(|(range, style)| {
+                    let clipped = range.start.max(start)..range.end.min(end);
+                    (!clipped.is_empty())
+                        .then(|| (clipped.start - start..clipped.end - start, *style))
+                })
+                .collect();
+            (line, runs)
+        })
+        .collect()
 }
 
 /// One column of icons down the sidebar, so every label starts at the same x
@@ -545,35 +633,6 @@ pub(crate) fn control(id: impl Into<gpui::ElementId>, tone: Tone, size: Control)
         .h(px(size.height()))
 }
 
-/// One choice of a segmented toggle, dressed as the preview's Data and
-/// Structure tabs so every either-or reads the same. The caller adds the click.
-pub(crate) fn segment(
-    id: impl Into<gpui::ElementId>,
-    label: &'static str,
-    selected: bool,
-    t: Theme,
-) -> gpui::Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(px(layout::chrome(24.)))
-        .px(px(layout::SPACE_SM))
-        .rounded(px(layout::RADIUS_CONTROL))
-        .text_size(px(layout::chrome(layout::TEXT_SM)))
-        .whitespace_nowrap()
-        .map(|segment| {
-            if selected {
-                segment.bg(t.element_active).text_color(t.text)
-            } else {
-                segment
-                    .text_color(t.text_muted)
-                    .hover(|style| style.bg(t.element_hover))
-            }
-        })
-        .child(label)
-}
-
 /// Rows set into the surface they sit on rather than raised off it, a
 /// hairline between each two: a settings group, a section of the connection
 /// form.
@@ -892,8 +951,7 @@ pub(crate) fn keycap_text(chord: &str) -> String {
 /// beside the label: a hint spelled out at the call site goes on claiming the
 /// shipped chord after the action has been rebound to another one.
 pub(crate) fn chord_hint(id: &str, overrides: &HashMap<String, String>) -> String {
-    keybindings::REGISTRY
-        .iter()
+    keybindings::available_registry()
         .find(|spec| spec.id == id)
         .and_then(|spec| keybindings::chords_for(spec, overrides).first().copied())
         .map(keycap_text)
@@ -903,8 +961,7 @@ pub(crate) fn chord_hint(id: &str, overrides: &HashMap<String, String>) -> Strin
 /// The chord bound to an action today, as GPUI writes it -- an override if the
 /// user set one, else the shipped default -- or `None` for an unbound action.
 pub(crate) fn chord_for(id: &str, overrides: &HashMap<String, String>) -> Option<String> {
-    keybindings::REGISTRY
-        .iter()
+    keybindings::available_registry()
         .find(|spec| spec.id == id)
         .and_then(|spec| keybindings::chords_for(spec, overrides).first().copied())
         .map(str::to_string)
@@ -1082,6 +1139,96 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 mod tests {
 
     #[test]
+    fn code_is_highlighted_within_itself_whatever_it_holds() {
+        let syntax = HighlightTheme::default_dark();
+        for (text, grammar, code) in [
+            (
+                "((status)::text = 'paid'::text)",
+                Syntax::Sql,
+                Code::Expression,
+            ),
+            ("(o.account_id = a.id)", Syntax::Sql, Code::Expression),
+            ("a.created_at DESC", Syntax::Sql, Code::Expression),
+            ("", Syntax::Sql, Code::Expression),
+            ("é ' ( ;; \u{1F600}", Syntax::Sql, Code::Expression),
+            (
+                "CREATE INDEX a ON t (b) WHERE c",
+                Syntax::Sql,
+                Code::Statement,
+            ),
+            ("é ' ( ;; \u{1F600}", Syntax::Mongo, Code::Statement),
+            (r#"{"a":1} unique"#, Syntax::Mongo, Code::Statement),
+        ] {
+            for (range, _) in code_highlights(text, grammar, code, &syntax) {
+                assert!(range.end <= text.len(), "{text:?} {range:?}");
+                assert!(text.is_char_boundary(range.start));
+                assert!(text.is_char_boundary(range.end));
+            }
+        }
+
+        let color = |name: &str| {
+            syntax
+                .style
+                .syntax
+                .style(name)
+                .and_then(|style| style.color)
+        };
+        let styled = |text: &str, grammar, code, token: &str| {
+            code_highlights(text, grammar, code, &syntax)
+                .into_iter()
+                .find(|(range, _)| &text[range.clone()] == token)
+                .and_then(|(_, style)| style.color)
+        };
+        assert!(color("keyword").is_some());
+        assert_eq!(
+            styled(
+                "(balance > 100) AND (name = 'x')",
+                Syntax::Sql,
+                Code::Expression,
+                "AND"
+            ),
+            color("keyword")
+        );
+        // A partial filter is a document, not the block a bare `{` would open.
+        assert_eq!(
+            styled(
+                r#"{"active":true}"#,
+                Syntax::Mongo,
+                Code::Expression,
+                "true"
+            ),
+            color("boolean")
+        );
+    }
+
+    #[test]
+    fn a_run_across_a_line_break_colours_both_lines() {
+        let style = HighlightStyle::default();
+        let text = "SELECT 'a\nb' FROM t\r\n\nx";
+        let split =
+            super::split_highlights(text, &[(0..6, style), (7..12, style), (22..23, style)]);
+        let lines: Vec<_> = split
+            .iter()
+            .map(|(line, runs)| {
+                let ranges: Vec<_> = runs
+                    .iter()
+                    .map(|(range, _)| (range.start, range.end))
+                    .collect();
+                (*line, ranges)
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("SELECT 'a", vec![(0, 6), (7, 9)]),
+                ("b' FROM t", vec![(0, 2)]),
+                ("", vec![]),
+                ("x", vec![(0, 1)]),
+            ]
+        );
+    }
+
+    #[test]
     fn a_chord_reads_as_a_cap_per_key_with_the_modifiers_in_platform_order() {
         let expected: &[&str] = if cfg!(target_os = "macos") {
             &["⇧", "⌘", "P"]
@@ -1107,7 +1254,7 @@ mod tests {
         assert!(!shipped.is_empty());
         assert_ne!(shipped, rebound);
         // An action nothing has bound draws no cap at all.
-        assert_eq!(chord_hint("cancel_query", &overrides), "");
+        assert_eq!(chord_hint("next_page", &overrides), "");
     }
 
     #[test]

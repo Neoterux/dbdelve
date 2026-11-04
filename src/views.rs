@@ -8,17 +8,23 @@
 //! surface it assembles, which is why the rest of the module is private.
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, AppContext, ClickEvent, ClipboardItem, Context, Div,
-    Entity, FontWeight, HighlightStyle, Hsla, InteractiveElement, IntoElement, ParentElement,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, StyledText, Window, div,
-    prelude::FluentBuilder, px,
+    Animation, AnimationExt, AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, Div,
+    Entity, Focusable, FontWeight, HighlightStyle, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, RenderOnce, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, StyledText, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_base::actions::{SelectNextColumn, SelectPrevColumn};
+use gpui_base::{
+    SelectableText,
+    actions::{SelectNextColumn, SelectPrevColumn},
+};
 use gpui_component::{
-    ActiveTheme, Disableable, ElementExt, FocusableExt, IconName, RopeExt, Sizable,
+    ActiveTheme, Disableable, ElementExt, FocusableExt, IconName, RopeExt, Sizable, ThemeStyled,
     button::Button,
     highlighter::{HighlightTheme, SyntaxHighlighter},
-    input::{self, Editor, EditorState, Input, InputState, Rope, Textarea, TextareaState},
+    input::{
+        self, Editor, EditorMode, EditorState, Input, InputModeKind, InputState, Rope, Textarea,
+        TextareaState,
+    },
     menu::DropdownMenu,
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     spinner::Spinner,
@@ -28,11 +34,11 @@ use gpui_component::{
 use crate::{
     InsertForm, TabKey, Workspace,
     actions::{
-        AddFilter, CancelQuery, CommitTransaction, CopyCell, CustomRowLimit, ExplainQuery,
-        FormatQuery, LimitTarget, NewQuery, NewRow, NextPage, PreviousPage, RemoveFilter,
-        RollbackTransaction, RunQuery, SaveQuery, SetDefaultRowLimit, SetFilterColumn,
-        SetFilterOperator, SetFilterRaw, SetQueryLimit, SetRowLimit, ToggleAutoCommit,
-        ToggleComment, ToggleFilterJoin, ToggleNextJoin, ToggleRowPanel,
+        AcceptCompletion, AddFilter, CancelQuery, CommitTransaction, CopyCell, CustomRowLimit,
+        ExplainQuery, FormatQuery, LimitTarget, NewQuery, NewRow, NextPage, PreviousPage,
+        RemoveFilter, RollbackTransaction, RunQuery, SaveQuery, SetDefaultRowLimit,
+        SetFilterColumn, SetFilterOperator, SetFilterRaw, SetQueryLimit, SetRowLimit,
+        ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, ToggleRowPanel,
     },
     db,
     db::{Engine, ExplainMode, RoutineKind},
@@ -45,15 +51,15 @@ use crate::{
     result_grid::{NewValue, ResultGrid},
     scroller::{SmoothScrollable, scroll_to, smooth, smooth_for, smooth_scoped},
     session::{
-        CloseTarget, Explained, ObjectBody, ObjectTab, Profile, ProfileState, QueryState, QueryTab,
+        Explained, ObjectBody, ObjectTab, Profile, ProfileState, QueryState, QueryTab, Said,
         Session, StructureState, Tab, query_label, result_pane_is_expanded,
     },
     structure_grid::{Section, StructureGrid},
     tab_drag::{DragTab, TabStrip},
     theme::{Theme, fonts, layout, theme},
     ui::{
-        Control, Tone, button, button_label, compact_count, group_thousands, icon_button, key_hint,
-        keycap_text, kind_color, object_icon, reconnect_button, row_icon, section_label,
+        Code, Control, Tone, button, code_highlights, compact_count, group_thousands, icon_button,
+        key_hint, keycap_text, kind_color, object_icon, reconnect_button, row_icon, section_label,
     },
     workspace::error_in_buffer,
 };
@@ -186,6 +192,31 @@ pub fn render_main_content(
         .into_any_element()
 }
 
+fn completion_target(editor: &Entity<EditorState>) -> Div {
+    let editor = editor.clone();
+    div().on_action(move |_: &AcceptCompletion, window, cx| {
+        // Use the focused surface's editor, not the tab's runnable query buffer.
+        let accepted = editor.update(cx, |editor, cx| {
+            EditorMode::handle_context_menu_action(
+                editor,
+                Box::new(input::Enter {
+                    secondary: false,
+                    shift: false,
+                }),
+                window,
+                cx,
+            )
+        });
+        if accepted {
+            // The menu propagates its synthetic Enter, but the original
+            // keystroke must not also reach the editor after acceptance.
+            cx.stop_propagation();
+        } else {
+            cx.propagate();
+        }
+    })
+}
+
 /// The editor over the rows it produces. Every runnable surface is this:
 /// the query buffer and an opened relation differ in where their SQL came
 /// from, not in what they are.
@@ -203,7 +234,7 @@ fn render_editor_surface(
 
     // The editor is the prompt, one tone behind its results -- and one step
     // more transparent, since it is also one step further from the data.
-    let buffer = div()
+    let buffer = completion_target(editor)
         .key_context("Editor")
         .flex_1()
         .min_h_0()
@@ -303,8 +334,23 @@ fn render_query_surface(
     // answer about the buffer above it, and two scrolling regions in a split
     // that is already a split leaves neither enough room to read.
     let (shown_state, shown_grid) = tab.shown();
-    let bottom = match tab.showing_plan.then_some(tab.plan.as_ref()).flatten() {
-        Some(explained) => render_plan(explained, plan_copied, &scope, cx),
+    let bottom = match tab.plan_shown() {
+        // Under the same switcher as the rows, or a typed `EXPLAIN`, which has
+        // no Data to flip to, would hide what its statement raised.
+        Some(explained) => {
+            let plan = render_plan(explained, plan_copied, &scope, cx);
+            match result_switcher(tab, cx) {
+                None => plan,
+                Some(switcher) => div()
+                    .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(switcher)
+                    .child(div().flex_1().min_h_0().child(plan))
+                    .into_any_element(),
+            }
+        }
         None => render_results(
             profile.config.engine(),
             matches!(profile.state, ProfileState::Failed(_)),
@@ -670,7 +716,7 @@ fn plan_detail(
         highlights.push((value_start..line.len(), tint(t.danger)));
     } else if explain::is_expression(key) {
         highlights.extend(
-            sql_highlights(value, syntax)
+            code_highlights(value, db::Syntax::Sql, Code::Expression, syntax)
                 .into_iter()
                 .map(|(range, style)| (shifted(range), style)),
         );
@@ -683,38 +729,6 @@ fn plan_detail(
     }
     highlights.retain(|(range, _)| !range.is_empty());
     StyledText::new(line).with_highlights(highlights)
-}
-
-thread_local! {
-    // Building one compiles the grammar's highlight query, which is far too
-    // slow to pay for every qualifier on every frame the plan redraws.
-    static SQL_HIGHLIGHTER: std::cell::RefCell<SyntaxHighlighter> =
-        std::cell::RefCell::new(SyntaxHighlighter::new("sql"));
-}
-
-/// An expression from a plan, highlighted as the editor would. It is parsed
-/// behind a `SELECT ` so the grammar reads an expression rather than a broken
-/// statement; what it still cannot read is left unstyled, never dropped.
-fn sql_highlights(
-    expression: &str,
-    syntax: &HighlightTheme,
-) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-    const PREFIX: &str = "SELECT ";
-    let text = format!("{PREFIX}{expression}");
-    SQL_HIGHLIGHTER
-        .with_borrow_mut(|highlighter| {
-            highlighter.update(None, &Rope::from_str(&text), None);
-            highlighter.styles(&(PREFIX.len()..text.len()), syntax)
-        })
-        .into_iter()
-        .map(|(range, style)| {
-            (
-                range.start.saturating_sub(PREFIX.len())..range.end.saturating_sub(PREFIX.len()),
-                style,
-            )
-        })
-        .filter(|(range, _)| !range.is_empty())
-        .collect()
 }
 
 /// A statement on one line, for the header strip that says what was explained.
@@ -950,12 +964,10 @@ fn render_filter_bar(
                         }
                     })
                 }))
-                // An absence needs no value, and a box that cannot change what
-                // runs is a box to read past.
-                .children(
-                    (filter.raw || filter.operator.takes_value())
-                        .then(|| Input::new(&filter.value).small().min_w_0().flex_1()),
-                )
+                .children(filter.shows_value().then(|| FilterValue {
+                    editor: filter.value.clone(),
+                    raw: filter.raw,
+                }))
                 .child(
                     icon_button(
                         ("remove-filter", row),
@@ -996,6 +1008,80 @@ fn render_filter_bar(
 /// menu to open for something a click already says.
 fn join_button(id: impl Into<gpui::ElementId>, conjunction: Conjunction, t: Theme) -> Button {
     button(id, conjunction.as_str(), Tone::Quiet, Control::Compact, t).tooltip("AND or OR")
+}
+
+/// A filter bar's value box: a code editor, dressed as the small one-line
+/// input it sits among.
+///
+/// The editor reserves two rows whatever it holds, so the box is cut to one
+/// and clips the other; the completion popup is drawn deferred, outside the
+/// clip. The library draws no focus ring on an editor, so this draws the one
+/// an input would have.
+#[derive(IntoElement)]
+struct FilterValue {
+    editor: Entity<EditorState>,
+    raw: bool,
+}
+
+impl RenderOnce for FilterValue {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focused = self.editor.read(cx).focus_handle(cx).is_focused(window);
+        let font = match self.raw {
+            true => fonts(cx).editor.clone(),
+            false => fonts(cx).chrome.clone(),
+        };
+        // A small input's height. The extra-small size puts no inset above
+        // the text, so a line as tall as the space inside the border centres.
+        let height = window.rem_size() * 1.5;
+        let editor = self.editor.clone();
+        completion_target(&self.editor)
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .rounded(cx.theme().radius)
+            // Plain Enter applies the bar; Shift+Enter would still break the
+            // line, onto the row the box clips.
+            .capture_action(|enter: &input::Enter, _, cx| {
+                if enter.shift {
+                    cx.stop_propagation();
+                }
+            })
+            // Submit-on-enter emits the filter event and propagates the
+            // action; consume it here instead of inserting a fallback newline.
+            .on_action(|_: &input::Enter, _, cx| cx.stop_propagation())
+            .when(focused, |this| this.focus_ring_style(window, cx))
+            .child(
+                Editor::new(&self.editor)
+                    .with_size(gpui_component::Size::XSmall)
+                    .h(height)
+                    .overflow_hidden()
+                    .bg(cx.theme().input_background())
+                    .when(focused, |this| this.border_color(cx.theme().ring))
+                    .font_family(font)
+                    .text_sm()
+                    .line_height(height - px(2.))
+                    .on_paste(move |item, window, cx| {
+                        let Some(text) = item.text().as_deref().and_then(crate::filter::one_line)
+                        else {
+                            return false;
+                        };
+                        editor.update(cx, |editor, cx| editor.replace(text, window, cx));
+                        true
+                    })
+                    // The query editor's menu, less what a filter has no use for.
+                    .context_menu(|menu, _, cx| {
+                        menu.menu("Cut", Box::new(input::Cut))
+                            .menu("Copy", Box::new(input::Copy))
+                            .menu_with_disabled(
+                                "Paste",
+                                cx.read_from_clipboard().is_none(),
+                                Box::new(input::Paste),
+                            )
+                            .separator()
+                            .menu("Select All", Box::new(input::SelectAll))
+                    }),
+            )
+    }
 }
 
 /// One line of controls, at the height every other control strip is.
@@ -1339,7 +1425,14 @@ fn render_results(
         _ => None,
     };
 
+    // The run's messages stand in for the selected result, form and inspector
+    // included: both describe rows that are not on screen.
+    let run_messages = query_tab.filter(|tab| tab.messages_shown()).map(|tab| {
+        let said = tab.messages();
+        render_messages(&said, None, "run-messages", scope, cx)
+    });
     let message = match query {
+        _ if run_messages.is_some() => run_messages,
         QueryState::Idle if query_tab.is_some() => Some(centered(
             key_hint(
                 t,
@@ -1407,11 +1500,30 @@ fn render_results(
         QueryState::Complete {
             rows,
             rows_affected,
+            messages,
             ..
-        } if *rows == 0 && !has_rows => Some(centered(quiet_line(match rows_affected {
-            Some(rows) => format!("Query completed. Server row count: {rows}."),
-            None => "Query completed.".into(),
-        }))),
+        } if *rows == 0 && !has_rows => {
+            let line = quiet_line(match rows_affected {
+                Some(rows) => format!("Query completed. Server row count: {rows}."),
+                None => "Query completed.".into(),
+            });
+            Some(match messages.is_empty() {
+                true => centered(line),
+                // Read top to bottom like the log it is, the outcome last,
+                // where it would have been printed.
+                false => render_messages(
+                    &[Said {
+                        index: 0,
+                        sql: "",
+                        messages,
+                    }],
+                    Some(line),
+                    "result-messages",
+                    scope,
+                    cx,
+                ),
+            })
+        }
         _ => None,
     };
 
@@ -1501,7 +1613,18 @@ fn render_results(
         .into_any_element();
 
     let content = match message {
-        Some(message) => message,
+        // Holding the grid's handle in its place: a table opened empty was
+        // given the keyboard as it opened, and a handle no element tracks
+        // leaves the window with no dispatch path at all.
+        Some(message) => div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .min_w_0()
+            .track_focus(&results.focus_handle(cx))
+            .child(message)
+            .into_any_element(),
         None => match loading {
             // A child rather than replacing the grid: it must stay mounted
             // for the focus a fresh tab put on it, `secondary-w` included --
@@ -1540,6 +1663,7 @@ fn render_results(
     // overlay -- rather than just the grid, so New row stays usable on an
     // empty table and Delete's refusal is visible after a failed preview.
     let panel = match form {
+        _ if query_tab.is_some_and(QueryTab::messages_shown) => None,
         Some(form) => Some((render_new_row_panel(engine, form, scope, cx), false)),
         None => render_row_inspector(results, folded, editing, row_panel, scope, cx)
             .map(|panel| (panel, folded)),
@@ -1580,62 +1704,101 @@ fn render_results(
 
 /// One chip per statement of a queue, from the moment it starts: those that
 /// have run, the one running, and those still to go, above the result the
-/// selected chip is showing.
+/// selected chip is showing. Then, once the server has said anything during
+/// the run, one for what it said.
 ///
-/// Only from the second chip: one is nothing to switch between, and an
-/// ordinary run has no queue at all.
+/// Only from the second chip: one is nothing to switch between. An ordinary
+/// run has no queue, and a chip for its one result only to stand beside its
+/// messages.
 fn result_switcher(tab: &QueryTab, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     let t = *theme(cx);
-    let queue = tab.queue.as_ref()?;
-    if queue.done.len() + usize::from(queue.awaiting) + queue.remaining.len() < 2 {
-        return None;
-    }
-    // The statement in flight is the tab's own slot, not one of `done`, so it
-    // is the chip one past the end. Selecting it is what following the run
-    // means; any other chip reads a result while that one keeps going.
-    let running = queue.awaiting.then(|| {
-        let label = tab
-            .ran_from
-            .as_ref()
-            .map(|(_, sql)| query_label(sql))
-            .unwrap_or_default();
-        let index = queue.done.len();
-        result_chip(
-            tab.id,
-            index,
-            &label,
-            &tab.query,
-            index == queue.showing,
-            cx,
-        )
-    });
-    let mut chips: Vec<AnyElement> = queue
-        .done
-        .iter()
-        .enumerate()
-        .map(|(index, finished)| {
-            result_chip(
+    let said = tab.messages();
+    let messages_shown = tab.showing_messages && !said.is_empty();
+    let mut chips: Vec<AnyElement> = match tab.queue.as_ref() {
+        Some(queue) => {
+            // The statement in flight is the tab's own slot, not one of
+            // `done`, so it is the chip one past the end. Selecting it is what
+            // following the run means; any other chip reads a result while
+            // that one keeps going.
+            let running = queue.awaiting.then(|| {
+                let label = tab
+                    .ran_from
+                    .as_ref()
+                    .map(|(_, sql)| query_label(sql))
+                    .unwrap_or_default();
+                let index = queue.done.len();
+                result_chip(
+                    tab.id,
+                    index,
+                    &label,
+                    &tab.query,
+                    index == queue.showing && !messages_shown,
+                    cx,
+                )
+            });
+            let mut chips: Vec<AnyElement> = queue
+                .done
+                .iter()
+                .enumerate()
+                .map(|(index, finished)| {
+                    result_chip(
+                        tab.id,
+                        index,
+                        &query_label(&finished.sql),
+                        tab.state_of(finished),
+                        index == queue.showing && !messages_shown,
+                        cx,
+                    )
+                })
+                .chain(running)
+                .collect();
+            for (offset, range) in queue.remaining.iter().enumerate() {
+                let index = queue.done.len() + usize::from(queue.awaiting) + offset;
+                let label = queue.sql.get(range.clone()).map(query_label);
+                chips.push(result_chip(
+                    tab.id,
+                    index,
+                    &label.unwrap_or_default(),
+                    &QueryState::Idle,
+                    false,
+                    cx,
+                ));
+            }
+            chips
+        }
+        None if !said.is_empty() => {
+            // A restored tab no longer knows which statement it ran.
+            let label = said
+                .first()
+                .map(|said| query_label(said.sql))
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| "Result".into());
+            vec![result_chip(
                 tab.id,
-                index,
-                &query_label(&finished.sql),
-                tab.state_of(finished),
-                index == queue.showing,
+                0,
+                &label,
+                &tab.query,
+                !messages_shown,
                 cx,
-            )
-        })
-        .chain(running)
-        .collect();
-    for (offset, range) in queue.remaining.iter().enumerate() {
-        let index = queue.done.len() + usize::from(queue.awaiting) + offset;
-        let label = queue.sql.get(range.clone()).map(query_label);
-        chips.push(result_chip(
-            tab.id,
-            index,
-            &label.unwrap_or_default(),
-            &QueryState::Idle,
-            false,
-            cx,
-        ));
+            )]
+        }
+        None => return None,
+    };
+    if !said.is_empty() {
+        let count = said.iter().map(|said| said.messages.len()).sum::<usize>();
+        let id = tab.id;
+        chips.push(
+            switcher_chip("messages-chip", messages_shown, false, t)
+                .child("Messages")
+                .child(div().text_color(t.text_faint).child(compact_count(count)))
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                    workspace.show_messages(Tab::Query(id), cx);
+                }))
+                .into_any_element(),
+        );
+    }
+    if chips.len() < 2 {
+        return None;
     }
 
     Some(
@@ -1657,27 +1820,16 @@ fn result_switcher(tab: &QueryTab, cx: &mut Context<Workspace>) -> Option<AnyEle
     )
 }
 
-/// One statement of a queue, in the row-limit chips' clothes: its place in the
-/// queue, what it was, and what it came back with.
-fn result_chip(
-    id: u64,
-    index: usize,
-    label: &str,
-    state: &QueryState,
+/// A switcher chip's clothes, the row-limit chips': what the result and
+/// Messages chips share.
+fn switcher_chip(
+    id: impl Into<gpui::ElementId>,
     selected: bool,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let t = *theme(cx);
-    let queued = matches!(state, QueryState::Idle);
-    let (readout, tint) = match state {
-        QueryState::Idle => (Some("queued".to_string()), t.text_faint),
-        QueryState::Running { .. } => (Some("running".to_string()), t.text_muted),
-        QueryState::Complete { rows, .. } => (Some(compact_count(*rows)), t.text_faint),
-        QueryState::Failed(_) => (Some("failed".to_string()), t.danger),
-        _ => (None, t.text_faint),
-    };
+    queued: bool,
+    t: Theme,
+) -> Stateful<Div> {
     div()
-        .id(("queued-result", index))
+        .id(id)
         .flex()
         .flex_shrink_0()
         .items_center()
@@ -1698,6 +1850,28 @@ fn result_chip(
                     .hover(|style| style.bg(t.element_hover))
             }
         })
+}
+
+/// One statement of a queue: its place in the queue, what it was, and what
+/// it came back with.
+fn result_chip(
+    id: u64,
+    index: usize,
+    label: &str,
+    state: &QueryState,
+    selected: bool,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let t = *theme(cx);
+    let queued = matches!(state, QueryState::Idle);
+    let (readout, tint) = match state {
+        QueryState::Idle => (Some("queued".to_string()), t.text_faint),
+        QueryState::Running { .. } => (Some("running".to_string()), t.text_muted),
+        QueryState::Complete { rows, .. } => (Some(compact_count(*rows)), t.text_faint),
+        QueryState::Failed(_) => (Some("failed".to_string()), t.danger),
+        _ => (None, t.text_faint),
+    };
+    switcher_chip(("queued-result", index), selected, queued, t)
         .child(
             div()
                 .text_color(t.text_faint)
@@ -1708,6 +1882,84 @@ fn result_chip(
         .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
             workspace.show_queued_result(Tab::Query(id), index, cx);
         }))
+        .into_any_element()
+}
+
+/// What the server said running a run's statements, as it said it, read top
+/// to bottom like the log it is. In the editor's face, as an error is: it
+/// quotes the server. Under a heading per statement only when more than one
+/// said something, the heading reading as that statement's chip does.
+///
+/// Each message is plain selectable text, never Markdown: a `PRINT` is the
+/// server's words and its `*` and `#` are not formatting.
+fn render_messages(
+    said: &[Said],
+    tail: Option<AnyElement>,
+    id: &'static str,
+    scope: &str,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let t = *theme(cx);
+    let (code, chrome) = (fonts(cx).editor.clone(), fonts(cx).chrome.clone());
+    let headed = said.len() > 1;
+    // The window's selection is a map of runs, so a copy across several only
+    // comes out in reading order, a line apiece, if each says where it sits.
+    let mut order: usize = 0;
+    let groups: Vec<_> = said
+        .iter()
+        .map(|said| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .when(headed, |group| {
+                    group.child(
+                        div()
+                            .flex()
+                            .gap(px(layout::SPACE_XS))
+                            .pb(px(layout::SPACE_XS))
+                            .font_family(chrome.clone())
+                            .text_size(px(layout::chrome(layout::TEXT_SM)))
+                            .text_color(t.text_muted)
+                            .child(
+                                div()
+                                    .text_color(t.text_faint)
+                                    .child(format!("{}.", said.index + 1)),
+                            )
+                            .child(query_label(said.sql)),
+                    )
+                })
+                .children(said.messages.iter().map(|message| {
+                    order += 1;
+                    div().text_color(t.text).child(
+                        SelectableText::new(("message", order), message.clone())
+                            .document_order(order as u64),
+                    )
+                }))
+        })
+        .collect();
+    div()
+        .id(id)
+        .size_full()
+        .min_h_0()
+        .overflow_y_scroll()
+        .smooth_scroll(&smooth_scoped(id, scope, cx))
+        .p(px(layout::SPACE_LG))
+        .flex()
+        .flex_col()
+        .gap(px(layout::SPACE_MD))
+        .font_family(code)
+        // Copy is `Root`'s, which reads the window's selection, and a focused
+        // buffer or grid would take the keystroke for a copy of its own
+        // first. The window's floor has no copy of its own to take it with.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|workspace, _: &MouseDownEvent, window, cx| {
+                workspace.focus.focus(window, cx)
+            }),
+        )
+        .children(groups)
+        .children(tail.map(|tail| div().font_family(chrome).child(tail)))
         .into_any_element()
 }
 
@@ -2333,20 +2585,34 @@ fn render_structure(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let t = *theme(cx);
+    // The grid's own focus handle, held by the line standing in for it: the
+    // tab gives the grid focus as it opens, and a handle no element tracks
+    // leaves the window with no dispatch path at all.
+    let standing_in = |line: AnyElement| {
+        div()
+            .size_full()
+            .track_focus(&grid.focus_handle(cx))
+            .child(line)
+            .into_any_element()
+    };
     let structure = match state {
         StructureState::Loading => {
-            return div()
-                .p(px(layout::SPACE_LG))
-                .text_color(t.text_muted)
-                .child("Loading structure…")
-                .into_any_element();
+            return standing_in(
+                div()
+                    .p(px(layout::SPACE_LG))
+                    .text_color(t.text_muted)
+                    .child("Loading structure…")
+                    .into_any_element(),
+            );
         }
         StructureState::Failed(message) => {
-            return div()
-                .p(px(layout::SPACE_LG))
-                .text_color(t.danger)
-                .child(message.clone())
-                .into_any_element();
+            return standing_in(
+                div()
+                    .p(px(layout::SPACE_LG))
+                    .text_color(t.danger)
+                    .child(message.clone())
+                    .into_any_element(),
+            );
         }
         StructureState::Loaded(structure) => structure,
     };
@@ -2660,27 +2926,32 @@ pub(crate) fn render_hidden_columns(
     })
 }
 
-/// Who orders the view in front, on any grid with columns to click. `None`
-/// where there is nothing to sort.
-pub(crate) fn render_view_sorting(
-    profile: &Profile,
-    cx: &mut Context<Workspace>,
-) -> Option<AnyElement> {
-    let t = *theme(cx);
+/// Whether the view in front is sorted in memory, on any grid with columns to
+/// click. `None` where there is nothing to sort, or no choice in how: the
+/// status bar's Server and Client, and the palette's rows for them.
+pub(crate) fn view_sorts_on_client(profile: &Profile, cx: &App) -> Option<bool> {
     let session = &profile.session;
     // Memory is the only choice there, so there is no choice to show.
     if !profile.config.engine().sorts_on_server() {
         return None;
     }
-    let client = match session.active {
+    match session.active {
         Tab::Object(_) => relation_preview(session).and(session.sorting(session.active)),
         Tab::Query(_) => session
             .active_results()
             .filter(|results| !results.read(cx).delegate().columns().is_empty())
             .and(session.sorting(session.active)),
     }
-    .map(|sorting| sorting.client_keys().is_some());
-    client.map(|client| {
+    .map(|sorting| sorting.client_keys().is_some())
+}
+
+/// Who orders the view in front.
+pub(crate) fn render_view_sorting(
+    profile: &Profile,
+    cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    let t = *theme(cx);
+    view_sorts_on_client(profile, cx).map(|client| {
         div()
             .flex_shrink_0()
             .flex()
@@ -2830,18 +3101,16 @@ fn render_tab_strip(
             .child(name)
     };
 
-    // Middle-click closes the tab, as it does in every browser and editor. It
-    // goes through `ask_before_close` rather than the chip's own button so the
-    // gesture means what `cmd+w` means -- a saved query is still asked about
-    // rather than deleted by a stray wheel press.
-    let close_on_middle_click = |chip: Stateful<Div>, target: CloseTarget| {
+    // Middle-click closes the tab, as it does in every browser and editor,
+    // through the same guard on unapplied edits as `cmd+w`.
+    let close_on_middle_click = |chip: Stateful<Div>, target: Tab| {
         let workspace = workspace.clone();
         chip.on_aux_click(move |event, window, cx| {
             if !event.is_middle_click() {
                 return;
             }
             _ = workspace.update(cx, |workspace, cx| {
-                workspace.ask_before_close(target.clone(), window, cx);
+                workspace.ask_before_close(target, window, cx);
             });
         })
     };
@@ -2932,7 +3201,7 @@ fn render_tab_strip(
                                 // this just closed, in the same click.
                                 cx.stop_propagation();
                                 _ = close_workspace.update(cx, |workspace, cx| {
-                                    workspace.ask_before_close(CloseTarget::Buffer(id), window, cx);
+                                    workspace.ask_before_close(Tab::Query(id), window, cx);
                                 });
                             }),
                         ),
@@ -2944,7 +3213,7 @@ fn render_tab_strip(
                 })
                 .map(|chip| {
                     draggable(
-                        close_on_middle_click(chip, CloseTarget::Buffer(id)),
+                        close_on_middle_click(chip, Tab::Query(id)),
                         TabKey::Unsaved(id),
                     )
                 })
@@ -2952,93 +3221,60 @@ fn render_tab_strip(
         })
         .collect::<Vec<_>>();
 
-    tabs.extend(
-        session
-            .saved_queries
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let open_name = name.clone();
-                let delete_name = name.clone();
-                let middle_name = name.clone();
-                let open_workspace = workspace.clone();
-                let delete_workspace = workspace.clone();
-                let pending = session.pending_delete.as_deref() == Some(name);
-                let active = session
-                    .tab_holding(name)
-                    .is_some_and(|id| session.active == Tab::Query(id));
-                chip(active)
-                    .id(("saved-query", index))
-                    .group(format!("query-tab-{index}"))
-                    .px(px(layout::SPACE_SM))
-                    .child(row_icon(t, icon::SAVED_QUERY))
-                    .child(name_label(name.clone()))
-                    .child(
-                        // Revealed by its own tab, so the strip reads as names
-                        // rather than a row of delete buttons.
-                        div()
-                            .when(!pending, |delete| {
-                                delete
-                                    .opacity(0.)
-                                    .group_hover(format!("query-tab-{index}"), |style| {
-                                        style.opacity(1.)
-                                    })
-                            })
-                            .child(
-                                // Armed, it says the word and takes the danger
-                                // fill: the icon alone asks, the red confirms.
-                                icon_button(
-                                    ("delete-query", index),
-                                    icon::DELETE,
-                                    if pending { Tone::Danger } else { Tone::Quiet },
-                                    Control::Inline,
-                                    t,
-                                )
-                                .when(pending, |armed| {
-                                    armed.w_auto().px(px(layout::SPACE_XS)).child(button_label(
-                                        "Delete?",
-                                        Tone::Danger,
-                                        Control::Inline,
-                                        t,
-                                    ))
-                                })
-                                .tooltip("Delete query")
-                                .on_click(move |_, window, cx| {
-                                    // Or the chip underneath opens the query in
-                                    // the same click, and the confirmation this
-                                    // arms is cleared before it can be seen.
-                                    cx.stop_propagation();
-                                    _ = delete_workspace.update(cx, |workspace, cx| {
-                                        workspace.arm_delete_saved_query(
-                                            delete_name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }),
-                            ),
+    // A saved query's chip closes like any other: the file stays, and the
+    // sidebar's Queries group is where it is opened again or deleted.
+    tabs.extend(session.queries.iter().filter_map(|tab| {
+        let name = tab.open_query.clone()?;
+        let id = tab.id;
+        let group = format!("saved-query-tab-{id}");
+        let open_workspace = workspace.clone();
+        let close_workspace = workspace.clone();
+        Some(
+            chip(session.active == Tab::Query(id))
+                .id(("saved-query-tab", id as usize))
+                .group(group.clone())
+                .px(px(layout::SPACE_SM))
+                .child(row_icon(t, icon::SAVED_QUERY))
+                .child(name_label(name.clone()))
+                .child(
+                    div()
+                        .opacity(0.)
+                        .group_hover(group, |style| style.opacity(1.))
+                        .child(
+                            icon_button(
+                                ("close-saved-query", id as usize),
+                                icon::CLOSE,
+                                Tone::Quiet,
+                                Control::Inline,
+                                t,
+                            )
+                            .tooltip("Close tab")
+                            .on_click(move |_, window, cx| {
+                                // Or the chip underneath activates the tab
+                                // this just closed, in the same click.
+                                cx.stop_propagation();
+                                _ = close_workspace.update(cx, |workspace, cx| {
+                                    workspace.ask_before_close(Tab::Query(id), window, cx);
+                                });
+                            }),
+                        ),
+                )
+                .on_click(move |_, window, cx| {
+                    _ = open_workspace.update(cx, |workspace, cx| {
+                        workspace.activate_tab(Tab::Query(id), window, cx);
+                    });
+                })
+                .map(|chip| {
+                    draggable(
+                        close_on_middle_click(chip, Tab::Query(id)),
+                        TabKey::Saved(name),
                     )
-                    .on_click(move |_, window, cx| {
-                        _ = open_workspace.update(cx, |workspace, cx| {
-                            workspace.open_saved_query(open_name.clone(), window, cx);
-                        });
-                    })
-                    .map(|chip| {
-                        draggable(
-                            close_on_middle_click(
-                                chip,
-                                CloseTarget::SavedQuery(middle_name.clone()),
-                            ),
-                            TabKey::Saved(name.clone()),
-                        )
-                    })
-                    .into_any_element()
-            }),
-    );
+                })
+                .into_any_element(),
+        )
+    }));
 
     // Opened objects sit after the queries, in the order they were opened.
-    // Closing one is not destructive, so it gets a plain × rather than the
-    // saved queries' confirmed delete.
     tabs.extend(session.objects.iter().map(|object| {
         let id = object.id;
         let group = format!("object-tab-{id}");
@@ -3090,7 +3326,7 @@ fn render_tab_strip(
                             // this just closed, in the same click.
                             cx.stop_propagation();
                             _ = close_workspace.update(cx, |workspace, cx| {
-                                workspace.ask_before_close(CloseTarget::Object(id), window, cx);
+                                workspace.ask_before_close(Tab::Object(id), window, cx);
                             });
                         }),
                     ),
@@ -3102,7 +3338,7 @@ fn render_tab_strip(
             })
             .map(|chip| {
                 draggable(
-                    close_on_middle_click(chip, CloseTarget::Object(id)),
+                    close_on_middle_click(chip, Tab::Object(id)),
                     TabKey::Object(id),
                 )
             })
@@ -3111,15 +3347,9 @@ fn render_tab_strip(
 
     // Left to right as the user dragged them; a chip they have not placed yet
     // follows the placed ones.
-    let default_keys = session
-        .queries
-        .iter()
-        .filter(|tab| tab.open_query.is_none())
-        .map(|tab| TabKey::Unsaved(tab.id))
-        .chain(session.saved_queries.iter().cloned().map(TabKey::Saved))
-        .chain(session.objects.iter().map(|tab| TabKey::Object(tab.id)));
+    let default_keys = session.default_chips();
     let order = session.strip_order();
-    let mut placed: Vec<(TabKey, AnyElement)> = default_keys.zip(tabs).collect();
+    let mut placed: Vec<(TabKey, AnyElement)> = default_keys.into_iter().zip(tabs).collect();
     placed.sort_by_key(|(key, _)| order.iter().position(|placed| placed == key));
     let tabs: Vec<AnyElement> = placed.into_iter().map(|(_, chip)| chip).collect();
 
@@ -3274,14 +3504,14 @@ fn render_query_toolbar(
                 .child(preview_tab(
                     "Data",
                     icon::TABLE,
-                    !tab.showing_plan,
+                    tab.plan_shown().is_none() && !tab.messages_shown(),
                     Command::ShowPlan(false),
                     cx,
                 ))
                 .child(preview_tab(
                     "Plan",
                     icon::PLAN,
-                    tab.showing_plan,
+                    tab.plan_shown().is_some(),
                     Command::ShowPlan(true),
                     cx,
                 ))
@@ -3487,37 +3717,155 @@ fn choice_chip(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, collections::HashMap, rc::Rc};
+
+    use gpui::{Render, TestAppContext};
+    use lsp_types::CompletionItem;
+
     use super::*;
 
-    #[test]
-    fn a_plan_expression_is_highlighted_within_itself_whatever_it_holds() {
-        let syntax = HighlightTheme::default_dark();
-        for expression in [
-            "((status)::text = 'paid'::text)",
-            "(o.account_id = a.id)",
-            "a.created_at DESC",
-            "",
-            "é ' ( ;; \u{1F600}",
-        ] {
-            for (range, _) in sql_highlights(expression, &syntax) {
-                assert!(range.end <= expression.len(), "{expression:?} {range:?}");
-                assert!(expression.is_char_boundary(range.start));
-                assert!(expression.is_char_boundary(range.end));
-            }
-        }
+    struct CompletionEditors {
+        query: Entity<EditorState>,
+        filters: [Entity<EditorState>; 2],
+    }
 
-        let expression = "(balance > 100) AND (name = 'x')";
-        let keyword = syntax
-            .style
-            .syntax
-            .style("keyword")
-            .and_then(|style| style.color);
-        assert!(keyword.is_some());
-        assert!(
-            sql_highlights(expression, &syntax)
-                .iter()
-                .any(|(range, style)| &expression[range.clone()] == "AND"
-                    && style.color == keyword)
+    impl Render for CompletionEditors {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    completion_target(&self.query)
+                        .key_context("Editor")
+                        .child(Editor::new(&self.query)),
+                )
+                .children(self.filters.iter().map(|editor| FilterValue {
+                    editor: editor.clone(),
+                    raw: true,
+                }))
+        }
+    }
+
+    fn completion_editors(
+        cx: &mut TestAppContext,
+        overrides: HashMap<String, String>,
+    ) -> (Entity<CompletionEditors>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(crate::theme::Fonts::default());
+            cx.bind_keys(crate::keybindings::build_bindings(&overrides));
+        });
+        cx.add_window_view(|window, cx| {
+            let query = cx.new(|cx| EditorState::new(window, cx).default_value("cust"));
+            let filters = ["untouched", "cust"].map(|value| {
+                cx.new(|cx| {
+                    EditorState::new(window, cx)
+                        .default_value(value)
+                        .tab_size(gpui_base::input::TabSize {
+                            tab_size: 4,
+                            hard_tabs: true,
+                        })
+                        .submit_on_enter(true)
+                })
+            });
+            CompletionEditors { query, filters }
+        })
+    }
+
+    #[gpui::test]
+    fn tab_completes_the_focused_raw_filter_without_applying_it(cx: &mut TestAppContext) {
+        let (view, cx) = completion_editors(cx, HashMap::new());
+        let (query, filters) =
+            view.read_with(cx, |view, _| (view.query.clone(), view.filters.clone()));
+        let applied = Rc::new(Cell::new(false));
+        let _subscription = cx.update(|_, cx| {
+            let applied = applied.clone();
+            cx.subscribe(&filters[1], move |_, event: &input::InputEvent, _| {
+                if matches!(event, input::InputEvent::PressEnter { .. }) {
+                    applied.set(true);
+                }
+            })
+        });
+
+        for (editor, navigation, expected) in [
+            (&filters[1], "down tab", "customer_email"),
+            (&query, "tab", "customer_name"),
+        ] {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_selected_range(4..4, cx);
+                    editor.focus(window, cx);
+                    editor.present_completion_items(
+                        0,
+                        "cust",
+                        ["customer_name", "customer_email"]
+                            .map(|label| CompletionItem {
+                                label: label.into(),
+                                ..Default::default()
+                            })
+                            .into(),
+                        cx,
+                    );
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.simulate_keystrokes(navigation);
+            cx.read(|cx| {
+                assert_eq!(editor.read(cx).value(), expected);
+                assert_eq!(filters[0].read(cx).value(), "untouched");
+                assert!(!applied.get(), "Tab must not submit the filter");
+            });
+        }
+        cx.read(|cx| assert_eq!(filters[1].read(cx).value(), "customer_email"));
+        cx.update(|window, cx| filters[1].focus_handle(cx).focus(window, cx));
+        cx.simulate_keystrokes("tab");
+        cx.read(|cx| {
+            assert_eq!(filters[1].read(cx).value(), "customer_email\t");
+            assert!(!applied.get(), "Indenting must not submit the filter");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_completion_override_still_submits_a_filter_without_a_popup(cx: &mut TestAppContext) {
+        let (view, cx) = completion_editors(
+            cx,
+            HashMap::from([("accept_completion".into(), "enter".into())]),
         );
+        let editor = view.read_with(cx, |view, _| view.filters[1].clone());
+        let submissions = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(4..4, cx);
+                editor.focus(window, cx);
+                editor.present_completion_items(
+                    0,
+                    "cust",
+                    vec![CompletionItem {
+                        label: "customer_name".into(),
+                        ..Default::default()
+                    }],
+                    cx,
+                );
+            });
+            let submissions = submissions.clone();
+            let subscription = cx.subscribe(&editor, move |_, event: &input::InputEvent, _| {
+                if matches!(event, input::InputEvent::PressEnter { .. }) {
+                    submissions.set(submissions.get() + 1);
+                }
+            });
+            window.draw(cx).clear(cx);
+            subscription
+        });
+        cx.simulate_keystrokes("enter");
+        cx.read(|cx| {
+            assert_eq!(editor.read(cx).value(), "customer_name");
+            assert_eq!(submissions.get(), 0);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.read(|cx| {
+            assert_eq!(editor.read(cx).value(), "customer_name");
+            assert_eq!(submissions.get(), 1);
+        });
     }
 }

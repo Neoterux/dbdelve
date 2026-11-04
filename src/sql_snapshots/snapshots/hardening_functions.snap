@@ -869,6 +869,130 @@ source: src/sql_snapshots.rs
 [snowflake] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_xact_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_try_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_try_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_try_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_try_advisory_xact_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_unlock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_creat(-1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_truncate(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT load_extension('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT query('select 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT system$cancel_all_queries(1) => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] scalar: SELECT system$cancel_query('q') => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] scalar: SELECT system$abort_session(1) => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] scalar: SELECT system$abort_transaction(1) => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] scalar: SELECT getnextval(seq1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] table function wrapper: SELECT * FROM TABLE(GETNEXTVAL(seq1)) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sequence without parentheses: SELECT s.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sequence without parentheses, qualified: SELECT db.s.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] unicode-escaped name: SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] unicode-escaped name, no escape sequence: SELECT U&"set_config"('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] unicode-escaped name, schema-qualified: SELECT pg_catalog.U&"set_c\006fnfig"('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control spaced bit-and of a quoted column: SELECT U & "x" FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control bit-and of an unquoted column: SELECT U&x FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control qualified column: SELECT t.id FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control qualified column sharing no listed name: SELECT t.nextvalue FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control session read lastval: SELECT lastval() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control session read currval: SELECT currval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control last_insert_id: SELECT last_insert_id() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control sleep: SELECT sleep(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=Full [Unreadable] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=Some(RunOnce)|
+[clickhouse] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sql-text executor with an unnamed text argument: SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] extension function splicing an identifier unescaped, carrying a write: SELECT st_findextent('t', 'a") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|

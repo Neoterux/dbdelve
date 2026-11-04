@@ -327,7 +327,7 @@ impl Workspace {
                 .whitespace_nowrap()
         };
 
-        let projects = self.render_welcome_projects(card_theme, cx);
+        let projects = self.render_welcome_projects(card_theme, window, cx);
         let surface = div()
             .id("welcome-scroll")
             .size_full()
@@ -495,7 +495,23 @@ impl Workspace {
 
     /// The projects made before any connection: each empty, each a way into
     /// the form with itself already picked.
-    fn render_welcome_projects(&self, t: Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    /// What the rename and delete of the project row at `index` sit in, which
+    /// is never a tab stop: it only tells whether Tab has reached them, drawn
+    /// unseen until something shows them.
+    pub(crate) fn welcome_project_focus(&self, index: usize, cx: &mut App) -> FocusHandle {
+        let mut handles = self.welcome_project_focus.borrow_mut();
+        while handles.len() <= index {
+            handles.push(cx.focus_handle());
+        }
+        handles[index].clone()
+    }
+
+    fn render_welcome_projects(
+        &self,
+        t: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
         if self.projects.is_empty() {
             return None;
         }
@@ -543,7 +559,7 @@ impl Workspace {
                             .text_color(t.text_faint)
                             .child("No connections yet"),
                     )
-                    .child(self.project_actions(index, &project.name, t, cx))
+                    .child(self.project_actions(index, &project.name, window, t, cx))
                     .child(
                         button(
                             ("welcome-add-connection", index),
@@ -878,6 +894,10 @@ mod tests {
             ("mongodb+srv://cluster0.example.net/app", Engine::MongoDb),
             ("rediss://cache:6380", Engine::Redis),
             ("snowflake://account", Engine::Snowflake),
+            (
+                "clickhouse://default@ch.internal:8123/logs",
+                Engine::ClickHouse,
+            ),
         ];
         for (text, engine) in cases {
             assert_eq!(recognise(text), Recognised::Url(engine), "{text}");
@@ -1036,9 +1056,7 @@ mod tests {
         ];
         for row in rows {
             assert!(
-                keybindings::REGISTRY
-                    .iter()
-                    .any(|spec| spec.id == row.action()),
+                keybindings::available_registry().any(|spec| spec.id == row.action()),
                 "{row:?}"
             );
         }
