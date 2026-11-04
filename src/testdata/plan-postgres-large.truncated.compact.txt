@@ -1,14 +1,10 @@
 truncated: kept 38 of 59 nodes (top 8 by self time, with their ancestors)
 plan: engine=postgres analyzed=yes basis=measured time_unit="measured (ms)" cost_unit="planner cost, arbitrary units" total=9119.317ms execution="9273.512 ms" planning="21.833 ms" outside_nodes=154.195ms conditions=verbatim
 findings:
-  n18 misestimate over x200 est=200 act=1 HashAggregate
-  n8 misestimate over x33 est=200 act=6 GroupAggregate
-  n19 misestimate under x33 est=4759 act=158330 CTE Scan on big x
-  n9 misestimate under x33 est=28556 act=949990 Sort
-  n10 misestimate under x33 est=28556 act=949990 Hash Join
   n0 misestimate over x16 est=482 act=29 Append
   n45 misestimate over x12 est=12 act=1 Gather Merge
   n55 misestimate over x12 est=12 act=1 Gather Merge
+  ... 5 findings on nodes not shown
 tree:
   n0 Append self=0.627ms 0.0% est=482 act=29 loops=1
     | Buffers: shared hit=7520 read=2492612, temp read=14427 written=14696
