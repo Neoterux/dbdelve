@@ -255,7 +255,10 @@ fn findings(nodes: &[NodeAnalysis]) -> Vec<Finding> {
 /// How far a node's row count was from the planner's, unless it only ran short
 /// because an ancestor stopped pulling rows. Estimates are for running to
 /// completion, so a scan under a `Limit`, or on a semi or anti join's inner
-/// side, reads as a huge overestimate on a healthy plan.
+/// side, reads as a huge overestimate on a healthy plan. Only a node that
+/// reaches the `Limit` or the join through operators that pass rows along as
+/// they get them counts: a `Sort` or an aggregate beneath it reads all of its
+/// input first, so what is under one is read to the end.
 ///
 /// Postgres reports both counts per loop, so they compare as they stand; zero
 /// is read as one so neither side divides by it.
@@ -276,21 +279,56 @@ fn misestimate(nodes: &[PlanNode], index: usize) -> Option<Misestimate> {
         Direction::Over
     };
 
-    let mut depth = node.depth;
-    let stopped = nodes[..index].iter().rev().any(|ancestor| {
-        let is_ancestor = ancestor.depth < depth;
-        depth = depth.min(ancestor.depth);
-        let label = ancestor.label.to_lowercase();
-        is_ancestor
-            && (label.starts_with("limit")
-                || label.contains("semi join")
-                || label.contains("anti join"))
-    });
+    let stopped = stopped_early(nodes, index);
     (!(direction == Direction::Over && stopped)).then_some(Misestimate {
         factor,
         direction,
         tier,
     })
+}
+
+/// Whether an ancestor stops pulling rows from this node before it is
+/// exhausted: a `Limit`, or a semi or anti join reached by its inner side (any
+/// child but the first). The walk up ends at the first operator that reads all
+/// of its input before it returns a row, since nothing above it can cut the
+/// node short.
+fn stopped_early(nodes: &[PlanNode], index: usize) -> bool {
+    let mut depth = nodes[index].depth;
+    // The child of the next ancestor found that the walk came up through.
+    let mut branch = index;
+    for (above, ancestor) in nodes[..index].iter().enumerate().rev() {
+        if ancestor.depth >= depth {
+            continue;
+        }
+        let label = ancestor.label.to_lowercase();
+        if reads_all_input(&label) {
+            return false;
+        }
+        let inner = branch != above + 1;
+        if label.starts_with("limit")
+            || (inner && (label.contains("semi join") || label.contains("anti join")))
+        {
+            return true;
+        }
+        depth = ancestor.depth;
+        branch = above;
+    }
+    false
+}
+
+/// Whether an operator, by its lowercased label, consumes every row beneath it
+/// before it produces one. A `Hash` is the build side of a hash join; a group
+/// aggregate streams its groups and is not listed.
+///
+/// ponytail: labels are matched by the engine's own words for these operators;
+/// an operator not named here is read as passing rows along, which can only
+/// hide a misestimate that a `Limit` above would have explained anyway.
+fn reads_all_input(label: &str) -> bool {
+    label == "hash"
+        || label.starts_with("sort")
+        || label.starts_with("materialize")
+        || label.starts_with("temporary table")
+        || (label.contains("aggregate") && !label.starts_with("group"))
 }
 
 /// A `Gather` and everything beneath it ran in workers. The count is what the
@@ -921,6 +959,57 @@ mod tests {
             node("Seq Scan on big", 1, 1_000_000.0, 10.0),
         ];
         assert_eq!(miss(plain, 1), Some(100_000.0));
+    }
+
+    #[test]
+    fn a_scan_a_sort_or_aggregate_reads_to_the_end_is_a_misestimate_under_a_limit() {
+        let miss = |nodes: Vec<PlanNode>, index: usize| {
+            let plan = Plan {
+                nodes,
+                ..Plan::default()
+            };
+            Analysis::new(&plan, Engine::Postgres).nodes[index]
+                .misestimate
+                .map(|miss| miss.factor)
+        };
+        // The shape of the spill fixture: the `Sort` reads the scan to the end.
+        let sorted = vec![
+            node("Limit", 0, 10.0, 10.0),
+            node("Sort", 1, 10.0, 10.0),
+            node("Seq Scan on big", 2, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(sorted, 2), Some(100_000.0));
+        let aggregated = vec![
+            node("Limit", 0, 10.0, 10.0),
+            node("HashAggregate", 1, 10.0, 10.0),
+            node("Seq Scan on big", 2, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(aggregated, 2), Some(100_000.0));
+        // Rows pass through a join and a group aggregate as they are read.
+        let streamed = vec![
+            node("Limit", 0, 10.0, 10.0),
+            node("GroupAggregate", 1, 10.0, 10.0),
+            node("Nested Loop", 2, 10.0, 10.0),
+            node("Seq Scan on a", 3, 10.0, 10.0),
+            node("Seq Scan on b", 3, 1_000_000.0, 10.0),
+        ];
+        assert_eq!(miss(streamed, 4), None);
+        // The outer side of a semi join is read to the end, the inner is not.
+        let semi = vec![
+            node("Nested Loop Semi Join", 0, 5.0, 5.0),
+            node("Seq Scan on outer_side", 1, 1_000_000.0, 5.0),
+            node("Index Scan on inner_side", 1, 100_000.0, 1.0),
+        ];
+        assert_eq!(miss(semi.clone(), 1), Some(200_000.0));
+        assert_eq!(miss(semi, 2), None);
+        // A hash join's inner side is the `Hash`, which reads all of it.
+        let hashed = vec![
+            node("Hash Semi Join", 0, 5.0, 5.0),
+            node("Seq Scan on a", 1, 5.0, 5.0),
+            node("Hash", 1, 5.0, 5.0),
+            node("Seq Scan on b", 2, 100_000.0, 1.0),
+        ];
+        assert_eq!(miss(hashed, 3), Some(100_000.0));
     }
 
     #[test]
