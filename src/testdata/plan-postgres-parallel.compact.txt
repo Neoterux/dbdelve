@@ -1,0 +1,11 @@
+truncated: none
+plan: engine=postgres analyzed=yes basis=measured time_unit="measured (ms)" cost_unit="planner cost, arbitrary units" total=742.711ms execution="888.825 ms" planning="14.157 ms" outside_nodes=146.114ms conditions=verbatim
+findings:
+tree:
+  n0 Limit self=156.628ms 21.0% est=36 act=6 loops=1
+    n1 Sort self=0.582ms 0.0% est=36 act=6 loops=1
+      n2 Finalize GroupAggregate self=0.895ms 0.1% est=36 act=6 loops=1
+        n3 Gather Merge self=118.586ms 15.9% est=72 act=18 loops=1 parallel=2workers
+          n4 Sort self=0.924ms 0.1% est=108 act=18 (x 3 loops) loops=3 parallel=2workers
+            n5 Partial HashAggregate self=57.796ms 7.7% est=108 act=18 (x 3 loops) loops=3 parallel=2workers
+              n6 Parallel Seq Scan on events self=407.3ms 54.8% est=1125678 act=899991 (x 3 loops) loops=3 parallel=2workers
