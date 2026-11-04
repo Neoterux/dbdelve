@@ -29,6 +29,7 @@ use gpui_component::{
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     spinner::Spinner,
     table::{DataTable, TableDelegate, TableState},
+    tooltip::Tooltip,
 };
 
 use crate::{
@@ -44,7 +45,7 @@ use crate::{
     db::{Engine, ExplainMode, RoutineKind},
     explain::{
         self, LabelPart,
-        analysis::{Basis, Tier, percent_text},
+        analysis::{Basis, Direction, Misestimate, Tier, percent_text},
     },
     explorer::ROW_LIMITS,
     filter::{Conjunction, FilterRow, Operator},
@@ -537,11 +538,34 @@ fn render_plan(
                                     t.success.into(),
                                 )
                             }))
+                            .children(
+                                drawn
+                                    .parallel
+                                    .filter(|parallel| parallel.gathers)
+                                    .map(|parallel| {
+                                        plan_chip(
+                                            plan_id("plan-parallel", scope, index),
+                                            format!("parallel ×{} workers", parallel.workers),
+                                            t.text_muted.into(),
+                                            format!(
+                                                "Times below are per-worker averages over {} participants: {} workers and the leader",
+                                                parallel.workers + 1,
+                                                parallel.workers
+                                            ),
+                                        )
+                                    }),
+                            )
                             .children(drawn.misestimate.map(|miss| {
-                                div().text_color(t.danger).child(format!(
-                                    "×{} misestimate",
-                                    group_thousands(miss.factor.round() as u64)
-                                ))
+                                plan_chip(
+                                    plan_id("plan-miss", scope, index),
+                                    misestimate_text(&miss),
+                                    tier_colour(miss.tier, &t),
+                                    misestimate_tooltip(
+                                        &miss,
+                                        node.estimated.map(|estimated| estimated.rows),
+                                        node.actual.map(|actual| actual.rows),
+                                    ),
+                                )
                             }))
                             .children(node.estimated.map(|estimated| {
                                 metric(
@@ -683,6 +707,65 @@ fn tier_colour(tier: Tier, t: &Theme) -> Hsla {
         Tier::Warm => t.danger.over(t.bg, 0.40).into(),
         Tier::Hot => t.danger.over(t.bg, 0.70).into(),
         Tier::Danger => t.danger.into(),
+    }
+}
+
+/// An id for an element of the plan pane that carries a tooltip, from the tab
+/// it is in and the node or entry it belongs to.
+fn plan_id(kind: &'static str, scope: &str, index: usize) -> gpui::ElementId {
+    gpui::ElementId::from((
+        gpui::ElementId::from(kind),
+        SharedString::from(format!("{scope}-{index}")),
+    ))
+}
+
+/// A short tinted label with a sentence behind it. The sentence is a tooltip
+/// because the label is the thing read at a glance and the explanation is what
+/// is wanted once, the first time.
+fn plan_chip(id: gpui::ElementId, text: String, tone: Hsla, tooltip: String) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px(px(layout::SPACE_XS))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .text_color(tone)
+        .bg(tone.opacity(0.12))
+        .child(text)
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+}
+
+/// `↓ ×340` when the planner expected fewer rows than it got, `↑ ×12` when it
+/// expected more. The factor is floored, because rounding would print a figure
+/// the chip's colour disagrees with: 99.6 would read `×100`, which is Hot, on a
+/// Warm chip. The one band flooring cannot fix is just above 1000, which is
+/// Danger and would print `×1,000`, a Hot figure, so there the next whole
+/// number is printed. The tier is read from the misestimate rather than derived
+/// from the factor, so the text and the colour come from one field.
+fn misestimate_text(miss: &Misestimate) -> String {
+    let arrow = match miss.direction {
+        Direction::Under => "↓",
+        Direction::Over => "↑",
+    };
+    let mut whole = miss.factor.floor() as u64;
+    if whole == 1000 && miss.tier == Tier::Danger {
+        whole = 1001;
+    }
+    format!("{arrow} ×{}", group_thousands(whole))
+}
+
+/// What a misestimate chip says in words, since an arrow is a direction and not
+/// a sentence.
+fn misestimate_tooltip(miss: &Misestimate, estimated: Option<f64>, actual: Option<f64>) -> String {
+    let which = match miss.direction {
+        Direction::Under => "fewer",
+        Direction::Over => "more",
+    };
+    match estimated.zip(actual) {
+        Some((estimated, actual)) => format!(
+            "planner expected {which} rows: estimated {}, got {} per loop",
+            round_count(estimated),
+            round_count(actual)
+        ),
+        None => format!("planner expected {which} rows"),
     }
 }
 
@@ -3899,5 +3982,56 @@ mod tests {
             assert_eq!(editor.read(cx).value(), "customer_name");
             assert_eq!(submissions.get(), 1);
         });
+    }
+
+    fn missed(direction: Direction, factor: f64) -> Misestimate {
+        Misestimate {
+            factor,
+            direction,
+            tier: Tier::of_misestimate(factor).expect("a factor of ten or more has a tier"),
+        }
+    }
+
+    #[test]
+    fn a_misestimate_reads_as_an_arrow_and_a_grouped_factor() {
+        for (direction, factor, text) in [
+            (Direction::Under, 340.0, "↓ ×340"),
+            (Direction::Over, 12.0, "↑ ×12"),
+            (Direction::Under, 1234.4, "↓ ×1,234"),
+            (Direction::Over, 10.0, "↑ ×10"),
+            // Warm: the band a rounding helper printed as `×100`.
+            (Direction::Under, 99.6, "↓ ×99"),
+            (Direction::Under, 99.99, "↓ ×99"),
+            (Direction::Under, 100.0, "↓ ×100"),
+            // Hot through exactly 1000, Danger only above it.
+            (Direction::Over, 1000.0, "↑ ×1,000"),
+            (Direction::Under, 1000.3, "↓ ×1,001"),
+            (Direction::Under, 1000.49, "↓ ×1,001"),
+        ] {
+            assert_eq!(
+                misestimate_text(&missed(direction, factor)),
+                text,
+                "{factor}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_printed_factor_never_crosses_its_tier_boundary() {
+        let above_a_thousand = f64::from_bits(1000.0f64.to_bits() + 1);
+        let sweep = (1000..=200_000).map(|i| i as f64 / 100.0);
+        for factor in sweep.chain([above_a_thousand]) {
+            let miss = missed(Direction::Under, factor);
+            let digits: String = misestimate_text(&miss)
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect();
+            let printed: u64 = digits.parse().expect("the chip prints a whole number");
+            assert_eq!(
+                Tier::of_misestimate(printed as f64),
+                Some(miss.tier),
+                "{factor} printed as {printed}"
+            );
+        }
     }
 }
