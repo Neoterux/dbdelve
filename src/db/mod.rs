@@ -704,6 +704,26 @@ impl Engine {
         self.spec().sql.read_only_session != ReadOnlySession::None
     }
 
+    /// What the server itself does while the profile is Read-only, as a
+    /// sentence. Static: no connection is asked, and it is true only while the
+    /// profile is in that mode.
+    pub fn read_only_hold(self) -> &'static str {
+        match self.spec().sql.read_only_session {
+            ReadOnlySession::DefaultTransaction => {
+                "While the profile is Read-only, the server holds every transaction it opens to reads."
+            }
+            ReadOnlySession::SessionTransaction => {
+                "While the profile is Read-only, the server holds the session's transactions to reads."
+            }
+            ReadOnlySession::PerRequest => {
+                "While the profile is Read-only, every request asks the server to refuse writes."
+            }
+            ReadOnlySession::None => {
+                "This database has no server-side read-only setting, so DBDelve's own checks are all that stop a write."
+            }
+        }
+    }
+
     /// Why a statement `sql::classify` cannot read is refused in Read-only,
     /// finishing "dbdelve can't parse this, and …".
     pub fn unreadable_reason(self) -> &'static str {
@@ -5010,6 +5030,31 @@ mod tests {
             Engine::Redis,
         ] {
             assert!(!held(engine), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn every_engine_names_its_read_only_hold() {
+        let none = "This database has no server-side read-only setting, so DBDelve's own checks are all that stop a write.";
+        let texts = [
+            "While the profile is Read-only, the server holds every transaction it opens to reads.",
+            "While the profile is Read-only, the server holds the session's transactions to reads.",
+            "While the profile is Read-only, every request asks the server to refuse writes.",
+            none,
+        ];
+        for (i, a) in texts.iter().enumerate() {
+            for b in &texts[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        for engine in Engine::ALL {
+            let hold = engine.read_only_hold();
+            assert!(texts.contains(&hold), "{engine:?}: {hold}");
+            let names_a_hold = matches!(
+                engine,
+                Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::ClickHouse
+            );
+            assert_eq!(hold != none, names_a_hold, "{engine:?}");
         }
     }
 

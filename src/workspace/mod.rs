@@ -2363,6 +2363,7 @@ impl Render for Workspace {
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),
                     ("discard", self.render_discard_confirmation(cx)),
+                    ("agent-visibility", self.render_agent_visibility(cx)),
                     ("pending-export", self.render_pending_export(cx)),
                     ("pending-run", self.render_pending_run(cx)),
                     ("queue-failure", self.render_queue_failure(cx)),
