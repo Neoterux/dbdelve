@@ -2567,3 +2567,113 @@ fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
         quit(workspace, cx);
     });
 }
+
+/// One call as a process on this machine makes it: connect to the socket, send
+/// `frame` and a newline, read until the app closes the connection. On a thread
+/// of its own, because the window answers only while the test drives it.
+#[cfg(unix)]
+fn raw_call(path: &std::path::Path, frame: &str) -> std::thread::JoinHandle<String> {
+    use std::io::{Read, Write};
+
+    let path = path.to_path_buf();
+    let frame = format!("{frame}\n");
+    std::thread::spawn(move || {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        stream
+            .write_all(frame.as_bytes())
+            .expect("the frame is written");
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .expect("the app answers or closes");
+        answer
+    })
+}
+
+/// Let the window run while threads outside it work, until `done` holds. The
+/// executor never advances its clock here, so only real time passes.
+#[cfg(unix)]
+fn drive_until(cx: &mut VisualTestContext, mut done: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "nothing happened in five seconds"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::agent::{Reply, Status};
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("billing", "Billing", visible),
+                sqlite_profile("secret", "Secret", ""),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+        let states = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profiles
+                    .iter()
+                    .map(|profile| matches!(profile.state, ProfileState::Idle))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = states(cx);
+
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, || client.is_finished());
+        let answer = client.join().expect("the client thread finished");
+
+        let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        let listed: serde_json::Value =
+            serde_json::from_str(&reply.text).expect("the text is a JSON array");
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"name": "Orders", "engine": "sqlite"},
+                {"name": "Billing", "engine": "sqlite"},
+            ])
+        );
+        for word in ["Secret", "path", ".db", "host", "user"] {
+            assert!(!reply.text.contains(word), "{word}: {}", reply.text);
+        }
+        assert_eq!(states(cx), before, "listing opened or changed nothing");
+        let mode = std::fs::metadata(path.parent().expect("the socket has a directory"))
+            .expect("the directory exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Dropping the bridge stops the listener; the pump would otherwise
+        // outlive the window.
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
