@@ -22,7 +22,11 @@
 //!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`.
 //! 5. (Server-side scripts and Redis disclosure commands are refused here, in
 //!    plan 03-03.)
-//! 6. (Statements that change the session are refused here, in task 3.)
+//! 6. A statement that changes the session, or assigns a user variable with
+//!    `:=`, is `Refuse(Session)`: a later approved write must hit the table the
+//!    human read it for, so nothing an agent sends may repoint the session
+//!    unseen. Stateless engines included. A plain read of what the session
+//!    holds, `currval` or `last_insert_id()`, stays a read.
 //! 7. A verdict that needs `Mode::Full` is `Refuse(NeedsFull)`: a Full profile
 //!    grants an agent nothing a Read-write one does not.
 //! 8. `gate(&verdict, mode, &[])` stopping the statement for the mode is
@@ -42,9 +46,13 @@
 
 use std::fmt;
 
+use sqlparser::tokenizer::{Token, Tokenizer};
+
 use crate::db::{Engine, Syntax};
 
-use super::{Buffer, Destructive, Mode, Stop, Verdict, dialect, gate, holds_a_token, parsed};
+use super::{
+    Buffer, Destructive, Mode, Stop, Verdict, dialect, executed_tokens, gate, holds_a_token, parsed,
+};
 
 /// What an agent's statement is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +82,8 @@ pub(crate) enum Refusal {
     Delete,
     /// An `ALTER TABLE` carrying anything but `ADD COLUMN`.
     Alter,
+    /// A statement that leaves the session changed, savepoints included.
+    Session,
     /// A statement that needs Full.
     NeedsFull,
     /// A statement that needs more than the profile's mode.
@@ -94,6 +104,9 @@ impl fmt::Display for Refusal {
             Refusal::Delete => f.write_str("deleting data is refused for agent statements"),
             Refusal::Alter => {
                 f.write_str("ALTER other than ADD COLUMN is refused for agent statements")
+            }
+            Refusal::Session => {
+                f.write_str("statements that change the session are refused for agent statements")
             }
             Refusal::NeedsFull => {
                 f.write_str("statements that need Full are refused for agent statements")
@@ -152,6 +165,13 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         return AgentVerdict::Refuse(Refusal::Alter);
     }
 
+    // Judged by the statements' own kinds and by the tokens, never by
+    // `leaves`: that answers nothing on an engine that keeps no session, and
+    // it flags a plain read of session state, which a read is.
+    if read.session || assigns_a_user_variable(engine, sql) {
+        return AgentVerdict::Refuse(Refusal::Session);
+    }
+
     if verdict.mode == Mode::Full {
         return AgentVerdict::Refuse(Refusal::NeedsFull);
     }
@@ -171,9 +191,41 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     }
 
     if verdict.mode == Mode::ReadWrite {
+        // ponytail: `REPLACE INTO` and `INSERT OR REPLACE` delete a conflicting
+        // row before they insert, and classify as the `INSERT` they parse as,
+        // so they are approved like one. The human reads the statement before
+        // approving it (D-23). The upgrade path is a removal flag on a
+        // replacing insert in the walk, which would refuse them as `Delete`.
         return AgentVerdict::Approve(verdict);
     }
     AgentVerdict::Run
+}
+
+/// Whether `sql` assigns a user variable with `:=` (`SELECT @x := 1`), the
+/// same session change as `SET @x = 1` in another spelling. Read off the
+/// tokens the server will run, so one inside an executable comment counts.
+/// The variable is an `@`-prefixed name, however the dialect's tokenizer
+/// spells it; a named argument (`f(a := 1)`) has no `@` and is not one.
+fn assigns_a_user_variable(engine: Engine, sql: &str) -> bool {
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    let tokens = executed_tokens(engine, dialect.as_ref(), sql)
+        .unwrap_or_else(|| Tokenizer::new(dialect.as_ref(), sql).tokenize());
+    // A submission the tokenizer cannot read was refused as unreadable before
+    // this is asked.
+    let Ok(tokens) = tokens else {
+        return false;
+    };
+    let tokens: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    tokens.windows(2).any(|pair| {
+        matches!(pair, [Token::Word(variable), Token::Assignment] if variable.value.starts_with('@'))
+    }) || tokens
+        .windows(3)
+        .any(|triple| matches!(triple, [Token::AtSign, Token::Word(_), Token::Assignment]))
 }
 
 /// How many statements `sql` holds, as the more of the two readings of it.
@@ -652,6 +704,7 @@ mod tests {
         "EXPORT DATABASE '/tmp/x'",
         "OPTIMIZE TABLE t FINAL",
         "KILL 1",
+        "SET GLOBAL max_connections = 1",
         "XA START 'x'",
     ];
 
@@ -667,6 +720,231 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn session_statements_are_refused_whatever_the_mode() {
+        for sql in [
+            "BEGIN",
+            "START TRANSACTION READ WRITE",
+            "COMMIT",
+            "ROLLBACK",
+            "SET search_path = other",
+            "SET ROLE other",
+            "SET SESSION TRANSACTION READ WRITE",
+            "CREATE TEMPORARY TABLE u (a INT)",
+        ] {
+            for mode in Mode::ALL {
+                assert_eq!(
+                    agent_gate(Engine::Postgres, sql, mode),
+                    refused(Refusal::Session),
+                    "{mode:?}: {sql}"
+                );
+            }
+        }
+        // Stateless engines keep no session, and an agent's `SET` is refused
+        // there all the same.
+        for engine in [Engine::Snowflake, Engine::ClickHouse] {
+            for sql in ["SET x = 1", "USE other"] {
+                for mode in Mode::ALL {
+                    let answer = agent_gate(engine, sql, mode);
+                    assert!(
+                        answer == refused(Refusal::Session)
+                            || answer == refused(Refusal::Unreadable),
+                        "{engine:?} {mode:?}: {sql}: {answer:?}"
+                    );
+                }
+            }
+        }
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for sql in ["USE other", "SELECT @x := 1", "SELECT 1 INTO @x"] {
+                for mode in Mode::ALL {
+                    let answer = agent_gate(engine, sql, mode);
+                    assert!(
+                        answer == refused(Refusal::Session)
+                            || answer == refused(Refusal::Unreadable),
+                        "{engine:?} {mode:?}: {sql}: {answer:?}"
+                    );
+                }
+            }
+        }
+        for engine in sql_engines() {
+            for sql in [
+                "BEGIN",
+                "COMMIT",
+                "SET search_path = other",
+                "SET x = 1",
+                "USE other",
+                "SELECT @x := 1",
+                "SELECT 1 INTO @x",
+                "SET GLOBAL max_connections = 1",
+            ] {
+                for mode in Mode::ALL {
+                    let answer = agent_gate(engine, sql, mode);
+                    assert!(
+                        matches!(answer, AgentVerdict::Refuse(_)),
+                        "{engine:?} {mode:?}: {sql}: {answer:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_savepoint_family_is_refused_as_a_session_statement() {
+        for sql in [
+            "SAVEPOINT a",
+            "RELEASE SAVEPOINT a",
+            "ROLLBACK TO SAVEPOINT a",
+        ] {
+            for engine in sql_engines() {
+                for mode in Mode::ALL {
+                    let answer = agent_gate(engine, sql, mode);
+                    let reads_it = matches!(
+                        engine,
+                        Engine::Postgres
+                            | Engine::MySql
+                            | Engine::MariaDb
+                            | Engine::Sqlite
+                            | Engine::DuckDb
+                    );
+                    if reads_it {
+                        assert_eq!(
+                            answer,
+                            refused(Refusal::Session),
+                            "{engine:?} {mode:?}: {sql}"
+                        );
+                    } else {
+                        assert!(
+                            answer == refused(Refusal::Session)
+                                || answer == refused(Refusal::Unreadable),
+                            "{engine:?} {mode:?}: {sql}: {answer:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_of_session_state_still_runs() {
+        for mode in Mode::ALL {
+            for (engine, sql) in [
+                (Engine::Postgres, "SELECT currval('s')"),
+                (Engine::MySql, "SELECT last_insert_id()"),
+                (Engine::Postgres, "SELECT make_interval(days := 10)"),
+            ] {
+                assert_eq!(
+                    agent_gate(engine, sql, mode),
+                    AgentVerdict::Run,
+                    "{engine:?} {mode:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_refusal_names_its_rule_in_its_own_words() {
+        let all = [
+            (Refusal::NoStatement, "there is no statement to run"),
+            (Refusal::MoreThanOne, "more than one statement"),
+            (Refusal::Unreadable, "DBDelve can't read this statement"),
+            (Refusal::Drop, "DROP is refused for agent statements"),
+            (
+                Refusal::Truncate,
+                "TRUNCATE is refused for agent statements",
+            ),
+            (
+                Refusal::Delete,
+                "deleting data is refused for agent statements",
+            ),
+            (
+                Refusal::Alter,
+                "ALTER other than ADD COLUMN is refused for agent statements",
+            ),
+            (
+                Refusal::Session,
+                "statements that change the session are refused for agent statements",
+            ),
+            (
+                Refusal::NeedsFull,
+                "statements that need Full are refused for agent statements",
+            ),
+            (
+                Refusal::NeedsMode {
+                    needed: Mode::ReadWrite,
+                    held: Mode::ReadOnly,
+                },
+                "needs Read-write; the profile is Read-only",
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (refusal, text) in all {
+            let said = refusal.to_string();
+            assert_eq!(said, text);
+            assert!(!seen.contains(&said), "{said} is said twice");
+            for advice in ["upgrade", "try", "instead", "please", "should"] {
+                assert!(
+                    !said.to_lowercase().contains(advice),
+                    "{said} gives advice: {advice}"
+                );
+            }
+            seen.push(said);
+        }
+        assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn a_cell_with_two_reasons_has_one_defined_answer() {
+        let postgres = |sql, mode| agent_gate(Engine::Postgres, sql, mode);
+        assert_eq!(
+            postgres("DROP TABLE a; DROP TABLE b", Mode::Full),
+            refused(Refusal::MoreThanOne)
+        );
+        assert_eq!(
+            postgres("SELECT 1; garbage", Mode::Full),
+            refused(Refusal::Unreadable)
+        );
+        assert_eq!(
+            postgres("DELETE FROM t WHERE id = 1", Mode::ReadOnly),
+            refused(Refusal::Delete)
+        );
+        assert_eq!(
+            postgres("ALTER TABLE t ADD COLUMN b INT, DROP COLUMN c", Mode::Full),
+            refused(Refusal::Alter)
+        );
+        assert_eq!(
+            postgres("GRANT SELECT ON t TO u", Mode::Full),
+            refused(Refusal::NeedsFull)
+        );
+    }
+
+    #[test]
+    fn the_same_question_gets_the_same_answer() {
+        for (engine, case, text) in crate::sql_snapshots::agent::sql_cells() {
+            for mode in Mode::ALL {
+                assert_eq!(
+                    agent_gate(engine, &text, mode),
+                    agent_gate(engine, &text, mode),
+                    "{engine:?} {mode:?} {case}: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_a_row_is_approvable() {
+        for (engine, sql) in [
+            (Engine::MySql, "REPLACE INTO t (a) VALUES (1)"),
+            (Engine::MariaDb, "REPLACE INTO t (a) VALUES (1)"),
+            (Engine::Sqlite, "INSERT OR REPLACE INTO t (a) VALUES (1)"),
+        ] {
+            assert_eq!(
+                agent_gate(engine, sql, Mode::ReadWrite),
+                AgentVerdict::Approve(Verdict::WRITE),
+                "{engine:?}: {sql}"
+            );
         }
     }
 }

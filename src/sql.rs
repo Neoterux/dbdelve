@@ -2637,6 +2637,16 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     alters: bool,
+    /// Whether any statement the parse judged leaves its session changed: a
+    /// transaction bracket, a `SET`, a `USE`, a temporary table, a variable
+    /// target, a savepoint. Read off the statements themselves, never off
+    /// [`leaves`], which says nothing on an engine that keeps no session and
+    /// also flags plain reads of what the session holds.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    session: bool,
 }
 
 impl Parsed {
@@ -2647,15 +2657,47 @@ impl Parsed {
             statements,
             removes: false,
             alters: false,
+            session: false,
         }
     }
 
-    fn read(reading: Reading, statements: usize) -> Self {
+    fn read(reading: Reading, statements: &[Statement]) -> Self {
         Self {
             verdict: reading.verdict,
-            statements,
+            statements: statements.len(),
             removes: reading.removes,
             alters: reading.alters,
+            session: statements.iter().any(changes_session),
+        }
+    }
+}
+
+/// Whether `statement`, or a statement it holds in an `IF` branch or a
+/// scripting block, leaves its session changed. [`Leaves::add`] answers for
+/// every kind it knows; it is not changed, because the queue of the user's
+/// own statements reads it. This adds what an agent cannot be allowed to do
+/// unseen and the queue does not care about: a savepoint, which brackets a
+/// transaction an agent has no way to end, and a session change inside a
+/// branch.
+fn changes_session(statement: &Statement) -> bool {
+    match statement {
+        Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Rollback {
+            savepoint: Some(_), ..
+        } => true,
+        Statement::If(branching) => std::iter::once(&branching.if_block)
+            .chain(&branching.elseif_blocks)
+            .chain(&branching.else_block)
+            .flat_map(ConditionalStatementBlock::statements)
+            .any(changes_session),
+        Statement::StartTransaction { statements, .. } if !statements.is_empty() => {
+            statements.iter().any(changes_session)
+        }
+        _ => {
+            let mut leaves = Leaves::default();
+            leaves.add(statement);
+            leaves != Leaves::default()
         }
     }
 }
@@ -2702,10 +2744,13 @@ impl From<Verdict> for Reading {
 /// [`classify`]'s reading of `sql`, with everything the parse knew.
 fn parsed(engine: Engine, sql: &str) -> Parsed {
     if engine.syntax() == Syntax::Redis {
-        return Parsed::counted(
-            crate::redis_cmd::classify(sql),
-            crate::redis_cmd::statements(sql).len(),
-        );
+        return Parsed {
+            session: crate::redis_cmd::leaves(sql) != Leaves::default(),
+            ..Parsed::counted(
+                crate::redis_cmd::classify(sql),
+                crate::redis_cmd::statements(sql).len(),
+            )
+        };
     }
     let Some(dialect) = dialect(engine) else {
         return Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len());
@@ -2754,7 +2799,7 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         .iter()
         .map(|statement| spec_verdict(engine.spec(), statement))
         .fold(Reading::READ, Reading::max);
-    let read = Parsed::read(reading, statements.len());
+    let read = Parsed::read(reading, &statements);
     Parsed {
         verdict: raised(engine, sql, read.verdict),
         ..read
@@ -2918,6 +2963,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
 
     let mut unreadable = !trusted;
     let mut counted = 0;
+    let mut session = false;
     let reading = between_semicolons(&tokens)
         .into_iter()
         .map(|range| {
@@ -2942,6 +2988,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
             let reading = match parsed {
                 Some(statements) => {
                     counted += statements.len();
+                    session |= statements.iter().any(changes_session);
                     statements
                         .iter()
                         .map(|statement| spec_verdict(spec, statement))
@@ -2974,6 +3021,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
         verdict,
         removes: reading.removes,
         alters: reading.alters,
+        session,
         ..Parsed::counted(Verdict::READ, counted)
     }
 }

@@ -85,6 +85,30 @@ source: src/sql_snapshots.rs
 [postgres] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [postgres] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [postgres] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[postgres] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[postgres] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[postgres] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[postgres] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[postgres] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[postgres] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[postgres] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[postgres] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [postgres] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [postgres] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [postgres] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -181,6 +205,30 @@ source: src/sql_snapshots.rs
 [mysql] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mysql] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [mysql] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mysql] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[mysql] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[mysql] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mysql] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mysql] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mysql] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[mysql] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mysql] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mysql] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mysql] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mysql] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -277,6 +325,30 @@ source: src/sql_snapshots.rs
 [mariadb] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mariadb] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [mariadb] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mariadb] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[mariadb] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[mariadb] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mariadb] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mariadb] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mariadb] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[mariadb] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mariadb] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mariadb] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mariadb] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mariadb] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -373,6 +445,30 @@ source: src/sql_snapshots.rs
 [sqlite] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [sqlite] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [sqlite] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[sqlite] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[sqlite] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[sqlite] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[sqlite] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[sqlite] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[sqlite] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[sqlite] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[sqlite] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [sqlite] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [sqlite] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [sqlite] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -469,6 +565,30 @@ source: src/sql_snapshots.rs
 [turso] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [turso] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [turso] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[turso] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[turso] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[turso] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[turso] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[turso] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[turso] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[turso] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[turso] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [turso] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [turso] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [turso] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -565,6 +685,30 @@ source: src/sql_snapshots.rs
 [duckdb] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [duckdb] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [duckdb] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[duckdb] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[duckdb] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[duckdb] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[duckdb] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[duckdb] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[duckdb] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[duckdb] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[duckdb] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [duckdb] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [duckdb] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [duckdb] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -661,6 +805,30 @@ source: src/sql_snapshots.rs
 [snowflake] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [snowflake] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [snowflake] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[snowflake] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[snowflake] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[snowflake] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[snowflake] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[snowflake] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[snowflake] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[snowflake] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[snowflake] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [snowflake] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [snowflake] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [snowflake] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -757,6 +925,30 @@ source: src/sql_snapshots.rs
 [clickhouse] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [clickhouse] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [clickhouse] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[clickhouse] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[clickhouse] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[clickhouse] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[clickhouse] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[clickhouse] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[clickhouse] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[clickhouse] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[clickhouse] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [clickhouse] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [clickhouse] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [clickhouse] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -853,6 +1045,30 @@ source: src/sql_snapshots.rs
 [mssql] optimize a table: OPTIMIZE TABLE t FINAL => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mssql] kill a session: KILL 1 => |ro=refuse(NeedsFull) rw=refuse(NeedsFull) full=refuse(NeedsFull)|
 [mssql] xa transaction: XA START 'x' => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mssql] begin: BEGIN => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] start a read-write transaction: START TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] commit: COMMIT => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] rollback: ROLLBACK => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] set the search path: SET search_path = other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] set a role: SET ROLE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] set the session transaction: SET SESSION TRANSACTION READ WRITE => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] set a variable: SET x = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[mssql] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[mssql] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mssql] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mssql] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mssql] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
+[mssql] insert on conflict: INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mssql] pragma read: PRAGMA table_info(t) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mssql] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mssql] whitespace only:     => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
 [mssql] line comment only: -- nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|

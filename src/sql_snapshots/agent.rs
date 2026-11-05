@@ -175,6 +175,48 @@ const SQL_KINDS: &[(&str, &str)] = &[
     ("optimize a table", "OPTIMIZE TABLE t FINAL"),
     ("kill a session", "KILL 1"),
     ("xa transaction", "XA START 'x'"),
+    ("begin", "BEGIN"),
+    (
+        "start a read-write transaction",
+        "START TRANSACTION READ WRITE",
+    ),
+    ("commit", "COMMIT"),
+    ("rollback", "ROLLBACK"),
+    ("set the search path", "SET search_path = other"),
+    ("set a role", "SET ROLE other"),
+    (
+        "set the session transaction",
+        "SET SESSION TRANSACTION READ WRITE",
+    ),
+    ("set a variable", "SET x = 1"),
+    (
+        "set a server-wide setting",
+        "SET GLOBAL max_connections = 1",
+    ),
+    ("use a database", "USE other"),
+    (
+        "create a temporary table",
+        "CREATE TEMPORARY TABLE u (a INT)",
+    ),
+    ("assign a user variable", "SELECT @x := 1"),
+    ("select into a user variable", "SELECT 1 INTO @x"),
+    ("savepoint", "SAVEPOINT a"),
+    ("release a savepoint", "RELEASE SAVEPOINT a"),
+    ("roll back to a savepoint", "ROLLBACK TO SAVEPOINT a"),
+    ("read a sequence's current value", "SELECT currval('s')"),
+    ("read the last insert id", "SELECT last_insert_id()"),
+    ("named argument", "SELECT make_interval(days := 10)"),
+    ("replace into", "REPLACE INTO t (a) VALUES (1)"),
+    (
+        "insert or replace",
+        "INSERT OR REPLACE INTO t (a) VALUES (1)",
+    ),
+    ("select for update", "SELECT a FROM t FOR UPDATE"),
+    (
+        "insert on conflict",
+        "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING",
+    ),
+    ("pragma read", "PRAGMA table_info(t)"),
     ("empty", ""),
     ("whitespace only", "   "),
     ("line comment only", "-- nothing"),
@@ -211,7 +253,7 @@ fn sql_engines() -> impl Iterator<Item = Engine> {
 
 /// Every `(engine, case, text)` the corpus records, in the order it records
 /// them: `Engine::ALL`, then the kinds, skipping what an engine has no text for.
-pub(super) fn sql_cells() -> Vec<(Engine, String, String)> {
+pub(crate) fn sql_cells() -> Vec<(Engine, String, String)> {
     sql_engines()
         .flat_map(|engine| {
             SQL_KINDS.iter().filter_map(move |(case, sql)| {
