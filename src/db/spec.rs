@@ -315,6 +315,19 @@ pub struct SqlSpec {
     pub local_table_engines: Option<&'static [&'static str]>,
     /// Nothing outlives one request, so no statement leaves state behind.
     pub stateless_requests: bool,
+    /// Functions whose effect the server-side Read-only hold does not stop, so
+    /// the verdict has to: a call to one needs more than Read-only wherever it
+    /// sits in the statement. A deny-list of named functions, not an allow-list
+    /// of safe ones -- a function that is not here, a user-defined one included,
+    /// stays a read. Lower-case, matched against the name as written.
+    pub denied_functions: &'static [&'static str],
+    /// Session settings that change nothing a Read-only profile protects, so
+    /// setting one stays a read: navigation and comfort. Every other setting a
+    /// user's own `SET` names is stopped, because the hold's whole value is
+    /// being hard to remove and each dialect has more settings than anyone has
+    /// listed. Lower-case, matched case-insensitively against the name once its
+    /// `@@` prefix and scope part are gone.
+    pub plain_settings: &'static [&'static str],
     /// Whether a transaction can be opened at all. Without one a generated
     /// multi-row batch is not bracketed, whatever `transaction` says.
     pub transactions: bool,
@@ -359,6 +372,8 @@ impl SqlSpec {
         unreadable_floor: UnreadableFloor::None,
         local_table_engines: None,
         stateless_requests: false,
+        denied_functions: &[],
+        plain_settings: &[],
         transactions: true,
         row_terms: false,
     };
@@ -742,6 +757,180 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::PostgreSql,
         regex: RegexMatch::Tilde,
         read_only_session: ReadOnlySession::DefaultTransaction,
+        // The armed `default_transaction_read_only` stops none of these, and
+        // `set_config` turns it off. Reading a file the role may read is not
+        // here: that is a read, and how DBDelve opens its own files.
+        //
+        // The large-object writers persist and rewrite stored data under the
+        // armed hold (reproduced live: `lo_from_bytea`, `lo_put` and
+        // `lo_truncate` each took effect). `lo_get` and `loread` are absent
+        // because reading an object is a read. The recovery and replication
+        // controls (`pg_promote`, `pg_wal_replay_pause`, the replication slot
+        // calls) are absent too: they need a superuser or a replication role,
+        // none was reproduced against the dev server, and they control
+        // recovery rather than stored data. The live differential asks the
+        // server's catalog for the large-object family, so a writer a later
+        // version adds fails there by name, provided the server it probes is
+        // that later version: the family was checked against Postgres 15.13.
+        //
+        // A function that executes its text argument as a query reaches any
+        // listed call through a name the token scan cannot read, because the
+        // call sits inside a string: `query_to_xml('select set_config(...)')`
+        // released the hold on the dev server, and `query_to_xml('select
+        // lo_from_bytea(...)')` wrote a large object with it armed. SPI's
+        // read-only mode refuses DML inside that text and refuses none of the
+        // listed functions, which is why the carrier works where
+        // `query_to_xml('delete ...')` does not. `query_to_xml`,
+        // `query_to_xml_and_xmlschema`, `query_to_xmlschema` and `ts_stat`
+        // are carriers found so far, because the server's catalog names their
+        // text argument `query` or `sqlquery`; the carrier is listed, never
+        // the text it carries. The live differential asks the catalog for
+        // that shape, so a function a later version adds with such an
+        // argument fails there by name.
+        //
+        // `ts_rewrite(tsquery, text)` is another, and the catalog does not
+        // name its text argument: both overloads carry no argument names.
+        // Its second argument is run as a query through SPI, so a listed call
+        // carried there reaches the server the same way (reproduced live,
+        // once releasing the hold and once creating a large object with it
+        // armed). The shape probe cannot see it, so an explicit pin in the
+        // differential holds it by name. The three-argument
+        // `ts_rewrite(tsquery, tsquery, tsquery)` overload runs no text, and
+        // the name stops it as well: an over-classification whose direction
+        // is an upgrade prompt, one of the accepted false positives listed
+        // in the advisory's `What users will see`.
+        //
+        // These are the carriers found so far, not a closed set, and the
+        // probe sees only those whose text argument the catalog names. A
+        // type-shape probe (every `pg_catalog` function taking a `text`
+        // argument the catalog leaves unnamed) was measured against Postgres
+        // 15.13 and returned 222 distinct names where this list then held 47;
+        // dispositioning that many by hand would be a second deny-list with
+        // no evidence behind its entries, so the probe keeps its
+        // named-argument query.
+        //
+        // `tablefunc`'s `crosstab` runs its source query through SPI, so a
+        // listed call carried there reaches the server (reproduced on the
+        // compose Postgres 15.13 in a scratch database, once releasing the
+        // hold and once writing a large object with it armed). It lives in an
+        // extension outside `pg_catalog`, so neither catalog probe in
+        // `conformance.rs` can see it; `live_extension_carriers_agree_with_the_server`
+        // in `src/db/postgres.rs` pins it against the extension's own catalog
+        // instead. Listing it means a `crosstab` pivot asks for Read-write on
+        // a Read-only profile, an accepted cost recorded in the advisory.
+        // `crosstab2` to `crosstab4` are `crosstab` with fixed result types and
+        // the same implementation. `tablefunc`'s `connectby` splices its
+        // relation and column arguments into the query it runs, so a
+        // parenthesised `select` given as the relation runs. `xml2`'s
+        // `xpath_table` splices its relation and criteria the same way
+        // (reproduced writing a large object under the armed hold). The rest
+        // of each extension's members are carved out by name in the live test
+        // with what each does instead. The `dblink` names are pinned the same
+        // way, and have no live case because what they run, they run in
+        // another session the local hold never covered. `dblink_open` is
+        // listed with them: it declares a cursor over the SQL text it is
+        // handed.
+        //
+        // PostGIS is asked by shape, because it is the extension the dev
+        // server has installed: its SQL and PL/pgSQL members whose source runs
+        // `EXECUTE`. `st_findextent` splices its column argument inside double
+        // quotes unescaped, so a quote closes the identifier and what follows
+        // runs, and it wrote a large object with the hold armed (reproduced
+        // live). The other six members that match escape every argument. The
+        // survey stops there: PostGIS's C members cannot be seen by a catalog
+        // shape, and `postgis_raster`, `postgis_topology` and
+        // `postgis_tiger_geocoder` were not surveyed. A function in an
+        // extension nobody has surveyed stays a read until it is listed, as
+        // an unlisted call does everywhere else. The catalog lists were
+        // checked against Postgres 15.13 (Debian 15.13-1.pgdg110+1).
+        denied_functions: &[
+            "set_config",
+            "nextval",
+            "setval",
+            "pg_advisory_lock",
+            "pg_advisory_lock_shared",
+            "pg_advisory_xact_lock",
+            "pg_advisory_xact_lock_shared",
+            "pg_try_advisory_lock",
+            "pg_try_advisory_lock_shared",
+            "pg_try_advisory_xact_lock",
+            "pg_try_advisory_xact_lock_shared",
+            "pg_advisory_unlock",
+            "pg_advisory_unlock_shared",
+            "pg_advisory_unlock_all",
+            "pg_notify",
+            "pg_terminate_backend",
+            "pg_cancel_backend",
+            "pg_reload_conf",
+            "pg_rotate_logfile",
+            "pg_switch_wal",
+            "pg_create_restore_point",
+            "pg_stat_reset",
+            "pg_stat_reset_shared",
+            "pg_stat_reset_single_table_counters",
+            "pg_stat_reset_single_function_counters",
+            "pg_stat_reset_slru",
+            "pg_stat_reset_replication_slot",
+            "lo_create",
+            "lo_import",
+            "lo_export",
+            "lo_unlink",
+            "lo_from_bytea",
+            "lo_put",
+            "lo_creat",
+            "lowrite",
+            "lo_truncate",
+            "lo_truncate64",
+            "query_to_xml",
+            "query_to_xml_and_xmlschema",
+            "query_to_xmlschema",
+            "ts_stat",
+            "ts_rewrite",
+            "crosstab",
+            "crosstab2",
+            "crosstab3",
+            "crosstab4",
+            "connectby",
+            "xpath_table",
+            "dblink",
+            "dblink_exec",
+            "dblink_connect",
+            "dblink_connect_u",
+            "dblink_send_query",
+            "dblink_open",
+            "st_findextent",
+        ],
+        // What a user's own `SET` may change on a Read-only profile without
+        // asking. Left off on purpose: the hold's own two names, `role` and
+        // `session_authorization`, the switches that turn the server's checks
+        // off, and everything that changes how a quote or a backslash is read.
+        plain_settings: &[
+            "search_path",
+            "timezone",
+            "statement_timeout",
+            "lock_timeout",
+            "idle_in_transaction_session_timeout",
+            "idle_session_timeout",
+            "application_name",
+            "extra_float_digits",
+            "datestyle",
+            "intervalstyle",
+            "client_min_messages",
+            "bytea_output",
+            "lc_monetary",
+            "lc_numeric",
+            "lc_time",
+            "default_text_search_config",
+            "work_mem",
+            "jit",
+            "random_page_cost",
+            "max_parallel_workers_per_gather",
+            "enable_seqscan",
+            "default_transaction_isolation",
+            "default_transaction_deferrable",
+            "transaction_isolation",
+            "xmloption",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -800,6 +989,32 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpLike,
         read_only_session: ReadOnlySession::SessionTransaction,
+        // The armed read-only transaction stops none of the named-lock calls.
+        // No sequences, so no `nextval`.
+        denied_functions: &["get_lock", "release_lock", "release_all_locks"],
+        // Left off on purpose: both spellings of the hold, the server-wide
+        // switches, and `sql_mode`, whose `NO_BACKSLASH_ESCAPES` and
+        // `ANSI_QUOTES` change how every later statement is lexed and are not
+        // stopped by the armed hold.
+        plain_settings: &[
+            "time_zone",
+            "autocommit",
+            "max_execution_time",
+            "sql_select_limit",
+            "wait_timeout",
+            "interactive_timeout",
+            "lock_wait_timeout",
+            "innodb_lock_wait_timeout",
+            "net_read_timeout",
+            "net_write_timeout",
+            "group_concat_max_len",
+            "lc_time_names",
+            "div_precision_increment",
+            "default_week_format",
+            "transaction_isolation",
+            "sql_big_selects",
+            "max_join_size",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -861,6 +1076,40 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpInstr,
         read_only_session: ReadOnlySession::SessionTransaction,
+        // The armed read-only transaction stops none of the named-lock calls;
+        // it does refuse a sequence advance, but a held session is not the
+        // boundary.
+        denied_functions: &[
+            "get_lock",
+            "release_lock",
+            "release_all_locks",
+            "nextval",
+            "setval",
+        ],
+        // The same list as MySQL's with the names MariaDB spells differently:
+        // `max_statement_time` for the statement timeout, and `tx_isolation`
+        // beside `transaction_isolation`. Its `tx_read_only` is a hold name and
+        // stays off, as `transaction_read_only` does.
+        plain_settings: &[
+            "time_zone",
+            "autocommit",
+            "max_statement_time",
+            "sql_select_limit",
+            "wait_timeout",
+            "interactive_timeout",
+            "lock_wait_timeout",
+            "innodb_lock_wait_timeout",
+            "net_read_timeout",
+            "net_write_timeout",
+            "group_concat_max_len",
+            "lc_time_names",
+            "div_precision_increment",
+            "default_week_format",
+            "transaction_isolation",
+            "tx_isolation",
+            "sql_big_selects",
+            "max_join_size",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -917,6 +1166,13 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
         substring: SubstringMatch::Instr,
         // No `generated_defaults`: `table_info` leaves generated columns out
         // altogether.
+        // Inert while `rusqlite` is built without its `load_extension`
+        // feature, and listed so enabling it cannot quietly open a hole.
+        denied_functions: &["load_extension"],
+        // No `plain_settings`, deliberately: SQLite has no `SET` statement. It
+        // configures through `PRAGMA`, a different statement type that already
+        // needs Full, so a `SET` here is one the server rejects and stopping it
+        // costs nobody a working statement.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -961,6 +1217,11 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
         },
         parser_dialect: ParserDialect::Sqlite,
         substring: SubstringMatch::Instr,
+        // Inert for the same reason as SQLite's. The rest of Turso's function
+        // set has not been surveyed.
+        denied_functions: &["load_extension"],
+        // No `plain_settings`, for the reason SQLite has none: configuration is
+        // `PRAGMA`, which is already Full, and there is no `SET` to allow.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1010,6 +1271,48 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // `explain.rs` does not read yet. No `read_only_session`: an open
         // database has no session switch; read-only is a way to open the
         // file, which a profile does not ask for yet.
+        // Nothing holds a session read-only, so an advance on a sequence runs,
+        // and the classifier is the only thing between a statement and its
+        // effect. The text executors were observed, not assumed, on the
+        // embedded build `SELECT version()` reports as `v2.0.0-dev88614`
+        // (crate `duckdb` 1.20000.0), with the sequence counter as the canary:
+        // `SELECT * FROM query('select nextval(...)')` moved it from 3 to 4,
+        // and `SELECT * FROM json_execute_serialized_sql(json_serialize_sql(
+        // 'select nextval(...)'))` moved it from 4 to 5, so both are listed.
+        // `query_table` is not: it resolves its argument as a table name and
+        // refuses the rest (`query_table('select 1')` answers "Table with name
+        // select 1 does not exist"), so it runs no text and listing it would
+        // only stop a read. `json_serialize_sql` and `json_deserialize_sql`
+        // turn text into JSON and back and run nothing. `duckdb_functions()`
+        // shows no other function with an argument named like a query. A
+        // listed name followed by a parenthesis is a call and stopped; one
+        // after a period is a column reference and a read, except
+        // `nextval`, which `MEMBER_FORMS` keeps for Snowflake's spelling and
+        // which therefore also stops a column called `t.nextval` here. What
+        // is left of the cost of listing `query` is the name used as a CTE
+        // name or a derived-table alias with a column list, which is followed
+        // by a parenthesis and stopped until the profile is upgraded; both
+        // are recorded in the corpus as accepted false positives.
+        denied_functions: &["nextval", "setval", "query", "json_execute_serialized_sql"],
+        // Names verified in `duckdb_settings()`. The configuration ratchets
+        // (`enable_external_access`, `lock_configuration`) are left off on
+        // purpose: once set they cannot be undone, and one in a user's buffer
+        // would end DBDelve's own CSV, Parquet and Excel opening for the rest
+        // of the session. The extension, directory and secret settings are off
+        // for the same reason.
+        plain_settings: &[
+            "threads",
+            "memory_limit",
+            "max_memory",
+            "timezone",
+            "calendar",
+            "search_path",
+            "schema",
+            "default_order",
+            "default_null_order",
+            "preserve_insertion_order",
+            "enable_progress_bar",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1076,6 +1379,36 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // shape `explain.rs` does not read yet. No `read_only_session`: there
         // is no session to set anything on. No `generated_defaults`: an
         // identity takes a supplied value.
+        // `seq.nextval` is no call at all, which the scan reads off the period
+        // before the name. Procedures are `CALL` statements, already Full.
+        // Unlike the Postgres and DuckDB lists, this one was built by documentation:
+        // the `SYSTEM$` control entries come from Snowflake's published function
+        // reference, and none was run, because no live Snowflake account is
+        // reachable from this repository's test environment and the mock in
+        // `snowflake/mock.rs` carries no function catalog. There is no read-only
+        // session to hold the rest, so on this engine the list is the whole
+        // boundary, and it is not an enumerated family: `SYSTEM$` has further
+        // members this list does not name. Listing them from documentation would
+        // be a long list with no evidence behind any entry, so it stays best-effort
+        // in the sense `calls_denied_function` states. A prefix rule, stopping
+        // any `system$` word followed by a parenthesis, was weighed and not
+        // taken: it would be a second matching mechanism for one engine where
+        // the list names functions, and it would stop the read-only `SYSTEM$`
+        // helpers on every Read-only profile with no evidence about which
+        // members write. The residual is stated for users in the advisory's
+        // `What users will see`.
+        denied_functions: &[
+            "system$cancel_all_queries",
+            "system$cancel_query",
+            "system$abort_session",
+            "system$abort_transaction",
+            "nextval",
+            "getnextval",
+        ],
+        // No `plain_settings`, deliberately: nothing a `SET` sets outlives one
+        // request on the SQL API, which answers even `USE` with a refusal, so
+        // an allow-list would protect nothing. A `SET` here prompts and
+        // changes nothing; the one extra arm is cheaper than a special case.
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1152,6 +1485,34 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         // `read_only_session`: no session-level switch exists.
         // `ApplicationIntent=ReadOnly` routes a login to a readable replica
         // and is ignored by a primary.
+        // The pass-through table functions run a statement on another server,
+        // and nothing holds a session read-only. A scalar function cannot have
+        // a side effect in T-SQL, so none is listed.
+        denied_functions: &["openquery", "openrowset", "opendatasource"],
+        // Names from the engine's own category table. Left off on purpose:
+        // `quoted_identifier`, which is read at parse time and changes how a
+        // double quote is read, `implicit_transactions`, which DBDelve's
+        // auto-commit switch relies on, and `identity_insert`. `set statistics`
+        // and `set transaction isolation level` are read from the parse
+        // instead, not from here.
+        plain_settings: &[
+            "nocount",
+            "rowcount",
+            "textsize",
+            "language",
+            "dateformat",
+            "datefirst",
+            "deadlock_priority",
+            "lock_timeout",
+            "arithabort",
+            "arithignore",
+            "numeric_roundabort",
+            "ansi_nulls",
+            "ansi_padding",
+            "ansi_warnings",
+            "concat_null_yields_null",
+            "xact_abort",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1195,6 +1556,8 @@ pub(crate) const MONGODB: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
+    // No `denied_functions` or `plain_settings`: this is not SQL, and its own
+    // closed tables decide what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,
@@ -1237,6 +1600,8 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
         user: "Optional",
         ..Hints::DEFAULT
     },
+    // No `denied_functions` or `plain_settings`: this is not SQL, and its own
+    // closed tables decide what a Read-only profile may run.
     sql: SqlSpec::ANSI,
     abilities: Abilities {
         edits: true,
@@ -1360,6 +1725,39 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
         // there is no analyzing form, and no `skip_duplicates`: there is no
         // clause that skips a row on a key, because there is no unique key.
         explain_plan: Some(ExplainPrefix::Explain),
+        // Empty is a position here, not the default: no ClickHouse function
+        // writes from inside a `SELECT`. The table functions that reach outside
+        // the database (`url`, `s3`, `remote`, `executable`) are plain reads by
+        // the owner's decision (`docs/agents/engines.md`), and `INSERT INTO
+        // FUNCTION` is Full by statement in `spec_verdict`, so neither belongs
+        // on a list of calls to raise.
+        denied_functions: &[],
+        // What a user's own `SET` may change on a Read-only profile without
+        // asking, chosen as Postgres's and DuckDB's lists are: navigation and
+        // comfort. `readonly=2` already refuses a change to `readonly`, but it
+        // is the driver's per-request hold, so the verdict does not lean on it
+        // and the name stays off. Left off on purpose, each for its own reason:
+        // `readonly` and `max_execution_time` (the driver sends both on a
+        // request, and the second is the bound a profile's timeout sets),
+        // `format_tsv_null_representation` and `enable_http_compression` (the
+        // driver decodes its answers by them), every `allow_*` switch (each
+        // turns a server check off), and anything that changes who the session
+        // is or how text is lexed. A name not listed is stopped rather than
+        // assumed harmless.
+        plain_settings: &[
+            // Parallelism and block size change how fast a read runs, not what
+            // it reads.
+            "max_threads",
+            "max_block_size",
+            // A cap on one query's memory, the counterpart of DuckDB's
+            // `memory_limit`.
+            "max_memory_usage",
+            // How a time is shown, the counterpart of Postgres's `timezone`.
+            "session_timezone",
+            // A label in the server's query log, the counterpart of Postgres's
+            // `application_name`.
+            "log_comment",
+        ],
         ..SqlSpec::ANSI
     },
     abilities: Abilities {

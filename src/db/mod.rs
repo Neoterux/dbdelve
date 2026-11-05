@@ -140,6 +140,23 @@ pub enum Engine {
     Generic,
 }
 
+/// The words an engine's plans use for each kind of number they can carry:
+/// what its measurements are and what its costs are. `None` where the engine's
+/// plans carry no such number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanBasis {
+    pub measured: Option<&'static str>,
+    pub cost: Option<&'static str>,
+}
+
+impl PlanBasis {
+    /// Plans that are structure only.
+    const NONE: Self = Self {
+        measured: None,
+        cost: None,
+    };
+}
+
 /// The shape of a connection's details. The form draws one of these and never
 /// asks which engine it is drawing for (hard rule 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,6 +449,52 @@ impl Engine {
         }
     }
 
+    /// What the numbers in this engine's plans are, as the words the plan
+    /// header says them in. A plan view names its engine and its basis from
+    /// here and never asks which engine it is drawing (hard rule 4).
+    ///
+    /// An arm per engine and no wildcard, so an engine added later cannot
+    /// compile without taking a position on what its plans carry.
+    pub fn plan_basis(self) -> PlanBasis {
+        match self {
+            // `EXPLAIN ANALYZE` prints `actual time` in milliseconds, and the
+            // planner's cost is in arbitrary units that only compare within
+            // one plan.
+            Self::Postgres => PlanBasis {
+                measured: Some("measured (ms)"),
+                cost: Some("planner cost, arbitrary units"),
+            },
+            // The `FORMAT=TREE` plan prints one cost figure per node and, under
+            // `EXPLAIN ANALYZE`, `actual time` in milliseconds.
+            Self::MySql => PlanBasis {
+                measured: Some("measured (ms)"),
+                cost: Some("planner cost, single figure"),
+            },
+            // Tabular in both modes: row estimates and `r_rows`, no cost and no
+            // time a node could be weighed by.
+            Self::MariaDb => PlanBasis::NONE,
+            // `EXPLAIN QUERY PLAN` is a tree of steps and nothing else.
+            Self::Sqlite => PlanBasis::NONE,
+            // Never asked for a plan: `explain_prefix` is `None` for each of
+            // these.
+            Self::Turso | Self::DuckDb | Self::Snowflake | Self::SqlServer | Self::Redis => {
+                PlanBasis::NONE
+            }
+            // `executionStats` stages carry `executionTimeMillisEstimate`, whole
+            // milliseconds that are estimates, and `queryPlanner` carries no
+            // number a node could be weighed by.
+            Self::MongoDb => PlanBasis {
+                measured: Some("integer-millisecond estimates"),
+                cost: None,
+            },
+            // `EXPLAIN` prints operators as box-drawn text with no cost and no
+            // timing (D-19): structure only.
+            Self::ClickHouse => PlanBasis::NONE,
+            // Its spec has no `explain_plan`: never asked for a plan.
+            Self::Generic => PlanBasis::NONE,
+        }
+    }
+
     /// The word that opens a transaction around a generated multi-statement
     /// batch, or `None` for the engine that already makes one submission
     /// atomic. `COMMIT` and `ROLLBACK` are spelled the same everywhere, so the
@@ -443,6 +506,43 @@ impl Engine {
             // says which rows already did. Redis's `MULTI` queues commands
             // without rolling back the ones that fail inside it.
             Syntax::Mongo | Syntax::Redis => None,
+        }
+    }
+
+    /// How a transaction the user drives is opened on this engine, for the
+    /// `BEGIN` Begin Transaction writes into their buffer. `None` where there
+    /// is none to drive.
+    ///
+    /// Not [`Engine::transaction_start`], which answers a different question:
+    /// whether a *generated* batch needs brackets of its own. Postgres needs
+    /// none there, because one submission is already one implicit
+    /// transaction, and still opens a transaction here, because an explicit
+    /// `BEGIN` is held across submissions by the session. Keeping them apart
+    /// is the point; collapsing them would silently stop opening transactions
+    /// on Postgres. An explicit arm per engine for the reason
+    /// `transaction_start` has one.
+    pub fn begins_transaction(self) -> Option<&'static str> {
+        match self {
+            Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::Sqlite
+            | Self::Turso
+            | Self::DuckDb
+            | Self::Snowflake => Some("BEGIN"),
+            // A bare `BEGIN` opens a statement block in T-SQL, not a
+            // transaction, and this spelling is the one the gate reads.
+            Self::SqlServer => Some("BEGIN TRANSACTION"),
+            // `MULTI` queues commands and rolls none of them back, and
+            // MongoDB's transactions need a client session dbdelve does not
+            // hold open across statements.
+            Self::MongoDb | Self::Redis => None,
+            // Its spec says `transactions: false`: no statement opens one that
+            // a later submission could close, so there is nothing to drive.
+            Self::ClickHouse => None,
+            // A plugin's server is not known to read `BEGIN` as opening a
+            // transaction (Db2 has no such statement), so none is driven.
+            Self::Generic => None,
         }
     }
 
@@ -4238,6 +4338,22 @@ mod tests {
             Engine::MongoDb.explain_suffix(ExplainMode::Analyze),
             r#".explain("executionStats")"#
         );
+    }
+
+    #[test]
+    fn every_engine_takes_a_position_on_its_plan_basis() {
+        for engine in Engine::ALL {
+            let basis = engine.plan_basis();
+            // An engine nothing is asked a plan of has no number to name.
+            if engine.explain_prefix(ExplainMode::Plan).is_none() {
+                assert_eq!(basis, PlanBasis::NONE, "{}", engine.label());
+            }
+        }
+        assert_eq!(Engine::ClickHouse.plan_basis(), PlanBasis::NONE);
+        assert_eq!(Engine::Sqlite.plan_basis(), PlanBasis::NONE);
+        assert_eq!(Engine::MariaDb.plan_basis(), PlanBasis::NONE);
+        assert!(Engine::Postgres.plan_basis().cost.is_some());
+        assert!(Engine::MongoDb.plan_basis().cost.is_none());
     }
 
     #[test]

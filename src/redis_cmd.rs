@@ -7,9 +7,11 @@
 //! addition; redis-cli would send it.
 //!
 //! Classifying a command is a lookup by its name (and subcommand, where the
-//! word after the name decides: `CONFIG GET` reads, `CONFIG SET` is
-//! destructive). The server has no Read-only hold to fall back on, so this is
-//! the whole boundary, and a name the table does not know is unreadable.
+//! word after the name decides: `CONFIG GET` writes nothing and is
+//! rated a write for what it returns, `requirepass` and `masterauth`, while
+//! `CONFIG SET` is destructive). The server has no Read-only hold to fall back
+//! on, so this is the whole boundary, and a name the table does not know is
+//! unreadable.
 
 use std::ops::Range;
 
@@ -326,7 +328,24 @@ pub(crate) fn leaves(text: &str) -> Leaves {
             "MULTI" => leaves.transaction = Some(true),
             "EXEC" | "DISCARD" => leaves.transaction = Some(false),
             "WATCH" | "AUTH" | "READONLY" | "READWRITE" => leaves.settings = true,
-            "CLIENT" if kind(&command) == Some(Kind::Write) => leaves.settings = true,
+            // By name, not by verdict: `CLIENT LIST` is a write for what it
+            // discloses, and says nothing about the session it is run on.
+            "CLIENT"
+                if matches!(
+                    command.subcommand().as_str(),
+                    "KILL"
+                        | "UNPAUSE"
+                        | "SETNAME"
+                        | "SETINFO"
+                        | "NO-EVICT"
+                        | "NO-TOUCH"
+                        | "TRACKING"
+                        | "CACHING"
+                        | "UNBLOCK"
+                ) =>
+            {
+                leaves.settings = true
+            }
             _ => {}
         }
     }
@@ -357,16 +376,26 @@ fn kind(command: &Command) -> Option<Kind> {
     let sub = command.subcommand();
     use Kind::*;
     Some(match (name.as_str(), sub.as_str()) {
-        ("CONFIG", "GET" | "HELP") => Read,
+        ("CONFIG", "HELP") => Read,
+        // These two answer with what a Read-only profile should not be handed
+        // unasked: `requirepass` and `masterauth`, and every connected
+        // client's address and name. The line is drawn at them and no wider.
+        // Their siblings stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`,
+        // `ID`, `GETNAME`, `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do
+        // commands elsewhere that do disclose something: the password hashes
+        // `ACL LIST` and `ACL GETUSER` return, and the client fields in
+        // `ACL LOG` and `SLOWLOG GET`. The rule is deliberately limited to
+        // plaintext secrets and client enumeration, and those are knowingly
+        // left as reads. Widening it changes what a Read-only profile may run,
+        // which is a product decision that has not been made.
+        ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
-        ("CLIENT", "LIST" | "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => {
-            Read
-        }
+        ("CLIENT", "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => Read,
         (
             "CLIENT",
-            "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
-            | "CACHING" | "UNBLOCK",
+            "LIST" | "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH"
+            | "TRACKING" | "CACHING" | "UNBLOCK",
         ) => Write,
         ("SCRIPT", "EXISTS" | "HELP") => Read,
         ("SCRIPT", "LOAD" | "KILL") => Write,
@@ -960,10 +989,12 @@ mod tests {
             ("GET a", &read),
             ("hgetall h", &read),
             ("SCAN 0 MATCH user:* COUNT 100", &read),
-            ("CONFIG GET maxmemory", &read),
+            ("CONFIG GET maxmemory", &write),
+            ("CONFIG HELP", &read),
             ("config set maxmemory 1", &drop),
             ("CONFIG REWRITE", &drop),
-            ("CLIENT LIST", &read),
+            ("CLIENT LIST", &write),
+            ("CLIENT ID", &read),
             ("CLIENT KILL ID 4", &write),
             ("SCRIPT EXISTS abc", &read),
             ("SCRIPT FLUSH", &drop),
@@ -1042,11 +1073,53 @@ mod tests {
     }
 
     #[test]
+    fn a_disclosing_command_has_the_same_verdict_first_or_last_in_a_buffer() {
+        for (first, second) in [
+            ("CONFIG GET requirepass", "GET a"),
+            ("CLIENT LIST", "GET a"),
+        ] {
+            let forward = classify(&format!("{first}\n{second}"));
+            assert_eq!(forward, Verdict::WRITE, "{first} then {second}");
+            assert_eq!(
+                classify(&format!("{second}\n{first}")),
+                forward,
+                "{second} then {first}"
+            );
+        }
+    }
+
+    #[test]
     fn a_multi_holds_its_session_until_exec_or_discard() {
         assert_eq!(leaves("MULTI").transaction, Some(true));
         assert_eq!(leaves("EXEC").transaction, Some(false));
         assert_eq!(leaves("DISCARD").transaction, Some(false));
         assert!(leaves("CLIENT SETNAME me").settings);
         assert_eq!(leaves("GET a"), Leaves::default());
+    }
+
+    #[test]
+    fn the_two_commands_that_return_secrets_are_split_from_their_siblings_by_name() {
+        let write = Verdict::WRITE;
+        for text in ["config get requirepass", "CLIENT LIST TYPE normal"] {
+            assert_eq!(classify(text), write, "{text}");
+        }
+        for text in [
+            "CONFIG HELP",
+            "CLIENT ID",
+            "CLIENT INFO",
+            "CLIENT GETNAME",
+            "CLIENT GETREDIR",
+            "CLIENT TRACKINGINFO",
+            "CLIENT HELP",
+        ] {
+            assert_eq!(classify(text), Verdict::READ, "{text}");
+        }
+    }
+
+    #[test]
+    fn listing_clients_leaves_no_session_setting_but_naming_one_does() {
+        assert_eq!(leaves("CLIENT LIST"), Leaves::default());
+        assert!(leaves("CLIENT SETNAME me").settings);
+        assert!(leaves("CLIENT NO-TOUCH ON").settings);
     }
 }

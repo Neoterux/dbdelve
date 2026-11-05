@@ -198,6 +198,7 @@ impl Workspace {
             generation: 0,
             state: ProfileState::Idle,
             in_transaction: false,
+            auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
@@ -255,6 +256,7 @@ impl Workspace {
             generation: 0,
             state: ProfileState::Idle,
             in_transaction: false,
+            auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
@@ -1576,6 +1578,10 @@ impl Workspace {
         profile.generation = generation;
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
+        // The transaction it was holding died with the session, and silently
+        // opening another on a connection the user has just watched drop is
+        // the kind of surprise this feature exists to avoid.
+        profile.auto_commit = true;
         profile.session_changed = false;
         profile.catalog = CatalogState::Loading;
         // Every structure still out was asked on the old generation, and

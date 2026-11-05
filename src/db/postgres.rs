@@ -2861,6 +2861,9 @@ mod tests {
         row_limit_drains_an_ineligible_read,
         capped_read_keeps_the_users_transaction,
         read_only_session_refuses_a_write,
+        denied_functions_agree_with_the_server,
+        session_settings_agree_with_the_server,
+        comment_forms_agree_with_the_server,
         generated_writes_round_trip,
     );
 
@@ -3374,6 +3377,359 @@ mod tests {
         .expect("databases should list");
 
         assert_eq!(databases.current.as_deref(), Some("postgres"));
+    }
+
+    /// The extension carriers the Postgres deny-list names, run against the
+    /// server with the Read-only hold armed. It works in a database of its own
+    /// because the dev database is shared and an extension is database-wide,
+    /// and it needs a role that can create a database and install an
+    /// untrusted extension, which is a superuser on the compose server. The
+    /// database is dropped before it is created and again when the test ends,
+    /// so a run stopped by a signal costs a re-run and not a manual cleanup.
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_extension_carriers_agree_with_the_server() {
+        use crate::db::{CancelToken as Cancel, Connection as Any};
+        use crate::sql;
+
+        // Named for this test alone, and large objects live per database, so
+        // nothing another scenario writes can collide with the oids below.
+        const SCRATCH: &str = "dbdelve_carriers_975";
+        let at = "live_extension_carriers_agree_with_the_server";
+        let drop_scratch = format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)");
+
+        /// Drops the scratch database when the test ends, panicking or not.
+        /// The result is ignored: the test's own failure is the one worth
+        /// reading.
+        struct Scratch<'a>(&'a Any, String);
+        impl Drop for Scratch<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.query(&self.1, &Cancel::default(), Fetch::default());
+            }
+        }
+
+        let maintenance = live_profile();
+        for statement in [
+            drop_scratch.clone(),
+            format!("CREATE DATABASE {SCRATCH} TEMPLATE template0"),
+        ] {
+            maintenance
+                .query(&statement, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{at}: `{statement}` failed: {error}"));
+        }
+        // Declared after `maintenance` and before the scratch connection, so
+        // it drops between them: the drop's FORCE ends the scratch session.
+        let _scratch = Scratch(&maintenance, drop_scratch);
+        let scratch = Any::Postgres(
+            Connection::open(&ServerConfig {
+                database: SCRATCH.into(),
+                ..live_config()
+            })
+            .expect("the scratch database should open"),
+        );
+
+        let run = |sql: &str| {
+            scratch
+                .query(sql, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{at}: `{sql}` failed: {error}"))
+        };
+        let install = |statement: &str| {
+            scratch
+                .query(statement, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| {
+                    panic!("{at}: `{statement}` failed, so its probe did not run: {error}")
+                });
+        };
+        let rated = |sql: &str| sql::classify(Engine::Postgres, sql).mode;
+        let above_a_read = |sql: &str| {
+            assert!(
+                rated(sql) > sql::Mode::ReadOnly,
+                "{at}: `{sql}` is rated {:?}, which a Read-only profile would run",
+                rated(sql)
+            );
+        };
+        let hold = |on: bool| {
+            scratch
+                .set_read_only(on)
+                .unwrap_or_else(|error| panic!("{at}: {error}"));
+        };
+        let canary = format!("INSERT INTO {SCRATCH} (id) VALUES (975)");
+        let refused = || {
+            let error = scratch
+                .query(&canary, &Cancel::default(), Fetch::default())
+                .expect_err(&format!("{at}: the hold took a write it should refuse"));
+            assert!(
+                error.message.contains("read-only transaction"),
+                "{at}: refused for another reason: {}",
+                error.message
+            );
+        };
+        // The control: rated a read, runs on the held session, and the hold
+        // is still armed after it. Without it a server that refused
+        // everything would pass.
+        let controlled = || {
+            let control = "SELECT current_setting('search_path')";
+            assert_eq!(
+                rated(control),
+                sql::Mode::ReadOnly,
+                "{at}: control `{control}`"
+            );
+            hold(true);
+            run(control);
+            refused();
+            hold(false);
+        };
+        let cell = |result: &QueryResult| {
+            result
+                .rows
+                .first()
+                .and_then(|row| row.get(0))
+                .unwrap_or_else(|| panic!("{at}: no value came back"))
+                .to_string()
+        };
+
+        install("CREATE EXTENSION tablefunc");
+        install("CREATE EXTENSION xml2");
+        install("CREATE EXTENSION dblink");
+        install("CREATE EXTENSION postgis");
+        run(&format!("CREATE TABLE {SCRATCH} (id int)"));
+
+        // `crosstab` releasing the hold: the canary write is refused, the
+        // carrier runs, and the same write then goes through.
+        let disarm = "SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text)";
+        above_a_read(disarm);
+        hold(true);
+        refused();
+        run(disarm);
+        run(&canary);
+        hold(false);
+        controlled();
+        run(&format!("DELETE FROM {SCRATCH} WHERE id = 975"));
+
+        // Every case arms the hold, runs, asserts, lowers the hold and runs
+        // the control before the next begins, so the order of the cases
+        // decides nothing. The objects live in the scratch database and go
+        // with it, so there is no `lo_unlink`.
+        let carried_write = |case: &str, write: &str, oid: u32| {
+            let read_back = format!("SELECT convert_from(lo_get({oid}), 'UTF8')");
+            above_a_read(write);
+            hold(true);
+            run(write);
+            assert_eq!(
+                cell(&run(&read_back)),
+                "abc",
+                "{at}: the object was not created through {case} under the hold: `{write}`"
+            );
+            hold(false);
+            controlled();
+        };
+
+        // `crosstab` writing with nothing released.
+        carried_write(
+            "`crosstab`",
+            "SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text)",
+            975001,
+        );
+        // `connectby` splices its relation argument into the query it runs.
+        // The start value finds no child row, so the carried call runs once:
+        // a second run would fail on the oid the first had just created.
+        carried_write(
+            "`connectby`",
+            "SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int)",
+            975002,
+        );
+        // `xpath_table` splices its relation and criteria the same way.
+        carried_write(
+            "`xpath_table`",
+            "SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text)",
+            975003,
+        );
+        // PostGIS's `st_findextent` concatenates its column argument inside
+        // double quotes with no escaping, so a quote in the argument closes
+        // the identifier and what follows is SQL. It is declared STABLE, so
+        // its `EXECUTE` runs in SPI's read-only mode, which refuses DML and
+        // none of the listed functions. Listed only because this write read
+        // back as `abc` with the hold armed.
+        carried_write(
+            "`st_findextent`",
+            "SELECT st_findextent('t', 'a\") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --')",
+            975004,
+        );
+
+        // The catalog is the authority on what an extension owns. A name that
+        // neither list knows fails here by name, which is the point rather
+        // than a flake: a later version added a function, and what it does is
+        // a decision. An empty answer or one missing a carrier fails too, so
+        // a server without the extension cannot satisfy the pin. The names are
+        // inlined because `query` binds nothing.
+        let owned = |extension: &str, shape: &str| -> Vec<String> {
+            run(&format!(
+                "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::regclass \
+                 AND d.objid = p.oid AND d.deptype = 'e' \
+                 JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+                 JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+                 WHERE e.extname = '{extension}' AND ({shape}) ORDER BY 1"
+            ))
+            .rows
+            .iter()
+            .filter_map(|row| row.get(0).map(str::to_string))
+            .collect()
+        };
+        let listed = Engine::Postgres.spec().sql.denied_functions;
+        let pin = |extension: &str, shape: &str, carriers: &[&str], carved_out: &[&str]| {
+            let members = owned(extension, shape);
+            assert!(
+                !members.is_empty(),
+                "{at}: the catalog lists no function owned by {extension}"
+            );
+            for carrier in carriers {
+                assert!(
+                    members.iter().any(|name| name == carrier),
+                    "{at}: {extension} does not own `{carrier}`: {members:?}"
+                );
+                assert!(
+                    listed.contains(carrier),
+                    "{at}: `{carrier}` is a carrier owned by {extension} and is not on the deny-list"
+                );
+            }
+            let unknown: Vec<_> = members
+                .iter()
+                .filter(|name| {
+                    !listed.contains(&name.as_str()) && !carved_out.contains(&name.as_str())
+                })
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "{at}: functions owned by {extension} on neither the deny-list nor the carve-out: {unknown:?}"
+            );
+        };
+
+        // Measured against Postgres 15.13 (Debian 15.13-1.pgdg110+1) with
+        // `tablefunc` 1.0: 6 distinct names, 5 of them carriers above. A
+        // member a later version adds fails here by name, provided the server
+        // tested is that later version.
+        pin(
+            "tablefunc",
+            "TRUE",
+            &[
+                "crosstab",
+                "crosstab2",
+                "crosstab3",
+                "crosstab4",
+                "connectby",
+            ],
+            &[
+                // Returns rows of normally distributed random numbers from
+                // its numeric arguments and runs no SQL text.
+                "normal_rand",
+            ],
+        );
+        // Measured against the same server with `xml2` 1.1: 9 distinct
+        // names, one a carrier. Every other member takes a document and an
+        // XPath expression or stylesheet as strings and returns a value
+        // computed from them. None runs SQL text.
+        pin(
+            "xml2",
+            "TRUE",
+            &["xpath_table"],
+            &[
+                // Checks that a string is well-formed XML.
+                "xml_valid",
+                // Escapes the characters XML reserves in a string.
+                "xml_encode_special_chars",
+                // Evaluate an XPath expression against a document string and
+                // return the result as text, a node set, a number, a boolean
+                // or a list.
+                "xpath_string",
+                "xpath_nodeset",
+                "xpath_number",
+                "xpath_bool",
+                "xpath_list",
+                // Applies a stylesheet to a document string and runs no SQL
+                // text.
+                "xslt_process",
+            ],
+        );
+        // Measured against the same server with `dblink` 1.2: 21 distinct
+        // names, six of them carriers. No live case: what these run, they run
+        // in a second session the local hold never covered, so a differential
+        // against the hold would prove nothing about them. Their listing
+        // rests on the catalog and the install script. The carve-outs either
+        // act only on a connection or cursor that a listed call opened, which
+        // may have been opened before the profile was lowered to Read-only,
+        // or build or report text and run none.
+        pin(
+            "dblink",
+            "TRUE",
+            &[
+                "dblink",
+                "dblink_exec",
+                "dblink_connect",
+                "dblink_connect_u",
+                "dblink_send_query",
+                "dblink_open",
+            ],
+            &[
+                // Return statement text built from a relation's key columns
+                // and values. They run nothing.
+                "dblink_build_sql_delete",
+                "dblink_build_sql_insert",
+                "dblink_build_sql_update",
+                // Act on a named connection or cursor that a listed call
+                // opened: cancel its running query, close its cursor, fetch
+                // from its cursor, collect the result of its sent query.
+                "dblink_cancel_query",
+                "dblink_close",
+                "dblink_fetch",
+                "dblink_get_result",
+                "dblink_disconnect",
+                // Report on a connection: its state, its last error, its
+                // pending notifications, and which connections are open.
+                "dblink_is_busy",
+                "dblink_error_message",
+                "dblink_get_notify",
+                "dblink_get_connections",
+                // Returns the text of the session's own current query.
+                "dblink_current_query",
+                // Reads a local relation's primary-key columns from the
+                // catalog.
+                "dblink_get_pkey",
+                // Checks the options of a foreign server definition when the
+                // server is created.
+                "dblink_fdw_validator",
+            ],
+        );
+        // PostGIS 3.5.2 (`pg_extension.extversion`) owns 563 distinct
+        // function names. The probe asks for the ones written in SQL or
+        // PL/pgSQL whose source runs `EXECUTE`, and returned 7: `st_findextent`
+        // above and the six carved out below. Its boundary is that shape: a C
+        // member that runs text is outside it, and the PostGIS extensions the
+        // dev server does not install (`postgis_raster`, `postgis_topology`,
+        // `postgis_tiger_geocoder`, `postgis_sfcgal`) were neither installed
+        // nor surveyed here, so this is not a closure of PostGIS. A member a
+        // later version adds in this shape fails here by name.
+        pin(
+            "postgis",
+            "l.lanname IN ('plpgsql', 'sql') AND p.prosrc ~* 'execute'",
+            &["st_findextent"],
+            &[
+                // Each of these splices its arguments through `quote_ident`,
+                // `quote_literal` or `format`'s `%I`, so a quote in an
+                // argument stays inside the identifier or literal, and each
+                // runs DDL or a catalog lookup that the hold refuses.
+                "addgeometrycolumn",
+                "dropgeometrycolumn",
+                "dropgeometrytable",
+                "populate_geometry_columns",
+                // Runs `CREATE EXTENSION` and `ALTER EXTENSION` for the
+                // installed PostGIS extensions, with each name through `%I`.
+                "postgis_extensions_upgrade",
+                // Alters a constraint and updates a column through
+                // `quote_ident`; its new SRID is an integer.
+                "updategeometrysrid",
+            ],
+        );
     }
 
     #[test]
