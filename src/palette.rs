@@ -4859,6 +4859,14 @@ mod tests {
     }
 
     #[test]
+    fn a_visibility_command_is_never_remembered() {
+        for scope in [Scope::Commands, Scope::Connections] {
+            assert!(!remembered(scope, &Command::ShowToAgents(0)));
+            assert!(!remembered(scope, &Command::HideFromAgents(0)));
+        }
+    }
+
+    #[test]
     fn enter_on_an_unavailable_row_says_remove() {
         let (rows, projects) = with_unavailable();
         let items = listed_connections(&rows, &projects, 0);
