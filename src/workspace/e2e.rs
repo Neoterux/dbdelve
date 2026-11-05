@@ -118,6 +118,57 @@ fn launch_on_sqlite_holding<'a>(
     (workspace, cx)
 }
 
+/// The app launched on `profiles`, the `[[profiles]]` tables of a hand-written
+/// `profiles.toml`, with no profile chosen to be in front. `DB_PATH` in the text
+/// stands for the path of an empty SQLite file written beside it, so a test can
+/// say what a profile looks like on disk without knowing where the home is.
+fn launch_with_profiles<'a>(
+    cx: &'a mut TestAppContext,
+    profiles: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    let database = directory.join("e2e.db");
+    std::fs::write(&database, b"").expect("the database file must be creatable");
+    std::fs::write(
+        directory.join("profiles.toml"),
+        format!("[settings]\ncheck_for_updates = false\n{profiles}")
+            .replace("DB_PATH", &format!("{:?}", database.display().to_string())),
+    )
+    .expect("profiles.toml must be writable");
+    launch(cx)
+}
+
+/// One SQLite profile as `profiles.toml` spells it. `extra` is more scalar
+/// keys, which have to come before any table.
+fn sqlite_profile(id: &str, name: &str, extra: &str) -> String {
+    format!(
+        "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+         user = \"\"\nengine = \"sqlite\"\npath = DB_PATH\n{extra}\n"
+    )
+}
+
+fn agent_visible(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile was restored")
+            .agent_visible
+    })
+}
+
+fn saved_visible(id: &str) -> bool {
+    store::peek_profiles()
+        .expect("profiles.toml reads back")
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .expect("the profile was saved")
+        .agent_visible
+}
+
 /// The test platform has no frame loop: what the app leaves for the next
 /// frame, such as a dialog handing back the keyboard, waits for this.
 fn settle(cx: &mut VisualTestContext) {
@@ -2057,5 +2108,153 @@ fn a_service_launch_does_not_reuse_a_profiles_explicit_port(cx: &mut TestAppCont
             workspace.read_with(cx, |workspace, _| workspace.profile().unwrap().id.clone());
         quit(workspace, cx);
         assert_eq!(active, "inherited");
+    });
+}
+
+#[gpui::test]
+fn an_upgraded_profile_file_loads_every_profile_hidden_and_saves_it_unchanged(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        assert!(!agent_visible(&workspace, cx, "first"));
+        assert!(!agent_visible(&workspace, cx, "second"));
+        quit(workspace, cx);
+
+        let text =
+            std::fs::read_to_string(store::dbdelve_directory().unwrap().join("profiles.toml"))
+                .unwrap();
+        assert!(!text.contains("agent_visible"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn making_a_profile_visible_needs_the_prompt_and_survives_a_save(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        let set = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str, on| {
+            workspace.update(cx, |workspace, cx| workspace.set_agent_visible(id, on, cx));
+        };
+
+        // No dialog open: asking changes nothing, in memory or on disk.
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+        assert!(!saved_visible("first"));
+
+        // A dialog open for another profile grants nothing to this one, and
+        // is not used up by the refusal.
+        workspace.update(cx, |workspace, _| {
+            workspace.agent_visibility_prompt = Some("second".into());
+        });
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.agent_visibility_prompt.as_deref(), Some("second"));
+        });
+
+        // A prompt for a profile that does not exist grants nothing at all.
+        set(&workspace, cx, "missing", true);
+        assert!(!saved_visible("second"));
+
+        // The prompt for this profile grants it, once, and the grant is saved.
+        set(&workspace, cx, "second", true);
+        assert!(agent_visible(&workspace, cx, "second"));
+        assert!(saved_visible("second"));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.agent_visibility_prompt, None);
+        });
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+
+        // Hiding needs no prompt and lands at once.
+        set(&workspace, cx, "second", false);
+        assert!(!agent_visible(&workspace, cx, "second"));
+        assert!(!saved_visible("second"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("dev", "Dev", "agent_visible = true"));
+        let index = workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "dev")
+                .expect("the saved profile is restored");
+            workspace.activate(index, cx);
+            index
+        });
+        cx.run_until_parked();
+        assert!(agent_visible(&workspace, cx, "dev"));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::Full, cx)
+        });
+        assert!(agent_visible(&workspace, cx, "dev"));
+
+        let save = |workspace: &Entity<Workspace>,
+                    cx: &mut VisualTestContext,
+                    name: &str,
+                    duckdb: bool| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let config = if duckdb {
+                    crate::db::ConnectionConfig::duckdb(
+                        store::dbdelve_directory()
+                            .unwrap()
+                            .join("never-created.duckdb")
+                            .display()
+                            .to_string(),
+                        0,
+                    )
+                } else {
+                    workspace.profiles[index].config.clone()
+                };
+                workspace.save_profile("dev", name.into(), config, None, window, cx);
+            });
+        };
+        let notice = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .and_then(|profile| profile.session.notice.clone())
+            })
+        };
+
+        // A new name on the same engine is not a reason to hide anything.
+        save(&workspace, cx, "Renamed", false);
+        assert!(agent_visible(&workspace, cx, "dev"));
+        assert_ne!(
+            notice(&workspace, cx).as_deref(),
+            Some("Renamed is hidden from agents because its engine changed.")
+        );
+        assert!(saved_visible("dev"));
+
+        // A new engine invalidates what the dialog stated, so it hides and says so.
+        save(&workspace, cx, "Dev", true);
+        assert!(!agent_visible(&workspace, cx, "dev"));
+        assert_eq!(
+            notice(&workspace, cx).as_deref(),
+            Some("Dev is hidden from agents because its engine changed.")
+        );
+        assert!(!saved_visible("dev"));
+        quit(workspace, cx);
     });
 }
