@@ -2192,6 +2192,18 @@ impl Workspace {
             }
             None => row_icon(t, icon::DATABASE).into_any_element(),
         };
+        // A hidden connection is drawn exactly as it always was; only a visible
+        // one gains the marker, beside the logo that leads its name.
+        let active_logo = match self.profile() {
+            Some(profile) if profile.agent_visible => div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .child(active_logo)
+                .child(row_icon(t, icon::AGENT_VISIBLE))
+                .into_any_element(),
+            _ => active_logo,
+        };
         let project_name = self.current_group().map(str::to_string);
         let open_from_project = cx.listener(|workspace, _, window, cx| {
             workspace.open_connections(window, cx);
