@@ -2258,3 +2258,89 @@ fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppCon
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_hidden_profile_and_a_missing_one_answer_byte_for_byte_the_same(cx: &mut TestAppContext) {
+    use super::agent::AgentLookup;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("prod-hidden", "Prod", ""),
+                sqlite_profile("prod", "Prod", visible),
+                sqlite_profile("secret", "Secret", ""),
+                sqlite_profile("staging", "Staging", visible),
+                sqlite_profile("twin-1", "Twin", visible),
+                sqlite_profile("twin-2", "Twin", visible),
+                sqlite_profile("cafe", "Caf\u{e9}", visible),
+                // An engine this build cannot open is held back from the
+                // profile list, whatever it says about itself.
+                "[[profiles]]\nid = \"legacy\"\nname = \"Legacy\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"plugin:odbc\"\nagent_visible = true\n"
+                    .to_string(),
+            ]
+            .concat(),
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .profiles
+                    .iter()
+                    .all(|profile| profile.id != "legacy"),
+                "a profile this build cannot open is not in the list"
+            );
+
+            let unanswered = [
+                "Secret",
+                "Missing",
+                "secret",
+                "Secre",
+                "Secret ",
+                "Legacy",
+                "",
+                "Cafe\u{301}",
+            ]
+            .map(|name| match workspace.agent_profile(name) {
+                Err(AgentLookup::NotAvailable) => (
+                    format!("{:?}", AgentLookup::NotAvailable),
+                    AgentLookup::NotAvailable.to_string(),
+                ),
+                Err(other) => panic!("{name:?} answered {other:?}"),
+                Ok(profile) => panic!("{name:?} resolved to {}", profile.id),
+            });
+            assert!(
+                unanswered.iter().all(|answer| *answer == unanswered[0]),
+                "{unanswered:?}"
+            );
+
+            assert_eq!(
+                workspace.agent_profile("Prod").map(|p| p.id.as_str()),
+                Ok("prod")
+            );
+            assert_eq!(
+                workspace.agent_profile("Staging").map(|p| p.id.as_str()),
+                Ok("staging")
+            );
+            assert_eq!(
+                workspace.agent_profile("Caf\u{e9}").map(|p| p.id.as_str()),
+                Ok("cafe")
+            );
+
+            let twin = workspace.agent_profile("Twin").map(|p| p.id.as_str());
+            assert_eq!(twin, Err(AgentLookup::Ambiguous));
+            assert_ne!(
+                AgentLookup::Ambiguous.to_string(),
+                AgentLookup::NotAvailable.to_string()
+            );
+            for lookup in [AgentLookup::NotAvailable, AgentLookup::Ambiguous] {
+                let text = lookup.to_string();
+                for name in ["Secret", "Missing", "Twin", "Prod", "Legacy"] {
+                    assert!(!text.contains(name), "{text}");
+                }
+            }
+        });
+        quit(workspace, cx);
+    });
+}
