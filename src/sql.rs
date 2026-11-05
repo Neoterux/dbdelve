@@ -2789,7 +2789,11 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         };
     }
     let Some(dialect) = dialect(engine) else {
-        return Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len());
+        return Parsed {
+            removes: crate::mql::removes(sql),
+            scripts: crate::mql::runs_script(sql),
+            ..Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len())
+        };
     };
 
     if engine.spec().sql.explain_analyze == Some(ExplainPrefix::Analyze)

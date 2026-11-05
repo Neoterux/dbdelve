@@ -1,6 +1,57 @@
 ---
 source: src/sql_snapshots.rs
 ---
+[mongodb] find: db.c.find({a: 1}) => |ro=run rw=run full=run|
+[mongodb] count: db.c.countDocuments({}) => |ro=run rw=run full=run|
+[mongodb] aggregate: db.c.aggregate([{$match: {a: 1}}]) => |ro=run rw=run full=run|
+[mongodb] show collections: show collections => |ro=run rw=run full=run|
+[mongodb] show databases: show dbs => |ro=run rw=run full=run|
+[mongodb] list indexes: db.c.getIndexes() => |ro=run rw=run full=run|
+[mongodb] run a read command: db.runCommand({ping: 1}) => |ro=run rw=run full=run|
+[mongodb] insert one: db.c.insertOne({a: 1}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] insert many: db.c.insertMany([{a: 1}]) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] update one: db.c.updateOne({a: 1}, {$set: {a: 2}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] update many: db.c.updateMany({a: 1}, {$set: {a: 2}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] update many without a filter: db.c.updateMany({}, {$set: {a: 2}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] replace one: db.c.replaceOne({a: 1}, {a: 2}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] find one and update: db.c.findOneAndUpdate({a: 1}, {$set: {a: 2}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] find one and replace: db.c.findOneAndReplace({a: 1}, {a: 2}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] create an index: db.c.createIndex({a: 1}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] aggregate into another collection: db.c.aggregate([{$match: {a: 1}}, {$merge: {into: "x"}}]) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] rename a collection: db.c.renameCollection("x") => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] rename without dropping the target: db.c.renameCollection("x", false) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] find and modify with an update: db.runCommand({findAndModify: "c", query: {a: 1}, update: {$set: {a: 2}}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] find and modify with remove false: db.runCommand({findAndModify: "c", query: {a: 1}, remove: false, update: {$set: {a: 2}}}) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] create a collection: db.createCollection("x") => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[mongodb] delete one: db.c.deleteOne({_id: 1}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] delete many: db.c.deleteMany({a: 1}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] delete many without a filter: db.c.deleteMany({}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] find one and delete: db.c.findOneAndDelete({a: 1}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] delete command: db.runCommand({delete: "c", deletes: [{q: {a: 1}, limit: 1}]}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] delete command on admin: db.adminCommand({delete: "c", deletes: [{q: {a: 1}, limit: 0}]}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] find and modify that removes: db.runCommand({findAndModify: "c", query: {a: 1}, remove: true}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove: db.c.remove({}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove with a filter: db.c.remove({a: 1}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove, one document: db.c.remove({a: 1}, true) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove with options: db.c.remove({a: 1}, {justOne: true}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove on a named collection: db.getCollection("c").remove({}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove on a sibling database: db.getSiblingDB("x").c.remove({}) => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] legacy remove, then a read: db.c.remove({}); db.c.find() => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[mongodb] drop a collection: db.c.drop() => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
+[mongodb] drop a database: db.dropDatabase() => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
+[mongodb] drop an index: db.c.dropIndex("i") => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
+[mongodb] aggregate out: db.c.aggregate([{$out: "x"}]) => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
+[mongodb] rename and drop the target: db.c.renameCollection("x", true) => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
+[mongodb] a where clause: db.c.find({$where: "1"}) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
+[mongodb] a function in an expression: db.c.find({$expr: {$function: {body: "1", args: [], lang: "js"}}}) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
+[mongodb] an accumulator: db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}]) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
+[mongodb] a where clause in a chained call: db.c.find({a: 1}).sort({$where: "1"}) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
+[mongodb] two reads: db.c.find(); db.c.find() => |ro=refuse(MoreThanOne) rw=refuse(MoreThanOne) full=refuse(MoreThanOne)|
+[mongodb] two deletes: db.c.deleteMany({}); db.c.deleteMany({}) => |ro=refuse(MoreThanOne) rw=refuse(MoreThanOne) full=refuse(MoreThanOne)|
+[mongodb] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
+[mongodb] a comment only: // nothing => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
+[mongodb] a method DBDelve does not know: db.c.bulkWrite([]) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mongodb] garbage: db.c.find( => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [redis] read a key: GET k => |ro=run rw=run full=run|
 [redis] read keys: KEYS * => |ro=run rw=run full=run|
 [redis] scan: SCAN 0 => |ro=run rw=run full=run|

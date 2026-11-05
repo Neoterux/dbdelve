@@ -235,6 +235,193 @@ const SQL_KINDS: &[(&str, &str)] = &[
 /// the engine, a case name and the text sent. A call is one command on Redis
 /// and one mongosh statement on MongoDB.
 const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
+    (Engine::MongoDb, "find", "db.c.find({a: 1})"),
+    (Engine::MongoDb, "count", "db.c.countDocuments({})"),
+    (
+        Engine::MongoDb,
+        "aggregate",
+        "db.c.aggregate([{$match: {a: 1}}])",
+    ),
+    (Engine::MongoDb, "show collections", "show collections"),
+    (Engine::MongoDb, "show databases", "show dbs"),
+    (Engine::MongoDb, "list indexes", "db.c.getIndexes()"),
+    (
+        Engine::MongoDb,
+        "run a read command",
+        "db.runCommand({ping: 1})",
+    ),
+    (Engine::MongoDb, "insert one", "db.c.insertOne({a: 1})"),
+    (Engine::MongoDb, "insert many", "db.c.insertMany([{a: 1}])"),
+    (
+        Engine::MongoDb,
+        "update one",
+        "db.c.updateOne({a: 1}, {$set: {a: 2}})",
+    ),
+    (
+        Engine::MongoDb,
+        "update many",
+        "db.c.updateMany({a: 1}, {$set: {a: 2}})",
+    ),
+    (
+        Engine::MongoDb,
+        "update many without a filter",
+        "db.c.updateMany({}, {$set: {a: 2}})",
+    ),
+    (
+        Engine::MongoDb,
+        "replace one",
+        "db.c.replaceOne({a: 1}, {a: 2})",
+    ),
+    (
+        Engine::MongoDb,
+        "find one and update",
+        "db.c.findOneAndUpdate({a: 1}, {$set: {a: 2}})",
+    ),
+    (
+        Engine::MongoDb,
+        "find one and replace",
+        "db.c.findOneAndReplace({a: 1}, {a: 2})",
+    ),
+    (
+        Engine::MongoDb,
+        "create an index",
+        "db.c.createIndex({a: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "aggregate into another collection",
+        "db.c.aggregate([{$match: {a: 1}}, {$merge: {into: \"x\"}}])",
+    ),
+    (
+        Engine::MongoDb,
+        "rename a collection",
+        "db.c.renameCollection(\"x\")",
+    ),
+    (
+        Engine::MongoDb,
+        "rename without dropping the target",
+        "db.c.renameCollection(\"x\", false)",
+    ),
+    (
+        Engine::MongoDb,
+        "find and modify with an update",
+        "db.runCommand({findAndModify: \"c\", query: {a: 1}, update: {$set: {a: 2}}})",
+    ),
+    (
+        Engine::MongoDb,
+        "find and modify with remove false",
+        "db.runCommand({findAndModify: \"c\", query: {a: 1}, remove: false, update: {$set: {a: 2}}})",
+    ),
+    (
+        Engine::MongoDb,
+        "create a collection",
+        "db.createCollection(\"x\")",
+    ),
+    (Engine::MongoDb, "delete one", "db.c.deleteOne({_id: 1})"),
+    (Engine::MongoDb, "delete many", "db.c.deleteMany({a: 1})"),
+    (
+        Engine::MongoDb,
+        "delete many without a filter",
+        "db.c.deleteMany({})",
+    ),
+    (
+        Engine::MongoDb,
+        "find one and delete",
+        "db.c.findOneAndDelete({a: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "delete command",
+        "db.runCommand({delete: \"c\", deletes: [{q: {a: 1}, limit: 1}]})",
+    ),
+    (
+        Engine::MongoDb,
+        "delete command on admin",
+        "db.adminCommand({delete: \"c\", deletes: [{q: {a: 1}, limit: 0}]})",
+    ),
+    (
+        Engine::MongoDb,
+        "find and modify that removes",
+        "db.runCommand({findAndModify: \"c\", query: {a: 1}, remove: true})",
+    ),
+    (Engine::MongoDb, "legacy remove", "db.c.remove({})"),
+    (
+        Engine::MongoDb,
+        "legacy remove with a filter",
+        "db.c.remove({a: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "legacy remove, one document",
+        "db.c.remove({a: 1}, true)",
+    ),
+    (
+        Engine::MongoDb,
+        "legacy remove with options",
+        "db.c.remove({a: 1}, {justOne: true})",
+    ),
+    (
+        Engine::MongoDb,
+        "legacy remove on a named collection",
+        "db.getCollection(\"c\").remove({})",
+    ),
+    (
+        Engine::MongoDb,
+        "legacy remove on a sibling database",
+        "db.getSiblingDB(\"x\").c.remove({})",
+    ),
+    (
+        Engine::MongoDb,
+        "legacy remove, then a read",
+        "db.c.remove({}); db.c.find()",
+    ),
+    (Engine::MongoDb, "drop a collection", "db.c.drop()"),
+    (Engine::MongoDb, "drop a database", "db.dropDatabase()"),
+    (Engine::MongoDb, "drop an index", "db.c.dropIndex(\"i\")"),
+    (
+        Engine::MongoDb,
+        "aggregate out",
+        "db.c.aggregate([{$out: \"x\"}])",
+    ),
+    (
+        Engine::MongoDb,
+        "rename and drop the target",
+        "db.c.renameCollection(\"x\", true)",
+    ),
+    (
+        Engine::MongoDb,
+        "a where clause",
+        "db.c.find({$where: \"1\"})",
+    ),
+    (
+        Engine::MongoDb,
+        "a function in an expression",
+        "db.c.find({$expr: {$function: {body: \"1\", args: [], lang: \"js\"}}})",
+    ),
+    (
+        Engine::MongoDb,
+        "an accumulator",
+        "db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: \"1\", accumulate: \"1\", accumulateArgs: [], merge: \"1\", lang: \"js\"}}}}])",
+    ),
+    (
+        Engine::MongoDb,
+        "a where clause in a chained call",
+        "db.c.find({a: 1}).sort({$where: \"1\"})",
+    ),
+    (Engine::MongoDb, "two reads", "db.c.find(); db.c.find()"),
+    (
+        Engine::MongoDb,
+        "two deletes",
+        "db.c.deleteMany({}); db.c.deleteMany({})",
+    ),
+    (Engine::MongoDb, "empty", ""),
+    (Engine::MongoDb, "a comment only", "// nothing"),
+    (
+        Engine::MongoDb,
+        "a method DBDelve does not know",
+        "db.c.bulkWrite([])",
+    ),
+    (Engine::MongoDb, "garbage", "db.c.find("),
     (Engine::Redis, "read a key", "GET k"),
     (Engine::Redis, "read keys", "KEYS *"),
     (Engine::Redis, "scan", "SCAN 0"),
@@ -459,6 +646,17 @@ fn all_cells() -> Vec<(Engine, String, String)> {
     let mut cells = sql_cells();
     cells.extend(nonsql_cells());
     cells
+}
+
+#[test]
+fn every_engine_has_cells() {
+    let cells = all_cells();
+    for engine in Engine::ALL {
+        assert!(
+            cells.iter().any(|(recorded, ..)| *recorded == engine),
+            "{engine:?} has no recorded cell"
+        );
+    }
 }
 
 #[test]
