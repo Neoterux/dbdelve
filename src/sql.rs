@@ -2647,6 +2647,30 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     session: bool,
+    /// Whether any statement is one a server-side script runs from: a Redis
+    /// `EVAL` or `FCALL` (the read-only forms too), `SCRIPT LOAD`, `FUNCTION
+    /// LOAD`, a MongoDB `$where`, `$function` or `$accumulator`. SQL leaves it
+    /// false: its functions are the deny-list's.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    scripts: bool,
+    /// Whether any Redis command is one that returns credentials or other
+    /// clients' details: `CONFIG GET`, `CLIENT LIST` (D-27).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    discloses: bool,
+    /// Whether a Redis line splits but is a command the editor never sends
+    /// (`MONITOR`, `SELECT`): [`classify`] rates it a read because it is never
+    /// sent, so only this tells it from a read that is.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    unsent: bool,
 }
 
 impl Parsed {
@@ -2658,6 +2682,9 @@ impl Parsed {
             removes: false,
             alters: false,
             session: false,
+            scripts: false,
+            discloses: false,
+            unsent: false,
         }
     }
 
@@ -2668,6 +2695,9 @@ impl Parsed {
             removes: reading.removes,
             alters: reading.alters,
             session: statements.iter().any(changes_session),
+            scripts: false,
+            discloses: false,
+            unsent: false,
         }
     }
 }
@@ -2746,6 +2776,12 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
     if engine.syntax() == Syntax::Redis {
         return Parsed {
             session: crate::redis_cmd::leaves(sql) != Leaves::default(),
+            removes: crate::redis_cmd::removes(sql),
+            scripts: crate::redis_cmd::runs_script(sql),
+            discloses: crate::redis_cmd::discloses(sql),
+            // Where a line does not split, `classify` has already said
+            // `Unreadable`, which the agent path asks first.
+            unsent: crate::redis_cmd::parse(sql).is_err(),
             ..Parsed::counted(
                 crate::redis_cmd::classify(sql),
                 crate::redis_cmd::statements(sql).len(),

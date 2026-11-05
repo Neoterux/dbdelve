@@ -231,6 +231,140 @@ const SQL_KINDS: &[(&str, &str)] = &[
     ("read, then a hash comment", "SELECT 1 # c"),
 ];
 
+/// The kinds of the engines that are not SQL, in the order they are recorded:
+/// the engine, a case name and the text sent. A call is one command on Redis
+/// and one mongosh statement on MongoDB.
+const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
+    (Engine::Redis, "read a key", "GET k"),
+    (Engine::Redis, "read keys", "KEYS *"),
+    (Engine::Redis, "scan", "SCAN 0"),
+    (Engine::Redis, "ttl", "TTL k"),
+    (Engine::Redis, "hash read", "HGETALL h"),
+    (Engine::Redis, "config help", "CONFIG HELP"),
+    (Engine::Redis, "client info", "CLIENT INFO"),
+    (Engine::Redis, "client getname", "CLIENT GETNAME"),
+    (Engine::Redis, "acl list", "ACL LIST"),
+    (Engine::Redis, "select a database", "SELECT 1"),
+    (Engine::Redis, "subscribe", "SUBSCRIBE n"),
+    (Engine::Redis, "pattern subscribe", "PSUBSCRIBE n*"),
+    (Engine::Redis, "monitor", "MONITOR"),
+    (Engine::Redis, "sync", "SYNC"),
+    (Engine::Redis, "hello", "HELLO 2"),
+    (Engine::Redis, "reset", "RESET"),
+    (Engine::Redis, "quit", "QUIT"),
+    (Engine::Redis, "client reply", "CLIENT REPLY OFF"),
+    (Engine::Redis, "monitor then a read", "MONITOR\nGET a"),
+    (Engine::Redis, "set", "SET k v"),
+    (Engine::Redis, "hash set", "HSET h f v"),
+    (Engine::Redis, "expire", "EXPIRE k 10"),
+    (Engine::Redis, "persist", "PERSIST k"),
+    (Engine::Redis, "expire at a past time", "EXPIREAT k 1"),
+    (Engine::Redis, "expire at in milliseconds", "PEXPIREAT k 1"),
+    (Engine::Redis, "rename", "RENAME a b"),
+    (Engine::Redis, "store an intersection", "SINTERSTORE d a b"),
+    (Engine::Redis, "copy over", "COPY a b REPLACE"),
+    (Engine::Redis, "list move", "LMOVE a b LEFT RIGHT"),
+    (Engine::Redis, "set move", "SMOVE a b m"),
+    (Engine::Redis, "delete", "DEL k"),
+    (Engine::Redis, "delete, lower case", "del k"),
+    (Engine::Redis, "unlink", "UNLINK k"),
+    (Engine::Redis, "get and delete", "GETDEL k"),
+    (Engine::Redis, "hash delete", "HDEL h f"),
+    (Engine::Redis, "list pop", "LPOP l"),
+    (Engine::Redis, "blocking list pop", "BLPOP l 1"),
+    (Engine::Redis, "list remove", "LREM l 0 v"),
+    (Engine::Redis, "list trim", "LTRIM l 0 0"),
+    (Engine::Redis, "set remove", "SREM s m"),
+    (Engine::Redis, "set pop", "SPOP s"),
+    (Engine::Redis, "sorted set remove", "ZREM z m"),
+    (Engine::Redis, "sorted set pop", "ZPOPMIN z"),
+    (
+        Engine::Redis,
+        "sorted set remove range",
+        "ZREMRANGEBYRANK z 0 1",
+    ),
+    (Engine::Redis, "stream delete", "XDEL s 1-1"),
+    (Engine::Redis, "stream trim", "XTRIM s MAXLEN 0"),
+    (Engine::Redis, "json delete", "JSON.DEL d $"),
+    (Engine::Redis, "time series delete", "TS.DEL t 0 1"),
+    (
+        Engine::Redis,
+        "destroy a consumer group",
+        "XGROUP DESTROY s g",
+    ),
+    (
+        Engine::Redis,
+        "delete a consumer",
+        "XGROUP DELCONSUMER s g c",
+    ),
+    (Engine::Redis, "migrate", "MIGRATE h 6379 k 0 1000"),
+    (Engine::Redis, "expire at zero", "EXPIRE k 0"),
+    (Engine::Redis, "expire at minus one", "EXPIRE k -1"),
+    (Engine::Redis, "expire with a leading zero", "EXPIRE k 010"),
+    (
+        Engine::Redis,
+        "expire in milliseconds at zero",
+        "PEXPIRE k 0",
+    ),
+    (
+        Engine::Redis,
+        "hash field expire at zero",
+        "HEXPIRE k 0 FIELDS 1 f",
+    ),
+    (Engine::Redis, "eval", "EVAL \"return 1\" 0"),
+    (Engine::Redis, "eval sha", "EVALSHA abc 0"),
+    (Engine::Redis, "fcall", "FCALL f 0"),
+    (
+        Engine::Redis,
+        "eval, read-only form",
+        "EVAL_RO \"return 1\" 0",
+    ),
+    (
+        Engine::Redis,
+        "eval sha, read-only form",
+        "EVALSHA_RO abc 0",
+    ),
+    (Engine::Redis, "fcall, read-only form", "FCALL_RO f 0"),
+    (Engine::Redis, "load a script", "SCRIPT LOAD \"return 1\""),
+    (
+        Engine::Redis,
+        "load a function",
+        "FUNCTION LOAD \"#!lua name=x\"",
+    ),
+    (
+        Engine::Redis,
+        "config get a password",
+        "CONFIG GET requirepass",
+    ),
+    (Engine::Redis, "config get everything", "CONFIG GET *"),
+    (
+        Engine::Redis,
+        "config get, lower case",
+        "config get maxmemory",
+    ),
+    (Engine::Redis, "client list", "CLIENT LIST"),
+    (Engine::Redis, "flush a database", "FLUSHDB"),
+    (Engine::Redis, "flush everything", "FLUSHALL"),
+    (Engine::Redis, "config set", "CONFIG SET maxmemory 1"),
+    (Engine::Redis, "shutdown", "SHUTDOWN"),
+    (Engine::Redis, "delete a function", "FUNCTION DELETE f"),
+    (Engine::Redis, "multi", "MULTI"),
+    (Engine::Redis, "exec", "EXEC"),
+    (Engine::Redis, "discard", "DISCARD"),
+    (Engine::Redis, "watch", "WATCH k"),
+    (Engine::Redis, "auth", "AUTH u p"),
+    (Engine::Redis, "client setname", "CLIENT SETNAME me"),
+    (Engine::Redis, "a transaction", "MULTI\nSET k v\nEXEC"),
+    (Engine::Redis, "two reads", "GET a\nGET b"),
+    (Engine::Redis, "two deletes", "DEL a\nDEL b"),
+    (Engine::Redis, "empty", ""),
+    (Engine::Redis, "a comment only", "# note"),
+    (Engine::Redis, "a comment, then a read", "# note\nGET a"),
+    (Engine::Redis, "an unknown command", "FROBNICATE a"),
+    (Engine::Redis, "an unclosed quote", "SET k \"open"),
+    (Engine::Redis, "a read, then garbage", "GET a\nFROBNICATE"),
+];
+
 /// The text of one kind on one engine, `None` where the engine has none: the
 /// deny-listed call of an engine that lists no function.
 fn text_of(engine: Engine, sql: &str) -> Option<String> {
@@ -263,6 +397,21 @@ pub(crate) fn sql_cells() -> Vec<(Engine, String, String)> {
         .collect()
 }
 
+/// Every `(engine, case, text)` the non-SQL corpus records, in the order it
+/// records them.
+pub(crate) fn nonsql_cells() -> Vec<(Engine, String, String)> {
+    NONSQL_KINDS
+        .iter()
+        .map(|(engine, case, text)| (*engine, (*case).to_owned(), (*text).to_owned()))
+        .collect()
+}
+
+/// The three answers for `text`, in Read-only, Read-write and Full.
+fn answers(engine: Engine, text: &str) -> String {
+    let [ro, rw, full] = Mode::ALL.map(|mode| answer(&sql::agent_gate(engine, text, mode)));
+    format!("ro={ro} rw={rw} full={full}")
+}
+
 fn answer(verdict: &AgentVerdict) -> String {
     match verdict {
         AgentVerdict::Run => "run".to_owned(),
@@ -280,13 +429,11 @@ fn agent_gate_corpus_for_sql_engines() {
                 fragment(&mut out, engine, case, None);
                 continue;
             };
-            let [ro, rw, full] =
-                Mode::ALL.map(|mode| answer(&sql::agent_gate(engine, &text, mode)));
             fragment(
                 &mut out,
                 engine,
                 &format!("{case}: {}", visible(&text)),
-                Some(&format!("ro={ro} rw={rw} full={full}")),
+                Some(&answers(engine, &text)),
             );
         }
     }
@@ -294,8 +441,29 @@ fn agent_gate_corpus_for_sql_engines() {
 }
 
 #[test]
+fn agent_gate_corpus_for_mongodb_and_redis() {
+    let mut out = String::new();
+    for (engine, case, text) in nonsql_cells() {
+        fragment(
+            &mut out,
+            engine,
+            &format!("{case}: {}", visible(&text)),
+            Some(&answers(engine, &text)),
+        );
+    }
+    check("agent_gate_nonsql", &out);
+}
+
+/// Every cell of the corpus, SQL and not.
+fn all_cells() -> Vec<(Engine, String, String)> {
+    let mut cells = sql_cells();
+    cells.extend(nonsql_cells());
+    cells
+}
+
+#[test]
 fn every_run_or_approve_cell_is_one_the_mode_already_allows() {
-    for (engine, case, text) in sql_cells() {
+    for (engine, case, text) in all_cells() {
         let verdict = sql::classify(engine, &text);
         for mode in Mode::ALL {
             match sql::agent_gate(engine, &text, mode) {
@@ -312,7 +480,7 @@ fn every_run_or_approve_cell_is_one_the_mode_already_allows() {
 
 #[test]
 fn every_run_cell_is_a_rerunnable_read() {
-    for (engine, case, text) in sql_cells() {
+    for (engine, case, text) in all_cells() {
         for mode in Mode::ALL {
             if sql::agent_gate(engine, &text, mode) == AgentVerdict::Run {
                 assert!(
@@ -326,7 +494,7 @@ fn every_run_cell_is_a_rerunnable_read() {
 
 #[test]
 fn the_full_column_equals_the_read_write_column() {
-    for (engine, case, text) in sql_cells() {
+    for (engine, case, text) in all_cells() {
         assert_eq!(
             sql::agent_gate(engine, &text, Mode::Full),
             sql::agent_gate(engine, &text, Mode::ReadWrite),
@@ -343,7 +511,7 @@ fn reason(refusal: &sql::Refusal) -> String {
 
 #[test]
 fn every_refusal_in_the_corpus_states_a_rule_and_gives_no_advice() {
-    for (engine, case, text) in sql_cells() {
+    for (engine, case, text) in all_cells() {
         for mode in Mode::ALL {
             let AgentVerdict::Refuse(refusal) = sql::agent_gate(engine, &text, mode) else {
                 continue;
