@@ -2451,3 +2451,81 @@ fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppCont
         quit(workspace, cx);
     });
 }
+
+/// A palette row's text box clips what runs past it, so a marker laid out past
+/// the box's right edge is drawn nowhere: a reachable connection then reads as
+/// hidden. `debug_bounds` records the laid-out bounds even when an ancestor
+/// clips, so the assertion is on where the marker sits, not whether it exists.
+#[gpui::test]
+fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let path = format!("{}/database.sqlite", "/a_long_folder_names_".repeat(9));
+        assert!(path.len() >= 200);
+        let long_name = "a_connection_named_at_great_length_".repeat(4);
+        assert!(long_name.len() >= 120);
+        let table = |id: &str, name: &str, path: &str| {
+            format!(
+                "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"sqlite\"\npath = {path:?}\nagent_visible = true\n"
+            )
+        };
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                table("long-path", "Short", &path),
+                table("long-name", &long_name, &path),
+                table("control", "Control", "c.db"),
+            ]
+            .concat(),
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_connections(window, cx)
+        });
+        settle(cx);
+
+        // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+        let bounds = |kind: &str, at: usize, cx: &mut VisualTestContext| {
+            let selector: &'static str = format!("palette-row-{kind}-{at}").leak();
+            cx.debug_bounds(selector)
+        };
+        let drawn: Vec<usize> = (0..32)
+            .filter(|at| bounds("marker", *at, cx).is_some())
+            .collect();
+        let ids = ["long-path", "long-name", "control"];
+        assert_eq!(
+            drawn.len(),
+            ids.len(),
+            "a marker is laid out on each visible connection row, at {drawn:?}"
+        );
+        for (at, id) in drawn.into_iter().zip(ids) {
+            let marker = bounds("marker", at, cx).expect("counted above");
+            let text = bounds("text", at, cx)
+                .unwrap_or_else(|| panic!("{id}: the row's text box is drawn"));
+            assert!(
+                text.left() <= marker.left() && marker.right() <= text.right(),
+                "{id}: the marker spans {:?}..{:?}, outside its text box {:?}..{:?}",
+                marker.left(),
+                marker.right(),
+                text.left(),
+                text.right()
+            );
+            if id != "long-name" {
+                let detail = bounds("detail", at, cx)
+                    .unwrap_or_else(|| panic!("{id}: the endpoint is drawn"));
+                assert!(
+                    detail.size.width > gpui::px(0.),
+                    "{id}: the endpoint was squeezed to nothing"
+                );
+                assert!(
+                    marker.right() <= detail.left(),
+                    "{id}: the endpoint starts at {:?}, before the marker's end at {:?}",
+                    detail.left(),
+                    marker.right()
+                );
+            }
+        }
+        quit(workspace, cx);
+    });
+}
