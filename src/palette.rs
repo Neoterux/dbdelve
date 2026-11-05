@@ -482,7 +482,8 @@ struct Item {
     /// what is drawn beside it: a connection by its host, which its detail
     /// shows. Built once per open.
     also: Vec<String>,
-    /// Muted and monospaced, inline after the label: where a connection points.
+    /// Muted and monospaced, after the label and any agent marker: where a
+    /// connection points. The first part of the row to give way when it runs out.
     detail: Option<SharedString>,
     /// Muted, at the far end: what kind of object this is, or which row is the
     /// one in force.
