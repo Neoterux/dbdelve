@@ -54,6 +54,10 @@ pub(crate) struct Profile {
     pub(crate) config: ConnectionConfig,
     pub(crate) color: Option<ConnectionColor>,
     pub(crate) mode: Mode,
+    /// Whether an agent may reach this connection. Off for every profile that
+    /// exists before its owner says otherwise. Read from `profiles.toml` only
+    /// at load, and written only by `Workspace::set_agent_visible`.
+    pub(crate) agent_visible: bool,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
@@ -260,6 +264,7 @@ impl Profile {
             next_query_id: Some(self.session.next_query_id),
             color: self.color.map(|color| color.slug().to_string()),
             mode: Some(self.mode.slug().to_string()),
+            agent_visible: self.agent_visible,
             confirmed: self
                 .confirmed
                 .iter()
