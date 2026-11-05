@@ -40,7 +40,13 @@
 //!    `Refuse(NeedsMode { needed, held })`. The silenced list is always empty,
 //!    so a kind a human silenced changes nothing for an agent.
 //! 9. A write the profile's mode allows is `Approve(verdict)`.
-//! 10. (A read that calls an egress function is approved here, in plan 03-05.)
+//! 10. A read that calls one of the engine's `egress_functions` is
+//!     `Approve(verdict)` with a Read-only verdict, in every mode: it reaches a
+//!     file, a URL, a program or another server, and the human sees the
+//!     statement first. After every refusal and after step 9, so a refused
+//!     statement stays refused and a write that also reads a file is approved
+//!     as the write it is. It narrows what the mode lets run and never widens
+//!     it.
 //! 11. Anything else is a read, and `Run`s.
 //!
 //! The mode stays the ceiling: `Run` and `Approve` both imply that `gate` with
@@ -239,6 +245,11 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         // replacing insert in the walk, which would refuse them as `Delete`.
         return AgentVerdict::Approve(verdict);
     }
+    // The engine's egress list, read by the same scan as the deny-list but
+    // never by the human path, so DBDelve's own file opens stay reads.
+    if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[]) {
+        return AgentVerdict::Approve(verdict);
+    }
     AgentVerdict::Run
 }
 
@@ -295,6 +306,7 @@ fn statement_count(engine: Engine, sql: &str, typed: usize) -> usize {
 mod tests {
     use super::*;
     use crate::db::Syntax;
+    use crate::sql::classify;
 
     fn sql_engines() -> impl Iterator<Item = Engine> {
         Engine::ALL
@@ -321,6 +333,99 @@ mod tests {
     fn redis_always(text: &str, expected: AgentVerdict) {
         for mode in Mode::ALL {
             assert_eq!(redis(text, mode), expected, "{mode:?}: {text}");
+        }
+    }
+
+    fn postgres(text: &str, mode: Mode) -> AgentVerdict {
+        agent_gate(Engine::Postgres, text, mode)
+    }
+
+    /// `text` answers `expected` in every mode on `engine`.
+    fn always(engine: Engine, text: &str, expected: AgentVerdict) {
+        for mode in Mode::ALL {
+            assert_eq!(
+                agent_gate(engine, text, mode),
+                expected,
+                "{engine:?} {mode:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_egress_call_asks_first_in_every_mode() {
+        for text in [
+            "SELECT pg_read_file('x')",
+            "SELECT * FROM pg_ls_dir('.')",
+            "SELECT pg_catalog.pg_read_file('x')",
+            "SELECT a FROM t WHERE b IN (SELECT pg_read_file('x'))",
+        ] {
+            always(Engine::Postgres, text, AgentVerdict::Approve(Verdict::READ));
+        }
+    }
+
+    #[test]
+    fn the_human_path_still_reads_an_egress_call_as_a_read() {
+        assert_eq!(
+            classify(Engine::Postgres, "SELECT pg_read_file('x')"),
+            Verdict::READ
+        );
+    }
+
+    #[test]
+    fn an_unlisted_function_still_runs() {
+        for text in [
+            "SELECT lower(a) FROM t",
+            "SELECT my_udf(a) FROM t",
+            "SELECT t.pg_read_file FROM t",
+            "SELECT pg_read_file FROM t",
+        ] {
+            always(Engine::Postgres, text, AgentVerdict::Run);
+        }
+    }
+
+    #[test]
+    fn egress_comes_after_every_refusal_and_the_write_approval() {
+        assert_eq!(
+            postgres("INSERT INTO t SELECT pg_read_file('x')", Mode::ReadOnly),
+            needs_read_write()
+        );
+        assert_eq!(
+            postgres("INSERT INTO t SELECT pg_read_file('x')", Mode::ReadWrite),
+            AgentVerdict::Approve(Verdict::WRITE)
+        );
+        for text in [
+            "SELECT nextval('s'), pg_read_file('x')",
+            "SELECT pg_read_file('x'), nextval('s')",
+        ] {
+            assert_eq!(postgres(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            assert_eq!(
+                postgres(text, Mode::ReadWrite),
+                AgentVerdict::Approve(Verdict::WRITE),
+                "{text}"
+            );
+        }
+        for text in [
+            "SELECT lower(a), pg_read_file('x') FROM t",
+            "SELECT pg_read_file('x'), lower(a) FROM t",
+        ] {
+            always(Engine::Postgres, text, AgentVerdict::Approve(Verdict::READ));
+        }
+        for mode in Mode::ALL {
+            assert_eq!(
+                postgres("DROP TABLE t; SELECT pg_read_file('x')", mode),
+                refused(Refusal::MoreThanOne),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_function_list_is_lower_case() {
+        for engine in Engine::ALL {
+            let spec = &engine.spec().sql;
+            for name in spec.denied_functions.iter().chain(spec.egress_functions) {
+                assert_eq!(*name, name.to_lowercase(), "{engine:?}");
+            }
         }
     }
 

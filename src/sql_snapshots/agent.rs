@@ -593,6 +593,24 @@ pub(crate) fn nonsql_cells() -> Vec<(Engine, String, String)> {
         .collect()
 }
 
+/// Every `(engine, case, text)` the egress corpus records, in the order it
+/// records them: for each SQL engine, `SELECT * FROM {name}('x')` for each name
+/// on its egress list. An engine with no list has no cell here and is recorded
+/// as `(no egress list)` by [`agent_gate_corpus_for_egress`].
+pub(crate) fn egress_cells() -> Vec<(Engine, String, String)> {
+    sql_engines()
+        .flat_map(|engine| {
+            engine.spec().sql.egress_functions.iter().map(move |name| {
+                (
+                    engine,
+                    format!("call {name}"),
+                    format!("SELECT * FROM {name}('x')"),
+                )
+            })
+        })
+        .collect()
+}
+
 /// The three answers for `text`, in Read-only, Read-write and Full.
 fn answers(engine: Engine, text: &str) -> String {
     let [ro, rw, full] = Mode::ALL.map(|mode| answer(&sql::agent_gate(engine, text, mode)));
@@ -641,10 +659,34 @@ fn agent_gate_corpus_for_mongodb_and_redis() {
     check("agent_gate_nonsql", &out);
 }
 
-/// Every cell of the corpus, SQL and not.
+#[test]
+fn agent_gate_corpus_for_egress() {
+    let mut out = String::new();
+    for engine in sql_engines() {
+        if engine.spec().sql.egress_functions.is_empty() {
+            fragment(&mut out, engine, "(no egress list)", None);
+            continue;
+        }
+        for (recorded, case, text) in egress_cells() {
+            if recorded != engine {
+                continue;
+            }
+            fragment(
+                &mut out,
+                engine,
+                &format!("{case}: {}", visible(&text)),
+                Some(&answers(engine, &text)),
+            );
+        }
+    }
+    check("agent_gate_egress", &out);
+}
+
+/// Every cell of the corpus, SQL and not, and the egress cells.
 fn all_cells() -> Vec<(Engine, String, String)> {
     let mut cells = sql_cells();
     cells.extend(nonsql_cells());
+    cells.extend(egress_cells());
     cells
 }
 
