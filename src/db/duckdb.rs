@@ -1278,6 +1278,81 @@ mod tests {
         assert_eq!(cells(&result), [[Some("Ada Lovelace")]]);
     }
 
+    /// The premise of DuckDB's `bare_path_reads`: a quoted string in a table
+    /// position is read as a file, wherever the table goes, and the agent's
+    /// gate asks first for each spelling.
+    #[test]
+    fn a_quoted_path_reads_the_file_wherever_the_table_goes() {
+        let path = fixture("clientes.csv");
+        let connection = memory("");
+        for sql in [
+            format!("SELECT * FROM '{path}'"),
+            format!("SELECT * FROM \"{path}\""),
+            format!("SELECT * FROM '{path}' a, '{path}' b"),
+            format!("SELECT 1 FROM (SELECT 1) x WHERE 1 IN (SELECT 1 FROM '{path}')"),
+        ] {
+            let result = connection.query(&sql, Fetch::default()).unwrap();
+            assert!(!result.rows.is_empty(), "{sql} returned no rows");
+            assert!(
+                matches!(
+                    crate::sql::agent_gate(
+                        crate::db::Engine::DuckDb,
+                        &sql,
+                        crate::sql::Mode::ReadWrite
+                    ),
+                    crate::sql::AgentVerdict::Approve(_)
+                ),
+                "{sql} is not asked about"
+            );
+        }
+    }
+
+    /// Table functions of extensions the embedded build does not load, so
+    /// `duckdb_functions()` cannot list them: they read a file, a lake or
+    /// another server all the same.
+    const EXTENSION_READERS: &[&str] = &[
+        "iceberg_scan",
+        "delta_scan",
+        "st_read",
+        "sqlite_scan",
+        "postgres_scan",
+        "postgres_query",
+        "mysql_scan",
+        "mysql_query",
+    ];
+
+    #[test]
+    fn every_file_reading_table_function_is_on_the_egress_list() {
+        let connection = memory("");
+        let result = connection
+            .query(
+                "SELECT DISTINCT function_name FROM duckdb_functions() \
+                 WHERE function_type = 'table' ORDER BY 1",
+                Fetch::default(),
+            )
+            .unwrap();
+        let listed = crate::db::Engine::DuckDb.spec().sql.egress_functions;
+        let found: Vec<&str> = result.rows.iter().filter_map(|row| row.get(0)).collect();
+        assert!(found.contains(&"read_csv"), "the catalog answered nothing");
+        for name in &found {
+            let reads = name.starts_with("read_")
+                || name.starts_with("parquet_")
+                || name.ends_with("_scan")
+                || *name == "glob"
+                || *name == "sniff_csv";
+            assert!(
+                !reads || listed.contains(name),
+                "{name} is in duckdb_functions() and not on egress_functions"
+            );
+        }
+        for name in listed {
+            assert!(
+                found.contains(name) || EXTENSION_READERS.contains(name),
+                "{name} is on egress_functions and is neither in duckdb_functions() nor an extension reader"
+            );
+        }
+    }
+
     #[test]
     fn a_spreadsheet_reads_by_its_header_with_numbers_as_numbers() {
         let connection = memory("");

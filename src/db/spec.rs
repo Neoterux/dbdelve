@@ -333,6 +333,16 @@ pub struct SqlSpec {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     pub egress_functions: &'static [&'static str],
+    /// Whether a quoted string in a table position is read as a file or a URL
+    /// (DuckDB's replacement scan: `FROM 'data.csv'`). The agent path asks for
+    /// approval on any statement of such an engine that holds a path-shaped
+    /// string, since no function name marks the read. Read only by the agent
+    /// path (`sql::agent_gate`).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    pub bare_path_reads: bool,
     /// Session settings that change nothing a Read-only profile protects, so
     /// setting one stays a read: navigation and comfort. Every other setting a
     /// user's own `SET` names is stopped, because the hold's whole value is
@@ -386,6 +396,7 @@ impl SqlSpec {
         stateless_requests: false,
         denied_functions: &[],
         egress_functions: &[],
+        bare_path_reads: false,
         plain_settings: &[],
         transactions: true,
         row_terms: false,
@@ -1008,6 +1019,9 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         // The armed read-only transaction stops none of the named-lock calls.
         // No sequences, so no `nextval`.
         denied_functions: &["get_lock", "release_lock", "release_all_locks"],
+        // The one function that reads a file; `LOAD DATA` and `INTO OUTFILE`
+        // are statements and the gate reads them as such.
+        egress_functions: &["load_file"],
         // Left off on purpose: both spellings of the hold, the server-wide
         // switches, and `sql_mode`, whose `NO_BACKSLASH_ESCAPES` and
         // `ANSI_QUOTES` change how every later statement is lexed and are not
@@ -1100,6 +1114,8 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
             "nextval",
             "setval",
         ],
+        // As MySQL's.
+        egress_functions: &["load_file"],
         // The same list as MySQL's with the names MariaDB spells differently:
         // `max_statement_time` for the statement timeout, and `tx_isolation`
         // beside `transaction_isolation`. Its `tx_read_only` is a hold name and
@@ -1302,6 +1318,54 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // by a parenthesis and stopped until the profile is upgraded; both
         // are recorded in the corpus as accepted false positives.
         denied_functions: &["nextval", "setval", "query", "json_execute_serialized_sql"],
+        // Every table function of the embedded build's `duckdb_functions()`
+        // that reads a file (`read_*`, `parquet_*`, `*_scan`, `glob`,
+        // `sniff_csv`), DBDelve's own `read_xlsx` among them, then the
+        // extension readers that build does not load. Pinned by
+        // `every_file_reading_table_function_is_on_the_egress_list`. The human
+        // path keeps them reads: DBDelve's CSV, Excel, Parquet and JSON opens
+        // are these calls.
+        egress_functions: &[
+            "arrow_scan",
+            "glob",
+            "parquet_bloom_probe",
+            "parquet_file_metadata",
+            "parquet_full_metadata",
+            "parquet_kv_metadata",
+            "parquet_metadata",
+            "parquet_scan",
+            "parquet_schema",
+            "read_blob",
+            "read_csv",
+            "read_csv_auto",
+            "read_duckdb",
+            "read_json",
+            "read_json_auto",
+            "read_json_objects",
+            "read_json_objects_auto",
+            "read_ndjson",
+            "read_ndjson_auto",
+            "read_ndjson_objects",
+            "read_parquet",
+            "read_single_csv_file",
+            "read_single_json_file",
+            "read_single_parquet_file",
+            "read_text",
+            "read_xlsx",
+            "seq_scan",
+            "sniff_csv",
+            "iceberg_scan",
+            "delta_scan",
+            "st_read",
+            "sqlite_scan",
+            "postgres_scan",
+            "postgres_query",
+            "mysql_scan",
+            "mysql_query",
+        ],
+        // A quoted string in a table position is a file or a URL to DuckDB, so
+        // the agent path asks for any path-shaped string (D-03).
+        bare_path_reads: true,
         // Names verified in `duckdb_settings()`. The configuration ratchets
         // (`enable_external_access`, `lock_configuration`) are left off on
         // purpose: once set they cannot be undone, and one in a user's buffer
@@ -1493,6 +1557,17 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         // and nothing holds a session read-only. A scalar function cannot have
         // a side effect in T-SQL, so none is listed.
         denied_functions: &["openquery", "openrowset", "opendatasource"],
+        // From the documentation, not probed against a server: the functions
+        // that read an audit, trace or extended-events file and the two
+        // dynamic management functions that list the server's file system. The
+        // pass-through functions above are on the stricter list.
+        egress_functions: &[
+            "fn_xe_file_target_read_file",
+            "fn_get_audit_file",
+            "fn_trace_gettable",
+            "dm_os_file_exists",
+            "dm_os_enumerate_filesystem",
+        ],
         // Names from the engine's own category table. Left off on purpose:
         // `quoted_identifier`, which is read at parse time and changes how a
         // double quote is read, `implicit_transactions`, which DBDelve's
@@ -1728,8 +1803,76 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
         // the database (`url`, `s3`, `remote`, `executable`) are plain reads by
         // the owner's decision (`docs/agents/engines.md`), and `INSERT INTO
         // FUNCTION` is Full by statement in `spec_verdict`, so neither belongs
-        // on a list of calls to raise.
+        // on a list of calls to raise. The agent path asks for approval on
+        // those table functions through `egress_functions` below (D-22).
         denied_functions: &[],
+        // Every table function of the dev server (26.8.36.3,
+        // `system.table_functions`) that reaches a file, a URL, a program or
+        // another server, or runs text it is handed: `eval` builds a SELECT
+        // from a string, so it could carry `url(..)` past a scan of names.
+        // `cluster`, `clusterAllReplicas` and `dictionary` are off it: they read
+        // servers and sources the administrator configured as part of the
+        // deployment, not ones a statement names. Pinned by
+        // `live_every_table_function_is_egress_or_local`.
+        egress_functions: &[
+            "url",
+            "urlcluster",
+            "s3",
+            "s3cluster",
+            "gcs",
+            "cosn",
+            "oss",
+            "azureblobstorage",
+            "azureblobstoragecluster",
+            "hdfs",
+            "hdfscluster",
+            "hive",
+            "deltalake",
+            "deltalakeazure",
+            "deltalakeazurecluster",
+            "deltalakecluster",
+            "deltalakelocal",
+            "deltalakes3",
+            "deltalakes3cluster",
+            "iceberg",
+            "icebergazure",
+            "icebergazurecluster",
+            "icebergcluster",
+            "iceberghdfs",
+            "iceberghdfscluster",
+            "iceberglocal",
+            "iceberglocalcluster",
+            "icebergs3",
+            "icebergs3cluster",
+            "hudi",
+            "hudicluster",
+            "paimon",
+            "paimonazure",
+            "paimonazurecluster",
+            "paimoncluster",
+            "paimonhdfs",
+            "paimonhdfscluster",
+            "paimonlocal",
+            "paimons3",
+            "paimons3cluster",
+            "arrowflight",
+            "bigquery",
+            "ytsaurus",
+            "jdbc",
+            "odbc",
+            "mysql",
+            "postgresql",
+            "mongodb",
+            "redis",
+            "sqlite",
+            "remote",
+            "remotesecure",
+            "file",
+            "filecluster",
+            "filesystem",
+            "executable",
+            "eval",
+        ],
         // What a user's own `SET` may change on a Read-only profile without
         // asking, chosen as Postgres's and DuckDB's lists are: navigation and
         // comfort. `readonly=2` already refuses a change to `readonly`, but it

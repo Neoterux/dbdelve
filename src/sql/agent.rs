@@ -247,10 +247,51 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     }
     // The engine's egress list, read by the same scan as the deny-list but
     // never by the human path, so DBDelve's own file opens stay reads.
-    if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[]) {
+    if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[])
+        || reads_a_bare_path(engine, sql)
+    {
         return AgentVerdict::Approve(verdict);
     }
     AgentVerdict::Run
+}
+
+/// Whether `sql`, on an engine that reads a quoted string in a table position
+/// as a file or a URL (`SELECT * FROM 'data.csv'`), holds a string literal or a
+/// `"`-quoted word with a `.`, `/` or `\` in it. False on every other engine.
+/// A text that does not tokenize answers true: it cannot be shown to read no
+/// path. `:` is not a trigger, so a timestamp literal does not ask.
+///
+/// ponytail: any dotted literal asks, wherever it sits, so `WHERE v = '1.2'`
+/// on DuckDB is approved though it reads no file; the corpus records it. This
+/// is a superset of the positions DuckDB reads a path from (`FROM`, `JOIN`, a
+/// comma join, a subquery anywhere), which is the safe direction. The upgrade
+/// path is a table-position reading over every table factor of the parse,
+/// which is a second reading of DuckDB's grammar kept in step by hand.
+fn reads_a_bare_path(engine: Engine, sql: &str) -> bool {
+    if !engine.spec().sql.bare_path_reads {
+        return false;
+    }
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    let Ok(tokens) = Tokenizer::new(dialect.as_ref(), sql).tokenize() else {
+        return true;
+    };
+    tokens.iter().any(|token| {
+        let text = match token {
+            Token::SingleQuotedString(text)
+            | Token::DoubleQuotedString(text)
+            | Token::TripleSingleQuotedString(text)
+            | Token::TripleDoubleQuotedString(text)
+            | Token::EscapedStringLiteral(text)
+            | Token::UnicodeStringLiteral(text)
+            | Token::NationalStringLiteral(text) => text,
+            Token::DollarQuotedString(quoted) => &quoted.value,
+            Token::Word(word) if word.quote_style == Some('"') => &word.value,
+            _ => return false,
+        };
+        text.contains(['.', '/', '\\'])
+    })
 }
 
 /// Whether `sql` assigns a user variable with `:=` (`SELECT @x := 1`), the
@@ -361,13 +402,61 @@ mod tests {
         ] {
             always(Engine::Postgres, text, AgentVerdict::Approve(Verdict::READ));
         }
+        for (engine, text) in [
+            (Engine::MySql, "SELECT load_file('/etc/hosts')"),
+            (Engine::MariaDb, "SELECT load_file('/etc/hosts')"),
+            (Engine::DuckDb, "SELECT * FROM read_csv('x.csv')"),
+            (Engine::DuckDb, "SELECT * FROM read_xlsx('x.xlsx')"),
+            (Engine::ClickHouse, "SELECT * FROM url('http://h/x', CSV)"),
+            (Engine::ClickHouse, "SELECT * FROM file('x.csv')"),
+            (Engine::ClickHouse, "SELECT * FROM remote('h', db.t)"),
+            (
+                Engine::ClickHouse,
+                "SELECT * FROM executable('s', CSV, 'a String')",
+            ),
+            (Engine::ClickHouse, "SELECT * FROM eval('SELECT 1')"),
+        ] {
+            always(engine, text, AgentVerdict::Approve(Verdict::READ));
+        }
     }
 
     #[test]
     fn the_human_path_still_reads_an_egress_call_as_a_read() {
-        assert_eq!(
-            classify(Engine::Postgres, "SELECT pg_read_file('x')"),
-            Verdict::READ
+        for (engine, text) in [
+            (Engine::Postgres, "SELECT pg_read_file('x')"),
+            (Engine::DuckDb, "SELECT * FROM read_csv('x.csv')"),
+            (Engine::DuckDb, "SELECT * FROM 'x.csv'"),
+            (Engine::ClickHouse, "SELECT * FROM url('http://h/x', CSV)"),
+        ] {
+            assert_eq!(classify(engine, text), Verdict::READ, "{engine:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_path_in_any_duckdb_table_position_asks_first() {
+        for text in [
+            "SELECT * FROM 'data.csv'",
+            "SELECT * FROM \"data.csv\"",
+            "SELECT * FROM 'https://example.com/x.parquet'",
+            "SELECT * FROM 'a.csv' a, 'b.csv' b",
+            "SELECT * FROM t JOIN 'b.csv' b ON t.id = b.id",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM 'b.csv')",
+            // The accepted false positive, recorded in the corpus.
+            "SELECT * FROM t WHERE v = '1.2'",
+        ] {
+            always(Engine::DuckDb, text, AgentVerdict::Approve(Verdict::READ));
+        }
+        for text in [
+            "SELECT * FROM t WHERE ts = '2024-01-02 03:04:05'",
+            "SELECT lower(a) FROM t",
+        ] {
+            always(Engine::DuckDb, text, AgentVerdict::Run);
+        }
+        // No other engine reads a path out of a table position.
+        always(
+            Engine::Postgres,
+            "SELECT * FROM t WHERE v = 'data.csv'",
+            AgentVerdict::Run,
         );
     }
 
