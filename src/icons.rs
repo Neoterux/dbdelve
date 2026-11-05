@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 71] = [
+const ICONS: [(&str, &IconData); 72] = [
     ("icons/git-fork.svg", icondata_lu::LuGitFork),
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
@@ -100,6 +100,7 @@ const ICONS: [(&str, &IconData); 71] = [
     ("icons/engine-sqlserver.svg", icondata_lu::LuServer),
     ("icons/engine-mongodb.svg", icondata_si::SiMongodb),
     ("icons/engine-redis.svg", icondata_si::SiRedis),
+    ("icons/bot.svg", icondata_lu::LuBot),
 ];
 
 /// dbdelve's own names for the icons it draws, so a call site names a thing
@@ -185,6 +186,8 @@ pub mod icon {
     pub const IMPORT: &str = "icons/import.svg";
     /// Back to the default: a font's family or size.
     pub const RESET: &str = "icons/rotate-ccw.svg";
+    /// A connection an agent may reach, beside its name.
+    pub const AGENT_VISIBLE: &str = "icons/bot.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -325,6 +328,7 @@ mod tests {
             icon::IMPORT,
             icon::CHOOSE,
             icon::NO_COLOR,
+            icon::AGENT_VISIBLE,
         ] {
             assert_draws(path);
         }

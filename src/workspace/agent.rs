@@ -34,7 +34,59 @@ impl std::fmt::Display for AgentLookup {
     }
 }
 
+/// What the visibility dialog tells the owner about this engine and mode, one
+/// entry per sentence. A pure function of the two, so opening the dialog asks
+/// no server anything: the hold is what the engine is built to do while the
+/// profile is Read-only, not what a live role allows.
+pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
+    vec![
+        format!("This connection's access level is {}.", mode.label()),
+        engine.read_only_hold().to_string(),
+        "Rows the agent reads leave this machine.".to_string(),
+    ]
+}
+
 impl Workspace {
+    /// Put up the dialog that makes a profile visible to agents. Changes no
+    /// flag: only [`Workspace::confirm_agent_visibility`] does. The index is
+    /// resolved to the profile's id here, once, because the dialog outlives
+    /// whatever the list does meanwhile.
+    pub(crate) fn open_agent_visibility(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        self.agent_visibility_prompt = Some(profile.id.clone());
+        cx.notify();
+    }
+
+    /// The dialog's `Make visible`. Closes the dialog whether or not the
+    /// profile it was open for is still there; the grant itself is
+    /// [`Workspace::set_agent_visible`]'s, which refuses a profile that is gone.
+    pub(crate) fn confirm_agent_visibility(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.agent_visibility_prompt.clone() else {
+            return;
+        };
+        self.set_agent_visible(&id, true, cx);
+        self.agent_visibility_prompt = None;
+        self.refocus_front();
+        cx.notify();
+    }
+
+    /// Close the dialog without granting anything. Answers whether a dialog was
+    /// drawn, so `escape` is only spent on one that was: a prompt left over a
+    /// profile that has since been removed draws nothing.
+    pub(crate) fn cancel_agent_visibility(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.agent_visibility_prompt.take() else {
+            return false;
+        };
+        let drawn = self.profiles.iter().any(|profile| profile.id == id);
+        if drawn {
+            self.refocus_front();
+            cx.notify();
+        }
+        drawn
+    }
+
     /// Make a profile visible to agents or hide it. Keyed by id, never by
     /// index: ids can repeat in a hand-edited file, and the first one wins as
     /// everywhere else in `profiles.rs`.
@@ -80,6 +132,32 @@ impl Workspace {
             (Some(profile), None) => Ok(profile),
             (Some(_), Some(_)) => Err(AgentLookup::Ambiguous),
             (None, _) => Err(AgentLookup::NotAvailable),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dialog_states_the_engines_hold_and_that_rows_leave_the_machine() {
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                let facts = visibility_facts(engine, mode);
+                assert!(facts.iter().any(|fact| fact == engine.read_only_hold()));
+                assert!(
+                    facts
+                        .iter()
+                        .any(|fact| fact == "Rows the agent reads leave this machine.")
+                );
+                assert!(facts.iter().any(|fact| fact.contains(mode.label())));
+                for fact in &facts {
+                    for word in ["yet", "Phase", "MCP", "try", "should", "upgrade"] {
+                        assert!(!fact.contains(word), "{engine:?} {mode:?}: {fact}");
+                    }
+                }
+            }
         }
     }
 }
