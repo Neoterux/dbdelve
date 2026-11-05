@@ -3355,6 +3355,326 @@ fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
     });
 }
 
+/// One call as a process on this machine makes it: connect to the socket, send
+/// `frame` and a newline, read until the app closes the connection. On a thread
+/// of its own, because the window answers only while the test drives it.
+#[cfg(unix)]
+fn raw_call(path: &std::path::Path, frame: &str) -> std::thread::JoinHandle<String> {
+    use std::io::{Read, Write};
+
+    let path = path.to_path_buf();
+    let frame = format!("{frame}\n");
+    std::thread::spawn(move || {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        stream
+            .write_all(frame.as_bytes())
+            .expect("the frame is written");
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .expect("the app answers or closes");
+        answer
+    })
+}
+
+/// Let the window run while threads outside it work, until `done` holds. The
+/// executor never advances its clock here, so only real time passes.
+#[cfg(unix)]
+fn drive_until(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
+    let started = std::time::Instant::now();
+    while !done(cx) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "nothing happened in five seconds"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::agent::{Reply, Status};
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("billing", "Billing", visible),
+                sqlite_profile("secret", "Secret", ""),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+        let states = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profiles
+                    .iter()
+                    .map(|profile| matches!(profile.state, ProfileState::Idle))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = states(cx);
+
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| client.is_finished());
+        let answer = client.join().expect("the client thread finished");
+
+        let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        let listed: serde_json::Value =
+            serde_json::from_str(&reply.text).expect("the text is a JSON array");
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"name": "Orders", "engine": "sqlite"},
+                {"name": "Billing", "engine": "sqlite"},
+            ])
+        );
+        for word in ["Secret", "path", ".db", "host", "user"] {
+            assert!(!reply.text.contains(word), "{word}: {}", reply.text);
+        }
+        assert_eq!(states(cx), before, "listing opened or changed nothing");
+        let mode = std::fs::metadata(path.parent().expect("the socket has a directory"))
+            .expect("the directory exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Dropping the bridge stops the listener; the pump would otherwise
+        // outlive the window.
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_window_holds_a_presence_for_as_long_as_the_connection_is_open(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        std::io::Write::write_all(&mut stream, b"{\"v\":1,\"kind\":\"presence\"}\n")
+            .expect("the frame is written");
+        drive_until(cx, |cx| open(cx) == 1);
+        drop(stream);
+        drive_until(cx, |cx| open(cx) == 0);
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// An agent's call arriving at the window as the socket would hand it over,
+/// without a socket: no thread crosses the test scheduler. Answers the id it
+/// was given and the end its answer will come out of.
+fn inject_call(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tool: crate::agent::tools::Tool,
+    connection: Option<&str>,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = crate::agent::CallId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let (reply, answers) = std::sync::mpsc::sync_channel(1);
+    let call = crate::agent::Inbound::Call {
+        id,
+        tool,
+        connection: connection.map(str::to_string),
+        reply,
+    };
+    workspace.update(cx, |workspace, cx| workspace.on_agent_message(call, cx));
+    (id, answers)
+}
+
+fn pending_calls(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<crate::agent::CallId> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.agent.calls.iter().map(|call| call.id).collect()
+    })
+}
+
+#[gpui::test]
+fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("secret", "Secret", ""),
+                sqlite_profile("dup-1", "Dup", visible),
+                sqlite_profile("dup-2", "Dup", visible),
+            ]
+            .concat(),
+        );
+        let refused = |text: &str| Reply {
+            status: Status::RefusedByGate,
+            text: text.to_string(),
+        };
+
+        for name in [Some("Secret"), Some("Nope"), Some("orders"), None] {
+            let (_, answers) = inject_call(&workspace, cx, Tool::Ping, name);
+            assert_eq!(
+                answers.try_recv().ok(),
+                Some(refused("no agent-visible connection has that name")),
+                "{name:?}"
+            );
+        }
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Dup"));
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(refused(
+                "more than one agent-visible connection has that name"
+            ))
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_unanswered_ping_expires_after_the_fixed_wait(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use crate::agent::{EXPIRY, Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        cx.executor().advance_clock(EXPIRY - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Expired,
+                text: "Nobody answered the ping in DBDelve within 5 minutes.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(answers.try_recv().is_err(), "nothing else is ever sent");
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let ping = b"{\"v\":1,\"kind\":\"call\",\"tool\":\"ping\",\"connection\":\"Orders\"}\n";
+        let connect = || {
+            let mut stream = UnixStream::connect(&path).expect("the socket accepts a client");
+            stream.write_all(ping).expect("the frame is written");
+            stream
+        };
+
+        let first = connect();
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let first_id = pending_calls(&workspace, cx)[0];
+        let mut second = connect();
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
+        let second_id = pending_calls(&workspace, cx)[1];
+        assert_ne!(first_id, second_id);
+
+        drop(first);
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        assert_eq!(pending_calls(&workspace, cx), [second_id]);
+        second
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("the timeout is set");
+        let silent = second.read(&mut [0u8; 1]).expect_err("nothing was sent");
+        assert!(matches!(
+            silent.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        // Stopping the bridge leaves a pending call to the window, which
+        // drops it: its caller sees the connection end with no answer.
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.bridge.take();
+            workspace.agent.calls.clear();
+        });
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is set");
+        let mut rest = Vec::new();
+        second.read_to_end(&mut rest).expect("the connection ends");
+        assert!(rest.is_empty());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
 #[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

@@ -351,6 +351,8 @@ pub(crate) struct Workspace {
     /// dialog sets it, and `set_agent_visible` grants visibility only to the
     /// profile it names.
     pub(crate) agent_visibility_prompt: Option<String>,
+    /// The agent bridge: the socket, and the calls waiting on this window.
+    pub(crate) agent: agent::AgentState,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -515,6 +517,7 @@ impl Workspace {
             collapsed_projects: HashSet::new(),
             theme_before_preview: None,
             agent_visibility_prompt: None,
+            agent: agent::AgentState::default(),
             opacity_input,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),

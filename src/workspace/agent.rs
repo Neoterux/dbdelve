@@ -5,15 +5,62 @@
 //! second writer would be one more path to tell about it. Granting is the
 //! asymmetric half: it needs the owner's confirmation, so it is refused unless
 //! the visibility dialog is open for that very profile.
+//!
+//! The other half is the bridge: what an agent's call becomes once the socket
+//! thread has handed it over. Everything a call does happens here, on the
+//! foreground, reached only through [`Workspace::on_agent_message`].
 
 use super::*;
+use crate::agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool};
+
+/// What the agent bridge holds while it is running.
+#[derive(Default)]
+pub(crate) struct AgentState {
+    /// The socket and the task that drains it, or nothing when no bridge runs.
+    /// Dropping it is what stops listening.
+    pub(crate) bridge: Option<Bridge>,
+    /// The presence connections open now: agents attached, whether or not they
+    /// have asked anything.
+    pub(crate) presence: Vec<crate::agent::ConnId>,
+    /// The calls waiting on an answer, found by their id and never by their
+    /// place in this list.
+    pub(crate) calls: Vec<PendingCall>,
+}
+
+/// A call that has been accepted and not yet finished. Dropping it without
+/// replying closes the caller's connection with no answer.
+pub(crate) struct PendingCall {
+    pub(crate) id: CallId,
+    reply: std::sync::mpsc::SyncSender<Reply>,
+    /// Ends the call as `expired` when it fires. Dropped with the call, which
+    /// is what cancels it.
+    _expiry: gpui::Task<()>,
+}
+
+/// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
+fn expired_text() -> String {
+    format!(
+        "Nobody answered the ping in DBDelve within {} minutes.",
+        EXPIRY.as_secs() / 60
+    )
+}
+
+/// A running bridge. Neither field is read: holding them is the point.
+pub(crate) struct Bridge {
+    _listener: crate::agent::Listener,
+    _pump: gpui::Task<()>,
+}
+
+/// One entry of `list_connections`: a name and an engine, and nothing that
+/// says where the database is or how to get in.
+#[derive(serde::Serialize)]
+struct Listed<'a> {
+    name: &'a str,
+    engine: &'static str,
+}
 
 /// Why a profile name did not resolve for an agent. Two answers only, and
 /// neither echoes the name asked for: the text goes back to the agent as it is.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLookup {
     /// No agent-visible profile has that name. A hidden profile, a missing one,
@@ -110,6 +157,151 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Start answering agents on the socket at `path`. Answers `Ok` when a
+    /// bridge already runs.
+    ///
+    /// The socket's threads hand each message to a channel, and a foreground
+    /// task drains it into [`Workspace::on_agent_message`]. That task only ever
+    /// awaits the channel: nothing here needs a reactor, which GPUI's executor
+    /// does not have.
+    pub(crate) fn start_bridge_at(
+        &mut self,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.agent.bridge.is_some() {
+            return Ok(());
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let listener = crate::agent::listen(&path, sender).map_err(|declined| match declined {
+            crate::agent::Declined::ServedElsewhere => {
+                "Another DBDelve window is already serving agents.".to_string()
+            }
+            crate::agent::Declined::Failed(text) => text,
+        })?;
+        let pump = cx.spawn(async move |workspace, cx| {
+            while let Some(message) = receiver.recv().await {
+                if workspace
+                    .update(cx, |workspace, cx| workspace.on_agent_message(message, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.agent.bridge = Some(Bridge {
+            _listener: listener,
+            _pump: pump,
+        });
+        Ok(())
+    }
+
+    /// Start answering agents on this build's own socket.
+    #[expect(
+        dead_code,
+        reason = "the agent access switch (plan 04-03) is the first caller"
+    )]
+    pub(crate) fn listen_for_agents(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        self.start_bridge_at(crate::agent::socket_path()?, cx)
+    }
+
+    /// What an agent asked for. Opens no connection and starts no database
+    /// work: the answer is read from the profile list as it stands.
+    pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
+        match message {
+            Inbound::PresenceOpened { conn } => {
+                self.agent.presence.push(conn);
+                cx.notify();
+            }
+            Inbound::PresenceClosed { conn } => {
+                self.agent.presence.retain(|open| *open != conn);
+                cx.notify();
+            }
+            Inbound::Call {
+                tool: Tool::ListConnections,
+                reply,
+                ..
+            } => {
+                let visible: Vec<Listed> = self
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.agent_visible)
+                    .map(|profile| Listed {
+                        name: &profile.name,
+                        engine: profile.config.engine().as_str(),
+                    })
+                    .collect();
+                let text = serde_json::to_string(&visible)
+                    .expect("names and engine spellings always serialize");
+                // The caller may have hung up, and then nobody reads this.
+                let _ = reply.send(Reply {
+                    status: Status::Executed,
+                    text,
+                });
+            }
+            Inbound::Call {
+                tool: Tool::Ping,
+                id,
+                connection,
+                reply,
+            } => {
+                let found = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(|_| ()),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                if let Err(lookup) = found {
+                    // The caller may have hung up, and then nobody reads this.
+                    let _ = reply.send(Reply {
+                        status: Status::RefusedByGate,
+                        text: lookup.to_string(),
+                    });
+                    return;
+                }
+                let expiry = cx.spawn(async move |workspace, cx| {
+                    cx.background_executor().timer(EXPIRY).await;
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.finish_call(id, Status::Expired, expired_text(), cx)
+                    });
+                });
+                self.agent.calls.push(PendingCall {
+                    id,
+                    reply,
+                    _expiry: expiry,
+                });
+                cx.notify();
+            }
+            Inbound::Hangup { id } => {
+                self.finish_call(id, Status::Cancelled, String::new(), cx);
+            }
+        }
+    }
+
+    /// The one door every call ends through: answered, expired or hung up.
+    /// It removes the call by id before it replies, so two things ending the
+    /// same call at once produce one outcome and at most one reply. Answers
+    /// whether there was such a call.
+    ///
+    /// A `Cancelled` call is dropped without a reply, because its caller has
+    /// gone and nobody would read one.
+    pub(crate) fn finish_call(
+        &mut self,
+        id: CallId,
+        status: Status,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
+            return false;
+        };
+        let call = self.agent.calls.remove(index);
+        if status != Status::Cancelled {
+            // The caller may have hung up, and then nobody reads this.
+            let _ = call.reply.send(Reply { status, text });
+        }
+        cx.notify();
+        true
+    }
+
     /// The agent-visible profile called `name`.
     ///
     /// Filters to visible profiles before it compares names, so a hidden
@@ -118,10 +310,6 @@ impl Workspace {
     /// on bytes, with no case folding, trimming or normalisation, so what an
     /// agent was told is the only spelling that works. A profile this build
     /// cannot open is never in `self.profiles`, so it is never a candidate.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     pub(crate) fn agent_profile(&self, name: &str) -> Result<&Profile, AgentLookup> {
         let mut matches = self
             .profiles
