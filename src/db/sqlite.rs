@@ -1274,6 +1274,20 @@ SELECT n FROM counting
         }
     }
 
+    /// Why SQLite's `egress_functions` is empty: `readfile` and `writefile` are
+    /// the command-line shell's functions, not the library's, so the bundled
+    /// library has no function that reaches a file.
+    #[test]
+    fn the_bundled_library_reads_and_writes_no_files() {
+        let connection = memory("");
+        for sql in ["SELECT readfile('x')", "SELECT writefile('x', 'y')"] {
+            assert!(
+                connection.query(sql, Fetch::default()).is_err(),
+                "{sql} ran on the bundled library"
+            );
+        }
+    }
+
     #[test]
     fn a_row_limit_keeps_the_first_rows_and_counts_the_rest() {
         let connection = memory("");

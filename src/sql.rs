@@ -2625,7 +2625,9 @@ struct Parsed {
     statements: usize,
     /// Whether any statement the walk reached is a `DELETE`, whatever its
     /// shape: top level, a CTE's body, under `EXPLAIN ANALYZE`, in an `IF` or a
-    /// scripting block, a ClickHouse mutation that amounts to one.
+    /// scripting block, a ClickHouse mutation that amounts to one. On MongoDB
+    /// and Redis it is whether any statement or command removes data, which
+    /// those engines' own readers decide.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
@@ -4546,10 +4548,23 @@ const MEMBER_FORMS: &[&str] = &["nextval"];
 /// does not name, so a shape probe over the catalog could not find it, and the
 /// functions in an extension outside `pg_catalog` that run text they are handed.
 fn calls_denied_function(engine: Engine, sql: &str) -> bool {
-    let denied = engine.spec().sql.denied_functions;
+    calls_listed(
+        engine,
+        sql,
+        engine.spec().sql.denied_functions,
+        MEMBER_FORMS,
+    )
+}
+
+/// Whether `sql` calls any function on `listed`, by the scan
+/// [`calls_denied_function`] describes. One scan answers both lists, so the
+/// deny-list and the agent's egress list cannot read a call two ways.
+/// `member_forms` is the deny-list's period arm only: an egress name straight
+/// after a period is a column reference and stays a read.
+fn calls_listed(engine: Engine, sql: &str, listed: &[&str], member_forms: &[&str]) -> bool {
     // An engine that lists nothing is judged by the parse alone, as it was
     // before the list existed.
-    if denied.is_empty() {
+    if listed.is_empty() {
         return false;
     }
     let Some(dialect) = dialect(engine) else {
@@ -4581,9 +4596,9 @@ fn calls_denied_function(engine: Engine, sql: &str) -> bool {
             // followed by one and still stopped. Deciding a word's position
             // from the tokens would be a second parser kept in step with six
             // dialects by hand, so those are recorded in the corpus instead.
-            if denied.contains(&name.as_str())
+            if listed.contains(&name.as_str())
                 && (tokens.peek() == Some(&&Token::LParen)
-                    || (previous == Some(&Token::Period) && MEMBER_FORMS.contains(&name.as_str())))
+                    || (previous == Some(&Token::Period) && member_forms.contains(&name.as_str())))
             {
                 return true;
             }

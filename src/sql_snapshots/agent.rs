@@ -593,6 +593,62 @@ pub(crate) fn nonsql_cells() -> Vec<(Engine, String, String)> {
         .collect()
 }
 
+/// The shapes of DuckDB's bare-path reads (D-03), recorded on every engine: a
+/// quoted string in each table position, then the two statements whose
+/// literal is no path and the one that is dotted without being one, which
+/// DuckDB asks about all the same.
+const BARE_PATHS: &[(&str, &str)] = &[
+    ("a quoted path", "SELECT * FROM 'data.csv'"),
+    ("a double-quoted path", "SELECT * FROM \"data.csv\""),
+    ("a url", "SELECT * FROM 'https://example.com/x.parquet'"),
+    ("a comma join", "SELECT * FROM 'a.csv' a, 'b.csv' b"),
+    ("a join", "SELECT * FROM t JOIN 'b.csv' b ON t.id = b.id"),
+    (
+        "a subquery",
+        "SELECT * FROM t WHERE id IN (SELECT id FROM 'b.csv')",
+    ),
+    (
+        "a dotted literal that is no path",
+        "SELECT * FROM t WHERE v = '1.2'",
+    ),
+    (
+        "a timestamp literal",
+        "SELECT * FROM t WHERE ts = '2024-01-02 03:04:05'",
+    ),
+];
+
+/// Every `(engine, case, text)` the egress corpus records, in the order it
+/// records them: for each SQL engine, `SELECT * FROM {name}('x')` for each name
+/// on its egress list, then the bare-path shapes on every engine, MongoDB and
+/// Redis included, as whatever their parsers make of them. An engine with no
+/// list is recorded as `(no egress list)` by [`agent_gate_corpus_for_egress`].
+pub(crate) fn egress_cells() -> Vec<(Engine, String, String)> {
+    Engine::ALL
+        .into_iter()
+        .flat_map(|engine| {
+            let calls = if engine.syntax() == Syntax::Sql {
+                engine.spec().sql.egress_functions
+            } else {
+                &[]
+            };
+            calls
+                .iter()
+                .map(move |name| {
+                    (
+                        engine,
+                        format!("call {name}"),
+                        format!("SELECT * FROM {name}('x')"),
+                    )
+                })
+                .chain(
+                    BARE_PATHS
+                        .iter()
+                        .map(move |(case, text)| (engine, (*case).to_owned(), (*text).to_owned())),
+                )
+        })
+        .collect()
+}
+
 /// The three answers for `text`, in Read-only, Read-write and Full.
 fn answers(engine: Engine, text: &str) -> String {
     let [ro, rw, full] = Mode::ALL.map(|mode| answer(&sql::agent_gate(engine, text, mode)));
@@ -641,10 +697,33 @@ fn agent_gate_corpus_for_mongodb_and_redis() {
     check("agent_gate_nonsql", &out);
 }
 
-/// Every cell of the corpus, SQL and not.
+#[test]
+fn agent_gate_corpus_for_egress() {
+    let mut out = String::new();
+    for engine in Engine::ALL {
+        if engine.syntax() == Syntax::Sql && engine.spec().sql.egress_functions.is_empty() {
+            fragment(&mut out, engine, "(no egress list)", None);
+        }
+        for (recorded, case, text) in egress_cells() {
+            if recorded != engine {
+                continue;
+            }
+            fragment(
+                &mut out,
+                engine,
+                &format!("{case}: {}", visible(&text)),
+                Some(&answers(engine, &text)),
+            );
+        }
+    }
+    check("agent_gate_egress", &out);
+}
+
+/// Every cell of the corpus, SQL and not, and the egress cells.
 fn all_cells() -> Vec<(Engine, String, String)> {
     let mut cells = sql_cells();
     cells.extend(nonsql_cells());
+    cells.extend(egress_cells());
     cells
 }
 

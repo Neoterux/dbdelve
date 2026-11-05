@@ -199,6 +199,63 @@ update on a table lacking the block columns is spelled `ALTER TABLE <t> UPDATE
 the setting last. A row that cannot be matched exactly stays read-only and says
 why.
 
+## Agent statements
+
+**`sql::agent_gate(engine, sql, mode)` is the one answer for a statement an
+agent originates, and nothing else answers for one.** It returns `Run`,
+`Approve(verdict)` or `Refuse(reason)`, reads no profile, no silenced
+confirmation and no earlier approval, and decides about the text as written. The
+`mode` is the profile's, and it is the ceiling: a `Run` or an `Approve` always
+passes `gate` with that mode and nothing silenced. The ladder, in the order it
+is asked (the header of `src/sql/agent.rs` is its source):
+
+1. An unreadable statement is `Refuse(Unreadable)`, or `Refuse(Delete)` where
+   it is seen to remove data.
+2. No statement is `Refuse(NoStatement)`, two or more `Refuse(MoreThanOne)`.
+3. A Redis command the editor never sends is `Refuse(NotSent)`.
+4. `DROP`, `TRUNCATE`, any `DELETE` and an `ALTER TABLE` that is not `ADD
+   COLUMN` are refused by name.
+5. A server-side script is `Refuse(Script)`, a Redis command returning
+   credentials or other clients' details `Refuse(Disclosure)`.
+6. A statement that changes the session is `Refuse(Session)`.
+7. A verdict needing Full is `Refuse(NeedsFull)`: a Full profile grants an agent
+   nothing a Read-write one does not.
+8. A statement the mode stops is `Refuse(NeedsMode)`.
+9. A write the mode allows is `Approve`.
+10. A read that calls an egress function, or on DuckDB holds a path, is
+    `Approve` with a Read-only verdict, in every mode.
+11. Anything else is a read and `Run`s.
+
+Steps 1 to 6 do not depend on the mode, so a refusal's reason is the same on
+every profile. A `Run` is therefore a lone `sql::rerunnable` read that changes no
+session state and calls nothing on the engine's `denied_functions` or
+`egress_functions`.
+
+**Egress is its own list.** `SqlSpec::egress_functions` names the functions that
+read a file, a URL, a program or another server, or run text that may
+(`pg_read_file`, MySQL's `load_file`, DuckDB's `read_csv` and `read_xlsx`,
+ClickHouse's `url`, `s3`, `file`, `remote`, `executable` and `eval`). An agent
+that reads one chooses where rows come from and carries them off the machine, so
+it waits for the human. It is not on `denied_functions` because that list raises
+the human path's verdict: a user's own read of a file, and DBDelve's own CSV,
+Excel, Parquet and JSON opens, which are these calls, would stop being reads.
+Only the agent path reads the egress list, which is why it narrows what a mode
+lets run and never widens it. Each list is pinned against its engine's own
+catalog (`pg_catalog`, `duckdb_functions()`, `system.table_functions`) so a
+function a later version adds fails a test by name; SQLite, Turso and Snowflake
+list none, and SQL Server's list is from the documentation.
+
+**DuckDB reads a quoted string in a table position as a file or a URL**
+(`FROM 'data.csv'`), so no function name marks the read. On an engine that sets
+`SqlSpec::bare_path_reads`, a string literal or `"`-quoted word holding a `.`,
+`/` or `\` asks first wherever it sits in the statement. That is a superset of
+the table positions, which is the safe direction, and its accepted cost is that
+any dotted literal asks (`WHERE v = '1.2'`); reading table positions off the
+parse would be a second reading of DuckDB's grammar kept in step by hand. A
+table the administrator set up that reads outside the database (a Postgres
+foreign table, a ClickHouse dictionary) carries no signal in the statement and
+is not covered here.
+
 ## Connection modes, per engine
 
 The core of the mode check is in `AGENTS.md`, "Connection modes". The detail:
