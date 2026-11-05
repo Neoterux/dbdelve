@@ -661,6 +661,13 @@ impl Workspace {
             }
             Command::EditConnection(index) => self.edit_profile(index, window, cx),
             Command::DuplicateConnection(index) => self.duplicate_profile(index, window, cx),
+            Command::ShowToAgents(index) => self.open_agent_visibility(index, cx),
+            Command::HideFromAgents(index) => {
+                // Resolved to the id before anything else, as the dialog does.
+                if let Some(id) = self.profiles.get(index).map(|profile| profile.id.clone()) {
+                    self.set_agent_visible(&id, false, cx);
+                }
+            }
             Command::ChooseProject(index) => {
                 self.open_palette(PaletteMode::MoveToProject(index), window, cx)
             }

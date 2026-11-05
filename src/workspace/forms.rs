@@ -12,6 +12,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable};
 
+use super::agent::visibility_facts;
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -779,9 +780,12 @@ impl Workspace {
             self.focus_before_dialog.replace(window.focused(cx));
         }
         if raised {
-            // Every dialog opens on its primary button, as a native one does.
-            // The ring is drawn by the dialogs above, before this ran.
-            self.dialog_choice.set(0);
+            // Every dialog opens on its primary button, as a native one does,
+            // except the one that widens what an agent may reach: it opens on
+            // Cancel, so an `enter` held or repeated from the palette row
+            // that raised it cancels rather than grants. The ring is drawn by
+            // the dialogs above, before this ran.
+            self.dialog_choice.set(first_choice(front));
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
         // The palette is stacked over the dialogs and holds the keyboard
@@ -996,6 +1000,8 @@ impl Workspace {
             ("pending-export", _) => _ = self.cancel_pending_export(cx),
             ("pending-run", 0) => self.approve_pending_run(cx),
             ("pending-run", _) => self.cancel_pending_run(cx),
+            ("agent-visibility", 0) => self.confirm_agent_visibility(cx),
+            ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
             ("delete", 0) => match deleting {
@@ -1329,6 +1335,99 @@ impl Workspace {
                                                     cx,
                                                     |workspace, cx| {
                                                         workspace.confirm_discard_close(window, cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What making a connection visible to agents asks first: which hold the
+    /// engine has while the profile is Read-only, and that rows an agent reads
+    /// leave this machine. Nothing here asks a server; the facts are static.
+    /// Nothing is drawn unless the prompt's profile is still in the list.
+    pub(crate) fn render_agent_visibility(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = popup_theme(cx);
+        let id = self.agent_visibility_prompt.as_deref()?;
+        let profile = self.profiles.iter().find(|profile| profile.id == id)?;
+        let facts = visibility_facts(profile.config.engine(), profile.mode);
+        let cancel_workspace = cx.entity().downgrade();
+        let confirm_workspace = cancel_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Agent access"))
+                        // Not in the label: it is upper-cased there, and a
+                        // connection's name is spelt the way its owner wrote it.
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text)
+                                .child(format!("Make {} visible to agents", profile.name)),
+                        )
+                        .children(facts.into_iter().map(|fact| {
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(fact)
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    self.choice(
+                                        "agent-visibility",
+                                        1,
+                                        button(
+                                            "cancel-agent-visibility",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                    workspace.cancel_agent_visibility(cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                )
+                                .child(
+                                    self.choice(
+                                        "agent-visibility",
+                                        0,
+                                        button(
+                                            "confirm-agent-visibility",
+                                            "Make visible",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = confirm_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.confirm_agent_visibility(cx);
                                                     },
                                                 );
                                             },
@@ -2831,6 +2930,16 @@ impl Workspace {
 
 /// What a saved query's row offers on a right click: what its tab offers, for
 /// a query that may have no tab open.
+/// The button the ring starts on when `dialog` goes up, counted from the right.
+/// Cancel for the one that widens what an agent may reach, the primary for
+/// every other.
+fn first_choice(dialog: Option<&str>) -> usize {
+    match dialog {
+        Some("agent-visibility") => 1,
+        _ => 0,
+    }
+}
+
 fn saved_query_menu(
     menu: PopupMenu,
     name: &str,

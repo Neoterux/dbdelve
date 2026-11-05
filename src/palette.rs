@@ -365,6 +365,11 @@ pub enum Command {
     ProjectActions(usize),
     EditConnection(usize),
     DuplicateConnection(usize),
+    /// Open the dialog that makes this connection visible to agents. Changes
+    /// nothing itself: the dialog's own button does.
+    ShowToAgents(usize),
+    /// Hide this connection from agents, at once and with no dialog.
+    HideFromAgents(usize),
     /// Put the palette back up over the projects this connection can join.
     ChooseProject(usize),
     /// `None` is No project.
@@ -1002,6 +1007,10 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
                 | Command::RemoveConnection(_)
                 | Command::RemoveUnavailable(_)
                 | Command::DeleteProject(_)
+                // A trust change is never one `enter` from a list the user
+                // did not open for it.
+                | Command::ShowToAgents(_)
+                | Command::HideFromAgents(_)
         )
 }
 
@@ -2589,6 +2598,21 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
         Command::DuplicateConnection(index),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        row(
+            format!("Hide {name} from agents"),
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(index),
+            CONNECTION,
+        )
+    } else {
+        row(
+            format!("Make {name} visible to agents…"),
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(index),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(row(
             format!("Move {name} to a project…"),
@@ -4047,6 +4071,21 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         Command::DuplicateConnection(active),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        command(
+            "Hide connection from agents",
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(active),
+            CONNECTION,
+        )
+    } else {
+        command(
+            "Make connection visible to agents…",
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(active),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(command(
             "Move connection to a project…",

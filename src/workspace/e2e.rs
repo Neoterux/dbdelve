@@ -15,7 +15,7 @@ use crate::{
     db::{CancelToken, Engine, Fetch},
     explain::analysis::Basis,
     explorer, keybindings,
-    palette::{Mode as PaletteMode, Scope},
+    palette::{Command, Mode as PaletteMode, Scope},
     session::{CatalogState, ObjectBody, QueryState, QueryTab, Tab},
     store,
     theme::{self, Fonts},
@@ -2341,6 +2341,46 @@ fn a_hidden_profile_and_a_missing_one_answer_byte_for_byte_the_same(cx: &mut Tes
                 }
             }
         });
+        quit(workspace, cx);
+    });
+}
+
+fn run_command(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, command: Command) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.run_command(command, window, cx)
+    });
+    settle(cx);
+}
+
+fn visibility_prompt(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| workspace.agent_visibility_prompt.clone())
+}
+
+#[gpui::test]
+fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+        assert_eq!(ringed_button(&workspace, cx), 1);
+        assert!(!agent_visible(&workspace, cx, "only"));
+
+        // An `enter` carried over from the palette row lands on Cancel.
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!agent_visible(&workspace, cx, "only"));
+        assert!(!saved_visible("only"));
+
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(ringed_button(&workspace, cx), 1);
+        press(cx, "right");
+        assert_eq!(ringed_button(&workspace, cx), 0);
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(visibility_prompt(&workspace, cx), None);
+        assert!(agent_visible(&workspace, cx, "only"));
+        assert!(saved_visible("only"));
         quit(workspace, cx);
     });
 }
