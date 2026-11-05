@@ -63,8 +63,8 @@ use crate::{
     },
     ui::{
         Control, Tone, chord_for, group_thousands, highlighted, icon_button, key_chip,
-        keycap_parts, keycaps, kind_color, object_icon, one_line, raised_card, row_icon_tinted,
-        search_field, status_dot,
+        keycap_parts, keycaps, kind_color, object_icon, one_line, raised_card, row_icon,
+        row_icon_tinted, search_field, status_dot,
     },
     workspace::{ReferenceSource, opacity_for},
 };
@@ -366,6 +366,11 @@ pub enum Command {
     ProjectActions(usize),
     EditConnection(usize),
     DuplicateConnection(usize),
+    /// Open the dialog that makes this connection visible to agents. Changes
+    /// nothing itself: the dialog's own button does.
+    ShowToAgents(usize),
+    /// Hide this connection from agents, at once and with no dialog.
+    HideFromAgents(usize),
     /// Put the palette back up over the projects this connection can join.
     ChooseProject(usize),
     /// `None` is No project.
@@ -495,6 +500,8 @@ struct Item {
     mono: bool,
     /// A label drawn muted: a connection this build cannot open.
     muted: bool,
+    /// A connection an agent may reach, marked after its name.
+    agent_visible: bool,
     scope: Scope,
     /// Listed under All as well as in its own scope.
     in_all: bool,
@@ -646,6 +653,7 @@ impl Item {
             status: None,
             mono: false,
             muted: false,
+            agent_visible: false,
             scope: Scope::Commands,
             in_all: true,
             group: Group::Bare,
@@ -702,6 +710,13 @@ impl Item {
     fn status(mut self, profile: usize) -> Self {
         self.status = Some(profile);
         self
+    }
+
+    fn agent_visible(self, visible: bool) -> Self {
+        Self {
+            agent_visible: visible,
+            ..self
+        }
     }
 
     fn beyond_all(mut self) -> Self {
@@ -1003,6 +1018,10 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
                 | Command::RemoveConnection(_)
                 | Command::RemoveUnavailable(_)
                 | Command::DeleteProject(_)
+                // A trust change is never one `enter` from a list the user
+                // did not open for it.
+                | Command::ShowToAgents(_)
+                | Command::HideFromAgents(_)
         )
 }
 
@@ -1726,6 +1745,13 @@ impl Palette {
                                     .text_size(px(layout::chrome(layout::TEXT_SM)))
                                     .text_color(t.text_faint)
                                     .child(detail)
+                            }))
+                            // Muted and still, like the hint: it says what is
+                            // true, it does not ask for attention.
+                            .children(item.agent_visible.then(|| {
+                                div()
+                                    .flex_shrink_0()
+                                    .child(row_icon(t, icon::AGENT_VISIBLE))
                             })),
                     )
                     .when(!item.hint.is_empty(), |row| {
@@ -2391,6 +2417,8 @@ struct Listed<'a> {
     endpoint: String,
     logo: &'static str,
     color: Option<ConnectionColor>,
+    /// Whether an agent may reach it. Never true for one this build cannot open.
+    agent_visible: bool,
     /// A connection this build cannot open, by index into
     /// `Workspace::unavailable`, and why.
     unavailable: Option<(usize, String)>,
@@ -2414,6 +2442,7 @@ fn connection_items(workspace: &Workspace) -> Vec<Item> {
             endpoint: profile.config.listed_endpoint(),
             logo: profile.config.target().logo(),
             color: profile.color,
+            agent_visible: profile.agent_visible,
             unavailable: None,
         })
         .chain(
@@ -2428,6 +2457,7 @@ fn connection_items(workspace: &Workspace) -> Vec<Item> {
                     endpoint: String::new(),
                     logo: icon::DATABASE,
                     color: None,
+                    agent_visible: false,
                     unavailable: Some((
                         at,
                         crate::workspace::unavailable_reason(gone, &workspace.plugins),
@@ -2525,6 +2555,7 @@ fn listed_connections(
             )
             .detail(connection.endpoint.clone())
             .tint(connection.color)
+            .agent_visible(connection.agent_visible)
             .status(index)
             .hint(if index == active { "current" } else { "" })
             .also(vec![connection.host.clone()])
@@ -2593,6 +2624,21 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
         Command::DuplicateConnection(index),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        row(
+            format!("Hide {name} from agents"),
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(index),
+            CONNECTION,
+        )
+    } else {
+        row(
+            format!("Make {name} visible to agents…"),
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(index),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(row(
             format!("Move {name} to a project…"),
@@ -4063,6 +4109,21 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         Command::DuplicateConnection(active),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        command(
+            "Hide connection from agents",
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(active),
+            CONNECTION,
+        )
+    } else {
+        command(
+            "Make connection visible to agents…",
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(active),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(command(
             "Move connection to a project…",
@@ -4778,6 +4839,7 @@ mod tests {
             endpoint: host.to_string(),
             logo: Engine::Postgres.logo(),
             color: None,
+            agent_visible: false,
             unavailable: None,
         }
     }
@@ -4834,6 +4896,34 @@ mod tests {
             .find(|item| matches!(item.command, Command::ToggleProject(0)))
             .unwrap();
         assert_eq!(billing.hint.as_ref(), "3 connections");
+    }
+
+    #[test]
+    fn a_visible_connection_row_carries_the_agent_marker() {
+        let (mut rows, projects) = with_unavailable();
+        rows[1] = Listed {
+            agent_visible: true,
+            ..listed("scratch", "Scratch", "localhost")
+        };
+        let items = listed_connections(&rows, &projects, 0);
+        let marked = |label: &str| {
+            items
+                .iter()
+                .find(|item| item.label == label)
+                .unwrap()
+                .agent_visible
+        };
+        assert!(marked("Scratch"));
+        assert!(!marked("Orders"));
+        assert!(!marked("Oracle"));
+    }
+
+    #[test]
+    fn a_visibility_command_is_never_remembered() {
+        for scope in [Scope::Commands, Scope::Connections] {
+            assert!(!remembered(scope, &Command::ShowToAgents(0)));
+            assert!(!remembered(scope, &Command::HideFromAgents(0)));
+        }
     }
 
     #[test]
