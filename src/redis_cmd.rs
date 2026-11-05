@@ -352,6 +352,71 @@ pub(crate) fn leaves(text: &str) -> Leaves {
     leaves
 }
 
+/// Every command of `text` that splits into words, in order. A line that does
+/// not split is left out: the callers below answer for what they can read, and
+/// [`classify`] already calls the text unreadable.
+fn commands(text: &str) -> impl Iterator<Item = Command> + '_ {
+    statements(text).into_iter().filter_map(|span| {
+        let words = split(&text[span.clone()]).ok()?;
+        Some(Command { span, words })
+    })
+}
+
+/// Whether any command of `text` takes data out of the database: a name in
+/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, or an expiry
+/// whose timeout is not a positive integer written plainly (`EXPIRE k 0`
+/// deletes the key at once). The agent path refuses all of them, whatever the
+/// mode (GATE-07); the human path never asks.
+pub(crate) fn removes(text: &str) -> bool {
+    commands(text).any(|command| removes_data(&command))
+}
+
+fn removes_data(command: &Command) -> bool {
+    let name = command.name();
+    match name.as_str() {
+        "MIGRATE" => true,
+        "XGROUP" => matches!(command.subcommand().as_str(), "DESTROY" | "DELCONSUMER"),
+        // The fail-safe reading of a timeout the server may take as
+        // non-positive or reject: only a run of digits not starting with `0`
+        // is known to keep the key.
+        "EXPIRE" | "PEXPIRE" | "HEXPIRE" | "HPEXPIRE" => {
+            let timeout = word(&command.words, 2);
+            timeout.is_empty()
+                || !timeout.bytes().all(|byte| byte.is_ascii_digit())
+                || timeout.starts_with('0')
+        }
+        name => REMOVES.contains(&name),
+    }
+}
+
+/// Whether any command of `text` runs a script the server holds, or loads one:
+/// `EVAL`, `EVALSHA`, `FCALL`, their `_RO` forms (the server holds those to
+/// reads, but what the script does is still code DBDelve cannot read),
+/// `SCRIPT LOAD` and `FUNCTION LOAD`.
+pub(crate) fn runs_script(text: &str) -> bool {
+    commands(text).any(|command| {
+        let name = command.name();
+        match name.as_str() {
+            "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => true,
+            "SCRIPT" | "FUNCTION" => command.subcommand() == "LOAD",
+            name => SCRIPTS.contains(&name),
+        }
+    })
+}
+
+/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`: the two
+/// commands that can answer with `requirepass`, `masterauth` or another
+/// client's address and name (D-27). Matched by name and subcommand and
+/// nothing wider; [`kind`] records why the line is drawn there.
+pub(crate) fn discloses(text: &str) -> bool {
+    commands(text).any(|command| {
+        matches!(
+            (command.name().as_str(), command.subcommand().as_str()),
+            ("CONFIG", "GET") | ("CLIENT", "LIST")
+        )
+    })
+}
+
 /// Every command name the editor offers, with how much it may do. A name that
 /// only has subcommands (`CONFIG`) has no kind of its own, and a refused one
 /// is left out.
@@ -850,6 +915,67 @@ const WRITES: &[&str] = &[
     "VSETATTR",
 ];
 
+/// Commands that take data out of the database, one word each: what the agent
+/// path's GATE-07 refuses on Redis whatever the mode. The human path never
+/// reads this list. Names that decide by an argument or a subcommand
+/// (`MIGRATE`, `XGROUP DESTROY`, the `EXPIRE` family) are in [`removes`].
+///
+/// ponytail: these overwrite or move data without a removal flag and stay
+/// approvable (D-23): `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` and `HPEXPIREAT`
+/// with a time in the past delete the key, `RENAME`, `COPY ... REPLACE`,
+/// `RESTORE ... REPLACE` and every `*STORE` command overwrite their
+/// destination, and `LMOVE`, `BLMOVE`, `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and
+/// `MOVE` hand what leaves one key to another. The ceiling is that a pure
+/// function has no clock and does not know whether a destination exists, so
+/// the human reads the exact command before approving it. The upgrade path
+/// is a removal flag on those words, once the approval surface can show the
+/// destination's state.
+const REMOVES: &[&str] = &[
+    "DEL",
+    "UNLINK",
+    "GETDEL",
+    "DELEX",
+    "HDEL",
+    "HGETDEL",
+    "LPOP",
+    "RPOP",
+    "BLPOP",
+    "BRPOP",
+    "LMPOP",
+    "BLMPOP",
+    "LREM",
+    "LTRIM",
+    "SREM",
+    "SPOP",
+    "ZREM",
+    "ZPOPMIN",
+    "ZPOPMAX",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "ZMPOP",
+    "BZMPOP",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+    "ZREMRANGEBYLEX",
+    "XDEL",
+    "XTRIM",
+    "XACKDEL",
+    "XDELEX",
+    "JSON.DEL",
+    "JSON.FORGET",
+    "JSON.CLEAR",
+    "JSON.ARRPOP",
+    "JSON.ARRTRIM",
+    "TS.DEL",
+    "TS.DELETERULE",
+    "CF.DEL",
+    "FT.ALIASDEL",
+    "FT.DICTDEL",
+    "FT.SUGDEL",
+    "VREM",
+    "TDIGEST.RESET",
+];
+
 /// Commands that run a script, whose `redis.call`s are DBDelve's to guess at:
 /// `EVAL "return redis.call('flushall')" 0` is a `FLUSHALL`. Their `_RO`
 /// forms, which the server holds to reads, are in `READS`.
@@ -1121,5 +1247,74 @@ mod tests {
         assert_eq!(leaves("CLIENT LIST"), Leaves::default());
         assert!(leaves("CLIENT SETNAME me").settings);
         assert!(leaves("CLIENT NO-TOUCH ON").settings);
+    }
+
+    #[test]
+    fn every_removal_and_script_name_is_one_the_tables_know() {
+        for name in REMOVES {
+            assert!(WRITES.contains(name), "{name} is not a write");
+        }
+        for name in ["EVAL", "EVALSHA", "FCALL"] {
+            assert!(SCRIPTS.contains(&name), "{name}");
+            assert!(runs_script(&format!("{name} x 0")), "{name}");
+        }
+        for name in ["EVAL_RO", "EVALSHA_RO", "FCALL_RO"] {
+            assert!(READS.contains(&name), "{name}");
+            assert!(runs_script(&format!("{name} x 0")), "{name}");
+        }
+        assert!(runs_script("SCRIPT LOAD \"return 1\""));
+        assert!(runs_script("function load code"));
+        assert!(!runs_script("SCRIPT EXISTS abc"));
+        assert!(!runs_script("GET a"));
+        for text in [
+            "CONFIG GET x",
+            "config get *",
+            "CLIENT LIST",
+            "GET a\nCLIENT LIST",
+        ] {
+            assert!(discloses(text), "{text}");
+        }
+        for text in [
+            "CONFIG HELP",
+            "CLIENT INFO",
+            "ACL LIST",
+            "ACL GETUSER u",
+            "SLOWLOG GET",
+        ] {
+            assert!(!discloses(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_expiry_removes_only_with_a_timeout_that_is_not_positive() {
+        assert!(!removes("EXPIRE k 10"));
+        assert!(!removes("hexpire k 10 FIELDS 1 f"));
+        for text in [
+            "EXPIRE k 0",
+            "EXPIRE k -5",
+            "EXPIRE k 010",
+            "EXPIRE k +5",
+            "EXPIRE k abc",
+            "EXPIRE k",
+            "PEXPIRE k 0",
+            "HEXPIRE k 0 FIELDS 1 f",
+            "HPEXPIRE k -1 FIELDS 1 f",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+        // A time in the past is not told apart from one in the future: a pure
+        // function has no clock, and the human reads the number.
+        assert!(!removes("EXPIREAT k 1"));
+        assert!(!removes("PEXPIREAT k 1"));
+    }
+
+    #[test]
+    fn a_removal_is_found_wherever_the_line_sits_and_however_it_is_cased() {
+        assert!(removes("GET a\ndel a"));
+        assert!(removes("# note\nXGROUP destroy s g"));
+        assert!(removes("MIGRATE h 6379 k 0 1000"));
+        assert!(!removes("SET k v"));
+        assert!(!removes("RENAME a b"));
+        assert!(!removes("SET k \"open"));
     }
 }
