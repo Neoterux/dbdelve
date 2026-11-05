@@ -2594,9 +2594,9 @@ fn raw_call(path: &std::path::Path, frame: &str) -> std::thread::JoinHandle<Stri
 /// Let the window run while threads outside it work, until `done` holds. The
 /// executor never advances its clock here, so only real time passes.
 #[cfg(unix)]
-fn drive_until(cx: &mut VisualTestContext, mut done: impl FnMut() -> bool) {
+fn drive_until(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
     let started = std::time::Instant::now();
-    while !done() {
+    while !done(cx) {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "nothing happened in five seconds"
@@ -2646,7 +2646,7 @@ fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
             })
             .expect("the socket binds");
         let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
-        drive_until(cx, || client.is_finished());
+        drive_until(cx, |_| client.is_finished());
         let answer = client.join().expect("the client thread finished");
 
         let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
@@ -2672,6 +2672,39 @@ fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
 
         // Dropping the bridge stops the listener; the pump would otherwise
         // outlive the window.
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_window_holds_a_presence_for_as_long_as_the_connection_is_open(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        std::io::Write::write_all(&mut stream, b"{\"v\":1,\"kind\":\"presence\"}\n")
+            .expect("the frame is written");
+        drive_until(cx, |cx| open(cx) == 1);
+        drop(stream);
+        drive_until(cx, |cx| open(cx) == 0);
+
         workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
         quit(workspace, cx);
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));

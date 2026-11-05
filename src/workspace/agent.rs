@@ -19,6 +19,9 @@ pub(crate) struct AgentState {
     /// The socket and the task that drains it, or nothing when no bridge runs.
     /// Dropping it is what stops listening.
     pub(crate) bridge: Option<Bridge>,
+    /// The presence connections open now: agents attached, whether or not they
+    /// have asked anything.
+    pub(crate) presence: Vec<crate::agent::ConnId>,
 }
 
 /// A running bridge. Neither field is read: holding them is the point.
@@ -144,13 +147,6 @@ impl Workspace {
     /// task drains it into [`Workspace::on_agent_message`]. That task only ever
     /// awaits the channel: nothing here needs a reactor, which GPUI's executor
     /// does not have.
-    #[cfg_attr(
-        not(all(test, unix)),
-        expect(
-            dead_code,
-            reason = "the e2e socket tests are the only caller until listen_for_agents (task 2)"
-        )
-    )]
     pub(crate) fn start_bridge_at(
         &mut self,
         path: PathBuf,
@@ -160,9 +156,11 @@ impl Workspace {
             return Ok(());
         }
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let listener = crate::agent::listen(&path, sender).map_err(|declined| {
-            let crate::agent::Declined::Failed(text) = declined;
-            text
+        let listener = crate::agent::listen(&path, sender).map_err(|declined| match declined {
+            crate::agent::Declined::ServedElsewhere => {
+                "Another DBDelve window is already serving agents.".to_string()
+            }
+            crate::agent::Declined::Failed(text) => text,
         })?;
         let pump = cx.spawn(async move |workspace, cx| {
             while let Some(message) = receiver.recv().await {
@@ -181,10 +179,27 @@ impl Workspace {
         Ok(())
     }
 
+    /// Start answering agents on this build's own socket.
+    #[expect(
+        dead_code,
+        reason = "the agent access switch (plan 04-03) is the first caller"
+    )]
+    pub(crate) fn listen_for_agents(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        self.start_bridge_at(crate::agent::socket_path()?, cx)
+    }
+
     /// What an agent asked for. Opens no connection and starts no database
     /// work: the answer is read from the profile list as it stands.
-    pub(crate) fn on_agent_message(&mut self, message: Inbound, _cx: &mut Context<Self>) {
+    pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
         match message {
+            Inbound::PresenceOpened { conn } => {
+                self.agent.presence.push(conn);
+                cx.notify();
+            }
+            Inbound::PresenceClosed { conn } => {
+                self.agent.presence.retain(|open| *open != conn);
+                cx.notify();
+            }
             Inbound::Call {
                 tool: Tool::ListConnections,
                 reply,

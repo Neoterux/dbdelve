@@ -27,6 +27,8 @@ pub(super) enum Hello {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection: Option<String>,
     },
+    /// An agent is attached. Asks nothing, and ends when the connection does.
+    Presence { v: u32 },
 }
 
 /// One frame as a line ending in `\n`.
@@ -68,12 +70,13 @@ pub(super) fn read_frame(reader: &mut impl BufRead, limit: u64) -> io::Result<Op
 pub(super) fn decode_hello(line: &str) -> Result<Hello, String> {
     let hello: Hello = serde_json::from_str(line)
         .map_err(|error| format!("The first frame was refused: {error}."))?;
-    match &hello {
-        Hello::Call { v, .. } if *v != PROTOCOL_VERSION => Err(format!(
+    let (Hello::Call { v, .. } | Hello::Presence { v }) = &hello;
+    if *v != PROTOCOL_VERSION {
+        return Err(format!(
             "The first frame speaks version {v}; this build speaks version {PROTOCOL_VERSION}."
-        )),
-        Hello::Call { .. } => Ok(hello),
+        ));
     }
+    Ok(hello)
 }
 
 #[cfg(test)]
@@ -145,6 +148,8 @@ mod tests {
             assert!(decode_hello(frame).is_err(), "{frame:?} was accepted");
         }
         assert!(decode_hello(r#"{"v":1,"kind":"call","tool":"list_connections"}"#).is_ok());
+        assert!(decode_hello(r#"{"v":1,"kind":"presence"}"#).is_ok());
+        assert!(decode_hello(r#"{"v":3,"kind":"presence"}"#).is_err());
 
         let mut long = Cursor::new(vec![b'a'; FRAME_LIMIT as usize + 10]);
         let error = read_frame(&mut long, FRAME_LIMIT).expect_err("a frame with no end is refused");
