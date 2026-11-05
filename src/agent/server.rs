@@ -22,7 +22,7 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{ConnId, Declined, Inbound, Reply, Status, ipc, tools::Tool, wire};
+use super::{CallId, ConnId, Declined, Inbound, Reply, Status, ipc, tools::Tool, wire};
 
 // ponytail: a first frame is a few bytes written the moment the shim
 // connects, so five seconds is patience, not a measurement; a slower peer is
@@ -212,16 +212,25 @@ fn serve(stream: UnixStream, shared: &Shared, inbound: &UnboundedSender<Inbound>
     };
     let _ = stream.set_read_timeout(None);
     match wire::decode_hello(&line) {
-        Ok(wire::Hello::Call { tool, .. }) => {
+        Ok(wire::Hello::Call {
+            tool, connection, ..
+        }) => {
             drop(registered);
-            call(&stream, shared, tool, inbound);
+            call(&stream, CallId(conn.0), tool, connection, shared, inbound);
         }
         Ok(wire::Hello::Presence { .. }) => presence(&stream, conn, shared, inbound),
         Err(_) => {}
     }
 }
 
-fn call(stream: &UnixStream, shared: &Shared, tool: Tool, inbound: &UnboundedSender<Inbound>) {
+fn call(
+    stream: &UnixStream,
+    id: CallId,
+    tool: Tool,
+    connection: Option<String>,
+    shared: &Shared,
+    inbound: &UnboundedSender<Inbound>,
+) {
     let Some(_open) = Counted::take(&shared.calls, CALL_CAP) else {
         answer(
             stream,
@@ -235,9 +244,16 @@ fn call(stream: &UnixStream, shared: &Shared, tool: Tool, inbound: &UnboundedSen
         return;
     };
     let (reply, answers) = mpsc::sync_channel(1);
-    if inbound.send(Inbound::Call { tool, reply }).is_err() {
+    let call = Inbound::Call {
+        id,
+        tool,
+        connection,
+        reply,
+    };
+    if inbound.send(call).is_err() {
         return;
     }
+    watch_for_hangup(stream, id, inbound);
     // A dropped sender is a call that ended without an answer: nothing is
     // written, and the stream closing is what the caller sees.
     match answers.recv() {
@@ -246,6 +262,24 @@ fn call(stream: &UnixStream, shared: &Shared, tool: Tool, inbound: &UnboundedSen
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+}
+
+/// Tell the window when the caller goes. The caller sends nothing after its
+/// first frame, so any result of a read, a byte, an end or an error, means it
+/// has gone; and the thread's own end comes when the call's stream is closed.
+/// A call this cannot watch still ends by its expiry.
+fn watch_for_hangup(stream: &UnixStream, id: CallId, inbound: &UnboundedSender<Inbound>) {
+    let Ok(watching) = stream.try_clone() else {
+        return;
+    };
+    let inbound = inbound.clone();
+    let _ = thread::Builder::new()
+        .name("dbdelve-agent-hangup".to_string())
+        .spawn(move || {
+            let mut reader = &watching;
+            let _ = reader.read(&mut [0u8; 1]);
+            let _ = inbound.send(Inbound::Hangup { id });
+        });
 }
 
 fn answer(stream: &UnixStream, reply: &Reply) {
