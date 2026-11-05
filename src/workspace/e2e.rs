@@ -817,6 +817,20 @@ fn front_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Op
     workspace.read_with(cx, |workspace, _| workspace.dialog_in_front.get())
 }
 
+/// What decides which surface the window draws, for an assertion that a
+/// dialog is up: only the workspace surface has a layer for most of them.
+fn surface(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    workspace.read_with(cx, |workspace, _| {
+        format!(
+            "form open: {}, profile in front: {}, profiles: {}, visibility prompt: {:?}",
+            workspace.form.is_some(),
+            workspace.profile().is_some(),
+            workspace.profiles.len(),
+            workspace.agent_visibility_prompt,
+        )
+    })
+}
+
 fn palette_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<PaletteMode> {
     workspace.read_with(cx, |workspace, cx| {
         workspace
@@ -2362,7 +2376,12 @@ fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mu
         let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
 
         run_command(&workspace, cx, Command::ShowToAgents(0));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
         assert_eq!(ringed_button(&workspace, cx), 1);
         assert!(!agent_visible(&workspace, cx, "only"));
 
@@ -2410,7 +2429,12 @@ fn dismissing_the_visibility_dialog_grants_nothing_and_hands_the_keyboard_back(
         // `escape`, and `enter` on the Cancel the ring opens on.
         for (dismiss, typed) in [("escape", "x"), ("enter", "y")] {
             run_command(&workspace, cx, Command::ShowToAgents(0));
-            assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+            assert_eq!(
+                front_dialog(&workspace, cx),
+                Some("agent-visibility"),
+                "{}",
+                surface(&workspace, cx)
+            );
             let before = buffer(&workspace, cx);
             press(cx, dismiss);
             assert_eq!(front_dialog(&workspace, cx), None, "{dismiss} left it up");
@@ -2438,7 +2462,12 @@ fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppCont
             ),
         );
         run_command(&workspace, cx, Command::ShowToAgents(0));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
 
         workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
         settle(cx);
