@@ -2140,6 +2140,36 @@ mod tests {
         assert!(skipped.contains("is readable by other users"), "{skipped}");
     }
 
+    /// The Generic File Access functions are pinned by shape against the
+    /// server's own catalog, so one a later release adds fails here by name
+    /// rather than reading a file for an agent unasked.
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_every_file_access_function_is_on_the_egress_list() {
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        let found = connection
+            .internal_query(
+                "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'pg_catalog' \
+                 AND p.proname ~ '^pg_(read_file|read_binary_file|stat_file|ls_)' \
+                 ORDER BY 1",
+            )
+            .expect("the catalog should answer");
+        let listed = Engine::Postgres.spec().sql.egress_functions;
+        let names: Vec<&str> = found.rows.iter().filter_map(|row| row.get(0)).collect();
+        assert!(
+            names.contains(&"pg_read_file"),
+            "the catalog answered {names:?}"
+        );
+        for name in names {
+            assert!(
+                listed.contains(&name),
+                "{name} is on the server and not on egress_functions"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_an_active_schema_leads_every_session_and_moves_the_open_ones() {
