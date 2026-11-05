@@ -4,6 +4,7 @@
 //! grouped by concern in the sibling modules, which are parts of this same
 //! inherent impl rather than types of their own.
 
+mod agent;
 mod commands;
 #[cfg(test)]
 mod e2e;
@@ -336,6 +337,10 @@ pub(crate) struct Workspace {
     /// The theme in force when the theme picker opened, while it is open. The
     /// installed one is only a preview until a row is confirmed.
     pub(crate) theme_before_preview: Option<Theme>,
+    /// The id of the profile whose agent-visibility dialog is open. Only that
+    /// dialog sets it, and `set_agent_visible` grants visibility only to the
+    /// profile it names.
+    pub(crate) agent_visibility_prompt: Option<String>,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -487,6 +492,7 @@ impl Workspace {
             palette_recents: Vec::new(),
             collapsed_projects: HashSet::new(),
             theme_before_preview: None,
+            agent_visibility_prompt: None,
             opacity_input,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),

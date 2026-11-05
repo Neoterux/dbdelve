@@ -183,6 +183,9 @@ impl Workspace {
             }),
             // A silenced kind this build cannot read is dropped, which only
             // means that kind still asks.
+            // Absent reads as hidden: the flag is a grant, and a file written
+            // before it existed granted nothing.
+            agent_visible: stored.agent_visible,
             confirmed: stored
                 .confirmed
                 .iter()
@@ -245,6 +248,10 @@ impl Workspace {
             config,
             color,
             mode,
+            // Every way a profile is made -- the form, a duplicate, an import --
+            // starts hidden. Only the owner's confirmation in the visibility
+            // dialog grants it.
+            agent_visible: false,
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
@@ -809,13 +816,24 @@ impl Workspace {
         let password = password_to_persist(&config, Origin::Form).map(str::to_string);
         let profile = &mut self.profiles[index];
         let reconnect = profile.config.needs_reconnect(&config);
+        // The dialog that granted visibility stated what the old engine holds
+        // server-side; a new engine makes those facts stale.
+        let engine_changed = profile.config.engine() != config.engine();
+        let hide = engine_changed && profile.agent_visible;
         let syntax = config.engine().syntax();
         if profile.config.engine().syntax() != syntax {
             profile.session.set_syntax(syntax, window, cx);
         }
-        profile.name = name;
+        profile.name = name.clone();
         profile.color = color;
         profile.config = config;
+        if hide {
+            self.set_agent_visible(id, false, cx);
+            self.note(
+                format!("{name} is hidden from agents because its engine changed."),
+                cx,
+            );
+        }
 
         // Only what was typed. A blank field is not an instruction to forget the
         // stored password.
