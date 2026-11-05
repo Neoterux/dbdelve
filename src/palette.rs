@@ -1725,6 +1725,7 @@ impl Palette {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .debug_selector(move || format!("palette-row-text-{at}"))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1743,6 +1744,7 @@ impl Palette {
                                     .font_family(mono.clone())
                                     .text_size(px(layout::chrome(layout::TEXT_SM)))
                                     .text_color(t.text_faint)
+                                    .debug_selector(move || format!("palette-row-detail-{at}"))
                                     .child(detail)
                             }))
                             // Muted and still, like the hint: it says what is
@@ -1750,6 +1752,7 @@ impl Palette {
                             .children(item.agent_visible.then(|| {
                                 div()
                                     .flex_shrink_0()
+                                    .debug_selector(move || format!("palette-row-marker-{at}"))
                                     .child(row_icon(t, icon::AGENT_VISIBLE))
                             })),
                     )
