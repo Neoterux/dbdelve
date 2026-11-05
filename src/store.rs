@@ -131,6 +131,16 @@ pub struct StoredProfile {
     /// the file.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Whether an agent may reach this connection over MCP. Absent is a
+    /// profile written before agents could see any, and reads back as hidden:
+    /// every profile that exists before this field does is invisible to agents
+    /// after the upgrade. Left out when false, so a hidden profile is written
+    /// exactly as it always was. A build without the field ignores the key and
+    /// drops it on its next save, which hides the profile -- the safe
+    /// direction. Written only by `Workspace::set_agent_visible`, and read from
+    /// disk only at load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_visible: bool,
     /// `sql::Destructive::slug()`, for the kinds whose confirmation this
     /// connection has silenced. Per connection and per kind: silencing DROP on
     /// a scratch database says nothing about whether you want to be asked on
@@ -2852,6 +2862,7 @@ user = "shayan"
                 next_query_id: Some(1),
                 color: None,
                 mode: Some("full".into()),
+                agent_visible: false,
                 confirmed: vec!["drop".into(), "truncate".into()],
                 open_query: None,
                 ssh: None,
@@ -2907,6 +2918,7 @@ user = "shayan"
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: Some("daily".into()),
             ssh: None,
@@ -3041,6 +3053,7 @@ open_objects = []
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3202,6 +3215,54 @@ folder = "Hot"
     }
 
     #[test]
+    fn a_profile_written_before_the_flag_loads_hidden_and_saves_without_it() {
+        let file = |extra: &str| {
+            format!(
+                "[[profiles]]\nid = \"a\"\nname = \"A\"\nhost = \"\"\ndatabase = \"\"\nuser = \"\"\n{extra}"
+            )
+        };
+        for text in [file(""), file("agent_visible = false\n")] {
+            let profiles = decode_profiles(&text, &[]).unwrap().profiles;
+            assert!(!profiles[0].agent_visible, "{text}");
+            let written = written_alone(profiles[0].clone());
+            assert!(!written.contains("agent_visible"), "{written}");
+        }
+        assert!(decode_profiles("", &[]).unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn a_visible_profile_round_trips_ahead_of_its_tables() {
+        let profile = StoredProfile {
+            agent_visible: true,
+            ssh: Some(SshTunnel {
+                host: "dbdelve-bastion".into(),
+                port: None,
+                user: "tunnel".into(),
+                identity_file: None,
+            }),
+            open_objects: vec![StoredObject {
+                schema: "public".into(),
+                name: "accounts".into(),
+                routine: false,
+                structure: false,
+                kind: RelationKind::default(),
+                filter: String::new(),
+                filter_engine: None,
+                origin: None,
+                filters: Vec::new(),
+                active: true,
+                bars: Vec::new(),
+            }],
+            ..a_stored_profile()
+        };
+        let text = written_alone(profile.clone());
+        let flag = text.find("agent_visible = true").expect(&text);
+        let first_table = text.find("\n[profiles.").expect(&text);
+        assert!(flag < first_table, "{text}");
+        assert_eq!(decode_profiles(&text, &[]).unwrap().profiles, vec![profile]);
+    }
+
+    #[test]
     fn an_ssh_tunnel_with_every_field_survives_the_round_trip_through_toml() {
         let profile = StoredProfile {
             ssh: Some(SshTunnel {
@@ -3343,6 +3404,7 @@ folder = "Hot"
             next_query_id: Some(0),
             color: Some(ConnectionColor::Purple.slug().to_string()),
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3422,6 +3484,7 @@ folder = "Hot"
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3487,6 +3550,7 @@ folder = "Hot"
             next_query_id: Some(1),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3601,6 +3665,7 @@ open_objects = []
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3727,6 +3792,7 @@ open_objects = []
                     next_query_id: Some(2),
                     color: None,
                     mode: None,
+                    agent_visible: false,
                     confirmed: Vec::new(),
                     open_query: None,
                     ssh: None,
@@ -3762,6 +3828,7 @@ open_objects = []
                     next_query_id: None,
                     color: None,
                     mode: None,
+                    agent_visible: false,
                     confirmed: Vec::new(),
                     open_query: None,
                     ssh: None,
@@ -4395,6 +4462,7 @@ open_objects = []
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: Some("daily".into()),
             ssh: None,
@@ -4760,6 +4828,7 @@ name = \"accounts\"
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -4875,6 +4944,7 @@ name = \"accounts\"
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
