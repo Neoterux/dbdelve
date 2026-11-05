@@ -806,8 +806,13 @@ mod tests {
     #[test]
     #[ignore = "measurement aid: reads DBDELVE_PLAN_FILE and writes DBDELVE_COMPACT_OUT"]
     fn the_compact_form_of_a_plan_file_is_written_for_measurement() {
+        // CI runs every ignored test, this one included; with no plan file named
+        // there is nothing to measure.
+        let Ok(plan_file) = std::env::var("DBDELVE_PLAN_FILE") else {
+            return;
+        };
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
-        let text = std::fs::read_to_string(var("DBDELVE_PLAN_FILE")).expect("the plan file reads");
+        let text = std::fs::read_to_string(plan_file).expect("the plan file reads");
         let cap = std::env::var("DBDELVE_COMPACT_CAP")
             .ok()
             .map_or(usize::MAX, |cap| cap.parse().expect("the cap is a number"));
