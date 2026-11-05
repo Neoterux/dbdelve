@@ -60,7 +60,18 @@ fn launch_with<'a>(
         workspace = Some(entity.clone());
         Root::new(entity, window, cx)
     });
-    (workspace.expect("the window builds the workspace"), cx)
+    let workspace = workspace.expect("the window builds the workspace");
+    // The runner's own `PG*` variables reach `Workspace::new`: GitHub's Windows
+    // image sets `PGUSER` and `PGPASSWORD` alone, which opens the connection
+    // form over everything a test puts in front. Every test starts from
+    // `profiles.toml` only.
+    workspace.update(cx, |workspace, cx| {
+        if workspace.form.is_some() {
+            workspace.close_form(cx);
+        }
+    });
+    settle(cx);
+    (workspace, cx)
 }
 
 /// Every write `Workspace` makes on the way out -- buffers on release,
@@ -857,6 +868,20 @@ fn in_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool 
 
 fn front_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<&'static str> {
     workspace.read_with(cx, |workspace, _| workspace.dialog_in_front.get())
+}
+
+/// What decides which surface the window draws, for an assertion that a
+/// dialog is up: only the workspace surface has a layer for most of them.
+fn surface(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    workspace.read_with(cx, |workspace, _| {
+        format!(
+            "form open: {}, profile in front: {}, profiles: {}, visibility prompt: {:?}",
+            workspace.form.is_some(),
+            workspace.profile().is_some(),
+            workspace.profiles.len(),
+            workspace.agent_visibility_prompt,
+        )
+    })
 }
 
 fn palette_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<PaletteMode> {
@@ -3149,7 +3174,12 @@ fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mu
         let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
 
         run_command(&workspace, cx, Command::ShowToAgents(0));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
         assert_eq!(ringed_button(&workspace, cx), 1);
         assert!(!agent_visible(&workspace, cx, "only"));
 
@@ -3197,7 +3227,12 @@ fn dismissing_the_visibility_dialog_grants_nothing_and_hands_the_keyboard_back(
         // `escape`, and `enter` on the Cancel the ring opens on.
         for (dismiss, typed) in [("escape", "x"), ("enter", "y")] {
             run_command(&workspace, cx, Command::ShowToAgents(0));
-            assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+            assert_eq!(
+                front_dialog(&workspace, cx),
+                Some("agent-visibility"),
+                "{}",
+                surface(&workspace, cx)
+            );
             let before = buffer(&workspace, cx);
             press(cx, dismiss);
             assert_eq!(front_dialog(&workspace, cx), None, "{dismiss} left it up");
@@ -3225,7 +3260,12 @@ fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppCont
             ),
         );
         run_command(&workspace, cx, Command::ShowToAgents(0));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
 
         workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
         settle(cx);
@@ -3235,6 +3275,82 @@ fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppCont
         assert!(!agent_visible(&workspace, cx, "second"));
         assert!(!saved_visible("second"));
         assert_eq!(visibility_prompt(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+/// A palette row's text box clips what runs past it, so a marker laid out past
+/// the box's right edge is drawn nowhere: a reachable connection then reads as
+/// hidden. `debug_bounds` records the laid-out bounds even when an ancestor
+/// clips, so the assertion is on where the marker sits, not whether it exists.
+#[gpui::test]
+fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let path = format!("{}/database.sqlite", "/a_long_folder_names_".repeat(9));
+        assert!(path.len() >= 200);
+        let long_name = "a_connection_named_at_great_length_".repeat(4);
+        assert!(long_name.len() >= 120);
+        let table = |id: &str, name: &str, path: &str| {
+            format!(
+                "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"sqlite\"\npath = {path:?}\nagent_visible = true\n"
+            )
+        };
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                table("long-path", "Short", &path),
+                table("long-name", &long_name, &path),
+                table("control", "Control", "c.db"),
+            ]
+            .concat(),
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_connections(window, cx)
+        });
+        settle(cx);
+
+        // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+        let bounds =
+            |selector: String, cx: &mut VisualTestContext| cx.debug_bounds(selector.leak());
+        let drawn: Vec<usize> = (0..32)
+            .filter(|at| bounds(format!("palette-row-marker-{at}"), cx).is_some())
+            .collect();
+        let ids = ["long-path", "long-name", "control"];
+        assert_eq!(
+            drawn.len(),
+            ids.len(),
+            "a marker is laid out on each visible connection row, at {drawn:?}"
+        );
+        for (at, id) in drawn.into_iter().zip(ids) {
+            let marker = bounds(format!("palette-row-marker-{at}"), cx).expect("counted above");
+            let text = bounds(format!("palette-row-text-{at}"), cx)
+                .unwrap_or_else(|| panic!("{id}: the row's text box is drawn"));
+            assert!(
+                text.left() <= marker.left() && marker.right() <= text.right(),
+                "{id}: the marker spans {:?}..{:?}, outside its text box {:?}..{:?}",
+                marker.left(),
+                marker.right(),
+                text.left(),
+                text.right()
+            );
+            if id != "long-name" {
+                let detail = bounds(format!("palette-row-detail-{at}"), cx)
+                    .unwrap_or_else(|| panic!("{id}: the endpoint is drawn"));
+                assert!(
+                    detail.size.width > gpui::px(0.),
+                    "{id}: the endpoint was squeezed to nothing"
+                );
+                assert!(
+                    marker.right() <= detail.left(),
+                    "{id}: the endpoint starts at {:?}, before the marker's end at {:?}",
+                    detail.left(),
+                    marker.right()
+                );
+            }
+        }
         quit(workspace, cx);
     });
 }
