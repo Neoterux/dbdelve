@@ -56,25 +56,25 @@ use gpui_component::{
 
 use actions::{
     AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CommitTransaction,
-    CopyCell, CopyPlan, CopyResults, CopyRow, CopyRows, CustomRowLimit, CycleMode, DeleteRow,
-    DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
-    HideColumn, ImportConnections, ImportRows, LimitTarget, Minimize, MoveTabLeft, MoveTabRight,
-    NewConnection, NewProject, NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult,
-    NextTab, OpenReference, OpenSettings, PreviousEdit, PreviousPage, PreviousProfile,
-    PreviousResult, PreviousTab, Quit, RefreshConnection, RefreshRelation, RemoveFilter,
-    RequestWriteMode, ResetConfirmations, ResetEditorZoom, RollbackTransaction, RunQuery,
-    SaveQuery, SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit,
-    SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit,
-    SetRowLimit, ShowAllColumns, ShowEditor, ShowMessages, ShowReferences, SortActiveColumn,
-    SortColumn, SubmitConnection, SwitchConnection, ToggleAutoCommit, ToggleComment,
-    ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit, ToggleRowPanel,
-    ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+    CopyCell, CopyPlan, CopyResults, CopyRow, CopyRows, CopySelection, CustomRowLimit, CycleMode,
+    DeleteRow, DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen,
+    GoToColumn, HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, LimitTarget,
+    MenuImportRowsFromClipboard, Minimize, MoveTabLeft, MoveTabRight, NewConnection, NewProject,
+    NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult, NextTab, OpenReference,
+    OpenSettings, PreviousEdit, PreviousPage, PreviousProfile, PreviousResult, PreviousTab, Quit,
+    RefreshConnection, RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations,
+    ResetEditorZoom, RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase,
+    SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator,
+    SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor,
+    ShowMessages, ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
+    ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn,
+    ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
 use db::{
     CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine, ExplainMode,
-    Fields, PostgresConfig, RelationKind, ServerConfig, SnowflakeConfig, SslMode,
+    Fields, PostgresConfig, RelationKind, ServerConfig, SnowflakeConfig, SslMode, Target,
 };
 use explorer::{ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, tree as build_explorer_tree};
 use export::{FileAs, Format};
@@ -260,6 +260,9 @@ fn panic_log_directory() -> Option<PathBuf> {
 
 fn main() {
     install_panic_log();
+    // Manifests only, ahead of the profiles that name them: no plugin process
+    // starts until one of its connections opens.
+    let plugins = db::plugin::discover();
     gpui_platform::application()
         .with_assets(Icons)
         .run(|cx: &mut App| {
@@ -287,7 +290,7 @@ fn main() {
             // here, rather than reused from `Workspace::new`'s own read of the
             // same file: nothing here can wait for a window and an entity to
             // exist first.
-            let overrides = store::peek_profiles()
+            let overrides = store::peek_profiles(&plugins)
                 .and_then(|list| list.settings)
                 .and_then(|settings| settings.custom_keybindings)
                 .unwrap_or_default();
@@ -325,9 +328,10 @@ fn main() {
             //
             // ponytail: there is nothing to sit over on Linux -- no compositor
             // draws window buttons into a transparent titlebar -- so the window
-            // asks for the real one and wears the seam. The upgrade is drawing
-            // close, minimise and maximise into `ui::titlebar` there too and
-            // switching back to `WindowDecorations::Client`.
+            // asks for the real one and wears the seam. Mutter refuses it, and
+            // `ui::titlebar` then draws the buttons itself; asking for
+            // `WindowDecorations::Client` everywhere would drop the seam on KDE
+            // and Sway too, at the cost of their native bar.
             let options = WindowOptions {
                 window_background: theme.window_background(),
                 titlebar: Some(TitlebarOptions {
@@ -357,7 +361,7 @@ fn main() {
             // Root must be the window's first layer or dialog and notification
             // layers panic when they look for it.
             cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                let workspace = cx.new(|cx| Workspace::new(plugins, window, cx));
                 cx.new(|cx| Root::new(workspace, window, cx))
             })
             .expect("failed to open window");
@@ -420,6 +424,7 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
                 [
                     MenuItem::separator(),
                     MenuItem::action("Import Rows…", ImportRows),
+                    MenuItem::action("Import Rows from Clipboard…", MenuImportRowsFromClipboard),
                 ]
                 .into_iter()
                 .filter(|_| imports_rows),
@@ -469,7 +474,20 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
 
 #[cfg(test)]
 mod tests {
-    use super::connection_config_from;
+    use std::collections::HashMap;
+
+    use super::{MenuImportRowsFromClipboard, connection_config_from, keybindings};
+
+    #[test]
+    fn the_menus_paste_import_has_no_key_equivalent() {
+        let keymap = gpui::Keymap::new(keybindings::build_bindings(&HashMap::new()));
+        assert_eq!(
+            keymap
+                .bindings_for_action(&MenuImportRowsFromClipboard)
+                .count(),
+            0
+        );
+    }
 
     #[test]
     fn pgservice_outranks_the_variables_and_leaves_them_for_connect() {

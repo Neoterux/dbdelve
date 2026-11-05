@@ -205,3 +205,12 @@ source: src/sql_snapshots.rs
 [redis] a subquery: SELECT * FROM t WHERE id IN (SELECT id FROM 'b.csv') => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [redis] a dotted literal that is no path: SELECT * FROM t WHERE v = '1.2' => |ro=refuse(NotSent) rw=refuse(NotSent) full=refuse(NotSent)|
 [redis] a timestamp literal: SELECT * FROM t WHERE ts = '2024-01-02 03:04:05' => |ro=refuse(NotSent) rw=refuse(NotSent) full=refuse(NotSent)|
+[generic] (no egress list) => (none)
+[generic] a quoted path: SELECT * FROM 'data.csv' => |ro=run rw=run full=run|
+[generic] a double-quoted path: SELECT * FROM "data.csv" => |ro=run rw=run full=run|
+[generic] a url: SELECT * FROM 'https://example.com/x.parquet' => |ro=run rw=run full=run|
+[generic] a comma join: SELECT * FROM 'a.csv' a, 'b.csv' b => |ro=run rw=run full=run|
+[generic] a join: SELECT * FROM t JOIN 'b.csv' b ON t.id = b.id => |ro=run rw=run full=run|
+[generic] a subquery: SELECT * FROM t WHERE id IN (SELECT id FROM 'b.csv') => |ro=run rw=run full=run|
+[generic] a dotted literal that is no path: SELECT * FROM t WHERE v = '1.2' => |ro=run rw=run full=run|
+[generic] a timestamp literal: SELECT * FROM t WHERE ts = '2024-01-02 03:04:05' => |ro=run rw=run full=run|

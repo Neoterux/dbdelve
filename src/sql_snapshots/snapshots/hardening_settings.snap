@@ -1227,3 +1227,91 @@ source: src/sql_snapshots.rs
 [redis] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [redis] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] identity change: SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] identity change, local: SET LOCAL ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] authorization change: SET SESSION AUTHORIZATION other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] write access mode: SET TRANSACTION READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] write access mode, session keyword: SET SESSION TRANSACTION READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] write access mode, characteristics: SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] write access mode after an isolation level: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] read access mode: SET TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] read access mode, session keyword: SET SESSION TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] isolation level: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] transaction opening, write: BEGIN READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] transaction opening, write, spelled out: START TRANSACTION READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] transaction opening, write, with the noise word: BEGIN TRANSACTION READ WRITE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] transaction opening, read: START TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] transaction opening: BEGIN => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] transaction opening, spelled out: START TRANSACTION => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] transaction commit: COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] transaction rollback: ROLLBACK => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] savepoint: SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] savepoint release: RELEASE SAVEPOINT a => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] bracketed read: BEGIN; SELECT 1; COMMIT => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] server-wide scope: SET GLOBAL max_execution_time = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] server-wide transaction access mode: SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] server-wide transaction isolation level: SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] persistent transaction access mode: SET PERSIST TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] persistent-only transaction access mode: SET PERSIST_ONLY TRANSACTION READ ONLY => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] local transaction access mode: SET LOCAL TRANSACTION READ ONLY => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] user variable beginning with the scope word: SET @global = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] server-wide scope, doubled-at prefix: SET @@global.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] server-wide scope on a harmless name: SET GLOBAL time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, session prefix: SET @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, doubled-at: SET @@transaction_read_only = OFF => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, session keyword: SET SESSION transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name: SET transaction_read_only = off => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, default: SET default_transaction_read_only = off => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, older spelling: SET tx_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name, local: SET LOCAL default_transaction_read_only = off => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] user variable: SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] session setting, doubled-at: SET @@session.time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] session setting, doubled-at, bare: SET @@time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] time zone: SET TIME ZONE 'UTC' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] unknown setting: SET x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] navigation setting: SET search_path TO other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] navigation setting, equals: SET search_path = other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] comfort setting: SET statement_timeout = 1000 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] comfort setting, time zone: SET timezone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] comfort setting, no count: SET NOCOUNT ON => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] comfort setting, auto-commit: SET autocommit = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] comfort setting, time zone name: SET time_zone = 'UTC' => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name after a user variable: SET @x = 1, @@session.transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] hold name before a user variable: SET @@session.transaction_read_only = 0, @x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two user variables: SET @x = 1, @y = 2 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] user variable then unknown setting: SET @x = 1, y = 2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] unknown setting then user variable: SET y = 2, @x = 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two unknown settings: SET x = 1, y = 2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] identity change in an IF block: IF 1 = 1 THEN SET ROLE other; END IF => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] identity change in a T-SQL IF: IF 1 = 1 SET ROLE other => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] identity change in a scripting block: BEGIN SET ROLE other; END => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] unknown setting in an IF block: IF 1 = 1 THEN SET x = 1; END IF => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] unknown setting in a T-SQL IF: IF 1 = 1 SET x = 1 => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] unknown setting in a scripting block: BEGIN SET x = 1; END => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] navigation setting in an IF block: IF 1 = 1 THEN SET search_path TO other; END IF => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] navigation setting in a scripting block: BEGIN SET search_path TO other; END => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] write opening in a scripting block: BEGIN START TRANSACTION READ WRITE; END => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] identity change under an analysing explain: EXPLAIN ANALYZE SET ROLE other => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] identity change under a plain explain: EXPLAIN SET ROLE other => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] two statements, hold name second: SELECT 1; SET transaction_read_only = 0 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two statements, user variable second: SELECT 1; SET @x = 1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] two statements, server-wide transaction second: SELECT 1; SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two statements, server-wide transaction first: SET GLOBAL TRANSACTION READ ONLY; SELECT 1 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] ordinary identifiers spelling the scope pair, no SET statement: SELECT t.set global FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] server-wide transaction under a plain explain: EXPLAIN SET GLOBAL TRANSACTION READ ONLY => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES DEFAULT => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES utf8mb4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES UTF8MB4 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES utf8mb3 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES utf8 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES latin1 => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES ascii => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES binary => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES 'utf8mb4' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] charset: SET NAMES gbk => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES big5 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES sjis => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES cp932 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES gb18030 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES ucs2 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] charset: SET NAMES utf16 => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|

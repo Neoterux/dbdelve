@@ -816,6 +816,15 @@ mod tests {
                 "SELECT lower(a) FROM t",
                 "SELECT my_udf(a) FROM t",
             ] {
+                // Generic SQL reads only a known side-effect-free built-in as
+                // a read (`SIDE_EFFECT_FREE_FUNCTIONS`): a function of the
+                // user's may write, and nothing on that server holds it back.
+                if engine == Engine::Generic && sql.contains("my_udf") {
+                    for mode in Mode::ALL {
+                        assert_ne!(agent_gate(engine, sql, mode), AgentVerdict::Run, "{mode:?}");
+                    }
+                    continue;
+                }
                 for mode in Mode::ALL {
                     assert_eq!(
                         agent_gate(engine, sql, mode),

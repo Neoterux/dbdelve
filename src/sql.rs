@@ -14,7 +14,7 @@
 //! not need a trailing semicolon on a statement sent over the wire.
 
 use std::borrow::Cow;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use serde::Deserialize;
 // Aliased: `tree_sitter::Parser` already owns the name `Parser` in this file,
@@ -22,8 +22,9 @@ use serde::Deserialize;
 use sqlparser::ast::{
     AlterTableOperation, ConditionalStatementBlock, ContextModifier, CopySource, CopyTarget,
     CreateTableOptions, Delete, Expr, Insert, Merge, ObjectName, ObjectNamePart, Query, Set,
-    SetExpr, SetSessionParamKind, SqlOption, Statement, TableObject, TransactionAccessMode,
-    TransactionMode, Update, UtilityOption,
+    SetExpr, SetSessionParamKind, SqlOption, Statement, TableFactor, TableObject,
+    TransactionAccessMode, TransactionMode, Update, UtilityOption, Visit, Visitor,
+    visit_statements,
 };
 use sqlparser::dialect::{
     ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect,
@@ -2804,17 +2805,49 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         return parsed(engine, &explain);
     }
 
+    if let Some(american) = analyse_as_analyze(dialect.as_ref(), sql) {
+        return parsed(engine, &american);
+    }
+
     let spec = engine.spec();
+    let calls = calls_verdict(engine, dialect.as_ref(), sql);
     if spec.sql.unreadable_floor == UnreadableFloor::FirstKeyword {
         let read = by_statement(engine, dialect.as_ref(), sql);
         return Parsed {
-            verdict: raised(engine, sql, read.verdict),
+            verdict: raised(engine, sql, read.verdict).max(calls),
             ..read
         };
     }
 
     // All or nothing: one statement it cannot read makes the whole submission
     // one it cannot vouch for.
+    let parser_dialect = spec.sql.parser_dialect;
+    // MySQL ignores a `/*M! … */` that MariaDB runs, and a MySQL profile may
+    // point at either server, so on MySQL the submission is read both ways --
+    // expanded below ([`executed_tokens`]), and here as MySQL runs it, with the
+    // comment ignored -- and held unreadable as well. MariaDB reads it expanded
+    // only, which is what it runs.
+    let calls = match engine == Engine::MySql && runs_mariadb_comment(dialect.as_ref(), sql) {
+        true => {
+            let ignored =
+                SqlParser::parse_sql(dialect.as_ref(), sql).map_or(Verdict::READ, |statements| {
+                    statements
+                        .iter()
+                        .map(|statement| spec_verdict(spec, statement).verdict)
+                        .fold(Verdict::READ, Verdict::max)
+                });
+            calls.max(unreadable_verdict(engine)).max(ignored)
+        }
+        false => calls,
+    };
+    // An unreadable verdict carries what the calls in it need as well.
+    let unreadable = || Parsed::counted(unreadable_verdict(engine).max(calls.clone()), 0);
+    if parser_dialect == ParserDialect::Generic && lexes_apart(dialect.as_ref(), sql)
+        || !ends_line_comments_as_sqlparser_does(parser_dialect)
+            && line_comment_past_carriage_return(dialect.as_ref(), sql)
+    {
+        return unreadable();
+    }
     let parsed = match executed_tokens(engine, dialect.as_ref(), sql) {
         // The derived stream is read here and goes no further: the driver is
         // handed `sql`, exactly as typed.
@@ -2824,10 +2857,19 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
                 .parse_statements()
                 .ok()
         }),
-        None => SqlParser::parse_sql(dialect.as_ref(), sql).ok(),
+        None => SqlParser::parse_sql(dialect.as_ref(), sql)
+            .or_else(|error| {
+                match db2_spelled(dialect.as_ref(), sql)
+                    .filter(|_| parser_dialect == ParserDialect::Generic)
+                {
+                    Some(respelled) => SqlParser::parse_sql(dialect.as_ref(), &respelled),
+                    None => Err(error),
+                }
+            })
+            .ok(),
     };
     let Some(statements) = parsed else {
-        return Parsed::counted(unreadable_verdict(engine), 0);
+        return unreadable();
     };
 
     // An empty or comment-only string parses to no statements at all. There is
@@ -2835,15 +2877,23 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
     // only when the grammar agrees there is nothing, so a range it finds that
     // the typed parser skipped is refused rather than run silently.
     if statements.is_empty() && grammar_finds_more_than_comments(engine, dialect.as_ref(), sql) {
-        return Parsed::counted(unreadable_verdict(engine), 0);
+        return unreadable();
     }
+
+    let calls = match parser_dialect == ParserDialect::Generic
+        && statements.iter().any(calls_unknown_function)
+    {
+        true => calls.max(Verdict::WRITE),
+        false => calls,
+    };
+
     let reading = statements
         .iter()
         .map(|statement| spec_verdict(engine.spec(), statement))
         .fold(Reading::READ, Reading::max);
     let read = Parsed::read(reading, &statements);
     Parsed {
-        verdict: raised(engine, sql, read.verdict),
+        verdict: raised(engine, sql, read.verdict).max(calls),
         ..read
     }
 }
@@ -2923,9 +2973,12 @@ fn holds_a_token(dialect: &dyn Dialect, text: &str) -> bool {
 /// statement carries, and cannot recurse. The one space after each expansion
 /// keeps two words from fusing into one that neither text holds.
 ///
-/// MySQL ignores the marker, so on it this reads a comment as code: the safe
-/// direction, and the dialect is what the parser shares, not the server.
-/// The `/*!` form needs no help here, the pinned tokenizer expands it itself.
+/// MySQL ignores the marker, and a MySQL profile may point at a MariaDB server
+/// that runs it, so on MySQL [`parsed`] also reads the submission with the
+/// comment ignored and holds it unreadable: the expansion alone would take
+/// `DELETE FROM t /*M! WHERE 1 = 0 */` for a filtered delete when MySQL
+/// deletes every row. The `/*!` form needs no help here, the pinned tokenizer
+/// expands it itself.
 ///
 /// Never returned beyond [`classify`] and [`calls_denied_function`]: the
 /// statement DBDelve sends is the statement the user typed.
@@ -2976,6 +3029,541 @@ fn executable_body(token: &Token) -> Option<&str> {
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     // Every byte counted is one ASCII digit, so `digits` is a character boundary.
     (!(1..=4).contains(&digits)).then(|| &rest[digits..])
+}
+
+/// `sql` with what Db2 reads and sqlparser's Generic dialect does not spelled
+/// so sqlparser reads it, for classifying only: a statement's trailing
+/// isolation clause, `WITH UR`, `CS`, `RS` or `RR`, blanked out, and a
+/// statement opening with `VALUES` respelled `SELECT`, so `VALUES 1, 2` is
+/// read by the expressions it evaluates. Every other token keeps its place.
+/// `None` when there is neither, or `sql` does not tokenize.
+fn db2_spelled(dialect: &dyn Dialect, sql: &str) -> Option<String> {
+    let tokens = located_tokens(dialect, sql)?;
+    let words: Vec<&(Token, Range<usize>)> = tokens
+        .iter()
+        .filter(|(token, _)| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    // A span is checked against its text as well as its token: one after
+    // Generic's `/*! … */` expansion points at the wrong text.
+    let spelled = |(token, range): &(Token, Range<usize>), keyword: &str| {
+        is_keyword(Some(&token), keyword)
+            && sql
+                .get(range.clone())
+                .is_some_and(|text| text.eq_ignore_ascii_case(keyword))
+    };
+    let mut respelled = sql.to_string();
+    let mut changed = false;
+    for statement in words.split(|(token, _)| *token == Token::SemiColon) {
+        if let Some(first) = statement.first()
+            && spelled(first, "VALUES")
+        {
+            respelled.replace_range(first.1.clone(), "SELECT");
+            changed = true;
+        }
+        if let [.., with, level] = statement
+            && spelled(with, "WITH")
+            && ["UR", "CS", "RS", "RR"]
+                .iter()
+                .any(|isolation| spelled(level, isolation))
+        {
+            for (_, range) in [with, level] {
+                respelled.replace_range(range.clone(), &" ".repeat(range.len()));
+            }
+            changed = true;
+        }
+    }
+    changed.then_some(respelled)
+}
+
+/// Whether `statement` calls, anywhere in it, a function that is not one of
+/// [`SIDE_EFFECT_FREE_FUNCTIONS`]: a scalar or aggregate call, or a function
+/// in `FROM`. A function can write whatever its body does, and nothing in the
+/// call says, so on a server that holds nothing ([`Engine::holds_read_only`])
+/// only a known built-in reads.
+///
+/// Only a bare, unquoted name is matched against the list: `s.upper(x)` and
+/// `"UPPER"(x)` may name a function of the user's. An overload of a listed
+/// name the user created with other argument types (Postgres's
+/// `public.abs(text)` whose body inserts) still reads, since the server picks
+/// it by its arguments' types, which SQL alone cannot resolve. That is
+/// accepted: Read-only guards against the user's mistakes, not a schema built
+/// to trap it.
+fn calls_unknown_function(statement: &Statement) -> bool {
+    struct Calls;
+    impl Visitor for Calls {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Function(function) if !side_effect_free(&function.name) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            match factor {
+                TableFactor::Table {
+                    name,
+                    args: Some(_),
+                    ..
+                }
+                | TableFactor::Function { name, .. }
+                    if !side_effect_free(name) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    statement.visit(&mut Calls).is_break()
+}
+
+fn side_effect_free(name: &ObjectName) -> bool {
+    matches!(
+        name.0.as_slice(),
+        [ObjectNamePart::Identifier(ident)]
+            if ident.quote_style.is_none()
+                && SIDE_EFFECT_FREE_FUNCTIONS
+                    .contains(&ident.value.to_ascii_lowercase().as_str())
+    )
+}
+
+/// The functions a Generic Read-only connection may call: built-ins of
+/// Postgres, Db2 and ANSI SQL that compute a value and change nothing, so a
+/// call to one is a read wherever it stands. Anything not listed needs
+/// Read-write there ([`calls_unknown_function`]). Keep it to functions whose
+/// every spelling across those servers is side-effect free.
+const SIDE_EFFECT_FREE_FUNCTIONS: &[&str] = &[
+    // Aggregates.
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "every",
+    "any_value",
+    "bool_and",
+    "bool_or",
+    "bit_and",
+    "bit_or",
+    "array_agg",
+    "string_agg",
+    "listagg",
+    "median",
+    "mode",
+    "percentile_cont",
+    "percentile_disc",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "corr",
+    "covar_pop",
+    "covar_samp",
+    "covariance",
+    "regr_slope",
+    "regr_intercept",
+    "regr_count",
+    "regr_r2",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_sxx",
+    "regr_syy",
+    "regr_sxy",
+    "grouping",
+    // Window functions.
+    "row_number",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
+    // Nulls and choices.
+    "coalesce",
+    "nullif",
+    "ifnull",
+    "nvl",
+    "nvl2",
+    "value",
+    "greatest",
+    "least",
+    "decode",
+    // Numbers.
+    "abs",
+    "ceil",
+    "ceiling",
+    "floor",
+    "round",
+    "trunc",
+    "truncate",
+    "mod",
+    "power",
+    "pow",
+    "sqrt",
+    "exp",
+    "ln",
+    "log",
+    "log10",
+    "sign",
+    "pi",
+    "degrees",
+    "radians",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "random",
+    "rand",
+    // Strings.
+    "upper",
+    "lower",
+    "ucase",
+    "lcase",
+    "initcap",
+    "length",
+    "char_length",
+    "character_length",
+    "octet_length",
+    "bit_length",
+    "substr",
+    "substring",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "btrim",
+    "replace",
+    "translate",
+    "concat",
+    "concat_ws",
+    "left",
+    "right",
+    "lpad",
+    "rpad",
+    "repeat",
+    "reverse",
+    "position",
+    "strpos",
+    "locate",
+    "instr",
+    "posstr",
+    "split_part",
+    "starts_with",
+    "regexp_replace",
+    "regexp_substr",
+    "regexp_like",
+    "regexp_instr",
+    "regexp_count",
+    "chr",
+    "ascii",
+    "md5",
+    "hex",
+    "to_hex",
+    "digits",
+    "space",
+    "format",
+    // Dates and times.
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "now",
+    "date_trunc",
+    "date_part",
+    "extract",
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "microsecond",
+    "dayofweek",
+    "dayofyear",
+    "dayofmonth",
+    "week",
+    "quarter",
+    "days",
+    "julian_day",
+    "monthname",
+    "dayname",
+    "age",
+    "make_date",
+    "make_timestamp",
+    "last_day",
+    "next_day",
+    "add_months",
+    "months_between",
+    "timestampdiff",
+    "timestamp_format",
+    "varchar_format",
+    "to_char",
+    "to_date",
+    "to_timestamp",
+    "to_number",
+    // Casts.
+    "cast",
+    "try_cast",
+    "int",
+    "integer",
+    "bigint",
+    "smallint",
+    "decimal",
+    "dec",
+    "numeric",
+    "double",
+    "real",
+    "float",
+    "char",
+    "varchar",
+    "date",
+    "time",
+    "timestamp",
+    // The session's own names.
+    "current_user",
+    "session_user",
+    "user",
+    "current_schema",
+    "current_database",
+    "current_catalog",
+    "current_setting",
+    "version",
+    // A sequence's value as this session last advanced it.
+    "currval",
+    "lastval",
+    // Rows from values.
+    "generate_series",
+    "unnest",
+];
+
+/// What a submission's calls do that its tree does not show, read off its
+/// tokens wherever they stand, so a call in a statement sqlparser cannot read
+/// counts too:
+///
+/// - a call no read-only hold stops ([`HOLD_IGNORING_CALLS`]) needs Full;
+/// - advancing a sequence (`nextval(…)`, `setval(…)`, `NEXT VALUE FOR s`,
+///   Db2's `NEXTVAL FOR s`, and `s.NEXTVAL` where [`advances_by_name`]) is a
+///   write: Postgres lets a temporary sequence advance in a read-only
+///   transaction, and Generic holds nothing;
+/// - a `set_config` that may lift the read-only hold ([`READ_ONLY_SETTINGS`])
+///   is a write. One naming another setting by a plain literal is left alone;
+///   any other first argument might name the hold.
+fn calls_verdict(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Verdict {
+    let parser_dialect = engine.spec().sql.parser_dialect;
+    // The calls the server will run, so one inside an executable comment
+    // counts, as it does for [`calls_denied_function`].
+    let tokens: Vec<Token> = match executed_tokens(engine, dialect, sql) {
+        Some(Ok(tokens)) => tokens,
+        _ => located_prefix(dialect, sql)
+            .0
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect(),
+    };
+    let tokens: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    let bare = |at: usize, name: &str| matches!(tokens.get(at), Some(Token::Word(word)) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(name));
+    let keyword = |at: usize, name: &str| is_keyword(tokens.get(at), name);
+    let called = |at: usize| tokens.get(at + 1) == Some(&&Token::LParen);
+    let call_name = |at: usize| match tokens.get(at) {
+        Some(Token::Word(word)) if called(at) => Some(word.value.to_ascii_lowercase()),
+        _ => None,
+    };
+
+    let ignores_hold = (0..tokens.len())
+        .any(|at| call_name(at).is_some_and(|name| HOLD_IGNORING_CALLS.contains(&name.as_str())));
+    if ignores_hold {
+        return Verdict::FULL;
+    }
+    let advances = (0..tokens.len()).any(|at| {
+        call_name(at).is_some_and(|name| name == "nextval" || name == "setval")
+            || keyword(at, "NEXT") && keyword(at + 1, "VALUE") && keyword(at + 2, "FOR")
+            || keyword(at, "NEXTVAL") && keyword(at + 1, "FOR")
+            || advances_by_name(parser_dialect)
+                && tokens.get(at) == Some(&&Token::Period)
+                && bare(at + 1, "NEXTVAL")
+    });
+    let lifts_hold = (0..tokens.len()).any(|at| {
+        call_name(at).as_deref() == Some("set_config")
+            && !matches!(
+                tokens.get(at + 2..at + 4),
+                Some([Token::SingleQuotedString(name), Token::Comma])
+                    if !READ_ONLY_SETTINGS.contains(&name.to_ascii_lowercase().as_str())
+            )
+    });
+    match advances || lifts_hold {
+        true => Verdict::WRITE,
+        false => Verdict::READ,
+    }
+}
+
+/// Whether the servers read in `dialect` advance a sequence by the name
+/// `s.NEXTVAL`, where anywhere else it is a column: Db2's and Oracle's, which
+/// Generic stands for, and Snowflake's. MariaDB spells it so only under
+/// `sql_mode=ORACLE`, a session setting this cannot see, so there it is read
+/// as the column it is by default.
+fn advances_by_name(dialect: ParserDialect) -> bool {
+    matches!(dialect, ParserDialect::Generic | ParserDialect::Snowflake)
+}
+
+/// Calls that act outside the transaction they run in, so no read-only hold
+/// stops them: signalling another backend, reloading or rotating the server's
+/// configuration and logs, writing the server's files, and running a
+/// statement down another connection with dblink.
+const HOLD_IGNORING_CALLS: &[&str] = &[
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_switch_wal",
+    "pg_create_restore_point",
+    "pg_file_write",
+    "pg_file_rename",
+    "pg_file_unlink",
+    "lo_import",
+    "lo_export",
+    "dblink",
+    "dblink_exec",
+    "dblink_send_query",
+];
+
+/// The settings that hold a session to reads: Postgres's
+/// `default_transaction_read_only` and `transaction_read_only`, MySQL's and
+/// MariaDB's `transaction_read_only` and its older name `tx_read_only`.
+const READ_ONLY_SETTINGS: &[&str] = &[
+    "default_transaction_read_only",
+    "transaction_read_only",
+    "tx_read_only",
+];
+
+/// Whether a `SET` may lift the read-only hold: an assignment to one of
+/// [`READ_ONLY_SETTINGS`] that is not plainly on (`DEFAULT` is whatever the
+/// server was started with), or a transaction characteristic of `READ WRITE`.
+fn set_lifts_hold(set: &Set) -> bool {
+    let lifts = |name: &ObjectName, values: &[Expr]| {
+        let name = name.to_string().to_ascii_lowercase();
+        let setting = name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&name)
+            .trim_start_matches('@')
+            .trim_matches(['"', '`']);
+        let on = matches!(
+            values,
+            [value] if ["on", "true", "1", "yes"]
+                .contains(&value.to_string().trim_matches('\'').to_ascii_lowercase().as_str())
+        );
+        READ_ONLY_SETTINGS.contains(&setting) && !on
+    };
+    match set {
+        Set::SingleAssignment {
+            variable, values, ..
+        } => lifts(variable, values),
+        Set::ParenthesizedAssignments { variables, .. } => {
+            variables.iter().any(|variable| lifts(variable, &[]))
+        }
+        Set::MultipleAssignments { assignments } => assignments
+            .iter()
+            .any(|assignment| lifts(&assignment.name, std::slice::from_ref(&assignment.value))),
+        Set::SetTransaction { modes, .. } => grants_write(modes),
+        _ => false,
+    }
+}
+
+/// Whether a server whose lexer is not known, as Generic's is not, could
+/// split `sql` otherwise than sqlparser's Generic tokenizer: a `/*` inside a
+/// comment, which the tokenizer nests and a server may not, so
+/// `/* /* */ DELETE FROM t -- */` is one comment to one and a `DELETE` to the
+/// other; MySQL's `/*! … */` and MariaDB's `/*M! … */`, which they run; a backslash in a literal or a
+/// quoted name, which ends it a byte later on a server where it escapes; a
+/// token opening with `$`, a dollar-quoted string or placeholder to the
+/// tokenizer and a name to Db2, so `$$; DELETE FROM t --$$` hides a `DELETE`
+/// Db2 runs. A `--` comment a lone carriage return runs through, which
+/// psqlODBC ends there, is [`line_comment_past_carriage_return`]'s.
+///
+/// Generic's tokenizer replaces a `/*! … */` with the tokens inside it, so no
+/// comment token is left to see, and those tokens' spans are placed as if the
+/// `/*!` and any version were not there, so their text is the wrong slice of
+/// `sql`. The comment is caught instead by the hole it leaves: every other
+/// token's span picks up where the last one ended, and the tokens of an
+/// expanded comment never cover its own `*/`.
+fn lexes_apart(dialect: &dyn Dialect, sql: &str) -> bool {
+    let (tokens, whole) = located_prefix(dialect, sql);
+    let mut end = 0;
+    tokens.iter().any(|(token, range)| {
+        let after_a_hole = std::mem::replace(&mut end, range.end) != range.start;
+        after_a_hole
+            || match token {
+                Token::Whitespace(Whitespace::MultiLineComment(comment)) => {
+                    comment.contains("/*") || comment.starts_with('!') || comment.starts_with("M!")
+                }
+                Token::Whitespace(_) => false,
+                Token::DollarQuotedString(_) => true,
+                Token::Placeholder(placeholder) if placeholder.starts_with('$') => true,
+                _ => {
+                    let text = &sql[range.clone()];
+                    text.starts_with('$') || text.contains('\\')
+                }
+            }
+    }) || whole && end != sql.len()
+}
+
+/// Whether `sql` holds MariaDB's `/*M! … */`, which MariaDB runs and
+/// sqlparser's MySQL tokenizer keeps as a comment, unlike the `/*! … */` it
+/// reads the inside of. MySQL ignores it, and a MySQL profile may well point
+/// at a MariaDB server, so on MySQL it is unreadable. Either spelling of the
+/// marker counts, whatever follows it.
+fn runs_mariadb_comment(dialect: &dyn Dialect, sql: &str) -> bool {
+    located_prefix(dialect, sql).0.iter().any(|(token, _)| {
+        matches!(
+            token,
+            Token::Whitespace(Whitespace::MultiLineComment(comment))
+                if comment.get(..2).is_some_and(|marker| marker.eq_ignore_ascii_case("M!"))
+        )
+    })
+}
+
+/// Whether the servers read in `dialect` end a `--` comment where sqlparser's
+/// tokenizer does: Postgres's dialect stops at a carriage return as Postgres
+/// does, and MySQL, MariaDB, SQLite and Turso, like the tokenizer elsewhere,
+/// run on to a newline. DuckDB's own tokenizer stops at a carriage return, and
+/// Snowflake's and SQL Server's are not known to agree.
+fn ends_line_comments_as_sqlparser_does(dialect: ParserDialect) -> bool {
+    matches!(
+        dialect,
+        ParserDialect::PostgreSql | ParserDialect::MySql | ParserDialect::Sqlite
+    )
+}
+
+/// Whether any `--` comment in `sql` runs on past a carriage return.
+fn line_comment_past_carriage_return(dialect: &dyn Dialect, sql: &str) -> bool {
+    located_prefix(dialect, sql).0.iter().any(|(token, _)| {
+        matches!(
+            token,
+            Token::Whitespace(Whitespace::SingleLineComment { comment, .. })
+                if carriage_return_inside(comment)
+        )
+    })
+}
+
+/// Whether a `--` comment's text runs on past a carriage return, where a
+/// server that ends the comment there reads the rest as SQL.
+fn carriage_return_inside(comment: &str) -> bool {
+    comment.trim_end_matches('\r').contains('\r')
 }
 
 /// [`classify`] where the floor under an unreadable statement is its first
@@ -3096,7 +3684,7 @@ fn misread_token(token: &Token, text: &str) -> bool {
     match token {
         Token::Char(_) => true,
         Token::Whitespace(Whitespace::SingleLineComment { comment, .. }) => {
-            comment.trim_end_matches('\r').contains('\r')
+            carriage_return_inside(comment)
         }
         Token::Whitespace(_)
         | Token::SingleQuotedString(_)
@@ -3415,6 +4003,27 @@ fn mariadb_analyze_as_explain(dialect: &dyn Dialect, sql: &str) -> Option<String
             )
         );
     dml.then(|| format!("EXPLAIN {sql}"))
+}
+
+/// Postgres's `EXPLAIN ANALYSE <statement>`, which runs the statement as
+/// `EXPLAIN ANALYZE` does, respelled as the `ANALYZE` sqlparser reads so it is
+/// classified by the statement it runs. The two words are the same length, so
+/// every other token keeps its place.
+fn analyse_as_analyze(dialect: &dyn Dialect, sql: &str) -> Option<String> {
+    let tokens = located_tokens(dialect, sql)?;
+    let mut words = tokens
+        .iter()
+        .filter(|(token, _)| !matches!(token, Token::Whitespace(_)));
+    let (first, _) = words.next()?;
+    let (second, range) = words.next()?;
+    let is = |token: &Token, keyword: &str| is_keyword(Some(&token), keyword);
+    // The slice is checked as well as the token: a span after Generic's
+    // `/*! … */` expansion points at the wrong text.
+    let spelled = sql
+        .get(range.clone())
+        .is_some_and(|text| text.eq_ignore_ascii_case("ANALYSE"));
+    (is(first, "EXPLAIN") && is(second, "ANALYSE") && spelled)
+        .then(|| format!("{}ANALYZE{}", &sql[..range.start], &sql[range.end..]))
 }
 
 /// Whether `sql` can run again just to reload the rows it produced. A grid is
@@ -4088,6 +4697,24 @@ fn escapes_an_identifier(tokens: &[Token]) -> bool {
     })
 }
 
+/// Whether `sql` runs statements it does not show, so what they did to the
+/// transaction cannot be read off it: a procedure call (`CALL`, `EXEC`,
+/// `EXECUTE`), anywhere in it, or anything sqlparser cannot read, which
+/// Postgres's `DO` block and MariaDB's `BEGIN NOT ATOMIC` are.
+pub(crate) fn runs_unseen(engine: Engine, sql: &str) -> bool {
+    let Some(dialect) = dialect(engine) else {
+        return false;
+    };
+    match SqlParser::parse_sql(dialect.as_ref(), sql) {
+        Ok(statements) => visit_statements(&statements, |statement| match statement {
+            Statement::Call(_) | Statement::Execute { .. } => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        })
+        .is_break(),
+        Err(_) => true,
+    }
+}
+
 /// What running `sql` leaves on its session that a fresh connection to the
 /// same profile would not have, which is what keeps a queue of reads from
 /// running at once on fresh ones.
@@ -4436,6 +5063,9 @@ const SINGLE_BYTE_CHARSETS: &[&str] = &["utf8", "utf8mb3", "utf8mb4", "latin1", 
 /// is stopped rather than assumed harmless. Every assignment of a multi-part
 /// `SET` has to pass, so the verdict does not depend on their order.
 fn set_verdict(spec: &SqlSpec, set: &Set) -> Verdict {
+    if set_lifts_hold(set) {
+        return Verdict::WRITE;
+    }
     match set {
         Set::SetRole { .. } | Set::SetSessionAuthorization(_) => Verdict::WRITE,
         Set::SetTransaction { modes, .. } if grants_write(modes) => Verdict::WRITE,
@@ -4560,9 +5190,11 @@ fn plain_setting_verdict(spec: &SqlSpec, parts: &[&str], variable_ok: bool) -> V
 /// (`EXPLAIN ANALYZE …`); the parenthesized form lands in `options` untouched,
 /// so `EXPLAIN (ANALYZE TRUE) DELETE FROM t` read as a plain EXPLAIN and
 /// deleted the rows. Anything but an explicit off counts as on: an argument
-/// this does not recognise is not a reason to call a write a read.
+/// this does not recognise is not a reason to call a write a read. Postgres
+/// takes the British `ANALYSE` as the same option.
 fn analyze_option_is_on(option: &UtilityOption) -> bool {
-    if !option.name.value.eq_ignore_ascii_case("analyze") {
+    let name = &option.name.value;
+    if !name.eq_ignore_ascii_case("analyze") && !name.eq_ignore_ascii_case("analyse") {
         return false;
     }
     match &option.arg {
@@ -7717,29 +8349,38 @@ mod tests {
             "EXPLAIN (ANALYZE TRUE, COSTS FALSE) DELETE FROM t",
             "EXPLAIN (COSTS FALSE, ANALYZE ON) DELETE FROM t",
             "EXPLAIN (analyze true) DELETE FROM t",
+            "EXPLAIN (ANALYSE) DELETE FROM t",
+            "EXPLAIN (ANALYSE TRUE) DELETE FROM t",
+            "EXPLAIN (ANALYSE on) DELETE FROM t",
+            "EXPLAIN (VERBOSE, analyse 1) DELETE FROM t",
+            "EXPLAIN ANALYSE DELETE FROM t",
+            "EXPLAIN ANALYSE VERBOSE DELETE FROM t",
         ];
 
-        for sql in cases {
-            assert_eq!(
-                classify(Engine::Postgres, sql),
-                Verdict {
-                    mode: Mode::Full,
-                    destructive: vec![Destructive::UnfilteredDelete],
-                },
-                "{sql}"
-            );
-        }
+        for engine in [Engine::Postgres, Engine::Generic] {
+            for sql in cases {
+                assert_eq!(
+                    classify(engine, sql),
+                    Verdict {
+                        mode: Mode::Full,
+                        destructive: vec![Destructive::UnfilteredDelete],
+                    },
+                    "{engine:?} {sql}"
+                );
+            }
 
-        for sql in [
-            "EXPLAIN (ANALYZE FALSE) DELETE FROM t",
-            "EXPLAIN (ANALYZE OFF) DELETE FROM t",
-            "EXPLAIN (COSTS TRUE) SELECT 1",
-        ] {
-            assert_eq!(
-                classify(Engine::Postgres, sql).mode,
-                Mode::ReadOnly,
-                "{sql}"
-            );
+            for sql in [
+                "EXPLAIN (ANALYZE FALSE) DELETE FROM t",
+                "EXPLAIN (ANALYZE OFF) DELETE FROM t",
+                "EXPLAIN (ANALYSE FALSE) DELETE FROM t",
+                "EXPLAIN (COSTS TRUE) SELECT 1",
+            ] {
+                assert_eq!(
+                    classify(engine, sql).mode,
+                    Mode::ReadOnly,
+                    "{engine:?} {sql}"
+                );
+            }
         }
     }
 
@@ -8063,6 +8704,560 @@ mod tests {
             mode,
             destructive: vec![Destructive::Unreadable],
         }
+    }
+
+    #[test]
+    fn generic_reads_as_unreadable_what_a_server_it_does_not_know_could_lex_otherwise() {
+        for sql in [
+            "/* /* */ DELETE FROM t -- */",
+            "/* /* */ SELECT 1 */",
+            "/*! DELETE FROM t */ SELECT 1",
+            r"SELECT '\'' ; DELETE FROM t; -- '",
+            r#"SELECT "a\" FROM t"#,
+        ] {
+            assert_eq!(
+                classify(Engine::Generic, sql),
+                unreadable_at(Mode::ReadWrite),
+                "{sql}"
+            );
+        }
+        for (sql, verdict) in [
+            ("/* a comment */ SELECT 1", Verdict::READ),
+            ("SELECT '/* not a comment */', 'a\"b'", Verdict::READ),
+            ("DELETE FROM t WHERE a = 1 -- /* \\", Verdict::WRITE),
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), verdict, "{sql}");
+        }
+    }
+
+    #[test]
+    fn generic_reads_as_unreadable_a_dollar_quote_db2_reads_as_a_name() {
+        for sql in [
+            "SELECT * FROM (SELECT 1 FROM SYSIBM.SYSDUMMY1) T(\"$$\") WHERE 1 = $$; \
+             DELETE FROM DELVETEST.GATE WHERE ID=1 --$$",
+            "SELECT * FROM (SELECT 1 FROM SYSIBM.SYSDUMMY1) T(\"$$\") WHERE 1 = $$; \
+             DELETE FROM DELVETEST.GATE --$$",
+            "SELECT * FROM (SELECT 1 FROM SYSIBM.SYSDUMMY1) T(\"$$\") WHERE 1 = $$;\n\
+             DROP TABLE DELVETEST.GATE --$$",
+            "SELECT * FROM (SELECT 1 FROM SYSIBM.SYSDUMMY1) T(\"$A$\") WHERE 1 = $a$; \
+             DELETE FROM DELVETEST.GATE WHERE ID=1 --$a$",
+            "SELECT 1 FROM SYSIBM.SYSDUMMY1 WHERE 1 = $$; \
+             DELETE FROM DELVETEST.GATE WHERE ID=1; SELECT 1 FROM SYSIBM.SYSDUMMY1 $$",
+            "SELECT $1$ ; DELETE FROM t WHERE id=1; SELECT $1$",
+        ] {
+            assert_eq!(
+                classify(Engine::Generic, sql),
+                unreadable_at(Mode::ReadWrite),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT '$$' FROM t",
+            "SELECT \"a$$\" FROM t",
+            "SELECT a$$ FROM t",
+            "SELECT * FROM V$SESSION",
+            "SELECT 1 /* $$ */",
+            "-- $$\nSELECT 1",
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), Verdict::READ, "{sql}");
+        }
+    }
+
+    #[test]
+    fn generic_reads_as_unreadable_any_executable_comment() {
+        for sql in [
+            "/*! SELECT $$ INTO OUTFILE '/tmp/x' FROM t AS $$ */",
+            "/*!50000 SELECT $$ INTO OUTFILE '/tmp/x' FROM t AS $$ */",
+            "/*! SELECT $$ ; DELETE FROM t ; SELECT $$ */",
+            "SELECT 1 FROM t WHERE 1 = /*! $$ ; DELETE FROM t ; SELECT $$ */",
+            "/*!\nSELECT $$ ; DELETE FROM t ; SELECT $$ */",
+            "/*! SELECT $1$ ; DELETE FROM t ; SELECT $1$ */",
+            "/*! SELECT \"a\\\" FROM t */",
+            "/*! SELECT 1 /* /* */ DELETE FROM t -- */ */",
+            "/*! DELETE FROM t */",
+            "SELECT 1 /*!99999 ; DELETE FROM t */",
+            "SELECT 1 /*! */",
+            "SELECT 1 /*M! INTO OUTFILE '/tmp/x' */",
+            "SELECT 1 /*M!100100 ; DELETE FROM t */",
+        ] {
+            assert_eq!(
+                classify(Engine::Generic, sql),
+                unreadable_at(Mode::ReadWrite),
+                "{sql:?}"
+            );
+        }
+        for sql in [
+            "SELECT '/*!' FROM t",
+            "SELECT 1 -- /*! $$ */",
+            "SELECT 1 /* ! */",
+            "SELECT 1 /* M! */",
+            "SELECT '/*M!' FROM t",
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), Verdict::READ, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn mysql_dialect_reads_as_unreadable_a_comment_mariadb_runs() {
+        // MySQL ignores the comment, but the server behind the profile may be
+        // a MariaDB that runs it: read both ways, and unreadable.
+        assert_eq!(
+            classify(
+                Engine::MySql,
+                "SELECT 1 /*M!100100 INTO OUTFILE '/tmp/x' */"
+            ),
+            unreadable_at(Mode::ReadOnly)
+        );
+        // What MySQL runs is the unfiltered delete, what MariaDB runs the
+        // filtered one; the delete is named either way.
+        for sql in [
+            "DELETE FROM t /*M! WHERE 1 = 0 */",
+            "DELETE FROM t /*M!100100 WHERE */",
+            "SELECT 1 /*M! ; DELETE FROM t */",
+        ] {
+            let verdict = classify(Engine::MySql, sql);
+            assert_eq!(verdict.mode, Mode::Full, "{sql:?}");
+            for kind in [Destructive::UnfilteredDelete, Destructive::Unreadable] {
+                assert!(verdict.destructive.contains(&kind), "{sql:?}: {verdict:?}");
+            }
+            assert_eq!(verdict.destructive.len(), 2, "{sql:?}: {verdict:?}");
+        }
+        // MariaDB runs what the comment holds, so it is read with it.
+        assert_eq!(
+            classify(Engine::MariaDb, "SELECT 1 /*M! ; DELETE FROM t */"),
+            Verdict::destroys(Destructive::UnfilteredDelete)
+        );
+        // sqlparser cannot read `INTO OUTFILE`, with or without the comment.
+        assert_eq!(
+            classify(
+                Engine::MariaDb,
+                "SELECT 1 /*M!100100 INTO OUTFILE '/tmp/x' */"
+            ),
+            unreadable_at(Mode::ReadOnly)
+        );
+        assert_eq!(
+            classify(Engine::MariaDb, "DELETE FROM t /*M! WHERE 1 = 0 */"),
+            Verdict::WRITE
+        );
+        for engine in [Engine::MariaDb, Engine::MySql] {
+            assert_eq!(classify(engine, "SELECT 1 /* M! */"), Verdict::READ);
+        }
+    }
+
+    #[test]
+    fn generic_reads_as_unreadable_a_line_comment_a_lone_carriage_return_may_end() {
+        for sql in [
+            "SELECT 1 -- x\r; DELETE FROM t WHERE id=1; --",
+            "SELECT 1\r--\r; DELETE FROM t WHERE id=1",
+            "SELECT 1; --\rDELETE FROM t WHERE id=1",
+            "/*\r*/--\rDELETE FROM t WHERE id=1",
+            "SELECT 1 /* x */ --\rDELETE FROM t WHERE id=1",
+            "-- line one\n-- line two\rDELETE FROM t WHERE id=1",
+            "-- line one\r\n-- line two\rDELETE FROM t WHERE id=1",
+            "-- c\rDELETE FROM t WHERE id=1",
+            "--\rDROP TABLE t",
+            "--\rTRUNCATE t",
+            "--\rCREATE TABLE zz (a int)",
+        ] {
+            assert_eq!(
+                classify(Engine::Generic, sql),
+                unreadable_at(Mode::ReadWrite),
+                "{sql:?}"
+            );
+        }
+        for sql in [
+            "-- c\r\nSELECT 1",
+            "SELECT 1 -- c\r",
+            "SELECT 1\r\nFROM t\r\n",
+            "SELECT 1\rFROM t",
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), Verdict::READ, "{sql:?}");
+        }
+    }
+
+    /// DuckDB's tokenizer ends a `--` comment at a carriage return as well as a
+    /// newline, and sqlparser's DuckDB dialect only at a newline, so
+    /// `SELECT 1 -- c\r; DROP TABLE t` was a read to the classifier and a
+    /// `DROP` to the server, run with no confirmation and, with no hold behind
+    /// DuckDB's Read-only, in Read-only too. Snowflake's and SQL Server's lexers
+    /// are not known to agree either. Postgres's dialect already ends the
+    /// comment where Postgres does, and MySQL, MariaDB, SQLite and Turso end it
+    /// at a newline as sqlparser does.
+    #[test]
+    fn a_line_comment_a_lone_carriage_return_may_end_is_unreadable_where_lexers_part() {
+        let parted = [
+            "SELECT 1 --\rDROP TABLE t",
+            "SELECT 1 -- c\r; DELETE FROM t WHERE id = 1",
+            "--\rDELETE FROM t WHERE id = 1",
+            "-- one\n-- two\rTRUNCATE t",
+        ];
+        let agreed = ["-- c\r\nSELECT 1", "SELECT 1 -- c\r", "SELECT 1\rFROM t"];
+        for engine in [
+            Engine::DuckDb,
+            Engine::Snowflake,
+            Engine::SqlServer,
+            Engine::Generic,
+        ] {
+            for sql in parted {
+                let verdict = classify(engine, sql);
+                assert!(
+                    verdict.destructive.contains(&Destructive::Unreadable),
+                    "{engine:?} {sql:?}: {verdict:?}"
+                );
+            }
+            for sql in agreed {
+                assert_eq!(classify(engine, sql), Verdict::READ, "{engine:?} {sql:?}");
+            }
+        }
+
+        assert_eq!(
+            classify(
+                Engine::Postgres,
+                "SELECT 1 -- c\r; DELETE FROM t WHERE id = 1"
+            ),
+            Verdict::WRITE
+        );
+        assert_eq!(
+            classify(Engine::Postgres, "-- one\n-- two\rTRUNCATE t"),
+            Verdict::destroys(Destructive::Truncate)
+        );
+        for engine in [
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::Turso,
+        ] {
+            for sql in parted[1..].iter().chain(&agreed) {
+                assert_eq!(classify(engine, sql), Verdict::READ, "{engine:?} {sql:?}");
+            }
+        }
+    }
+
+    /// Postgres holds Read-only with `default_transaction_read_only`, MySQL and
+    /// MariaDB with the session's transaction access mode. A statement that
+    /// lifts either lifts the hold, after which the server runs any write.
+    #[test]
+    fn a_statement_that_lifts_the_read_only_hold_is_a_write() {
+        let postgres = [
+            "SET default_transaction_read_only = off",
+            "SET default_transaction_read_only TO off",
+            "SET SESSION default_transaction_read_only = 'off'",
+            "SET LOCAL default_transaction_read_only = false",
+            "SET default_transaction_read_only = DEFAULT",
+            "SET \"default_transaction_read_only\" = off",
+            "SET transaction_read_only = off",
+            "RESET default_transaction_read_only",
+            "RESET ALL",
+            "DISCARD ALL",
+            "BEGIN READ WRITE",
+            "BEGIN TRANSACTION READ WRITE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+            "START TRANSACTION READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT set_config('TRANSACTION_READ_ONLY', 'off', true), 1",
+            "SELECT pg_catalog.set_config('default_transaction_read_only', 'off', false)",
+            "SELECT set_config(name, 'off', false) FROM t",
+            "SELECT set_config('default_transaction_' || 'read_only', 'off', false)",
+        ];
+        let mysql = [
+            "SET transaction_read_only = 0",
+            "SET transaction_read_only = OFF",
+            "SET @@transaction_read_only = 0",
+            "SET @@session.transaction_read_only = OFF",
+            "SET SESSION transaction_read_only = 0",
+            "SET GLOBAL transaction_read_only = 0",
+            "SET tx_read_only = 0",
+            "SET autocommit = 1, transaction_read_only = 0",
+            "SET transaction_read_only = DEFAULT",
+            "START TRANSACTION READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "SET SESSION TRANSACTION READ WRITE",
+        ];
+        let lifts = |engines: &[Engine], cases: &[&str]| {
+            for &engine in engines {
+                for sql in cases {
+                    assert!(
+                        classify(engine, sql).mode >= Mode::ReadWrite,
+                        "{engine:?} {sql}: {:?}",
+                        classify(engine, sql)
+                    );
+                }
+            }
+        };
+        lifts(&[Engine::Postgres, Engine::Generic], &postgres);
+        lifts(&[Engine::MySql, Engine::MariaDb, Engine::Generic], &mysql);
+
+        for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+            for sql in [
+                "BEGIN",
+                "START TRANSACTION READ ONLY",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET SESSION TRANSACTION READ ONLY",
+            ] {
+                assert_eq!(classify(engine, sql), Verdict::READ, "{engine:?} {sql}");
+            }
+            // Setting a read-only setting on is not a lift, but a setting the
+            // engine's `plain_settings` does not list is a write whatever it
+            // is set to ([`set_verdict`]), which is stricter.
+            for sql in [
+                "SET default_transaction_read_only = on",
+                "SET transaction_read_only = 1",
+            ] {
+                assert_eq!(classify(engine, sql), Verdict::WRITE, "{engine:?} {sql}");
+            }
+        }
+        assert_eq!(
+            classify(Engine::Postgres, "SET search_path = x"),
+            Verdict::READ
+        );
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert_eq!(
+                classify(engine, "SET search_path = x"),
+                Verdict::WRITE,
+                "{engine:?}: not a setting this engine lists as plain"
+            );
+        }
+        for sql in [
+            "BEGIN READ ONLY",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+        ] {
+            assert_eq!(classify(Engine::Postgres, sql), Verdict::READ, "{sql}");
+        }
+        // Postgres's deny-list names `set_config` whatever it sets.
+        assert_eq!(
+            classify(
+                Engine::Postgres,
+                "SELECT set_config('search_path', 'x', false)"
+            ),
+            Verdict::WRITE
+        );
+    }
+
+    /// Advancing a sequence writes, and no engine's read-only hold stops it
+    /// for every sequence: Postgres lets a temporary one advance in a read-only
+    /// transaction, and Db2 reached through Generic holds nothing at all.
+    #[test]
+    fn advancing_a_sequence_is_a_write_on_every_engine() {
+        let engines = Engine::ALL
+            .into_iter()
+            .filter(|engine| engine.syntax() == Syntax::Sql);
+        for engine in engines {
+            for sql in [
+                "SELECT nextval('s')",
+                "SELECT setval('delvetest.seq', 100)",
+                "SELECT pg_catalog.nextval('s')",
+                "SELECT NEXTVAL(s)",
+                "SELECT NEXT VALUE FOR s",
+                "SELECT next value for s FROM t",
+                "SELECT NEXTVAL FOR s FROM t",
+            ] {
+                assert!(
+                    classify(engine, sql).mode >= Mode::ReadWrite,
+                    "{engine:?} {sql}: {:?}",
+                    classify(engine, sql)
+                );
+            }
+        }
+        // `s.NEXTVAL` only where the server spells an advance that way: Db2
+        // and Oracle behind Generic, and Snowflake. Anywhere else, and quoted
+        // anywhere, it is a column.
+        for engine in [Engine::Generic, Engine::Snowflake] {
+            for sql in [
+                "SELECT s.NEXTVAL FROM SYSIBM.SYSDUMMY1",
+                "SELECT DELVETEST.SEQ.NEXTVAL FROM SYSIBM.SYSDUMMY1",
+                "SELECT a FROM t WHERE id = s.nextval",
+                "VALUES (DELVETEST.SEQ.NEXTVAL)",
+                "SET DELVETEST.VV = DELVETEST.SEQ.NEXTVAL",
+            ] {
+                assert!(
+                    classify(engine, sql).mode >= Mode::ReadWrite,
+                    "{engine:?} {sql}: {:?}",
+                    classify(engine, sql)
+                );
+            }
+        }
+        for (engine, sql) in [
+            (Engine::MySql, "SELECT t.nextval FROM t"),
+            (Engine::SqlServer, "SELECT t.nextval FROM t"),
+            (Engine::Generic, "SELECT t.\"NEXTVAL\" FROM t"),
+        ] {
+            assert_eq!(classify(engine, sql), Verdict::READ, "{engine:?} {sql}");
+        }
+        // Where the deny-list names `nextval`, its member form after a period
+        // is read as the advance, quoted or not ([`MEMBER_FORMS`]): stricter.
+        for (engine, sql) in [
+            (Engine::Postgres, "SELECT t.nextval FROM t"),
+            (Engine::Postgres, "SELECT t.\"nextval\" FROM t"),
+            (Engine::DuckDb, "SELECT t.nextval FROM t"),
+            (Engine::Snowflake, "SELECT t.\"NEXTVAL\" FROM t"),
+        ] {
+            assert_eq!(classify(engine, sql), Verdict::WRITE, "{engine:?} {sql}");
+        }
+        for engine in [Engine::Postgres, Engine::Generic] {
+            assert_eq!(
+                classify(engine, "SELECT \"nextval\"('s')").mode,
+                Mode::ReadWrite,
+                "{engine:?}"
+            );
+            for sql in [
+                "SELECT currval('s')",
+                "SELECT nextval_at, next, value FROM t",
+                "SELECT 'nextval(1)' FROM t",
+                "SELECT 1 -- nextval('s')",
+            ] {
+                assert_eq!(classify(engine, sql), Verdict::READ, "{engine:?} {sql}");
+            }
+        }
+    }
+
+    /// A read-only transaction does not stop a backend being signalled, the
+    /// configuration reloaded, or a statement sent down another connection.
+    #[test]
+    fn a_call_the_read_only_hold_does_not_stop_needs_full() {
+        for engine in [Engine::Postgres, Engine::Generic] {
+            for sql in [
+                "SELECT pg_terminate_backend(123)",
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'x'",
+                "SELECT pg_cancel_backend(123)",
+                "SELECT pg_catalog.pg_reload_conf()",
+                "SELECT dblink_exec('dbname=x', 'DELETE FROM t')",
+                "SELECT * FROM dblink('dbname=x', 'DELETE FROM t RETURNING 1') AS r(a int)",
+            ] {
+                assert_eq!(classify(engine, sql).mode, Mode::Full, "{engine:?} {sql}");
+            }
+        }
+    }
+
+    /// Nothing on a Generic server holds Read-only, and what a function does
+    /// cannot be read off its call, so a call to anything but a known
+    /// side-effect-free built-in needs Read-write there. Built-in engines keep
+    /// reading such a call as a read, since their hold stops what it writes.
+    #[test]
+    fn generic_read_only_refuses_a_call_to_a_function_it_does_not_know() {
+        for sql in [
+            "SELECT delvetest.upd_f()",
+            "SELECT upd_f()",
+            "SELECT * FROM delvetest.upd_f()",
+            "SELECT 1 WHERE delvetest.upd_f() = 1",
+            "VALUES (delvetest.upd_f())",
+            "SELECT * FROM TABLE(DELVETEST.UPD_TF())",
+            "SELECT * FROM TABLE(DELVETEST.UPD_TF()) AS T",
+            "SELECT COUNT(*) FROM TABLE(DELVETEST.UPD_TF()) x WHERE 1=0",
+            "WITH t AS (SELECT * FROM TABLE(DELVETEST.UPD_TF()) x) SELECT * FROM t",
+            "SET DELVETEST.VV = (SELECT COUNT(*) FROM TABLE(DELVETEST.UPD_TF()) x)",
+            "SELECT myschema.upper(x) FROM t",
+            "SELECT \"UPPER\"(x) FROM t",
+            "SELECT count(upd_f()) FROM t",
+            "SELECT 1 FROM t ORDER BY upd_f()",
+            "SELECT 1 FROM t GROUP BY upd_f()",
+            "SELECT * FROM t JOIN u ON upd_f() = 1",
+            "SELECT CAST(upd_f() AS INT)",
+            "SELECT CASE WHEN upd_f() = 1 THEN 1 END",
+            "SELECT * FROM t WHERE x IN (SELECT upd_f())",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = upd_f())",
+            "SELECT 1 UNION SELECT upd_f()",
+            "EXPLAIN ANALYZE SELECT upd_f()",
+        ] {
+            assert!(
+                classify(Engine::Generic, sql).mode >= Mode::ReadWrite,
+                "{sql}: {:?}",
+                classify(Engine::Generic, sql)
+            );
+        }
+        for sql in [
+            "SELECT count(*), upper(x), coalesce(a, b), cast(x as int), current_date, \
+             substr(x, 1, 2) FROM t",
+            "SELECT max(a), min(b), sum(c), avg(d), count(DISTINCT e) FROM t GROUP BY f",
+            "SELECT lower(name), length(name), trim(name), round(v, 2), abs(v) FROM t",
+            "SELECT row_number() OVER (ORDER BY a), lag(a) OVER (ORDER BY a) FROM t",
+            "SELECT current_timestamp, year(d), nullif(a, b), concat(a, b) FROM t",
+            "SELECT * FROM t WHERE upper(x) = 'A' AND replace(y, 'a', 'b') LIKE 'c%'",
+            "SELECT extract(year FROM d), substring(x FROM 2), position('a' IN x) FROM t",
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), Verdict::READ, "{sql}");
+        }
+        for sql in [
+            "SELECT delvetest.upd_f()",
+            "SELECT * FROM TABLE(DELVETEST.UPD_TF())",
+        ] {
+            assert_eq!(classify(Engine::Postgres, sql), Verdict::READ, "{sql}");
+        }
+    }
+
+    /// Db2 ends a query with its isolation clause, `WITH UR|CS|RS|RR`, and
+    /// takes `VALUES 1` without parentheses, neither of which sqlparser's
+    /// Generic dialect parses. They read as what they are, and whatever else
+    /// the submission holds is read as strictly as ever.
+    #[test]
+    fn generic_reads_db2_isolation_clauses_and_bare_values() {
+        for sql in [
+            "SELECT * FROM t WITH UR",
+            "SELECT a FROM t WHERE b = 1 with cs;",
+            "SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY WITH RS",
+            "SELECT 1 FROM t WITH RR; SELECT 2 FROM u WITH UR",
+            "VALUES 1",
+            "VALUES 1, 2",
+            "values current_date",
+            "VALUES (1, 'a'), (2, 'b')",
+            "VALUES upper('a'); SELECT 1 FROM t WITH UR",
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), Verdict::READ, "{sql}");
+        }
+        for (sql, verdict) in [
+            (
+                "SELECT 1 FROM t WITH UR; DELETE FROM t WHERE id = 1",
+                Verdict::WRITE,
+            ),
+            ("DELETE FROM t WHERE id = 1 WITH UR", Verdict::WRITE),
+            (
+                "VALUES 1; DROP TABLE t",
+                Verdict::destroys(Destructive::Drop),
+            ),
+            ("VALUES upd_f()", Verdict::WRITE),
+            ("VALUES DELVETEST.SEQ.NEXTVAL", Verdict::WRITE),
+            ("SELECT upd_f() FROM t WITH UR", Verdict::WRITE),
+        ] {
+            assert_eq!(classify(Engine::Generic, sql), verdict, "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WITH RS USE AND KEEP EXCLUSIVE LOCKS",
+            "SELECT * FROM t WITH UR UR",
+            "SELECT * FROM t WITH \"UR\"",
+            "VALUES",
+        ] {
+            assert_eq!(
+                classify(Engine::Generic, sql),
+                unreadable_at(Mode::ReadWrite),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The filter bar's raw text is spliced into the preview, and the preview
+    /// goes through the same gate: a call in it is read as it is anywhere.
+    #[test]
+    fn a_generic_preview_filter_calling_an_unknown_function_needs_read_write() {
+        let preview = |filter: &str| {
+            crate::explorer::preview_sql(Engine::Generic, "DELVETEST", "INJ", filter, Some(100), 0)
+        };
+        for filter in [
+            "ID = DELVETEST.UPD_F()",
+            "ID IN (SELECT C FROM TABLE(DELVETEST.UPD_TF()) T)",
+            "ID = DELVETEST.SEQ.NEXTVAL",
+            "ID = NEXT VALUE FOR DELVETEST.SEQ",
+        ] {
+            let sql = preview(filter);
+            assert!(
+                classify(Engine::Generic, &sql).mode >= Mode::ReadWrite,
+                "{sql}: {:?}",
+                classify(Engine::Generic, &sql)
+            );
+        }
+        let sql = preview("upper(V) = 'A'");
+        assert!(is_generated_select(Engine::Generic, &sql), "{sql}");
+        assert_eq!(classify(Engine::Generic, &sql), Verdict::READ, "{sql}");
     }
 
     #[test]
@@ -9251,12 +10446,23 @@ mod tests {
     fn a_function_stays_a_read_on_an_engine_that_does_not_list_it() {
         use crate::db::{Engine, Syntax};
 
-        let sql = "SELECT set_config('default_transaction_read_only', 'off', false)";
-        for engine in Engine::ALL
-            .into_iter()
-            .filter(|engine| engine.syntax() == Syntax::Sql && *engine != Engine::Postgres)
-        {
-            assert_eq!(classify(engine, sql).mode, Mode::ReadOnly, "{engine:?}");
+        // Generic is left out: only a known side-effect-free built-in is a
+        // read there (`SIDE_EFFECT_FREE_FUNCTIONS`), so any call it does not
+        // know is a write.
+        for engine in Engine::ALL.into_iter().filter(|engine| {
+            engine.syntax() == Syntax::Sql
+                && *engine != Engine::Postgres
+                && *engine != Engine::Generic
+        }) {
+            assert_eq!(
+                classify(engine, "SELECT pg_stat_reset()").mode,
+                Mode::ReadOnly,
+                "{engine:?}"
+            );
+            // A `set_config` that may lift the read-only hold is a write on
+            // every engine ([`calls_verdict`]), whether or not it lists it.
+            let lift = "SELECT set_config('default_transaction_read_only', 'off', false)";
+            assert!(classify(engine, lift).mode >= Mode::ReadWrite, "{engine:?}");
         }
     }
 
@@ -9319,11 +10525,14 @@ mod tests {
             .filter(|engine| engine.syntax() == Syntax::Sql)
         {
             for sql in ["SELECT my_function(1)", "SELECT * FROM my_function(1)"] {
-                assert_eq!(
-                    classify(engine, sql).mode,
-                    Mode::ReadOnly,
-                    "{engine:?}: {sql}"
-                );
+                // Generic SQL reads only a known side-effect-free built-in as
+                // a read (`SIDE_EFFECT_FREE_FUNCTIONS`): nothing on that
+                // server holds a function of the user's to reads.
+                let expected = match engine {
+                    Engine::Generic => Mode::ReadWrite,
+                    _ => Mode::ReadOnly,
+                };
+                assert_eq!(classify(engine, sql).mode, expected, "{engine:?}: {sql}");
             }
         }
     }
@@ -9397,9 +10606,11 @@ mod tests {
                 );
             }
         }
+        // MySQL has no sequences, but a call spelled as an advance is a write
+        // on every engine ([`calls_verdict`]): the stricter of the two rules.
         assert_eq!(
             classify(Engine::MySql, "SELECT nextval('s')").mode,
-            Mode::ReadOnly
+            Mode::ReadWrite
         );
     }
 
@@ -9498,10 +10709,23 @@ mod tests {
         for lister in sql_engines() {
             for name in lister.spec().sql.denied_functions {
                 for engine in sql_engines() {
-                    if engine.spec().sql.denied_functions.contains(name) {
+                    // Generic reads any call it does not know as a write.
+                    if engine.spec().sql.denied_functions.contains(name)
+                        || engine == Engine::Generic
+                    {
                         continue;
                     }
-                    let verdict = classify(engine, &format!("SELECT {name}()"));
+                    let sql = format!("SELECT {name}()");
+                    // A sequence advance, a `set_config` and a call no hold
+                    // stops are read on every engine ([`calls_verdict`]).
+                    let everywhere = dialect(engine).is_some_and(|dialect| {
+                        calls_verdict(engine, dialect.as_ref(), &sql) != Verdict::READ
+                    });
+                    if everywhere {
+                        assert!(classify(engine, &sql).mode >= Mode::ReadWrite);
+                        continue;
+                    }
+                    let verdict = classify(engine, &sql);
                     // A dialect that cannot read the name at all is refused
                     // for that, which is not what is under test.
                     if verdict.destructive.is_empty() {
@@ -9544,7 +10768,8 @@ mod tests {
             assert!(is_stopped(Engine::Postgres, sql), "{sql}");
         }
         for sql in ["SELECT lo_get(1)", "SELECT loread(0, 10)"] {
-            for engine in sql_engines() {
+            // Generic reads only a known side-effect-free built-in as a read.
+            for engine in sql_engines().filter(|engine| *engine != Engine::Generic) {
                 assert!(is_plain_read(engine, sql), "{engine:?}: {sql}");
             }
         }
@@ -10247,10 +11472,62 @@ mod tests {
         }
     }
 
-    /// The engines whose dialect expands the marker, found through the spec the
-    /// way `classify` finds them.
+    /// The engines whose server runs the marker, so `classify` expands it:
+    /// MariaDB alone. MySQL shares the dialect and ignores the marker, and is
+    /// pinned by [`on_mysql_an_executable_comment_is_ignored_and_unreadable`].
     fn marker_engines() -> impl Iterator<Item = crate::db::Engine> {
-        sql_engines().filter(|engine| engine.spec().sql.parser_dialect == ParserDialect::MySql)
+        [crate::db::Engine::MariaDb].into_iter()
+    }
+
+    /// Every input the MariaDB tests above read, on MySQL: MySQL ignores the
+    /// comment and a MySQL profile may point at a MariaDB server that runs it,
+    /// so the verdict holds both readings and is unreadable on top. It is never
+    /// looser than MariaDB's, so nothing MariaDB would run escapes on MySQL.
+    #[test]
+    fn on_mysql_an_executable_comment_is_ignored_and_unreadable() {
+        use crate::db::Engine;
+
+        for sql in [
+            "/*M!100100 DROP TABLE t */",
+            "/*M!DROP TABLE t */",
+            "/*M!100100DROP TABLE t */",
+            "/*m!100100 DROP TABLE t */",
+            "/*M!100100 TRUNCATE TABLE t */",
+            "/*M!100100 DELETE FROM t */",
+            "/*M!100100 INSERT INTO t VALUES (1) */",
+            "/*M!100100 SELECT 1 */",
+            "SELECT 1; /*M!100100 DROP TABLE t */",
+            "/*M!100100 SET SESSION TRANSACTION READ WRITE */",
+            "/*M!100100 SET SESSION transaction_read_only = 0 */",
+            "/*M!100100 SET GLOBAL read_only = 0 */",
+            "SELECT 1 /*M!100100 INTO @y */ FROM t",
+            "SELECT 2 /*M!100100 +1 */",
+            "/*M!100100 SELECT get_lock('k', 1) */",
+            "/*M!100100 DROP TABLE t */ SELECT 1",
+            "/*M!1234 DROP TABLE t */",
+            "/*M!*/",
+            "DELETE FROM t /*M! WHERE 1 = 0 */",
+            "INSERT INTO t VALUES (1) /*M!100100 , (2) */",
+        ] {
+            let mysql = classify(Engine::MySql, sql);
+            let mariadb = classify(Engine::MariaDb, sql);
+            assert!(
+                mysql.destructive.contains(&Destructive::Unreadable),
+                "{sql}: {mysql:?}"
+            );
+            assert!(mysql.mode >= mariadb.mode, "{sql}: {mysql:?} {mariadb:?}");
+            for kind in &mariadb.destructive {
+                assert!(mysql.destructive.contains(kind), "{sql}: {mysql:?}");
+            }
+        }
+        // A marker that is not a comment token is no marker.
+        for sql in [
+            "SELECT '/*M!100100 DROP TABLE t */'",
+            "-- /*M!100100 DROP TABLE t */\nSELECT 1",
+            "# /*M!100100 DROP TABLE t */\nSELECT 1",
+        ] {
+            assert!(is_plain_read(Engine::MySql, sql), "{sql}");
+        }
     }
 
     fn destroys_as(engine: crate::db::Engine, sql: &str, kind: Destructive) -> bool {
@@ -10399,9 +11676,16 @@ mod tests {
 
     #[test]
     fn a_dialect_that_does_not_expand_the_marker_is_not_affected_by_it() {
-        for engine in
-            sql_engines().filter(|engine| !marker_engines().any(|marker| marker == *engine))
-        {
+        use crate::db::Engine;
+
+        // MySQL holds the marker unreadable (see the test above). Generic
+        // cannot tell which server runs it, so any `/*M!` makes the submission
+        // one it may lex otherwise (`lexes_apart`).
+        for engine in sql_engines().filter(|engine| {
+            !marker_engines().any(|marker| marker == *engine)
+                && *engine != Engine::MySql
+                && *engine != Engine::Generic
+        }) {
             assert!(
                 is_plain_read(engine, "/*M!100100 DROP TABLE t */"),
                 "{engine:?}"
@@ -10442,9 +11726,19 @@ mod tests {
 
     #[test]
     fn nothing_and_a_lone_empty_executable_comment_are_silent_reads() {
+        use crate::db::Engine;
+
         for engine in sql_engines() {
-            for sql in ["", "   \n\t", "/*M!*/"] {
+            for sql in ["", "   \n\t"] {
                 assert!(is_plain_read(engine, sql), "{engine:?}: {sql:?}");
+            }
+            // MySQL holds any marker unreadable, and Generic any comment that
+            // opens with one, since neither knows the server runs nothing.
+            match engine {
+                Engine::MySql | Engine::Generic => {
+                    assert!(is_unreadable(engine, "/*M!*/"), "{engine:?}")
+                }
+                _ => assert!(is_plain_read(engine, "/*M!*/"), "{engine:?}"),
             }
         }
     }
@@ -10576,6 +11870,10 @@ mod tests {
                 "{engine:?}: a Read-only profile lets the release through"
             );
         }
+        // MySQL ignores the comment, and the human confirms it all the same.
+        let verdict = classify(crate::db::Engine::MySql, comment);
+        assert!(verdict.destructive.contains(&Destructive::Unreadable));
+        assert!(gate(&verdict, Mode::ReadOnly, &[]).is_some());
     }
 
     /// The second reachable shape: one selected statement with the comment
@@ -10609,14 +11907,18 @@ mod tests {
             assert_eq!(submitted, &buffer[selection.clone()], "{engine:?}");
         }
 
+        let submitted = &buffer[selection.clone()];
         for engine in marker_engines() {
-            let submitted = &buffer[selection.clone()];
             assert!(is_stopped(engine, submitted), "{engine:?}");
             assert!(
                 gate(&classify(engine, submitted), Mode::ReadOnly, &[]).is_some(),
                 "{engine:?}"
             );
         }
+        // MySQL ignores the comment, and the human confirms it all the same.
+        let verdict = classify(crate::db::Engine::MySql, submitted);
+        assert!(verdict.destructive.contains(&Destructive::Unreadable));
+        assert!(gate(&verdict, Mode::ReadOnly, &[]).is_some());
     }
 
     /// An empty selection does not take the selection branch: `sql_to_run`
