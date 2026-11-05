@@ -2384,3 +2384,70 @@ fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mu
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn hiding_a_profile_takes_one_action_and_no_dialog(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("only", "Only", "agent_visible = true"));
+        assert!(agent_visible(&workspace, cx, "only"));
+
+        run_command(&workspace, cx, Command::HideFromAgents(0));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!agent_visible(&workspace, cx, "only"));
+        assert!(!saved_visible("only"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn dismissing_the_visibility_dialog_grants_nothing_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+
+        // `escape`, and `enter` on the Cancel the ring opens on.
+        for (dismiss, typed) in [("escape", "x"), ("enter", "y")] {
+            run_command(&workspace, cx, Command::ShowToAgents(0));
+            assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+            let before = buffer(&workspace, cx);
+            press(cx, dismiss);
+            assert_eq!(front_dialog(&workspace, cx), None, "{dismiss} left it up");
+            assert!(!agent_visible(&workspace, cx, "only"), "after {dismiss}");
+            assert!(!saved_visible("only"), "after {dismiss}");
+            assert_eq!(visibility_prompt(&workspace, cx), None, "after {dismiss}");
+            assert!(editor_has_keyboard(&workspace, cx), "after {dismiss}");
+            cx.simulate_input(typed);
+            settle(cx);
+            assert_eq!(buffer(&workspace, cx), format!("{before}{typed}"));
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-visibility"));
+
+        workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        workspace.update(cx, |workspace, cx| workspace.confirm_agent_visibility(cx));
+        assert!(!agent_visible(&workspace, cx, "second"));
+        assert!(!saved_visible("second"));
+        assert_eq!(visibility_prompt(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}

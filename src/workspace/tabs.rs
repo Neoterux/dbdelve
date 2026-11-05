@@ -833,6 +833,9 @@ impl Workspace {
         if self.cancel_discard_close(cx) {
             return;
         }
+        if self.cancel_agent_visibility(cx) {
+            return;
+        }
         if self.cancel_delete_query(cx) {
             return;
         }
