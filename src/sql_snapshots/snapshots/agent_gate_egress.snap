@@ -1,0 +1,24 @@
+---
+source: src/sql_snapshots.rs
+---
+[postgres] call pg_read_file: SELECT * FROM pg_read_file('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_read_binary_file: SELECT * FROM pg_read_binary_file('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_read_file_old: SELECT * FROM pg_read_file_old('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_stat_file: SELECT * FROM pg_stat_file('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_dir: SELECT * FROM pg_ls_dir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_logdir: SELECT * FROM pg_ls_logdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_waldir: SELECT * FROM pg_ls_waldir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_logicalmapdir: SELECT * FROM pg_ls_logicalmapdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_logicalsnapdir: SELECT * FROM pg_ls_logicalsnapdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_replslotdir: SELECT * FROM pg_ls_replslotdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_archive_statusdir: SELECT * FROM pg_ls_archive_statusdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_tmpdir: SELECT * FROM pg_ls_tmpdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_ls_summariesdir: SELECT * FROM pg_ls_summariesdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[mysql] (no egress list) => (none)
+[mariadb] (no egress list) => (none)
+[sqlite] (no egress list) => (none)
+[turso] (no egress list) => (none)
+[duckdb] (no egress list) => (none)
+[snowflake] (no egress list) => (none)
+[clickhouse] (no egress list) => (none)
+[mssql] (no egress list) => (none)

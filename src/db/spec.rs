@@ -320,6 +320,19 @@ pub struct SqlSpec {
     /// of safe ones -- a function that is not here, a user-defined one included,
     /// stays a read. Lower-case, matched against the name as written.
     pub denied_functions: &'static [&'static str],
+    /// Functions that read a file, a URL, a program or another server, or run
+    /// text that may, so an agent's read of one asks the human first: the rows
+    /// leave the machine, and the agent chose where from. Lower-case, matched
+    /// against the last word before the parenthesis, as `denied_functions` is.
+    /// Read only by the agent path (`sql::agent_gate`). It is not on
+    /// `denied_functions` because that list raises the human path's verdict
+    /// (Phase 1 D-05), and DBDelve's own CSV, Excel, Parquet and JSON opens
+    /// and a user's own read of a file are reads and stay so.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    pub egress_functions: &'static [&'static str],
     /// Session settings that change nothing a Read-only profile protects, so
     /// setting one stays a read: navigation and comfort. Every other setting a
     /// user's own `SET` names is stopped, because the hold's whole value is
@@ -372,6 +385,7 @@ impl SqlSpec {
         local_table_engines: None,
         stateless_requests: false,
         denied_functions: &[],
+        egress_functions: &[],
         plain_settings: &[],
         transactions: true,
         row_terms: false,
@@ -885,6 +899,24 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "dblink_send_query",
             "dblink_open",
             "st_findextent",
+        ],
+        // The documentation's Generic File Access Functions, plus
+        // `pg_read_file_old`, which the server carries. Pinned against
+        // `pg_catalog` by `live_every_file_access_function_is_on_the_egress_list`.
+        egress_functions: &[
+            "pg_read_file",
+            "pg_read_binary_file",
+            "pg_read_file_old",
+            "pg_stat_file",
+            "pg_ls_dir",
+            "pg_ls_logdir",
+            "pg_ls_waldir",
+            "pg_ls_logicalmapdir",
+            "pg_ls_logicalsnapdir",
+            "pg_ls_replslotdir",
+            "pg_ls_archive_statusdir",
+            "pg_ls_tmpdir",
+            "pg_ls_summariesdir",
         ],
         // What a user's own `SET` may change on a Read-only profile without
         // asking. Left off on purpose: the hold's own two names, `role` and
