@@ -3193,7 +3193,11 @@ mod tests {
         let connection = live();
         let started = Instant::now();
         let error = blocked_then_cancelled(&connection);
-        assert!(is_cancel(Engine::Redis, &error), "{}", error.message);
+        assert!(
+            is_cancel(crate::db::Target::built_in(Engine::Redis), &error),
+            "{}",
+            error.message
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(cells(&ran(&connection, "PING")), [some(&["PONG"])]);
         let info = ran(&connection, "CLIENT INFO");
@@ -3987,7 +3991,11 @@ mod tests {
         .expect("connection should open");
         assert_eq!(cells(&ran(&connection, "GET counter")), [some(&["42"])]);
         let error = blocked_then_cancelled(&connection);
-        assert!(is_cancel(Engine::Redis, &error), "{}", error.message);
+        assert!(
+            is_cancel(crate::db::Target::built_in(Engine::Redis), &error),
+            "{}",
+            error.message
+        );
     }
 
     fn conformance_subject() -> crate::db::conformance::Subject {
@@ -3996,12 +4004,13 @@ mod tests {
                 live_config(),
             ))
             .expect("connection should open"),
-            engine: Engine::Redis,
+            target: crate::db::Target::built_in(Engine::Redis),
             schema: "db0",
             relation: KEYS,
             key: "key",
             columns: &["key", "type", "ttl", "value"],
             read: "SCAN 0 MATCH item:* COUNT 10".to_string(),
+            endless_rows: None,
             endless: "SCAN 0 MATCH item:* COUNT 10",
             runaway: "BLPOP live:never 0",
             read_only_refusal: "",

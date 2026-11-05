@@ -16,12 +16,12 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_notify('c', 'p') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_terminate_backend(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_cancel_backend(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_reload_conf() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_rotate_logfile() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_switch_wal() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT pg_create_restore_point('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [postgres] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -29,8 +29,8 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_create(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [postgres] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -40,11 +40,11 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [postgres] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [postgres] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -125,9 +125,9 @@ source: src/sql_snapshots.rs
 [postgres] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -140,12 +140,12 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mysql] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -153,8 +153,8 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mysql] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -164,11 +164,11 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mysql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mysql] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -196,14 +196,14 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mysql] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -228,7 +228,7 @@ source: src/sql_snapshots.rs
 [mysql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mysql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mysql] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mysql] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] sql-text executor with an unnamed text argument: SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -249,7 +249,7 @@ source: src/sql_snapshots.rs
 [mysql] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -264,12 +264,12 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mariadb] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -277,8 +277,8 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mariadb] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -288,11 +288,11 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mariadb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mariadb] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -352,7 +352,7 @@ source: src/sql_snapshots.rs
 [mariadb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mariadb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadOnly [Unreadable] gate ro=Some(RunOnce) rw=Some(RunOnce) full=Some(RunOnce)|
+[mariadb] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mariadb] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] sql-text executor with an unnamed text argument: SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -373,9 +373,9 @@ source: src/sql_snapshots.rs
 [mariadb] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -388,12 +388,12 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [sqlite] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -401,8 +401,8 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [sqlite] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -412,11 +412,11 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [sqlite] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [sqlite] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -444,14 +444,14 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[sqlite] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[sqlite] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [sqlite] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -497,9 +497,9 @@ source: src/sql_snapshots.rs
 [sqlite] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -512,12 +512,12 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [turso] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -525,8 +525,8 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [turso] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -536,11 +536,11 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [turso] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [turso] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -568,14 +568,14 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[turso] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[turso] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [turso] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -621,7 +621,7 @@ source: src/sql_snapshots.rs
 [turso] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -636,12 +636,12 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [duckdb] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -649,8 +649,8 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [duckdb] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -660,11 +660,11 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [duckdb] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[duckdb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [duckdb] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -745,9 +745,9 @@ source: src/sql_snapshots.rs
 [duckdb] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [duckdb] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[snowflake] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [snowflake] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -760,12 +760,12 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [snowflake] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -773,8 +773,8 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [snowflake] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -784,11 +784,11 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [snowflake] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[snowflake] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [snowflake] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -869,9 +869,9 @@ source: src/sql_snapshots.rs
 [snowflake] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [clickhouse] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -884,12 +884,12 @@ source: src/sql_snapshots.rs
 [clickhouse] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [clickhouse] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -897,8 +897,8 @@ source: src/sql_snapshots.rs
 [clickhouse] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [clickhouse] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -908,11 +908,11 @@ source: src/sql_snapshots.rs
 [clickhouse] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [clickhouse] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [clickhouse] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -940,14 +940,14 @@ source: src/sql_snapshots.rs
 [clickhouse] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [clickhouse] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[clickhouse] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [clickhouse] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -955,7 +955,7 @@ source: src/sql_snapshots.rs
 [clickhouse] sequence without parentheses: SELECT s.nextval => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] sequence without parentheses, qualified: SELECT db.s.nextval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] unicode-escaped name: SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[clickhouse] unicode-escaped name, no escape sequence: SELECT U&"set_config"('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] unicode-escaped name, no escape sequence: SELECT U&"set_config"('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [clickhouse] unicode-escaped name, schema-qualified: SELECT pg_catalog.U&"set_c\006fnfig"('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control spaced bit-and of a quoted column: SELECT U & "x" FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control bit-and of an unquoted column: SELECT U&x FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -993,9 +993,9 @@ source: src/sql_snapshots.rs
 [clickhouse] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT setval('s', 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] scalar: SELECT pg_advisory_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1008,12 +1008,12 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_notify('c', 'p') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_terminate_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_cancel_backend(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_reload_conf() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_rotate_logfile() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_switch_wal() => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT pg_create_restore_point('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mssql] scalar: SELECT pg_stat_reset() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1021,8 +1021,8 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_create(0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT lo_import('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mssql] scalar: SELECT lo_unlink(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1032,11 +1032,11 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT lo_get(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT loread(0, 10) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mssql] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
 [mssql] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1064,14 +1064,14 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
-[mssql] table position: SELECT * FROM nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadOnly [] gate ro=None rw=None full=None|
-[mssql] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[mssql] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mssql] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -1365,3 +1365,127 @@ source: src/sql_snapshots.rs
 [redis] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] scalar: SELECT set_config('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT setval('s', 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_xact_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_xact_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_try_advisory_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_try_advisory_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_try_advisory_xact_lock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_try_advisory_xact_lock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_unlock(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_unlock_shared(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_advisory_unlock_all() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_notify('c', 'p') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_terminate_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_cancel_backend(0) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_reload_conf() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_rotate_logfile() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_switch_wal() => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_create_restore_point('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_stat_reset() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_stat_reset_shared('bgwriter') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_stat_reset_single_table_counters(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_stat_reset_single_function_counters(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_stat_reset_slru('CommitTs') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_stat_reset_replication_slot('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_create(0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_import('/etc/hostname') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT lo_export(1, '/tmp/x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT lo_unlink(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_from_bytea(1, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_put(1, 0, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_creat(-1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lowrite(0, 'abc'::bytea) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_truncate(0, 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_truncate64(0, 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT lo_get(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT loread(0, 10) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT dblink('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT dblink_exec('c', 'DELETE FROM t') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT dblink_connect('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT dblink_connect_u('c', 'dbname=x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT dblink_send_query('c', 'SELECT 1') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT dblink_open('c', 'cur', 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT query_to_xml('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT query_to_xml_and_xmlschema('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT query_to_xmlschema('select 1', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT ts_stat('select to_tsvector(''a'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT ts_rewrite('a & b'::tsquery, 'select ''c''::tsquery, ''d''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT crosstab('select ''a''::text, ''b''::text, ''c''::text') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT crosstab2('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT crosstab3('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT crosstab4('select 1, 2, 3') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT st_findextent('t', 'a') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT load_extension('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT query('select 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT json_execute_serialized_sql('{}') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT system$cancel_all_queries(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT system$cancel_query('q') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT system$abort_session(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT system$abort_transaction(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT getnextval(seq1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT openquery(srv, 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT openrowset('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT opendatasource('SQLNCLI', 'x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] table position: SELECT * FROM nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] lateral table position: SELECT * FROM t, LATERAL nextval('s') x => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] schema-qualified: SELECT pg_catalog.set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] where subquery: SELECT * FROM t WHERE id = (SELECT nextval('s')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] cte body: WITH n AS (SELECT nextval('s') AS v) SELECT v FROM n => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] comment before paren: SELECT nextval /* c */ ('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two denied calls: SELECT nextval('s'), set_config('a', 'b', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] two denied calls reversed: SELECT set_config('a', 'b', false), nextval('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] openquery in table position: SELECT * FROM OPENQUERY(srv, 'SELECT 1') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] openrowset in table position: SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM t') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] opendatasource in table position: SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] table function wrapper: SELECT * FROM TABLE(GETNEXTVAL(seq1)) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] sequence without parentheses: SELECT s.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] sequence without parentheses, qualified: SELECT db.s.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] unicode-escaped name: SELECT U&"set_c\006fnfig"('default_transaction_read_only', 'off', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] unicode-escaped name, no escape sequence: SELECT U&"set_config"('default_transaction_read_only', 'off', false) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] unicode-escaped name, schema-qualified: SELECT pg_catalog.U&"set_c\006fnfig"('a', 'b', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] control spaced bit-and of a quoted column: SELECT U & "x" FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control bit-and of an unquoted column: SELECT U&x FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control qualified column: SELECT t.id FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control qualified column sharing no listed name: SELECT t.nextvalue FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control session read lastval: SELECT lastval() => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control session read currval: SELECT currval('s') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control last_insert_id: SELECT last_insert_id() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control sleep: SELECT sleep(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control user-defined call: SELECT my_function(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] sql-text executor carrying a disarm: SELECT query_to_xml('select set_config(''default_transaction_read_only'', ''off'', false)', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] sql-text executor in table position: SELECT count(*) FROM ts_stat($q$select to_tsvector(set_config('default_transaction_read_only', 'off', false))$q$) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[generic] sql-text executor carrying a write: SELECT query_to_xml('select lo_from_bytea(970972, ''abc''::bytea)', true, false, '') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] sql-text executor with an unnamed text argument: SELECT ts_rewrite('a & b'::tsquery, 'select set_config(''default_transaction_read_only'', ''off'', false)::tsquery, ''c''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] sql-text executor with an unnamed text argument carrying a write: SELECT ts_rewrite('a & b'::tsquery, 'select lo_from_bytea(970974, ''abc''::bytea)::text::tsquery, ''c''::tsquery') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] extension sql-text executor carrying a disarm: SELECT * FROM crosstab('select set_config(''default_transaction_read_only'', ''off'', false), ''a'', ''b''') AS t(r text, c text) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] extension sql-text executor carrying a write: SELECT * FROM crosstab('select 1::text, ''a''::text, lo_from_bytea(975001, ''abc''::bytea)::text') AS t(r text, c text) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] extension sql-text executor splicing a relation name, carrying a write: SELECT * FROM connectby('(select 1 as k, 0 as p, lo_from_bytea(975002, ''abc''::bytea) as o) q', 'k', 'p', '0', 0) AS t(k int, p int, level int) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] extension sql-text executor splicing a relation and criteria, carrying a write: SELECT * FROM xpath_table('id', 'doc', '(select 1 as id, (select lo_from_bytea(975003, ''abc''::bytea))::text as doc) s', '/r/a', 'true') AS t(id int, a text) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] extension function splicing an identifier unescaped, carrying a write: SELECT st_findextent('t', 'a") AS extent FROM (select lo_from_bytea(975004, ''abc''::bytea), null::geometry AS a) AS q --') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control column named like an extension carrier: SELECT t.crosstab FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] control denied name inside a literal with no executor: SELECT 'select set_config(''default_transaction_read_only'', ''off'', false)' => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] duckdb text executor: SELECT * FROM query('select nextval(''s'')') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] duckdb text executor by name: SELECT * FROM query_table('s') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] duckdb serialized-plan executor: SELECT * FROM json_execute_serialized_sql(json_serialize_sql('select nextval(''s'')')) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control column named like the duckdb text executor: SELECT t.query FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] member form, snowflake sequence pseudo-column: SELECT seq1.nextval => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] accepted false positive: column reference to a listed sequence name, stopped by the member form: SELECT t.nextval FROM t => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] column reference to a listed name, not a member form: SELECT t.setval FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] column reference to a listed lock name, not a member form: SELECT x.get_lock FROM x => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] accepted false positive: listed name as a cte name with a column list: WITH query(x) AS (SELECT 1) SELECT x FROM query => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[generic] accepted false positive: listed name as a derived-table alias with a column list: SELECT * FROM (SELECT 1, 2) AS query(a, b) => |classify=ReadOnly [] gate ro=None rw=None full=None|

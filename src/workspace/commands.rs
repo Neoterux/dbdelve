@@ -300,9 +300,7 @@ impl Workspace {
     ) {
         let finding = format!("Finding {} themes…", source.name());
         self.note(finding.clone(), cx);
-        let found = cx
-            .background_executor()
-            .spawn(on_own_thread(move || source.found()));
+        let found = spawn_blocking(cx.background_executor(), move || source.found());
         cx.spawn_in(window, async move |workspace, cx| {
             found.await;
             _ = workspace.update_in(cx, |workspace, window, cx| {
@@ -637,6 +635,9 @@ impl Workspace {
             Command::ClearFilter => self.clear_filter(&ClearFilter, window, cx),
             Command::NewRow => self.new_row(&NewRow, window, cx),
             Command::ImportRows => self.import_rows(&ImportRows, window, cx),
+            Command::ImportRowsFromClipboard => {
+                self.import_rows_from_clipboard(&ImportRowsFromClipboard, window, cx)
+            }
             Command::CloseObject(id) => self.ask_before_close(Tab::Object(id), window, cx),
             Command::SetNull => self.set_null(&SetNull, window, cx),
             Command::SetEmpty => self.set_empty(&SetEmpty, window, cx),
@@ -698,9 +699,9 @@ impl Workspace {
             Command::SelectTheme => self.select_theme(&SelectTheme, window, cx),
             Command::SelectDatabase => self.select_database(&SelectDatabase, window, cx),
             Command::SetDatabase(name) => self.set_database(name, window, cx),
-            Command::SetEngine(engine) => {
+            Command::SetTarget(target) => {
                 if let Some(form) = &mut self.form {
-                    form.set_engine(engine);
+                    form.set_target(target);
                 }
                 cx.notify();
             }
