@@ -27,6 +27,8 @@ mod server;
 #[cfg(unix)]
 mod wire;
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -61,6 +63,16 @@ pub(crate) struct Reply {
     pub(crate) text: String,
 }
 
+// ponytail: the one fixed wait for a person to answer a ping. Phase 6 may tune
+// it, and it is not a setting: a call a person has walked away from has to end
+// by itself, and nothing here answers it for them.
+pub(crate) const EXPIRY: Duration = Duration::from_secs(300);
+
+/// A call's identity: the connection it arrived on, which is also how it is
+/// found again when that connection closes. Never a position in a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CallId(pub(crate) u64);
+
 /// One accepted connection, from the moment it is classified until it ends.
 /// What a presence is held by; a call has its own identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +84,16 @@ pub(crate) enum Inbound {
     /// sender unsent closes the connection without writing, which is how a
     /// cancelled call ends.
     Call {
+        id: CallId,
         tool: Tool,
+        /// The profile name the agent gave, if it gave one.
+        connection: Option<String>,
         reply: std::sync::mpsc::SyncSender<Reply>,
     },
+    /// The caller closed its connection, so nobody is waiting for the call
+    /// any more. Sent for every call, answered or not, so one that arrives
+    /// after the call finished is expected.
+    Hangup { id: CallId },
     /// A shim opened its presence connection: an agent is attached, though it
     /// may have asked nothing yet.
     PresenceOpened { conn: ConnId },

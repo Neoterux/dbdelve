@@ -9,4 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Tool {
     ListConnections,
+    /// Asks the person at the window to answer: nothing runs for it, so it
+    /// only ever waits to be answered, to expire, or to be hung up.
+    Ping,
 }

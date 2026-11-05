@@ -11,7 +11,7 @@
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
 use super::*;
-use crate::agent::{Inbound, Reply, Status, tools::Tool};
+use crate::agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool};
 
 /// What the agent bridge holds while it is running.
 #[derive(Default)]
@@ -22,6 +22,27 @@ pub(crate) struct AgentState {
     /// The presence connections open now: agents attached, whether or not they
     /// have asked anything.
     pub(crate) presence: Vec<crate::agent::ConnId>,
+    /// The calls waiting on an answer, found by their id and never by their
+    /// place in this list.
+    pub(crate) calls: Vec<PendingCall>,
+}
+
+/// A call that has been accepted and not yet finished. Dropping it without
+/// replying closes the caller's connection with no answer.
+pub(crate) struct PendingCall {
+    pub(crate) id: CallId,
+    reply: std::sync::mpsc::SyncSender<Reply>,
+    /// Ends the call as `expired` when it fires. Dropped with the call, which
+    /// is what cancels it.
+    _expiry: gpui::Task<()>,
+}
+
+/// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
+fn expired_text() -> String {
+    format!(
+        "Nobody answered the ping in DBDelve within {} minutes.",
+        EXPIRY.as_secs() / 60
+    )
 }
 
 /// A running bridge. Neither field is read: holding them is the point.
@@ -40,10 +61,6 @@ struct Listed<'a> {
 
 /// Why a profile name did not resolve for an agent. Two answers only, and
 /// neither echoes the name asked for: the text goes back to the agent as it is.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLookup {
     /// No agent-visible profile has that name. A hidden profile, a missing one,
@@ -203,6 +220,7 @@ impl Workspace {
             Inbound::Call {
                 tool: Tool::ListConnections,
                 reply,
+                ..
             } => {
                 let visible: Vec<Listed> = self
                     .profiles
@@ -221,7 +239,67 @@ impl Workspace {
                     text,
                 });
             }
+            Inbound::Call {
+                tool: Tool::Ping,
+                id,
+                connection,
+                reply,
+            } => {
+                let found = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(|_| ()),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                if let Err(lookup) = found {
+                    // The caller may have hung up, and then nobody reads this.
+                    let _ = reply.send(Reply {
+                        status: Status::RefusedByGate,
+                        text: lookup.to_string(),
+                    });
+                    return;
+                }
+                let expiry = cx.spawn(async move |workspace, cx| {
+                    cx.background_executor().timer(EXPIRY).await;
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.finish_call(id, Status::Expired, expired_text(), cx)
+                    });
+                });
+                self.agent.calls.push(PendingCall {
+                    id,
+                    reply,
+                    _expiry: expiry,
+                });
+                cx.notify();
+            }
+            Inbound::Hangup { id } => {
+                self.finish_call(id, Status::Cancelled, String::new(), cx);
+            }
         }
+    }
+
+    /// The one door every call ends through: answered, expired or hung up.
+    /// It removes the call by id before it replies, so two things ending the
+    /// same call at once produce one outcome and at most one reply. Answers
+    /// whether there was such a call.
+    ///
+    /// A `Cancelled` call is dropped without a reply, because its caller has
+    /// gone and nobody would read one.
+    pub(crate) fn finish_call(
+        &mut self,
+        id: CallId,
+        status: Status,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
+            return false;
+        };
+        let call = self.agent.calls.remove(index);
+        if status != Status::Cancelled {
+            // The caller may have hung up, and then nobody reads this.
+            let _ = call.reply.send(Reply { status, text });
+        }
+        cx.notify();
+        true
     }
 
     /// The agent-visible profile called `name`.
@@ -232,10 +310,6 @@ impl Workspace {
     /// on bytes, with no case folding, trimming or normalisation, so what an
     /// agent was told is the only spelling that works. A profile this build
     /// cannot open is never in `self.profiles`, so it is never a candidate.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     pub(crate) fn agent_profile(&self, name: &str) -> Result<&Profile, AgentLookup> {
         let mut matches = self
             .profiles
