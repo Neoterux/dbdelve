@@ -4,6 +4,7 @@
 //! `explorer.rs` and `db/mod.rs` so that refactor never edits the tests that
 //! judge it.
 
+mod agent;
 mod batches;
 mod engines;
 mod explain;

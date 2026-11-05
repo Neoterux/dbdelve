@@ -42,6 +42,17 @@ use crate::db::{
 use crate::import_rows::Value;
 use crate::result_grid::{NewValue, PendingRow};
 
+mod agent;
+
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "the agent tools (Phase 4) are the first caller"
+    )
+)]
+pub(crate) use agent::{AgentVerdict, Refusal, agent_gate};
+
 /// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
     statements: Vec<Range<usize>>,
@@ -2595,22 +2606,59 @@ pub(crate) fn typed_explain(engine: Engine, sql: &str) -> Option<ExplainMode> {
 /// finds statement boundaries in a buffer someone is still typing into;
 /// this needs a typed statement, and would rather refuse than guess.
 pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
+    parsed(engine, sql).verdict
+}
+
+/// What one parse of a submission says: the verdict [`classify`] returns, and
+/// what the same parse knows that a `Verdict` drops. Read once, so the human's
+/// gate and the agent's cannot judge two different readings of one text.
+struct Parsed {
+    verdict: Verdict,
+    /// How many statements the parse that was judged produced, MariaDB's
+    /// executable comments expanded, so a statement a comment carries is
+    /// counted.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    statements: usize,
+}
+
+impl Parsed {
+    /// A verdict and a count, for the readings that look at no tree.
+    fn counted(verdict: Verdict, statements: usize) -> Self {
+        Self {
+            verdict,
+            statements,
+        }
+    }
+}
+
+/// [`classify`]'s reading of `sql`, with everything the parse knew.
+fn parsed(engine: Engine, sql: &str) -> Parsed {
     if engine.syntax() == Syntax::Redis {
-        return crate::redis_cmd::classify(sql);
+        return Parsed::counted(
+            crate::redis_cmd::classify(sql),
+            crate::redis_cmd::statements(sql).len(),
+        );
     }
     let Some(dialect) = dialect(engine) else {
-        return crate::mql::classify(sql);
+        return Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len());
     };
 
     if engine.spec().sql.explain_analyze == Some(ExplainPrefix::Analyze)
         && let Some(explain) = mariadb_analyze_as_explain(dialect.as_ref(), sql)
     {
-        return classify(engine, &explain);
+        return parsed(engine, &explain);
     }
 
     let spec = engine.spec();
     if spec.sql.unreadable_floor == UnreadableFloor::FirstKeyword {
-        return raised(engine, sql, by_statement(engine, dialect.as_ref(), sql));
+        let read = by_statement(engine, dialect.as_ref(), sql);
+        return Parsed {
+            verdict: raised(engine, sql, read.verdict),
+            ..read
+        };
     }
 
     // All or nothing: one statement it cannot read makes the whole submission
@@ -2627,7 +2675,7 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
         None => SqlParser::parse_sql(dialect.as_ref(), sql).ok(),
     };
     let Some(statements) = parsed else {
-        return unreadable_verdict(engine);
+        return Parsed::counted(unreadable_verdict(engine), 0);
     };
 
     // An empty or comment-only string parses to no statements at all. There is
@@ -2635,13 +2683,13 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
     // only when the grammar agrees there is nothing, so a range it finds that
     // the typed parser skipped is refused rather than run silently.
     if statements.is_empty() && grammar_finds_more_than_comments(engine, dialect.as_ref(), sql) {
-        return unreadable_verdict(engine);
+        return Parsed::counted(unreadable_verdict(engine), 0);
     }
     let verdict = statements
         .iter()
         .map(|statement| spec_verdict(engine.spec(), statement))
         .fold(Verdict::READ, Verdict::max);
-    raised(engine, sql, verdict)
+    Parsed::counted(raised(engine, sql, verdict), statements.len())
 }
 
 /// `verdict`, raised by what the whole text says on its own, whichever of
@@ -2689,14 +2737,19 @@ fn grammar_finds_more_than_comments(engine: Engine, dialect: &dyn Dialect, sql: 
     Buffer::for_engine(engine, sql)
         .statements()
         .iter()
-        .any(|range| {
-            Tokenizer::new(dialect, &sql[range.clone()])
-                .tokenize()
-                .map_or(true, |tokens| {
-                    tokens
-                        .iter()
-                        .any(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
-                })
+        .any(|range| holds_a_token(dialect, &sql[range.clone()]))
+}
+
+/// Whether `text` holds a token to the dialect's own lexer that is neither
+/// whitespace, a comment nor a `;`. A range it cannot read counts as holding
+/// one.
+fn holds_a_token(dialect: &dyn Dialect, text: &str) -> bool {
+    Tokenizer::new(dialect, text)
+        .tokenize()
+        .map_or(true, |tokens| {
+            tokens
+                .iter()
+                .any(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
         })
 }
 
@@ -2782,7 +2835,7 @@ fn executable_body(token: &Token) -> Option<&str> {
 /// ([`misread`]), a word the server runs may be one the tokenizer never saw,
 /// so the submission needs Full. A tokenizer error is placed by the words it
 /// read before the error, and at Read-write at least.
-fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Verdict {
+fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
     let spec = engine.spec();
     let (tokens, whole) = located_prefix(dialect, sql);
     // What the tokenizer stopped at is unread, so anything there [`misread`]
@@ -2795,6 +2848,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Verdict {
     let trusted = whole && !misread;
 
     let mut unreadable = !trusted;
+    let mut counted = 0;
     let verdict = between_semicolons(&tokens)
         .into_iter()
         .map(|range| {
@@ -2817,11 +2871,16 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Verdict {
                 },
             };
             let verdict = match parsed {
-                Some(statements) => statements
-                    .iter()
-                    .map(|statement| spec_verdict(spec, statement))
-                    .fold(Verdict::READ, Verdict::max),
+                Some(statements) => {
+                    counted += statements.len();
+                    statements
+                        .iter()
+                        .map(|statement| spec_verdict(spec, statement))
+                        .fold(Verdict::READ, Verdict::max)
+                }
                 None => {
+                    // A range it could not read is still a statement.
+                    counted += 1;
                     unreadable = true;
                     first_keyword_verdict(&words)
                 }
@@ -2835,13 +2894,14 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Verdict {
         (false, false) => Mode::ReadWrite,
         (false, true) => unreadable_verdict(engine).mode,
     };
-    match unreadable {
+    let verdict = match unreadable {
         true => Verdict {
             mode: verdict.mode.max(floor),
             destructive: vec![Destructive::Unreadable],
         },
         false => verdict,
-    }
+    };
+    Parsed::counted(verdict, counted)
 }
 
 /// Whether the server's lexer may read `tokens` otherwise than sqlparser's
