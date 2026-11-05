@@ -1669,6 +1669,113 @@ pub(crate) fn classify(text: &str) -> Verdict {
         .unwrap_or(unreadable)
 }
 
+/// Whether `text` removes documents: a parsed `deleteOne`, `deleteMany` or
+/// `findOneAndDelete`, a `delete` command, a `findAndModify` whose `remove` is
+/// present and not literally `false` (the rule [`collection_verdict`] applies
+/// to `dropTarget`), or any call of a method named `remove`, whether or not
+/// the text parses. The agent path refuses all of them, whatever the mode
+/// (GATE-07); [`classify`] and the human path are not changed by it.
+pub(crate) fn removes(text: &str) -> bool {
+    parse(text).is_ok_and(|statements| {
+        statements
+            .iter()
+            .any(|statement| removes_documents(&statement.target))
+    }) || calls_remove(text)
+}
+
+fn removes_documents(target: &Target) -> bool {
+    match target {
+        Target::Show(_) => false,
+        Target::Database { call, .. } => {
+            matches!(call.method, DbMethod::RunCommand | DbMethod::AdminCommand)
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|command| command_removes(&command.value))
+        }
+        Target::Collection { call, .. } => matches!(
+            call.method,
+            Method::DeleteOne | Method::DeleteMany | Method::FindOneAndDelete
+        ),
+    }
+}
+
+/// Whether a `runCommand` or `adminCommand` argument is a `delete`, or a
+/// `findAndModify` asked to remove.
+fn command_removes(command: &Value) -> bool {
+    match command {
+        Value::String(name) => name == "delete",
+        Value::Document(fields) => match fields.first() {
+            Some((name, _)) if name == "delete" => true,
+            Some((name, _)) if name == "findAndModify" => fields
+                .iter()
+                .any(|(key, value)| key == "remove" && *value != Value::Bool(false)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `text` holds a call whose method is named `remove`, found in the
+/// tree the grammar gives it rather than through [`read`], which refuses the
+/// method: so every receiver spelling (`db.c`, `db.getCollection(..)`,
+/// `db.getSiblingDB(..).c`) and every argument shape counts, and a `remove`
+/// inside a string, a comment or a document key does not. A `remove` called on
+/// something that is not a collection counts too: a false positive, on the
+/// refusing side.
+fn calls_remove(text: &str) -> bool {
+    let mut parser = Parser::new();
+    let Some(tree) = parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .ok()
+        .and_then(|()| parser.parse(text, None))
+    else {
+        return false;
+    };
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let removes = node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .filter(|function| function.kind() == "member_expression")
+                .and_then(|function| function.child_by_field_name("property"))
+                .is_some_and(|property| text.get(property.byte_range()) == Some("remove"));
+        if removes {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    false
+}
+
+/// Whether any argument of any call in `text`, a chained cursor call included,
+/// holds one of [`JS_OPERATORS`] as a key, at any depth: JavaScript the server
+/// would run. Refused for an agent whatever the mode (D-12); [`classify`] rates
+/// the same operators Full, which is the human's answer.
+pub(crate) fn runs_script(text: &str) -> bool {
+    let holds = |args: &[Arg]| args.iter().any(|arg| holds_javascript(&arg.value));
+    parse(text).is_ok_and(|statements| {
+        statements.iter().any(|statement| match &statement.target {
+            Target::Show(_) => false,
+            Target::Database { call, .. } => holds(&call.args),
+            Target::Collection { call, cursor, .. } => {
+                holds(&call.args) || cursor.iter().any(|chained| holds(&chained.args))
+            }
+        })
+    })
+}
+
+fn holds_javascript(value: &Value) -> bool {
+    match value {
+        Value::Document(fields) => fields
+            .iter()
+            .any(|(key, value)| JS_OPERATORS.contains(&key.as_str()) || holds_javascript(value)),
+        Value::Array(values) => values.iter().any(holds_javascript),
+        _ => false,
+    }
+}
+
 /// Whether `text` is a statement `.explain(verbosity)` can be put on the end
 /// of, and why not when it is not. Only a lone read is: Analyze runs what it
 /// explains, so a statement that writes, or that cannot be read whole, is
@@ -1936,8 +2043,9 @@ fn command_reads(command: &Value) -> bool {
 /// The operators that run JavaScript inside the database process. Rated Full,
 /// not Write: arbitrary code in the server is a different order of thing from
 /// a write, and a Read-write profile would run it with no prompt at all.
-/// Two rules read this list -- [`out_verdict`] and the filter bar's
-/// `browse::runs_code` -- so an operator added here reaches both.
+/// Three rules read this list -- [`out_verdict`], the filter bar's
+/// `browse::runs_code` and the agent path's [`runs_script`] -- so an operator
+/// added here reaches all three.
 const JS_OPERATORS: &[&str] = &["$where", "$function", "$accumulator"];
 
 /// What a `$out`, `$merge` or JavaScript operator anywhere in `value` does.
@@ -4833,5 +4941,80 @@ mod tests {
             "db.getCollection(\"c\").insertMany([{\"n\": 2.5, \"d\": ISODate(\"2024-02-29T00:00:00.000Z\"), \"j\": {\"k\": [1]}, \"b\": true},\n{\"b\": null}])"
         );
         assert!(is_generated_write(&s));
+    }
+
+    #[test]
+    fn find_and_modify_removes_unless_remove_is_literally_false() {
+        for text in [
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, remove: true})"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, remove: 1})"#,
+            r#"db.adminCommand({findAndModify: "c", remove: "yes"})"#,
+        ] {
+            assert!(removes(text), "{text}");
+        }
+        for text in [
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, remove: false, update: {$set: {a: 2}}})"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, update: {$set: {a: 2}}})"#,
+            r#"db.runCommand({find: "c", filter: {remove: true}})"#,
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_remove_call_is_a_removal_wherever_its_collection_comes_from() {
+        for text in [
+            "db.c.remove({})",
+            "db.c.remove({a: 1})",
+            "db.c.remove({a: 1}, true)",
+            "db.c.remove({a: 1}, {justOne: true})",
+            r#"db.getCollection("c").remove({})"#,
+            r#"db.getSiblingDB("x").c.remove({})"#,
+            "db.c.remove({}); db.c.find()",
+            "db.c.deleteOne({_id: 1})",
+            "db.c.deleteMany({})",
+            "db.c.findOneAndDelete({a: 1})",
+            r#"db.runCommand({delete: "c", deletes: [{q: {a: 1}, limit: 1}]})"#,
+            r#"db.adminCommand({delete: "c", deletes: [{q: {a: 1}, limit: 0}]})"#,
+        ] {
+            assert!(removes(text), "{text}");
+        }
+        for text in [
+            "db.c.find({remove: 1})",
+            r#"db.c.find({a: "remove()"})"#,
+            "db.c.find() // remove()",
+            "db.c.find({a: 1})",
+            "db.c.insertOne({a: 1})",
+            "show collections",
+            "",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+        // The human path still cannot read a `remove`.
+        assert_eq!(
+            classify("db.c.remove({})").destructive,
+            [Destructive::Unreadable]
+        );
+    }
+
+    #[test]
+    fn a_javascript_operator_at_any_depth_of_any_argument_runs_a_script() {
+        for text in [
+            r#"db.c.find({$where: "1"})"#,
+            r#"db.c.find({$expr: {$function: {body: "1", args: [], lang: "js"}}})"#,
+            r#"db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}])"#,
+            r#"db.c.find({a: 1}).sort({$where: "1"})"#,
+            r#"db.runCommand({find: "c", filter: {$where: "1"}})"#,
+        ] {
+            assert!(runs_script(text), "{text}");
+        }
+        for text in [
+            "db.c.find({a: 1})",
+            r#"db.c.find({a: "$where"})"#,
+            "db.c.aggregate([{$match: {a: 1}}])",
+            "garbage(",
+        ] {
+            assert!(!runs_script(text), "{text}");
+        }
     }
 }

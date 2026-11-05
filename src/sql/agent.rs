@@ -496,6 +496,122 @@ mod tests {
         }
     }
 
+    fn mongodb(text: &str, mode: Mode) -> AgentVerdict {
+        agent_gate(Engine::MongoDb, text, mode)
+    }
+
+    /// `text` answers `expected` in every mode.
+    fn mongodb_always(text: &str, expected: AgentVerdict) {
+        for mode in Mode::ALL {
+            assert_eq!(mongodb(text, mode), expected, "{mode:?}: {text}");
+        }
+    }
+
+    const MONGODB_REMOVE_CALLS: [&str; 6] = [
+        "db.c.remove({})",
+        "db.c.remove({a: 1})",
+        "db.c.remove({a: 1}, true)",
+        "db.c.remove({a: 1}, {justOne: true})",
+        r#"db.getCollection("c").remove({})"#,
+        r#"db.getSiblingDB("x").c.remove({})"#,
+    ];
+
+    #[test]
+    fn every_mongodb_removal_is_refused_as_a_delete() {
+        for text in [
+            "db.c.deleteOne({_id: 1})",
+            "db.c.deleteMany({a: 1})",
+            "db.c.deleteMany({})",
+            "db.c.findOneAndDelete({a: 1})",
+            r#"db.runCommand({delete: "c", deletes: [{q: {a: 1}, limit: 1}]})"#,
+            r#"db.adminCommand({delete: "c", deletes: [{q: {a: 1}, limit: 0}]})"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, remove: true})"#,
+        ]
+        .into_iter()
+        .chain(MONGODB_REMOVE_CALLS)
+        {
+            mongodb_always(text, refused(Refusal::Delete));
+        }
+        // The human path still cannot read a `remove`: only the agent path
+        // names what it is seen to do.
+        for text in MONGODB_REMOVE_CALLS {
+            assert_eq!(
+                super::super::classify(Engine::MongoDb, text).destructive,
+                [Destructive::Unreadable],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mongodb_javascript_is_refused_as_a_script() {
+        for text in [
+            r#"db.c.find({$where: "1"})"#,
+            r#"db.c.find({$expr: {$function: {body: "1", args: [], lang: "js"}}})"#,
+            r#"db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}])"#,
+        ] {
+            mongodb_always(text, refused(Refusal::Script));
+        }
+    }
+
+    #[test]
+    fn two_mongodb_calls_are_more_than_one_statement() {
+        mongodb_always("db.c.find(); db.c.find()", refused(Refusal::MoreThanOne));
+        mongodb_always(
+            "db.c.deleteMany({}); db.c.find()",
+            refused(Refusal::MoreThanOne),
+        );
+        mongodb_always("", refused(Refusal::NoStatement));
+        mongodb_always("// nothing", refused(Refusal::NoStatement));
+    }
+
+    #[test]
+    fn mongodb_writes_that_remove_nothing_are_approvable() {
+        for text in [
+            "db.c.insertOne({a: 1})",
+            "db.c.insertMany([{a: 1}])",
+            "db.c.updateOne({a: 1}, {$set: {a: 2}})",
+            "db.c.updateMany({a: 1}, {$set: {a: 2}})",
+            "db.c.replaceOne({a: 1}, {a: 2})",
+            "db.c.findOneAndUpdate({a: 1}, {$set: {a: 2}})",
+            "db.c.findOneAndReplace({a: 1}, {a: 2})",
+            "db.c.createIndex({a: 1})",
+            r#"db.c.aggregate([{$match: {a: 1}}, {$merge: {into: "x"}}])"#,
+            r#"db.c.renameCollection("x")"#,
+            r#"db.c.renameCollection("x", false)"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, update: {$set: {a: 2}}})"#,
+        ] {
+            assert_eq!(mongodb(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    mongodb(text, mode),
+                    AgentVerdict::Approve(Verdict::WRITE),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mongodb_reads_run_and_drops_are_refused_by_name() {
+        for text in [
+            "db.c.find({a: 1})",
+            "db.c.countDocuments({})",
+            "db.c.aggregate([{$match: {a: 1}}])",
+            "show collections",
+        ] {
+            mongodb_always(text, AgentVerdict::Run);
+        }
+        for text in [
+            "db.c.drop()",
+            "db.dropDatabase()",
+            r#"db.c.aggregate([{$out: "x"}])"#,
+            r#"db.c.renameCollection("x", true)"#,
+        ] {
+            mongodb_always(text, refused(Refusal::Drop));
+        }
+    }
+
     #[test]
     fn a_plain_select_runs_on_every_engine_and_mode() {
         for engine in sql_engines() {
