@@ -67,6 +67,26 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   rename to the name it has). File → New Project (`NewProject`, no default
   chord) opens that, or the welcome surface's name field while there is no
   connection.
+- **A profile is hidden from agents until its owner says otherwise.**
+  `Profile::agent_visible` is false for every profile, including each one
+  written before the flag existed, and `Workspace::set_agent_visible` is the
+  one place it changes, keyed by id: a second writer would be one more path to
+  tell when a profile is hidden. Making a profile visible goes only through the
+  `agent-visibility` dialog (`Command::ShowToAgents` opens it, and the
+  dialog's `Make visible` is the only caller that passes `true`). It opens with
+  the ring on Cancel (`first_choice`), so an `enter` held or repeated from the
+  palette row that raised it cancels instead of grants, and it states the
+  engine's server-side hold while the profile is Read-only
+  (`Engine::read_only_hold`) and that rows an agent reads leave the machine --
+  static facts, so opening it connects to nothing. Hiding is one action with no
+  dialog (`Command::HideFromAgents`), because narrowing needs no consent.
+  Neither command is remembered under Recent. A visible profile carries a bot
+  marker on its palette rows and beside its name in the titlebar; a hidden one
+  is drawn as it always was. The agent-side lookup filters to visible profiles
+  before it compares names (`Workspace::agent_profile`), so a hidden profile and
+  a missing one answer alike. The one other route to a change is an engine
+  change in `save_profile`, which hides a visible profile and says so, because
+  the dialog's facts were about the old engine.
 - **No connection is a state, not a prompt.** With no profiles and no form
   open, the window is the welcome surface (`Workspace::render_welcome`): New
   project, New connection, each project with an Add connection of its own, and
