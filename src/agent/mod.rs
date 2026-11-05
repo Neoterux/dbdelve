@@ -30,6 +30,8 @@ mod wire;
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
+pub(crate) use ipc::socket_path;
+#[cfg(unix)]
 pub(crate) use server::{Listener, listen};
 use tools::Tool;
 
@@ -59,6 +61,11 @@ pub(crate) struct Reply {
     pub(crate) text: String,
 }
 
+/// One accepted connection, from the moment it is classified until it ends.
+/// What a presence is held by; a call has its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnId(pub(crate) u64);
+
 /// What a connection thread tells the window.
 pub(crate) enum Inbound {
     /// A call, with the one-slot channel its answer goes back on. Dropping the
@@ -68,10 +75,18 @@ pub(crate) enum Inbound {
         tool: Tool,
         reply: std::sync::mpsc::SyncSender<Reply>,
     },
+    /// A shim opened its presence connection: an agent is attached, though it
+    /// may have asked nothing yet.
+    PresenceOpened { conn: ConnId },
+    /// A presence connection ended, however it did.
+    PresenceClosed { conn: ConnId },
 }
 
 /// Why the socket was not bound.
 pub(crate) enum Declined {
+    /// A live socket is already at the path: another window is serving agents,
+    /// and its socket is left as it is.
+    ServedElsewhere,
     /// Something went wrong, in words that say what.
     Failed(String),
 }
@@ -83,6 +98,12 @@ pub(crate) const UNAVAILABLE: &str = "The agent integration is not available on 
 /// The socket is Unix only, so there is nothing to keep alive here.
 #[cfg(not(unix))]
 pub(crate) enum Listener {}
+
+/// There is no socket path.
+#[cfg(not(unix))]
+pub(crate) fn socket_path() -> Result<std::path::PathBuf, String> {
+    Err(UNAVAILABLE.to_string())
+}
 
 /// There is no socket to listen on.
 #[cfg(not(unix))]

@@ -11,14 +11,42 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use super::Declined;
+
+/// The longest path `bind` accepts: `sun_path` less the terminating NUL.
+pub(super) fn max_path_len() -> usize {
+    // SAFETY: `sockaddr_un` is plain old data, so all zeroes is a valid value.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 1
+}
+
+/// Refuse a path the platform cannot bind, by its length, before one is tried.
+pub(super) fn check_len(path: &Path) -> Result<(), String> {
+    let length = path.as_os_str().len();
+    let max = max_path_len();
+    if length > max {
+        return Err(format!(
+            "The agent socket path is {length} bytes long; this system allows at most {max}."
+        ));
+    }
+    Ok(())
+}
+
+/// Where this build's socket lives: beside its profiles, so a dev build and a
+/// release build never share one. No other directory is tried when this one is
+/// too long to bind.
+pub(crate) fn socket_path() -> Result<PathBuf, String> {
+    let path = crate::store::dbdelve_directory()?.join("agent").join("s");
+    check_len(&path)?;
+    Ok(path)
+}
 
 /// The effective uid this process runs as.
 pub(super) fn current_euid() -> u32 {
@@ -111,6 +139,37 @@ pub(super) fn secure_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What is at `path` when binding it found something there. A socket someone
+/// answers on is another window's and is left alone. One nobody answers on,
+/// owned by this user, is what a crash leaves behind and is replaced, once. A
+/// file of any other kind, or a socket of another user's, is never removed.
+fn replace_stale(path: &Path) -> Result<UnixListener, Declined> {
+    let shown = path.display();
+    if UnixStream::connect(path).is_ok() {
+        return Err(Declined::ServedElsewhere);
+    }
+    let ours = std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == current_euid());
+    if !ours {
+        return Err(Declined::Failed(format!(
+            "Something other than a DBDelve socket of this user is at {shown}."
+        )));
+    }
+    std::fs::remove_file(path).map_err(|error| {
+        Declined::Failed(format!(
+            "The stale agent socket {shown} could not be removed: {error}."
+        ))
+    })?;
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        // Someone bound it between the removal and now.
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => Err(Declined::ServedElsewhere),
+        Err(error) => Err(Declined::Failed(format!(
+            "The agent socket {shown} could not be bound: {error}."
+        ))),
+    }
+}
+
 /// Bind the socket at `path`, in a private directory, readable and writable by
 /// this user only.
 pub(super) fn bind(path: &Path) -> Result<UnixListener, Declined> {
@@ -121,15 +180,143 @@ pub(super) fn bind(path: &Path) -> Result<UnixListener, Declined> {
         )));
     };
     secure_dir(parent).map_err(Declined::Failed)?;
-    let listener = UnixListener::bind(path).map_err(|error| {
-        Declined::Failed(format!(
-            "The agent socket {shown} could not be bound: {error}."
-        ))
-    })?;
+    let listener = match UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => replace_stale(path)?,
+        Err(error) => {
+            return Err(Declined::Failed(format!(
+                "The agent socket {shown} could not be bound: {error}."
+            )));
+        }
+    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
         Declined::Failed(format!(
             "The agent socket {shown} could not be made private: {error}."
         ))
     })?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::agent::tests::short_socket_path;
+
+    fn fresh_dir() -> PathBuf {
+        short_socket_path()
+            .parent()
+            .expect("the path has a directory")
+            .to_path_buf()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the path exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn the_socket_directory_is_made_private_to_this_user() {
+        let dir = fresh_dir();
+        secure_dir(&dir).expect("an absent directory is created");
+        assert_eq!(mode(&dir), 0o700);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("the mode changes");
+        secure_dir(&dir).expect("an open directory is tightened");
+        assert_eq!(mode(&dir), 0o700);
+
+        let link = fresh_dir();
+        std::os::unix::fs::symlink(&dir, &link).expect("the link is made");
+        assert!(secure_dir(&link).is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_live_socket_is_left_alone_and_a_stale_one_is_replaced() {
+        let path = short_socket_path();
+        let dir = path
+            .parent()
+            .expect("the path has a directory")
+            .to_path_buf();
+        let Ok(first) = bind(&path) else {
+            panic!("the first bind succeeds");
+        };
+        assert_eq!(mode(&path), 0o600);
+
+        assert!(matches!(bind(&path), Err(Declined::ServedElsewhere)));
+        let client = UnixStream::connect(&path).expect("the live socket still takes clients");
+        assert!(first.accept().is_ok());
+        drop(client);
+
+        // A crash leaves the file behind with nobody listening.
+        drop(first);
+        assert!(path.exists());
+        let Ok(second) = bind(&path) else {
+            panic!("a stale socket is replaced");
+        };
+        let client = UnixStream::connect(&path).expect("the new socket takes clients");
+        assert!(second.accept().is_ok());
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_regular_file_at_the_socket_path_is_never_removed() {
+        let path = short_socket_path();
+        let dir = path
+            .parent()
+            .expect("the path has a directory")
+            .to_path_buf();
+        secure_dir(&dir).expect("the directory is made");
+        std::fs::write(&path, b"not a socket").expect("the file is written");
+
+        assert!(matches!(bind(&path), Err(Declined::Failed(_))));
+        assert_eq!(
+            std::fs::read(&path).expect("the file is still there"),
+            b"not a socket"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_peer_with_another_uid_is_refused() {
+        let (stream, _peer) = UnixStream::pair().expect("a socket pair");
+        assert!(admit(&stream, current_euid()));
+        assert!(!admit(&stream, current_euid().wrapping_add(1)));
+    }
+
+    #[test]
+    fn a_socket_path_one_byte_over_the_limit_is_refused_by_name() {
+        let dir = fresh_dir();
+        std::fs::create_dir_all(&dir).expect("the directory is made");
+        let max = max_path_len();
+        let room = max - dir.as_os_str().len() - 1;
+        let longest = dir.join("a".repeat(room));
+        let too_long = dir.join("a".repeat(room + 1));
+        assert_eq!(longest.as_os_str().len(), max);
+
+        assert!(check_len(&longest).is_ok());
+        assert!(UnixListener::bind(&longest).is_ok());
+        assert!(UnixListener::bind(&too_long).is_err());
+        assert_eq!(
+            check_len(&too_long),
+            Err(format!(
+                "The agent socket path is {} bytes long; this system allows at most {max}.",
+                max + 1
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
