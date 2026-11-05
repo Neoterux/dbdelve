@@ -2486,12 +2486,10 @@ fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
         settle(cx);
 
         // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
-        let bounds = |kind: &str, at: usize, cx: &mut VisualTestContext| {
-            let selector: &'static str = format!("palette-row-{kind}-{at}").leak();
-            cx.debug_bounds(selector)
-        };
+        let bounds =
+            |selector: String, cx: &mut VisualTestContext| cx.debug_bounds(selector.leak());
         let drawn: Vec<usize> = (0..32)
-            .filter(|at| bounds("marker", *at, cx).is_some())
+            .filter(|at| bounds(format!("palette-row-marker-{at}"), cx).is_some())
             .collect();
         let ids = ["long-path", "long-name", "control"];
         assert_eq!(
@@ -2500,8 +2498,8 @@ fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
             "a marker is laid out on each visible connection row, at {drawn:?}"
         );
         for (at, id) in drawn.into_iter().zip(ids) {
-            let marker = bounds("marker", at, cx).expect("counted above");
-            let text = bounds("text", at, cx)
+            let marker = bounds(format!("palette-row-marker-{at}"), cx).expect("counted above");
+            let text = bounds(format!("palette-row-text-{at}"), cx)
                 .unwrap_or_else(|| panic!("{id}: the row's text box is drawn"));
             assert!(
                 text.left() <= marker.left() && marker.right() <= text.right(),
@@ -2512,7 +2510,7 @@ fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
                 text.right()
             );
             if id != "long-name" {
-                let detail = bounds("detail", at, cx)
+                let detail = bounds(format!("palette-row-detail-{at}"), cx)
                     .unwrap_or_else(|| panic!("{id}: the endpoint is drawn"));
                 assert!(
                     detail.size.width > gpui::px(0.),

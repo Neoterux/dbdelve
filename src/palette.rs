@@ -1738,15 +1738,6 @@ impl Palette {
                                     .when(item.mono, |label| label.font_family(mono.clone()))
                                     .child(highlighted(item.label.clone(), &ranges, t)),
                             )
-                            .children(item.detail.clone().map(|detail| {
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(mono.clone())
-                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                    .text_color(t.text_faint)
-                                    .debug_selector(move || format!("palette-row-detail-{at}"))
-                                    .child(detail)
-                            }))
                             // Muted and still, like the hint: it says what is
                             // true, it does not ask for attention.
                             .children(item.agent_visible.then(|| {
@@ -1754,6 +1745,21 @@ impl Palette {
                                     .flex_shrink_0()
                                     .debug_selector(move || format!("palette-row-marker-{at}"))
                                     .child(row_icon(t, icon::AGENT_VISIBLE))
+                            }))
+                            // An endpoint can be a file path longer than the row, and
+                            // the name and the marker are what the row is for, so the
+                            // endpoint gives way first.
+                            .children(item.detail.clone().map(|detail| {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .font_family(mono.clone())
+                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                    .text_color(t.text_faint)
+                                    .debug_selector(move || format!("palette-row-detail-{at}"))
+                                    .child(detail)
                             })),
                     )
                     .when(!item.hint.is_empty(), |row| {
