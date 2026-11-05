@@ -17,8 +17,9 @@
 //!    bearing ranges. None is `Refuse(NoStatement)`, two or more is
 //!    `Refuse(MoreThanOne)`.
 //! 3. (Redis commands the editor never sends are refused here, in plan 03-03.)
-//! 4. `DROP` is `Refuse(Drop)`, `TRUNCATE` is `Refuse(Truncate)`, an unfiltered
-//!    `DELETE` is `Refuse(Delete)`.
+//! 4. `DROP` is `Refuse(Drop)`, `TRUNCATE` is `Refuse(Truncate)`, any `DELETE`
+//!    the walk reached, filtered or not, is `Refuse(Delete)`, and an `ALTER
+//!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`.
 //! 5. (Server-side scripts and Redis disclosure commands are refused here, in
 //!    plan 03-03.)
 //! 6. (Statements that change the session are refused here, in task 3.)
@@ -71,6 +72,8 @@ pub(crate) enum Refusal {
     Truncate,
     /// Any `DELETE`, whatever its shape.
     Delete,
+    /// An `ALTER TABLE` carrying anything but `ADD COLUMN`.
+    Alter,
     /// A statement that needs Full.
     NeedsFull,
     /// A statement that needs more than the profile's mode.
@@ -89,6 +92,9 @@ impl fmt::Display for Refusal {
             Refusal::Drop => f.write_str("DROP is refused for agent statements"),
             Refusal::Truncate => f.write_str("TRUNCATE is refused for agent statements"),
             Refusal::Delete => f.write_str("deleting data is refused for agent statements"),
+            Refusal::Alter => {
+                f.write_str("ALTER other than ADD COLUMN is refused for agent statements")
+            }
             Refusal::NeedsFull => {
                 f.write_str("statements that need Full are refused for agent statements")
             }
@@ -131,11 +137,19 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     for (kind, refusal) in [
         (Destructive::Drop, Refusal::Drop),
         (Destructive::Truncate, Refusal::Truncate),
-        (Destructive::UnfilteredDelete, Refusal::Delete),
     ] {
         if verdict.destructive.contains(&kind) {
             return AgentVerdict::Refuse(refusal);
         }
+    }
+    // A filtered `DELETE` is a plain write to the verdict, so only the walk
+    // that read it knows it removed rows; an unfiltered one carries its kind
+    // as well.
+    if read.removes || verdict.destructive.contains(&Destructive::UnfilteredDelete) {
+        return AgentVerdict::Refuse(Refusal::Delete);
+    }
+    if read.alters {
+        return AgentVerdict::Refuse(Refusal::Alter);
     }
 
     if verdict.mode == Mode::Full {
@@ -456,6 +470,202 @@ mod tests {
                     AgentVerdict::Run,
                     "{engine:?} {mode:?}"
                 );
+            }
+        }
+    }
+
+    /// Every shape of `DELETE` on the engine whose dialect reads it, each with
+    /// the text that makes the walk reach it somewhere other than the top.
+    const DELETES: &[(Engine, &str)] = &[
+        (Engine::Postgres, "DELETE FROM t WHERE id = 1"),
+        (Engine::Postgres, "DELETE FROM t"),
+        (
+            Engine::Postgres,
+            "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING *) SELECT * FROM d",
+        ),
+        (
+            Engine::Postgres,
+            "WITH s AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM s)",
+        ),
+        (
+            Engine::Postgres,
+            "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1",
+        ),
+        (
+            Engine::Postgres,
+            "EXPLAIN (ANALYZE TRUE) DELETE FROM t WHERE id = 1",
+        ),
+        (Engine::MariaDb, "ANALYZE DELETE FROM t WHERE id = 1"),
+        (Engine::SqlServer, "IF 1 = 1 DELETE FROM t WHERE id = 1"),
+        (
+            Engine::SqlServer,
+            "IF 1 = 1 SELECT 1 ELSE DELETE FROM t WHERE id = 1",
+        ),
+        (Engine::Snowflake, "BEGIN DELETE FROM t WHERE id = 1; END"),
+        (Engine::ClickHouse, "ALTER TABLE t DELETE WHERE id = 1"),
+        (Engine::ClickHouse, "DELETE FROM t WHERE id = 1"),
+    ];
+
+    #[test]
+    fn every_shape_of_delete_is_refused() {
+        for (engine, sql) in DELETES {
+            for mode in Mode::ALL {
+                assert_eq!(
+                    agent_gate(*engine, sql, mode),
+                    refused(Refusal::Delete),
+                    "{engine:?} {mode:?}: {sql}"
+                );
+            }
+        }
+        // A one-row delete by key is not softened for naming one row.
+        for engine in sql_engines() {
+            let one = agent_gate(engine, "DELETE FROM t WHERE id = 1", Mode::ReadWrite);
+            let all = agent_gate(engine, "DELETE FROM t", Mode::ReadWrite);
+            assert_eq!(one, refused(Refusal::Delete), "{engine:?}");
+            assert_eq!(one, all, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_explain_runs_and_explain_analyze_takes_the_inner_verdict() {
+        let postgres = |sql, mode| agent_gate(Engine::Postgres, sql, mode);
+        for mode in Mode::ALL {
+            assert_eq!(
+                postgres("EXPLAIN DELETE FROM t WHERE id = 1", mode),
+                AgentVerdict::Run,
+                "{mode:?}"
+            );
+            assert_eq!(
+                postgres("EXPLAIN ANALYZE SELECT a FROM t", mode),
+                AgentVerdict::Run,
+                "{mode:?}"
+            );
+        }
+        let update = "EXPLAIN ANALYZE UPDATE t SET a = 1 WHERE id = 1";
+        assert_eq!(
+            postgres(update, Mode::ReadWrite),
+            AgentVerdict::Approve(Verdict::WRITE)
+        );
+        assert_eq!(postgres(update, Mode::ReadOnly), needs_read_write());
+    }
+
+    #[test]
+    fn alter_beyond_add_column_is_refused_by_name() {
+        for sql in [
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t ALTER COLUMN a TYPE TEXT",
+            "alter table t drop column b",
+            "ALTER TABLE t ADD COLUMN b INT, DROP COLUMN c",
+        ] {
+            for mode in Mode::ALL {
+                assert_eq!(
+                    agent_gate(Engine::Postgres, sql, mode),
+                    refused(Refusal::Alter),
+                    "{mode:?}: {sql}"
+                );
+            }
+        }
+        let add = "ALTER TABLE t ADD COLUMN b INT";
+        for engine in sql_engines() {
+            assert_eq!(
+                agent_gate(engine, add, Mode::ReadWrite),
+                AgentVerdict::Approve(Verdict::WRITE),
+                "{engine:?}"
+            );
+        }
+        // A ClickHouse mutation amounts to the statement it is written as.
+        assert_eq!(
+            agent_gate(
+                Engine::ClickHouse,
+                "ALTER TABLE t UPDATE a = 1 WHERE id = 1",
+                Mode::ReadWrite
+            ),
+            AgentVerdict::Approve(Verdict::WRITE)
+        );
+    }
+
+    #[test]
+    fn a_statement_inside_an_executable_comment_is_counted() {
+        for mode in Mode::ALL {
+            for (sql, refusal) in [
+                ("SELECT 1 /*M!100100 ; SELECT 2 */", Refusal::MoreThanOne),
+                (
+                    "SELECT 1 /*M!100100 ; DELETE FROM t WHERE id = 1 */",
+                    Refusal::MoreThanOne,
+                ),
+                ("/*M!100100 DELETE FROM t WHERE id = 1 */", Refusal::Delete),
+            ] {
+                assert_eq!(
+                    agent_gate(Engine::MariaDb, sql, mode),
+                    refused(refusal),
+                    "{mode:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_transaction_block_is_more_than_one_statement() {
+        let sql = "BEGIN; DELETE FROM t WHERE id = 1; COMMIT";
+        for engine in sql_engines() {
+            for mode in Mode::ALL {
+                let answer = agent_gate(engine, sql, mode);
+                // A dialect that cannot read the block says so.
+                assert!(
+                    answer == refused(Refusal::MoreThanOne)
+                        || answer == refused(Refusal::Unreadable),
+                    "{engine:?} {mode:?}: {answer:?}"
+                );
+            }
+        }
+        assert_eq!(
+            agent_gate(Engine::Postgres, sql, Mode::Full),
+            refused(Refusal::MoreThanOne)
+        );
+    }
+
+    /// The statements the classifier has no arm for, or cannot parse. None of
+    /// them may be run or approved on any engine in any mode.
+    const NO_ARM: &[&str] = &[
+        "PREPARE p AS SELECT 1",
+        "EXECUTE p",
+        "DEALLOCATE p",
+        "DO $$ BEGIN DELETE FROM t; END $$",
+        "LOAD DATA INFILE 'x.csv' INTO TABLE t",
+        "SELECT a INTO OUTFILE '/tmp/x' FROM t",
+        "SELECT a FROM t INTO OUTFILE '/tmp/x'",
+        "DECLARE c CURSOR FOR SELECT 1",
+        "FETCH NEXT FROM c",
+        "LISTEN c",
+        "NOTIFY c",
+        "LOCK TABLE t",
+        "REFRESH MATERIALIZED VIEW v",
+        "REINDEX TABLE t",
+        "CLUSTER t",
+        "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1' LANGUAGE SQL",
+        "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE EXTENSION x",
+        "ATTACH 'x.db' AS x",
+        "INSTALL httpfs",
+        "LOAD httpfs",
+        "EXPORT DATABASE '/tmp/x'",
+        "OPTIMIZE TABLE t FINAL",
+        "KILL 1",
+        "XA START 'x'",
+    ];
+
+    #[test]
+    fn statements_with_no_arm_of_their_own_are_never_run_or_approved() {
+        for engine in sql_engines() {
+            for sql in NO_ARM {
+                for mode in Mode::ALL {
+                    let answer = agent_gate(engine, sql, mode);
+                    assert!(
+                        matches!(answer, AgentVerdict::Refuse(_)),
+                        "{engine:?} {mode:?}: {sql}: {answer:?}"
+                    );
+                }
             }
         }
     }
