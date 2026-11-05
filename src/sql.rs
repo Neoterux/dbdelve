@@ -2622,6 +2622,21 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     statements: usize,
+    /// Whether any statement the walk reached is a `DELETE`, whatever its
+    /// shape: top level, a CTE's body, under `EXPLAIN ANALYZE`, in an `IF` or a
+    /// scripting block, a ClickHouse mutation that amounts to one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    removes: bool,
+    /// Whether any `ALTER TABLE` the walk reached carries an operation other
+    /// than `ADD COLUMN`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    alters: bool,
 }
 
 impl Parsed {
@@ -2630,6 +2645,56 @@ impl Parsed {
         Self {
             verdict,
             statements,
+            removes: false,
+            alters: false,
+        }
+    }
+
+    fn read(reading: Reading, statements: usize) -> Self {
+        Self {
+            verdict: reading.verdict,
+            statements,
+            removes: reading.removes,
+            alters: reading.alters,
+        }
+    }
+}
+
+/// A [`Verdict`] and what the walk that reached it saw that a verdict drops.
+/// One walk answers for the human's gate and the agent's, so what the agent is
+/// refused for comes from the tree the verdict was read off, never from the
+/// text: `classify` keeps only the verdict, and every record of it is unmoved.
+#[derive(Debug)]
+struct Reading {
+    verdict: Verdict,
+    removes: bool,
+    alters: bool,
+}
+
+impl Reading {
+    const READ: Self = Self {
+        verdict: Verdict::READ,
+        removes: false,
+        alters: false,
+    };
+
+    /// The more restrictive of two readings: [`Verdict::max`] of the verdicts,
+    /// and either flag set by either.
+    fn max(self, other: Self) -> Self {
+        Self {
+            verdict: self.verdict.max(other.verdict),
+            removes: self.removes || other.removes,
+            alters: self.alters || other.alters,
+        }
+    }
+}
+
+impl From<Verdict> for Reading {
+    fn from(verdict: Verdict) -> Self {
+        Self {
+            verdict,
+            removes: false,
+            alters: false,
         }
     }
 }
@@ -2685,11 +2750,15 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
     if statements.is_empty() && grammar_finds_more_than_comments(engine, dialect.as_ref(), sql) {
         return Parsed::counted(unreadable_verdict(engine), 0);
     }
-    let verdict = statements
+    let reading = statements
         .iter()
         .map(|statement| spec_verdict(engine.spec(), statement))
-        .fold(Verdict::READ, Verdict::max);
-    Parsed::counted(raised(engine, sql, verdict), statements.len())
+        .fold(Reading::READ, Reading::max);
+    let read = Parsed::read(reading, statements.len());
+    Parsed {
+        verdict: raised(engine, sql, read.verdict),
+        ..read
+    }
 }
 
 /// `verdict`, raised by what the whole text says on its own, whichever of
@@ -2849,7 +2918,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
 
     let mut unreadable = !trusted;
     let mut counted = 0;
-    let verdict = between_semicolons(&tokens)
+    let reading = between_semicolons(&tokens)
         .into_iter()
         .map(|range| {
             // A character the tokenizer does not know may be a space to the
@@ -2870,24 +2939,24 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
                     None => SqlParser::parse_sql(dialect, text).ok(),
                 },
             };
-            let verdict = match parsed {
+            let reading = match parsed {
                 Some(statements) => {
                     counted += statements.len();
                     statements
                         .iter()
                         .map(|statement| spec_verdict(spec, statement))
-                        .fold(Verdict::READ, Verdict::max)
+                        .fold(Reading::READ, Reading::max)
                 }
                 None => {
                     // A range it could not read is still a statement.
                     counted += 1;
                     unreadable = true;
-                    first_keyword_verdict(&words)
+                    first_keyword_verdict(&words).into()
                 }
             };
-            verdict.max(words_verdict(&words))
+            reading.max(words_verdict(&words).into())
         })
-        .fold(Verdict::READ, Verdict::max);
+        .fold(Reading::READ, Reading::max);
 
     let floor = match (misread, whole) {
         (true, _) => Mode::Full,
@@ -2896,12 +2965,17 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
     };
     let verdict = match unreadable {
         true => Verdict {
-            mode: verdict.mode.max(floor),
+            mode: reading.verdict.mode.max(floor),
             destructive: vec![Destructive::Unreadable],
         },
-        false => verdict,
+        false => reading.verdict,
     };
-    Parsed::counted(verdict, counted)
+    Parsed {
+        verdict,
+        removes: reading.removes,
+        alters: reading.alters,
+        ..Parsed::counted(Verdict::READ, counted)
+    }
 }
 
 /// Whether the server's lexer may read `tokens` otherwise than sqlparser's
@@ -3029,11 +3103,11 @@ fn words_verdict(words: &[&Token]) -> Verdict {
 /// `CREATE TABLE` on a table engine outside the spec's `local_table_engines`
 /// keeps its rows somewhere else, a URL, a file or another server, so it needs
 /// Full.
-fn spec_verdict(spec: &EngineSpec, statement: &Statement) -> Verdict {
-    let verdict = statement_verdict(&spec.sql, statement);
+fn spec_verdict(spec: &EngineSpec, statement: &Statement) -> Reading {
+    let reading = statement_verdict(&spec.sql, statement);
     let (Some(local), Statement::CreateTable(create)) = (spec.sql.local_table_engines, statement)
     else {
-        return verdict;
+        return reading;
     };
     let options = match &create.table_options {
         CreateTableOptions::None => &[][..],
@@ -3053,8 +3127,8 @@ fn spec_verdict(spec: &EngineSpec, statement: &Statement) -> Verdict {
         _ => false,
     });
     match elsewhere {
-        true => verdict.max(Verdict::FULL),
-        false => verdict,
+        true => reading.max(Verdict::FULL.into()),
+        false => reading,
     }
 }
 
@@ -4009,11 +4083,11 @@ impl Leaves {
 /// data-modifying CTE, so
 /// `COPY (WITH x AS (DELETE FROM t RETURNING a) SELECT a FROM x) TO STDOUT`
 /// empties a table under a variant that reads as `COPY TO`.
-fn statement_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
-    let verdict = variant_verdict(spec, statement);
+fn statement_verdict(spec: &SqlSpec, statement: &Statement) -> Reading {
+    let reading = variant_verdict(spec, statement);
     match owned_query(statement) {
-        Some(query) => verdict.max(query_verdict(spec, query)),
-        None => verdict,
+        Some(query) => reading.max(query_verdict(spec, query)),
+        None => reading,
     }
 }
 
@@ -4039,11 +4113,11 @@ fn owned_query(statement: &Statement) -> Option<&Query> {
 
 /// What a statement's variant alone says. Never called directly: the fold in
 /// `statement_verdict` is the half that reads what the variant is carrying.
-fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
+fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Reading {
     match statement {
         // Read only as a variant. Everything dangerous a query can hold is
         // inside it, and `statement_verdict` folds that in.
-        Statement::Query(_) => Verdict::READ,
+        Statement::Query(_) => Reading::READ,
 
         // `EXPLAIN ANALYZE DELETE FROM t` runs the delete -- documented in
         // Postgres, and in MySQL since 8.0.18. dbdelve never sends it to SQLite:
@@ -4062,10 +4136,10 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
             if analyze {
                 statement_verdict(spec, statement)
             } else {
-                Verdict::READ
+                Reading::READ
             }
         }
-        Statement::ExplainTable { .. } => Verdict::READ,
+        Statement::ExplainTable { .. } => Reading::READ,
 
         // A Snowflake Scripting block, `BEGIN DELETE FROM t; END`, parses as the
         // same variant as a bare `BEGIN` with its body inside. Any exception
@@ -4076,12 +4150,12 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
             ..
         } if !statements.is_empty() || exception.is_some() => {
             if exception.is_some() {
-                Verdict::FULL
+                Verdict::FULL.into()
             } else {
                 statements
                     .iter()
                     .map(|statement| statement_verdict(spec, statement))
-                    .fold(Verdict::READ, Verdict::max)
+                    .fold(Reading::READ, Reading::max)
             }
         }
 
@@ -4089,9 +4163,9 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
         // for that transaction, with no `SET` at all (Postgres spells it `BEGIN
         // READ WRITE`). Below the scripting-block guard so a block keeps being
         // read by what it holds.
-        Statement::StartTransaction { modes, .. } if grants_write(modes) => Verdict::WRITE,
+        Statement::StartTransaction { modes, .. } if grants_write(modes) => Verdict::WRITE.into(),
 
-        Statement::Set(set) => set_verdict(spec, set),
+        Statement::Set(set) => set_verdict(spec, set).into(),
 
         // `IF … ELSE` (T-SQL's, and the `IF … END IF` Postgres, MySQL and
         // Snowflake parse to the same variant) is as dangerous as what it holds.
@@ -4110,7 +4184,7 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
                         .flat_map(ConditionalStatementBlock::statements)
                         .map(|statement| statement_verdict(spec, statement)),
                 )
-                .fold(Verdict::READ, Verdict::max)
+                .fold(Reading::READ, Reading::max)
         }
 
         Statement::ShowTables { .. }
@@ -4139,7 +4213,7 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
         | Statement::Rollback { .. }
         // Savepoints touch no data, and `ROLLBACK TO` above is already a read.
         | Statement::Savepoint { .. }
-        | Statement::ReleaseSavepoint { .. } => Verdict::READ,
+        | Statement::ReleaseSavepoint { .. } => Reading::READ,
 
         // COPY TO reads a table out to a file; COPY FROM loads rows in. Either
         // direction against a `PROGRAM` or a file runs on the *server*: a shell
@@ -4149,14 +4223,15 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
             CopyTarget::File { .. } | CopyTarget::Program { .. } => Verdict::FULL,
             _ if *to => Verdict::READ,
             _ => Verdict::WRITE,
-        },
+        }
+        .into(),
 
         // Replacing an object that holds data drops that data first: `CREATE OR
         // REPLACE SCHEMA s` empties every table in `s`, and `INSERT OVERWRITE`
         // truncates before it inserts. A replaced view, function or procedure
         // holds no rows, so those stay with the object they create.
         Statement::CreateTable(create) if create.or_replace => {
-            Verdict::destroys(Destructive::Drop)
+            Verdict::destroys(Destructive::Drop).into()
         }
         Statement::CreateSchema {
             or_replace: true, ..
@@ -4167,15 +4242,15 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
         // An internal stage holds the files put into it.
         | Statement::CreateStage {
             or_replace: true, ..
-        } => Verdict::destroys(Destructive::Drop),
+        } => Verdict::destroys(Destructive::Drop).into(),
         // `INSERT INTO FUNCTION url(…)`, `s3(…)`, `file(…)`, `remote(…)` and
         // the rest write outside the database, as a `COPY … TO` file does.
         // Only ClickHouse's dialect parses one.
         Statement::Insert(insert) if matches!(insert.table, TableObject::TableFunction(_)) => {
-            Verdict::FULL
+            Verdict::FULL.into()
         }
         Statement::Insert(insert) if insert.overwrite => {
-            Verdict::destroys(Destructive::Truncate)
+            Verdict::destroys(Destructive::Truncate).into()
         }
 
         Statement::Insert { .. }
@@ -4186,33 +4261,45 @@ fn variant_verdict(spec: &SqlSpec, statement: &Statement) -> Verdict {
         | Statement::CreateSchema { .. }
         | Statement::Comment { .. }
         | Statement::Analyze { .. }
-        | Statement::Vacuum { .. } => Verdict::WRITE,
+        | Statement::Vacuum { .. } => Verdict::WRITE.into(),
 
-        Statement::Delete(delete) => {
-            if delete.selection.is_some() {
+        // Every `DELETE` is flagged, filtered or not: the agent is refused all
+        // of them, and the flag is read off the statement the walk reached,
+        // wherever it sits.
+        Statement::Delete(delete) => Reading {
+            verdict: if delete.selection.is_some() {
                 Verdict::WRITE
             } else {
                 Verdict::destroys(Destructive::UnfilteredDelete)
-            }
-        }
+            },
+            removes: true,
+            alters: false,
+        },
 
-        Statement::Drop { .. } => Verdict::destroys(Destructive::Drop),
-        Statement::Truncate { .. } => Verdict::destroys(Destructive::Truncate),
+        Statement::Drop { .. } => Verdict::destroys(Destructive::Drop).into(),
+        Statement::Truncate { .. } => Verdict::destroys(Destructive::Truncate).into(),
 
         // One ALTER can carry several operations, so the verdict is the maximum
         // over them and not the first.
-        Statement::AlterTable(alter) => alter
-            .operations
-            .iter()
-            .map(alter_verdict)
-            .fold(Verdict::WRITE, Verdict::max),
+        Statement::AlterTable(alter) => Reading {
+            verdict: alter
+                .operations
+                .iter()
+                .map(alter_verdict)
+                .fold(Verdict::WRITE, Verdict::max),
+            removes: false,
+            alters: alter
+                .operations
+                .iter()
+                .any(|operation| !matches!(operation, AlterTableOperation::AddColumn { .. })),
+        },
 
         // Everything else needs Full: a statement this function has not been
         // taught about is one nobody has decided is safe. A statement type added
         // by a later crate version lands here silently, so the arm has to be the
         // conservative one -- `Statement` is not `#[non_exhaustive]`, and the
         // build will not break to ask.
-        _ => Verdict::FULL,
+        _ => Verdict::FULL.into(),
     }
 }
 
@@ -4387,22 +4474,22 @@ fn analyze_option_is_on(option: &UtilityOption) -> bool {
 /// A CTE body can be a `DELETE`. `WITH x AS (DELETE FROM t RETURNING *) SELECT *
 /// FROM x` parses as `Statement::Query`, so reading only the top-level variant
 /// calls a statement that empties a table a read.
-fn query_verdict(spec: &SqlSpec, query: &Query) -> Verdict {
-    let mut verdict = set_expr_verdict(spec, &query.body);
+fn query_verdict(spec: &SqlSpec, query: &Query) -> Reading {
+    let mut reading = set_expr_verdict(spec, &query.body);
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            verdict = verdict.max(query_verdict(spec, &cte.query));
+            reading = reading.max(query_verdict(spec, &cte.query));
         }
     }
-    verdict
+    reading
 }
 
-fn set_expr_verdict(spec: &SqlSpec, body: &SetExpr) -> Verdict {
+fn set_expr_verdict(spec: &SqlSpec, body: &SetExpr) -> Reading {
     match body {
         // `SELECT * INTO newt FROM t` is DDL wearing a select's clothes: same
         // variant as a read, one field apart, and it creates a table.
-        SetExpr::Select(select) if select.into.is_some() => Verdict::WRITE,
-        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Verdict::READ,
+        SetExpr::Select(select) if select.into.is_some() => Verdict::WRITE.into(),
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Reading::READ,
         SetExpr::Query(query) => query_verdict(spec, query),
         SetExpr::SetOperation { left, right, .. } => {
             set_expr_verdict(spec, left).max(set_expr_verdict(spec, right))
@@ -4419,9 +4506,9 @@ fn set_expr_verdict(spec: &SqlSpec, body: &SetExpr) -> Verdict {
 /// write anything a Postgres or Snowflake function can, so everything but
 /// operators over names, values and subqueries keeps that verdict. A subquery
 /// is read like any other query.
-fn condition_verdict(spec: &SqlSpec, condition: &Expr) -> Verdict {
+fn condition_verdict(spec: &SqlSpec, condition: &Expr) -> Reading {
     match condition {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => Verdict::READ,
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => Reading::READ,
         Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
@@ -4453,12 +4540,12 @@ fn condition_verdict(spec: &SqlSpec, condition: &Expr) -> Verdict {
         Expr::InList { expr, list, .. } => list
             .iter()
             .map(|item| condition_verdict(spec, item))
-            .fold(condition_verdict(spec, expr), Verdict::max),
+            .fold(condition_verdict(spec, expr), Reading::max),
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => query_verdict(spec, subquery),
         Expr::InSubquery { expr, subquery, .. } => {
             condition_verdict(spec, expr).max(query_verdict(spec, subquery))
         }
-        _ => Verdict::FULL,
+        _ => Verdict::FULL.into(),
     }
 }
 
@@ -9463,7 +9550,7 @@ mod tests {
         SqlParser::parse_sql(dialect.as_ref(), sql)
             .expect("the statement parses in this dialect")
             .iter()
-            .map(|statement| statement_verdict(spec, statement))
+            .map(|statement| statement_verdict(spec, statement).verdict)
             .fold(Verdict::READ, Verdict::max)
     }
 
