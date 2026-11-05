@@ -182,9 +182,16 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         Some(Stop::Upgrade(needed)) => {
             return AgentVerdict::Refuse(Refusal::NeedsMode { needed, held: mode });
         }
-        // Steps 1 and 4 took every kind these two answer for, so neither is
-        // reached; each is refused as what it names rather than panicking.
-        Some(Stop::Confirm(_)) | Some(Stop::RunOnce) => {
+        // Steps 1 and 4 took every kind these answer for, so none is reached;
+        // each is refused as what it names rather than panicking.
+        Some(Stop::Confirm(Destructive::Drop)) => return AgentVerdict::Refuse(Refusal::Drop),
+        Some(Stop::Confirm(Destructive::Truncate)) => {
+            return AgentVerdict::Refuse(Refusal::Truncate);
+        }
+        Some(Stop::Confirm(Destructive::UnfilteredDelete)) => {
+            return AgentVerdict::Refuse(Refusal::Delete);
+        }
+        Some(Stop::Confirm(Destructive::Unreadable) | Stop::RunOnce) => {
             return AgentVerdict::Refuse(Refusal::Unreadable);
         }
         None => {}
