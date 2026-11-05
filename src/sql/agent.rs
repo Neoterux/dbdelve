@@ -40,7 +40,8 @@
 //!    `Refuse(NeedsMode { needed, held })`. The silenced list is always empty,
 //!    so a kind a human silenced changes nothing for an agent.
 //! 9. A write the profile's mode allows is `Approve(verdict)`.
-//! 10. A read that calls one of the engine's `egress_functions` is
+//! 10. A read that calls one of the engine's `egress_functions`, or on DuckDB
+//!     holds a string that looks like a path ([`reads_a_bare_path`]), is
 //!     `Approve(verdict)` with a Read-only verdict, in every mode: it reaches a
 //!     file, a URL, a program or another server, and the human sees the
 //!     statement first. After every refusal and after step 9, so a refused
@@ -246,7 +247,8 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         return AgentVerdict::Approve(verdict);
     }
     // The engine's egress list, read by the same scan as the deny-list but
-    // never by the human path, so DBDelve's own file opens stay reads.
+    // never by the human path, so DBDelve's own file opens stay reads, and
+    // DuckDB's quoted paths, which no function name marks.
     if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[])
         || reads_a_bare_path(engine, sql)
     {
