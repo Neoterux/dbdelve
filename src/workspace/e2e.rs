@@ -136,7 +136,18 @@ fn launch_with_profiles<'a>(
             .replace("DB_PATH", &format!("{:?}", database.display().to_string())),
     )
     .expect("profiles.toml must be writable");
-    launch(cx)
+    let (workspace, cx) = launch(cx);
+    // The runner's own `PG*` variables reach `Workspace::new`: GitHub's Windows
+    // image sets `PGUSER` and `PGPASSWORD` alone, which opens the connection
+    // form over everything these tests put in front. They start from
+    // `profiles.toml` only.
+    workspace.update(cx, |workspace, cx| {
+        if workspace.form.is_some() {
+            workspace.close_form(cx);
+        }
+    });
+    settle(cx);
+    (workspace, cx)
 }
 
 /// One SQLite profile as `profiles.toml` spells it. `extra` is more scalar
