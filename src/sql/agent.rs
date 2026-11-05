@@ -12,16 +12,23 @@
 //!
 //! 1. `Unreadable` in the verdict is `Refuse(Unreadable)`, before `gate` is
 //!    asked: `gate` answers `Upgrade` for an unreadable statement on an engine
-//!    with no server-side hold, which would read as a negotiation.
+//!    with no server-side hold, which would read as a negotiation. An
+//!    unreadable statement that is seen to remove data is named a
+//!    `Refuse(Delete)` (D-10): MongoDB's legacy `remove` is no method DBDelve
+//!    reads, and it is still a deletion.
 //! 2. The statement count: the parse `classify` judged and the buffer's token
 //!    bearing ranges. None is `Refuse(NoStatement)`, two or more is
 //!    `Refuse(MoreThanOne)`.
-//! 3. (Redis commands the editor never sends are refused here, in plan 03-03.)
+//! 3. A Redis command the editor never sends (`MONITOR`, `SELECT`, ...) is
+//!    `Refuse(NotSent)`, after the count so two commands are `MoreThanOne`.
 //! 4. `DROP` is `Refuse(Drop)`, `TRUNCATE` is `Refuse(Truncate)`, any `DELETE`
 //!    the walk reached, filtered or not, is `Refuse(Delete)`, and an `ALTER
 //!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`.
-//! 5. (Server-side scripts and Redis disclosure commands are refused here, in
-//!    plan 03-03.)
+//! 5. A server-side script (a Redis `EVAL`, `FCALL` and their read-only forms,
+//!    a MongoDB `$where`) is `Refuse(Script)`, and a Redis command that
+//!    returns credentials or other clients' details is `Refuse(Disclosure)`
+//!    (D-27), in every mode: before the session and mode steps, so the reason
+//!    is the script's and not the mode's.
 //! 6. A statement that changes the session, or assigns a user variable with
 //!    `:=`, is `Refuse(Session)`: a later approved write must hit the table the
 //!    human read it for, so nothing an agent sends may repoint the session
@@ -48,7 +55,7 @@ use std::fmt;
 
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use crate::db::{Engine, Syntax};
+use crate::db::Engine;
 
 use super::{
     Buffer, Destructive, Mode, Stop, Verdict, dialect, executed_tokens, gate, holds_a_token, parsed,
@@ -76,14 +83,22 @@ pub(crate) enum Refusal {
     MoreThanOne,
     /// DBDelve could not read the statement, so it cannot say what it does.
     Unreadable,
+    /// A Redis command DBDelve never sends: it would take the session out from
+    /// under the connection, or end it.
+    NotSent,
     Drop,
     Truncate,
-    /// Any `DELETE`, whatever its shape.
+    /// Any `DELETE`, whatever its shape, and on MongoDB and Redis any command
+    /// that removes data.
     Delete,
     /// An `ALTER TABLE` carrying anything but `ADD COLUMN`.
     Alter,
     /// A statement that leaves the session changed, savepoints included.
     Session,
+    /// A server-side script, which no statement read can say the effect of.
+    Script,
+    /// A command that returns credentials or other clients' connection details.
+    Disclosure,
     /// A statement that needs Full.
     NeedsFull,
     /// A statement that needs more than the profile's mode.
@@ -99,6 +114,7 @@ impl fmt::Display for Refusal {
             Refusal::NoStatement => f.write_str("there is no statement to run"),
             Refusal::MoreThanOne => f.write_str("more than one statement"),
             Refusal::Unreadable => f.write_str("DBDelve can't read this statement"),
+            Refusal::NotSent => f.write_str("DBDelve never sends this command"),
             Refusal::Drop => f.write_str("DROP is refused for agent statements"),
             Refusal::Truncate => f.write_str("TRUNCATE is refused for agent statements"),
             Refusal::Delete => f.write_str("deleting data is refused for agent statements"),
@@ -108,6 +124,12 @@ impl fmt::Display for Refusal {
             Refusal::Session => {
                 f.write_str("statements that change the session are refused for agent statements")
             }
+            Refusal::Script => {
+                f.write_str("server-side scripts are refused for agent statements")
+            }
+            Refusal::Disclosure => f.write_str(
+                "commands that return credentials or other clients' details are refused for agent statements",
+            ),
             Refusal::NeedsFull => {
                 f.write_str("statements that need Full are refused for agent statements")
             }
@@ -126,25 +148,30 @@ impl fmt::Display for Refusal {
 /// The answer for `sql` as an agent originates it on a profile whose mode is
 /// `mode`. See the module header for the order the reasons are asked in.
 pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict {
-    // ponytail: MongoDB and Redis are not answered yet, so they are refused as
-    // unreadable rather than run through a ladder written for SQL; plan 03-03
-    // gives each its own steps. Failing closed is the only safe default for a
-    // function whose `Run` sends a statement with no human.
-    if engine.syntax() != Syntax::Sql {
-        return AgentVerdict::Refuse(Refusal::Unreadable);
-    }
-
     let read = parsed(engine, sql);
     let verdict = read.verdict;
 
     if verdict.destructive.contains(&Destructive::Unreadable) {
-        return AgentVerdict::Refuse(Refusal::Unreadable);
+        // Named a deletion where it was seen to be one (D-10). On SQL `removes`
+        // comes only from statements the parser read, so this is never reached
+        // with it set.
+        return AgentVerdict::Refuse(if read.removes {
+            Refusal::Delete
+        } else {
+            Refusal::Unreadable
+        });
     }
 
     match statement_count(engine, sql, read.statements) {
         0 => return AgentVerdict::Refuse(Refusal::NoStatement),
         1 => {}
         _ => return AgentVerdict::Refuse(Refusal::MoreThanOne),
+    }
+
+    // `classify` rates a command that is never sent a read, so only the parse
+    // tells it from one that is.
+    if read.unsent {
+        return AgentVerdict::Refuse(Refusal::NotSent);
     }
 
     for (kind, refusal) in [
@@ -163,6 +190,13 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     }
     if read.alters {
         return AgentVerdict::Refuse(Refusal::Alter);
+    }
+
+    if read.scripts {
+        return AgentVerdict::Refuse(Refusal::Script);
+    }
+    if read.discloses {
+        return AgentVerdict::Refuse(Refusal::Disclosure);
     }
 
     // Judged by the statements' own kinds and by the tokens, never by
@@ -260,6 +294,7 @@ fn statement_count(engine: Engine, sql: &str, typed: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Syntax;
 
     fn sql_engines() -> impl Iterator<Item = Engine> {
         Engine::ALL
@@ -276,6 +311,305 @@ mod tests {
             needed: Mode::ReadWrite,
             held: Mode::ReadOnly,
         })
+    }
+
+    fn redis(text: &str, mode: Mode) -> AgentVerdict {
+        agent_gate(Engine::Redis, text, mode)
+    }
+
+    /// `text` answers `expected` in every mode.
+    fn redis_always(text: &str, expected: AgentVerdict) {
+        for mode in Mode::ALL {
+            assert_eq!(redis(text, mode), expected, "{mode:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn redis_commands_the_editor_never_sends_are_refused() {
+        for text in [
+            "SELECT 1",
+            "select 1",
+            "SUBSCRIBE n",
+            "PSUBSCRIBE n*",
+            "SSUBSCRIBE s",
+            "MONITOR",
+            "SYNC",
+            "PSYNC ? -1",
+            "HELLO 2",
+            "RESET",
+            "QUIT",
+            "CLIENT REPLY OFF",
+            "client reply off",
+        ] {
+            redis_always(text, refused(Refusal::NotSent));
+        }
+    }
+
+    #[test]
+    fn every_redis_removal_is_refused_as_a_delete() {
+        for text in [
+            "DEL k",
+            "UNLINK k",
+            "GETDEL k",
+            "DELEX k",
+            "HDEL h f",
+            "HGETDEL h FIELDS 1 f",
+            "LPOP l",
+            "RPOP l",
+            "BLPOP l 1",
+            "BRPOP l 1",
+            "LMPOP 1 l LEFT",
+            "BLMPOP 1 1 l LEFT",
+            "LREM l 0 v",
+            "LTRIM l 0 0",
+            "SREM s m",
+            "SPOP s",
+            "ZREM z m",
+            "ZPOPMIN z",
+            "ZPOPMAX z",
+            "BZPOPMIN z 1",
+            "BZPOPMAX z 1",
+            "ZMPOP 1 z MIN",
+            "BZMPOP 1 1 z MIN",
+            "ZREMRANGEBYRANK z 0 1",
+            "ZREMRANGEBYSCORE z 0 1",
+            "ZREMRANGEBYLEX z - +",
+            "XDEL s 1-1",
+            "XTRIM s MAXLEN 0",
+            "XACKDEL s g IDS 1 1-1",
+            "XDELEX s IDS 1 1-1",
+            "JSON.DEL d $",
+            "JSON.FORGET d $",
+            "JSON.CLEAR d $",
+            "JSON.ARRPOP d $",
+            "JSON.ARRTRIM d $ 0 1",
+            "TS.DEL t 0 1",
+            "TS.DELETERULE a b",
+            "CF.DEL c i",
+            "FT.ALIASDEL a",
+            "FT.DICTDEL d t",
+            "FT.SUGDEL k s",
+            "VREM v e",
+            "TDIGEST.RESET t",
+            "XGROUP DESTROY s g",
+            "XGROUP DELCONSUMER s g c",
+            "MIGRATE h 6379 k 0 1000",
+            "EXPIRE k 0",
+            "EXPIRE k -1",
+            "EXPIRE k 010",
+            "PEXPIRE k 0",
+            "HEXPIRE k 0 FIELDS 1 f",
+            "HPEXPIRE k 0 FIELDS 1 f",
+            "del k",
+        ] {
+            redis_always(text, refused(Refusal::Delete));
+        }
+    }
+
+    #[test]
+    fn redis_scripts_are_refused_including_the_read_only_forms() {
+        for text in [
+            "EVAL \"return 1\" 0",
+            "EVALSHA abc 0",
+            "FCALL f 0",
+            "EVAL_RO \"return 1\" 0",
+            "EVALSHA_RO abc 0",
+            "FCALL_RO f 0",
+            "SCRIPT LOAD \"return 1\"",
+            "FUNCTION LOAD \"#!lua name=x\"",
+        ] {
+            redis_always(text, refused(Refusal::Script));
+        }
+    }
+
+    #[test]
+    fn a_redis_transaction_or_two_commands_is_refused() {
+        redis_always("MULTI\nSET k v\nEXEC", refused(Refusal::MoreThanOne));
+        redis_always("GET a\nGET b", refused(Refusal::MoreThanOne));
+        redis_always("MONITOR\nGET a", refused(Refusal::MoreThanOne));
+        for text in [
+            "MULTI", "EXEC", "DISCARD", "WATCH k", "AUTH u p", "READONLY",
+        ] {
+            redis_always(text, refused(Refusal::Session));
+        }
+        redis_always("CLIENT SETNAME me", refused(Refusal::Session));
+        redis_always("", refused(Refusal::NoStatement));
+        redis_always("# note", refused(Refusal::NoStatement));
+    }
+
+    #[test]
+    fn redis_overwrites_and_other_writes_are_approvable() {
+        for text in [
+            "SET k v",
+            "HSET h f v",
+            "EXPIRE k 10",
+            "PERSIST k",
+            "EXPIREAT k 1",
+            "PEXPIREAT k 1",
+            "RENAME a b",
+            "SINTERSTORE d a b",
+            "COPY a b REPLACE",
+            "LMOVE a b LEFT RIGHT",
+            "SMOVE a b m",
+        ] {
+            assert_eq!(redis(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    redis(text, mode),
+                    AgentVerdict::Approve(Verdict::WRITE),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redis_commands_that_return_credentials_are_refused() {
+        for text in [
+            "CONFIG GET requirepass",
+            "CONFIG GET masterauth",
+            "CONFIG GET *",
+            "config get maxmemory",
+            "CLIENT LIST",
+            "CLIENT LIST TYPE normal",
+        ] {
+            redis_always(text, refused(Refusal::Disclosure));
+        }
+        for text in ["CONFIG HELP", "CLIENT INFO", "CLIENT GETNAME"] {
+            redis_always(text, AgentVerdict::Run);
+        }
+    }
+
+    #[test]
+    fn redis_reads_run_and_drops_are_refused_by_name() {
+        for text in ["GET k", "KEYS *", "SCAN 0", "TTL k"] {
+            redis_always(text, AgentVerdict::Run);
+        }
+        for text in [
+            "FLUSHDB",
+            "FLUSHALL",
+            "CONFIG SET maxmemory 1",
+            "SHUTDOWN",
+            "FUNCTION DELETE f",
+        ] {
+            redis_always(text, refused(Refusal::Drop));
+        }
+    }
+
+    fn mongodb(text: &str, mode: Mode) -> AgentVerdict {
+        agent_gate(Engine::MongoDb, text, mode)
+    }
+
+    /// `text` answers `expected` in every mode.
+    fn mongodb_always(text: &str, expected: AgentVerdict) {
+        for mode in Mode::ALL {
+            assert_eq!(mongodb(text, mode), expected, "{mode:?}: {text}");
+        }
+    }
+
+    const MONGODB_REMOVE_CALLS: [&str; 6] = [
+        "db.c.remove({})",
+        "db.c.remove({a: 1})",
+        "db.c.remove({a: 1}, true)",
+        "db.c.remove({a: 1}, {justOne: true})",
+        r#"db.getCollection("c").remove({})"#,
+        r#"db.getSiblingDB("x").c.remove({})"#,
+    ];
+
+    #[test]
+    fn every_mongodb_removal_is_refused_as_a_delete() {
+        for text in [
+            "db.c.deleteOne({_id: 1})",
+            "db.c.deleteMany({a: 1})",
+            "db.c.deleteMany({})",
+            "db.c.findOneAndDelete({a: 1})",
+            r#"db.runCommand({delete: "c", deletes: [{q: {a: 1}, limit: 1}]})"#,
+            r#"db.adminCommand({delete: "c", deletes: [{q: {a: 1}, limit: 0}]})"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, remove: true})"#,
+        ]
+        .into_iter()
+        .chain(MONGODB_REMOVE_CALLS)
+        {
+            mongodb_always(text, refused(Refusal::Delete));
+        }
+        // The human path still cannot read a `remove`: only the agent path
+        // names what it is seen to do.
+        for text in MONGODB_REMOVE_CALLS {
+            assert_eq!(
+                super::super::classify(Engine::MongoDb, text).destructive,
+                [Destructive::Unreadable],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mongodb_javascript_is_refused_as_a_script() {
+        for text in [
+            r#"db.c.find({$where: "1"})"#,
+            r#"db.c.find({$expr: {$function: {body: "1", args: [], lang: "js"}}})"#,
+            r#"db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}])"#,
+        ] {
+            mongodb_always(text, refused(Refusal::Script));
+        }
+    }
+
+    #[test]
+    fn two_mongodb_calls_are_more_than_one_statement() {
+        mongodb_always("db.c.find(); db.c.find()", refused(Refusal::MoreThanOne));
+        mongodb_always(
+            "db.c.deleteMany({}); db.c.find()",
+            refused(Refusal::MoreThanOne),
+        );
+        mongodb_always("", refused(Refusal::NoStatement));
+        mongodb_always("// nothing", refused(Refusal::NoStatement));
+    }
+
+    #[test]
+    fn mongodb_writes_that_remove_nothing_are_approvable() {
+        for text in [
+            "db.c.insertOne({a: 1})",
+            "db.c.insertMany([{a: 1}])",
+            "db.c.updateOne({a: 1}, {$set: {a: 2}})",
+            "db.c.updateMany({a: 1}, {$set: {a: 2}})",
+            "db.c.replaceOne({a: 1}, {a: 2})",
+            "db.c.findOneAndUpdate({a: 1}, {$set: {a: 2}})",
+            "db.c.findOneAndReplace({a: 1}, {a: 2})",
+            "db.c.createIndex({a: 1})",
+            r#"db.c.aggregate([{$match: {a: 1}}, {$merge: {into: "x"}}])"#,
+            r#"db.c.renameCollection("x")"#,
+            r#"db.c.renameCollection("x", false)"#,
+            r#"db.runCommand({findAndModify: "c", query: {a: 1}, update: {$set: {a: 2}}})"#,
+        ] {
+            assert_eq!(mongodb(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    mongodb(text, mode),
+                    AgentVerdict::Approve(Verdict::WRITE),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mongodb_reads_run_and_drops_are_refused_by_name() {
+        for text in [
+            "db.c.find({a: 1})",
+            "db.c.countDocuments({})",
+            "db.c.aggregate([{$match: {a: 1}}])",
+            "show collections",
+        ] {
+            mongodb_always(text, AgentVerdict::Run);
+        }
+        for text in [
+            "db.c.drop()",
+            "db.dropDatabase()",
+            r#"db.c.aggregate([{$out: "x"}])"#,
+            r#"db.c.renameCollection("x", true)"#,
+        ] {
+            mongodb_always(text, refused(Refusal::Drop));
+        }
     }
 
     #[test]
@@ -866,6 +1200,7 @@ mod tests {
             (Refusal::NoStatement, "there is no statement to run"),
             (Refusal::MoreThanOne, "more than one statement"),
             (Refusal::Unreadable, "DBDelve can't read this statement"),
+            (Refusal::NotSent, "DBDelve never sends this command"),
             (Refusal::Drop, "DROP is refused for agent statements"),
             (
                 Refusal::Truncate,
@@ -882,6 +1217,14 @@ mod tests {
             (
                 Refusal::Session,
                 "statements that change the session are refused for agent statements",
+            ),
+            (
+                Refusal::Script,
+                "server-side scripts are refused for agent statements",
+            ),
+            (
+                Refusal::Disclosure,
+                "commands that return credentials or other clients' details are refused for agent statements",
             ),
             (
                 Refusal::NeedsFull,
@@ -908,7 +1251,7 @@ mod tests {
             }
             seen.push(said);
         }
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), 13);
     }
 
     #[test]
