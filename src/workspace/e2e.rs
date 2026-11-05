@@ -14,9 +14,10 @@ use crate::{
     actions::{CancelQuery, ImportRowsFromClipboard},
     connection_form::ConnectionForm,
     db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, SshTunnel},
+    explain::analysis::Basis,
     explorer, keybindings,
     palette::{Mode as PaletteMode, Scope},
-    session::{CatalogState, ObjectBody, QueryState, QueryTab},
+    session::{CatalogState, ObjectBody, QueryState, QueryTab, Tab},
     store,
     theme::{self, Fonts},
 };
@@ -208,6 +209,185 @@ fn a_query_typed_and_run_from_the_keyboard_lands_its_rows(cx: &mut TestAppContex
             QueryState::Failed(error) => panic!("the query failed: {error}"),
             _ => panic!("the query never completed"),
         });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_explained_query_lands_a_plan_that_names_its_engine_and_basis(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "CREATE TABLE t (a INTEGER)");
+
+        cx.simulate_input("select * from t where a = 1");
+        cx.simulate_keystrokes("secondary-shift-enter");
+        // `settle` draws a frame, which is what renders the plan the answer
+        // landed: a panic in `render_plan` fails here.
+        settle(cx);
+
+        query_tab(&workspace, cx, |tab, _, _| {
+            let explained = tab
+                .plan
+                .as_ref()
+                .expect("the Explain command landed a plan");
+            assert_eq!(explained.analysis.basis, Basis::Structure);
+            assert_eq!(explained.analysis.label, "SQLite · structure only");
+            assert!(!explained.analysis.nodes.is_empty());
+            assert!(
+                explained
+                    .analysis
+                    .nodes
+                    .iter()
+                    .all(|node| node.share.is_none())
+            );
+            assert!(tab.showing_plan);
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// A server's answer to an explain: its columns and its rows.
+type Answer = (Vec<String>, Vec<crate::db::Row>);
+
+/// One `QUERY PLAN` cell, as Postgres answers.
+fn postgres_plan(text: &str) -> Answer {
+    (
+        vec!["QUERY PLAN".to_string()],
+        crate::db::rows(vec![vec![Some(text.to_string())]]),
+    )
+}
+
+/// A MongoDB `explain` reply as the driver hands it back: one column per
+/// top-level key.
+fn mongo_reply(json: &str) -> Answer {
+    let reply: mongodb::bson::Document =
+        serde_json::from_str(json).expect("the reply is valid JSON");
+    let columns = reply.keys().cloned().collect();
+    let row = crate::db::Row::new(reply.values().map(|value| match value {
+        mongodb::bson::Bson::String(text) => Some(text.clone()),
+        other => serde_json::to_string(other).ok(),
+    }))
+    .expect("the reply fits a row");
+    (columns, vec![row])
+}
+
+#[gpui::test]
+fn every_kind_of_plan_draws_its_bars_and_chips_without_panicking(cx: &mut TestAppContext) {
+    use crate::{db::ExplainMode, explain::analysis::Tier, session::Explained};
+
+    let sqlite_columns = ["id", "parent", "notused", "detail"].map(str::to_string);
+    let sqlite_rows = crate::db::rows(vec![
+        vec![
+            Some("2".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("SCAN t".to_string()),
+        ],
+        vec![
+            Some("5".to_string()),
+            Some("2".to_string()),
+            Some("0".to_string()),
+            Some("USE TEMP B-TREE FOR ORDER BY".to_string()),
+        ],
+    ]);
+    let plain = "Limit  (cost=0.00..10.00 rows=10 width=8)
+  ->  Seq Scan on a  (cost=0.00..100.00 rows=1000 width=8)";
+    let stats = r#"{"queryPlanner":{"winningPlan":{"stage":"LIMIT","inputStage":{"stage":"IXSCAN","indexName":"_id_"}}},"executionStats":{"nReturned":3,"executionStages":{"stage":"LIMIT","nReturned":3,"executionTimeMillisEstimate":4,"inputStage":{"stage":"IXSCAN","nReturned":3,"executionTimeMillisEstimate":1,"indexName":"_id_"}}},"ok":1}"#;
+
+    let mut plans: Vec<(&str, Engine, ExplainMode, Answer)> = Vec::new();
+    for (name, text) in [
+        (
+            "parallel",
+            include_str!("../testdata/plan-postgres-parallel.txt"),
+        ),
+        (
+            "cte",
+            include_str!("../testdata/plan-postgres-cte-subplan.txt"),
+        ),
+        ("spill", include_str!("../testdata/plan-postgres-spill.txt")),
+        ("large", include_str!("../testdata/plan-postgres-large.txt")),
+    ] {
+        plans.push((
+            name,
+            Engine::Postgres,
+            ExplainMode::Analyze,
+            postgres_plan(text),
+        ));
+    }
+    plans.push((
+        "cost",
+        Engine::Postgres,
+        ExplainMode::Plan,
+        postgres_plan(plain),
+    ));
+    plans.push((
+        "structure",
+        Engine::Sqlite,
+        ExplainMode::Plan,
+        (sqlite_columns.to_vec(), sqlite_rows),
+    ));
+    plans.push((
+        "empty",
+        Engine::Postgres,
+        ExplainMode::Plan,
+        postgres_plan(""),
+    ));
+    plans.push((
+        "mongo",
+        Engine::MongoDb,
+        ExplainMode::Analyze,
+        mongo_reply(stats),
+    ));
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+
+        for (name, engine, mode, (columns, rows)) in plans {
+            let plan = crate::explain::parse(&columns, &rows);
+            let explained = Explained::new(
+                engine,
+                plan,
+                mode,
+                "select 1".to_string(),
+                false,
+                columns,
+                rows,
+            );
+            if name == "parallel" {
+                // A drawing test that only checks for a panic would pass on a
+                // plan that is one flat colour, so the fixture has to give the
+                // bars something to tell apart.
+                let mut tiers: Vec<Tier> = Vec::new();
+                for tier in explained.analysis.nodes.iter().filter_map(|node| node.tier) {
+                    if !tiers.contains(&tier) {
+                        tiers.push(tier);
+                    }
+                }
+                assert!(tiers.len() >= 2, "{name} drew {tiers:?}");
+                assert!(tiers.contains(&Tier::Quiet));
+            }
+            workspace.update(cx, |workspace, cx| {
+                let session = &mut workspace
+                    .profile_mut()
+                    .expect("the SQLite profile is active")
+                    .session;
+                let Tab::Query(id) = session.active else {
+                    panic!("a fresh profile opens on a query tab");
+                };
+                let tab = session
+                    .query_tab_mut(id)
+                    .expect("the active query tab exists");
+                tab.plan = Some(explained);
+                tab.showing_plan = true;
+                cx.notify();
+            });
+            // `settle` draws a frame, which runs `render_plan` on this plan.
+            settle(cx);
+            query_tab(&workspace, cx, |tab, _, _| {
+                assert!(tab.plan_shown().is_some(), "{name} was not in front");
+            });
+        }
 
         quit(workspace, cx);
     });

@@ -1933,15 +1933,25 @@ fn command_reads(command: &Value) -> bool {
     }
 }
 
-/// What a `$out` or `$merge` anywhere in `value` does. `$out` replaces its
-/// target collection whole, as `CREATE OR REPLACE TABLE … AS SELECT` does, so
-/// it is a drop; `$merge` writes into what is there.
+/// The operators that run JavaScript inside the database process. Rated Full,
+/// not Write: arbitrary code in the server is a different order of thing from
+/// a write, and a Read-write profile would run it with no prompt at all.
+/// Two rules read this list -- [`out_verdict`] and the filter bar's
+/// `browse::runs_code` -- so an operator added here reaches both.
+const JS_OPERATORS: &[&str] = &["$where", "$function", "$accumulator"];
+
+/// What a `$out`, `$merge` or JavaScript operator anywhere in `value` does.
+/// `$out` replaces its target collection whole, as `CREATE OR REPLACE TABLE …
+/// AS SELECT` does, so it is a drop; `$merge` writes into what is there.
 fn out_verdict(value: &Value) -> Verdict {
     match value {
         Value::Document(fields) => fields.iter().fold(Verdict::READ, |verdict, (key, value)| {
             let stage = match key.as_str() {
                 "$out" => Verdict::destroys(Destructive::Drop),
                 "$merge" => Verdict::WRITE,
+                // Not `browse::runs_code`, which also flags a string where
+                // `$or` wants documents -- the filter bar's rule, not this one.
+                operator if JS_OPERATORS.contains(&operator) => Verdict::FULL,
                 _ => Verdict::READ,
             };
             verdict.max(stage).max(out_verdict(value))
@@ -4125,6 +4135,30 @@ mod tests {
             "db.runCommand({aggregate: 'c', pipeline: [{$merge: {into: 'd'}}]})",
         ] {
             assert_eq!(classify(text), Verdict::WRITE, "{text}");
+        }
+    }
+
+    #[test]
+    fn javascript_operators_need_full_at_any_depth_and_in_every_call_shape() {
+        for text in [
+            "db.c.find({$where: 'sleep(1000)'})",
+            "db.c.aggregate([{$addFields: {x: {$function: {body: 'f', args: [], lang: 'js'}}}}])",
+            "db.c.aggregate([{$group: {_id: 1, x: {$accumulator: {init: 'f', accumulate: 'g', accumulateArgs: [], merge: 'h', lang: 'js'}}}}])",
+            "db.c.find({$and: [{a: {$or: [{$where: '1'}]}}]})",
+            "db.c.aggregate([{$lookup: {from: 'o', pipeline: [{$match: {$where: '1'}}], as: 'z'}}])",
+            "db.c.find({}).hint({$where: '1'})",
+            "db.runCommand({find: 'c', filter: {$where: '1'}})",
+            "db.runCommand({aggregate: 'c', pipeline: [{$match: {$where: '1'}}], cursor: {}})",
+            "db.c.find({\"\\u0024where\": '1'})",
+        ] {
+            assert_eq!(classify(text), Verdict::FULL, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_string_where_or_wants_documents_is_still_a_read_in_a_typed_statement() {
+        for text in ["db.c.find({$or: 'x'})", "db.c.find({a: '$where'})"] {
+            assert_eq!(classify(text), Verdict::READ, "{text}");
         }
     }
 
