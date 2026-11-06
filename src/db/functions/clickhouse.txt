@@ -1,4 +1,4 @@
-# ClickHouse 26.10.3.7 system.functions, minus the categories Other, Internal, Introspection, Machine Learning, AI, Dictionary, Embedded Dictionary and Natural Language Processing and the names ai*, sleep, sleepEachRow and throwIf, plus the local table functions.
+# ClickHouse 26.10.3.7 system.functions, minus the categories Other, Internal, Introspection, Machine Learning, AI, Dictionary, Embedded Dictionary and Natural Language Processing and the names ai*, sleep, sleepEachRow and throwIf, currentDatabase and version (category Other on 26.8), plus the local table functions.
 # Names are matched as spelled (case_sensitive_functions): a case-insensitive built-in is listed as lower and UPPER, a case-sensitive one in its one exact spelling.
 # Pinned by live_every_listed_built_in_is_a_system_function_or_a_local_table_function.
 ABS
@@ -567,7 +567,6 @@ countsubstrings
 crc32
 crc32ieee
 crc64
-currentDatabase
 current_catalog
 current_date
 current_schema
@@ -1618,7 +1617,6 @@ user
 values
 vectordifference
 vectorsum
-version
 view
 visitParamExtractBool
 visitParamExtractFloat
