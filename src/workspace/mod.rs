@@ -39,6 +39,7 @@ pub(crate) use profiles::unavailable_reason;
 pub(crate) use projects::project_name_refusal;
 pub(crate) use queries::error_in_buffer;
 
+use crate::actions::DisconnectAgents;
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
@@ -530,6 +531,10 @@ impl Workspace {
         };
 
         let mut load_failure = None;
+        // Read once, here, to decide whether to listen. The window keeps no
+        // copy: a saved one is what would write `true` back over another
+        // window's kill switch (see `agent_access_to_save`).
+        let mut listen_at_launch = false;
         match store::load_profiles(&workspace.plugins) {
             Ok(store::ProfileList {
                 profiles,
@@ -542,6 +547,7 @@ impl Workspace {
                 // Before the first frame, so the window is drawn in the faces
                 // the user picked rather than repainted into them.
                 let stored_settings = stored_settings.unwrap_or_default();
+                listen_at_launch = stored_settings.agent_access.unwrap_or(false);
                 // Ahead of the fonts and the theme, which size gpui-component's
                 // widgets off the chrome size as they install.
                 let chrome_font_size =
@@ -683,6 +689,12 @@ impl Workspace {
         if let Some(message) = load_failure {
             workspace.note(message, cx);
         }
+        // A refusal is shown and nothing saved changes: the choice is the
+        // user's, and a window that found another one serving can be asked
+        // again from the palette.
+        if listen_at_launch && let Err(text) = workspace.listen_for_agents(cx) {
+            workspace.note(text, cx);
+        }
 
         if workspace.settings.check_for_updates {
             let check = spawn_blocking(cx.background_executor(), update::newer_release);
@@ -764,14 +776,21 @@ impl Workspace {
 
         // Finish writes synchronously: the process is going, and nothing
         // would wait for background work to finish.
+        //
+        // The agent socket file goes with the window; the user's choice stays
+        // saved, so the next launch listens again only if access was on.
         cx.on_app_quit(|workspace: &mut Self, cx: &mut Context<Self>| {
             workspace.persist_buffers(cx);
+            workspace.drop_bridge();
             async {}
         })
         .detach();
         // Window release also persists when the window closes without Quit.
-        cx.on_release(|workspace, cx| workspace.persist_buffers(cx))
-            .detach();
+        cx.on_release(|workspace, cx| {
+            workspace.persist_buffers(cx);
+            workspace.drop_bridge();
+        })
+        .detach();
 
         workspace.connect_active(cx);
         workspace
@@ -842,6 +861,15 @@ impl Workspace {
             Some(profile) => profile.session.editor_needs_focus = true,
             None => self.welcome_needs_focus = true,
         }
+    }
+
+    fn disconnect_agents_action(
+        &mut self,
+        _: &DisconnectAgents,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.disconnect_agents(cx);
     }
 
     pub(crate) fn note(&mut self, message: String, cx: &mut Context<Self>) {
@@ -1388,6 +1416,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::submit_connection))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::next_profile))
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
@@ -1423,6 +1452,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::open_connection_form))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
@@ -2216,6 +2246,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::rollback_transaction))
             .on_action(cx.listener(Self::switch_connection))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::disconnect_agents_action))
             .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
             // Unregistered under the import dialog, which stops only the

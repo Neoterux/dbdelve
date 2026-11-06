@@ -28,9 +28,9 @@ use crate::{
     actions::{
         AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab,
         CommandPalette, CommitTransaction, ConfirmDialog, CopyCell, CopyPlan, CopyResults, CopyRow,
-        CopyRows, CopySelection, CycleMode, DeleteRow, DiscardEdits, EditCell, ExplainQuery,
-        FocusSidebar, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn,
-        ImportConnections, ImportRows, ImportRowsFromClipboard, Minimize, MoveTabLeft,
+        CopyRows, CopySelection, CycleMode, DeleteRow, DiscardEdits, DisconnectAgents, EditCell,
+        ExplainQuery, FocusSidebar, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
+        HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, Minimize, MoveTabLeft,
         MoveTabRight, NewConnection, NewProject, NewQuery, NewRow, NextDialogButton, NextEdit,
         NextPage, NextProfile, NextResult, NextTab, OpenSettings, OpenSidebarItem,
         PaletteHistoryFilter, PaletteHistorySort, PaletteNext, PaletteNextScope, PalettePrevious,
@@ -225,6 +225,8 @@ registry! {
     ("previous_dialog_button", "Dialog: Previous Button", Some("Dialog"), ["left", "shift-tab"], PreviousDialogButton),
     ("next_dialog_button", "Dialog: Next Button", Some("Dialog"), ["right", "tab"], NextDialogButton),
     ("toggle_sidebar", "Toggle Sidebar", None, ["secondary-shift-s"], ToggleSidebar),
+    // The kill switch for agent access. Unscoped, so it fires wherever focus is.
+    ("disconnect_agents", "Disconnect Agents", None, ["secondary-shift-k"], DisconnectAgents),
     ("toggle_row_panel", "Toggle Row Panel", None, ["secondary-shift-i"], ToggleRowPanel),
     ("toggle_row_edit", "Toggle Row Panel Edit Mode", None, ["secondary-shift-e"], ToggleRowEdit),
     ("toggle_structure", "Toggle Data / Structure", None, ["secondary-shift-d"], ToggleStructure),
