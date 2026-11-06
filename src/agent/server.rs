@@ -253,35 +253,68 @@ fn call(
     if inbound.send(call).is_err() {
         return;
     }
-    watch_for_hangup(stream, id, inbound);
+    let gone = Arc::new(AtomicBool::new(false));
+    watch_for_hangup(stream, id, &gone, inbound);
     // A dropped sender is a call that ended without an answer: nothing is
     // written, and the stream closing is what the caller sees.
-    match answers.recv() {
-        Ok(reply) => answer(stream, &reply),
-        Err(_) => {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
+    if let Ok(reply) = answers.recv()
+        && !deliver(stream, &reply, &gone)
+    {
+        let _ = inbound.send(Inbound::Undelivered { id });
     }
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// Tell the window when the caller goes. The caller sends nothing after its
-/// first frame, so any result of a read, a byte, an end or an error, means it
-/// has gone; and the thread's own end comes when the call's stream is closed.
-/// A call this cannot watch still ends by its expiry.
-fn watch_for_hangup(stream: &UnixStream, id: CallId, inbound: &UnboundedSender<Inbound>) {
+/// Tell the window when the caller goes, after setting `gone` for the writer.
+/// The caller sends nothing after its first frame, so any result of a read, a
+/// byte, an end or an error, means it has gone; and the thread's own end comes
+/// when the call's stream is closed. A call this cannot watch still ends by
+/// its expiry.
+fn watch_for_hangup(
+    stream: &UnixStream,
+    id: CallId,
+    gone: &Arc<AtomicBool>,
+    inbound: &UnboundedSender<Inbound>,
+) {
     let Ok(watching) = stream.try_clone() else {
         return;
     };
     let inbound = inbound.clone();
+    let gone = gone.clone();
     let _ = thread::Builder::new()
         .name("dbdelve-agent-hangup".to_string())
         .spawn(move || {
             let mut reader = &watching;
             let _ = reader.read(&mut [0u8; 1]);
+            // Before the window hears of it, so an answer the window gives in
+            // between is known to have no one to go to.
+            gone.store(true, Ordering::Release);
             let _ = inbound.send(Inbound::Hangup { id });
         });
 }
 
+/// Write the answer, unless the caller is known to have left. Answers whether
+/// it reached a caller that was still there.
+///
+/// There are two ways to know. `gone` is what the hangup reader saw, and it
+/// spares the write. The write itself is the other: a caller that left after
+/// the flag was read has closed its end, and Rust ignores `SIGPIPE`, so the
+/// write fails with `EPIPE` instead of ending the process.
+///
+/// The stream stays as it is and is never read here: the hangup reader holds a
+/// handle on the same open file description, so changing how this one blocks
+/// would change that read too, and it would return at once and read as a
+/// hangup.
+fn deliver(stream: &UnixStream, reply: &Reply, gone: &AtomicBool) -> bool {
+    if gone.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut writer = stream;
+    writer.write_all(wire::encode(reply).as_bytes()).is_ok()
+}
+
+/// A refusal written before the call was ever handed to the window, so there is
+/// no window to tell if nobody reads it.
 fn answer(stream: &UnixStream, reply: &Reply) {
     let mut writer = stream;
     // The caller may have hung up already, and then nobody reads this.
@@ -479,6 +512,77 @@ mod tests {
         assert!(matches!(
             rig.inbound.recv_timeout(Duration::from_secs(5)),
             Ok(Inbound::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn an_answer_written_to_a_caller_that_left_reports_undelivered() {
+        let rig = Rig::new(FIRST_FRAME_TIMEOUT);
+        let mut client = rig.client();
+        client
+            .write_all(b"{\"v\":1,\"kind\":\"call\",\"tool\":\"list_connections\"}\n")
+            .expect("the frame is sent");
+        let Ok(Inbound::Call { id, reply, .. }) = rig.inbound.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("the call reaches the window");
+        };
+
+        // Closed, not half-closed: the caller is gone. The reader sets the
+        // flag before it sends the hangup, so once the window has heard it the
+        // answer is known to have no one to go to, and none is written.
+        drop(client);
+        let Ok(Inbound::Hangup { id: hung_up }) = rig.inbound.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("the hangup reaches the window");
+        };
+        assert_eq!(hung_up, id);
+        reply
+            .send(Reply {
+                status: Status::Executed,
+                text: "late".to_string(),
+            })
+            .expect("the writer still waits for its answer");
+        let Ok(Inbound::Undelivered { id: undelivered }) =
+            rig.inbound.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("the window is told the answer found no one");
+        };
+        assert_eq!(undelivered, id);
+    }
+
+    #[test]
+    fn an_answer_to_a_closed_peer_is_not_delivered() {
+        let reply = Reply {
+            status: Status::Executed,
+            text: "answer".to_string(),
+        };
+        let frame = wire::encode(&reply);
+
+        // Open peer, flag clear: written, and the peer reads the frame.
+        let (server, mut peer) = UnixStream::pair().expect("a pair of sockets");
+        let gone = AtomicBool::new(false);
+        assert!(deliver(&server, &reply, &gone));
+        let mut read = vec![0u8; frame.len()];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is set");
+        peer.read_exact(&mut read)
+            .expect("the peer reads the frame");
+        assert_eq!(read, frame.as_bytes());
+
+        // Peer gone, flag clear: the write itself fails.
+        drop(peer);
+        assert!(!deliver(&server, &reply, &gone));
+
+        // Flag set, peer open: nothing is written.
+        let (server, mut peer) = UnixStream::pair().expect("a pair of sockets");
+        let gone = AtomicBool::new(true);
+        assert!(!deliver(&server, &reply, &gone));
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("the timeout is set");
+        let silent = peer.read(&mut [0u8; 1]).expect_err("nothing was written");
+        assert!(matches!(
+            silent.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
         ));
     }
 

@@ -308,6 +308,47 @@ pub(crate) fn update_pill(t: Theme, version: &str) -> Button {
         )
 }
 
+/// What the titlebar's agent mark says. There is no third state here: with
+/// agent access off nothing is drawn at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentMark {
+    /// DBDelve is listening and no agent is attached.
+    Listening,
+    /// An agent is attached or a call is waiting; `waiting` is how many calls
+    /// wait on the person at the window.
+    Connected { waiting: usize },
+}
+
+/// The agent mark: the MCP logo, dim while DBDelve only listens and lit once an agent
+/// is there, with the number of calls waiting beside it when there are any.
+///
+/// A `Button` like [`mode_pill`], so the titlebar can hang its popover off it.
+/// Drawn still: nothing here moves.
+pub(crate) fn agent_mark(t: Theme, mark: AgentMark) -> Button {
+    let (color, selector, waiting) = match mark {
+        AgentMark::Listening => (t.text_muted, "agent-mark-listening", 0),
+        AgentMark::Connected { waiting } => (t.accent, "agent-mark-connected", waiting),
+    };
+    control("agent-mark", Tone::Quiet, Control::Compact)
+        .px(px(layout::SPACE_SM))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .child(
+            div()
+                .debug_selector(|| selector.into())
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .text_size(px(layout::chrome(layout::TEXT_XS)))
+                .text_color(color)
+                .child(
+                    icon(icon::AGENT_MARK)
+                        .size(px(layout::chrome(layout::ICON_SIZE)))
+                        .text_color(color),
+                )
+                .when(waiting > 0, |mark| mark.child(waiting.to_string())),
+        )
+}
+
 /// macOS draws its window buttons over a transparent titlebar, and Windows
 /// draws none at all into one, so both leave the strip to dbdelve. Linux asks
 /// for the system bar, and draws its own only where the compositor declines to

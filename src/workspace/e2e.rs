@@ -4862,3 +4862,540 @@ fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+#[cfg(unix)]
+fn agent_mark_state(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::ui::AgentMark> {
+    workspace.read_with(cx, |workspace, _| workspace.agent_mark_state())
+}
+
+/// Whether the mark drew itself in the last frame, in either state.
+#[cfg(unix)]
+fn agent_mark_drawn(cx: &mut VisualTestContext) -> bool {
+    cx.debug_bounds("agent-mark-listening").is_some()
+        || cx.debug_bounds("agent-mark-connected").is_some()
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{ConnId, Inbound, tools::Tool},
+        ui::AgentMark,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+
+        assert!(!agent_mark_drawn(cx), "access is off");
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        assert!(cx.debug_bounds("agent-mark-connected").is_none());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 })
+        );
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+        assert!(cx.debug_bounds("agent-mark-listening").is_none());
+
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 1 })
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceClosed { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+        assert!(!agent_mark_drawn(cx), "the kill switch takes the mark away");
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_in_every_titlebar(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        // No saved profile: the welcome surface, unless the runner's `PG*`
+        // variables put a profile in front, which has the main titlebar.
+        let (workspace, cx) = launch_with_settings(cx, "agent_access = true", "");
+        cx.executor().allow_parking();
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+
+        // A profile in front, then the connection form over it.
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::NewConnection);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.form.is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_lights_when_a_running_shim_finds_access_turned_on(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::ui::AgentMark;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let presence = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        // Claude Code already has DBDelve loaded: the shim runs and retries
+        // against a socket nothing listens at.
+        let shim = crate::agent::shim::testing::idle_shim(path, Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
+        settle(cx);
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        drive_until(cx, |cx| {
+            agent_mark_state(&workspace, cx) == Some(AgentMark::Connected { waiting: 0 })
+        });
+        // No call was made: the agent is there because its shim is.
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(shim.lines_after_handshake().is_empty());
+        settle(cx);
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+        assert!(
+            !listening(&workspace, cx),
+            "the shim's retries bound nothing"
+        );
+
+        drop(shim);
+        quit(workspace, cx);
+    });
+}
+
+fn agent_log(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<super::agent::LogEntry> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.agent.log.iter().cloned().collect()
+    })
+}
+
+#[gpui::test]
+fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::agent::{EXPIRY, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (listed, _listed_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        // A name the agent made up, with a bell in it and far too long.
+        let made_up = format!("Nope\u{7}{}", "x".repeat(80));
+        let (refused, _refused_answers) = inject_call(&workspace, cx, Tool::Ping, Some(&made_up));
+        let (expired, _expired_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        cx.executor().advance_clock(EXPIRY + Duration::from_secs(1));
+        cx.run_until_parked();
+        let (hung_up, _hung_up_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: hung_up }, cx)
+        });
+        let (denied, _denied_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(denied, cx));
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter().map(|entry| entry.status).collect::<Vec<_>>(),
+            [
+                Status::Rejected,
+                Status::Cancelled,
+                Status::Expired,
+                Status::RefusedByGate,
+                Status::Executed
+            ]
+        );
+        assert_eq!(
+            log.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            [denied, hung_up, expired, refused, listed]
+        );
+        let asked = log[3]
+            .asked
+            .as_deref()
+            .expect("the refusal keeps what was asked");
+        assert_eq!(asked.chars().count(), 64);
+        assert!(asked.starts_with("Nope") && !asked.chars().any(char::is_control));
+        assert_eq!(log[3].resolved, None);
+        for entry in &log[..3] {
+            assert_eq!(entry.resolved.as_deref(), Some("Orders"));
+            assert_eq!(entry.asked, None);
+        }
+        // What `list_connections` answered is not kept: not the text, nor a
+        // name it listed.
+        assert_eq!((&log[4].resolved, &log[4].asked), (&None, &None));
+        assert!(!format!("{:?}", log[4]).contains("engine"));
+
+        for _ in 0..25 {
+            inject_call(&workspace, cx, Tool::ListConnections, None);
+        }
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::LOG_CAP);
+        let mut ids: Vec<_> = log.iter().map(|entry| entry.id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), super::agent::LOG_CAP, "a call was logged twice");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use crate::agent::{CallId, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.approve_ping(id, cx));
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, false)
+        );
+
+        // An id nothing logged is not a call this window answered.
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(
+                Inbound::Undelivered {
+                    id: CallId(u64::MAX),
+                },
+                cx,
+            )
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!((log.len(), log[0].requester_gone), (1, false));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Undelivered { id }, cx)
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, true)
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+
+        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
+        client
+            .write_all(format!("{PING_ORDERS}\n").as_bytes())
+            .expect("the frame is written");
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let id = pending_calls(&workspace, cx)[0];
+
+        // The caller leaves, and the window is not run while the socket's
+        // threads see it: the answer below is given before the hangup is
+        // delivered, which is the race.
+        drop(client);
+        std::thread::sleep(Duration::from_millis(100));
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.agent.calls.len(),
+                1,
+                "the hangup was delivered early, so this is not the race"
+            );
+            workspace.approve_ping(id, cx)
+        });
+        drive_until(cx, |cx| {
+            agent_log(&workspace, cx)
+                .iter()
+                .any(|entry| entry.id == id && entry.requester_gone)
+        });
+        cx.run_until_parked();
+        let entries: Vec<_> = agent_log(&workspace, cx)
+            .into_iter()
+            .filter(|entry| entry.id == id)
+            .collect();
+        assert_eq!(entries.len(), 1, "the late hangup logged the call again");
+        assert_eq!(entries[0].status, Status::Executed);
+        assert_eq!(agent_log(&workspace, cx).len(), 1);
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[test]
+fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
+    use super::{agent::LogEntry, agent_log_label};
+    use crate::agent::{CallId, Status, tools::Tool};
+
+    let entry = LogEntry {
+        at: 1_000_000,
+        id: CallId(1),
+        tool: Tool::Ping,
+        resolved: None,
+        asked: Some("Nope".to_string()),
+        status: Status::RefusedByGate,
+        requester_gone: false,
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000 + 125_000),
+        "2m ago \u{b7} ping \u{b7} asked for \"Nope\" \u{b7} refused_by_gate"
+    );
+    let entry = LogEntry {
+        resolved: Some("Orders".to_string()),
+        asked: None,
+        status: Status::Executed,
+        requester_gone: true,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} ping \u{b7} Orders \u{b7} executed \u{b7} no requester"
+    );
+    let entry = LogEntry {
+        resolved: None,
+        requester_gone: false,
+        tool: Tool::ListConnections,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} list_connections \u{b7} executed"
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_popover_turns_access_off(cx: &mut TestAppContext) {
+    use crate::agent::{ConnId, Inbound};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        let in_menu = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(!in_menu(cx));
+
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("an attached agent lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        assert!(in_menu(cx), "clicking the mark opened no menu");
+
+        // The kill switch is the only item that can be chosen. The menu's
+        // first step down always lands on its first row, a label, so the
+        // second is the one that reaches the item.
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        assert!(listening(&workspace, cx), "a label was chosen");
+        cx.simulate_keystrokes("down enter");
+        settle(cx);
+        assert!(!in_menu(cx));
+        assert!(!listening(&workspace, cx));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.presence.is_empty()));
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the_dialog(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        // The dialog stops under the titlebar, so the click reaches the mark.
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("a waiting call lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        let menu_open = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(
+            menu_open(cx),
+            "the dialog took the click meant for the mark"
+        );
+        assert_eq!(
+            answers.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Empty),
+            "opening the menu answered the ping"
+        );
+
+        // By the pointer: the dialog holds the keyboard while it is up, so a
+        // key meant for the menu is the dialog's, and `enter` there denies.
+        // The rows have no selector, so each try reopens the menu and clicks
+        // one row lower until the one item that acts is under the pointer; a
+        // click on a label or outside the menu only closes it.
+        for step in 0..12 {
+            if pending_calls(&workspace, cx).is_empty() {
+                break;
+            }
+            if !menu_open(cx) {
+                cx.simulate_click(mark.center(), gpui::Modifiers::default());
+                settle(cx);
+            }
+            let at = gpui::point(
+                mark.center().x,
+                mark.bottom() + gpui::px(14. + 8. * step as f32),
+            );
+            cx.simulate_click(at, gpui::Modifiers::default());
+            settle(cx);
+        }
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(crate::agent::Reply {
+                status: crate::agent::Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!listening(&workspace, cx));
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_click_on_the_ping_backdrop_below_the_titlebar_does_not_approve(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        let just_below_the_titlebar = gpui::point(
+            gpui::px(12.),
+            gpui::px(crate::theme::layout::TITLEBAR_HEIGHT + 12.),
+        );
+        cx.simulate_click(just_below_the_titlebar, gpui::Modifiers::default());
+        settle(cx);
+
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        quit(workspace, cx);
+    });
+}

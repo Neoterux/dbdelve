@@ -732,6 +732,9 @@ mod tests {
                         }
                         Inbound::PresenceOpened { conn } => Seen::PresenceOpened(conn),
                         Inbound::PresenceClosed { conn } => Seen::PresenceClosed(conn),
+                        // The window's own bookkeeping: nothing here is about
+                        // what the shim does.
+                        Inbound::Undelivered { .. } => continue,
                     };
                     let _ = heard_by_test.send(seen);
                 }
