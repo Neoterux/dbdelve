@@ -1170,6 +1170,74 @@ mod tests {
         Connection::wrap(connection, statement_timeout)
     }
 
+    /// The built-in list as the bundled build answers it: every built-in
+    /// function, the grammar-defined names, minus the engine's own deny and
+    /// egress names.
+    fn built_in_list() -> String {
+        let connection = rusqlite::Connection::open_in_memory().expect("in-memory should open");
+        let mut statement = connection
+            .prepare("SELECT DISTINCT lower(name) FROM pragma_function_list WHERE builtin = 1")
+            .expect("the catalog answers");
+        let mut names: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("the catalog answers")
+            .collect::<Result<_, _>>()
+            .expect("every name is text");
+        let version: String = connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .expect("the version answers");
+        assert!(
+            names.iter().any(|name| name == "lower"),
+            "the catalog answered nothing"
+        );
+        let spec = &crate::db::Engine::Sqlite.spec().sql;
+        names.extend(
+            crate::db::spec::GRAMMAR_FUNCTIONS
+                .iter()
+                .map(|name| name.to_string()),
+        );
+        // Operators and multi-word forms (`+`, `->>`, `is distinct from`) are
+        // answered as functions but are never a call's bare name.
+        names.retain(|name| {
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !spec.denied_functions.contains(&name.as_str())
+                && !spec.egress_functions.contains(&name.as_str())
+        });
+        names.sort();
+        names.dedup();
+        let mut list = format!(
+            "# SQLite {version} pragma_function_list WHERE builtin = 1, plus grammar-defined names, minus denied_functions and egress_functions.\n\
+             # Written by the_built_in_list_is_written_from_the_bundled_catalog.\n"
+        );
+        for name in names {
+            list.push_str(&name);
+            list.push('\n');
+        }
+        list
+    }
+
+    #[test]
+    fn the_built_in_list_is_the_bundled_catalogs_answer() {
+        let committed: Vec<&str> = include_str!("functions/sqlite.txt").lines().collect();
+        let fresh = built_in_list();
+        assert_eq!(
+            committed,
+            fresh.lines().collect::<Vec<&str>>(),
+            "src/db/functions/sqlite.txt is not what the bundled build answers; if the \
+             sqlite pin moved, run the_built_in_list_is_written_from_the_bundled_catalog"
+        );
+    }
+
+    #[test]
+    #[ignore = "writes src/db/functions/sqlite.txt from the bundled build; run when the sqlite pin moves"]
+    fn the_built_in_list_is_written_from_the_bundled_catalog() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/db/functions/sqlite.txt"),
+            built_in_list(),
+        )
+        .expect("the list is written");
+    }
+
     /// Runs until something stops it. The recursion has no termination
     /// condition, which is the shape of the runaway both of these are about.
     const FOREVER: &str = "

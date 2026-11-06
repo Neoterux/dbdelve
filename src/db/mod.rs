@@ -704,6 +704,14 @@ impl Engine {
         self.spec().sql.read_only_session != ReadOnlySession::None
     }
 
+    /// Whether only a call to a function on the engine's built-in list is a
+    /// read on the human path as well. That is Generic SQL, which has no hold
+    /// and no catalog behind its Read-only, so a call it cannot vouch for is
+    /// held to Read-write. MongoDB and Redis write no SQL and answer false.
+    pub fn reads_only_listed_calls(self) -> bool {
+        self.syntax() == Syntax::Sql && self.spec().sql.parser_dialect == ParserDialect::Generic
+    }
+
     /// What the server itself does while the profile is Read-only, as a
     /// sentence. Static: no connection is asked, and it is true only while the
     /// profile is in that mode.
