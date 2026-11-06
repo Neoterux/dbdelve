@@ -4417,3 +4417,105 @@ fn pings_are_answered_oldest_first(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+fn swept() -> crate::agent::Reply {
+    crate::agent::Reply {
+        status: crate::agent::Status::Rejected,
+        text: "The connection is no longer available to agents.".to_string(),
+    }
+}
+
+#[gpui::test]
+fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("a", "Shop", visible),
+                sqlite_profile("b", "Shop", ""),
+                sqlite_profile("o", "Orders", visible),
+                sqlite_profile("r", "Reports", visible),
+            ]
+            .concat(),
+        );
+        let (first_shop, first_shop_answers) =
+            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
+        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (second_shop, second_shop_answers) =
+            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
+        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_ping_id(&workspace, cx), Some(first_shop));
+
+        // Hiding the profile that is already hidden answers nothing.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("b", false, cx)
+        });
+        assert_eq!(
+            pending_calls(&workspace, cx),
+            [first_shop, orders, second_shop, reports]
+        );
+
+        run_command(&workspace, cx, Command::HideFromAgents(0));
+        assert_eq!(first_shop_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(second_shop_answers.try_recv().ok(), Some(swept()));
+        assert!(first_shop_answers.try_recv().is_err(), "answered twice");
+        assert!(second_shop_answers.try_recv().is_err(), "answered twice");
+        assert_eq!(pending_calls(&workspace, cx), [orders, reports]);
+        assert_eq!(orders_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        // Nothing waits on Reports once its ping is denied, so hiding it sends
+        // nothing and says nothing.
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(orders, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(reports, cx));
+        assert_eq!(orders_answers.try_recv().ok(), Some(denied()));
+        assert_eq!(reports_answers.try_recv().ok(), Some(denied()));
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::HideFromAgents(3));
+        assert!(!agent_visible(&workspace, cx, "r"));
+        assert!(reports_answers.try_recv().is_err());
+        assert_eq!(shown_notice(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("o", "Orders", visible),
+                sqlite_profile("r", "Reports", visible),
+            ]
+            .concat(),
+        );
+        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        settle(cx);
+        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+
+        workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
+        settle(cx);
+        assert_eq!(orders_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(pending_calls(&workspace, cx), [reports]);
+        assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(front_ping_id(&workspace, cx), Some(reports));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        quit(workspace, cx);
+    });
+}

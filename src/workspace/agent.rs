@@ -1,6 +1,6 @@
 //! The one place a profile's agent visibility changes.
 //!
-//! One door, because a sweep of the agent calls still pending against a
+//! One door, because the sweep of the agent calls still pending against a
 //! profile has to run exactly when the profile is hidden, and a second writer
 //! would be one more path to tell about it. Granting is the asymmetric half:
 //! it needs the owner's confirmation, so it is refused unless the visibility
@@ -53,6 +53,10 @@ const TURNED_OFF: &str = "Agent access was turned off in DBDelve.";
 /// window of the variant is. Its sentence is what stays true: that window's
 /// agents are not disconnected.
 const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
+
+/// What every call waiting on a profile is told when it is hidden or removed.
+/// One sentence for both, so the agent cannot tell which happened.
+const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
@@ -180,8 +184,26 @@ impl Workspace {
             self.agent_visibility_prompt = None;
         }
         profile.agent_visible = visible;
+        if !visible {
+            self.reject_calls_for(id, cx);
+        }
         self.remember_profiles(cx);
         cx.notify();
+    }
+
+    /// Answer every call waiting on this profile `rejected`, oldest first, each
+    /// once. Calls waiting on any other profile are left as they are.
+    pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let waiting: Vec<CallId> = self
+            .agent
+            .calls
+            .iter()
+            .filter(|call| call.profile_id == profile_id)
+            .map(|call| call.id)
+            .collect();
+        for id in waiting {
+            self.finish_call(id, Status::Rejected, NO_LONGER_AVAILABLE.to_string(), cx);
+        }
     }
 
     /// The call the ping dialog is about: the oldest one whose profile is still

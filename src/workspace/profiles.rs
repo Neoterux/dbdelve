@@ -2154,6 +2154,9 @@ impl Workspace {
         let stopped = self.abandon_import(&id, cx);
 
         let removed = self.profiles.remove(index);
+        // Removal does not pass through `set_agent_visible`, so it sweeps here
+        // too: a call waiting on this profile has nothing left to be about.
+        self.reject_calls_for(&removed.id, cx);
         if let Some(key) = identity_file(&removed.config)
             && let Ok(directory) = store::ssh_key_directory()
             && is_unshared_imported_key(
