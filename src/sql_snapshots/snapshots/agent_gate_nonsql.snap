@@ -46,6 +46,16 @@ source: src/sql_snapshots.rs
 [mongodb] a function in an expression: db.c.find({$expr: {$function: {body: "1", args: [], lang: "js"}}}) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
 [mongodb] an accumulator: db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}]) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
 [mongodb] a where clause in a chained call: db.c.find({a: 1}).sort({$where: "1"}) => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
+[mongodb] current op: db.adminCommand({currentOp: 1}) => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] current op of every client: db.adminCommand({currentOp: 1, $all: true}) => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] current op through runCommand: db.runCommand({currentOp: 1}) => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] current op stage: db.adminCommand({aggregate: 1, pipeline: [{$currentOp: {allUsers: true}}], cursor: {}}) => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] current op helper: db.currentOp() => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] current op stage on the database: db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}]) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
+[mongodb] connection status with privileges: db.runCommand({connectionStatus: 1, showPrivileges: true}) => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[mongodb] connection status: db.runCommand({connectionStatus: 1}) => |ro=run rw=run full=run|
+[mongodb] connection status, privileges off: db.runCommand({connectionStatus: 1, showPrivileges: false}) => |ro=run rw=run full=run|
+[mongodb] a field named currentOp: db.c.find({currentOp: 1}) => |ro=run rw=run full=run|
 [mongodb] two reads: db.c.find(); db.c.find() => |ro=refuse(MoreThanOne) rw=refuse(MoreThanOne) full=refuse(MoreThanOne)|
 [mongodb] two deletes: db.c.deleteMany({}); db.c.deleteMany({}) => |ro=refuse(MoreThanOne) rw=refuse(MoreThanOne) full=refuse(MoreThanOne)|
 [mongodb] empty:  => |ro=refuse(NoStatement) rw=refuse(NoStatement) full=refuse(NoStatement)|
@@ -60,7 +70,7 @@ source: src/sql_snapshots.rs
 [redis] config help: CONFIG HELP => |ro=run rw=run full=run|
 [redis] client info: CLIENT INFO => |ro=run rw=run full=run|
 [redis] client getname: CLIENT GETNAME => |ro=run rw=run full=run|
-[redis] acl list: ACL LIST => |ro=run rw=run full=run|
+[redis] acl list: ACL LIST => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
 [redis] select a database: SELECT 1 => |ro=refuse(NotSent) rw=refuse(NotSent) full=refuse(NotSent)|
 [redis] subscribe: SUBSCRIBE n => |ro=refuse(NotSent) rw=refuse(NotSent) full=refuse(NotSent)|
 [redis] pattern subscribe: PSUBSCRIBE n* => |ro=refuse(NotSent) rw=refuse(NotSent) full=refuse(NotSent)|
@@ -129,6 +139,11 @@ source: src/sql_snapshots.rs
 [redis] config get everything: CONFIG GET * => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
 [redis] config get, lower case: config get maxmemory => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
 [redis] client list: CLIENT LIST => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[redis] acl getuser: ACL GETUSER u => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
+[redis] acl whoami: ACL WHOAMI => |ro=run rw=run full=run|
+[redis] acl users: ACL USERS => |ro=run rw=run full=run|
+[redis] acl log: ACL LOG => |ro=run rw=run full=run|
+[redis] config get, then an unknown command: CONFIG GET x\u{a}FROBNICATE => |ro=refuse(Disclosure) rw=refuse(Disclosure) full=refuse(Disclosure)|
 [redis] flush a database: FLUSHDB => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
 [redis] flush everything: FLUSHALL => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|
 [redis] config set: CONFIG SET maxmemory 1 => |ro=refuse(Drop) rw=refuse(Drop) full=refuse(Drop)|

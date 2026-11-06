@@ -417,6 +417,52 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
         "a where clause in a chained call",
         "db.c.find({a: 1}).sort({$where: \"1\"})",
     ),
+    (
+        Engine::MongoDb,
+        "current op",
+        "db.adminCommand({currentOp: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "current op of every client",
+        "db.adminCommand({currentOp: 1, $all: true})",
+    ),
+    (
+        Engine::MongoDb,
+        "current op through runCommand",
+        "db.runCommand({currentOp: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "current op stage",
+        "db.adminCommand({aggregate: 1, pipeline: [{$currentOp: {allUsers: true}}], cursor: {}})",
+    ),
+    (Engine::MongoDb, "current op helper", "db.currentOp()"),
+    (
+        Engine::MongoDb,
+        "current op stage on the database",
+        "db.getSiblingDB(\"admin\").aggregate([{$currentOp: {allUsers: true}}])",
+    ),
+    (
+        Engine::MongoDb,
+        "connection status with privileges",
+        "db.runCommand({connectionStatus: 1, showPrivileges: true})",
+    ),
+    (
+        Engine::MongoDb,
+        "connection status",
+        "db.runCommand({connectionStatus: 1})",
+    ),
+    (
+        Engine::MongoDb,
+        "connection status, privileges off",
+        "db.runCommand({connectionStatus: 1, showPrivileges: false})",
+    ),
+    (
+        Engine::MongoDb,
+        "a field named currentOp",
+        "db.c.find({currentOp: 1})",
+    ),
     (Engine::MongoDb, "two reads", "db.c.find(); db.c.find()"),
     (
         Engine::MongoDb,
@@ -572,6 +618,15 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
         "config get maxmemory",
     ),
     (Engine::Redis, "client list", "CLIENT LIST"),
+    (Engine::Redis, "acl getuser", "ACL GETUSER u"),
+    (Engine::Redis, "acl whoami", "ACL WHOAMI"),
+    (Engine::Redis, "acl users", "ACL USERS"),
+    (Engine::Redis, "acl log", "ACL LOG"),
+    (
+        Engine::Redis,
+        "config get, then an unknown command",
+        "CONFIG GET x\nFROBNICATE",
+    ),
     (Engine::Redis, "flush a database", "FLUSHDB"),
     (Engine::Redis, "flush everything", "FLUSHALL"),
     (Engine::Redis, "config set", "CONFIG SET maxmemory 1"),

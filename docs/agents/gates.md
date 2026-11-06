@@ -209,14 +209,16 @@ confirmation and no earlier approval, and decides about the text as written. The
 passes `gate` with that mode and nothing silenced. The ladder, in the order it
 is asked (the header of `src/sql/agent.rs` is its source):
 
-1. An unreadable statement is `Refuse(Unreadable)`, or `Refuse(Delete)` where
-   it is seen to remove data.
+1. An unreadable statement is `Refuse(Unreadable)`, `Refuse(Delete)` where it is
+   seen to remove data, or `Refuse(Disclosure)` where it is seen to disclose, in
+   that order.
 2. No statement is `Refuse(NoStatement)`, two or more `Refuse(MoreThanOne)`.
 3. A Redis command the editor never sends is `Refuse(NotSent)`.
 4. `DROP`, `TRUNCATE`, any `DELETE` and an `ALTER TABLE` that is not `ADD
    COLUMN` are refused by name.
-5. A server-side script is `Refuse(Script)`, a Redis command returning
-   credentials or other clients' details `Refuse(Disclosure)`.
+5. A server-side script is `Refuse(Script)`, a Redis or MongoDB command
+   returning credentials, password hashes, privileges or other clients' details
+   `Refuse(Disclosure)`.
 6. A statement that changes the session is `Refuse(Session)`.
 7. A verdict needing Full is `Refuse(NeedsFull)`: a Full profile grants an agent
    nothing a Read-write one does not.
@@ -230,6 +232,20 @@ Steps 1 to 6 do not depend on the mode, so a refusal's reason is the same on
 every profile. A `Run` is therefore a lone `sql::rerunnable` read that changes no
 session state and calls nothing on the engine's `denied_functions` or
 `egress_functions`.
+
+**The disclosure line is drawn per engine.** On Redis it is `CONFIG GET`,
+`CLIENT LIST`, `ACL LIST` and `ACL GETUSER`: plaintext secrets, every client's
+address and name, and every user's password hashes. On MongoDB it is `currentOp`
+as the first key of a `runCommand` or `adminCommand`, written as a document or
+as a string and under `explain` too, the `$currentOp` stage at any depth of a
+statement DBDelve parses, and the `db.currentOp()` helper, together with
+`connectionStatus` whose `showPrivileges` is anything but `false`. A
+database-level `aggregate` carrying the stage is not a method DBDelve reads, so
+it is `Refuse(Unreadable)` and never runs. Only the agent path reads this line.
+The human path keeps its verdicts: `CONFIG GET` and `CLIENT LIST` are writes,
+and the rest are reads. Redis `ACL LOG` and `SLOWLOG GET` (the client fields of
+logged entries), MongoDB `getParameter` and the `$listSessions` and
+`$listLocalSessions` stages stay reads on both paths on purpose.
 
 **Egress is its own list.** `SqlSpec::egress_functions` names the functions that
 read a file, a URL, a program or another server, or run text that may

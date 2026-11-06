@@ -15,7 +15,9 @@
 //!    with no server-side hold, which would read as a negotiation. An
 //!    unreadable statement that is seen to remove data is named a
 //!    `Refuse(Delete)` (D-10): MongoDB's legacy `remove` is no method DBDelve
-//!    reads, and it is still a deletion.
+//!    reads, and it is still a deletion. One seen to disclose (a MongoDB
+//!    `db.currentOp()`, a Redis `CONFIG GET` before a command DBDelve cannot
+//!    read) is a `Refuse(Disclosure)`; a deletion is asked first.
 //! 2. The statement count: the parse `classify` judged and the buffer's token
 //!    bearing ranges. None is `Refuse(NoStatement)`, two or more is
 //!    `Refuse(MoreThanOne)`.
@@ -25,10 +27,12 @@
 //!    the walk reached, filtered or not, is `Refuse(Delete)`, and an `ALTER
 //!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`.
 //! 5. A server-side script (a Redis `EVAL`, `FCALL` and their read-only forms,
-//!    a MongoDB `$where`) is `Refuse(Script)`, and a Redis command that
-//!    returns credentials or other clients' details is `Refuse(Disclosure)`
-//!    (D-27), in every mode: before the session and mode steps, so the reason
-//!    is the script's and not the mode's.
+//!    a MongoDB `$where`) is `Refuse(Script)`, and a command that returns
+//!    credentials, password hashes, the user's privileges or other clients'
+//!    details (Redis `CONFIG GET`, `CLIENT LIST`, `ACL LIST`, `ACL GETUSER`;
+//!    MongoDB `currentOp`, `connectionStatus` with `showPrivileges`) is
+//!    `Refuse(Disclosure)` (D-27), in every mode: before the session and mode
+//!    steps, so the reason is the script's and not the mode's.
 //! 6. A statement that changes the session, or assigns a user variable with
 //!    `:=`, is `Refuse(Session)`: a later approved write must hit the table the
 //!    human read it for, so nothing an agent sends may repoint the session
@@ -104,7 +108,8 @@ pub(crate) enum Refusal {
     Session,
     /// A server-side script, which no statement read can say the effect of.
     Script,
-    /// A command that returns credentials or other clients' connection details.
+    /// A command that returns credentials, password hashes, the user's
+    /// privileges or other clients' connection details.
     Disclosure,
     /// A statement that needs Full.
     NeedsFull,
@@ -159,11 +164,13 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     let verdict = read.verdict;
 
     if verdict.destructive.contains(&Destructive::Unreadable) {
-        // Named a deletion where it was seen to be one (D-10). On SQL `removes`
-        // comes only from statements the parser read, so this is never reached
-        // with it set.
+        // Named a deletion or a disclosure where it was seen to be one (D-10).
+        // On SQL both flags come only from statements the parser read, so this
+        // is never reached with either set.
         return AgentVerdict::Refuse(if read.removes {
             Refusal::Delete
+        } else if read.discloses {
+            Refusal::Disclosure
         } else {
             Refusal::Unreadable
         });
@@ -727,12 +734,46 @@ mod tests {
             "config get maxmemory",
             "CLIENT LIST",
             "CLIENT LIST TYPE normal",
+            "ACL LIST",
+            "acl list",
+            "ACL GETUSER u",
+            "acl getuser u",
         ] {
             redis_always(text, refused(Refusal::Disclosure));
         }
-        for text in ["CONFIG HELP", "CLIENT INFO", "CLIENT GETNAME"] {
+        for text in [
+            "CONFIG HELP",
+            "CLIENT INFO",
+            "CLIENT GETNAME",
+            "ACL WHOAMI",
+            "ACL USERS",
+            "ACL LOG",
+        ] {
             redis_always(text, AgentVerdict::Run);
         }
+        // Only the agent path reads the disclosure: the human's verdict stays a read.
+        for text in ["ACL LIST", "ACL GETUSER u"] {
+            assert_eq!(
+                super::super::classify(Engine::Redis, text),
+                Verdict::READ,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_statement_seen_to_disclose_is_refused_as_a_disclosure() {
+        mongodb_always("db.currentOp()", refused(Refusal::Disclosure));
+        redis_always("CONFIG GET x\nFROBNICATE", refused(Refusal::Disclosure));
+        // Delete is asked first, then Disclosure, then Unreadable.
+        mongodb_always("db.c.remove({})", refused(Refusal::Delete));
+        redis_always("FROBNICATE a", refused(Refusal::Unreadable));
+        // A database-level `aggregate` is no method DBDelve reads, so it is
+        // refused as unreadable and never runs.
+        mongodb_always(
+            r#"db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}])"#,
+            refused(Refusal::Unreadable),
+        );
     }
 
     #[test]
@@ -806,6 +847,47 @@ mod tests {
             r#"db.c.aggregate([{$group: {_id: 1, n: {$accumulator: {init: "1", accumulate: "1", accumulateArgs: [], merge: "1", lang: "js"}}}}])"#,
         ] {
             mongodb_always(text, refused(Refusal::Script));
+        }
+    }
+
+    #[test]
+    fn mongodb_commands_that_disclose_are_refused() {
+        for text in [
+            "db.adminCommand({currentOp: 1})",
+            "db.adminCommand({currentOp: 1, $all: true})",
+            "db.runCommand({currentOp: 1})",
+            "db.adminCommand('currentOp')",
+            "db.getSiblingDB('admin').adminCommand({currentOp: 1})",
+            "db.runCommand({explain: {currentOp: 1}})",
+            "db.adminCommand({aggregate: 1, pipeline: [{$currentOp: {allUsers: true}}], cursor: {}})",
+            "db.c.aggregate([{$currentOp: {}}])",
+            "db.runCommand({connectionStatus: 1, showPrivileges: true})",
+            "db.runCommand({connectionStatus: 1, showPrivileges: 1})",
+            "db.adminCommand({connectionStatus: 1, showPrivileges: true})",
+            "db.currentOp()",
+            r#"db.getSiblingDB("admin").currentOp()"#,
+        ] {
+            mongodb_always(text, refused(Refusal::Disclosure));
+        }
+        for text in [
+            "db.runCommand({connectionStatus: 1})",
+            "db.runCommand({connectionStatus: 1, showPrivileges: false})",
+            "db.c.find({currentOp: 1})",
+            "db.runCommand({ping: 1, currentOp: 1})",
+            "db.runCommand({ping: 1})",
+        ] {
+            mongodb_always(text, AgentVerdict::Run);
+        }
+        // Only the agent path reads the disclosure: the human's verdict stays a read.
+        for text in [
+            "db.adminCommand({currentOp: 1})",
+            "db.runCommand({connectionStatus: 1, showPrivileges: true})",
+        ] {
+            assert_eq!(
+                super::super::classify(Engine::MongoDb, text),
+                Verdict::READ,
+                "{text}"
+            );
         }
     }
 
