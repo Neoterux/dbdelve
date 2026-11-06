@@ -1399,6 +1399,79 @@ mod tests {
         }
     }
 
+    /// A temporary view shadows the table of the same name for the rest of the
+    /// session, so a later approved write would hit the view, not the table.
+    #[test]
+    fn a_temporary_view_is_refused_as_a_session_statement() {
+        for engine in sql_engines() {
+            for text in [
+                "CREATE TEMP VIEW v AS SELECT 1",
+                "CREATE OR REPLACE TEMP VIEW v AS SELECT 1",
+                "CREATE TEMPORARY VIEW v AS SELECT a FROM t",
+            ] {
+                always(engine, text, refused(Refusal::Session));
+            }
+        }
+    }
+
+    /// A temporary table or variable that the `SELECT` writes under a set
+    /// operation lasts the session just as the bare `SELECT ... INTO` already
+    /// refused does.
+    #[test]
+    fn a_select_into_a_temporary_target_under_a_set_operation_is_refused_as_a_session_statement() {
+        for engine in sql_engines() {
+            for text in [
+                "SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w",
+                "SELECT * INTO TEMP u FROM t EXCEPT SELECT * FROM w",
+                "(SELECT * INTO TEMP u FROM t) UNION ALL SELECT * FROM w",
+            ] {
+                always(engine, text, refused(Refusal::Session));
+            }
+        }
+        always(
+            Engine::SqlServer,
+            "SELECT * INTO #u FROM t UNION ALL SELECT * FROM w",
+            refused(Refusal::Session),
+        );
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            always(
+                engine,
+                "SELECT a INTO @x FROM t UNION SELECT a FROM w",
+                refused(Refusal::Session),
+            );
+        }
+    }
+
+    /// The walker reads only the target, so a permanent target and a plain
+    /// read keep their answers.
+    #[test]
+    fn a_view_or_a_set_operation_with_no_temporary_target_keeps_its_answer() {
+        for engine in sql_engines() {
+            for text in [
+                "CREATE VIEW v AS SELECT a FROM t",
+                "SELECT * INTO u FROM t UNION ALL SELECT * FROM w",
+            ] {
+                assert!(
+                    matches!(
+                        agent_gate(engine, text, Mode::ReadWrite),
+                        AgentVerdict::Approve(_)
+                    ),
+                    "{engine:?}: {text}"
+                );
+            }
+            always(
+                engine,
+                "SELECT a FROM t UNION ALL SELECT a FROM w",
+                AgentVerdict::Run,
+            );
+            assert_eq!(
+                classify(engine, "CREATE TEMP VIEW v AS SELECT 1"),
+                classify(engine, "CREATE VIEW v AS SELECT 1"),
+                "{engine:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_read_of_session_state_still_runs() {
         for mode in Mode::ALL {
