@@ -88,7 +88,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `save_profile` that changes where the profile connects
   (`ConnectionConfig::needs_reconnect`, an engine change included). That save
   hides a visible profile and says so, because the dialog's consent and facts
-  were about the old target. Profiles are saved whole by
+  were about the old target. A restore (`restore_profile`) that reads a visible
+  profile as Postgres, because this build cannot read its engine, hides it for
+  the same reason; `Workspace::new` saves that hide once every profile and
+  project is in, so it waits in `AgentState::visibility_choices` until then.
+  Profiles are saved whole by
   whichever window saves, so a window's flags are the file's
   (`Workspace::adopt_saved_visibility`, on every save and every agent call)
   except where it made a choice of its own that no save has written yet

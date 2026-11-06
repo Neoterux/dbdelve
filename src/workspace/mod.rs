@@ -641,6 +641,14 @@ impl Workspace {
                     .chain(workspace.unavailable.iter().map(|gone| gone.id.as_str()))
                     .collect::<Vec<_>>();
                 workspace.projects = projects::normalized_projects(projects, &live);
+                // Only a restore that hid a profile read as Postgres leaves a
+                // choice at launch. Saving after the loop and the projects
+                // writes the whole file, and clears the choice so another
+                // window's later grant is adopted, not overwritten. A launch
+                // that narrowed nothing writes nothing.
+                if !workspace.agent.visibility_choices.is_empty() {
+                    workspace.remember_profiles(cx);
+                }
             }
             Err(failure) => {
                 workspace.store_unreadable = !failure.moved_aside;

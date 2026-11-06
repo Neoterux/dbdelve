@@ -3083,6 +3083,92 @@ fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn a_profile_read_as_postgres_by_the_fallback_loads_hidden_and_is_saved_hidden(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        // `note__toml_private` sends the file through the plain decode, which
+        // reads an engine this build cannot open as Postgres. The key is not a
+        // field, so it is dropped and the launch save round-trips cleanly.
+        let profiles = format!(
+            "{}\
+             [[profiles]]\nid = \"gone\"\nname = \"Gone\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\nengine = \"zz-unknown\"\nagent_visible = true\n\
+             note__toml_private = 1\n\n\
+             [[profiles]]\nid = \"odd\"\nname = \"Odd\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\nengine = \"generic\"\nagent_visible = true\n\n\
+             {}",
+            sqlite_profile("kept", "Kept", "agent_visible = true"),
+            sqlite_profile("later", "Later", ""),
+        );
+        let (workspace, cx) = launch_with_profiles(cx, &profiles);
+
+        for id in ["gone", "odd"] {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .expect("the profile was restored");
+                assert_eq!(profile.config.engine(), Engine::Postgres, "{id} fell back");
+                assert!(
+                    profile
+                        .session
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("Reading it as Postgres.")),
+                    "{id} says it was read as Postgres"
+                );
+            });
+        }
+
+        assert!(
+            !agent_visible(&workspace, cx, "gone"),
+            "gone is hidden once read as Postgres"
+        );
+        assert!(!agent_visible(&workspace, cx, "odd"), "odd is hidden too");
+        assert!(agent_visible(&workspace, cx, "kept"));
+        assert!(!agent_visible(&workspace, cx, "later"));
+
+        // Straight after launch, with no action: the hide is on disk, and the
+        // profile after the narrowed ones was not lost to an early save.
+        assert!(!saved_visible("gone"), "gone is saved hidden");
+        assert!(!saved_visible("odd"), "odd is saved hidden");
+        assert!(saved_visible("kept"), "a readable profile keeps its grant");
+        let saved = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        for id in ["kept", "gone", "odd", "later"] {
+            assert!(
+                saved.profiles.iter().any(|profile| profile.id == id),
+                "{id} survives the launch save"
+            );
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.agent.visibility_choices.is_empty(),
+                "the launch save leaves no pending choice"
+            );
+        });
+
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(!agent_visible(&workspace, cx, "gone"));
+        assert!(!saved_visible("gone"), "a later save keeps the hide");
+
+        // Another window grants it afterwards; this window adopts, not undoes.
+        let mut list = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        list.profiles
+            .iter_mut()
+            .find(|profile| profile.id == "gone")
+            .expect("the profile was saved")
+            .agent_visible = true;
+        store::save_profiles(&list).expect("the other window saves");
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(agent_visible(&workspace, cx, "gone"));
+        assert!(saved_visible("gone"), "the other window's grant survives");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_unedited_save_keeps_visibility_and_a_new_host_hides(cx: &mut TestAppContext) {
     use super::agent::AgentLookup;
 
