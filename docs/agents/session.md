@@ -84,9 +84,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   marker on its palette rows and beside its name in the titlebar; a hidden one
   is drawn as it always was. The agent-side lookup filters to visible profiles
   before it compares names (`Workspace::agent_profile`), so a hidden profile and
-  a missing one answer alike. The one other route to a change is an engine
-  change in `save_profile`, which hides a visible profile and says so, because
-  the dialog's facts were about the old engine. Profiles are saved whole by
+  a missing one answer alike. The one other route to a change is a save in
+  `save_profile` that changes where the profile connects
+  (`ConnectionConfig::needs_reconnect`, an engine change included). That save
+  hides a visible profile and says so, because the dialog's consent and facts
+  were about the old target. Profiles are saved whole by
   whichever window saves, so a window's flags are the file's
   (`Workspace::adopt_saved_visibility`, on every save and every agent call)
   except where it made a choice of its own that no save has written yet
