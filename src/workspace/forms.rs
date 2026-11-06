@@ -3176,8 +3176,6 @@ impl Workspace {
     }
 }
 
-/// What a saved query's row offers on a right click: what its tab offers, for
-/// a query that may have no tab open.
 /// The button the ring starts on when `dialog` goes up, counted from the right.
 /// Cancel for the one that widens what an agent may reach, the primary for
 /// every other.
@@ -3188,6 +3186,8 @@ fn first_choice(dialog: Option<&str>) -> usize {
     }
 }
 
+/// What a saved query's row offers on a right click: what its tab offers, for
+/// a query that may have no tab open.
 fn saved_query_menu(
     menu: PopupMenu,
     name: &str,

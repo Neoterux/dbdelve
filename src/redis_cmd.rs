@@ -363,10 +363,14 @@ fn commands(text: &str) -> impl Iterator<Item = Command> + '_ {
 }
 
 /// Whether any command of `text` takes data out of the database: a name in
-/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, or an expiry
-/// whose timeout is not a positive integer written plainly (`EXPIRE k 0`
-/// deletes the key at once). The agent path refuses all of them, whatever the
-/// mode (GATE-07); the human path never asks.
+/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, an `XADD` that
+/// trims (`MAXLEN` or `MINID`), an expiry whose timeout is not a positive
+/// integer written plainly (`EXPIRE k 0` deletes the key at once, as does
+/// `EX 0` on `HSETEX` or `HGETEX`), or a
+/// `SET`, `GETEX`, `HSETEX` or `HGETEX` with an absolute expiry (`EXAT` or
+/// `PXAT`), which deletes the key or field at once when the time has passed.
+/// The agent path refuses all of them, whatever the mode (GATE-07); the human
+/// path never asks.
 pub(crate) fn removes(text: &str) -> bool {
     commands(text).any(|command| removes_data(&command))
 }
@@ -376,17 +380,45 @@ fn removes_data(command: &Command) -> bool {
     match name.as_str() {
         "MIGRATE" => true,
         "XGROUP" => matches!(command.subcommand().as_str(), "DESTROY" | "DELCONSUMER"),
-        // The fail-safe reading of a timeout the server may take as
-        // non-positive or reject: only a run of digits not starting with `0`
-        // is known to keep the key.
-        "EXPIRE" | "PEXPIRE" | "HEXPIRE" | "HPEXPIRE" => {
-            let timeout = word(&command.words, 2);
-            timeout.is_empty()
-                || !timeout.bytes().all(|byte| byte.is_ascii_digit())
-                || timeout.starts_with('0')
+        "EXPIRE" | "PEXPIRE" | "HEXPIRE" | "HPEXPIRE" => !keeps_the_key(&word(&command.words, 2)),
+        // An `XADD` that trims is an `XTRIM`, and `LIMIT` only ever follows
+        // `MAXLEN` or `MINID`.
+        "XADD" => has_option(command, &["MAXLEN", "MINID"]),
+        // ponytail: the words are matched anywhere after the name, so a key,
+        // field or value spelled like an option word is refused as well. The
+        // ceiling is that this reads words and not each command's option
+        // grammar; the upgrade path is reading the grammar.
+        "SET" | "GETEX" => has_option(command, &["EXAT", "PXAT"]),
+        // Unlike `SET`, these take a zero `EX` or `PX` and delete the field
+        // at once (checked on Redis 8.10.3).
+        "HSETEX" | "HGETEX" => {
+            has_option(command, &["EXAT", "PXAT"])
+                || command.words.iter().enumerate().skip(1).any(|(at, word)| {
+                    (word.eq_ignore_ascii_case(b"EX") || word.eq_ignore_ascii_case(b"PX"))
+                        && !keeps_the_key(&self::word(&command.words, at + 1))
+                })
         }
         name => REMOVES.contains(&name),
     }
+}
+
+/// The fail-safe reading of a timeout the server may take as non-positive or
+/// reject: only a run of digits not starting with `0` is known to keep the
+/// key.
+fn keeps_the_key(timeout: &str) -> bool {
+    !timeout.is_empty()
+        && timeout.bytes().all(|byte| byte.is_ascii_digit())
+        && !timeout.starts_with('0')
+}
+
+/// Whether any word after the command's name is one of `options`, compared
+/// without regard to case.
+fn has_option(command: &Command, options: &[&str]) -> bool {
+    command.words.iter().skip(1).any(|word| {
+        options
+            .iter()
+            .any(|option| word.eq_ignore_ascii_case(option.as_bytes()))
+    })
 }
 
 /// Whether any command of `text` runs a script the server holds, or loads one:
@@ -404,15 +436,16 @@ pub(crate) fn runs_script(text: &str) -> bool {
     })
 }
 
-/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`: the two
-/// commands that can answer with `requirepass`, `masterauth` or another
-/// client's address and name (D-27). Matched by name and subcommand and
-/// nothing wider; [`kind`] records why the line is drawn there.
+/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`, which can
+/// answer with `requirepass`, `masterauth` or another client's address and name
+/// (D-27), or `ACL LIST` or `ACL GETUSER`, which answer with every user's
+/// password hashes. Matched by name and subcommand and nothing wider; [`kind`]
+/// records why the line is drawn there.
 pub(crate) fn discloses(text: &str) -> bool {
     commands(text).any(|command| {
         matches!(
             (command.name().as_str(), command.subcommand().as_str()),
-            ("CONFIG", "GET") | ("CLIENT", "LIST")
+            ("CONFIG", "GET") | ("CLIENT", "LIST") | ("ACL", "LIST" | "GETUSER")
         )
     })
 }
@@ -444,15 +477,13 @@ fn kind(command: &Command) -> Option<Kind> {
         ("CONFIG", "HELP") => Read,
         // These two answer with what a Read-only profile should not be handed
         // unasked: `requirepass` and `masterauth`, and every connected
-        // client's address and name. The line is drawn at them and no wider.
-        // Their siblings stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`,
-        // `ID`, `GETNAME`, `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do
-        // commands elsewhere that do disclose something: the password hashes
-        // `ACL LIST` and `ACL GETUSER` return, and the client fields in
-        // `ACL LOG` and `SLOWLOG GET`. The rule is deliberately limited to
-        // plaintext secrets and client enumeration, and those are knowingly
-        // left as reads. Widening it changes what a Read-only profile may run,
-        // which is a product decision that has not been made.
+        // client's address and name. This is where the human path's line is
+        // drawn, so they are rated writes and Read-only asks. Their siblings
+        // stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`, `ID`, `GETNAME`,
+        // `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do `ACL LIST` and
+        // `ACL GETUSER`, because the human is reading their own server. The
+        // agent path refuses all four through [`discloses`]. The client fields
+        // in `ACL LOG` and `SLOWLOG GET` stay reads on both paths.
         ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
@@ -918,7 +949,10 @@ const WRITES: &[&str] = &[
 /// Commands that take data out of the database, one word each: what the agent
 /// path's GATE-07 refuses on Redis whatever the mode. The human path never
 /// reads this list. Names that decide by an argument or a subcommand
-/// (`MIGRATE`, `XGROUP DESTROY`, the `EXPIRE` family) are in [`removes`].
+/// (`MIGRATE`, `XGROUP DESTROY`, an `XADD` that trims, the `EXPIRE` family,
+/// `EXAT` and `PXAT` on `SET`, `GETEX`, `HSETEX` and `HGETEX`, and a
+/// non-positive `EX` or `PX` on the last two) are in
+/// [`removes`].
 ///
 /// ponytail: these overwrite or move data without a removal flag and stay
 /// approvable (D-23): `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` and `HPEXPIREAT`
@@ -927,9 +961,16 @@ const WRITES: &[&str] = &[
 /// destination, and `LMOVE`, `BLMOVE`, `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and
 /// `MOVE` hand what leaves one key to another. The ceiling is that a pure
 /// function has no clock and does not know whether a destination exists, so
-/// the human reads the exact command before approving it. The upgrade path
-/// is a removal flag on those words, once the approval surface can show the
-/// destination's state.
+/// the human reads the exact command before approving it. The no-clock
+/// ceiling is answered two ways. The `EXAT` and `PXAT` options of `SET`,
+/// `GETEX`, `HSETEX` and `HGETEX` are refused whatever the time, in
+/// [`removes`]: `SET` and `GETEX` reject a non-positive `EX` or `PX`, so an
+/// absolute time is the only expiry of theirs that can delete. `HSETEX` and
+/// `HGETEX` take a zero `EX` or `PX` and delete the field (Redis 8.10.3), so
+/// their relative timeout is read the way `HEXPIRE`'s is. The `*EXPIREAT`
+/// commands keep their time approvable, and a past one still deletes. The
+/// upgrade path is a removal flag on those words, once the approval surface
+/// can show the destination's state.
 const REMOVES: &[&str] = &[
     "DEL",
     "UNLINK",
@@ -1271,14 +1312,18 @@ mod tests {
             "config get *",
             "CLIENT LIST",
             "GET a\nCLIENT LIST",
+            "ACL LIST",
+            "acl getuser u",
+            "ACL GETUSER u",
         ] {
             assert!(discloses(text), "{text}");
         }
         for text in [
             "CONFIG HELP",
             "CLIENT INFO",
-            "ACL LIST",
-            "ACL GETUSER u",
+            "ACL WHOAMI",
+            "ACL USERS",
+            "ACL LOG",
             "SLOWLOG GET",
         ] {
             assert!(!discloses(text), "{text}");
@@ -1302,10 +1347,91 @@ mod tests {
         ] {
             assert!(removes(text), "{text}");
         }
-        // A time in the past is not told apart from one in the future: a pure
-        // function has no clock, and the human reads the number.
+        // The `*EXPIREAT` commands do not tell a time in the past from one in
+        // the future: a pure function has no clock, and the human reads the
+        // number. The option forms are refused whatever the time, in
+        // `an_absolute_expiry_option_removes_whatever_its_time`.
         assert!(!removes("EXPIREAT k 1"));
         assert!(!removes("PEXPIREAT k 1"));
+    }
+
+    #[test]
+    fn a_stream_add_removes_only_when_it_trims() {
+        for text in [
+            "XADD s * f v",
+            "XADD s NOMKSTREAM * f v",
+            // The grid's guard read: `MAXLEN` decides only on `XADD`.
+            "LPOS l v COUNT 0 MAXLEN 1",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+        for text in [
+            "XADD s MAXLEN 0 * f v",
+            "XADD s MAXLEN ~ 1000 * f v",
+            "XADD s MINID = 9999999999999-0 * f v",
+            "xadd s minid 1 * f v",
+            "XADD s NOMKSTREAM MAXLEN ~ 10 LIMIT 5 * f v",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_expiry_option_removes_whatever_its_time() {
+        for text in [
+            "SET k v",
+            "SET k v EX 10",
+            "SET k v PX 10",
+            "SET k v KEEPTTL",
+            "GETEX k EX 10",
+            "GETEX k PERSIST",
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HGETEX h PERSIST FIELDS 1 f",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+        for text in [
+            "SET k v EXAT 1",
+            "SET k v NX PXAT 1 GET",
+            "set k v exat 4102444800",
+            "GETEX k EXAT 1",
+            "GETEX k PXAT 1",
+            "HSETEX h FXX EXAT 1 FIELDS 1 f v",
+            "HSETEX h PXAT 1 FIELDS 1 f v",
+            "HGETEX h EXAT 1 FIELDS 1 f",
+            "hgetex h pxat 1 fields 1 f",
+            // A value spelled like the option is read as the option, which
+            // fails safe.
+            "SET k EXAT",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_hash_field_expiry_that_is_not_positive_removes_the_field() {
+        // Redis 8.10.3 deletes the field at once for a zero `EX` or `PX` on
+        // `HSETEX` and `HGETEX`, where `SET` refuses the same timeout.
+        for text in [
+            "HSETEX h EX 0 FIELDS 1 f v",
+            "HSETEX h PX 0 FIELDS 1 f v",
+            "HGETEX h EX 0 FIELDS 1 f",
+            "hgetex h px 00 fields 1 f",
+            "HSETEX h FNX EX -1 FIELDS 1 f v",
+            "HGETEX h EX abc FIELDS 1 f",
+            "HGETEX h EX",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+        for text in [
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HGETEX h PX 1 FIELDS 1 f",
+            "HGETEX h PERSIST FIELDS 1 f",
+            "SET k v EX 0",
+            "GETEX k PX 0",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
     }
 
     #[test]

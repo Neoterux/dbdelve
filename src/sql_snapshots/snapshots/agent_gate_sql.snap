@@ -96,6 +96,9 @@ source: src/sql_snapshots.rs
 [postgres] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[postgres] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -216,6 +219,9 @@ source: src/sql_snapshots.rs
 [mysql] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mysql] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -336,6 +342,9 @@ source: src/sql_snapshots.rs
 [mariadb] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mariadb] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -456,6 +465,9 @@ source: src/sql_snapshots.rs
 [sqlite] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[sqlite] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -576,6 +588,9 @@ source: src/sql_snapshots.rs
 [turso] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[turso] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -696,6 +711,9 @@ source: src/sql_snapshots.rs
 [duckdb] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[duckdb] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -816,6 +834,9 @@ source: src/sql_snapshots.rs
 [snowflake] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[snowflake] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -936,6 +957,9 @@ source: src/sql_snapshots.rs
 [clickhouse] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[clickhouse] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -1056,6 +1080,9 @@ source: src/sql_snapshots.rs
 [mssql] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[mssql] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
@@ -1176,6 +1203,9 @@ source: src/sql_snapshots.rs
 [generic] set a server-wide setting: SET GLOBAL max_connections = 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [generic] use a database: USE other => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [generic] create a temporary table: CREATE TEMPORARY TABLE u (a INT) => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[generic] create a temporary view: CREATE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[generic] create or replace a temporary view: CREATE OR REPLACE TEMP VIEW v AS SELECT 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
+[generic] select into a temporary table under a union: SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [generic] assign a user variable: SELECT @x := 1 => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [generic] select into a user variable: SELECT 1 INTO @x => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [generic] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
