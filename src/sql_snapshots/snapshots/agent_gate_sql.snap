@@ -3,7 +3,7 @@ source: src/sql_snapshots.rs
 ---
 [postgres] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [postgres] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[postgres] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[postgres] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [postgres] deny-listed call: SELECT set_config() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [postgres] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [postgres] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -105,7 +105,7 @@ source: src/sql_snapshots.rs
 [postgres] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [postgres] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[postgres] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
+[postgres] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [postgres] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
 [postgres] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [postgres] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -126,7 +126,7 @@ source: src/sql_snapshots.rs
 [postgres] read, then a hash comment: SELECT 1 # c => |ro=run rw=run full=run|
 [mysql] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [mysql] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[mysql] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[mysql] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mysql] deny-listed call: SELECT get_lock() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mysql] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mysql] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -227,9 +227,9 @@ source: src/sql_snapshots.rs
 [mysql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mysql] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[mysql] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[mysql] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mysql] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[mysql] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mysql] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mysql] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mysql] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mysql] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -249,7 +249,7 @@ source: src/sql_snapshots.rs
 [mysql] read, then a hash comment: SELECT 1 # c => |ro=run rw=run full=run|
 [mariadb] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [mariadb] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[mariadb] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[mariadb] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mariadb] deny-listed call: SELECT get_lock() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mariadb] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mariadb] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -350,9 +350,9 @@ source: src/sql_snapshots.rs
 [mariadb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mariadb] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[mariadb] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
+[mariadb] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mariadb] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[mariadb] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mariadb] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mariadb] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mariadb] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mariadb] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -372,7 +372,7 @@ source: src/sql_snapshots.rs
 [mariadb] read, then a hash comment: SELECT 1 # c => |ro=run rw=run full=run|
 [sqlite] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [sqlite] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[sqlite] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[sqlite] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [sqlite] deny-listed call: SELECT load_extension() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [sqlite] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [sqlite] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -473,9 +473,9 @@ source: src/sql_snapshots.rs
 [sqlite] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [sqlite] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[sqlite] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[sqlite] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[sqlite] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[sqlite] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[sqlite] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[sqlite] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [sqlite] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [sqlite] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [sqlite] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -495,7 +495,7 @@ source: src/sql_snapshots.rs
 [sqlite] read, then a hash comment: SELECT 1 # c => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [turso] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [turso] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[turso] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[turso] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [turso] deny-listed call: SELECT load_extension() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [turso] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [turso] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -596,9 +596,9 @@ source: src/sql_snapshots.rs
 [turso] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [turso] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[turso] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[turso] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[turso] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[turso] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[turso] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[turso] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [turso] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [turso] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [turso] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -618,7 +618,7 @@ source: src/sql_snapshots.rs
 [turso] read, then a hash comment: SELECT 1 # c => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [duckdb] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [duckdb] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[duckdb] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[duckdb] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [duckdb] deny-listed call: SELECT nextval() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [duckdb] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [duckdb] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -719,9 +719,9 @@ source: src/sql_snapshots.rs
 [duckdb] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [duckdb] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[duckdb] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[duckdb] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[duckdb] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[duckdb] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[duckdb] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[duckdb] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [duckdb] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [duckdb] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [duckdb] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -741,7 +741,7 @@ source: src/sql_snapshots.rs
 [duckdb] read, then a hash comment: SELECT 1 # c => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [snowflake] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [snowflake] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[snowflake] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[snowflake] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [snowflake] deny-listed call: SELECT system$cancel_all_queries() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [snowflake] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [snowflake] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -842,9 +842,9 @@ source: src/sql_snapshots.rs
 [snowflake] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [snowflake] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[snowflake] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[snowflake] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[snowflake] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[snowflake] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[snowflake] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[snowflake] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [snowflake] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [snowflake] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [snowflake] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -864,7 +864,7 @@ source: src/sql_snapshots.rs
 [snowflake] read, then a hash comment: SELECT 1 # c => |ro=run rw=run full=run|
 [clickhouse] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [clickhouse] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[clickhouse] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[clickhouse] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [clickhouse] deny-listed call => (none)
 [clickhouse] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [clickhouse] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -965,9 +965,9 @@ source: src/sql_snapshots.rs
 [clickhouse] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [clickhouse] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[clickhouse] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[clickhouse] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[clickhouse] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[clickhouse] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[clickhouse] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[clickhouse] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [clickhouse] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [clickhouse] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [clickhouse] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|
@@ -987,7 +987,7 @@ source: src/sql_snapshots.rs
 [clickhouse] read, then a hash comment: SELECT 1 # c => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mssql] plain select: SELECT a FROM t => |ro=run rw=run full=run|
 [mssql] scalar function: SELECT lower(a) FROM t => |ro=run rw=run full=run|
-[mssql] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=run full=run|
+[mssql] user-defined function: SELECT my_udf(a) FROM t => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mssql] deny-listed call: SELECT openquery() => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mssql] insert: INSERT INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mssql] update: UPDATE t SET a = 1 WHERE id = 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -1088,9 +1088,9 @@ source: src/sql_snapshots.rs
 [mssql] savepoint: SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] release a savepoint: RELEASE SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
 [mssql] roll back to a savepoint: ROLLBACK TO SAVEPOINT a => |ro=refuse(Session) rw=refuse(Session) full=refuse(Session)|
-[mssql] read a sequence's current value: SELECT currval('s') => |ro=run rw=run full=run|
-[mssql] read the last insert id: SELECT last_insert_id() => |ro=run rw=run full=run|
-[mssql] named argument: SELECT make_interval(days := 10) => |ro=run rw=run full=run|
+[mssql] read a sequence's current value: SELECT currval('s') => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[mssql] read the last insert id: SELECT last_insert_id() => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
+[mssql] named argument: SELECT make_interval(days := 10) => |ro=run rw=approve(ReadOnly) full=approve(ReadOnly)|
 [mssql] replace into: REPLACE INTO t (a) VALUES (1) => |ro=refuse(Unreadable) rw=refuse(Unreadable) full=refuse(Unreadable)|
 [mssql] insert or replace: INSERT OR REPLACE INTO t (a) VALUES (1) => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [mssql] select for update: SELECT a FROM t FOR UPDATE => |ro=run rw=run full=run|

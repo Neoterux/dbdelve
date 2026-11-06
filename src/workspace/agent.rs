@@ -191,13 +191,28 @@ pub(crate) fn ping_prompt(name: &str) -> String {
 /// What the visibility dialog tells the owner about this engine and mode, one
 /// entry per sentence. A pure function of the two, so opening the dialog asks
 /// no server anything: the hold is what the engine is built to do while the
-/// profile is Read-only, not what a live role allows.
+/// profile is Read-only, not what a live role allows. The sentence about a call
+/// to a function DBDelve does not list is what `agent_gate` answers such a call
+/// in that mode, and is left out where the gate refuses it.
 pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
-    vec![
+    let mut facts = vec![
         format!("This connection's access level is {}.", mode.label()),
         engine.read_only_hold().to_string(),
         "Rows the agent reads leave this machine.".to_string(),
-    ]
+    ];
+    // MongoDB and Redis have no function call to ask about, and Generic at
+    // Read-only refuses one, so neither sentence is true there.
+    if engine.syntax() == db::Syntax::Sql {
+        if mode >= Mode::ReadWrite {
+            facts.push(
+                "Calls to functions DBDelve does not list wait for your approval.".to_string(),
+            );
+        } else if !engine.reads_only_listed_calls() {
+            facts
+                .push("Calls to functions DBDelve does not list run without approval.".to_string());
+        }
+    }
+    facts
 }
 
 impl Workspace {
@@ -674,6 +689,40 @@ mod tests {
                 for fact in &facts {
                     for word in ["yet", "Phase", "MCP", "try", "should", "upgrade"] {
                         assert!(!fact.contains(word), "{engine:?} {mode:?}: {fact}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_dialog_says_whether_a_call_to_an_unlisted_function_waits() {
+        use crate::sql::{AgentVerdict, agent_gate};
+
+        const RUNS: &str = "Calls to functions DBDelve does not list run without approval.";
+        const WAITS: &str = "Calls to functions DBDelve does not list wait for your approval.";
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                // The sentence comes from what the gate answers, so the dialog
+                // cannot state an answer the gate contradicts.
+                let (stated, other) = match agent_gate(engine, "SELECT my_udf(a) FROM t", mode) {
+                    AgentVerdict::Run => (Some(RUNS), WAITS),
+                    AgentVerdict::Approve(_) => (Some(WAITS), RUNS),
+                    AgentVerdict::Refuse(_) => (None, ""),
+                };
+                let facts = visibility_facts(engine, mode);
+                let count = |sentence: &str| facts.iter().filter(|fact| *fact == sentence).count();
+                match stated {
+                    Some(stated) => {
+                        assert_eq!(count(stated), 1, "{engine:?} {mode:?}: {facts:?}");
+                        assert_eq!(count(other), 0, "{engine:?} {mode:?}: {facts:?}");
+                    }
+                    None => {
+                        assert_eq!(
+                            count(RUNS) + count(WAITS),
+                            0,
+                            "{engine:?} {mode:?}: {facts:?}"
+                        );
                     }
                 }
             }
