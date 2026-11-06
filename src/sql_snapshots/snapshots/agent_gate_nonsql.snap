@@ -77,6 +77,8 @@ source: src/sql_snapshots.rs
 [redis] persist: PERSIST k => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] expire at a past time: EXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] expire at in milliseconds: PEXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] stream add: XADD s * f v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] set with a timeout: SET k v EX 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] rename: RENAME a b => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] store an intersection: SINTERSTORE d a b => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] copy over: COPY a b REPLACE => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -98,6 +100,8 @@ source: src/sql_snapshots.rs
 [redis] sorted set remove range: ZREMRANGEBYRANK z 0 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] stream delete: XDEL s 1-1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] stream trim: XTRIM s MAXLEN 0 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] stream add that trims: XADD s MAXLEN 0 * f v => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] stream add that trims by id: XADD s MINID 9999999999999-0 * f v => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] json delete: JSON.DEL d $ => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] time series delete: TS.DEL t 0 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] destroy a consumer group: XGROUP DESTROY s g => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
@@ -108,6 +112,11 @@ source: src/sql_snapshots.rs
 [redis] expire with a leading zero: EXPIRE k 010 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] expire in milliseconds at zero: PEXPIRE k 0 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] hash field expire at zero: HEXPIRE k 0 FIELDS 1 f => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] set at a fixed time: SET k v EXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] set at a fixed time in milliseconds: SET k v PXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] get and expire at a fixed time: GETEX k EXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] hash set at a fixed time: HSETEX h EXAT 1 FIELDS 1 f v => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] hash get and expire at a fixed time: HGETEX h PXAT 1 FIELDS 1 f => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] eval: EVAL "return 1" 0 => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
 [redis] eval sha: EVALSHA abc 0 => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
 [redis] fcall: FCALL f 0 => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|
