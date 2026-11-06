@@ -25,6 +25,11 @@ pub(crate) struct AgentState {
     /// The calls waiting on an answer, found by their id and never by their
     /// place in this list.
     pub(crate) calls: Vec<PendingCall>,
+    /// What this window's own access action decided and no save has written
+    /// yet: `true` from turning access on, `false` from the kill switch. Set
+    /// by those two actions only, and taken by the next save, so it is the one
+    /// way this window changes `agent_access`.
+    pub(crate) access_choice: Option<bool>,
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -36,6 +41,14 @@ pub(crate) struct PendingCall {
     /// is what cancels it.
     _expiry: gpui::Task<()>,
 }
+
+/// What a pending call is told when the kill switch ends it.
+const TURNED_OFF: &str = "Agent access was turned off in DBDelve.";
+
+/// What the kill switch says in a window that is not serving while another
+/// window of the variant is. Its sentence is what stays true: that window's
+/// agents are not disconnected.
+const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
 
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
@@ -197,12 +210,90 @@ impl Workspace {
     }
 
     /// Start answering agents on this build's own socket.
-    #[expect(
-        dead_code,
-        reason = "the agent access switch (plan 04-03) is the first caller"
-    )]
     pub(crate) fn listen_for_agents(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         self.start_bridge_at(crate::agent::socket_path()?, cx)
+    }
+
+    /// What `agent_access` holds in the file right now, `None` when it holds
+    /// nothing or the file cannot be read, which both read as off.
+    fn saved_agent_access(&self) -> Option<bool> {
+        store::peek_profiles(&self.plugins)
+            .and_then(|list| list.settings)
+            .and_then(|settings| settings.agent_access)
+    }
+
+    /// The `agent_access` the next save writes: this window's own choice when
+    /// one of its two access actions made one, else whatever the file holds at
+    /// this moment. Settings are written whole by whichever window saves, so a
+    /// value remembered from launch would put back `true` over another
+    /// window's kill switch, or `false` over its turn-on.
+    ///
+    /// ponytail: the read and the write that follows are not one step across
+    /// processes, so two windows saving within the same instant can still
+    /// lose one of the two. The upgrade is a lock around the settings write.
+    pub(crate) fn agent_access_to_save(&mut self) -> Option<bool> {
+        let own = self.agent.access_choice.take();
+        own.or_else(|| self.saved_agent_access())
+    }
+
+    /// Open the socket and, only once that has worked, save that access is on.
+    /// A refusal is shown as it is and changes nothing saved, so a window that
+    /// found another one serving can be asked again later.
+    pub(crate) fn turn_on_agent_access(&mut self, cx: &mut Context<Self>) {
+        if self.agent.bridge.is_some() {
+            return;
+        }
+        match self.listen_for_agents(cx) {
+            Ok(()) => {
+                self.agent.access_choice = Some(true);
+                self.remember_profiles(cx);
+                cx.notify();
+            }
+            Err(text) => self.note(text, cx),
+        }
+    }
+
+    /// Stop listening and forget who was attached. Dropping the bridge stops
+    /// the listener, removes the socket file and shuts every presence
+    /// connection; it leaves the saved choice alone, so quitting keeps it.
+    pub(crate) fn drop_bridge(&mut self) {
+        self.agent.bridge = None;
+        self.agent.presence.clear();
+    }
+
+    /// The kill switch: nothing an agent started stays open, and nothing
+    /// listens until the user turns access on again. In order:
+    ///
+    /// 1. Every pending call is answered `rejected`. This comes first and runs
+    ///    with or without a bridge, because dropping the bridge never closes a
+    ///    call's connection: each call's writer thread sends its frame and then
+    ///    closes its own socket, so a waiting client reads a whole answer and
+    ///    not a bare end of file.
+    /// 2. The bridge is dropped, if there is one.
+    /// 3. `agent_access = false` is saved when this window was serving or when
+    ///    the file says `true`. It is the user's own action, so no later launch
+    ///    of the variant listens, even if this window never did. With neither,
+    ///    nothing is written.
+    /// 4. In a window that was not serving, while another window of the
+    ///    variant is, the notice says that window's agents stay connected. This
+    ///    window cannot reach them, because Phase 4 has no frame that tells
+    ///    another window to stop; what it can do is save the choice and say
+    ///    that. The notice repeats on every press, since it stays true.
+    pub(crate) fn disconnect_agents(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<CallId> = self.agent.calls.iter().map(|call| call.id).collect();
+        for id in pending {
+            self.finish_call(id, Status::Rejected, TURNED_OFF.to_string(), cx);
+        }
+        let was_serving = self.agent.bridge.is_some();
+        self.drop_bridge();
+        if was_serving || self.saved_agent_access() == Some(true) {
+            self.agent.access_choice = Some(false);
+            self.remember_profiles(cx);
+        }
+        if !was_serving && crate::agent::socket_is_live() {
+            self.note(STILL_SERVED_ELSEWHERE.to_string(), cx);
+        }
+        cx.notify();
     }
 
     /// What an agent asked for. Opens no connection and starts no database

@@ -227,6 +227,7 @@ actions!(
         CycleMode,
         CloseTab,
         ToggleSidebar,
+        DisconnectAgents,
         ToggleRowPanel,
         ToggleRowEdit,
         ToggleStructure,
