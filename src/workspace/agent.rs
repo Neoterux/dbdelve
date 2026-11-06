@@ -32,6 +32,10 @@ pub(crate) struct AgentState {
     /// by those two actions only, and taken by the next save, so it is the one
     /// way this window changes `agent_access`.
     pub(crate) access_choice: Option<bool>,
+    /// The profiles, by id, whose `agent_visible` this window changed and no
+    /// save has written yet. Every other profile's flag is the file's: see
+    /// [`Workspace::adopt_saved_visibility`].
+    pub(crate) visibility_choices: HashSet<String>,
     /// The calls that have ended, newest first, at most [`LOG_CAP`].
     pub(crate) log: VecDeque<LogEntry>,
 }
@@ -256,6 +260,7 @@ impl Workspace {
             self.agent_visibility_prompt = None;
         }
         profile.agent_visible = visible;
+        self.agent.visibility_choices.insert(id.to_string());
         if !visible {
             self.reject_calls_for(id, cx);
         }
@@ -386,6 +391,40 @@ impl Workspace {
         own.or_else(|| self.saved_agent_access())
     }
 
+    /// Take on each profile's `agent_visible` as the file holds it now, except
+    /// where this window made a choice no save has written yet. Profiles are
+    /// written whole by whichever window saves, so a flag remembered from
+    /// launch would put a hidden profile back in front of agents, with no
+    /// dialog, over another window's hide, or drop another window's grant.
+    /// And the window serving agents must answer with the hide made in
+    /// another one. A profile hidden this way has its waiting calls rejected,
+    /// as a hide here does.
+    ///
+    /// ponytail: the read and the write that follows are not one step across
+    /// processes, as for `agent_access`; the upgrade is the same lock.
+    pub(crate) fn adopt_saved_visibility(&mut self, cx: &mut Context<Self>) {
+        let Some(saved) = store::peek_profiles(&self.plugins) else {
+            return;
+        };
+        let mut hidden = Vec::new();
+        for profile in &mut self.profiles {
+            if self.agent.visibility_choices.contains(&profile.id) {
+                continue;
+            }
+            // The first of a repeated id, as everywhere else.
+            let Some(stored) = saved.profiles.iter().find(|stored| stored.id == profile.id) else {
+                continue;
+            };
+            if profile.agent_visible && !stored.agent_visible {
+                hidden.push(profile.id.clone());
+            }
+            profile.agent_visible = stored.agent_visible;
+        }
+        for id in hidden {
+            self.reject_calls_for(&id, cx);
+        }
+    }
+
     /// Open the socket and, only once that has worked, save that access is on.
     /// A refusal is shown as it is and changes nothing saved, so a window that
     /// found another one serving can be asked again later.
@@ -479,6 +518,7 @@ impl Workspace {
                 reply,
                 ..
             } => {
+                self.adopt_saved_visibility(cx);
                 let visible: Vec<Listed> = self
                     .profiles
                     .iter()
@@ -504,6 +544,7 @@ impl Workspace {
                 connection,
                 reply,
             } => {
+                self.adopt_saved_visibility(cx);
                 let found = match connection.as_deref() {
                     Some(name) => self
                         .agent_profile(name)

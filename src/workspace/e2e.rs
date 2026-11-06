@@ -5094,3 +5094,70 @@ fn a_click_on_the_ping_backdrop_below_the_titlebar_does_not_approve(cx: &mut Tes
         quit(workspace, cx);
     });
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_choice_overrides_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", "agent_visible = true"),
+                sqlite_profile("billing", "Billing", ""),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+
+        // Another window hides Orders and, through its own dialog, shows
+        // Billing. Only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        let text = text.replace("agent_visible = true\n", "").replace(
+            "name = \"Billing\"\n",
+            "name = \"Billing\"\nagent_visible = true\n",
+        );
+        std::fs::write(&file, text).expect("profiles.toml is written");
+        assert!(saved_visible("billing") && !saved_visible("orders"));
+
+        // The window serving agents answers with the file's flags.
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| client.is_finished());
+        let answer = client.join().expect("the client thread finished");
+        let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply.text).expect("a JSON array"),
+            serde_json::json!([{"name": "Billing", "engine": "sqlite"}])
+        );
+
+        // A save for something else entirely writes the other window's flags
+        // back as they are.
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(!saved_visible("orders") && saved_visible("billing"));
+        assert!(!agent_visible(&workspace, cx, "orders"));
+        assert!(agent_visible(&workspace, cx, "billing"));
+
+        // This window's own hide is the one that is written.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("billing", false, cx)
+        });
+        assert!(!saved_visible("billing"));
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
