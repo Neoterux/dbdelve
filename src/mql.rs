@@ -1680,7 +1680,7 @@ pub(crate) fn removes(text: &str) -> bool {
         statements
             .iter()
             .any(|statement| removes_documents(&statement.target))
-    }) || calls_remove(text)
+    }) || calls_method(text, "remove")
 }
 
 fn removes_documents(target: &Target) -> bool {
@@ -1716,14 +1716,14 @@ fn command_removes(command: &Value) -> bool {
     }
 }
 
-/// Whether `text` holds a call whose method is named `remove`, found in the
-/// tree the grammar gives it rather than through [`read`], which refuses the
-/// method: so every receiver spelling (`db.c`, `db.getCollection(..)`,
-/// `db.getSiblingDB(..).c`) and every argument shape counts, and a `remove`
-/// inside a string, a comment or a document key does not. A `remove` called on
-/// something that is not a collection counts too: a false positive, on the
-/// refusing side.
-fn calls_remove(text: &str) -> bool {
+/// Whether `text` holds a call whose method is named `name`, found in the
+/// tree the grammar gives it rather than through [`read`], which refuses a
+/// method it does not know: so every receiver spelling (`db.c`,
+/// `db.getCollection(..)`, `db.getSiblingDB(..).c`) and every argument shape
+/// counts, and a `name` inside a string, a comment or a document key does not.
+/// A call on something that is not a collection counts too: a false positive,
+/// on the refusing side.
+fn calls_method(text: &str, name: &str) -> bool {
     let mut parser = Parser::new();
     let Some(tree) = parser
         .set_language(&tree_sitter_javascript::LANGUAGE.into())
@@ -1734,13 +1734,13 @@ fn calls_remove(text: &str) -> bool {
     };
     let mut pending = vec![tree.root_node()];
     while let Some(node) = pending.pop() {
-        let removes = node.kind() == "call_expression"
+        let calls = node.kind() == "call_expression"
             && node
                 .child_by_field_name("function")
                 .filter(|function| function.kind() == "member_expression")
                 .and_then(|function| function.child_by_field_name("property"))
-                .is_some_and(|property| text.get(property.byte_range()) == Some("remove"));
-        if removes {
+                .is_some_and(|property| text.get(property.byte_range()) == Some(name));
+        if calls {
             return true;
         }
         let mut cursor = node.walk();
@@ -1772,6 +1772,73 @@ fn holds_javascript(value: &Value) -> bool {
             .iter()
             .any(|(key, value)| JS_OPERATORS.contains(&key.as_str()) || holds_javascript(value)),
         Value::Array(values) => values.iter().any(holds_javascript),
+        _ => false,
+    }
+}
+
+/// Whether `text` asks for what no agent is handed unasked: `currentOp`, as a
+/// `runCommand` or `adminCommand` or as the `$currentOp` stage of an
+/// aggregation, which lists every client's address, application name, user and
+/// in-flight command text, and `connectionStatus` asked for `showPrivileges`,
+/// which returns the user's whole privilege set. Refused for an agent whatever
+/// the mode, extending the rule that refuses Redis's `CONFIG GET` and `CLIENT
+/// LIST` (D-27); [`classify`] rates all of them reads, which is the human's
+/// answer about their own server, and is not changed. The `db.currentOp()`
+/// helper is no method DBDelve reads, so it is found in the tree like a legacy
+/// `remove`.
+pub(crate) fn discloses(text: &str) -> bool {
+    let holds = |args: &[Arg]| args.iter().any(|arg| holds_current_op(&arg.value));
+    calls_method(text, "currentOp")
+        || parse(text).is_ok_and(|statements| {
+            statements.iter().any(|statement| match &statement.target {
+                Target::Show(_) => false,
+                Target::Database { call, .. } => {
+                    (matches!(call.method, DbMethod::RunCommand | DbMethod::AdminCommand)
+                        && call
+                            .args
+                            .first()
+                            .is_some_and(|command| command_discloses(&command.value)))
+                        || holds(&call.args)
+                }
+                Target::Collection { call, cursor, .. } => {
+                    holds(&call.args) || cursor.iter().any(|chained| holds(&chained.args))
+                }
+            })
+        })
+}
+
+/// Whether a `runCommand` or `adminCommand` argument is `currentOp`, or a
+/// `connectionStatus` whose `showPrivileges` is present and not literally
+/// `false` (the fail-safe rule [`command_removes`] applies to `remove`). The
+/// server dispatches on the first key, compared exactly, so a field named
+/// `currentOp` further in is a field. An `explain` is as disclosing as the
+/// command it explains.
+fn command_discloses(command: &Value) -> bool {
+    match command {
+        Value::String(name) => name == "currentOp",
+        Value::Document(fields) => match fields.first() {
+            Some((name, _)) if name == "currentOp" => true,
+            Some((name, _)) if name == "connectionStatus" => fields
+                .iter()
+                .any(|(key, value)| key == "showPrivileges" && *value != Value::Bool(false)),
+            Some((name, inner @ Value::Document(_))) if name == "explain" => {
+                command_discloses(inner)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `value` holds a `$currentOp` key at any depth of a document or an
+/// array. A `$`-prefixed key is an operator and never a field, so none is
+/// matched by mistake.
+fn holds_current_op(value: &Value) -> bool {
+    match value {
+        Value::Document(fields) => fields
+            .iter()
+            .any(|(key, value)| key == "$currentOp" || holds_current_op(value)),
+        Value::Array(values) => values.iter().any(holds_current_op),
         _ => false,
     }
 }
@@ -5115,6 +5182,36 @@ mod tests {
             "garbage(",
         ] {
             assert!(!runs_script(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_current_op_and_connection_status_with_privileges_disclose() {
+        for text in [
+            "db.adminCommand({currentOp: 1})",
+            "db.adminCommand({currentOp: 1, $all: true})",
+            "db.runCommand({currentOp: 1})",
+            "db.adminCommand('currentOp')",
+            "db.getSiblingDB('admin').adminCommand({currentOp: 1})",
+            "db.runCommand({explain: {currentOp: 1}})",
+            "db.adminCommand({aggregate: 1, pipeline: [{$currentOp: {allUsers: true}}], cursor: {}})",
+            "db.c.aggregate([{$currentOp: {}}])",
+            "db.runCommand({connectionStatus: 1, showPrivileges: true})",
+            "db.runCommand({connectionStatus: 1, showPrivileges: 1})",
+            "db.adminCommand({connectionStatus: 1, showPrivileges: true})",
+        ] {
+            assert!(discloses(text), "{text}");
+        }
+        for text in [
+            "db.runCommand({connectionStatus: 1})",
+            "db.runCommand({connectionStatus: 1, showPrivileges: false})",
+            "db.c.find({currentOp: 1})",
+            "db.runCommand({ping: 1, currentOp: 1})",
+            "db.runCommand({ping: 1})",
+            "garbage(",
+            "show dbs",
+        ] {
+            assert!(!discloses(text), "{text}");
         }
     }
 }

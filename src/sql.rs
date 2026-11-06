@@ -2659,8 +2659,12 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     scripts: bool,
-    /// Whether any Redis command is one that returns credentials or other
-    /// clients' details: `CONFIG GET`, `CLIENT LIST` (D-27).
+    /// Whether any statement is one that returns credentials, password hashes,
+    /// the user's privileges or other clients' details (D-27): the Redis
+    /// commands `CONFIG GET`, `CLIENT LIST`, `ACL LIST` and `ACL GETUSER`, a
+    /// MongoDB `currentOp` in any spelling (the command, the `$currentOp` stage
+    /// and the `db.currentOp()` helper) and `connectionStatus` asked for its
+    /// privileges. SQL leaves it false.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
@@ -2826,6 +2830,7 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         return Parsed {
             removes: crate::mql::removes(sql),
             scripts: crate::mql::runs_script(sql),
+            discloses: crate::mql::discloses(sql),
             ..Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len())
         };
     };

@@ -425,15 +425,16 @@ pub(crate) fn runs_script(text: &str) -> bool {
     })
 }
 
-/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`: the two
-/// commands that can answer with `requirepass`, `masterauth` or another
-/// client's address and name (D-27). Matched by name and subcommand and
-/// nothing wider; [`kind`] records why the line is drawn there.
+/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`, which can
+/// answer with `requirepass`, `masterauth` or another client's address and name
+/// (D-27), or `ACL LIST` or `ACL GETUSER`, which answer with every user's
+/// password hashes. Matched by name and subcommand and nothing wider; [`kind`]
+/// records why the line is drawn there.
 pub(crate) fn discloses(text: &str) -> bool {
     commands(text).any(|command| {
         matches!(
             (command.name().as_str(), command.subcommand().as_str()),
-            ("CONFIG", "GET") | ("CLIENT", "LIST")
+            ("CONFIG", "GET") | ("CLIENT", "LIST") | ("ACL", "LIST" | "GETUSER")
         )
     })
 }
@@ -465,15 +466,13 @@ fn kind(command: &Command) -> Option<Kind> {
         ("CONFIG", "HELP") => Read,
         // These two answer with what a Read-only profile should not be handed
         // unasked: `requirepass` and `masterauth`, and every connected
-        // client's address and name. The line is drawn at them and no wider.
-        // Their siblings stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`,
-        // `ID`, `GETNAME`, `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do
-        // commands elsewhere that do disclose something: the password hashes
-        // `ACL LIST` and `ACL GETUSER` return, and the client fields in
-        // `ACL LOG` and `SLOWLOG GET`. The rule is deliberately limited to
-        // plaintext secrets and client enumeration, and those are knowingly
-        // left as reads. Widening it changes what a Read-only profile may run,
-        // which is a product decision that has not been made.
+        // client's address and name. This is where the human path's line is
+        // drawn, so they are rated writes and Read-only asks. Their siblings
+        // stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`, `ID`, `GETNAME`,
+        // `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do `ACL LIST` and
+        // `ACL GETUSER`, because the human is reading their own server. The
+        // agent path refuses all four through [`discloses`]. The client fields
+        // in `ACL LOG` and `SLOWLOG GET` stay reads on both paths.
         ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
@@ -1301,14 +1300,18 @@ mod tests {
             "config get *",
             "CLIENT LIST",
             "GET a\nCLIENT LIST",
+            "ACL LIST",
+            "acl getuser u",
+            "ACL GETUSER u",
         ] {
             assert!(discloses(text), "{text}");
         }
         for text in [
             "CONFIG HELP",
             "CLIENT INFO",
-            "ACL LIST",
-            "ACL GETUSER u",
+            "ACL WHOAMI",
+            "ACL USERS",
+            "ACL LOG",
             "SLOWLOG GET",
         ] {
             assert!(!discloses(text), "{text}");
