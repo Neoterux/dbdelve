@@ -7,7 +7,8 @@
 //! and is neither a call nor a presence.
 
 use std::{
-    io::{BufReader, Read, Write},
+    fs::File,
+    io::{self, BufReader, Read, Write},
     net::Shutdown,
     os::unix::{fs::FileTypeExt, fs::MetadataExt, net::UnixListener, net::UnixStream},
     path::{Path, PathBuf},
@@ -17,7 +18,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -110,6 +111,9 @@ impl Drop for Counted<'_> {
 pub(crate) struct Listener {
     path: PathBuf,
     shared: Arc<Shared>,
+    /// The serving lock. A field, so it is let go only after `drop` has run:
+    /// the path is this window's own for as long as the removal takes.
+    _lock: File,
 }
 
 /// Bind `path` and serve it, sending what arrives on `inbound`.
@@ -124,7 +128,7 @@ fn listen_with(
     inbound: UnboundedSender<Inbound>,
     first_frame_timeout: Duration,
 ) -> Result<Listener, Declined> {
-    let listener = ipc::bind(path)?;
+    let ipc::Bound { listener, lock } = ipc::bind(path)?;
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         next_id: AtomicU64::new(0),
@@ -146,6 +150,7 @@ fn listen_with(
     Ok(Listener {
         path: path.to_path_buf(),
         shared,
+        _lock: lock,
     })
 }
 
@@ -154,10 +159,11 @@ impl Drop for Listener {
         self.shared.stop.store(true, Ordering::SeqCst);
         // A listener cannot be closed from another thread, and `accept` does
         // not return for a flag: one connection of our own wakes it, and it
-        // sees the flag before it spawns anything for it.
+        // sees the flag before it spawns anything for it. The lock is still
+        // held, so no other window has bound the path this connects to.
         let _ = UnixStream::connect(&self.path);
-        // Only what is still this user's socket: a path a later window bound,
-        // or a file that is not ours, is not ours to remove.
+        // The lock keeps every other window off the path, so a socket here is
+        // this one's; a file that is not a socket of this user's is still left.
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
             && metadata.file_type().is_socket()
             && metadata.uid() == ipc::current_euid()
@@ -203,13 +209,14 @@ fn serve(stream: UnixStream, shared: &Shared, inbound: &UnboundedSender<Inbound>
     if shared.stop.load(Ordering::SeqCst) {
         return;
     }
-    let _ = stream.set_read_timeout(Some(shared.first_frame_timeout));
-    let Ok(reading) = stream.try_clone() else {
+    let mut reading = BufReader::new(Deadline {
+        stream: &stream,
+        until: Instant::now() + shared.first_frame_timeout,
+    });
+    let Ok(Some(line)) = wire::read_frame(&mut reading, wire::FRAME_LIMIT) else {
         return;
     };
-    let Ok(Some(line)) = wire::read_frame(&mut BufReader::new(reading), wire::FRAME_LIMIT) else {
-        return;
-    };
+    drop(reading);
     let _ = stream.set_read_timeout(None);
     match wire::decode_hello(&line) {
         Ok(wire::Hello::Call {
@@ -220,6 +227,30 @@ fn serve(stream: UnixStream, shared: &Shared, inbound: &UnboundedSender<Inbound>
         }
         Ok(wire::Hello::Presence { .. }) => presence(&stream, conn, shared, inbound),
         Err(_) => {}
+    }
+}
+
+/// Reads a stream until a moment, not for a while per read: before each read
+/// the stream's timeout is set to what is left, so a peer sending a byte at a
+/// time is closed when the first frame's time is up, as a silent one is.
+struct Deadline<'a> {
+    stream: &'a UnixStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        // A zero timeout means none at all to `set_read_timeout`.
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the first frame did not arrive in time",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        let mut reader = self.stream;
+        reader.read(buf)
     }
 }
 
@@ -584,6 +615,23 @@ mod tests {
             silent.kind(),
             ErrorKind::WouldBlock | ErrorKind::TimedOut
         ));
+    }
+
+    #[test]
+    fn a_first_frame_sent_a_byte_at_a_time_is_closed_when_its_time_is_up() {
+        let rig = Rig::new(Duration::from_millis(300));
+        let mut slow = rig.client();
+        let started = Instant::now();
+        // Each byte comes well inside the limit; the frame as a whole does not.
+        for byte in b"{\"v\":1,\"kind\":\"presence\"}" {
+            if slow.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(Rig::closed_with(&mut slow).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        rig.nothing_arrives();
     }
 
     #[test]
