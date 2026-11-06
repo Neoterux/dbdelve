@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 76] = [
+const ICONS: [(&str, &IconData); 75] = [
     ("icons/git-fork.svg", icondata_lu::LuGitFork),
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
@@ -103,7 +103,6 @@ const ICONS: [(&str, &IconData); 76] = [
     ("icons/bot.svg", icondata_lu::LuBot),
     ("icons/engine-generic.svg", icondata_lu::LuDatabase),
     ("icons/plugin.svg", icondata_lu::LuPlug),
-    ("icons/plug.svg", icondata_lu::LuPlug),
     ("icons/plug-zap.svg", icondata_lu::LuPlugZap),
 ];
 
@@ -197,7 +196,7 @@ pub mod icon {
     /// The titlebar's mark while DBDelve listens for agents and none is there,
     /// and while one is attached or a call waits. Lucide stand-ins: the one
     /// brand set in the tree has no mark for the protocol.
-    pub const AGENT_LISTENING: &str = "icons/plug.svg";
+    pub const AGENT_LISTENING: &str = "icons/plugin.svg";
     pub const AGENT_CONNECTED: &str = "icons/plug-zap.svg";
 }
 
