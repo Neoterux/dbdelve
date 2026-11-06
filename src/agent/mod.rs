@@ -119,6 +119,11 @@ pub(crate) enum Inbound {
     /// any more. Sent for every call, answered or not, so one that arrives
     /// after the call finished is expected.
     Hangup { id: CallId },
+    /// The answer to this call could not be delivered, because its caller had
+    /// already gone: the human answered in the moment between the caller
+    /// leaving and its `Hangup` reaching the window. Sent after the call has
+    /// finished, so the window only ever marks what it logged.
+    Undelivered { id: CallId },
     /// A shim opened its presence connection: an agent is attached, though it
     /// may have asked nothing yet.
     PresenceOpened { conn: ConnId },

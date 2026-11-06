@@ -4714,3 +4714,223 @@ fn the_agent_mark_lights_when_a_running_shim_finds_access_turned_on(cx: &mut Tes
         quit(workspace, cx);
     });
 }
+
+fn agent_log(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<super::agent::LogEntry> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.agent.log.iter().cloned().collect()
+    })
+}
+
+#[gpui::test]
+fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::agent::{EXPIRY, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (listed, _listed_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        // A name the agent made up, with a bell in it and far too long.
+        let made_up = format!("Nope\u{7}{}", "x".repeat(80));
+        let (refused, _refused_answers) = inject_call(&workspace, cx, Tool::Ping, Some(&made_up));
+        let (expired, _expired_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        cx.executor().advance_clock(EXPIRY + Duration::from_secs(1));
+        cx.run_until_parked();
+        let (hung_up, _hung_up_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: hung_up }, cx)
+        });
+        let (denied, _denied_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(denied, cx));
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter().map(|entry| entry.status).collect::<Vec<_>>(),
+            [
+                Status::Rejected,
+                Status::Cancelled,
+                Status::Expired,
+                Status::RefusedByGate,
+                Status::Executed
+            ]
+        );
+        assert_eq!(
+            log.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            [denied, hung_up, expired, refused, listed]
+        );
+        let asked = log[3]
+            .asked
+            .as_deref()
+            .expect("the refusal keeps what was asked");
+        assert_eq!(asked.chars().count(), 64);
+        assert!(asked.starts_with("Nope") && !asked.chars().any(char::is_control));
+        assert_eq!(log[3].resolved, None);
+        for entry in &log[..3] {
+            assert_eq!(entry.resolved.as_deref(), Some("Orders"));
+            assert_eq!(entry.asked, None);
+        }
+        // What `list_connections` answered is not kept: not the text, nor a
+        // name it listed.
+        assert_eq!((&log[4].resolved, &log[4].asked), (&None, &None));
+        assert!(!format!("{:?}", log[4]).contains("engine"));
+
+        for _ in 0..25 {
+            inject_call(&workspace, cx, Tool::ListConnections, None);
+        }
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::LOG_CAP);
+        let mut ids: Vec<_> = log.iter().map(|entry| entry.id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), super::agent::LOG_CAP, "a call was logged twice");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use crate::agent::{CallId, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.approve_ping(id, cx));
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, false)
+        );
+
+        // An id nothing logged is not a call this window answered.
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(
+                Inbound::Undelivered {
+                    id: CallId(u64::MAX),
+                },
+                cx,
+            )
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!((log.len(), log[0].requester_gone), (1, false));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Undelivered { id }, cx)
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, true)
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+
+        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
+        client
+            .write_all(format!("{PING_ORDERS}\n").as_bytes())
+            .expect("the frame is written");
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let id = pending_calls(&workspace, cx)[0];
+
+        // The caller leaves, and the window is not run while the socket's
+        // threads see it: the answer below is given before the hangup is
+        // delivered, which is the race.
+        drop(client);
+        std::thread::sleep(Duration::from_millis(100));
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.agent.calls.len(),
+                1,
+                "the hangup was delivered early, so this is not the race"
+            );
+            workspace.approve_ping(id, cx)
+        });
+        drive_until(cx, |cx| {
+            agent_log(&workspace, cx)
+                .iter()
+                .any(|entry| entry.id == id && entry.requester_gone)
+        });
+        cx.run_until_parked();
+        let entries: Vec<_> = agent_log(&workspace, cx)
+            .into_iter()
+            .filter(|entry| entry.id == id)
+            .collect();
+        assert_eq!(entries.len(), 1, "the late hangup logged the call again");
+        assert_eq!(entries[0].status, Status::Executed);
+        assert_eq!(agent_log(&workspace, cx).len(), 1);
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[test]
+fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
+    use super::{agent::LogEntry, agent_log_label};
+    use crate::agent::{CallId, Status, tools::Tool};
+
+    let entry = LogEntry {
+        at: 1_000_000,
+        id: CallId(1),
+        tool: Tool::Ping,
+        resolved: None,
+        asked: Some("Nope".to_string()),
+        status: Status::RefusedByGate,
+        requester_gone: false,
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000 + 125_000),
+        "2m ago \u{b7} ping \u{b7} asked for \"Nope\" \u{b7} refused_by_gate"
+    );
+    let entry = LogEntry {
+        resolved: Some("Orders".to_string()),
+        asked: None,
+        status: Status::Executed,
+        requester_gone: true,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} ping \u{b7} Orders \u{b7} executed \u{b7} no requester"
+    );
+    let entry = LogEntry {
+        resolved: None,
+        requester_gone: false,
+        tool: Tool::ListConnections,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} list_connections \u{b7} executed"
+    );
+}
