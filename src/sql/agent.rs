@@ -399,6 +399,7 @@ mod tests {
         for text in [
             "SELECT pg_read_file('x')",
             "SELECT * FROM pg_ls_dir('.')",
+            "SELECT * FROM pg_logdir_ls()",
             "SELECT pg_catalog.pg_read_file('x')",
             "SELECT a FROM t WHERE b IN (SELECT pg_read_file('x'))",
         ] {
@@ -426,11 +427,36 @@ mod tests {
     fn the_human_path_still_reads_an_egress_call_as_a_read() {
         for (engine, text) in [
             (Engine::Postgres, "SELECT pg_read_file('x')"),
+            (Engine::Postgres, "SELECT * FROM pg_logdir_ls()"),
             (Engine::DuckDb, "SELECT * FROM read_csv('x.csv')"),
             (Engine::DuckDb, "SELECT * FROM 'x.csv'"),
             (Engine::ClickHouse, "SELECT * FROM url('http://h/x', CSV)"),
         ] {
             assert_eq!(classify(engine, text), Verdict::READ, "{engine:?}: {text}");
+        }
+    }
+
+    /// The three writers answer `NeedsFull` because `HOLD_IGNORING_CALLS` also
+    /// holds them at Full; `pg_file_sync` is only listed, so it is approvable.
+    #[test]
+    fn the_adminpack_file_functions_never_run_for_an_agent() {
+        let sync = "SELECT pg_file_sync('x')";
+        assert_eq!(classify(Engine::Postgres, sync).mode, Mode::ReadWrite);
+        assert_eq!(postgres(sync, Mode::ReadOnly), needs_read_write());
+        for mode in [Mode::ReadWrite, Mode::Full] {
+            assert_eq!(
+                postgres(sync, mode),
+                AgentVerdict::Approve(Verdict::WRITE),
+                "{mode:?}"
+            );
+        }
+        for text in [
+            "SELECT pg_file_write('x', 'abc', false)",
+            "SELECT pg_file_rename('x', 'y')",
+            "SELECT pg_file_unlink('x')",
+        ] {
+            assert_eq!(classify(Engine::Postgres, text).mode, Mode::Full, "{text}");
+            always(Engine::Postgres, text, refused(Refusal::NeedsFull));
         }
     }
 
