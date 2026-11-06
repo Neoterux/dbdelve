@@ -132,6 +132,41 @@ DBDelve doesn't bundle any.
   to load it: `xattr -dr com.apple.quarantine <driver directory>`.
 - **Windows** uses the system ODBC manager. That path is untested.
 
+## Connecting Claude Code
+
+On macOS and Linux, Claude Code reaches a running DBDelve through `dbdelve mcp`,
+a small process Claude Code starts and DBDelve answers over a socket only your
+user can open. It is registered once, with one line:
+
+1. In DBDelve, open the command palette and choose `Turn agent access on`.
+2. Choose `Copy Claude Code registration`.
+3. Paste the line into a terminal.
+
+The line is for the DBDelve that copied it. For the macOS app it is
+
+```sh
+claude mcp add --scope user dbdelve -- '/Applications/DBDelve.app/Contents/MacOS/DBDelve' mcp
+```
+
+For a Linux package it is the same line with the installed `dbdelve` path in
+place of the app's, `~/.local/bin/dbdelve` expanded for the tarball's
+`install.sh`. For an AppImage the path is the `.AppImage` file itself, wherever
+you keep it. The dev build registers as `dbdelve-dev` and carries
+`-e DBDELVE_VARIANT=dev`, so it can sit beside the release one:
+
+```sh
+claude mcp add --scope user dbdelve-dev -e DBDELVE_VARIANT=dev -- '/path/to/DBDelve Dev.app/Contents/MacOS/DBDelve Dev' mcp
+```
+
+The path has to be absolute and the scope `user`, so that every project sees
+the server. DBDelve never runs `claude` and never edits its configuration; it
+only puts the line on the clipboard.
+
+With agent access off, or DBDelve closed, every tool answers that DBDelve is
+not running or its agent access is off.
+
+The agent integration is not available on Windows.
+
 ## Updating
 
 `brew upgrade --cask dbdelve`, if you installed it that way. Otherwise the
