@@ -319,25 +319,15 @@ pub(crate) enum AgentMark {
     Connected { waiting: usize },
 }
 
-/// The agent mark: a plug, dim while DBDelve only listens and lit once an agent
+/// The agent mark: the MCP logo, dim while DBDelve only listens and lit once an agent
 /// is there, with the number of calls waiting beside it when there are any.
 ///
 /// A `Button` like [`mode_pill`], so the titlebar can hang its popover off it.
 /// Drawn still: nothing here moves.
 pub(crate) fn agent_mark(t: Theme, mark: AgentMark) -> Button {
-    let (path, color, selector, waiting) = match mark {
-        AgentMark::Listening => (
-            icon::AGENT_LISTENING,
-            t.text_muted,
-            "agent-mark-listening",
-            0,
-        ),
-        AgentMark::Connected { waiting } => (
-            icon::AGENT_CONNECTED,
-            t.accent,
-            "agent-mark-connected",
-            waiting,
-        ),
+    let (color, selector, waiting) = match mark {
+        AgentMark::Listening => (t.text_muted, "agent-mark-listening", 0),
+        AgentMark::Connected { waiting } => (t.accent, "agent-mark-connected", waiting),
     };
     control("agent-mark", Tone::Quiet, Control::Compact)
         .px(px(layout::SPACE_SM))
@@ -351,7 +341,7 @@ pub(crate) fn agent_mark(t: Theme, mark: AgentMark) -> Button {
                 .text_size(px(layout::chrome(layout::TEXT_XS)))
                 .text_color(color)
                 .child(
-                    icon(path)
+                    icon(icon::AGENT_MARK)
                         .size(px(layout::chrome(layout::ICON_SIZE)))
                         .text_color(color),
                 )

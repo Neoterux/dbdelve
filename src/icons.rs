@@ -103,8 +103,26 @@ const ICONS: [(&str, &IconData); 75] = [
     ("icons/bot.svg", icondata_lu::LuBot),
     ("icons/engine-generic.svg", icondata_lu::LuDatabase),
     ("icons/plugin.svg", icondata_lu::LuPlug),
-    ("icons/plug-zap.svg", icondata_lu::LuPlugZap),
+    ("icons/mcp.svg", &MCP),
 ];
+
+/// The Model Context Protocol's mark, the three strokes of the protocol's own
+/// logo with its wordmark left off. `icondata_si` at its pin has no entry for
+/// it, so the paths are written here.
+const MCP: IconData = IconData {
+    style: None,
+    x: None,
+    y: None,
+    width: None,
+    height: None,
+    view_box: Some("0 0 195 195"),
+    stroke_linecap: Some("round"),
+    stroke_linejoin: None,
+    stroke_width: Some("12"),
+    stroke: Some("currentColor"),
+    fill: Some("none"),
+    data: r#"<path d="M25 97.8528L92.8823 29.9706C102.255 20.598 117.451 20.598 126.823 29.9706V29.9706C136.196 39.3431 136.196 54.5391 126.823 63.9117L75.5581 115.177"/><path d="M76.2653 114.47L126.823 63.9117C136.196 54.5391 151.392 54.5391 160.765 63.9117L161.118 64.2652C170.491 73.6378 170.491 88.8338 161.118 98.2063L99.7248 159.6C96.6006 162.724 96.6006 167.789 99.7248 170.913L112.331 183.52"/><path d="M109.853 46.9411L59.6482 97.1457C50.2757 106.518 50.2757 121.714 59.6482 131.087V131.087C69.0208 140.459 84.2168 140.459 93.5894 131.087L143.794 80.8822"/>"#,
+};
 
 /// dbdelve's own names for the icons it draws, so a call site names a thing
 /// rather than a file.
@@ -193,11 +211,9 @@ pub mod icon {
     pub const RESET: &str = "icons/rotate-ccw.svg";
     /// A connection an agent may reach, beside its name.
     pub const AGENT_VISIBLE: &str = "icons/bot.svg";
-    /// The titlebar's mark while DBDelve listens for agents and none is there,
-    /// and while one is attached or a call waits. Lucide stand-ins: the one
-    /// brand set in the tree has no mark for the protocol.
-    pub const AGENT_LISTENING: &str = "icons/plugin.svg";
-    pub const AGENT_CONNECTED: &str = "icons/plug-zap.svg";
+    /// The titlebar's agent mark, the MCP logo: dim while DBDelve listens and
+    /// lit once an agent is attached.
+    pub const AGENT_MARK: &str = "icons/mcp.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -339,8 +355,7 @@ mod tests {
             icon::CHOOSE,
             icon::NO_COLOR,
             icon::AGENT_VISIBLE,
-            icon::AGENT_LISTENING,
-            icon::AGENT_CONNECTED,
+            icon::AGENT_MARK,
         ] {
             assert_draws(path);
         }
