@@ -1727,6 +1727,97 @@ mod tests {
         }
     }
 
+    /// The categories whose functions the built-in list leaves out: they reach
+    /// outside the database, run a model or text, or look at the server.
+    const EXCLUDED_CATEGORIES: &[&str] = &[
+        "Other",
+        "Internal",
+        "Introspection",
+        "Machine Learning",
+        "AI",
+        "Dictionary",
+        "Embedded Dictionary",
+        "Natural Language Processing",
+    ];
+
+    /// The built-in list is pinned against the server's own catalog: a listed
+    /// name the server has must be a system function outside the excluded
+    /// categories, or a local table function. A name the server lacks only
+    /// fails on a server as new as the list (26.10), because a user function
+    /// could take it.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_every_listed_built_in_is_a_system_function_or_a_local_table_function() {
+        let connection =
+            Connection::open(&super::live::live_config()).expect("connection should open");
+        let rows = |sql: &str| -> Vec<Vec<String>> {
+            run(&connection, sql)
+                .expect("the catalog should answer")
+                .rows
+                .iter()
+                .map(|row| {
+                    (0..row.len())
+                        .map(|at| row.get(at).unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .collect()
+        };
+        let mut known = std::collections::HashSet::new();
+        let mut allowed = std::collections::HashSet::new();
+        for row in rows("SELECT name, case_insensitive, origin, categories FROM system.functions") {
+            let spellings = if row[1] == "1" {
+                vec![row[0].clone(), row[0].to_lowercase(), row[0].to_uppercase()]
+            } else {
+                vec![row[0].clone()]
+            };
+            let excluded = EXCLUDED_CATEGORIES
+                .iter()
+                .any(|category| row[3].split(',').any(|word| word.trim() == *category));
+            for spelling in spellings {
+                if row[2] == "System" && !excluded {
+                    allowed.insert(spelling.clone());
+                }
+                known.insert(spelling);
+            }
+        }
+        let tables: std::collections::HashSet<String> =
+            rows("SELECT name FROM system.table_functions")
+                .into_iter()
+                .map(|row| row[0].to_lowercase())
+                .collect();
+        let version = rows("SELECT version()")[0][0].clone();
+        let mut numbers = version
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        let at_least_the_lists = (numbers.next(), numbers.next()) >= (Some(26), Some(10));
+        assert!(
+            allowed.contains("lower") && tables.contains("numbers"),
+            "the catalog answered {} functions",
+            known.len()
+        );
+        for name in Engine::ClickHouse
+            .spec()
+            .sql
+            .builtin_functions
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let lower = name.to_lowercase();
+            if known.contains(name) || tables.contains(&lower) {
+                assert!(
+                    allowed.contains(name)
+                        || (tables.contains(&lower) && LOCAL.contains(&lower.as_str())),
+                    "{name} is on the built-in list and is neither a system function outside the excluded categories nor a local table function"
+                );
+            } else if at_least_the_lists {
+                assert!(
+                    crate::db::spec::GRAMMAR_FUNCTIONS.contains(&lower.as_str()),
+                    "{name} is on the built-in list and in no catalog of this server"
+                );
+            }
+        }
+    }
+
     /// The requests that carried `statement`, in order.
     fn sent(mock: &Mock, statement: &str) -> Vec<Request> {
         mock.requests()

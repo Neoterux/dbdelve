@@ -2678,6 +2678,15 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     unsent: bool,
+    /// Whether any statement the judged parse holds calls a function the
+    /// engine's built-in list does not name, in any clause, in `FROM` or under
+    /// `EXPLAIN`. The agent path reads it; the human path never does, except
+    /// through Generic's raise in [`parsed`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    unlisted_call: bool,
 }
 
 impl Parsed {
@@ -2692,10 +2701,11 @@ impl Parsed {
             scripts: false,
             discloses: false,
             unsent: false,
+            unlisted_call: false,
         }
     }
 
-    fn read(reading: Reading, statements: &[Statement]) -> Self {
+    fn read(reading: Reading, statements: &[Statement], unlisted_call: bool) -> Self {
         Self {
             verdict: reading.verdict,
             statements: statements.len(),
@@ -2705,6 +2715,7 @@ impl Parsed {
             scripts: false,
             discloses: false,
             unsent: false,
+            unlisted_call,
         }
     }
 }
@@ -2916,9 +2927,10 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         return unreadable();
     }
 
-    let calls = match parser_dialect == ParserDialect::Generic
-        && statements.iter().any(calls_unknown_function)
-    {
+    let unlisted_call = statements
+        .iter()
+        .any(|statement| calls_unlisted_function(engine, statement));
+    let calls = match engine.reads_only_listed_calls() && unlisted_call {
         true => calls.max(Verdict::WRITE),
         false => calls,
     };
@@ -2927,7 +2939,7 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         .iter()
         .map(|statement| spec_verdict(engine.spec(), statement))
         .fold(Reading::READ, Reading::max);
-    let read = Parsed::read(reading, &statements);
+    let read = Parsed::read(reading, &statements, unlisted_call);
     Parsed {
         verdict: raised(engine, sql, read.verdict).max(calls),
         ..read
@@ -3111,11 +3123,13 @@ fn db2_spelled(dialect: &dyn Dialect, sql: &str) -> Option<String> {
     changed.then_some(respelled)
 }
 
-/// Whether `statement` calls, anywhere in it, a function that is not one of
-/// [`SIDE_EFFECT_FREE_FUNCTIONS`]: a scalar or aggregate call, or a function
-/// in `FROM`. A function can write whatever its body does, and nothing in the
-/// call says, so on a server that holds nothing ([`Engine::holds_read_only`])
-/// only a known built-in reads.
+/// Whether `statement` calls, anywhere in it, a function that is not on
+/// `engine`'s [`SqlSpec::builtin_functions`]: a scalar or aggregate call, or a
+/// function in `FROM`. A function can write whatever its body does, and nothing
+/// in the call says. Two readers act on that: on Generic, which holds nothing
+/// ([`Engine::holds_read_only`]), the human path raises an unlisted call to a
+/// write; on every engine the agent path asks before one runs at Read-write
+/// and Full.
 ///
 /// Only a bare, unquoted name is matched against the list: `s.upper(x)` and
 /// `"UPPER"(x)` may name a function of the user's. An overload of a listed
@@ -3124,13 +3138,20 @@ fn db2_spelled(dialect: &dyn Dialect, sql: &str) -> Option<String> {
 /// it by its arguments' types, which SQL alone cannot resolve. That is
 /// accepted: Read-only guards against the user's mistakes, not a schema built
 /// to trap it.
-fn calls_unknown_function(statement: &Statement) -> bool {
-    struct Calls;
+///
+/// ponytail: the ceiling is what the text does not show. Postgres field
+/// notation (`t.f` calls `f(t)` with no parenthesis, and telling it from a
+/// column takes the catalog), a view, policy, rule, cast or operator that
+/// calls a function, and a listed name the connected server's version lacks,
+/// which a user function can take. The upgrade path is a catalog lookup on the
+/// live connection.
+fn calls_unlisted_function(engine: Engine, statement: &Statement) -> bool {
+    struct Calls(Engine);
     impl Visitor for Calls {
         type Break = ();
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
             match expr {
-                Expr::Function(function) if !side_effect_free(&function.name) => {
+                Expr::Function(function) if !listed(self.0, &function.name) => {
                     ControlFlow::Break(())
                 }
                 _ => ControlFlow::Continue(()),
@@ -3144,7 +3165,7 @@ fn calls_unknown_function(statement: &Statement) -> bool {
                     ..
                 }
                 | TableFactor::Function { name, .. }
-                    if !side_effect_free(name) =>
+                    if !listed(self.0, name) =>
                 {
                     ControlFlow::Break(())
                 }
@@ -3152,236 +3173,27 @@ fn calls_unknown_function(statement: &Statement) -> bool {
             }
         }
     }
-    statement.visit(&mut Calls).is_break()
+    statement.visit(&mut Calls(engine)).is_break()
 }
 
-fn side_effect_free(name: &ObjectName) -> bool {
-    matches!(
-        name.0.as_slice(),
-        [ObjectNamePart::Identifier(ident)]
-            if ident.quote_style.is_none()
-                && SIDE_EFFECT_FREE_FUNCTIONS
-                    .contains(&ident.value.to_ascii_lowercase().as_str())
-    )
+/// Whether `name` is one bare, unquoted word on `engine`'s built-in list.
+/// Case is folded unless the server tells names apart by it.
+fn listed(engine: Engine, name: &ObjectName) -> bool {
+    let sql = &engine.spec().sql;
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return false;
+    };
+    if ident.quote_style.is_some() {
+        return false;
+    }
+    let folded = match sql.case_sensitive_functions {
+        true => ident.value.clone(),
+        false => ident.value.to_ascii_lowercase(),
+    };
+    sql.builtin_functions
+        .lines()
+        .any(|line| !line.starts_with('#') && line == folded)
 }
-
-/// The functions a Generic Read-only connection may call: built-ins of
-/// Postgres, Db2 and ANSI SQL that compute a value and change nothing, so a
-/// call to one is a read wherever it stands. Anything not listed needs
-/// Read-write there ([`calls_unknown_function`]). Keep it to functions whose
-/// every spelling across those servers is side-effect free.
-const SIDE_EFFECT_FREE_FUNCTIONS: &[&str] = &[
-    // Aggregates.
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "every",
-    "any_value",
-    "bool_and",
-    "bool_or",
-    "bit_and",
-    "bit_or",
-    "array_agg",
-    "string_agg",
-    "listagg",
-    "median",
-    "mode",
-    "percentile_cont",
-    "percentile_disc",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
-    "variance",
-    "var_pop",
-    "var_samp",
-    "corr",
-    "covar_pop",
-    "covar_samp",
-    "covariance",
-    "regr_slope",
-    "regr_intercept",
-    "regr_count",
-    "regr_r2",
-    "regr_avgx",
-    "regr_avgy",
-    "regr_sxx",
-    "regr_syy",
-    "regr_sxy",
-    "grouping",
-    // Window functions.
-    "row_number",
-    "rank",
-    "dense_rank",
-    "percent_rank",
-    "cume_dist",
-    "ntile",
-    "lag",
-    "lead",
-    "first_value",
-    "last_value",
-    "nth_value",
-    // Nulls and choices.
-    "coalesce",
-    "nullif",
-    "ifnull",
-    "nvl",
-    "nvl2",
-    "value",
-    "greatest",
-    "least",
-    "decode",
-    // Numbers.
-    "abs",
-    "ceil",
-    "ceiling",
-    "floor",
-    "round",
-    "trunc",
-    "truncate",
-    "mod",
-    "power",
-    "pow",
-    "sqrt",
-    "exp",
-    "ln",
-    "log",
-    "log10",
-    "sign",
-    "pi",
-    "degrees",
-    "radians",
-    "sin",
-    "cos",
-    "tan",
-    "asin",
-    "acos",
-    "atan",
-    "atan2",
-    "random",
-    "rand",
-    // Strings.
-    "upper",
-    "lower",
-    "ucase",
-    "lcase",
-    "initcap",
-    "length",
-    "char_length",
-    "character_length",
-    "octet_length",
-    "bit_length",
-    "substr",
-    "substring",
-    "trim",
-    "ltrim",
-    "rtrim",
-    "btrim",
-    "replace",
-    "translate",
-    "concat",
-    "concat_ws",
-    "left",
-    "right",
-    "lpad",
-    "rpad",
-    "repeat",
-    "reverse",
-    "position",
-    "strpos",
-    "locate",
-    "instr",
-    "posstr",
-    "split_part",
-    "starts_with",
-    "regexp_replace",
-    "regexp_substr",
-    "regexp_like",
-    "regexp_instr",
-    "regexp_count",
-    "chr",
-    "ascii",
-    "md5",
-    "hex",
-    "to_hex",
-    "digits",
-    "space",
-    "format",
-    // Dates and times.
-    "current_date",
-    "current_time",
-    "current_timestamp",
-    "localtime",
-    "localtimestamp",
-    "now",
-    "date_trunc",
-    "date_part",
-    "extract",
-    "year",
-    "month",
-    "day",
-    "hour",
-    "minute",
-    "second",
-    "microsecond",
-    "dayofweek",
-    "dayofyear",
-    "dayofmonth",
-    "week",
-    "quarter",
-    "days",
-    "julian_day",
-    "monthname",
-    "dayname",
-    "age",
-    "make_date",
-    "make_timestamp",
-    "last_day",
-    "next_day",
-    "add_months",
-    "months_between",
-    "timestampdiff",
-    "timestamp_format",
-    "varchar_format",
-    "to_char",
-    "to_date",
-    "to_timestamp",
-    "to_number",
-    // Casts.
-    "cast",
-    "try_cast",
-    "int",
-    "integer",
-    "bigint",
-    "smallint",
-    "decimal",
-    "dec",
-    "numeric",
-    "double",
-    "real",
-    "float",
-    "char",
-    "varchar",
-    "date",
-    "time",
-    "timestamp",
-    // The session's own names.
-    "current_user",
-    "session_user",
-    "user",
-    "current_schema",
-    "current_database",
-    "current_catalog",
-    "current_setting",
-    "version",
-    // A sequence's value as this session last advanced it.
-    "currval",
-    "lastval",
-    // Rows from values.
-    "generate_series",
-    "unnest",
-];
 
 /// What a submission's calls do that its tree does not show, read off its
 /// tokens wherever they stand, so a call in a statement sqlparser cannot read
@@ -3630,6 +3442,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
     let mut unreadable = !trusted;
     let mut counted = 0;
     let mut session = false;
+    let mut unlisted_call = false;
     let reading = between_semicolons(&tokens)
         .into_iter()
         .map(|range| {
@@ -3655,6 +3468,9 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
                 Some(statements) => {
                     counted += statements.len();
                     session |= statements.iter().any(changes_session);
+                    unlisted_call |= statements
+                        .iter()
+                        .any(|statement| calls_unlisted_function(engine, statement));
                     statements
                         .iter()
                         .map(|statement| spec_verdict(spec, statement))
@@ -3688,6 +3504,7 @@ fn by_statement(engine: Engine, dialect: &dyn Dialect, sql: &str) -> Parsed {
         removes: reading.removes,
         alters: reading.alters,
         session,
+        unlisted_call,
         ..Parsed::counted(Verdict::READ, counted)
     }
 }
@@ -10484,9 +10301,9 @@ mod tests {
     fn a_function_stays_a_read_on_an_engine_that_does_not_list_it() {
         use crate::db::{Engine, Syntax};
 
-        // Generic is left out: only a known side-effect-free built-in is a
-        // read there (`SIDE_EFFECT_FREE_FUNCTIONS`), so any call it does not
-        // know is a write.
+        // Generic is left out: only a call to a function on its built-in list
+        // (`src/db/functions/generic.txt`) is a read there, so any call it
+        // does not know is a write.
         for engine in Engine::ALL.into_iter().filter(|engine| {
             engine.syntax() == Syntax::Sql
                 && *engine != Engine::Postgres
@@ -10563,9 +10380,9 @@ mod tests {
             .filter(|engine| engine.syntax() == Syntax::Sql)
         {
             for sql in ["SELECT my_function(1)", "SELECT * FROM my_function(1)"] {
-                // Generic SQL reads only a known side-effect-free built-in as
-                // a read (`SIDE_EFFECT_FREE_FUNCTIONS`): nothing on that
-                // server holds a function of the user's to reads.
+                // Generic SQL reads only a call to a function on its built-in
+                // list (`src/db/functions/generic.txt`) as a read: nothing on
+                // that server holds a function of the user's to reads.
                 let expected = match engine {
                     Engine::Generic => Mode::ReadWrite,
                     _ => Mode::ReadOnly,

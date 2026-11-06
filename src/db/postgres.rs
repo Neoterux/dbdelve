@@ -2170,6 +2170,87 @@ mod tests {
         }
     }
 
+    /// Volatile names on the built-in list that change nothing, added by hand:
+    /// they are volatile in `pg_proc` only because they read the clock, the
+    /// random source or the sequence a session already holds, or the size of
+    /// a relation. A name another run finds volatile either leaves the list or
+    /// joins this one with a reason.
+    const HARMLESS_VOLATILE: &[&str] = &[
+        "random",
+        "random_normal",
+        "clock_timestamp",
+        "timeofday",
+        "gen_random_uuid",
+        "uuidv4",
+        "uuidv7",
+        "currval",
+        "lastval",
+        "pg_database_size",
+        "pg_relation_size",
+        "pg_total_relation_size",
+        "pg_table_size",
+        "pg_indexes_size",
+        "pg_tablespace_size",
+        "pg_is_in_recovery",
+    ];
+
+    /// The built-in list is pinned against the server's own catalog: a listed
+    /// name the server has must be no volatile function, which is how a
+    /// function that writes shows itself. A name the server lacks only fails
+    /// on a server as new as the list, because a user function could take it.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_every_listed_built_in_changes_nothing() {
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        let names = |sql: &str| -> std::collections::HashSet<String> {
+            connection
+                .internal_query(sql)
+                .expect("the catalog should answer")
+                .rows
+                .iter()
+                .filter_map(|row| row.get(0).map(str::to_owned))
+                .collect()
+        };
+        let catalog = names(
+            "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc \
+             WHERE pronamespace = 'pg_catalog'::regnamespace",
+        );
+        let volatile = names(
+            "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc \
+             WHERE pronamespace = 'pg_catalog'::regnamespace AND provolatile = 'v'",
+        );
+        let keywords = names("SELECT word FROM pg_catalog.pg_get_keywords()");
+        let version: u32 = names("SELECT current_setting('server_version_num')")
+            .into_iter()
+            .next()
+            .and_then(|number| number.parse().ok())
+            .expect("the server reports its version");
+        assert!(
+            catalog.contains("lower"),
+            "the catalog answered {} names",
+            catalog.len()
+        );
+        for name in Engine::Postgres
+            .spec()
+            .sql
+            .builtin_functions
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            if catalog.contains(name) {
+                assert!(
+                    !volatile.contains(name) || HARMLESS_VOLATILE.contains(&name),
+                    "{name} is on the built-in list and has a volatile overload"
+                );
+            } else if version >= 180000 {
+                assert!(
+                    keywords.contains(name) || crate::db::spec::GRAMMAR_FUNCTIONS.contains(&name),
+                    "{name} is on the built-in list and in no catalog of this server"
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_an_active_schema_leads_every_session_and_moves_the_open_ones() {

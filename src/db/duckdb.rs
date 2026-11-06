@@ -1249,6 +1249,85 @@ mod tests {
         connection
     }
 
+    /// The built-in list as the bundled build answers it: scalar, aggregate and
+    /// macro functions the build marks as changing nothing, the grammar-defined
+    /// names, minus the engine's own deny and egress names. Table functions are
+    /// left out on purpose (see `DuckDB`'s `builtin_functions` in `spec.rs`).
+    fn built_in_list() -> String {
+        let connection = memory("");
+        let answer = connection
+            .query(
+                "SELECT DISTINCT lower(function_name) FROM duckdb_functions() \
+                 WHERE internal AND NOT coalesce(has_side_effects, false) \
+                 AND function_type IN ('scalar', 'aggregate', 'macro') ORDER BY 1",
+                Fetch::default(),
+            )
+            .expect("the catalog answers");
+        let version = connection
+            .query(
+                "SELECT library_version FROM pragma_version()",
+                Fetch::default(),
+            )
+            .expect("the version answers");
+        let version = version.rows[0].get(0).expect("a version").to_string();
+        let mut names: Vec<String> = answer
+            .rows
+            .iter()
+            .filter_map(|row| row.get(0))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "lower"),
+            "the catalog answered nothing"
+        );
+        let spec = &crate::db::Engine::DuckDb.spec().sql;
+        names.extend(
+            crate::db::spec::GRAMMAR_FUNCTIONS
+                .iter()
+                .map(|name| name.to_string()),
+        );
+        // Operators and multi-word forms (`+`, `->>`, `is distinct from`) are
+        // answered as functions but are never a call's bare name.
+        names.retain(|name| {
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !spec.denied_functions.contains(&name.as_str())
+                && !spec.egress_functions.contains(&name.as_str())
+        });
+        names.sort();
+        names.dedup();
+        let mut list = format!(
+            "# DuckDB {version} duckdb_functions(): internal scalar, aggregate and macro functions without side effects, plus grammar-defined names,\n\
+             # minus denied_functions and egress_functions. Written by the_built_in_list_is_written_from_the_bundled_catalog.\n"
+        );
+        for name in names {
+            list.push_str(&name);
+            list.push('\n');
+        }
+        list
+    }
+
+    #[test]
+    fn the_built_in_list_is_the_bundled_catalogs_answer() {
+        let committed: Vec<&str> = include_str!("functions/duckdb.txt").lines().collect();
+        let fresh = built_in_list();
+        assert_eq!(
+            committed,
+            fresh.lines().collect::<Vec<&str>>(),
+            "src/db/functions/duckdb.txt is not what the bundled build answers; if the \
+             duckdb pin moved, run the_built_in_list_is_written_from_the_bundled_catalog"
+        );
+    }
+
+    #[test]
+    #[ignore = "writes src/db/functions/duckdb.txt from the bundled build; run when the duckdb pin moves"]
+    fn the_built_in_list_is_written_from_the_bundled_catalog() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/db/functions/duckdb.txt"),
+            built_in_list(),
+        )
+        .expect("the list is written");
+    }
+
     fn cells(result: &QueryResult) -> Vec<Vec<Option<&str>>> {
         result.rows.iter().map(|row| row.iter().collect()).collect()
     }

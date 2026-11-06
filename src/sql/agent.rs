@@ -37,7 +37,8 @@
 //!    `:=`, is `Refuse(Session)`: a later approved write must hit the table the
 //!    human read it for, so nothing an agent sends may repoint the session
 //!    unseen. Stateless engines included. A plain read of what the session
-//!    holds, `currval` or `last_insert_id()`, stays a read.
+//!    holds, `currval` or `last_insert_id()`, stays a read where the engine lists
+//!    it.
 //! 7. A verdict that needs `Mode::Full` is `Refuse(NeedsFull)`: a Full profile
 //!    grants an agent nothing a Read-write one does not.
 //! 8. `gate(&verdict, mode, &[])` stopping the statement for the mode is
@@ -52,7 +53,13 @@
 //!     statement stays refused and a write that also reads a file is approved
 //!     as the write it is. It narrows what the mode lets run and never widens
 //!     it.
-//! 11. Anything else is a read, and `Run`s.
+//! 11. A read that calls a function its engine's `builtin_functions` does not
+//!     name is `Approve(verdict)` with a Read-only verdict at Read-write and
+//!     Full, and `Run`s at Read-only: the call may be a user-defined function
+//!     that writes, and at Read-write and Full no engine holds one back. The
+//!     name is judged as written, so a schema-qualified or quoted one is
+//!     unlisted. It narrows what the mode lets run and never widens it.
+//! 12. Anything else is a read, and `Run`s.
 //!
 //! The mode stays the ceiling: `Run` and `Approve` both imply that `gate` with
 //! the same mode and no silenced kind lets the statement through, and the
@@ -253,11 +260,15 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         // replacing insert in the walk, which would refuse them as `Delete`.
         return AgentVerdict::Approve(verdict);
     }
-    // The engine's egress list, read by the same scan as the deny-list but
-    // never by the human path, so DBDelve's own file opens stay reads, and
-    // DuckDB's quoted paths, which no function name marks.
+    // The egress list, read by the same scan as the deny-list but never by the
+    // human path, so DBDelve's own file opens stay reads, and DuckDB's quoted
+    // paths, which no function name marks, ask in every mode. A call the
+    // engine's built-in list does not name asks at Read-write and Full, where
+    // no engine holds; at Read-only the hold, where there is one, stops a write
+    // and a read runs.
     if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[])
         || reads_a_bare_path(engine, sql)
+        || (mode >= Mode::ReadWrite && read.unlisted_call)
     {
         return AgentVerdict::Approve(verdict);
     }
@@ -496,14 +507,71 @@ mod tests {
     }
 
     #[test]
-    fn an_unlisted_function_still_runs() {
+    fn an_unlisted_function_asks_at_read_write_and_full() {
+        // A listed built-in runs wherever it stands, and a column named like a
+        // file function is no call.
         for text in [
             "SELECT lower(a) FROM t",
-            "SELECT my_udf(a) FROM t",
             "SELECT t.pg_read_file FROM t",
             "SELECT pg_read_file FROM t",
+            // Field notation calls a one-argument function without a
+            // parenthesis, and telling it from a column needs the catalog, so
+            // it is an accepted residual.
+            "SELECT t.f FROM t",
         ] {
             always(Engine::Postgres, text, AgentVerdict::Run);
+        }
+        for text in [
+            "SELECT my_udf(a) FROM t",
+            "SELECT * FROM my_tf()",
+            "SELECT a FROM t WHERE my_udf(a) = 1",
+            "EXPLAIN SELECT my_udf(a) FROM t",
+            "SELECT pg_catalog.lower(a) FROM t",
+            "SELECT \"lower\"(a) FROM t",
+        ] {
+            assert_eq!(postgres(text, Mode::ReadOnly), AgentVerdict::Run, "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    postgres(text, mode),
+                    AgentVerdict::Approve(Verdict::READ),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clickhouse_matches_a_function_name_as_spelled() {
+        let clickhouse = &Engine::ClickHouse.spec().sql;
+        assert!(clickhouse.case_sensitive_functions);
+        for engine in sql_engines().filter(|engine| *engine != Engine::ClickHouse) {
+            assert!(!engine.spec().sql.case_sensitive_functions, "{engine:?}");
+        }
+        // A user `todate` can sit beside the built-in `toDate`, so a
+        // differently cased spelling is a different function.
+        let listed: Vec<&str> = clickhouse.builtin_functions.lines().collect();
+        for name in ["merge", "cluster", "clusterAllReplicas", "dictionary"] {
+            assert!(!listed.contains(&name), "{name}");
+        }
+        let ask = |text: &str, mode| agent_gate(Engine::ClickHouse, text, mode);
+        for mode in [Mode::ReadWrite, Mode::Full] {
+            assert_eq!(
+                ask("SELECT todate(a) FROM t", mode),
+                AgentVerdict::Approve(Verdict::READ),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            ask("SELECT todate(a) FROM t", Mode::ReadOnly),
+            AgentVerdict::Run
+        );
+        for text in [
+            "SELECT toDate(a) FROM t",
+            "SELECT lower(a) FROM t",
+            "SELECT LOWER(a) FROM t",
+            "SELECT * FROM numbers(10)",
+        ] {
+            always(Engine::ClickHouse, text, AgentVerdict::Run);
         }
     }
 
@@ -549,6 +617,132 @@ mod tests {
             let spec = &engine.spec().sql;
             for name in spec.denied_functions.iter().chain(spec.egress_functions) {
                 assert_eq!(*name, name.to_lowercase(), "{engine:?}");
+            }
+            if !spec.case_sensitive_functions {
+                for name in listed_names(engine) {
+                    assert_eq!(name, name.to_lowercase(), "{engine:?}");
+                }
+            }
+        }
+    }
+
+    /// The names of `engine`'s built-in list: every line that is not a comment.
+    fn listed_names(engine: Engine) -> impl Iterator<Item = &'static str> {
+        engine
+            .spec()
+            .sql
+            .builtin_functions
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+    }
+
+    #[test]
+    fn no_built_in_list_names_a_denied_or_egress_function() {
+        for engine in sql_engines() {
+            let names: Vec<&str> = listed_names(engine).collect();
+            assert!(names.contains(&"lower"), "{engine:?}");
+            let spec = &engine.spec().sql;
+            for name in &names {
+                assert!(
+                    !name.is_empty() && *name == name.trim(),
+                    "{engine:?}: {name:?} is not a bare name"
+                );
+                let lower = name.to_lowercase();
+                assert!(
+                    !spec.denied_functions.contains(&lower.as_str())
+                        && !spec.egress_functions.contains(&lower.as_str()),
+                    "{engine:?}: {name} is on the built-in list and on a deny or egress list"
+                );
+            }
+        }
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|e| e.syntax() != Syntax::Sql)
+        {
+            assert_eq!(listed_names(engine).count(), 0, "{engine:?}");
+        }
+        assert_eq!(
+            Engine::Turso.spec().sql.builtin_functions,
+            Engine::Sqlite.spec().sql.builtin_functions
+        );
+    }
+
+    /// The shapes of a call to a function the engine does not list, in every
+    /// clause the visitor has to reach, with a qualified and a quoted name.
+    /// Some do not parse on every dialect; those are refused, which is not `Run`
+    /// either.
+    const UNLISTED_CALLS: [&str; 22] = [
+        "SELECT delvetest.my_udf()",
+        "SELECT my_udf()",
+        "SELECT * FROM delvetest.my_udf()",
+        "SELECT 1 WHERE delvetest.my_udf() = 1",
+        "VALUES (delvetest.my_udf())",
+        "SELECT * FROM TABLE(DELVETEST.MY_TF())",
+        "SELECT * FROM TABLE(DELVETEST.MY_TF()) AS T",
+        "SELECT COUNT(*) FROM TABLE(DELVETEST.MY_TF()) x WHERE 1=0",
+        "WITH t AS (SELECT * FROM TABLE(DELVETEST.MY_TF()) x) SELECT * FROM t",
+        "SET DELVETEST.VV = (SELECT COUNT(*) FROM TABLE(DELVETEST.MY_TF()) x)",
+        "SELECT myschema.upper(x) FROM t",
+        "SELECT \"UPPER\"(x) FROM t",
+        "SELECT count(my_udf()) FROM t",
+        "SELECT 1 FROM t ORDER BY my_udf()",
+        "SELECT 1 FROM t GROUP BY my_udf()",
+        "SELECT * FROM t JOIN u ON my_udf() = 1",
+        "SELECT CAST(my_udf() AS INT)",
+        "SELECT CASE WHEN my_udf() = 1 THEN 1 END",
+        "SELECT * FROM t WHERE x IN (SELECT my_udf())",
+        "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = my_udf())",
+        "SELECT 1 UNION SELECT my_udf()",
+        "EXPLAIN ANALYZE SELECT my_udf()",
+    ];
+
+    #[test]
+    fn every_sql_engine_asks_before_a_call_it_does_not_list() {
+        for engine in sql_engines() {
+            for text in UNLISTED_CALLS {
+                for mode in [Mode::ReadWrite, Mode::Full] {
+                    assert_ne!(
+                        agent_gate(engine, text, mode),
+                        AgentVerdict::Run,
+                        "{engine:?} {mode:?}: {text}"
+                    );
+                }
+            }
+            for text in [
+                "SELECT my_udf(a) FROM t",
+                "SELECT a FROM t WHERE my_udf(a) = 1",
+                "SELECT a FROM t ORDER BY my_udf(a)",
+            ] {
+                // Generic's Read-only already reads the call as a write, so it
+                // is refused there rather than run.
+                if engine == Engine::Generic {
+                    for mode in Mode::ALL {
+                        assert_ne!(agent_gate(engine, text, mode), AgentVerdict::Run);
+                    }
+                    continue;
+                }
+                assert_eq!(
+                    agent_gate(engine, text, Mode::ReadOnly),
+                    AgentVerdict::Run,
+                    "{engine:?}: {text}"
+                );
+                for mode in [Mode::ReadWrite, Mode::Full] {
+                    assert_eq!(
+                        agent_gate(engine, text, mode),
+                        AgentVerdict::Approve(Verdict::READ),
+                        "{engine:?} {mode:?}: {text}"
+                    );
+                }
+            }
+        }
+        // The visitor reads the expanded tokens of a MySQL executable comment.
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_ne!(
+                    agent_gate(engine, "SELECT 1 /*!, my_udf() */", mode),
+                    AgentVerdict::Run,
+                    "{engine:?} {mode:?}"
+                );
             }
         }
     }
@@ -956,27 +1150,8 @@ mod tests {
     #[test]
     fn a_plain_select_runs_on_every_engine_and_mode() {
         for engine in sql_engines() {
-            for sql in [
-                "SELECT a FROM t",
-                "SELECT lower(a) FROM t",
-                "SELECT my_udf(a) FROM t",
-            ] {
-                // Generic SQL reads only a known side-effect-free built-in as
-                // a read (`SIDE_EFFECT_FREE_FUNCTIONS`): a function of the
-                // user's may write, and nothing on that server holds it back.
-                if engine == Engine::Generic && sql.contains("my_udf") {
-                    for mode in Mode::ALL {
-                        assert_ne!(agent_gate(engine, sql, mode), AgentVerdict::Run, "{mode:?}");
-                    }
-                    continue;
-                }
-                for mode in Mode::ALL {
-                    assert_eq!(
-                        agent_gate(engine, sql, mode),
-                        AgentVerdict::Run,
-                        "{engine:?} {mode:?}: {sql}"
-                    );
-                }
+            for sql in ["SELECT a FROM t", "SELECT lower(a) FROM t"] {
+                always(engine, sql, AgentVerdict::Run);
             }
         }
     }
