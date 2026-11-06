@@ -198,6 +198,15 @@ const SQL_KINDS: &[(&str, &str)] = &[
         "create a temporary table",
         "CREATE TEMPORARY TABLE u (a INT)",
     ),
+    ("create a temporary view", "CREATE TEMP VIEW v AS SELECT 1"),
+    (
+        "create or replace a temporary view",
+        "CREATE OR REPLACE TEMP VIEW v AS SELECT 1",
+    ),
+    (
+        "select into a temporary table under a union",
+        "SELECT * INTO TEMP u FROM t UNION ALL SELECT * FROM w",
+    ),
     ("assign a user variable", "SELECT @x := 1"),
     ("select into a user variable", "SELECT 1 INTO @x"),
     ("savepoint", "SAVEPOINT a"),
