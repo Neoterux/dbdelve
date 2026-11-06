@@ -14,6 +14,7 @@ source: src/sql_snapshots.rs
 [postgres] call pg_ls_archive_statusdir: SELECT * FROM pg_ls_archive_statusdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
 [postgres] call pg_ls_tmpdir: SELECT * FROM pg_ls_tmpdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
 [postgres] call pg_ls_summariesdir: SELECT * FROM pg_ls_summariesdir('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
+[postgres] call pg_logdir_ls: SELECT * FROM pg_logdir_ls('x') => |ro=approve(ReadOnly) rw=approve(ReadOnly) full=approve(ReadOnly)|
 [postgres] a quoted path: SELECT * FROM 'data.csv' => |ro=run rw=run full=run|
 [postgres] a double-quoted path: SELECT * FROM "data.csv" => |ro=run rw=run full=run|
 [postgres] a url: SELECT * FROM 'https://example.com/x.parquet' => |ro=run rw=run full=run|
