@@ -1269,14 +1269,16 @@ pub(super) fn session_settings_agree_with_the_server(subject: &Subject) {
 /// The two servers of the MySQL dialect disagree about a MariaDB-only
 /// executable comment (`/*M!100100 … */`): one runs what it holds, the other
 /// reads a comment. The classifier cannot know which it is talking to, so it
-/// rates what the executing one would run, and this scenario pins both halves:
-/// the executing server really does the destructive thing and really does
-/// disarm the hold, and the other really does neither.
+/// rates what the executing one would run, and on MySQL also calls the
+/// statement unreadable. This scenario pins both halves: the executing server
+/// really does the destructive thing and really does disarm the hold, and the
+/// other really does neither.
 ///
 /// Which one this is is asked of the server, not of the engine: `SELECT 2
 /// /*M!100100 +1 */` answers 3 from one and 2 from the other. Every positive
-/// has a control spelled as a plain comment that is rated a read and leaves the
-/// same object, or the same refused write, untouched on both.
+/// has a control spelled as a plain comment that leaves the same object, or the
+/// same refused write, untouched on both; it is rated a read on MariaDB and
+/// unreadable on MySQL.
 pub(super) fn executable_comments_agree_with_the_server(subject: &Subject) {
     let scenario = "executable_comments_agree_with_the_server";
     let at = format!("{scenario} on {:?}", subject.target.engine);
@@ -1349,38 +1351,50 @@ pub(super) fn executable_comments_agree_with_the_server(subject: &Subject) {
             error.message
         );
     };
-    let verdict = |sql: &str| sql::classify(engine, sql);
-    let stopped = |sql: &str| {
-        let rated = verdict(sql);
-        assert!(
-            rated.mode > sql::Mode::ReadOnly
-                && !rated.destructive.contains(&sql::Destructive::Unreadable),
-            "{at}: `{sql}` is rated {rated:?}, which a Read-only profile would run"
-        );
-    };
-    let a_read = |sql: &str| {
-        assert_eq!(
-            verdict(sql),
-            sql::Verdict::READ,
-            "{at}: control `{sql}` is not rated a plain read"
-        );
-    };
-
     let executes = match cell("SELECT 2 /*M!100100 +1 */").as_str() {
         "3" => true,
         "2" => false,
         other => panic!("{at}: the probe answered {other}, which neither server gives"),
     };
 
+    // On MySQL, which never runs the marker, the classifier also rates every
+    // `/*M!` statement unreadable: what it holds and what MySQL runs without it
+    // differ, so the human sees the statement before it goes.
+    let unreadable = sql::Destructive::Unreadable;
+    let verdict = |sql: &str| sql::classify(engine, sql);
+    let stopped = |sql: &str| {
+        let rated = verdict(sql);
+        assert!(
+            rated.mode > sql::Mode::ReadOnly && rated.destructive.contains(&unreadable) != executes,
+            "{at}: `{sql}` is rated {rated:?}, which a Read-only profile would run"
+        );
+    };
+    let a_read = |sql: &str| {
+        let rated = verdict(sql);
+        if executes {
+            assert_eq!(
+                rated,
+                sql::Verdict::READ,
+                "{at}: control `{sql}` is not rated a plain read"
+            );
+        } else {
+            assert!(
+                rated.destructive == [unreadable],
+                "{at}: control `{sql}` is rated {rated:?}, not unreadable"
+            );
+        }
+    };
+
     // The destructive form: rated by the kind it holds on both servers, and the
     // object is gone afterwards on the one that runs it and still there on the
     // other.
     let drop = format!("/*M!100100 DROP TABLE {table} */");
-    assert_eq!(
-        verdict(&drop).destructive,
-        [sql::Destructive::Drop],
-        "{at}: `{drop}`"
-    );
+    let held = if executes {
+        vec![sql::Destructive::Drop]
+    } else {
+        vec![sql::Destructive::Drop, unreadable]
+    };
+    assert_eq!(verdict(&drop).destructive, held, "{at}: `{drop}`");
     run(&create);
     send(&drop);
     assert_eq!(
