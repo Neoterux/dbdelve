@@ -1589,8 +1589,15 @@ impl Workspace {
 
         Some(
             div()
+                // Starts below the titlebar rather than over it: the agent
+                // mark's waiting count and its turn-off item must stay
+                // clickable while a ping waits, and the window controls live
+                // in that strip too.
                 .absolute()
-                .inset_0()
+                .top(px(layout::TITLEBAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .bottom_0()
                 .occlude()
                 .flex()
                 .items_center()

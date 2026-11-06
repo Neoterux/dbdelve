@@ -4986,3 +4986,111 @@ fn the_agent_popover_turns_access_off(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the_dialog(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        // The dialog stops under the titlebar, so the click reaches the mark.
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("a waiting call lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        let menu_open = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(
+            menu_open(cx),
+            "the dialog took the click meant for the mark"
+        );
+        assert_eq!(
+            answers.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Empty),
+            "opening the menu answered the ping"
+        );
+
+        // By the pointer: the dialog holds the keyboard while it is up, so a
+        // key meant for the menu is the dialog's, and `enter` there denies.
+        // The rows have no selector, so each try reopens the menu and clicks
+        // one row lower until the one item that acts is under the pointer; a
+        // click on a label or outside the menu only closes it.
+        for step in 0..12 {
+            if pending_calls(&workspace, cx).is_empty() {
+                break;
+            }
+            if !menu_open(cx) {
+                cx.simulate_click(mark.center(), gpui::Modifiers::default());
+                settle(cx);
+            }
+            let at = gpui::point(
+                mark.center().x,
+                mark.bottom() + gpui::px(14. + 8. * step as f32),
+            );
+            cx.simulate_click(at, gpui::Modifiers::default());
+            settle(cx);
+        }
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(crate::agent::Reply {
+                status: crate::agent::Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!listening(&workspace, cx));
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_click_on_the_ping_backdrop_below_the_titlebar_does_not_approve(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        let just_below_the_titlebar = gpui::point(
+            gpui::px(12.),
+            gpui::px(crate::theme::layout::TITLEBAR_HEIGHT + 12.),
+        );
+        cx.simulate_click(just_below_the_titlebar, gpui::Modifiers::default());
+        settle(cx);
+
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        quit(workspace, cx);
+    });
+}
