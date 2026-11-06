@@ -270,8 +270,13 @@ draft of this document. Each is closed in the same release.
   test plan 01-15 added, for the extensions it surveyed: `tablefunc`, `xml2`,
   `dblink`, and PostGIS as the compose server installs it. The PostGIS
   extensions that server does not install (`postgis_raster`, `postgis_topology`,
-  `postgis_tiger_geocoder`) and every other extension were not surveyed, and a
-  function in an unsurveyed extension stays a read until it is listed.
+  `postgis_tiger_geocoder`) and every other extension were not surveyed for
+  carriers. Those surveys were for carriers: the file functions of `adminpack`,
+  a contrib extension shipped through Postgres 16, are listed for what they do.
+  Its four writers are on the deny-list and `pg_logdir_ls` is on the agent's
+  egress list, and a live test pins its members against both lists. `pg_surgery`,
+  `pg_stat_statements_reset`, `pg_visibility` and `pg_prewarm`, and any function
+  in another unsurveyed extension, stay reads until they are listed.
   Plan 01-08 listed the executors the catalog names; the record of the changed verdicts
   is `hardening_functions` in `src/sql_snapshots/snapshots/`. Plan 01-09 asked
   the same question of DuckDB on the embedded build the tests use

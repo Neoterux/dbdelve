@@ -864,10 +864,26 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         // live). The other six members that match escape every argument. The
         // survey stops there: PostGIS's C members cannot be seen by a catalog
         // shape, and `postgis_raster`, `postgis_topology` and
-        // `postgis_tiger_geocoder` were not surveyed. A function in an
-        // extension nobody has surveyed stays a read until it is listed, as
-        // an unlisted call does everywhere else. The catalog lists were
+        // `postgis_tiger_geocoder` were not surveyed. The catalog lists were
         // checked against Postgres 15.13 (Debian 15.13-1.pgdg110+1).
+        //
+        // `adminpack` is contrib, shipped through Postgres 16 and removed in
+        // 17. It installs into `pg_catalog` four functions that write,
+        // rename, flush and delete files on the server's file system. They
+        // are listed so that a Read-only profile asks first.
+        // `pg_file_write`, `pg_file_rename` and `pg_file_unlink` also need
+        // Full, through `HOLD_IGNORING_CALLS` in src/sql.rs, because a file
+        // written outside the database is not rolled back; that leaves
+        // `pg_file_sync` at Read-write. Its `pg_logdir_ls` lists the log
+        // directory and is on `egress_functions` below. The extension's
+        // members are pinned against its own catalog by
+        // `live_every_function_adminpack_owns_is_on_the_deny_or_egress_list`
+        // in src/db/postgres.rs. The names come from the PostgreSQL 16
+        // documentation, not from a run against a server.
+        //
+        // The other contrib extensions with side effects were not surveyed
+        // and stay reads until they are listed: `pg_surgery`,
+        // `pg_stat_statements_reset`, `pg_visibility` and `pg_prewarm`.
         denied_functions: &[
             "set_config",
             "nextval",
@@ -924,10 +940,18 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "dblink_send_query",
             "dblink_open",
             "st_findextent",
+            "pg_file_write",
+            "pg_file_rename",
+            "pg_file_unlink",
+            "pg_file_sync",
         ],
         // The documentation's Generic File Access Functions, plus
         // `pg_read_file_old`, which the server carries. Pinned against
         // `pg_catalog` by `live_every_file_access_function_is_on_the_egress_list`.
+        // `adminpack`'s `pg_logdir_ls` lists the log directory as
+        // `pg_ls_logdir` does; the adminpack live test pins it rather than
+        // that regex test, because an extension is installed per database and
+        // the shared dev database does not install it.
         egress_functions: &[
             "pg_read_file",
             "pg_read_binary_file",
@@ -942,6 +966,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "pg_ls_archive_statusdir",
             "pg_ls_tmpdir",
             "pg_ls_summariesdir",
+            "pg_logdir_ls",
         ],
         // What a user's own `SET` may change on a Read-only profile without
         // asking. Left off on purpose: the hold's own two names, `role` and
