@@ -3805,6 +3805,213 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
     });
 }
 
+/// Another window of the same variant, as far as the socket can tell: a
+/// listener bound at the derived path, whose messages the test holds. Dropping
+/// it is that window closing.
+#[cfg(unix)]
+fn another_window() -> (
+    crate::agent::Listener,
+    tokio::sync::mpsc::UnboundedReceiver<crate::agent::Inbound>,
+) {
+    let path = crate::agent::socket_path().expect("the test home gives a socket path");
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    match crate::agent::listen(&path, sender) {
+        Ok(listener) => (listener, receiver),
+        Err(_) => panic!("the stand-in window binds the socket"),
+    }
+}
+
+/// What another window's own access action leaves in the shared settings file.
+#[cfg(unix)]
+fn another_window_saves_agent_access(choice: bool) {
+    let mut list = store::peek_profiles(&[]).expect("profiles.toml reads back");
+    list.settings
+        .get_or_insert_with(Default::default)
+        .agent_access = Some(choice);
+    store::save_profiles(&list).expect("profiles.toml is written");
+}
+
+#[cfg(unix)]
+const ALREADY_SERVED: &str = "Another DBDelve window is already serving agents.";
+
+#[cfg(unix)]
+const STILL_SERVED: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
+
+#[cfg(unix)]
+fn listening(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_some())
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_saved_agent_access_listens_at_launch_and_quit_removes_the_socket(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let profile = sqlite_profile("orders", "Orders", "agent_visible = true");
+        // The second `true` is the next launch from the file the first quit
+        // left; the last two are a file that says off and one that says nothing.
+        for (setting, saved, listens) in [
+            ("agent_access = true", Some(true), true),
+            ("agent_access = true", Some(true), true),
+            ("agent_access = false", Some(false), false),
+            ("", None, false),
+        ] {
+            let (workspace, cx) = launch_with_settings(cx, setting, &profile);
+            cx.executor().allow_parking();
+            assert_eq!(listening(&workspace, cx), listens, "{setting:?}");
+            assert_eq!(path.exists(), listens, "{setting:?}");
+            assert_eq!(
+                agent_access_rows(&workspace, cx),
+                [if listens {
+                    "Disconnect agents and turn access off"
+                } else {
+                    "Turn agent access on"
+                }]
+            );
+
+            quit(workspace, cx);
+            assert!(
+                std::fs::symlink_metadata(&path).is_err(),
+                "{setting:?}: quitting leaves no socket file"
+            );
+            assert_eq!(saved_agent_access(), saved, "{setting:?}");
+        }
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_second_window_leaves_a_live_socket_alone_and_says_so(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixStream;
+
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let (first_window, _received) = another_window();
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+        assert_eq!(saved_agent_access(), Some(true), "a decline writes nothing");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first window still accepts"
+        );
+
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+        assert_eq!(saved_agent_access(), Some(true));
+        assert!(UnixStream::connect(&path).is_ok());
+
+        drop(first_window);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(listening(&workspace, cx));
+        assert!(UnixStream::connect(&path).is_ok());
+        assert_eq!(saved_agent_access(), Some(true));
+
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_holds_across_two_windows_of_the_same_variant(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixStream;
+
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let (first_window, mut received) = another_window();
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+
+        // R-02: this window reaches none of the first window's agents, and
+        // says so, while still saving that access is off for every launch.
+        let press = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, _| workspace.clear_notice());
+            run_command(&workspace, cx, Command::DisconnectAgents);
+        };
+        press(cx);
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(STILL_SERVED));
+        assert_eq!(saved_agent_access(), Some(false));
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first window is left serving"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "nothing was sent to the first window"
+        );
+        press(cx);
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(STILL_SERVED));
+        assert_eq!(saved_agent_access(), Some(false));
+
+        // T-04-22: the other window's turn-on and kill switch each survive an
+        // unrelated save made here.
+        let toggle_titlebar = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let color = workspace.settings.color_titlebar;
+                workspace.set_color_titlebar(!color, cx)
+            });
+        };
+        another_window_saves_agent_access(true);
+        toggle_titlebar(cx);
+        assert_eq!(saved_agent_access(), Some(true));
+        another_window_saves_agent_access(false);
+        drop(first_window);
+        toggle_titlebar(cx);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert!(!listening(&workspace, cx));
+        assert!(UnixStream::connect(&path).is_err());
+
+        // The other window turned access on and quit: nothing serves, and
+        // the kill saves off and has nothing to add.
+        another_window_saves_agent_access(true);
+        press(cx);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(shown_notice(&workspace, cx), None);
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let written = || {
+            std::fs::metadata(&file)
+                .and_then(|metadata| metadata.modified())
+                .expect("profiles.toml has a modification time")
+        };
+        let before = written();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        press(cx);
+        assert_eq!(written(), before, "nothing is written the second time");
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        quit(workspace, cx);
+        let (workspace, cx) = launch(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

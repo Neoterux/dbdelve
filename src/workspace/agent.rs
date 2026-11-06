@@ -45,6 +45,11 @@ pub(crate) struct PendingCall {
 /// What a pending call is told when the kill switch ends it.
 const TURNED_OFF: &str = "Agent access was turned off in DBDelve.";
 
+/// What the kill switch says in a window that is not serving while another
+/// window of the variant is. Its sentence is what stays true: that window's
+/// agents are not disconnected.
+const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
+
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
     format!(
@@ -269,6 +274,11 @@ impl Workspace {
     ///    the file says `true`. It is the user's own action, so no later launch
     ///    of the variant listens, even if this window never did. With neither,
     ///    nothing is written.
+    /// 4. In a window that was not serving, while another window of the
+    ///    variant is, the notice says that window's agents stay connected. This
+    ///    window cannot reach them, because Phase 4 has no frame that tells
+    ///    another window to stop; what it can do is save the choice and say
+    ///    that. The notice repeats on every press, since it stays true.
     pub(crate) fn disconnect_agents(&mut self, cx: &mut Context<Self>) {
         let pending: Vec<CallId> = self.agent.calls.iter().map(|call| call.id).collect();
         for id in pending {
@@ -279,6 +289,9 @@ impl Workspace {
         if was_serving || self.saved_agent_access() == Some(true) {
             self.agent.access_choice = Some(false);
             self.remember_profiles(cx);
+        }
+        if !was_serving && crate::agent::socket_is_live() {
+            self.note(STILL_SERVED_ELSEWHERE.to_string(), cx);
         }
         cx.notify();
     }

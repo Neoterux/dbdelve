@@ -38,6 +38,15 @@ pub(crate) use ipc::socket_path;
 pub(crate) use server::{Listener, listen};
 use tools::Tool;
 
+/// Whether another window of this variant is serving agents at this build's
+/// socket. Asked of a window that is not listening itself, so a live answer
+/// can only be someone else. The probe is an unframed connection, which the
+/// serving window closes without counting (see [`Listener`]).
+#[cfg(unix)]
+pub(crate) fn socket_is_live() -> bool {
+    socket_path().is_ok_and(|path| ipc::is_live(&path))
+}
+
 /// What the agent is told: `executed` is the app's, for a call it carried out;
 /// `refused_by_gate` is the app's, for a name that resolves to nothing visible
 /// or a bridge that is full; `expired` is the app's, for a ping nobody answered;
@@ -138,6 +147,12 @@ pub(crate) enum Listener {}
 #[cfg(not(unix))]
 pub(crate) fn socket_path() -> Result<std::path::PathBuf, String> {
     Err(UNAVAILABLE.to_string())
+}
+
+/// There is no socket for another window to be serving.
+#[cfg(not(unix))]
+pub(crate) fn socket_is_live() -> bool {
+    false
 }
 
 /// There is no socket to listen on.

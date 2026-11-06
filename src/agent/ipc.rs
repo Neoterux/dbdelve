@@ -139,13 +139,20 @@ pub(super) fn secure_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether something answers on the socket at `path`: another window serving.
+/// A plain connect that sends no frame, which the serving window closes
+/// without counting as a call or a presence.
+pub(super) fn is_live(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
 /// What is at `path` when binding it found something there. A socket someone
 /// answers on is another window's and is left alone. One nobody answers on,
 /// owned by this user, is what a crash leaves behind and is replaced, once. A
 /// file of any other kind, or a socket of another user's, is never removed.
 fn replace_stale(path: &Path) -> Result<UnixListener, Declined> {
     let shown = path.display();
-    if UnixStream::connect(path).is_ok() {
+    if is_live(path) {
         return Err(Declined::ServedElsewhere);
     }
     let ours = std::fs::symlink_metadata(path)

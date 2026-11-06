@@ -525,6 +525,10 @@ impl Workspace {
         };
 
         let mut load_failure = None;
+        // Read once, here, to decide whether to listen. The window keeps no
+        // copy: a saved one is what would write `true` back over another
+        // window's kill switch (see `agent_access_to_save`).
+        let mut listen_at_launch = false;
         match store::load_profiles(&workspace.plugins) {
             Ok(store::ProfileList {
                 profiles,
@@ -537,6 +541,7 @@ impl Workspace {
                 // Before the first frame, so the window is drawn in the faces
                 // the user picked rather than repainted into them.
                 let stored_settings = stored_settings.unwrap_or_default();
+                listen_at_launch = stored_settings.agent_access.unwrap_or(false);
                 // Ahead of the fonts and the theme, which size gpui-component's
                 // widgets off the chrome size as they install.
                 let chrome_font_size =
@@ -678,6 +683,12 @@ impl Workspace {
         if let Some(message) = load_failure {
             workspace.note(message, cx);
         }
+        // A refusal is shown and nothing saved changes: the choice is the
+        // user's, and a window that found another one serving can be asked
+        // again from the palette.
+        if listen_at_launch && let Err(text) = workspace.listen_for_agents(cx) {
+            workspace.note(text, cx);
+        }
 
         if workspace.settings.check_for_updates {
             let check = spawn_blocking(cx.background_executor(), update::newer_release);
@@ -759,14 +770,21 @@ impl Workspace {
 
         // Finish writes synchronously: the process is going, and nothing
         // would wait for background work to finish.
+        //
+        // The agent socket file goes with the window; the user's choice stays
+        // saved, so the next launch listens again only if access was on.
         cx.on_app_quit(|workspace: &mut Self, cx: &mut Context<Self>| {
             workspace.persist_buffers(cx);
+            workspace.drop_bridge();
             async {}
         })
         .detach();
         // Window release also persists when the window closes without Quit.
-        cx.on_release(|workspace, cx| workspace.persist_buffers(cx))
-            .detach();
+        cx.on_release(|workspace, cx| {
+            workspace.persist_buffers(cx);
+            workspace.drop_bridge();
+        })
+        .detach();
 
         workspace.connect_active(cx);
         workspace
