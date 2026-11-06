@@ -586,6 +586,16 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
         "hash get and expire at a fixed time",
         "HGETEX h PXAT 1 FIELDS 1 f",
     ),
+    (
+        Engine::Redis,
+        "hash set expiring at zero",
+        "HSETEX h EX 0 FIELDS 1 f v",
+    ),
+    (
+        Engine::Redis,
+        "hash get expiring at zero",
+        "HGETEX h PX 0 FIELDS 1 f",
+    ),
     (Engine::Redis, "eval", "EVAL \"return 1\" 0"),
     (Engine::Redis, "eval sha", "EVALSHA abc 0"),
     (Engine::Redis, "fcall", "FCALL f 0"),
