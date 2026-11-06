@@ -7,11 +7,12 @@
 //! never used.
 
 use std::{
+    fs::{File, OpenOptions},
     io,
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -146,15 +147,55 @@ pub(super) fn is_live(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
 }
 
-/// What is at `path` when binding it found something there. A socket someone
-/// answers on is another window's and is left alone. One nobody answers on,
-/// owned by this user, is what a crash leaves behind and is replaced, once. A
-/// file of any other kind, or a socket of another user's, is never removed.
+/// A bound socket and the lock that makes it this window's. The lock is held
+/// for as long as the window serves: while it is, no other window binds or
+/// removes the path, and the kernel lets go of it when the process ends, crash
+/// or not.
+pub(super) struct Bound {
+    pub(super) listener: UnixListener,
+    pub(super) lock: File,
+}
+
+/// Take the serving lock beside `path`, or learn that another window holds it.
+///
+/// Whether a window serves is asked of this lock and never of a connect: a
+/// socket whose backlog is full refuses a connect exactly as a stale one does,
+/// so a connect cannot tell a busy window from a crashed one.
+fn take_lock(path: &Path) -> Result<File, Declined> {
+    let lock_path = path.with_extension("lock");
+    let shown = lock_path.display();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|error| {
+            Declined::Failed(format!(
+                "The agent socket's lock {shown} could not be opened: {error}."
+            ))
+        })?;
+    // SAFETY: the descriptor is the open file's own and outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(Declined::ServedElsewhere);
+        }
+        return Err(Declined::Failed(format!(
+            "The agent socket's lock {shown} could not be taken: {error}."
+        )));
+    }
+    Ok(file)
+}
+
+/// Replace what binding `path` found there. Only a window holding the lock
+/// gets here, so a socket at the path is one a crash left behind. A socket of
+/// this user's is removed, once; a file of any other kind, or a socket of
+/// another user's, is never removed.
 fn replace_stale(path: &Path) -> Result<UnixListener, Declined> {
     let shown = path.display();
-    if is_live(path) {
-        return Err(Declined::ServedElsewhere);
-    }
     let ours = std::fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == current_euid());
     if !ours {
@@ -167,19 +208,16 @@ fn replace_stale(path: &Path) -> Result<UnixListener, Declined> {
             "The stale agent socket {shown} could not be removed: {error}."
         ))
     })?;
-    match UnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
-        // Someone bound it between the removal and now.
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => Err(Declined::ServedElsewhere),
-        Err(error) => Err(Declined::Failed(format!(
+    UnixListener::bind(path).map_err(|error| {
+        Declined::Failed(format!(
             "The agent socket {shown} could not be bound: {error}."
-        ))),
-    }
+        ))
+    })
 }
 
 /// Bind the socket at `path`, in a private directory, readable and writable by
-/// this user only.
-pub(super) fn bind(path: &Path) -> Result<UnixListener, Declined> {
+/// this user only, under the serving lock.
+pub(super) fn bind(path: &Path) -> Result<Bound, Declined> {
     let shown = path.display();
     let Some(parent) = path.parent() else {
         return Err(Declined::Failed(format!(
@@ -187,6 +225,7 @@ pub(super) fn bind(path: &Path) -> Result<UnixListener, Declined> {
         )));
     };
     secure_dir(parent).map_err(Declined::Failed)?;
+    let lock = take_lock(path)?;
     let listener = match UnixListener::bind(path) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => replace_stale(path)?,
@@ -201,7 +240,7 @@ pub(super) fn bind(path: &Path) -> Result<UnixListener, Declined> {
             "The agent socket {shown} could not be made private: {error}."
         ))
     })?;
-    Ok(listener)
+    Ok(Bound { listener, lock })
 }
 
 #[cfg(test)]
@@ -264,7 +303,7 @@ mod tests {
 
         assert!(matches!(bind(&path), Err(Declined::ServedElsewhere)));
         let client = UnixStream::connect(&path).expect("the live socket still takes clients");
-        assert!(first.accept().is_ok());
+        assert!(first.listener.accept().is_ok());
         drop(client);
 
         // A crash leaves the file behind with nobody listening.
@@ -274,7 +313,46 @@ mod tests {
             panic!("a stale socket is replaced");
         };
         let client = UnixStream::connect(&path).expect("the new socket takes clients");
-        assert!(second.accept().is_ok());
+        assert!(second.listener.accept().is_ok());
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_starting_together_over_a_stale_socket_leave_exactly_one_serving() {
+        let path = short_socket_path();
+        let dir = path
+            .parent()
+            .expect("the path has a directory")
+            .to_path_buf();
+        // A crash leaves the file behind with nobody listening.
+        drop(bind(&path).unwrap_or_else(|_| panic!("the first bind succeeds")));
+        assert!(path.exists());
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let windows: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    bind(&path)
+                })
+            })
+            .collect();
+        let results: Vec<_> = windows
+            .into_iter()
+            .map(|window| window.join().expect("the window thread ends"))
+            .collect();
+        let serving: Vec<&Bound> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(serving.len(), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Ok(_) | Err(Declined::ServedElsewhere)))
+        );
+        let client = UnixStream::connect(&path).expect("the serving socket takes clients");
+        assert!(serving[0].listener.accept().is_ok());
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
     }
