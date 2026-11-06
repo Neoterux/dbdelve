@@ -4934,3 +4934,55 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         "moments ago \u{b7} list_connections \u{b7} executed"
     );
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_popover_turns_access_off(cx: &mut TestAppContext) {
+    use crate::agent::{ConnId, Inbound};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        let in_menu = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(!in_menu(cx));
+
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("an attached agent lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        assert!(in_menu(cx), "clicking the mark opened no menu");
+
+        // The kill switch is the only item that can be chosen. The menu's
+        // first step down always lands on its first row, a label, so the
+        // second is the one that reaches the item.
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        assert!(listening(&workspace, cx), "a label was chosen");
+        cx.simulate_keystrokes("down enter");
+        settle(cx);
+        assert!(!in_menu(cx));
+        assert!(!listening(&workspace, cx));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.presence.is_empty()));
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+    });
+}

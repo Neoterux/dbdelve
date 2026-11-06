@@ -1204,6 +1204,7 @@ impl Workspace {
         let mark = self.agent_mark_state()?;
         // Snapshotted before the closure, as the mode pill's `silenced` is:
         // the menu is built when it opens, from what was drawn.
+        let waiting = self.agent.calls.len();
         let now = agent::unix_millis();
         let log: Vec<String> = self
             .agent
@@ -1216,7 +1217,27 @@ impl Workspace {
         Some(
             div()
                 .child(ui::agent_mark(t, mark).dropdown_menu(move |menu, _, _| {
-                    log.iter().fold(menu, |menu, line| menu.label(line.clone()))
+                    // The kill switch is the only item that can be selected, so
+                    // the keyboard reaches it with one step. The mark is drawn
+                    // only while access is on, so this is the one thing the
+                    // menu changes: turning access on is the palette's.
+                    let menu = menu
+                        .label(match waiting {
+                            0 => "No calls waiting".to_string(),
+                            1 => "1 call waiting for you".to_string(),
+                            n => format!("{n} calls waiting for you"),
+                        })
+                        .label("Agent access is on")
+                        .menu(
+                            "Disconnect agents and turn access off",
+                            Box::new(DisconnectAgents),
+                        );
+                    if log.is_empty() {
+                        menu
+                    } else {
+                        log.iter()
+                            .fold(menu.separator(), |menu, line| menu.label(line.clone()))
+                    }
                 }))
                 .into_any_element(),
         )
