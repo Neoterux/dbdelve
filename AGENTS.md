@@ -35,9 +35,13 @@ require it, stop and raise it instead.
    a query tab of an engine whose rows are named by every value, whose writes
    must run behind their guard (`Engine::reviews_query_edits`); Import
    Rows shows every statement before any runs; Explain prefixes a copy, never
-   the buffer; Format Query rewrites on command only, at the token level
-   (`sqlformat`, or `mql::format` on MongoDB), never an AST round-trip, which
-   drops every comment the user wrote.
+   the buffer; transaction control (Toggle Auto-commit, Commit, Roll Back)
+   appends its `BEGIN`, `COMMIT` and `ROLLBACK` to the buffer and runs them
+   from there, which is why auto-commit is a switch over statements the user
+   can read rather than a `BEGIN` on the wire they cannot; Format Query
+   rewrites on command only, at the token level (`sqlformat`, or
+   `mql::format` on MongoDB), never an AST round-trip, which drops every
+   comment the user wrote.
 
    It never writes `DROP` or `TRUNCATE` into a buffer or onto the wire. It
    writes `DELETE` only as the explicit deletion of one named row, by primary

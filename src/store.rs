@@ -131,6 +131,16 @@ pub struct StoredProfile {
     /// the file.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Whether an agent may reach this connection over MCP. Absent is a
+    /// profile written before agents could see any, and reads back as hidden:
+    /// every profile that exists before this field does is invisible to agents
+    /// after the upgrade. Left out when false, so a hidden profile is written
+    /// exactly as it always was. A build without the field ignores the key and
+    /// drops it on its next save, which hides the profile -- the safe
+    /// direction. Written only by `Workspace::set_agent_visible`, and read from
+    /// disk only at load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_visible: bool,
     /// `sql::Destructive::slug()`, for the kinds whose confirmation this
     /// connection has silenced. Per connection and per kind: silencing DROP on
     /// a scratch database says nothing about whether you want to be asked on
@@ -490,6 +500,13 @@ pub struct StoredSettings {
     /// before there was one.
     #[serde(default)]
     pub welcomed: Option<bool>,
+    /// Whether agents may reach this variant's windows over the socket.
+    /// Absent reads as off, including in a file written before the field
+    /// existed. Only a window's own access actions write it, through
+    /// `Workspace::agent_access_to_save`: every other save carries the file's
+    /// value forward, so one window's save never undoes another's choice.
+    #[serde(default)]
+    pub agent_access: Option<bool>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -2688,7 +2705,15 @@ user = ""
 
         let mut counter = LOCK.lock().unwrap_or_else(|error| error.into_inner());
         *counter += 1;
-        let home = std::env::temp_dir().join(format!(
+        // On Unix the home is short on purpose: the agent socket lives under
+        // it, and under macOS's `temp_dir()` that path is about 117 bytes
+        // against the 104 `sun_path` holds. Tests of the socket then bind the
+        // path the app derives, not a stand-in for it.
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir();
+        let home = root.join(format!(
             "dbdelve-store-test-{}-{}",
             std::process::id(),
             *counter
@@ -2852,6 +2877,7 @@ user = "shayan"
                 next_query_id: Some(1),
                 color: None,
                 mode: Some("full".into()),
+                agent_visible: false,
                 confirmed: vec!["drop".into(), "truncate".into()],
                 open_query: None,
                 ssh: None,
@@ -2907,6 +2933,7 @@ user = "shayan"
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: Some("daily".into()),
             ssh: None,
@@ -3041,6 +3068,7 @@ open_objects = []
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3202,6 +3230,54 @@ folder = "Hot"
     }
 
     #[test]
+    fn a_profile_written_before_the_flag_loads_hidden_and_saves_without_it() {
+        let file = |extra: &str| {
+            format!(
+                "[[profiles]]\nid = \"a\"\nname = \"A\"\nhost = \"\"\ndatabase = \"\"\nuser = \"\"\n{extra}"
+            )
+        };
+        for text in [file(""), file("agent_visible = false\n")] {
+            let profiles = decode_profiles(&text, &[]).unwrap().profiles;
+            assert!(!profiles[0].agent_visible, "{text}");
+            let written = written_alone(profiles[0].clone());
+            assert!(!written.contains("agent_visible"), "{written}");
+        }
+        assert!(decode_profiles("", &[]).unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn a_visible_profile_round_trips_ahead_of_its_tables() {
+        let profile = StoredProfile {
+            agent_visible: true,
+            ssh: Some(SshTunnel {
+                host: "dbdelve-bastion".into(),
+                port: None,
+                user: "tunnel".into(),
+                identity_file: None,
+            }),
+            open_objects: vec![StoredObject {
+                schema: "public".into(),
+                name: "accounts".into(),
+                routine: false,
+                structure: false,
+                kind: RelationKind::default(),
+                filter: String::new(),
+                filter_engine: None,
+                origin: None,
+                filters: Vec::new(),
+                active: true,
+                bars: Vec::new(),
+            }],
+            ..a_stored_profile()
+        };
+        let text = written_alone(profile.clone());
+        let flag = text.find("agent_visible = true").expect(&text);
+        let first_table = text.find("\n[profiles.").expect(&text);
+        assert!(flag < first_table, "{text}");
+        assert_eq!(decode_profiles(&text, &[]).unwrap().profiles, vec![profile]);
+    }
+
+    #[test]
     fn an_ssh_tunnel_with_every_field_survives_the_round_trip_through_toml() {
         let profile = StoredProfile {
             ssh: Some(SshTunnel {
@@ -3343,6 +3419,7 @@ folder = "Hot"
             next_query_id: Some(0),
             color: Some(ConnectionColor::Purple.slug().to_string()),
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3422,6 +3499,7 @@ folder = "Hot"
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3487,6 +3565,7 @@ folder = "Hot"
             next_query_id: Some(1),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3601,6 +3680,7 @@ open_objects = []
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -3683,6 +3763,7 @@ open_objects = []
                 client_sort: Some(true),
                 qualify_completions: Some(true),
                 welcomed: Some(true),
+                agent_access: Some(true),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),
@@ -3727,6 +3808,7 @@ open_objects = []
                     next_query_id: Some(2),
                     color: None,
                     mode: None,
+                    agent_visible: false,
                     confirmed: Vec::new(),
                     open_query: None,
                     ssh: None,
@@ -3762,6 +3844,7 @@ open_objects = []
                     next_query_id: None,
                     color: None,
                     mode: None,
+                    agent_visible: false,
                     confirmed: Vec::new(),
                     open_query: None,
                     ssh: None,
@@ -3787,6 +3870,39 @@ open_objects = []
             .expect("a file predating settings must load")
             .settings;
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn agent_access_is_off_unless_saved_on() {
+        let read = |text: &str| {
+            decode_profiles(text, &[])
+                .expect("the file decodes")
+                .settings
+                .and_then(|settings| settings.agent_access)
+        };
+        assert_eq!(read(""), None);
+        assert_eq!(read("[settings]\ncheck_for_updates = false\n"), None);
+        assert_eq!(read("[settings]\nagent_access = true\n"), Some(true));
+        assert_eq!(read("[settings]\nagent_access = false\n"), Some(false));
+
+        // Written ahead of the tables whichever way it is set, or TOML would
+        // refuse the file.
+        for choice in [Some(true), Some(false)] {
+            let file = ProfileFile {
+                settings: Some(StoredSettings {
+                    agent_access: choice,
+                    custom_keybindings: Some(HashMap::from([(
+                        "apply_edits".to_string(),
+                        "cmd-shift-s".to_string(),
+                    )])),
+                    ..StoredSettings::default()
+                }),
+                ..ProfileFile::default()
+            };
+            let text = toml::to_string_pretty(&file).expect("the file encodes");
+            let decoded: ProfileFile = toml::from_str(&text).expect("the file decodes");
+            assert_eq!(decoded, file, "{text}");
+        }
     }
 
     #[test]
@@ -4395,6 +4511,7 @@ open_objects = []
             next_query_id: Some(7),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: Some("daily".into()),
             ssh: None,
@@ -4760,6 +4877,7 @@ name = \"accounts\"
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,
@@ -4875,6 +4993,7 @@ name = \"accounts\"
             next_query_id: Some(0),
             color: None,
             mode: None,
+            agent_visible: false,
             confirmed: Vec::new(),
             open_query: None,
             ssh: None,

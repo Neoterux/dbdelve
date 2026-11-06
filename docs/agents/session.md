@@ -67,6 +67,63 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   rename to the name it has). File → New Project (`NewProject`, no default
   chord) opens that, or the welcome surface's name field while there is no
   connection.
+- **A profile is hidden from agents until its owner says otherwise.**
+  `Profile::agent_visible` is false for every profile, including each one
+  written before the flag existed, and `Workspace::set_agent_visible` is the
+  one place it changes, keyed by id: a second writer would be one more path to
+  tell when a profile is hidden. Making a profile visible goes only through the
+  `agent-visibility` dialog (`Command::ShowToAgents` opens it, and the
+  dialog's `Make visible` is the only caller that passes `true`). It opens with
+  the ring on Cancel (`first_choice`), so an `enter` held or repeated from the
+  palette row that raised it cancels instead of grants, and it states the
+  engine's server-side hold while the profile is Read-only
+  (`Engine::read_only_hold`) and that rows an agent reads leave the machine --
+  static facts, so opening it connects to nothing. Hiding is one action with no
+  dialog (`Command::HideFromAgents`), because narrowing needs no consent.
+  Neither command is remembered under Recent. A visible profile carries a bot
+  marker on its palette rows and beside its name in the titlebar; a hidden one
+  is drawn as it always was. The agent-side lookup filters to visible profiles
+  before it compares names (`Workspace::agent_profile`), so a hidden profile and
+  a missing one answer alike. The one other route to a change is an engine
+  change in `save_profile`, which hides a visible profile and says so, because
+  the dialog's facts were about the old engine. Profiles are saved whole by
+  whichever window saves, so a window's flags are the file's
+  (`Workspace::adopt_saved_visibility`, on every save and every agent call)
+  except where it made a choice of its own that no save has written yet
+  (`AgentState::visibility_choices`): a grant made in one window's dialog, or a
+  hide, is neither undone by another window's save nor missed by the window
+  serving agents.
+- **An agent's call reaches the window only through the pump, and ends only
+  through `finish_call`.** The socket's threads send `Inbound` messages on a
+  channel and a foreground task hands each to `Workspace::on_agent_message`;
+  a call is addressed by its `CallId`, never by its place in a list.
+  `finish_call` removes the call by id before it replies, so a call ended by
+  two things at once answers at most once, and it writes the call's one log
+  line, so a hangup that arrives after the answer adds nothing. The log is
+  this session's own (`AgentState::log`, at most `LOG_CAP`): names, a code and
+  a time, never a row or a statement, and never written to disk. The ping
+  dialog is the first entry of every `dialog_layer` list, so it is drawn
+  behind every dialog the user is already answering, and only a click on
+  Approve answers it `executed`; every key answers `rejected`. Hiding or
+  removing a profile rejects the calls waiting on it, and the kill switch
+  answers every pending call before it drops the bridge, so a waiting client
+  reads a whole answer and not a bare end. The titlebar mark has three states
+  and is the same in all three titlebars: nothing while no bridge runs, the
+  MCP logo dim while one listens alone, and lit with the count of waiting calls
+  once a shim is attached or a call waits. It carries the kill switch and the
+  log in a popover, and the popover exists only while the mark does: turning
+  access on is the palette's. Nothing in it animates. The ping dialog starts
+  below the titlebar, so while a ping waits the mark and its kill switch can
+  still be clicked; the keyboard stays with the dialog, where every key denies.
+- **One window serves agents, and the lock beside the socket says which.** The
+  window that binds holds an exclusive `flock` on `agent/s.lock` for as long as
+  it serves, and the kernel lets go of it if the process dies. A window that
+  cannot take it is told another one serves; one that takes it owns the path,
+  so a socket already there is a crash's leftover and is replaced, and the
+  socket it removes on stopping is its own. A connect is never what decides
+  this: a socket with a full backlog refuses a connect as a stale one does. A
+  connection's first frame must arrive whole within its time, not each read
+  within it, so a peer sending a byte at a time is closed as a silent one is.
 - **No connection is a state, not a prompt.** With no profiles and no form
   open, the window is the welcome surface (`Workspace::render_welcome`): New
   project, New connection, each project with an Add connection of its own, and

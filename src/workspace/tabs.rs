@@ -812,7 +812,8 @@ impl Workspace {
         // settings panel beside it -- so `escape` backs out
         // of them in that order, one at a time. The palette stays first so
         // that picking a font from inside settings closes the font list and
-        // leaves the panel it was opened from standing.
+        // leaves the panel it was opened from standing. An agent's ping is
+        // drawn behind every dialog, so it backs out last, and only denies.
         if self.cancel_stale_edit(cx) {
             return;
         }
@@ -833,6 +834,9 @@ impl Workspace {
         if self.cancel_discard_close(cx) {
             return;
         }
+        if self.cancel_agent_visibility(cx) {
+            return;
+        }
         if self.cancel_delete_query(cx) {
             return;
         }
@@ -843,6 +847,9 @@ impl Workspace {
             return;
         }
         if self.close_apply_review(cx) {
+            return;
+        }
+        if self.deny_front_ping(cx) {
             return;
         }
         // Only from inside the panel: it sits beside the workspace rather than

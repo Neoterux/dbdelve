@@ -12,6 +12,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable};
 
+use super::agent::{ping_prompt, visibility_facts};
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -906,9 +907,12 @@ impl Workspace {
             self.focus_before_dialog.replace(window.focused(cx));
         }
         if raised {
-            // Every dialog opens on its primary button, as a native one does.
-            // The ring is drawn by the dialogs above, before this ran.
-            self.dialog_choice.set(0);
+            // Every dialog opens on its primary button, as a native one does,
+            // except the one that widens what an agent may reach: it opens on
+            // Cancel, so an `enter` held or repeated from the palette row
+            // that raised it cancels rather than grants. The ring is drawn by
+            // the dialogs above, before this ran.
+            self.dialog_choice.set(first_choice(front));
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
         // The palette is stacked over the dialogs and holds the keyboard
@@ -994,6 +998,8 @@ impl Workspace {
                 if all { 3 } else { 2 }
             }
             Some("import-rows") | None => 0,
+            // Deny alone: Approve is click-only and never a stop.
+            Some("agent-ping") => 1,
             Some(_) => 2 + checkbox,
         }
     }
@@ -1123,6 +1129,10 @@ impl Workspace {
             ("pending-export", _) => _ = self.cancel_pending_export(cx),
             ("pending-run", 0) => self.approve_pending_run(cx),
             ("pending-run", _) => self.cancel_pending_run(cx),
+            ("agent-visibility", 0) => self.confirm_agent_visibility(cx),
+            ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
+            // Every index denies: no key approves a ping.
+            ("agent-ping", _) => _ = self.deny_front_ping(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
             ("delete", 0) => match deleting {
@@ -1461,6 +1471,203 @@ impl Workspace {
                                             },
                                         ),
                                         t,
+                                    ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What making a connection visible to agents asks first: which hold the
+    /// engine has while the profile is Read-only, and that rows an agent reads
+    /// leave this machine. Nothing here asks a server; the facts are static.
+    /// Nothing is drawn unless the prompt's profile is still in the list.
+    pub(crate) fn render_agent_visibility(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = popup_theme(cx);
+        let id = self.agent_visibility_prompt.as_deref()?;
+        let profile = self.profiles.iter().find(|profile| profile.id == id)?;
+        let facts = visibility_facts(profile.config.engine(), profile.mode);
+        let cancel_workspace = cx.entity().downgrade();
+        let confirm_workspace = cancel_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Agent access"))
+                        // Not in the label: it is upper-cased there, and a
+                        // connection's name is spelt the way its owner wrote it.
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text)
+                                .child(format!("Make {} visible to agents", profile.name)),
+                        )
+                        .children(facts.into_iter().map(|fact| {
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(fact)
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    self.choice(
+                                        "agent-visibility",
+                                        1,
+                                        button(
+                                            "cancel-agent-visibility",
+                                            "Cancel",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                    workspace.cancel_agent_visibility(cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                )
+                                .child(
+                                    self.choice(
+                                        "agent-visibility",
+                                        0,
+                                        button(
+                                            "confirm-agent-visibility",
+                                            "Make visible",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = confirm_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.confirm_agent_visibility(cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What an agent's ping asks the human: a test for one connection, named by
+    /// the profile's own current name read by id, never by anything the agent
+    /// sent. Deny is the ring's only stop; Approve is a click and nothing else.
+    /// Nothing is drawn unless the oldest waiting call still has its profile.
+    pub(crate) fn render_agent_ping(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = popup_theme(cx);
+        let call = self.front_ping()?;
+        let id = call.id;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == call.profile_id)?;
+        let deny_workspace = cx.entity().downgrade();
+        let approve_workspace = deny_workspace.clone();
+
+        Some(
+            div()
+                // Starts below the titlebar rather than over it: the agent
+                // mark's waiting count and its turn-off item must stay
+                // clickable while a ping waits, and the window controls live
+                // in that strip too.
+                .absolute()
+                .top(px(layout::TITLEBAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Agent"))
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text)
+                                .child("Ping from an agent"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(ping_prompt(&profile.name)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    self.choice(
+                                        "agent-ping",
+                                        0,
+                                        button(
+                                            "deny-agent-ping",
+                                            "Deny",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = deny_workspace.update(cx, |workspace, cx| {
+                                                    workspace.deny_ping(id, cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                )
+                                // Outside the ring, and with an id of this call
+                                // alone: a press that began on one call's button
+                                // cannot finish on the next call's.
+                                .child(
+                                    div().debug_selector(|| "agent-ping-approve".into()).child(
+                                        button(
+                                            format!("approve-ping-{}", id.0),
+                                            "Approve",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        // A key cannot move onto it, so a key
+                                        // cannot press it.
+                                        .tab_stop(false)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = approve_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.approve_ping(id, cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
                                     ),
                                 ),
                         ),
@@ -2220,6 +2427,18 @@ impl Workspace {
             }
             None => row_icon(t, icon::DATABASE).into_any_element(),
         };
+        // A hidden connection is drawn exactly as it always was; only a visible
+        // one gains the marker, beside the logo that leads its name.
+        let active_logo = match self.profile() {
+            Some(profile) if profile.agent_visible => div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .child(active_logo)
+                .child(row_icon(t, icon::AGENT_VISIBLE))
+                .into_any_element(),
+            _ => active_logo,
+        };
         let project_name = self.current_group().map(str::to_string);
         let open_from_project = cx.listener(|workspace, _, window, cx| {
             workspace.open_connections(window, cx);
@@ -2959,6 +3178,16 @@ impl Workspace {
 
 /// What a saved query's row offers on a right click: what its tab offers, for
 /// a query that may have no tab open.
+/// The button the ring starts on when `dialog` goes up, counted from the right.
+/// Cancel for the one that widens what an agent may reach, the primary for
+/// every other.
+fn first_choice(dialog: Option<&str>) -> usize {
+    match dialog {
+        Some("agent-visibility") => 1,
+        _ => 0,
+    }
+}
+
 fn saved_query_menu(
     menu: PopupMenu,
     name: &str,

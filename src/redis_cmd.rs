@@ -7,9 +7,11 @@
 //! addition; redis-cli would send it.
 //!
 //! Classifying a command is a lookup by its name (and subcommand, where the
-//! word after the name decides: `CONFIG GET` reads, `CONFIG SET` is
-//! destructive). The server has no Read-only hold to fall back on, so this is
-//! the whole boundary, and a name the table does not know is unreadable.
+//! word after the name decides: `CONFIG GET` writes nothing and is
+//! rated a write for what it returns, `requirepass` and `masterauth`, while
+//! `CONFIG SET` is destructive). The server has no Read-only hold to fall back
+//! on, so this is the whole boundary, and a name the table does not know is
+//! unreadable.
 
 use std::ops::Range;
 
@@ -326,11 +328,93 @@ pub(crate) fn leaves(text: &str) -> Leaves {
             "MULTI" => leaves.transaction = Some(true),
             "EXEC" | "DISCARD" => leaves.transaction = Some(false),
             "WATCH" | "AUTH" | "READONLY" | "READWRITE" => leaves.settings = true,
-            "CLIENT" if kind(&command) == Some(Kind::Write) => leaves.settings = true,
+            // By name, not by verdict: `CLIENT LIST` is a write for what it
+            // discloses, and says nothing about the session it is run on.
+            "CLIENT"
+                if matches!(
+                    command.subcommand().as_str(),
+                    "KILL"
+                        | "UNPAUSE"
+                        | "SETNAME"
+                        | "SETINFO"
+                        | "NO-EVICT"
+                        | "NO-TOUCH"
+                        | "TRACKING"
+                        | "CACHING"
+                        | "UNBLOCK"
+                ) =>
+            {
+                leaves.settings = true
+            }
             _ => {}
         }
     }
     leaves
+}
+
+/// Every command of `text` that splits into words, in order. A line that does
+/// not split is left out: the callers below answer for what they can read, and
+/// [`classify`] already calls the text unreadable.
+fn commands(text: &str) -> impl Iterator<Item = Command> + '_ {
+    statements(text).into_iter().filter_map(|span| {
+        let words = split(&text[span.clone()]).ok()?;
+        Some(Command { span, words })
+    })
+}
+
+/// Whether any command of `text` takes data out of the database: a name in
+/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, or an expiry
+/// whose timeout is not a positive integer written plainly (`EXPIRE k 0`
+/// deletes the key at once). The agent path refuses all of them, whatever the
+/// mode (GATE-07); the human path never asks.
+pub(crate) fn removes(text: &str) -> bool {
+    commands(text).any(|command| removes_data(&command))
+}
+
+fn removes_data(command: &Command) -> bool {
+    let name = command.name();
+    match name.as_str() {
+        "MIGRATE" => true,
+        "XGROUP" => matches!(command.subcommand().as_str(), "DESTROY" | "DELCONSUMER"),
+        // The fail-safe reading of a timeout the server may take as
+        // non-positive or reject: only a run of digits not starting with `0`
+        // is known to keep the key.
+        "EXPIRE" | "PEXPIRE" | "HEXPIRE" | "HPEXPIRE" => {
+            let timeout = word(&command.words, 2);
+            timeout.is_empty()
+                || !timeout.bytes().all(|byte| byte.is_ascii_digit())
+                || timeout.starts_with('0')
+        }
+        name => REMOVES.contains(&name),
+    }
+}
+
+/// Whether any command of `text` runs a script the server holds, or loads one:
+/// `EVAL`, `EVALSHA`, `FCALL`, their `_RO` forms (the server holds those to
+/// reads, but what the script does is still code DBDelve cannot read),
+/// `SCRIPT LOAD` and `FUNCTION LOAD`.
+pub(crate) fn runs_script(text: &str) -> bool {
+    commands(text).any(|command| {
+        let name = command.name();
+        match name.as_str() {
+            "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => true,
+            "SCRIPT" | "FUNCTION" => command.subcommand() == "LOAD",
+            name => SCRIPTS.contains(&name),
+        }
+    })
+}
+
+/// Whether any command of `text` is `CONFIG GET` or `CLIENT LIST`: the two
+/// commands that can answer with `requirepass`, `masterauth` or another
+/// client's address and name (D-27). Matched by name and subcommand and
+/// nothing wider; [`kind`] records why the line is drawn there.
+pub(crate) fn discloses(text: &str) -> bool {
+    commands(text).any(|command| {
+        matches!(
+            (command.name().as_str(), command.subcommand().as_str()),
+            ("CONFIG", "GET") | ("CLIENT", "LIST")
+        )
+    })
 }
 
 /// Every command name the editor offers, with how much it may do. A name that
@@ -357,16 +441,26 @@ fn kind(command: &Command) -> Option<Kind> {
     let sub = command.subcommand();
     use Kind::*;
     Some(match (name.as_str(), sub.as_str()) {
-        ("CONFIG", "GET" | "HELP") => Read,
+        ("CONFIG", "HELP") => Read,
+        // These two answer with what a Read-only profile should not be handed
+        // unasked: `requirepass` and `masterauth`, and every connected
+        // client's address and name. The line is drawn at them and no wider.
+        // Their siblings stay reads -- `CONFIG HELP`, and on `CLIENT` `INFO`,
+        // `ID`, `GETNAME`, `GETREDIR`, `TRACKINGINFO` and `HELP` -- and so do
+        // commands elsewhere that do disclose something: the password hashes
+        // `ACL LIST` and `ACL GETUSER` return, and the client fields in
+        // `ACL LOG` and `SLOWLOG GET`. The rule is deliberately limited to
+        // plaintext secrets and client enumeration, and those are knowingly
+        // left as reads. Widening it changes what a Read-only profile may run,
+        // which is a product decision that has not been made.
+        ("CONFIG", "GET") => Write,
         ("CONFIG", "SET" | "REWRITE" | "RESETSTAT") => Drop,
         ("CLIENT", "PAUSE") => Drop,
-        ("CLIENT", "LIST" | "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => {
-            Read
-        }
+        ("CLIENT", "INFO" | "ID" | "GETNAME" | "GETREDIR" | "TRACKINGINFO" | "HELP") => Read,
         (
             "CLIENT",
-            "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
-            | "CACHING" | "UNBLOCK",
+            "LIST" | "KILL" | "UNPAUSE" | "SETNAME" | "SETINFO" | "NO-EVICT" | "NO-TOUCH"
+            | "TRACKING" | "CACHING" | "UNBLOCK",
         ) => Write,
         ("SCRIPT", "EXISTS" | "HELP") => Read,
         ("SCRIPT", "LOAD" | "KILL") => Write,
@@ -821,6 +915,67 @@ const WRITES: &[&str] = &[
     "VSETATTR",
 ];
 
+/// Commands that take data out of the database, one word each: what the agent
+/// path's GATE-07 refuses on Redis whatever the mode. The human path never
+/// reads this list. Names that decide by an argument or a subcommand
+/// (`MIGRATE`, `XGROUP DESTROY`, the `EXPIRE` family) are in [`removes`].
+///
+/// ponytail: these overwrite or move data without a removal flag and stay
+/// approvable (D-23): `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` and `HPEXPIREAT`
+/// with a time in the past delete the key, `RENAME`, `COPY ... REPLACE`,
+/// `RESTORE ... REPLACE` and every `*STORE` command overwrite their
+/// destination, and `LMOVE`, `BLMOVE`, `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and
+/// `MOVE` hand what leaves one key to another. The ceiling is that a pure
+/// function has no clock and does not know whether a destination exists, so
+/// the human reads the exact command before approving it. The upgrade path
+/// is a removal flag on those words, once the approval surface can show the
+/// destination's state.
+const REMOVES: &[&str] = &[
+    "DEL",
+    "UNLINK",
+    "GETDEL",
+    "DELEX",
+    "HDEL",
+    "HGETDEL",
+    "LPOP",
+    "RPOP",
+    "BLPOP",
+    "BRPOP",
+    "LMPOP",
+    "BLMPOP",
+    "LREM",
+    "LTRIM",
+    "SREM",
+    "SPOP",
+    "ZREM",
+    "ZPOPMIN",
+    "ZPOPMAX",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "ZMPOP",
+    "BZMPOP",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+    "ZREMRANGEBYLEX",
+    "XDEL",
+    "XTRIM",
+    "XACKDEL",
+    "XDELEX",
+    "JSON.DEL",
+    "JSON.FORGET",
+    "JSON.CLEAR",
+    "JSON.ARRPOP",
+    "JSON.ARRTRIM",
+    "TS.DEL",
+    "TS.DELETERULE",
+    "CF.DEL",
+    "FT.ALIASDEL",
+    "FT.DICTDEL",
+    "FT.SUGDEL",
+    "VREM",
+    "TDIGEST.RESET",
+];
+
 /// Commands that run a script, whose `redis.call`s are DBDelve's to guess at:
 /// `EVAL "return redis.call('flushall')" 0` is a `FLUSHALL`. Their `_RO`
 /// forms, which the server holds to reads, are in `READS`.
@@ -960,10 +1115,12 @@ mod tests {
             ("GET a", &read),
             ("hgetall h", &read),
             ("SCAN 0 MATCH user:* COUNT 100", &read),
-            ("CONFIG GET maxmemory", &read),
+            ("CONFIG GET maxmemory", &write),
+            ("CONFIG HELP", &read),
             ("config set maxmemory 1", &drop),
             ("CONFIG REWRITE", &drop),
-            ("CLIENT LIST", &read),
+            ("CLIENT LIST", &write),
+            ("CLIENT ID", &read),
             ("CLIENT KILL ID 4", &write),
             ("SCRIPT EXISTS abc", &read),
             ("SCRIPT FLUSH", &drop),
@@ -1042,11 +1199,122 @@ mod tests {
     }
 
     #[test]
+    fn a_disclosing_command_has_the_same_verdict_first_or_last_in_a_buffer() {
+        for (first, second) in [
+            ("CONFIG GET requirepass", "GET a"),
+            ("CLIENT LIST", "GET a"),
+        ] {
+            let forward = classify(&format!("{first}\n{second}"));
+            assert_eq!(forward, Verdict::WRITE, "{first} then {second}");
+            assert_eq!(
+                classify(&format!("{second}\n{first}")),
+                forward,
+                "{second} then {first}"
+            );
+        }
+    }
+
+    #[test]
     fn a_multi_holds_its_session_until_exec_or_discard() {
         assert_eq!(leaves("MULTI").transaction, Some(true));
         assert_eq!(leaves("EXEC").transaction, Some(false));
         assert_eq!(leaves("DISCARD").transaction, Some(false));
         assert!(leaves("CLIENT SETNAME me").settings);
         assert_eq!(leaves("GET a"), Leaves::default());
+    }
+
+    #[test]
+    fn the_two_commands_that_return_secrets_are_split_from_their_siblings_by_name() {
+        let write = Verdict::WRITE;
+        for text in ["config get requirepass", "CLIENT LIST TYPE normal"] {
+            assert_eq!(classify(text), write, "{text}");
+        }
+        for text in [
+            "CONFIG HELP",
+            "CLIENT ID",
+            "CLIENT INFO",
+            "CLIENT GETNAME",
+            "CLIENT GETREDIR",
+            "CLIENT TRACKINGINFO",
+            "CLIENT HELP",
+        ] {
+            assert_eq!(classify(text), Verdict::READ, "{text}");
+        }
+    }
+
+    #[test]
+    fn listing_clients_leaves_no_session_setting_but_naming_one_does() {
+        assert_eq!(leaves("CLIENT LIST"), Leaves::default());
+        assert!(leaves("CLIENT SETNAME me").settings);
+        assert!(leaves("CLIENT NO-TOUCH ON").settings);
+    }
+
+    #[test]
+    fn every_removal_and_script_name_is_one_the_tables_know() {
+        for name in REMOVES {
+            assert!(WRITES.contains(name), "{name} is not a write");
+        }
+        for name in ["EVAL", "EVALSHA", "FCALL"] {
+            assert!(SCRIPTS.contains(&name), "{name}");
+            assert!(runs_script(&format!("{name} x 0")), "{name}");
+        }
+        for name in ["EVAL_RO", "EVALSHA_RO", "FCALL_RO"] {
+            assert!(READS.contains(&name), "{name}");
+            assert!(runs_script(&format!("{name} x 0")), "{name}");
+        }
+        assert!(runs_script("SCRIPT LOAD \"return 1\""));
+        assert!(runs_script("function load code"));
+        assert!(!runs_script("SCRIPT EXISTS abc"));
+        assert!(!runs_script("GET a"));
+        for text in [
+            "CONFIG GET x",
+            "config get *",
+            "CLIENT LIST",
+            "GET a\nCLIENT LIST",
+        ] {
+            assert!(discloses(text), "{text}");
+        }
+        for text in [
+            "CONFIG HELP",
+            "CLIENT INFO",
+            "ACL LIST",
+            "ACL GETUSER u",
+            "SLOWLOG GET",
+        ] {
+            assert!(!discloses(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_expiry_removes_only_with_a_timeout_that_is_not_positive() {
+        assert!(!removes("EXPIRE k 10"));
+        assert!(!removes("hexpire k 10 FIELDS 1 f"));
+        for text in [
+            "EXPIRE k 0",
+            "EXPIRE k -5",
+            "EXPIRE k 010",
+            "EXPIRE k +5",
+            "EXPIRE k abc",
+            "EXPIRE k",
+            "PEXPIRE k 0",
+            "HEXPIRE k 0 FIELDS 1 f",
+            "HPEXPIRE k -1 FIELDS 1 f",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+        // A time in the past is not told apart from one in the future: a pure
+        // function has no clock, and the human reads the number.
+        assert!(!removes("EXPIREAT k 1"));
+        assert!(!removes("PEXPIREAT k 1"));
+    }
+
+    #[test]
+    fn a_removal_is_found_wherever_the_line_sits_and_however_it_is_cased() {
+        assert!(removes("GET a\ndel a"));
+        assert!(removes("# note\nXGROUP destroy s g"));
+        assert!(removes("MIGRATE h 6379 k 0 1000"));
+        assert!(!removes("SET k v"));
+        assert!(!removes("RENAME a b"));
+        assert!(!removes("SET k \"open"));
     }
 }
