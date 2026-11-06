@@ -14,9 +14,10 @@ use crate::{
     actions::{CancelQuery, ImportRowsFromClipboard},
     connection_form::ConnectionForm,
     db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, SshTunnel},
+    explain::analysis::Basis,
     explorer, keybindings,
-    palette::{Mode as PaletteMode, Scope},
-    session::{CatalogState, ObjectBody, QueryState, QueryTab},
+    palette::{Command, Mode as PaletteMode, Scope},
+    session::{CatalogState, ObjectBody, QueryState, QueryTab, Tab},
     store,
     theme::{self, Fonts},
 };
@@ -59,7 +60,18 @@ fn launch_with<'a>(
         workspace = Some(entity.clone());
         Root::new(entity, window, cx)
     });
-    (workspace.expect("the window builds the workspace"), cx)
+    let workspace = workspace.expect("the window builds the workspace");
+    // The runner's own `PG*` variables reach `Workspace::new`: GitHub's Windows
+    // image sets `PGUSER` and `PGPASSWORD` alone, which opens the connection
+    // form over everything a test puts in front. Every test starts from
+    // `profiles.toml` only.
+    workspace.update(cx, |workspace, cx| {
+        if workspace.form.is_some() {
+            workspace.close_form(cx);
+        }
+    });
+    settle(cx);
+    (workspace, cx)
 }
 
 /// Every write `Workspace` makes on the way out -- buffers on release,
@@ -124,6 +136,67 @@ fn launch_on_sqlite_holding<'a>(
     });
     cx.run_until_parked();
     (workspace, cx)
+}
+
+/// The app launched on `profiles`, the `[[profiles]]` tables of a hand-written
+/// `profiles.toml`, with no profile chosen to be in front. `DB_PATH` in the text
+/// stands for the path of an empty SQLite file written beside it, so a test can
+/// say what a profile looks like on disk without knowing where the home is.
+fn launch_with_profiles<'a>(
+    cx: &'a mut TestAppContext,
+    profiles: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    launch_with_settings(cx, "", profiles)
+}
+
+/// `launch_with_profiles` with more `[settings]` keys, such as
+/// `agent_access = true`.
+fn launch_with_settings<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+    profiles: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    let database = directory.join("e2e.db");
+    std::fs::write(&database, b"").expect("the database file must be creatable");
+    std::fs::write(
+        directory.join("profiles.toml"),
+        format!("[settings]\ncheck_for_updates = false\n{settings}\n{profiles}")
+            .replace("DB_PATH", &format!("{:?}", database.display().to_string())),
+    )
+    .expect("profiles.toml must be writable");
+    launch(cx)
+}
+
+/// One SQLite profile as `profiles.toml` spells it. `extra` is more scalar
+/// keys, which have to come before any table.
+fn sqlite_profile(id: &str, name: &str, extra: &str) -> String {
+    format!(
+        "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+         user = \"\"\nengine = \"sqlite\"\npath = DB_PATH\n{extra}\n"
+    )
+}
+
+fn agent_visible(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile was restored")
+            .agent_visible
+    })
+}
+
+fn saved_visible(id: &str) -> bool {
+    store::peek_profiles(&[])
+        .expect("profiles.toml reads back")
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .expect("the profile was saved")
+        .agent_visible
 }
 
 /// The test platform has no frame loop: what the app leaves for the next
@@ -208,6 +281,185 @@ fn a_query_typed_and_run_from_the_keyboard_lands_its_rows(cx: &mut TestAppContex
             QueryState::Failed(error) => panic!("the query failed: {error}"),
             _ => panic!("the query never completed"),
         });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_explained_query_lands_a_plan_that_names_its_engine_and_basis(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "CREATE TABLE t (a INTEGER)");
+
+        cx.simulate_input("select * from t where a = 1");
+        cx.simulate_keystrokes("secondary-shift-enter");
+        // `settle` draws a frame, which is what renders the plan the answer
+        // landed: a panic in `render_plan` fails here.
+        settle(cx);
+
+        query_tab(&workspace, cx, |tab, _, _| {
+            let explained = tab
+                .plan
+                .as_ref()
+                .expect("the Explain command landed a plan");
+            assert_eq!(explained.analysis.basis, Basis::Structure);
+            assert_eq!(explained.analysis.label, "SQLite · structure only");
+            assert!(!explained.analysis.nodes.is_empty());
+            assert!(
+                explained
+                    .analysis
+                    .nodes
+                    .iter()
+                    .all(|node| node.share.is_none())
+            );
+            assert!(tab.showing_plan);
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// A server's answer to an explain: its columns and its rows.
+type Answer = (Vec<String>, Vec<crate::db::Row>);
+
+/// One `QUERY PLAN` cell, as Postgres answers.
+fn postgres_plan(text: &str) -> Answer {
+    (
+        vec!["QUERY PLAN".to_string()],
+        crate::db::rows(vec![vec![Some(text.to_string())]]),
+    )
+}
+
+/// A MongoDB `explain` reply as the driver hands it back: one column per
+/// top-level key.
+fn mongo_reply(json: &str) -> Answer {
+    let reply: mongodb::bson::Document =
+        serde_json::from_str(json).expect("the reply is valid JSON");
+    let columns = reply.keys().cloned().collect();
+    let row = crate::db::Row::new(reply.values().map(|value| match value {
+        mongodb::bson::Bson::String(text) => Some(text.clone()),
+        other => serde_json::to_string(other).ok(),
+    }))
+    .expect("the reply fits a row");
+    (columns, vec![row])
+}
+
+#[gpui::test]
+fn every_kind_of_plan_draws_its_bars_and_chips_without_panicking(cx: &mut TestAppContext) {
+    use crate::{db::ExplainMode, explain::analysis::Tier, session::Explained};
+
+    let sqlite_columns = ["id", "parent", "notused", "detail"].map(str::to_string);
+    let sqlite_rows = crate::db::rows(vec![
+        vec![
+            Some("2".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("SCAN t".to_string()),
+        ],
+        vec![
+            Some("5".to_string()),
+            Some("2".to_string()),
+            Some("0".to_string()),
+            Some("USE TEMP B-TREE FOR ORDER BY".to_string()),
+        ],
+    ]);
+    let plain = "Limit  (cost=0.00..10.00 rows=10 width=8)
+  ->  Seq Scan on a  (cost=0.00..100.00 rows=1000 width=8)";
+    let stats = r#"{"queryPlanner":{"winningPlan":{"stage":"LIMIT","inputStage":{"stage":"IXSCAN","indexName":"_id_"}}},"executionStats":{"nReturned":3,"executionStages":{"stage":"LIMIT","nReturned":3,"executionTimeMillisEstimate":4,"inputStage":{"stage":"IXSCAN","nReturned":3,"executionTimeMillisEstimate":1,"indexName":"_id_"}}},"ok":1}"#;
+
+    let mut plans: Vec<(&str, Engine, ExplainMode, Answer)> = Vec::new();
+    for (name, text) in [
+        (
+            "parallel",
+            include_str!("../testdata/plan-postgres-parallel.txt"),
+        ),
+        (
+            "cte",
+            include_str!("../testdata/plan-postgres-cte-subplan.txt"),
+        ),
+        ("spill", include_str!("../testdata/plan-postgres-spill.txt")),
+        ("large", include_str!("../testdata/plan-postgres-large.txt")),
+    ] {
+        plans.push((
+            name,
+            Engine::Postgres,
+            ExplainMode::Analyze,
+            postgres_plan(text),
+        ));
+    }
+    plans.push((
+        "cost",
+        Engine::Postgres,
+        ExplainMode::Plan,
+        postgres_plan(plain),
+    ));
+    plans.push((
+        "structure",
+        Engine::Sqlite,
+        ExplainMode::Plan,
+        (sqlite_columns.to_vec(), sqlite_rows),
+    ));
+    plans.push((
+        "empty",
+        Engine::Postgres,
+        ExplainMode::Plan,
+        postgres_plan(""),
+    ));
+    plans.push((
+        "mongo",
+        Engine::MongoDb,
+        ExplainMode::Analyze,
+        mongo_reply(stats),
+    ));
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+
+        for (name, engine, mode, (columns, rows)) in plans {
+            let plan = crate::explain::parse(&columns, &rows);
+            let explained = Explained::new(
+                engine,
+                plan,
+                mode,
+                "select 1".to_string(),
+                false,
+                columns,
+                rows,
+            );
+            if name == "parallel" {
+                // A drawing test that only checks for a panic would pass on a
+                // plan that is one flat colour, so the fixture has to give the
+                // bars something to tell apart.
+                let mut tiers: Vec<Tier> = Vec::new();
+                for tier in explained.analysis.nodes.iter().filter_map(|node| node.tier) {
+                    if !tiers.contains(&tier) {
+                        tiers.push(tier);
+                    }
+                }
+                assert!(tiers.len() >= 2, "{name} drew {tiers:?}");
+                assert!(tiers.contains(&Tier::Quiet));
+            }
+            workspace.update(cx, |workspace, cx| {
+                let session = &mut workspace
+                    .profile_mut()
+                    .expect("the SQLite profile is active")
+                    .session;
+                let Tab::Query(id) = session.active else {
+                    panic!("a fresh profile opens on a query tab");
+                };
+                let tab = session
+                    .query_tab_mut(id)
+                    .expect("the active query tab exists");
+                tab.plan = Some(explained);
+                tab.showing_plan = true;
+                cx.notify();
+            });
+            // `settle` draws a frame, which runs `render_plan` on this plan.
+            settle(cx);
+            query_tab(&workspace, cx, |tab, _, _| {
+                assert!(tab.plan_shown().is_some(), "{name} was not in front");
+            });
+        }
 
         quit(workspace, cx);
     });
@@ -626,6 +878,20 @@ fn in_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool 
 
 fn front_dialog(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<&'static str> {
     workspace.read_with(cx, |workspace, _| workspace.dialog_in_front.get())
+}
+
+/// What decides which surface the window draws, for an assertion that a
+/// dialog is up: only the workspace surface has a layer for most of them.
+fn surface(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    workspace.read_with(cx, |workspace, _| {
+        format!(
+            "form open: {}, profile in front: {}, profiles: {}, visibility prompt: {:?}",
+            workspace.form.is_some(),
+            workspace.profile().is_some(),
+            workspace.profiles.len(),
+            workspace.agent_visibility_prompt,
+        )
+    })
 }
 
 fn palette_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<PaletteMode> {
@@ -2668,6 +2934,1226 @@ fn a_service_launch_does_not_reuse_a_profiles_explicit_port(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn an_upgraded_profile_file_loads_every_profile_hidden_and_saves_it_unchanged(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        assert!(!agent_visible(&workspace, cx, "first"));
+        assert!(!agent_visible(&workspace, cx, "second"));
+        quit(workspace, cx);
+
+        let text =
+            std::fs::read_to_string(store::dbdelve_directory().unwrap().join("profiles.toml"))
+                .unwrap();
+        assert!(!text.contains("agent_visible"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn making_a_profile_visible_needs_the_prompt_and_survives_a_save(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        let set = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str, on| {
+            workspace.update(cx, |workspace, cx| workspace.set_agent_visible(id, on, cx));
+        };
+
+        // No dialog open: asking changes nothing, in memory or on disk.
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+        assert!(!saved_visible("first"));
+
+        // A dialog open for another profile grants nothing to this one, and
+        // is not used up by the refusal.
+        workspace.update(cx, |workspace, _| {
+            workspace.agent_visibility_prompt = Some("second".into());
+        });
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.agent_visibility_prompt.as_deref(), Some("second"));
+        });
+
+        // A prompt for a profile that does not exist grants nothing at all.
+        set(&workspace, cx, "missing", true);
+        assert!(!saved_visible("second"));
+
+        // The prompt for this profile grants it, once, and the grant is saved.
+        set(&workspace, cx, "second", true);
+        assert!(agent_visible(&workspace, cx, "second"));
+        assert!(saved_visible("second"));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.agent_visibility_prompt, None);
+        });
+        set(&workspace, cx, "first", true);
+        assert!(!agent_visible(&workspace, cx, "first"));
+
+        // Hiding needs no prompt and lands at once.
+        set(&workspace, cx, "second", false);
+        assert!(!agent_visible(&workspace, cx, "second"));
+        assert!(!saved_visible("second"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("dev", "Dev", "agent_visible = true"));
+        let index = workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "dev")
+                .expect("the saved profile is restored");
+            workspace.activate(index, cx);
+            index
+        });
+        cx.run_until_parked();
+        assert!(agent_visible(&workspace, cx, "dev"));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::Full, cx)
+        });
+        assert!(agent_visible(&workspace, cx, "dev"));
+
+        let save = |workspace: &Entity<Workspace>,
+                    cx: &mut VisualTestContext,
+                    name: &str,
+                    duckdb: bool| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let config = if duckdb {
+                    crate::db::ConnectionConfig::duckdb(
+                        store::dbdelve_directory()
+                            .unwrap()
+                            .join("never-created.duckdb")
+                            .display()
+                            .to_string(),
+                        0,
+                    )
+                } else {
+                    workspace.profiles[index].config.clone()
+                };
+                workspace.save_profile("dev", name.into(), config, None, window, cx);
+            });
+        };
+        let notice = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .and_then(|profile| profile.session.notice.clone())
+            })
+        };
+
+        // A new name on the same engine is not a reason to hide anything.
+        save(&workspace, cx, "Renamed", false);
+        assert!(agent_visible(&workspace, cx, "dev"));
+        assert_ne!(
+            notice(&workspace, cx).as_deref(),
+            Some("Renamed is hidden from agents because its engine changed.")
+        );
+        assert!(saved_visible("dev"));
+
+        // A new engine invalidates what the dialog stated, so it hides and says so.
+        save(&workspace, cx, "Dev", true);
+        assert!(!agent_visible(&workspace, cx, "dev"));
+        assert_eq!(
+            notice(&workspace, cx).as_deref(),
+            Some("Dev is hidden from agents because its engine changed.")
+        );
+        assert!(!saved_visible("dev"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_hidden_profile_and_a_missing_one_answer_byte_for_byte_the_same(cx: &mut TestAppContext) {
+    use super::agent::AgentLookup;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("prod-hidden", "Prod", ""),
+                sqlite_profile("prod", "Prod", visible),
+                sqlite_profile("secret", "Secret", ""),
+                sqlite_profile("staging", "Staging", visible),
+                sqlite_profile("twin-1", "Twin", visible),
+                sqlite_profile("twin-2", "Twin", visible),
+                sqlite_profile("cafe", "Caf\u{e9}", visible),
+                // An engine this build cannot open is held back from the
+                // profile list, whatever it says about itself.
+                "[[profiles]]\nid = \"legacy\"\nname = \"Legacy\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"plugin:odbc\"\nagent_visible = true\n"
+                    .to_string(),
+            ]
+            .concat(),
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .profiles
+                    .iter()
+                    .all(|profile| profile.id != "legacy"),
+                "a profile this build cannot open is not in the list"
+            );
+
+            let unanswered = [
+                "Secret",
+                "Missing",
+                "secret",
+                "Secre",
+                "Secret ",
+                "Legacy",
+                "",
+                "Cafe\u{301}",
+            ]
+            .map(|name| match workspace.agent_profile(name) {
+                Err(AgentLookup::NotAvailable) => (
+                    format!("{:?}", AgentLookup::NotAvailable),
+                    AgentLookup::NotAvailable.to_string(),
+                ),
+                Err(other) => panic!("{name:?} answered {other:?}"),
+                Ok(profile) => panic!("{name:?} resolved to {}", profile.id),
+            });
+            assert!(
+                unanswered.iter().all(|answer| *answer == unanswered[0]),
+                "{unanswered:?}"
+            );
+
+            assert_eq!(
+                workspace.agent_profile("Prod").map(|p| p.id.as_str()),
+                Ok("prod")
+            );
+            assert_eq!(
+                workspace.agent_profile("Staging").map(|p| p.id.as_str()),
+                Ok("staging")
+            );
+            assert_eq!(
+                workspace.agent_profile("Caf\u{e9}").map(|p| p.id.as_str()),
+                Ok("cafe")
+            );
+
+            let twin = workspace.agent_profile("Twin").map(|p| p.id.as_str());
+            assert_eq!(twin, Err(AgentLookup::Ambiguous));
+            assert_ne!(
+                AgentLookup::Ambiguous.to_string(),
+                AgentLookup::NotAvailable.to_string()
+            );
+            for lookup in [AgentLookup::NotAvailable, AgentLookup::Ambiguous] {
+                let text = lookup.to_string();
+                for name in ["Secret", "Missing", "Twin", "Prod", "Legacy"] {
+                    assert!(!text.contains(name), "{text}");
+                }
+            }
+        });
+        quit(workspace, cx);
+    });
+}
+
+fn run_command(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, command: Command) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.run_command(command, window, cx)
+    });
+    settle(cx);
+}
+
+fn visibility_prompt(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| workspace.agent_visibility_prompt.clone())
+}
+
+#[gpui::test]
+fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
+        assert_eq!(ringed_button(&workspace, cx), 1);
+        assert!(!agent_visible(&workspace, cx, "only"));
+
+        // An `enter` carried over from the palette row lands on Cancel.
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!agent_visible(&workspace, cx, "only"));
+        assert!(!saved_visible("only"));
+
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(ringed_button(&workspace, cx), 1);
+        press(cx, "right");
+        assert_eq!(ringed_button(&workspace, cx), 0);
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(visibility_prompt(&workspace, cx), None);
+        assert!(agent_visible(&workspace, cx, "only"));
+        assert!(saved_visible("only"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hiding_a_profile_takes_one_action_and_no_dialog(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("only", "Only", "agent_visible = true"));
+        assert!(agent_visible(&workspace, cx, "only"));
+
+        run_command(&workspace, cx, Command::HideFromAgents(0));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!agent_visible(&workspace, cx, "only"));
+        assert!(!saved_visible("only"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn dismissing_the_visibility_dialog_grants_nothing_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+
+        // `escape`, and `enter` on the Cancel the ring opens on.
+        for (dismiss, typed) in [("escape", "x"), ("enter", "y")] {
+            run_command(&workspace, cx, Command::ShowToAgents(0));
+            assert_eq!(
+                front_dialog(&workspace, cx),
+                Some("agent-visibility"),
+                "{}",
+                surface(&workspace, cx)
+            );
+            let before = buffer(&workspace, cx);
+            press(cx, dismiss);
+            assert_eq!(front_dialog(&workspace, cx), None, "{dismiss} left it up");
+            assert!(!agent_visible(&workspace, cx, "only"), "after {dismiss}");
+            assert!(!saved_visible("only"), "after {dismiss}");
+            assert_eq!(visibility_prompt(&workspace, cx), None, "after {dismiss}");
+            assert!(editor_has_keyboard(&workspace, cx), "after {dismiss}");
+            cx.simulate_input(typed);
+            settle(cx);
+            assert_eq!(buffer(&workspace, cx), format!("{before}{typed}"));
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_dialog_left_open_over_a_removed_profile_grants_nothing(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}{}",
+                sqlite_profile("first", "First", ""),
+                sqlite_profile("second", "Second", "")
+            ),
+        );
+        run_command(&workspace, cx, Command::ShowToAgents(0));
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("agent-visibility"),
+            "{}",
+            surface(&workspace, cx)
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        workspace.update(cx, |workspace, cx| workspace.confirm_agent_visibility(cx));
+        assert!(!agent_visible(&workspace, cx, "second"));
+        assert!(!saved_visible("second"));
+        assert_eq!(visibility_prompt(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+/// A palette row's text box clips what runs past it, so a marker laid out past
+/// the box's right edge is drawn nowhere: a reachable connection then reads as
+/// hidden. `debug_bounds` records the laid-out bounds even when an ancestor
+/// clips, so the assertion is on where the marker sits, not whether it exists.
+#[gpui::test]
+fn a_visible_connection_keeps_its_marker_in_view_however_long_its_path_or_name(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let path = format!("{}/database.sqlite", "/a_long_folder_names_".repeat(9));
+        assert!(path.len() >= 200);
+        let long_name = "a_connection_named_at_great_length_".repeat(4);
+        assert!(long_name.len() >= 120);
+        let table = |id: &str, name: &str, path: &str| {
+            format!(
+                "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"sqlite\"\npath = {path:?}\nagent_visible = true\n"
+            )
+        };
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                table("long-path", "Short", &path),
+                table("long-name", &long_name, &path),
+                table("control", "Control", "c.db"),
+            ]
+            .concat(),
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_connections(window, cx)
+        });
+        settle(cx);
+
+        // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+        let bounds =
+            |selector: String, cx: &mut VisualTestContext| cx.debug_bounds(selector.leak());
+        let drawn: Vec<usize> = (0..32)
+            .filter(|at| bounds(format!("palette-row-marker-{at}"), cx).is_some())
+            .collect();
+        let ids = ["long-path", "long-name", "control"];
+        assert_eq!(
+            drawn.len(),
+            ids.len(),
+            "a marker is laid out on each visible connection row, at {drawn:?}"
+        );
+        for (at, id) in drawn.into_iter().zip(ids) {
+            let marker = bounds(format!("palette-row-marker-{at}"), cx).expect("counted above");
+            let text = bounds(format!("palette-row-text-{at}"), cx)
+                .unwrap_or_else(|| panic!("{id}: the row's text box is drawn"));
+            assert!(
+                text.left() <= marker.left() && marker.right() <= text.right(),
+                "{id}: the marker spans {:?}..{:?}, outside its text box {:?}..{:?}",
+                marker.left(),
+                marker.right(),
+                text.left(),
+                text.right()
+            );
+            if id != "long-name" {
+                let detail = bounds(format!("palette-row-detail-{at}"), cx)
+                    .unwrap_or_else(|| panic!("{id}: the endpoint is drawn"));
+                assert!(
+                    detail.size.width > gpui::px(0.),
+                    "{id}: the endpoint was squeezed to nothing"
+                );
+                assert!(
+                    marker.right() <= detail.left(),
+                    "{id}: the endpoint starts at {:?}, before the marker's end at {:?}",
+                    detail.left(),
+                    marker.right()
+                );
+            }
+        }
+        quit(workspace, cx);
+    });
+}
+
+/// One call as a process on this machine makes it: connect to the socket, send
+/// `frame` and a newline, read until the app closes the connection. On a thread
+/// of its own, because the window answers only while the test drives it.
+#[cfg(unix)]
+fn raw_call(path: &std::path::Path, frame: &str) -> std::thread::JoinHandle<String> {
+    use std::io::{Read, Write};
+
+    let path = path.to_path_buf();
+    let frame = format!("{frame}\n");
+    std::thread::spawn(move || {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        stream
+            .write_all(frame.as_bytes())
+            .expect("the frame is written");
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .expect("the app answers or closes");
+        answer
+    })
+}
+
+/// Let the window run while threads outside it work, until `done` holds. The
+/// executor never advances its clock here, so only real time passes.
+#[cfg(unix)]
+fn drive_until(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
+    let started = std::time::Instant::now();
+    while !done(cx) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "nothing happened in five seconds"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::agent::{Reply, Status};
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("billing", "Billing", visible),
+                sqlite_profile("secret", "Secret", ""),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+        let states = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profiles
+                    .iter()
+                    .map(|profile| matches!(profile.state, ProfileState::Idle))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = states(cx);
+
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| client.is_finished());
+        let answer = client.join().expect("the client thread finished");
+
+        let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        let listed: serde_json::Value =
+            serde_json::from_str(&reply.text).expect("the text is a JSON array");
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"name": "Orders", "engine": "sqlite"},
+                {"name": "Billing", "engine": "sqlite"},
+            ])
+        );
+        for word in ["Secret", "path", ".db", "host", "user"] {
+            assert!(!reply.text.contains(word), "{word}: {}", reply.text);
+        }
+        assert_eq!(states(cx), before, "listing opened or changed nothing");
+        let mode = std::fs::metadata(path.parent().expect("the socket has a directory"))
+            .expect("the directory exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Dropping the bridge stops the listener; the pump would otherwise
+        // outlive the window.
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_window_holds_a_presence_for_as_long_as_the_connection_is_open(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
+        std::io::Write::write_all(&mut stream, b"{\"v\":1,\"kind\":\"presence\"}\n")
+            .expect("the frame is written");
+        drive_until(cx, |cx| open(cx) == 1);
+        drop(stream);
+        drive_until(cx, |cx| open(cx) == 0);
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// An agent's call arriving at the window as the socket would hand it over,
+/// without a socket: no thread crosses the test scheduler. Answers the id it
+/// was given and the end its answer will come out of.
+fn inject_call(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tool: crate::agent::tools::Tool,
+    connection: Option<&str>,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = crate::agent::CallId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let (reply, answers) = std::sync::mpsc::sync_channel(1);
+    let call = crate::agent::Inbound::Call {
+        id,
+        tool,
+        connection: connection.map(str::to_string),
+        reply,
+    };
+    workspace.update(cx, |workspace, cx| workspace.on_agent_message(call, cx));
+    (id, answers)
+}
+
+fn pending_calls(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<crate::agent::CallId> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.agent.calls.iter().map(|call| call.id).collect()
+    })
+}
+
+#[gpui::test]
+fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("secret", "Secret", ""),
+                sqlite_profile("dup-1", "Dup", visible),
+                sqlite_profile("dup-2", "Dup", visible),
+            ]
+            .concat(),
+        );
+        let refused = |text: &str| Reply {
+            status: Status::RefusedByGate,
+            text: text.to_string(),
+        };
+
+        for name in [Some("Secret"), Some("Nope"), Some("orders"), None] {
+            let (_, answers) = inject_call(&workspace, cx, Tool::Ping, name);
+            assert_eq!(
+                answers.try_recv().ok(),
+                Some(refused("no agent-visible connection has that name")),
+                "{name:?}"
+            );
+        }
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Dup"));
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(refused(
+                "more than one agent-visible connection has that name"
+            ))
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_unanswered_ping_expires_after_the_fixed_wait(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use crate::agent::{EXPIRY, Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        cx.executor().advance_clock(EXPIRY - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Expired,
+                text: "Nobody answered the ping in DBDelve within 5 minutes.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(answers.try_recv().is_err(), "nothing else is ever sent");
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let ping = b"{\"v\":1,\"kind\":\"call\",\"tool\":\"ping\",\"connection\":\"Orders\"}\n";
+        let connect = || {
+            let mut stream = UnixStream::connect(&path).expect("the socket accepts a client");
+            stream.write_all(ping).expect("the frame is written");
+            stream
+        };
+
+        let first = connect();
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let first_id = pending_calls(&workspace, cx)[0];
+        let mut second = connect();
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
+        let second_id = pending_calls(&workspace, cx)[1];
+        assert_ne!(first_id, second_id);
+
+        drop(first);
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        assert_eq!(pending_calls(&workspace, cx), [second_id]);
+        second
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("the timeout is set");
+        let silent = second.read(&mut [0u8; 1]).expect_err("nothing was sent");
+        assert!(matches!(
+            silent.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        // Stopping the bridge leaves a pending call to the window, which
+        // drops it: its caller sees the connection end with no answer.
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.bridge.take();
+            workspace.agent.calls.clear();
+        });
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is set");
+        let mut rest = Vec::new();
+        second.read_to_end(&mut rest).expect("the connection ends");
+        assert!(rest.is_empty());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// What `agent_access` reads as in the file, which is what the next launch
+/// would act on.
+#[cfg(unix)]
+fn saved_agent_access() -> Option<bool> {
+    store::peek_profiles(&[])
+        .expect("profiles.toml reads back")
+        .settings
+        .and_then(|settings| settings.agent_access)
+}
+
+/// The notice where `Workspace::note` put it: on the profile in front, else on
+/// the connection form, else on the welcome surface.
+fn shown_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| match workspace.profile() {
+        Some(profile) => profile.session.shown_notice().map(str::to_string),
+        None => match &workspace.form {
+            Some(form) => form.error.clone(),
+            None => workspace.welcome_notice.clone(),
+        },
+    })
+}
+
+/// The labels of the palette's agent access row, which is one row or none: the
+/// registration row is there whatever the access, and has its own test.
+#[cfg(unix)]
+fn agent_access_rows(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    workspace.read_with(cx, |workspace, _| {
+        crate::palette::agent_items(workspace)
+            .into_iter()
+            .map(|item| item.label)
+            .filter(|label| label != "Copy Claude Code registration")
+            .collect()
+    })
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn copying_the_registration_puts_the_line_on_the_clipboard_and_says_so(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        assert!(workspace.read_with(cx, |workspace, _| {
+            crate::palette::agent_items(workspace)
+                .iter()
+                .any(|item| item.label == "Copy Claude Code registration")
+        }));
+
+        run_command(&workspace, cx, Command::CopyAgentRegistration);
+        let line = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("the line was copied");
+        // The name and the option depend on the variant this process runs
+        // under; the shape around them does not.
+        assert!(line.starts_with("claude mcp add --scope user "), "{line}");
+        assert!(line.ends_with("' mcp"), "{line}");
+        assert!(line.contains(" -- '/"), "{line}");
+        let notice = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .and_then(|profile| profile.session.notice.clone())
+        });
+        assert_eq!(
+            notice.as_deref(),
+            Some("Copied the Claude Code registration line.")
+        );
+    });
+}
+
+#[cfg(unix)]
+const PING_ORDERS: &str = r#"{"v":1,"kind":"call","tool":"ping","connection":"Orders"}"#;
+
+#[cfg(unix)]
+#[gpui::test]
+fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::{fs::PermissionsExt, net::UnixStream};
+
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        assert_eq!(agent_access_rows(&workspace, cx), ["Turn agent access on"]);
+        assert_eq!(saved_agent_access(), None);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_some()));
+        assert!(path.exists(), "the socket is bound at the derived path");
+        let mode = std::fs::metadata(path.parent().expect("the socket has a directory"))
+            .expect("the directory exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(saved_agent_access(), Some(true));
+        assert_eq!(
+            agent_access_rows(&workspace, cx),
+            ["Disconnect agents and turn access off"]
+        );
+
+        // Another setting's save writes back what the file holds, not a copy
+        // this window made at launch.
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(false, cx));
+        assert_eq!(saved_agent_access(), Some(true));
+
+        let listed = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| listed.is_finished());
+        let reply: Reply = serde_json::from_str(
+            listed
+                .join()
+                .expect("the client thread finished")
+                .trim_end(),
+        )
+        .expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        assert!(reply.text.contains("Orders"), "{}", reply.text);
+
+        let ping = raw_call(&path, PING_ORDERS);
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        drive_until(cx, |_| ping.is_finished());
+        assert_eq!(
+            ping.join().expect("the client thread finished").trim_end(),
+            r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_none()));
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "no file is left at the socket path"
+        );
+        assert!(UnixStream::connect(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(agent_access_rows(&workspace, cx), ["Turn agent access on"]);
+
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(true, cx));
+        assert_eq!(saved_agent_access(), Some(false));
+
+        // Pressed again with nothing listening, it changes nothing and says
+        // nothing.
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        quit(workspace, cx);
+    });
+}
+
+/// Another window of the same variant, as far as the socket can tell: a
+/// listener bound at the derived path, whose messages the test holds. Dropping
+/// it is that window closing.
+#[cfg(unix)]
+fn another_window() -> (
+    crate::agent::Listener,
+    tokio::sync::mpsc::UnboundedReceiver<crate::agent::Inbound>,
+) {
+    let path = crate::agent::socket_path().expect("the test home gives a socket path");
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    match crate::agent::listen(&path, sender) {
+        Ok(listener) => (listener, receiver),
+        Err(_) => panic!("the stand-in window binds the socket"),
+    }
+}
+
+/// What another window's own access action leaves in the shared settings file.
+#[cfg(unix)]
+fn another_window_saves_agent_access(choice: bool) {
+    let mut list = store::peek_profiles(&[]).expect("profiles.toml reads back");
+    list.settings
+        .get_or_insert_with(Default::default)
+        .agent_access = Some(choice);
+    store::save_profiles(&list).expect("profiles.toml is written");
+}
+
+#[cfg(unix)]
+const ALREADY_SERVED: &str = "Another DBDelve window is already serving agents.";
+
+#[cfg(unix)]
+const STILL_SERVED: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
+
+#[cfg(unix)]
+fn listening(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_some())
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_saved_agent_access_listens_at_launch_and_quit_removes_the_socket(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let profile = sqlite_profile("orders", "Orders", "agent_visible = true");
+        // The second `true` is the next launch from the file the first quit
+        // left; the last two are a file that says off and one that says nothing.
+        for (setting, saved, listens) in [
+            ("agent_access = true", Some(true), true),
+            ("agent_access = true", Some(true), true),
+            ("agent_access = false", Some(false), false),
+            ("", None, false),
+        ] {
+            let (workspace, cx) = launch_with_settings(cx, setting, &profile);
+            cx.executor().allow_parking();
+            assert_eq!(listening(&workspace, cx), listens, "{setting:?}");
+            assert_eq!(path.exists(), listens, "{setting:?}");
+            assert_eq!(
+                agent_access_rows(&workspace, cx),
+                [if listens {
+                    "Disconnect agents and turn access off"
+                } else {
+                    "Turn agent access on"
+                }]
+            );
+
+            quit(workspace, cx);
+            assert!(
+                std::fs::symlink_metadata(&path).is_err(),
+                "{setting:?}: quitting leaves no socket file"
+            );
+            assert_eq!(saved_agent_access(), saved, "{setting:?}");
+        }
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_second_window_leaves_a_live_socket_alone_and_says_so(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixStream;
+
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let (first_window, _received) = another_window();
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+        assert_eq!(saved_agent_access(), Some(true), "a decline writes nothing");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first window still accepts"
+        );
+
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+        assert_eq!(saved_agent_access(), Some(true));
+        assert!(UnixStream::connect(&path).is_ok());
+
+        drop(first_window);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(listening(&workspace, cx));
+        assert!(UnixStream::connect(&path).is_ok());
+        assert_eq!(saved_agent_access(), Some(true));
+
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_holds_across_two_windows_of_the_same_variant(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixStream;
+
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let (first_window, mut received) = another_window();
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        assert!(!listening(&workspace, cx));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(ALREADY_SERVED)
+        );
+
+        // R-02: this window reaches none of the first window's agents, and
+        // says so, while still saving that access is off for every launch.
+        let press = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, _| workspace.clear_notice());
+            run_command(&workspace, cx, Command::DisconnectAgents);
+        };
+        press(cx);
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(STILL_SERVED));
+        assert_eq!(saved_agent_access(), Some(false));
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first window is left serving"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "nothing was sent to the first window"
+        );
+        press(cx);
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(STILL_SERVED));
+        assert_eq!(saved_agent_access(), Some(false));
+
+        // T-04-22: the other window's turn-on and kill switch each survive an
+        // unrelated save made here.
+        let toggle_titlebar = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let color = workspace.settings.color_titlebar;
+                workspace.set_color_titlebar(!color, cx)
+            });
+        };
+        another_window_saves_agent_access(true);
+        toggle_titlebar(cx);
+        assert_eq!(saved_agent_access(), Some(true));
+        another_window_saves_agent_access(false);
+        drop(first_window);
+        toggle_titlebar(cx);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert!(!listening(&workspace, cx));
+        assert!(UnixStream::connect(&path).is_err());
+
+        // The other window turned access on and quit: nothing serves, and
+        // the kill saves off and has nothing to add.
+        another_window_saves_agent_access(true);
+        press(cx);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(shown_notice(&workspace, cx), None);
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let written = || {
+            std::fs::metadata(&file)
+                .and_then(|metadata| metadata.modified())
+                .expect("profiles.toml has a modification time")
+        };
+        let before = written();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        press(cx);
+        assert_eq!(written(), before, "nothing is written the second time");
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        quit(workspace, cx);
+        let (workspace, cx) = launch(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+const PRESENCE: &str = r#"{"v":1,"kind":"presence"}"#;
+
+#[cfg(unix)]
+const REJECTED: &str = r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#;
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let pings = [raw_call(&path, PING_ORDERS), raw_call(&path, PING_ORDERS)];
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
+        let presence = raw_call(&path, PRESENCE);
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
+        });
+        // A waiting ping's dialog holds the keyboard, so the chord is pressed
+        // from inside it, and has to reach the workspace from there.
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+
+        cx.simulate_keystrokes("secondary-shift-k");
+        drive_until(cx, |_| {
+            pings.iter().all(|ping| ping.is_finished()) && presence.is_finished()
+        });
+        for ping in pings {
+            // A whole frame, then the end of the connection: a bare end of
+            // file would read as an empty string.
+            assert_eq!(
+                ping.join().expect("the client thread finished"),
+                format!("{REJECTED}\n")
+            );
+        }
+        assert_eq!(
+            presence.join().expect("the client thread finished"),
+            "",
+            "a presence is closed, and is sent nothing"
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.presence.is_empty());
+            assert!(workspace.agent.bridge.is_none());
+        });
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_answers_its_chord_on_every_surface(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        // No profile: the welcome surface. A runner whose `PG*` variables make
+        // a profile in front of it drives the main pane instead, which has
+        // the same binding; the form is driven below either way.
+        let (workspace, cx) = launch_with_settings(cx, "agent_access = true", "");
+        cx.executor().allow_parking();
+        assert!(listening(&workspace, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus.focus(window, cx)
+        });
+        settle(cx);
+        cx.simulate_keystrokes("secondary-shift-k");
+        settle(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+
+        // The connection form, opened over a profile.
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        assert!(listening(&workspace, cx));
+        run_command(&workspace, cx, Command::NewConnection);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.form.is_some()));
+        cx.simulate_keystrokes("secondary-shift-k");
+        settle(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) =
@@ -3056,5 +4542,927 @@ fn refused_table_copies_preserve_the_clipboard(cx: &mut TestAppContext) {
             }
         }
         quit(workspace, cx);
+    });
+}
+
+/// The call the ping dialog is about.
+fn front_ping_id(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::agent::CallId> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.front_ping().map(|call| call.id)
+    })
+}
+
+fn denied() -> crate::agent::Reply {
+    crate::agent::Reply {
+        status: crate::agent::Status::Rejected,
+        text: "The ping was denied in DBDelve.".to_string(),
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_ping_through_the_shim_waits_for_the_human_and_answers_executed(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("reports", "Reports", visible),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "ping",
+            serde_json::json!({ "connection": "Reports" }),
+        );
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(ringed_button(&workspace, cx), 0);
+        assert!(!shim.is_finished(), "the agent waits for the human");
+
+        let approve = cx
+            .debug_bounds("agent-ping-approve")
+            .expect("the dialog draws Approve");
+        cx.simulate_click(approve.center(), gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "status: executed\nThe ping was approved in DBDelve."
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let reports = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "reports")
+                .expect("the profile was restored");
+            assert!(
+                matches!(reports.state, ProfileState::Idle),
+                "approving a ping opened a connection"
+            );
+        });
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(ringed_button(&workspace, cx), 0);
+
+        for key in ["right", "left", "tab"] {
+            press(cx, key);
+            assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"), "{key}");
+            assert_eq!(ringed_button(&workspace, cx), 0, "{key}");
+            assert_eq!(pending_calls(&workspace, cx), [id], "{key}");
+            assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty), "{key}");
+        }
+
+        press(cx, "enter");
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        press(cx, "escape");
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{EXPIRY, Inbound, Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+
+        // Hung up.
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id }, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(
+            answers.try_recv().is_err(),
+            "a hung-up call is sent nothing"
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // Expired.
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        cx.executor()
+            .advance_clock(EXPIRY + std::time::Duration::from_secs(1));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(
+            answers.try_recv().ok().map(|reply| reply.status),
+            Some(Status::Expired)
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // Cut off. No bridge runs here: the kill switch answers every pending
+        // call first, with or without one.
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn pings_are_answered_oldest_first(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (first, first_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (second, second_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_ping_id(&workspace, cx), Some(first));
+
+        workspace.update(cx, |workspace, cx| workspace.approve_ping(first, cx));
+        settle(cx);
+        assert_eq!(
+            first_answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Executed,
+                text: "The ping was approved in DBDelve.".to_string(),
+            })
+        );
+        assert_eq!(pending_calls(&workspace, cx), [second]);
+        assert_eq!(front_ping_id(&workspace, cx), Some(second));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(
+            second_answers.try_recv().err(),
+            Some(TryRecvError::Empty),
+            "the second ping was answered by the first's approval"
+        );
+        quit(workspace, cx);
+    });
+}
+
+fn swept() -> crate::agent::Reply {
+    crate::agent::Reply {
+        status: crate::agent::Status::Rejected,
+        text: "The connection is no longer available to agents.".to_string(),
+    }
+}
+
+#[gpui::test]
+fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("a", "Shop", visible),
+                sqlite_profile("b", "Shop", ""),
+                sqlite_profile("o", "Orders", visible),
+                sqlite_profile("r", "Reports", visible),
+            ]
+            .concat(),
+        );
+        let (first_shop, first_shop_answers) =
+            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
+        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (second_shop, second_shop_answers) =
+            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
+        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_ping_id(&workspace, cx), Some(first_shop));
+
+        // Hiding the profile that is already hidden answers nothing.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("b", false, cx)
+        });
+        assert_eq!(
+            pending_calls(&workspace, cx),
+            [first_shop, orders, second_shop, reports]
+        );
+
+        run_command(&workspace, cx, Command::HideFromAgents(0));
+        assert_eq!(first_shop_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(second_shop_answers.try_recv().ok(), Some(swept()));
+        assert!(first_shop_answers.try_recv().is_err(), "answered twice");
+        assert!(second_shop_answers.try_recv().is_err(), "answered twice");
+        assert_eq!(pending_calls(&workspace, cx), [orders, reports]);
+        assert_eq!(orders_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        // Nothing waits on Reports once its ping is denied, so hiding it sends
+        // nothing and says nothing.
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(orders, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(reports, cx));
+        assert_eq!(orders_answers.try_recv().ok(), Some(denied()));
+        assert_eq!(reports_answers.try_recv().ok(), Some(denied()));
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::HideFromAgents(3));
+        assert!(!agent_visible(&workspace, cx, "r"));
+        assert!(reports_answers.try_recv().is_err());
+        assert_eq!(shown_notice(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("o", "Orders", visible),
+                sqlite_profile("r", "Reports", visible),
+            ]
+            .concat(),
+        );
+        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        settle(cx);
+        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+
+        workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
+        settle(cx);
+        assert_eq!(orders_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(pending_calls(&workspace, cx), [reports]);
+        assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(front_ping_id(&workspace, cx), Some(reports));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+fn agent_mark_state(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::ui::AgentMark> {
+    workspace.read_with(cx, |workspace, _| workspace.agent_mark_state())
+}
+
+/// Whether the mark drew itself in the last frame, in either state.
+#[cfg(unix)]
+fn agent_mark_drawn(cx: &mut VisualTestContext) -> bool {
+    cx.debug_bounds("agent-mark-listening").is_some()
+        || cx.debug_bounds("agent-mark-connected").is_some()
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{ConnId, Inbound, tools::Tool},
+        ui::AgentMark,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+
+        assert!(!agent_mark_drawn(cx), "access is off");
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        assert!(cx.debug_bounds("agent-mark-connected").is_none());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 })
+        );
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+        assert!(cx.debug_bounds("agent-mark-listening").is_none());
+
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 1 })
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceClosed { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+        assert!(!agent_mark_drawn(cx), "the kill switch takes the mark away");
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_in_every_titlebar(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        // No saved profile: the welcome surface, unless the runner's `PG*`
+        // variables put a profile in front, which has the main titlebar.
+        let (workspace, cx) = launch_with_settings(cx, "agent_access = true", "");
+        cx.executor().allow_parking();
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+
+        // A profile in front, then the connection form over it.
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::NewConnection);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.form.is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_lights_when_a_running_shim_finds_access_turned_on(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::ui::AgentMark;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let presence = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        // Claude Code already has DBDelve loaded: the shim runs and retries
+        // against a socket nothing listens at.
+        let shim = crate::agent::shim::testing::idle_shim(path, Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
+        settle(cx);
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        drive_until(cx, |cx| {
+            agent_mark_state(&workspace, cx) == Some(AgentMark::Connected { waiting: 0 })
+        });
+        // No call was made: the agent is there because its shim is.
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(shim.lines_after_handshake().is_empty());
+        settle(cx);
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+        assert!(
+            !listening(&workspace, cx),
+            "the shim's retries bound nothing"
+        );
+
+        drop(shim);
+        quit(workspace, cx);
+    });
+}
+
+fn agent_log(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<super::agent::LogEntry> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.agent.log.iter().cloned().collect()
+    })
+}
+
+#[gpui::test]
+fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::agent::{EXPIRY, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (listed, _listed_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        // A name the agent made up, with a bell in it and far too long.
+        let made_up = format!("Nope\u{7}{}", "x".repeat(80));
+        let (refused, _refused_answers) = inject_call(&workspace, cx, Tool::Ping, Some(&made_up));
+        let (expired, _expired_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        cx.executor().advance_clock(EXPIRY + Duration::from_secs(1));
+        cx.run_until_parked();
+        let (hung_up, _hung_up_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: hung_up }, cx)
+        });
+        let (denied, _denied_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(denied, cx));
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter().map(|entry| entry.status).collect::<Vec<_>>(),
+            [
+                Status::Rejected,
+                Status::Cancelled,
+                Status::Expired,
+                Status::RefusedByGate,
+                Status::Executed
+            ]
+        );
+        assert_eq!(
+            log.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            [denied, hung_up, expired, refused, listed]
+        );
+        let asked = log[3]
+            .asked
+            .as_deref()
+            .expect("the refusal keeps what was asked");
+        assert_eq!(asked.chars().count(), 64);
+        assert!(asked.starts_with("Nope") && !asked.chars().any(char::is_control));
+        assert_eq!(log[3].resolved, None);
+        for entry in &log[..3] {
+            assert_eq!(entry.resolved.as_deref(), Some("Orders"));
+            assert_eq!(entry.asked, None);
+        }
+        // What `list_connections` answered is not kept: not the text, nor a
+        // name it listed.
+        assert_eq!((&log[4].resolved, &log[4].asked), (&None, &None));
+        assert!(!format!("{:?}", log[4]).contains("engine"));
+
+        for _ in 0..25 {
+            inject_call(&workspace, cx, Tool::ListConnections, None);
+        }
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::LOG_CAP);
+        let mut ids: Vec<_> = log.iter().map(|entry| entry.id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), super::agent::LOG_CAP, "a call was logged twice");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use crate::agent::{CallId, Inbound, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.approve_ping(id, cx));
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, false)
+        );
+
+        // An id nothing logged is not a call this window answered.
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(
+                Inbound::Undelivered {
+                    id: CallId(u64::MAX),
+                },
+                cx,
+            )
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!((log.len(), log[0].requester_gone), (1, false));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Undelivered { id }, cx)
+        });
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            (log.len(), log[0].status, log[0].requester_gone),
+            (1, Status::Executed, true)
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+
+        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
+        client
+            .write_all(format!("{PING_ORDERS}\n").as_bytes())
+            .expect("the frame is written");
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let id = pending_calls(&workspace, cx)[0];
+
+        // The caller leaves, and the window is not run while the socket's
+        // threads see it: the answer below is given before the hangup is
+        // delivered, which is the race.
+        drop(client);
+        std::thread::sleep(Duration::from_millis(100));
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.agent.calls.len(),
+                1,
+                "the hangup was delivered early, so this is not the race"
+            );
+            workspace.approve_ping(id, cx)
+        });
+        drive_until(cx, |cx| {
+            agent_log(&workspace, cx)
+                .iter()
+                .any(|entry| entry.id == id && entry.requester_gone)
+        });
+        cx.run_until_parked();
+        let entries: Vec<_> = agent_log(&workspace, cx)
+            .into_iter()
+            .filter(|entry| entry.id == id)
+            .collect();
+        assert_eq!(entries.len(), 1, "the late hangup logged the call again");
+        assert_eq!(entries[0].status, Status::Executed);
+        assert_eq!(agent_log(&workspace, cx).len(), 1);
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[test]
+fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
+    use super::{agent::LogEntry, agent_log_label};
+    use crate::agent::{CallId, Status, tools::Tool};
+
+    let entry = LogEntry {
+        at: 1_000_000,
+        id: CallId(1),
+        tool: Tool::Ping,
+        resolved: None,
+        asked: Some("Nope".to_string()),
+        status: Status::RefusedByGate,
+        requester_gone: false,
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000 + 125_000),
+        "2m ago \u{b7} ping \u{b7} asked for \"Nope\" \u{b7} refused_by_gate"
+    );
+    let entry = LogEntry {
+        resolved: Some("Orders".to_string()),
+        asked: None,
+        status: Status::Executed,
+        requester_gone: true,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} ping \u{b7} Orders \u{b7} executed \u{b7} no requester"
+    );
+    let entry = LogEntry {
+        resolved: None,
+        requester_gone: false,
+        tool: Tool::ListConnections,
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} list_connections \u{b7} executed"
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_popover_turns_access_off(cx: &mut TestAppContext) {
+    use crate::agent::{ConnId, Inbound};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        let in_menu = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(!in_menu(cx));
+
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("an attached agent lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        assert!(in_menu(cx), "clicking the mark opened no menu");
+
+        // The kill switch is the only item that can be chosen. The menu's
+        // first step down always lands on its first row, a label, so the
+        // second is the one that reaches the item.
+        cx.simulate_keystrokes("down");
+        settle(cx);
+        assert!(listening(&workspace, cx), "a label was chosen");
+        cx.simulate_keystrokes("down enter");
+        settle(cx);
+        assert!(!in_menu(cx));
+        assert!(!listening(&workspace, cx));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.presence.is_empty()));
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the_dialog(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        // The dialog stops under the titlebar, so the click reaches the mark.
+        let mark = cx
+            .debug_bounds("agent-mark-connected")
+            .expect("a waiting call lights the mark");
+        cx.simulate_click(mark.center(), gpui::Modifiers::default());
+        settle(cx);
+        let menu_open = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+            })
+        };
+        assert!(
+            menu_open(cx),
+            "the dialog took the click meant for the mark"
+        );
+        assert_eq!(
+            answers.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Empty),
+            "opening the menu answered the ping"
+        );
+
+        // By the pointer: the dialog holds the keyboard while it is up, so a
+        // key meant for the menu is the dialog's, and `enter` there denies.
+        // The rows have no selector, so each try reopens the menu and clicks
+        // one row lower until the one item that acts is under the pointer; a
+        // click on a label or outside the menu only closes it.
+        for step in 0..12 {
+            if pending_calls(&workspace, cx).is_empty() {
+                break;
+            }
+            if !menu_open(cx) {
+                cx.simulate_click(mark.center(), gpui::Modifiers::default());
+                settle(cx);
+            }
+            let at = gpui::point(
+                mark.center().x,
+                mark.bottom() + gpui::px(14. + 8. * step as f32),
+            );
+            cx.simulate_click(at, gpui::Modifiers::default());
+            settle(cx);
+        }
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(crate::agent::Reply {
+                status: crate::agent::Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(!listening(&workspace, cx));
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_click_on_the_ping_backdrop_below_the_titlebar_does_not_approve(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+
+        let just_below_the_titlebar = gpui::point(
+            gpui::px(12.),
+            gpui::px(crate::theme::layout::TITLEBAR_HEIGHT + 12.),
+        );
+        cx.simulate_click(just_below_the_titlebar, gpui::Modifiers::default());
+        settle(cx);
+
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_choice_overrides_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", "agent_visible = true"),
+                sqlite_profile("billing", "Billing", ""),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+
+        // Another window hides Orders and, through its own dialog, shows
+        // Billing. Only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        let text = text.replace("agent_visible = true\n", "").replace(
+            "name = \"Billing\"\n",
+            "name = \"Billing\"\nagent_visible = true\n",
+        );
+        std::fs::write(&file, text).expect("profiles.toml is written");
+        assert!(saved_visible("billing") && !saved_visible("orders"));
+
+        // The window serving agents answers with the file's flags.
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| client.is_finished());
+        let answer = client.join().expect("the client thread finished");
+        let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply.text).expect("a JSON array"),
+            serde_json::json!([{"name": "Billing", "engine": "sqlite"}])
+        );
+
+        // A save for something else entirely writes the other window's flags
+        // back as they are.
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(!saved_visible("orders") && saved_visible("billing"));
+        assert!(!agent_visible(&workspace, cx, "orders"));
+        assert!(agent_visible(&workspace, cx, "billing"));
+
+        // This window's own hide is the one that is written.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("billing", false, cx)
+        });
+        assert!(!saved_visible("billing"));
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
     });
 }

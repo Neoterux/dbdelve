@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod agent;
 mod completion;
 mod connection_form;
 mod db;
@@ -54,20 +55,20 @@ use gpui_component::{
 };
 
 use actions::{
-    AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CopyCell, CopyPlan,
-    CopyResults, CopyRow, CopyRows, CopySelection, CustomRowLimit, CycleMode, DeleteRow,
-    DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
-    HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, LimitTarget,
+    AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CommitTransaction,
+    CopyCell, CopyPlan, CopyResults, CopyRow, CopyRows, CopySelection, CustomRowLimit, CycleMode,
+    DeleteRow, DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen,
+    GoToColumn, HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, LimitTarget,
     MenuImportRowsFromClipboard, Minimize, MoveTabLeft, MoveTabRight, NewConnection, NewProject,
     NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult, NextTab, OpenReference,
     OpenSettings, PreviousEdit, PreviousPage, PreviousProfile, PreviousResult, PreviousTab, Quit,
     RefreshConnection, RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations,
-    ResetEditorZoom, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
-    SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw,
-    SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowMessages,
-    ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
-    ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn, ToggleRowEdit,
-    ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+    ResetEditorZoom, RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase,
+    SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator,
+    SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor,
+    ShowMessages, ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
+    ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn,
+    ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
@@ -258,6 +259,11 @@ fn panic_log_directory() -> Option<PathBuf> {
 }
 
 fn main() {
+    // The agent shim speaks MCP on stdio and must never open a window or reach
+    // GPUI, on any OS, so it is decided before anything else starts.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
+        std::process::exit(agent::shim::run());
+    }
     install_panic_log();
     // Manifests only, ahead of the profiles that name them: no plugin process
     // starts until one of its connections opens.

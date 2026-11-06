@@ -63,8 +63,8 @@ use crate::{
     },
     ui::{
         Control, Tone, chord_for, group_thousands, highlighted, icon_button, key_chip,
-        keycap_parts, keycaps, kind_color, object_icon, one_line, raised_card, row_icon_tinted,
-        search_field, status_dot,
+        keycap_parts, keycaps, kind_color, object_icon, one_line, raised_card, row_icon,
+        row_icon_tinted, search_field, status_dot,
     },
     workspace::{ReferenceSource, opacity_for},
 };
@@ -366,6 +366,20 @@ pub enum Command {
     ProjectActions(usize),
     EditConnection(usize),
     DuplicateConnection(usize),
+    /// Open the dialog that makes this connection visible to agents. Changes
+    /// nothing itself: the dialog's own button does.
+    ShowToAgents(usize),
+    /// Hide this connection from agents, at once and with no dialog.
+    HideFromAgents(usize),
+    /// Open the socket agents reach DBDelve on, and keep access on across
+    /// launches.
+    TurnOnAgentAccess,
+    /// The kill switch: answer every waiting call `rejected`, close every
+    /// agent connection, and turn access off across launches.
+    DisconnectAgents,
+    /// Copy the `claude mcp add` line that registers this DBDelve with Claude
+    /// Code. Runs nothing: the user pastes it.
+    CopyAgentRegistration,
     /// Put the palette back up over the projects this connection can join.
     ChooseProject(usize),
     /// `None` is No project.
@@ -470,15 +484,16 @@ pub enum Command {
     DownloadUpdate(String),
 }
 
-struct Item {
+pub(crate) struct Item {
     /// What the matcher scores, and what the row reads as. One string for both,
     /// so nothing can be found by text that is not on screen.
-    label: String,
+    pub(crate) label: String,
     /// What else the matcher scores, each on its own, for a row also found by
     /// what is drawn beside it: a connection by its host, which its detail
     /// shows. Built once per open.
     also: Vec<String>,
-    /// Muted and monospaced, inline after the label: where a connection points.
+    /// Muted and monospaced, after the label and any agent marker: where a
+    /// connection points. The first part of the row to give way when it runs out.
     detail: Option<SharedString>,
     /// Muted, at the far end: what kind of object this is, or which row is the
     /// one in force.
@@ -495,6 +510,8 @@ struct Item {
     mono: bool,
     /// A label drawn muted: a connection this build cannot open.
     muted: bool,
+    /// A connection an agent may reach, marked after its name.
+    agent_visible: bool,
     scope: Scope,
     /// Listed under All as well as in its own scope.
     in_all: bool,
@@ -646,6 +663,7 @@ impl Item {
             status: None,
             mono: false,
             muted: false,
+            agent_visible: false,
             scope: Scope::Commands,
             in_all: true,
             group: Group::Bare,
@@ -702,6 +720,13 @@ impl Item {
     fn status(mut self, profile: usize) -> Self {
         self.status = Some(profile);
         self
+    }
+
+    fn agent_visible(self, visible: bool) -> Self {
+        Self {
+            agent_visible: visible,
+            ..self
+        }
     }
 
     fn beyond_all(mut self) -> Self {
@@ -1003,6 +1028,12 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
                 | Command::RemoveConnection(_)
                 | Command::RemoveUnavailable(_)
                 | Command::DeleteProject(_)
+                // A trust change is never one `enter` from a list the user
+                // did not open for it.
+                | Command::ShowToAgents(_)
+                | Command::HideFromAgents(_)
+                | Command::TurnOnAgentAccess
+                | Command::DisconnectAgents
         )
 }
 
@@ -1707,6 +1738,7 @@ impl Palette {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .debug_selector(move || format!("palette-row-text-{at}"))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1719,12 +1751,27 @@ impl Palette {
                                     .when(item.mono, |label| label.font_family(mono.clone()))
                                     .child(highlighted(item.label.clone(), &ranges, t)),
                             )
-                            .children(item.detail.clone().map(|detail| {
+                            // Muted and still, like the hint: it says what is
+                            // true, it does not ask for attention.
+                            .children(item.agent_visible.then(|| {
                                 div()
                                     .flex_shrink_0()
+                                    .debug_selector(move || format!("palette-row-marker-{at}"))
+                                    .child(row_icon(t, icon::AGENT_VISIBLE))
+                            }))
+                            // An endpoint can be a file path longer than the row, and
+                            // the name and the marker are what the row is for, so the
+                            // endpoint gives way first.
+                            .children(item.detail.clone().map(|detail| {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
                                     .font_family(mono.clone())
                                     .text_size(px(layout::chrome(layout::TEXT_SM)))
                                     .text_color(t.text_faint)
+                                    .debug_selector(move || format!("palette-row-detail-{at}"))
                                     .child(detail)
                             })),
                     )
@@ -2391,6 +2438,8 @@ struct Listed<'a> {
     endpoint: String,
     logo: &'static str,
     color: Option<ConnectionColor>,
+    /// Whether an agent may reach it. Never true for one this build cannot open.
+    agent_visible: bool,
     /// A connection this build cannot open, by index into
     /// `Workspace::unavailable`, and why.
     unavailable: Option<(usize, String)>,
@@ -2414,6 +2463,7 @@ fn connection_items(workspace: &Workspace) -> Vec<Item> {
             endpoint: profile.config.listed_endpoint(),
             logo: profile.config.target().logo(),
             color: profile.color,
+            agent_visible: profile.agent_visible,
             unavailable: None,
         })
         .chain(
@@ -2428,6 +2478,7 @@ fn connection_items(workspace: &Workspace) -> Vec<Item> {
                     endpoint: String::new(),
                     logo: icon::DATABASE,
                     color: None,
+                    agent_visible: false,
                     unavailable: Some((
                         at,
                         crate::workspace::unavailable_reason(gone, &workspace.plugins),
@@ -2525,6 +2576,7 @@ fn listed_connections(
             )
             .detail(connection.endpoint.clone())
             .tint(connection.color)
+            .agent_visible(connection.agent_visible)
             .status(index)
             .hint(if index == active { "current" } else { "" })
             .also(vec![connection.host.clone()])
@@ -2593,6 +2645,21 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
         Command::DuplicateConnection(index),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        row(
+            format!("Hide {name} from agents"),
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(index),
+            CONNECTION,
+        )
+    } else {
+        row(
+            format!("Make {name} visible to agents…"),
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(index),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(row(
             format!("Move {name} to a project…"),
@@ -3256,10 +3323,51 @@ fn welcome_items(workspace: &Workspace) -> Vec<Item> {
     let overrides = &workspace.settings.custom_keybindings;
     let mut items = starting_items(overrides);
     items.extend(appearance_items(overrides));
+    items.extend(agent_items(workspace));
     if !workspace.unavailable.is_empty() {
         items.extend(connection_items(workspace));
     }
     items
+}
+
+/// The agent rows: the one that governs access, turning it on while this window
+/// is not listening and the kill switch while it is, and the one that copies the
+/// line registering DBDelve with Claude Code. Nothing on an OS the socket
+/// does not run on, where there is nothing to turn on. `cfg!`, not `#[cfg]`,
+/// so the row's code builds and is checked everywhere.
+pub(crate) fn agent_items(workspace: &Workspace) -> Vec<Item> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    let overrides = &workspace.settings.custom_keybindings;
+    let access = if workspace.agent.bridge.is_none() {
+        command(
+            "Turn agent access on",
+            icon::AGENT_VISIBLE,
+            Command::TurnOnAgentAccess,
+            AGENTS,
+        )
+    } else {
+        with_chord(
+            command(
+                "Disconnect agents and turn access off",
+                icon::AGENT_VISIBLE,
+                Command::DisconnectAgents,
+                AGENTS,
+            ),
+            "disconnect_agents",
+            overrides,
+        )
+    };
+    vec![
+        access,
+        command(
+            "Copy Claude Code registration",
+            icon::COPY,
+            Command::CopyAgentRegistration,
+            AGENTS,
+        ),
+    ]
 }
 
 fn command(label: &str, icon: &'static str, command: Command, group: &'static str) -> Item {
@@ -3374,6 +3482,7 @@ const EDITS: &str = "Edits";
 const RESULTS: &str = "Results";
 const TAB: &str = "Tab";
 const CONNECTION: &str = "Connection";
+const AGENTS: &str = "Agents";
 const PROJECT: &str = "Project";
 const APPEARANCE: &str = "Appearance";
 const WINDOW: &str = "Window";
@@ -4063,6 +4172,21 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         Command::DuplicateConnection(active),
         CONNECTION,
     ));
+    items.push(if profile.agent_visible {
+        command(
+            "Hide connection from agents",
+            icon::AGENT_VISIBLE,
+            Command::HideFromAgents(active),
+            CONNECTION,
+        )
+    } else {
+        command(
+            "Make connection visible to agents…",
+            icon::AGENT_VISIBLE,
+            Command::ShowToAgents(active),
+            CONNECTION,
+        )
+    });
     if !workspace.projects.is_empty() {
         items.push(command(
             "Move connection to a project…",
@@ -4171,6 +4295,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         ));
     }
     items.extend(appearance_items(overrides));
+    items.extend(agent_items(workspace));
     if let Some(release) = &workspace.newer_release {
         items.push(command(
             &format!("Download dbdelve {}", release.version),
@@ -4778,6 +4903,7 @@ mod tests {
             endpoint: host.to_string(),
             logo: Engine::Postgres.logo(),
             color: None,
+            agent_visible: false,
             unavailable: None,
         }
     }
@@ -4834,6 +4960,42 @@ mod tests {
             .find(|item| matches!(item.command, Command::ToggleProject(0)))
             .unwrap();
         assert_eq!(billing.hint.as_ref(), "3 connections");
+    }
+
+    #[test]
+    fn a_visible_connection_row_carries_the_agent_marker() {
+        let (mut rows, projects) = with_unavailable();
+        rows[1] = Listed {
+            agent_visible: true,
+            ..listed("scratch", "Scratch", "localhost")
+        };
+        let items = listed_connections(&rows, &projects, 0);
+        let marked = |label: &str| {
+            items
+                .iter()
+                .find(|item| item.label == label)
+                .unwrap()
+                .agent_visible
+        };
+        assert!(marked("Scratch"));
+        assert!(!marked("Orders"));
+        assert!(!marked("Oracle"));
+    }
+
+    #[test]
+    fn a_visibility_command_is_never_remembered() {
+        for scope in [Scope::Commands, Scope::Connections] {
+            assert!(!remembered(scope, &Command::ShowToAgents(0)));
+            assert!(!remembered(scope, &Command::HideFromAgents(0)));
+        }
+    }
+
+    #[test]
+    fn agent_access_rows_are_never_remembered() {
+        for scope in [Scope::Commands, Scope::Connections] {
+            assert!(!remembered(scope, &Command::TurnOnAgentAccess));
+            assert!(!remembered(scope, &Command::DisconnectAgents));
+        }
     }
 
     #[test]

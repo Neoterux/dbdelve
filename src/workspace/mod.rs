@@ -4,6 +4,7 @@
 //! grouped by concern in the sibling modules, which are parts of this same
 //! inherent impl rather than types of their own.
 
+mod agent;
 mod commands;
 #[cfg(test)]
 mod e2e;
@@ -21,6 +22,7 @@ mod profiles;
 mod projects;
 mod queries;
 mod tabs;
+mod transactions;
 mod welcome;
 
 use std::collections::{HashMap, HashSet};
@@ -37,6 +39,7 @@ pub(crate) use profiles::unavailable_reason;
 pub(crate) use projects::project_name_refusal;
 pub(crate) use queries::error_in_buffer;
 
+use crate::actions::DisconnectAgents;
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
@@ -345,6 +348,12 @@ pub(crate) struct Workspace {
     /// The theme in force when the theme picker opened, while it is open. The
     /// installed one is only a preview until a row is confirmed.
     pub(crate) theme_before_preview: Option<Theme>,
+    /// The id of the profile whose agent-visibility dialog is open. Only that
+    /// dialog sets it, and `set_agent_visible` grants visibility only to the
+    /// profile it names.
+    pub(crate) agent_visibility_prompt: Option<String>,
+    /// The agent bridge: the socket, and the calls waiting on this window.
+    pub(crate) agent: agent::AgentState,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -508,6 +517,8 @@ impl Workspace {
             palette_recents: Vec::new(),
             collapsed_projects: HashSet::new(),
             theme_before_preview: None,
+            agent_visibility_prompt: None,
+            agent: agent::AgentState::default(),
             opacity_input,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
@@ -520,6 +531,10 @@ impl Workspace {
         };
 
         let mut load_failure = None;
+        // Read once, here, to decide whether to listen. The window keeps no
+        // copy: a saved one is what would write `true` back over another
+        // window's kill switch (see `agent_access_to_save`).
+        let mut listen_at_launch = false;
         match store::load_profiles(&workspace.plugins) {
             Ok(store::ProfileList {
                 profiles,
@@ -532,6 +547,7 @@ impl Workspace {
                 // Before the first frame, so the window is drawn in the faces
                 // the user picked rather than repainted into them.
                 let stored_settings = stored_settings.unwrap_or_default();
+                listen_at_launch = stored_settings.agent_access.unwrap_or(false);
                 // Ahead of the fonts and the theme, which size gpui-component's
                 // widgets off the chrome size as they install.
                 let chrome_font_size =
@@ -673,6 +689,12 @@ impl Workspace {
         if let Some(message) = load_failure {
             workspace.note(message, cx);
         }
+        // A refusal is shown and nothing saved changes: the choice is the
+        // user's, and a window that found another one serving can be asked
+        // again from the palette.
+        if listen_at_launch && let Err(text) = workspace.listen_for_agents(cx) {
+            workspace.note(text, cx);
+        }
 
         if workspace.settings.check_for_updates {
             let check = spawn_blocking(cx.background_executor(), update::newer_release);
@@ -754,14 +776,21 @@ impl Workspace {
 
         // Finish writes synchronously: the process is going, and nothing
         // would wait for background work to finish.
+        //
+        // The agent socket file goes with the window; the user's choice stays
+        // saved, so the next launch listens again only if access was on.
         cx.on_app_quit(|workspace: &mut Self, cx: &mut Context<Self>| {
             workspace.persist_buffers(cx);
+            workspace.drop_bridge();
             async {}
         })
         .detach();
         // Window release also persists when the window closes without Quit.
-        cx.on_release(|workspace, cx| workspace.persist_buffers(cx))
-            .detach();
+        cx.on_release(|workspace, cx| {
+            workspace.persist_buffers(cx);
+            workspace.drop_bridge();
+        })
+        .detach();
 
         workspace.connect_active(cx);
         workspace
@@ -832,6 +861,15 @@ impl Workspace {
             Some(profile) => profile.session.editor_needs_focus = true,
             None => self.welcome_needs_focus = true,
         }
+    }
+
+    fn disconnect_agents_action(
+        &mut self,
+        _: &DisconnectAgents,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.disconnect_agents(cx);
     }
 
     pub(crate) fn note(&mut self, message: String, cx: &mut Context<Self>) {
@@ -1162,6 +1200,72 @@ impl Workspace {
             .children(self.settings_open.then(|| render_settings_panel(self, cx)))
             .into_any_element()
     }
+
+    /// The agent mark for a titlebar, or nothing while no bridge runs, so a
+    /// window with agent access off draws exactly what it always did. Every
+    /// titlebar asks for it, so no surface hides an agent that is attached.
+    fn render_agent_mark(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let mark = self.agent_mark_state()?;
+        // Snapshotted before the closure, as the mode pill's `silenced` is:
+        // the menu is built when it opens, from what was drawn.
+        let waiting = self.agent.calls.len();
+        let now = agent::unix_millis();
+        let log: Vec<String> = self
+            .agent
+            .log
+            .iter()
+            .map(|entry| agent_log_label(entry, now))
+            .collect();
+        // On a wrapper: `dropdown_menu` wraps the button, so a margin on the
+        // button never reaches the titlebar's row.
+        Some(
+            div()
+                .child(ui::agent_mark(t, mark).dropdown_menu(move |menu, _, _| {
+                    // The kill switch is the only item that can be selected, so
+                    // the keyboard reaches it with one step. The mark is drawn
+                    // only while access is on, so this is the one thing the
+                    // menu changes: turning access on is the palette's.
+                    let menu = menu
+                        .label(match waiting {
+                            0 => "No calls waiting".to_string(),
+                            1 => "1 call waiting for you".to_string(),
+                            n => format!("{n} calls waiting for you"),
+                        })
+                        .label("Agent access is on")
+                        .menu(
+                            "Disconnect agents and turn access off",
+                            Box::new(DisconnectAgents),
+                        );
+                    if log.is_empty() {
+                        menu
+                    } else {
+                        log.iter()
+                            .fold(menu.separator(), |menu, line| menu.label(line.clone()))
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
+/// One line of the agent call log, newest at the top of the menu: how long ago,
+/// the tool, the connection, and how the call ended. A name the agent gave that
+/// resolved nothing is quoted as asked for, so its words never read as a
+/// connection of DBDelve's.
+fn agent_log_label(entry: &agent::LogEntry, now: u64) -> String {
+    let age = ui::relative_age(now.saturating_sub(entry.at) / 1000);
+    let mut line = format!("{age} ago \u{b7} {}", entry.tool.name());
+    match (&entry.resolved, &entry.asked) {
+        (Some(name), _) => line.push_str(&format!(" \u{b7} {name}")),
+        (None, Some(asked)) => line.push_str(&format!(" \u{b7} asked for \"{asked}\"")),
+        (None, None) => {}
+    }
+    line.push_str(&format!(" \u{b7} {}", entry.status.as_str()));
+    if entry.requester_gone {
+        line.push_str(" \u{b7} no requester");
+    }
+    line
 }
 
 impl Render for Workspace {
@@ -1378,6 +1482,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::submit_connection))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::next_profile))
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
@@ -1385,7 +1490,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -1393,7 +1504,13 @@ impl Render for Workspace {
                         .child(self.render_connection_form(window, cx)),
                 )
                 .children(self.dialog_layer(
-                    [("import-choice", self.render_import_choice(cx))],
+                    [
+                        // First, so it is drawn behind every other dialog: an
+                        // agent's unsolicited ping never covers one the user
+                        // is already answering.
+                        ("agent-ping", self.render_agent_ping(cx)),
+                        ("import-choice", self.render_import_choice(cx)),
+                    ],
                     window,
                     cx,
                 ))
@@ -1413,6 +1530,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::open_connection_form))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
@@ -1424,7 +1542,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
                 .on_action(cx.listener(Self::reset_editor_zoom))
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.dialog_layer(
                     [("import-choice", self.render_import_choice(cx))],
@@ -1500,6 +1624,7 @@ impl Render for Workspace {
         let paging =
             running.or_else(|| views::render_paging(profile, self.custom_limit.as_ref(), cx));
         let view_sorting = views::render_view_sorting(profile, cx);
+        let transaction = views::render_transaction(profile, cx);
         let hidden_columns = views::render_hidden_columns(profile, cx);
         let relation = profile
             .session
@@ -1764,6 +1889,7 @@ impl Render for Workspace {
             || notice.is_some()
             || paging.is_some()
             || view_sorting.is_some()
+            || transaction.is_some()
             || hidden_columns.is_some()
             || query_status.is_some()
             || refreshable_snapshot
@@ -1792,6 +1918,7 @@ impl Render for Workspace {
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
+                        .children(transaction)
                         .children(view_sorting)
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
@@ -2198,8 +2325,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::search_everything))
             .on_action(cx.listener(Self::cycle_mode))
+            .on_action(cx.listener(Self::toggle_auto_commit))
+            .on_action(cx.listener(Self::commit_transaction))
+            .on_action(cx.listener(Self::rollback_transaction))
             .on_action(cx.listener(Self::switch_connection))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::disconnect_agents_action))
             .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
             // Unregistered under the import dialog, which stops only the
@@ -2292,6 +2423,7 @@ impl Render for Workspace {
                         })
                         .into_any_element()
                 })
+                .chain(self.render_agent_mark(cx))
                 .chain(newer_release.map(|release| {
                     // On a wrapper: `dropdown_menu` wraps the button, so a
                     // margin on the button never reaches the titlebar's row.
@@ -2346,10 +2478,15 @@ impl Render for Workspace {
             .child(self.beside_settings(main_pane, cx))
             .children(self.dialog_layer(
                 [
+                    // First, so it is drawn behind every other dialog: an
+                    // agent's unsolicited ping never covers one the user is
+                    // already answering, and `escape` reaches it last.
+                    ("agent-ping", self.render_agent_ping(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),
                     ("discard", self.render_discard_confirmation(cx)),
+                    ("agent-visibility", self.render_agent_visibility(cx)),
                     ("pending-export", self.render_pending_export(cx)),
                     ("pending-run", self.render_pending_run(cx)),
                     ("queue-failure", self.render_queue_failure(cx)),

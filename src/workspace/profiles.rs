@@ -34,12 +34,15 @@ impl Workspace {
         if self.store_unreadable {
             return;
         }
+        self.adopt_saved_visibility(cx);
+        self.agent.visibility_choices.clear();
         let profiles = self
             .profiles
             .iter()
             .map(|profile| profile.stored())
             .collect::<Vec<_>>();
         let active = self.profile().map(|profile| profile.id.clone());
+        let agent_access = self.agent_access_to_save();
         let picked = fonts(cx);
         let fonts = store::StoredFonts {
             chrome: Some(picked.chrome.to_string()),
@@ -67,6 +70,7 @@ impl Workspace {
             client_sort: Some(self.settings.client_sort),
             qualify_completions: Some(self.settings.qualify_completions),
             welcomed: Some(self.settings.welcomed),
+            agent_access,
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };
@@ -189,6 +193,9 @@ impl Workspace {
             }),
             // A silenced kind this build cannot read is dropped, which only
             // means that kind still asks.
+            // Absent reads as hidden: the flag is a grant, and a file written
+            // before it existed granted nothing.
+            agent_visible: stored.agent_visible,
             confirmed: stored
                 .confirmed
                 .iter()
@@ -198,6 +205,7 @@ impl Workspace {
             generation: 0,
             state: ProfileState::Idle,
             in_transaction: false,
+            auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
@@ -250,11 +258,16 @@ impl Workspace {
             config,
             color,
             mode,
+            // Every way a profile is made -- the form, a duplicate, an import --
+            // starts hidden. Only the owner's confirmation in the visibility
+            // dialog grants it.
+            agent_visible: false,
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
             state: ProfileState::Idle,
             in_transaction: false,
+            auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
@@ -814,13 +827,24 @@ impl Workspace {
         let password = password_to_persist(&config, Origin::Form).map(str::to_string);
         let profile = &mut self.profiles[index];
         let reconnect = profile.config.needs_reconnect(&config);
+        // The dialog that granted visibility stated what the old engine holds
+        // server-side; a new engine makes those facts stale.
+        let engine_changed = profile.config.engine() != config.engine();
+        let hide = engine_changed && profile.agent_visible;
         let syntax = config.engine().syntax();
         if profile.config.engine().syntax() != syntax {
             profile.session.set_syntax(syntax, window, cx);
         }
-        profile.name = name;
+        profile.name = name.clone();
         profile.color = color;
         profile.config = config;
+        if hide {
+            self.set_agent_visible(id, false, cx);
+            self.note(
+                format!("{name} is hidden from agents because its engine changed."),
+                cx,
+            );
+        }
 
         // Only what was typed. A blank field is not an instruction to forget the
         // stored password.
@@ -1576,6 +1600,10 @@ impl Workspace {
         profile.generation = generation;
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
+        // The transaction it was holding died with the session, and silently
+        // opening another on a connection the user has just watched drop is
+        // the kind of surprise this feature exists to avoid.
+        profile.auto_commit = true;
         profile.session_changed = false;
         profile.catalog = CatalogState::Loading;
         // Every structure still out was asked on the old generation, and
@@ -2128,6 +2156,9 @@ impl Workspace {
         let stopped = self.abandon_import(&id, cx);
 
         let removed = self.profiles.remove(index);
+        // Removal does not pass through `set_agent_visible`, so it sweeps here
+        // too: a call waiting on this profile has nothing left to be about.
+        self.reject_calls_for(&removed.id, cx);
         if let Some(key) = identity_file(&removed.config)
             && let Ok(directory) = store::ssh_key_directory()
             && is_unshared_imported_key(

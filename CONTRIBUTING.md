@@ -256,6 +256,7 @@ chore(release): bump version to 0.3.8
 | `grid`        | Result grid, row panel, structure grid, filters, sorting                |
 | `editing`     | Row edits and the write gate                                            |
 | `explain`     | The plan pane                                                           |
+| `agent`       | The agent gate, the MCP shim and socket, agent visibility and approvals |
 | `tabs`        | Tabs, sessions, restore at startup                                      |
 | `palette`     | Command palette, actions, keybindings                                   |
 | `theme`       | Themes and theme import                                                 |

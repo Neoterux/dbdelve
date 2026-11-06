@@ -930,6 +930,12 @@ fn tokens(sql: &str) -> Vec<&str> {
             }
             tokens.push(&sql[start..index]);
         } else {
+            // The comma is the only punctuation that carries meaning here: it
+            // is what tells `FROM a, b` apart from `FROM a b`, and dropping it
+            // is why every source after the first went unbound.
+            if bytes[index] == b',' {
+                tokens.push(&sql[index..index + 1]);
+            }
             index += 1;
         }
     }
@@ -971,35 +977,47 @@ fn bindings(statement: &str) -> Vec<(String, String)> {
         let is_source = SOURCE_KEYWORDS
             .iter()
             .any(|keyword| tokens[index].eq_ignore_ascii_case(keyword));
-
-        let Some(name) = tokens.get(index + 1).filter(|_| is_source) else {
-            index += 1;
-            continue;
-        };
-        if is_keyword(name) {
+        if !is_source {
             index += 1;
             continue;
         }
+        index += 1;
 
-        // A schema-qualified name binds under its last segment: `FROM
-        // public.accounts` puts `accounts.` in reach, which is what anyone
-        // types next.
-        let relation = name.rsplit('.').next().unwrap_or(name).to_string();
-        bindings.push((relation.clone(), relation.clone()));
+        // The whole comma-separated list the keyword opens, not just its first
+        // source. Reading one source per keyword is what left `FROM accounts
+        // a, orders o` with nothing to offer after `o.`.
+        while let Some(name) = tokens.get(index).copied() {
+            if is_keyword(name) || name == "," {
+                break;
+            }
 
-        let alias = if tokens
-            .get(index + 2)
-            .is_some_and(|token| token.eq_ignore_ascii_case("as"))
-        {
-            tokens.get(index + 3)
-        } else {
-            tokens.get(index + 2)
-        };
-        if let Some(alias) = alias.filter(|alias| !is_keyword(alias)) {
-            bindings.push(((*alias).to_string(), relation));
+            // A schema-qualified name binds under its last segment: `FROM
+            // public.accounts` puts `accounts.` in reach, which is what anyone
+            // types next.
+            let relation = name.rsplit('.').next().unwrap_or(name).to_string();
+            bindings.push((relation.clone(), relation.clone()));
+            index += 1;
+
+            if tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("as"))
+            {
+                index += 1;
+            }
+            if let Some(alias) = tokens
+                .get(index)
+                .copied()
+                .filter(|alias| !is_keyword(alias) && *alias != ",")
+            {
+                bindings.push((alias.to_string(), relation));
+                index += 1;
+            }
+
+            if tokens.get(index).copied() != Some(",") {
+                break;
+            }
+            index += 1;
         }
-
-        index += 2;
     }
 
     bindings
@@ -1127,6 +1145,39 @@ mod tests {
                 "email".to_string(),
                 "created_at".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn every_source_in_a_comma_separated_list_binds_its_own_alias() {
+        let binding = |name: &str, relation: &str| (name.to_string(), relation.to_string());
+
+        assert_eq!(
+            bindings("SELECT * FROM accounts a, orders o"),
+            vec![
+                binding("accounts", "accounts"),
+                binding("a", "accounts"),
+                binding("orders", "orders"),
+                binding("o", "orders"),
+            ]
+        );
+
+        // Qualified, `AS`-aliased and unaliased sources all continue the list.
+        assert_eq!(
+            bindings("SELECT * FROM public.accounts AS a, orders, public.events e"),
+            vec![
+                binding("accounts", "accounts"),
+                binding("a", "accounts"),
+                binding("orders", "orders"),
+                binding("events", "events"),
+                binding("e", "events"),
+            ]
+        );
+
+        // A comma in the select list opens no source list of its own.
+        assert_eq!(
+            bindings("SELECT a, b FROM accounts"),
+            vec![binding("accounts", "accounts")]
         );
     }
 

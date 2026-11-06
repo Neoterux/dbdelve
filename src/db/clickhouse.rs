@@ -1656,6 +1656,77 @@ mod tests {
         connection.query(sql, &CancelToken::default(), Fetch::default())
     }
 
+    /// The table functions of the dev server that read nothing outside it:
+    /// generators, the server's own tables and the ones that read a source the
+    /// administrator configured, which a statement does not name. Every other
+    /// name in `system.table_functions` must be on `egress_functions`, so a
+    /// table function a later server adds fails the test by name.
+    const LOCAL: &[&str] = &[
+        "numbers",
+        "numbers_mt",
+        "zeros",
+        "zeros_mt",
+        "primes",
+        "null",
+        "values",
+        "sqlstandardvalues",
+        "view",
+        "viewexplain",
+        "viewifpermitted",
+        "merge",
+        "loop",
+        "cluster",
+        "clusterallreplicas",
+        "dictionary",
+        "format",
+        "input",
+        "generaterandom",
+        "generateseries",
+        "generate_series",
+        "fuzzjson",
+        "fuzzquery",
+        "mergetreeanalyzeindexes",
+        "mergetreeanalyzeindexesuuid",
+        "mergetreecodecblockcounts",
+        "mergetreeindex",
+        "mergetreeprojection",
+        "mergetreetextindex",
+        "prometheusquery",
+        "prometheusqueryrange",
+        "timeseriesdata",
+        "timeseriesmetrics",
+        "timeseriessamples",
+        "timeseriesselector",
+        "timeseriestags",
+    ];
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
+    fn live_every_table_function_is_egress_or_local() {
+        let connection =
+            Connection::open(&super::live::live_config()).expect("connection should open");
+        let result = run(&connection, "SELECT name FROM system.table_functions")
+            .expect("the catalog should answer");
+        let names: Vec<String> = result
+            .rows
+            .iter()
+            .filter_map(|row| row.get(0).map(str::to_lowercase))
+            .collect();
+        for expected in ["url", "numbers"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "the catalog answered {names:?}"
+            );
+        }
+        let egress = Engine::ClickHouse.spec().sql.egress_functions;
+        for name in &names {
+            assert!(
+                egress.contains(&name.as_str()) || LOCAL.contains(&name.as_str()),
+                "{name} is on the server and neither on egress_functions nor local"
+            );
+        }
+    }
+
     /// The requests that carried `statement`, in order.
     fn sent(mock: &Mock, statement: &str) -> Vec<Request> {
         mock.requests()
@@ -3696,7 +3767,7 @@ mod live {
     use crate::filter::{Operator, filter_predicate};
     use crate::sql::{Mode, Stop, classify, gate};
 
-    fn live_config() -> ServerConfig {
+    pub(super) fn live_config() -> ServerConfig {
         let url =
             std::env::var("dbdelve_CLICKHOUSE_URL").expect("dbdelve_CLICKHOUSE_URL is required");
         crate::db::server_from_url(&url, "ClickHouse").expect("dbdelve_CLICKHOUSE_URL should parse")
