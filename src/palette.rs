@@ -377,6 +377,9 @@ pub enum Command {
     /// The kill switch: answer every waiting call `rejected`, close every
     /// agent connection, and turn access off across launches.
     DisconnectAgents,
+    /// Copy the `claude mcp add` line that registers this DBDelve with Claude
+    /// Code. Runs nothing: the user pastes it.
+    CopyAgentRegistration,
     /// Put the palette back up over the projects this connection can join.
     ChooseProject(usize),
     /// `None` is No project.
@@ -3327,8 +3330,9 @@ fn welcome_items(workspace: &Workspace) -> Vec<Item> {
     items
 }
 
-/// The one row that governs agent access: turning it on while this window is
-/// not listening, the kill switch while it is. Nothing on an OS the socket
+/// The agent rows: the one that governs access, turning it on while this window
+/// is not listening and the kill switch while it is, and the one that copies the
+/// line registering DBDelve with Claude Code. Nothing on an OS the socket
 /// does not run on, where there is nothing to turn on. `cfg!`, not `#[cfg]`,
 /// so the row's code builds and is checked everywhere.
 pub(crate) fn agent_items(workspace: &Workspace) -> Vec<Item> {
@@ -3336,7 +3340,7 @@ pub(crate) fn agent_items(workspace: &Workspace) -> Vec<Item> {
         return Vec::new();
     }
     let overrides = &workspace.settings.custom_keybindings;
-    vec![if workspace.agent.bridge.is_none() {
+    let access = if workspace.agent.bridge.is_none() {
         command(
             "Turn agent access on",
             icon::AGENT_VISIBLE,
@@ -3354,7 +3358,16 @@ pub(crate) fn agent_items(workspace: &Workspace) -> Vec<Item> {
             "disconnect_agents",
             overrides,
         )
-    }]
+    };
+    vec![
+        access,
+        command(
+            "Copy Claude Code registration",
+            icon::COPY,
+            Command::CopyAgentRegistration,
+            AGENTS,
+        ),
+    ]
 }
 
 fn command(label: &str, icon: &'static str, command: Command, group: &'static str) -> Item {
