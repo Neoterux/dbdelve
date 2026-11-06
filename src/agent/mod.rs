@@ -18,6 +18,7 @@
     )
 )]
 
+pub(crate) mod shim;
 pub(crate) mod tools;
 
 #[cfg(unix)]
@@ -53,6 +54,21 @@ pub(crate) enum Status {
     Cancelled,
     Expired,
     AppNotRunning,
+}
+
+impl Status {
+    /// The code as the agent reads it, at the head of every answer: the same
+    /// string serde writes for it on the socket.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Status::Executed => "executed",
+            Status::Rejected => "rejected",
+            Status::RefusedByGate => "refused_by_gate",
+            Status::Cancelled => "cancelled",
+            Status::Expired => "expired",
+            Status::AppNotRunning => "app_not_running",
+        }
+    }
 }
 
 /// The one answer frame a call gets: a status and one sentence.
@@ -139,6 +155,25 @@ pub(crate) mod tests {
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    use super::Status;
+
+    #[test]
+    fn a_status_reads_as_the_string_serde_writes() {
+        for status in [
+            Status::Executed,
+            Status::Rejected,
+            Status::RefusedByGate,
+            Status::Cancelled,
+            Status::Expired,
+            Status::AppNotRunning,
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("a status serializes"),
+                status.as_str()
+            );
+        }
+    }
 
     /// A socket path short enough to bind on every platform. Not under
     /// `temp_dir()`: macOS's is already about 49 bytes, and `sun_path` holds

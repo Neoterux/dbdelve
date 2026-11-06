@@ -259,6 +259,11 @@ fn panic_log_directory() -> Option<PathBuf> {
 }
 
 fn main() {
+    // The agent shim speaks MCP on stdio and must never open a window or reach
+    // GPUI, on any OS, so it is decided before anything else starts.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
+        std::process::exit(agent::shim::run());
+    }
     install_panic_log();
     // Manifests only, ahead of the profiles that name them: no plugin process
     // starts until one of its connections opens.
