@@ -1,10 +1,10 @@
 //! The one place a profile's agent visibility changes.
 //!
-//! One door, because a sweep of the agent calls still pending against a
-//! profile (Phase 4) has to run exactly when the profile is hidden, and a
-//! second writer would be one more path to tell about it. Granting is the
-//! asymmetric half: it needs the owner's confirmation, so it is refused unless
-//! the visibility dialog is open for that very profile.
+//! One door, because the sweep of the agent calls still pending against a
+//! profile has to run exactly when the profile is hidden, and a second writer
+//! would be one more path to tell about it. Granting is the asymmetric half:
+//! it needs the owner's confirmation, so it is refused unless the visibility
+//! dialog is open for that very profile.
 //!
 //! The other half is the bridge: what an agent's call becomes once the socket
 //! thread has handed it over. Everything a call does happens here, on the
@@ -36,6 +36,10 @@ pub(crate) struct AgentState {
 /// replying closes the caller's connection with no answer.
 pub(crate) struct PendingCall {
     pub(crate) id: CallId,
+    /// The profile the call's connection name resolved to when it arrived. The
+    /// dialog and the sweeps read the profile by this id, so a rename or a
+    /// second profile of the same name cannot change which one a call is about.
+    pub(crate) profile_id: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
@@ -49,6 +53,10 @@ const TURNED_OFF: &str = "Agent access was turned off in DBDelve.";
 /// window of the variant is. Its sentence is what stays true: that window's
 /// agents are not disconnected.
 const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDelve window is still serving agents; they stay connected until that window closes or its own kill switch is used.";
+
+/// What every call waiting on a profile is told when it is hidden or removed.
+/// One sentence for both, so the agent cannot tell which happened.
+const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
@@ -92,6 +100,16 @@ impl std::fmt::Display for AgentLookup {
             Self::Ambiguous => "more than one agent-visible connection has that name",
         })
     }
+}
+
+/// What the ping dialog says: the connection by its own name, that this is a
+/// test, and that approving touches nothing. The name is the profile's, as its
+/// owner spelt it, never text the agent sent.
+pub(crate) fn ping_prompt(name: &str) -> String {
+    format!(
+        "An agent asks you to answer a test for {name}. Approving answers the agent; it runs \
+         nothing on the database."
+    )
 }
 
 /// What the visibility dialog tells the owner about this engine and mode, one
@@ -166,8 +184,68 @@ impl Workspace {
             self.agent_visibility_prompt = None;
         }
         profile.agent_visible = visible;
+        if !visible {
+            self.reject_calls_for(id, cx);
+        }
         self.remember_profiles(cx);
         cx.notify();
+    }
+
+    /// Answer every call waiting on this profile `rejected`, oldest first, each
+    /// once. Calls waiting on any other profile are left as they are.
+    pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let waiting: Vec<CallId> = self
+            .agent
+            .calls
+            .iter()
+            .filter(|call| call.profile_id == profile_id)
+            .map(|call| call.id)
+            .collect();
+        for id in waiting {
+            self.finish_call(id, Status::Rejected, NO_LONGER_AVAILABLE.to_string(), cx);
+        }
+    }
+
+    /// The call the ping dialog is about: the oldest one whose profile is still
+    /// in the list. A call whose profile has gone is swept with it, so the
+    /// filter only guards the moment between the two.
+    pub(crate) fn front_ping(&self) -> Option<&PendingCall> {
+        self.agent.calls.iter().find(|call| {
+            self.profiles
+                .iter()
+                .any(|profile| profile.id == call.profile_id)
+        })
+    }
+
+    /// The dialog's Approve. Answers the agent and nothing else: no connection
+    /// is opened and nothing runs.
+    pub(crate) fn approve_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
+        self.finish_call(
+            id,
+            Status::Executed,
+            "The ping was approved in DBDelve.".to_string(),
+            cx,
+        );
+    }
+
+    /// The dialog's Deny, for a call named by id.
+    pub(crate) fn deny_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
+        self.finish_call(
+            id,
+            Status::Rejected,
+            "The ping was denied in DBDelve.".to_string(),
+            cx,
+        );
+    }
+
+    /// Deny whichever ping the dialog in front is about. Answers whether there
+    /// was one, so `escape` is only spent on a dialog that was drawn.
+    pub(crate) fn deny_front_ping(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.front_ping().map(|call| call.id) else {
+            return false;
+        };
+        self.deny_ping(id, cx);
+        true
     }
 
     /// Start answering agents on the socket at `path`. Answers `Ok` when a
@@ -337,17 +415,20 @@ impl Workspace {
                 reply,
             } => {
                 let found = match connection.as_deref() {
-                    Some(name) => self.agent_profile(name).map(|_| ()),
+                    Some(name) => self.agent_profile(name).map(|profile| profile.id.clone()),
                     None => Err(AgentLookup::NotAvailable),
                 };
-                if let Err(lookup) = found {
-                    // The caller may have hung up, and then nobody reads this.
-                    let _ = reply.send(Reply {
-                        status: Status::RefusedByGate,
-                        text: lookup.to_string(),
-                    });
-                    return;
-                }
+                let profile_id = match found {
+                    Ok(profile_id) => profile_id,
+                    Err(lookup) => {
+                        // The caller may have hung up, and then nobody reads this.
+                        let _ = reply.send(Reply {
+                            status: Status::RefusedByGate,
+                            text: lookup.to_string(),
+                        });
+                        return;
+                    }
+                };
                 let expiry = cx.spawn(async move |workspace, cx| {
                     cx.background_executor().timer(EXPIRY).await;
                     _ = workspace.update(cx, |workspace, cx| {
@@ -356,6 +437,7 @@ impl Workspace {
                 });
                 self.agent.calls.push(PendingCall {
                     id,
+                    profile_id,
                     reply,
                     _expiry: expiry,
                 });
@@ -384,10 +466,16 @@ impl Workspace {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
             return false;
         };
+        let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
         if status != Status::Cancelled {
             // The caller may have hung up, and then nobody reads this.
             let _ = call.reply.send(Reply { status, text });
+        }
+        if was_in_front {
+            // The dialog took the keyboard when it went up and goes away with
+            // the call, by whichever route the call ended.
+            self.refocus_front();
         }
         cx.notify();
         true
@@ -436,6 +524,20 @@ mod tests {
                         assert!(!fact.contains(word), "{engine:?} {mode:?}: {fact}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ping_prompt_names_the_connection_and_runs_nothing() {
+        let prompt = ping_prompt("Reports");
+        assert!(prompt.contains("Reports"), "{prompt}");
+        assert!(prompt.contains("runs nothing"), "{prompt}");
+        for name in ["Orders", "a b", "x'y"] {
+            let prompt = ping_prompt(name);
+            assert!(prompt.contains(name), "{prompt}");
+            for word in ["SQL", "try", "should", "Phase", "MCP"] {
+                assert!(!prompt.contains(word), "{name}: {prompt}");
             }
         }
     }
