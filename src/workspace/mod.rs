@@ -1195,6 +1195,15 @@ impl Workspace {
             .children(self.settings_open.then(|| render_settings_panel(self, cx)))
             .into_any_element()
     }
+
+    /// The agent mark for a titlebar, or nothing while no bridge runs, so a
+    /// window with agent access off draws exactly what it always did. Every
+    /// titlebar asks for it, so no surface hides an agent that is attached.
+    fn render_agent_mark(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let mark = self.agent_mark_state()?;
+        Some(ui::agent_mark(t, mark).into_any_element())
+    }
 }
 
 impl Render for Workspace {
@@ -1419,7 +1428,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -1465,7 +1480,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
                 .on_action(cx.listener(Self::reset_editor_zoom))
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.dialog_layer(
                     [("import-choice", self.render_import_choice(cx))],
@@ -2310,6 +2331,7 @@ impl Render for Workspace {
                         })
                         .into_any_element()
                 })
+                .chain(self.render_agent_mark(cx))
                 .chain(newer_release.map(|release| {
                     // On a wrapper: `dropdown_menu` wraps the button, so a
                     // margin on the button never reaches the titlebar's row.

@@ -374,6 +374,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// What the titlebar's agent mark shows: nothing while no bridge runs, the
+    /// dim mark while one listens alone, and the lit mark, with the count of
+    /// calls waiting, while an agent is attached or a call waits.
+    pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
+        self.agent.bridge.as_ref()?;
+        let attached = !self.agent.presence.is_empty() || !self.agent.calls.is_empty();
+        Some(if attached {
+            ui::AgentMark::Connected {
+                waiting: self.agent.calls.len(),
+            }
+        } else {
+            ui::AgentMark::Listening
+        })
+    }
+
     /// What an agent asked for. Opens no connection and starts no database
     /// work: the answer is read from the profile list as it stands.
     pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
