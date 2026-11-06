@@ -83,12 +83,20 @@ source: src/sql_snapshots.rs
 [redis] monitor then a read: MONITOR\u{a}GET a => |ro=refuse(MoreThanOne) rw=refuse(MoreThanOne) full=refuse(MoreThanOne)|
 [redis] set: SET k v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] hash set: HSET h f v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
-[redis] expire: EXPIRE k 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] expire: EXPIRE k 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
 [redis] persist: PERSIST k => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
-[redis] expire at a past time: EXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
-[redis] expire at in milliseconds: PEXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] expire at a past time: EXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] expire at in milliseconds: PEXPIREAT k 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
 [redis] stream add: XADD s * f v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
-[redis] set with a timeout: SET k v EX 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] set with a timeout: SET k v EX 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] set with a timeout the server rejects: SET k v EX 0 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
+[redis] get and expire: GETEX k EX 10 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] hash field expire: HEXPIRE h 10 FIELDS 1 f => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
+[redis] hash field expire at a fixed time in milliseconds: HPEXPIREAT h 1 FIELDS 1 f => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
+[redis] hash set with a timeout: HSETEX h EX 10 FIELDS 1 f v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
+[redis] hash get and expire: HGETEX h EX 10 FIELDS 1 f => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
+[redis] set with an expiry in seconds: SETEX k 10 v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] set with an expiry in milliseconds: PSETEX k 10 v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
 [redis] rename: RENAME a b => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] store an intersection: SINTERSTORE d a b => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
 [redis] copy over: COPY a b REPLACE => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite) full=approve(ReadWrite)|
@@ -122,11 +130,11 @@ source: src/sql_snapshots.rs
 [redis] expire with a leading zero: EXPIRE k 010 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] expire in milliseconds at zero: PEXPIRE k 0 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] hash field expire at zero: HEXPIRE k 0 FIELDS 1 f => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
-[redis] set at a fixed time: SET k v EXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
-[redis] set at a fixed time in milliseconds: SET k v PXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
-[redis] get and expire at a fixed time: GETEX k EXAT 1 => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
-[redis] hash set at a fixed time: HSETEX h EXAT 1 FIELDS 1 f v => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
-[redis] hash get and expire at a fixed time: HGETEX h PXAT 1 FIELDS 1 f => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
+[redis] set at a fixed time: SET k v EXAT 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] set at a fixed time in milliseconds: SET k v PXAT 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] get and expire at a fixed time: GETEX k EXAT 1 => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Key) full=approve(ReadWrite, Key)|
+[redis] hash set at a fixed time: HSETEX h EXAT 1 FIELDS 1 f v => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
+[redis] hash get and expire at a fixed time: HGETEX h PXAT 1 FIELDS 1 f => |ro=refuse(NeedsMode { needed: ReadWrite, held: ReadOnly }) rw=approve(ReadWrite, Field) full=approve(ReadWrite, Field)|
 [redis] hash set expiring at zero: HSETEX h EX 0 FIELDS 1 f v => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] hash get expiring at zero: HGETEX h PX 0 FIELDS 1 f => |ro=refuse(Delete) rw=refuse(Delete) full=refuse(Delete)|
 [redis] eval: EVAL "return 1" 0 => |ro=refuse(Script) rw=refuse(Script) full=refuse(Script)|

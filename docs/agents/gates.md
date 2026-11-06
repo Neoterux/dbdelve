@@ -203,7 +203,7 @@ why.
 
 **`sql::agent_gate(engine, sql, mode)` is the one answer for a statement an
 agent originates, and nothing else answers for one.** It returns `Run`,
-`Approve(verdict)` or `Refuse(reason)`, reads no profile, no silenced
+`Approve(verdict, expiry)` or `Refuse(reason)`, reads no profile, no silenced
 confirmation and no earlier approval, and decides about the text as written. The
 `mode` is the profile's, and it is the ceiling: a `Run` or an `Approve` always
 passes `gate` with that mode and nothing silenced. The ladder, in the order it
@@ -215,7 +215,9 @@ is asked (the header of `src/sql/agent.rs` is its source):
 2. No statement is `Refuse(NoStatement)`, two or more `Refuse(MoreThanOne)`.
 3. A Redis command the editor never sends is `Refuse(NotSent)`.
 4. `DROP`, `TRUNCATE`, any `DELETE` and an `ALTER TABLE` that is not `ADD
-   COLUMN` are refused by name.
+   COLUMN` are refused by name. On MongoDB and Redis a command seen to remove
+   data is `Refuse(Delete)`, a Redis expiry whose timeout is not a plain
+   positive number among them.
 5. A server-side script is `Refuse(Script)`, a Redis or MongoDB command
    returning credentials, password hashes, privileges or other clients' details
    `Refuse(Disclosure)`.
@@ -223,7 +225,12 @@ is asked (the header of `src/sql/agent.rs` is its source):
 7. A verdict needing Full is `Refuse(NeedsFull)`: a Full profile grants an agent
    nothing a Read-write one does not.
 8. A statement the mode stops is `Refuse(NeedsMode)`.
-9. A write the mode allows is `Approve`.
+9. A write the mode allows is `Approve`. A Redis command that schedules a
+   removal is approved as an expiry: the `Approve` carries an `Expiry` whose
+   text is what the approval surface states beside the statement. It says the
+   key, or for the hash commands the named fields, is removed when the time
+   passes, and at once for a time already past. A write that schedules nothing
+   carries none.
 10. A read that calls an egress function, or on DuckDB holds a path, is
     `Approve` with a Read-only verdict, in every mode.
 11. A read that calls a function its engine's built-in list does not name is
@@ -250,6 +257,22 @@ The human path keeps its verdicts: `CONFIG GET` and `CLIENT LIST` are writes,
 and the rest are reads. Redis `ACL LOG` and `SLOWLOG GET` (the client fields of
 logged entries), MongoDB `getParameter` and the `$listSessions` and
 `$listLocalSessions` stages stay reads on both paths on purpose.
+
+**On Redis a removal and an expiry are told apart by the statement alone.**
+`Refuse(Delete)` is a command that removes now: a name in `REMOVES`, `MIGRATE`,
+`XGROUP DESTROY`, an `XADD` that trims, `EXPIRE` or `HEXPIRE` with a timeout
+that is not a plain positive number, and `HSETEX` or `HGETEX` with such an `EX`
+or `PX`. An expiry (`redis_cmd::expiry`) is a command that schedules a removal:
+`EXPIRE`, `PEXPIRE`, `SETEX` and `PSETEX` with a positive timeout, `EXPIREAT`
+and `PEXPIREAT` at any time, `SET` and `GETEX` with a positive `EX` or `PX` or
+any `EXAT` or `PXAT`, and the `H` forms of the same for the fields of a hash.
+The gate has no clock, so a time already past, which removes at once, is
+approved with the same text as a time to come. An expiry is refused at Read-only
+like any write. `RESTORE` with a `ttl` also schedules a removal; it is approved
+as a plain write that names none, and that stays a residual. The option words
+are matched anywhere after the name, so a key or value spelled like one is named
+an expiry too, which is the safe direction. Only the agent path reads either:
+the human path rates all of these as writes.
 
 **Egress is its own list.** `SqlSpec::egress_functions` names the functions that
 read a file, a URL, a program or another server, or run text that may

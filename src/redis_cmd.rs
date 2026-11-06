@@ -15,7 +15,7 @@
 
 use std::ops::Range;
 
-use crate::sql::{Destructive, Leaves, Mode, Verdict};
+use crate::sql::{Destructive, Expiry, Leaves, Mode, Verdict};
 
 pub(crate) mod browse;
 pub(crate) mod edit;
@@ -366,13 +366,50 @@ fn commands(text: &str) -> impl Iterator<Item = Command> + '_ {
 /// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, an `XADD` that
 /// trims (`MAXLEN` or `MINID`), an expiry whose timeout is not a positive
 /// integer written plainly (`EXPIRE k 0` deletes the key at once, as does
-/// `EX 0` on `HSETEX` or `HGETEX`), or a
-/// `SET`, `GETEX`, `HSETEX` or `HGETEX` with an absolute expiry (`EXAT` or
-/// `PXAT`), which deletes the key or field at once when the time has passed.
-/// The agent path refuses all of them, whatever the mode (GATE-07); the human
-/// path never asks.
+/// `EX 0` on `HSETEX` or `HGETEX`). The agent path refuses all of them,
+/// whatever the mode (GATE-07); the human path never asks. A command that
+/// schedules a removal (a positive timeout, an absolute time) is not one: it
+/// is an expiry, which [`expiry`] names and the agent path approves.
 pub(crate) fn removes(text: &str) -> bool {
     commands(text).any(|command| removes_data(&command))
+}
+
+/// What the first command of `text` that schedules a removal schedules it
+/// for: the key (`EXPIRE`, `SETEX` or `SET` with a positive timeout, an
+/// `*EXPIREAT` or an `EXAT` or `PXAT` at any time), or the named fields of a
+/// hash (the `H` forms of the same). The agent path approves such a command and
+/// names the effect; the human path never asks. A timeout that is not a
+/// positive integer written plainly schedules nothing here: the server rejects
+/// it on `SET`, `GETEX` and `SETEX`, and `EXPIRE` and the hash commands remove
+/// on it, which [`removes`] answers.
+///
+/// ponytail: the option words are matched anywhere after the name, so a key,
+/// field or value spelled like one is named an expiry too. That is the safe
+/// direction: the human sees one sentence too many, never one too few. The
+/// ceiling is that this reads words and not each command's option grammar; the
+/// upgrade path is reading the grammar.
+pub(crate) fn expiry(text: &str) -> Option<Expiry> {
+    commands(text).find_map(|command| match command.name().as_str() {
+        "EXPIRE" | "PEXPIRE" | "SETEX" | "PSETEX" => {
+            keeps_the_key(&word(&command.words, 2)).then_some(Expiry::Key)
+        }
+        "EXPIREAT" | "PEXPIREAT" => Some(Expiry::Key),
+        "HEXPIRE" | "HPEXPIRE" => keeps_the_key(&word(&command.words, 2)).then_some(Expiry::Field),
+        "HEXPIREAT" | "HPEXPIREAT" => Some(Expiry::Field),
+        "SET" | "GETEX" => times_out(&command).then_some(Expiry::Key),
+        "HSETEX" | "HGETEX" => times_out(&command).then_some(Expiry::Field),
+        _ => None,
+    })
+}
+
+/// Whether `command` carries an absolute time, or a relative one the server
+/// takes as positive.
+fn times_out(command: &Command) -> bool {
+    has_option(command, &["EXAT", "PXAT"])
+        || command.words.iter().enumerate().skip(1).any(|(at, word)| {
+            (word.eq_ignore_ascii_case(b"EX") || word.eq_ignore_ascii_case(b"PX"))
+                && keeps_the_key(&self::word(&command.words, at + 1))
+        })
 }
 
 fn removes_data(command: &Command) -> bool {
@@ -384,20 +421,12 @@ fn removes_data(command: &Command) -> bool {
         // An `XADD` that trims is an `XTRIM`, and `LIMIT` only ever follows
         // `MAXLEN` or `MINID`.
         "XADD" => has_option(command, &["MAXLEN", "MINID"]),
-        // ponytail: the words are matched anywhere after the name, so a key,
-        // field or value spelled like an option word is refused as well. The
-        // ceiling is that this reads words and not each command's option
-        // grammar; the upgrade path is reading the grammar.
-        "SET" | "GETEX" => has_option(command, &["EXAT", "PXAT"]),
         // Unlike `SET`, these take a zero `EX` or `PX` and delete the field
         // at once (checked on Redis 8.10.3).
-        "HSETEX" | "HGETEX" => {
-            has_option(command, &["EXAT", "PXAT"])
-                || command.words.iter().enumerate().skip(1).any(|(at, word)| {
-                    (word.eq_ignore_ascii_case(b"EX") || word.eq_ignore_ascii_case(b"PX"))
-                        && !keeps_the_key(&self::word(&command.words, at + 1))
-                })
-        }
+        "HSETEX" | "HGETEX" => command.words.iter().enumerate().skip(1).any(|(at, word)| {
+            (word.eq_ignore_ascii_case(b"EX") || word.eq_ignore_ascii_case(b"PX"))
+                && !keeps_the_key(&self::word(&command.words, at + 1))
+        }),
         name => REMOVES.contains(&name),
     }
 }
@@ -950,27 +979,20 @@ const WRITES: &[&str] = &[
 /// path's GATE-07 refuses on Redis whatever the mode. The human path never
 /// reads this list. Names that decide by an argument or a subcommand
 /// (`MIGRATE`, `XGROUP DESTROY`, an `XADD` that trims, the `EXPIRE` family,
-/// `EXAT` and `PXAT` on `SET`, `GETEX`, `HSETEX` and `HGETEX`, and a
-/// non-positive `EX` or `PX` on the last two) are in
+/// and a non-positive `EX` or `PX` on `HSETEX` and `HGETEX`) are in
 /// [`removes`].
 ///
 /// ponytail: these overwrite or move data without a removal flag and stay
-/// approvable (D-23): `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` and `HPEXPIREAT`
-/// with a time in the past delete the key, `RENAME`, `COPY ... REPLACE`,
-/// `RESTORE ... REPLACE` and every `*STORE` command overwrite their
-/// destination, and `LMOVE`, `BLMOVE`, `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and
-/// `MOVE` hand what leaves one key to another. The ceiling is that a pure
-/// function has no clock and does not know whether a destination exists, so
-/// the human reads the exact command before approving it. The no-clock
-/// ceiling is answered two ways. The `EXAT` and `PXAT` options of `SET`,
-/// `GETEX`, `HSETEX` and `HGETEX` are refused whatever the time, in
-/// [`removes`]: `SET` and `GETEX` reject a non-positive `EX` or `PX`, so an
-/// absolute time is the only expiry of theirs that can delete. `HSETEX` and
-/// `HGETEX` take a zero `EX` or `PX` and delete the field (Redis 8.10.3), so
-/// their relative timeout is read the way `HEXPIRE`'s is. The `*EXPIREAT`
-/// commands keep their time approvable, and a past one still deletes. The
-/// upgrade path is a removal flag on those words, once the approval surface
-/// can show the destination's state.
+/// approvable (D-23): `RENAME`, `COPY ... REPLACE`, `RESTORE ... REPLACE` and
+/// every `*STORE` command overwrite their destination, and `LMOVE`, `BLMOVE`,
+/// `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and `MOVE` hand what leaves one key to
+/// another. The ceiling is that a pure function has no clock and does not know
+/// whether a destination exists, so the human reads the exact command before
+/// approving it. An expiry is told from a removal by the statement alone: a
+/// pure function has no clock, so an absolute time already past, which removes
+/// at once, is approved as an expiry, and the approval's text tells the human
+/// so ([`expiry`]). The upgrade path is a removal flag on those words, once the
+/// approval surface can show the destination's state.
 const REMOVES: &[&str] = &[
     "DEL",
     "UNLINK",
@@ -1347,10 +1369,9 @@ mod tests {
         ] {
             assert!(removes(text), "{text}");
         }
-        // The `*EXPIREAT` commands do not tell a time in the past from one in
-        // the future: a pure function has no clock, and the human reads the
-        // number. The option forms are refused whatever the time, in
-        // `an_absolute_expiry_option_removes_whatever_its_time`.
+        // The `*EXPIREAT` commands cannot be told a time in the past from one
+        // in the future without a clock, so they are expiries the approval
+        // names, not removals.
         assert!(!removes("EXPIREAT k 1"));
         assert!(!removes("PEXPIREAT k 1"));
     }
@@ -1377,34 +1398,91 @@ mod tests {
     }
 
     #[test]
-    fn an_absolute_expiry_option_removes_whatever_its_time() {
-        for text in [
-            "SET k v",
-            "SET k v EX 10",
-            "SET k v PX 10",
-            "SET k v KEEPTTL",
-            "GETEX k EX 10",
-            "GETEX k PERSIST",
-            "HSETEX h EX 10 FIELDS 1 f v",
-            "HGETEX h PERSIST FIELDS 1 f",
-        ] {
-            assert!(!removes(text), "{text}");
-        }
+    fn a_set_or_getex_with_a_timeout_or_a_fixed_time_is_an_expiry_of_the_key() {
         for text in [
             "SET k v EXAT 1",
-            "SET k v NX PXAT 1 GET",
+            "SET k v PXAT 1",
             "set k v exat 4102444800",
+            "SET k v NX PXAT 1 GET",
+            "SET k v EX 10",
+            "SET k v PX 10",
+            "GETEX k EX 10",
             "GETEX k EXAT 1",
             "GETEX k PXAT 1",
-            "HSETEX h FXX EXAT 1 FIELDS 1 f v",
-            "HSETEX h PXAT 1 FIELDS 1 f v",
-            "HGETEX h EXAT 1 FIELDS 1 f",
-            "hgetex h pxat 1 fields 1 f",
             // A value spelled like the option is read as the option, which
             // fails safe.
             "SET k EXAT",
         ] {
-            assert!(removes(text), "{text}");
+            assert_eq!(expiry(text), Some(Expiry::Key), "{text}");
+            assert!(!removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_command_that_schedules_no_removal_is_no_expiry() {
+        for text in [
+            "SET k v",
+            "SET k v KEEPTTL",
+            "GETEX k PERSIST",
+            "SET k v EX 0",
+            "GETEX k PX 0",
+            "SET k v EX abc",
+            "GET k",
+            "PERSIST k",
+            "EXPIRE k 0",
+            "EXPIRE k -1",
+            "HEXPIRE k 0 FIELDS 1 f",
+            "HSETEX h EX 0 FIELDS 1 f v",
+            "HGETEX h PERSIST FIELDS 1 f",
+            "HSET h f v",
+            "HGETEX h FIELDS 1 f",
+            // The server rejects these, so they schedule nothing and remove
+            // nothing.
+            "SETEX k 0 v",
+            "PSETEX k -1 v",
+            "SETEX k 010 v",
+        ] {
+            assert_eq!(expiry(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_hash_command_with_a_timeout_or_a_fixed_time_is_an_expiry_of_its_fields() {
+        for text in [
+            "HEXPIRE h 10 FIELDS 1 f",
+            "HPEXPIRE h 10 FIELDS 1 f",
+            "hexpire h 10 fields 1 f",
+            "HEXPIREAT h 1 FIELDS 1 f",
+            "HPEXPIREAT h 1 FIELDS 1 f",
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HSETEX h FXX EXAT 1 FIELDS 1 f v",
+            "HSETEX h PXAT 1 FIELDS 1 f v",
+            "HGETEX h PX 1 FIELDS 1 f",
+            "HGETEX h EXAT 1 FIELDS 1 f",
+            "hgetex h pxat 1 fields 1 f",
+        ] {
+            assert_eq!(expiry(text), Some(Expiry::Field), "{text}");
+            assert!(!removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_expire_or_setex_with_a_positive_timeout_or_any_fixed_time_is_an_expiry_of_the_key() {
+        for text in [
+            "EXPIRE k 10",
+            "PEXPIRE k 10",
+            "EXPIRE k 10 NX",
+            "EXPIREAT k 1",
+            "PEXPIREAT k 1",
+            "expireat k 4102444800",
+            // No time at all is over-named, which fails safe.
+            "EXPIREAT k",
+            "SETEX k 10 v",
+            "PSETEX k 10 v",
+            "setex k 10 v",
+        ] {
+            assert_eq!(expiry(text), Some(Expiry::Key), "{text}");
+            assert!(!removes(text), "{text}");
         }
     }
 
@@ -1425,7 +1503,9 @@ mod tests {
         }
         for text in [
             "HSETEX h EX 10 FIELDS 1 f v",
+            "HSETEX h PXAT 1 FIELDS 1 f v",
             "HGETEX h PX 1 FIELDS 1 f",
+            "HGETEX h EXAT 1 FIELDS 1 f",
             "HGETEX h PERSIST FIELDS 1 f",
             "SET k v EX 0",
             "GETEX k PX 0",
