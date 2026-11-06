@@ -623,6 +623,16 @@ mod tests {
             "HEXPIRE k 0 FIELDS 1 f",
             "HPEXPIRE k 0 FIELDS 1 f",
             "del k",
+            "XADD s MAXLEN 0 * f v",
+            "XADD s MINID 9999999999999-0 * f v",
+            "xadd s maxlen ~ 0 limit 10 * f v",
+            "SET k v EXAT 1",
+            "SET k v PXAT 1",
+            "GETEX k EXAT 1",
+            "GETEX k PXAT 1",
+            "HSETEX h EXAT 1 FIELDS 1 f v",
+            "HGETEX h PXAT 1 FIELDS 1 f",
+            "set k v exat 1",
         ] {
             redis_always(text, refused(Refusal::Delete));
         }
@@ -673,6 +683,11 @@ mod tests {
             "COPY a b REPLACE",
             "LMOVE a b LEFT RIGHT",
             "SMOVE a b m",
+            "XADD s * f v",
+            "SET k v EX 10",
+            "GETEX k PERSIST",
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HGETEX h FIELDS 1 f",
         ] {
             assert_eq!(redis(text, Mode::ReadOnly), needs_read_write(), "{text}");
             for mode in [Mode::ReadWrite, Mode::Full] {
@@ -682,6 +697,24 @@ mod tests {
                     "{mode:?}: {text}"
                 );
             }
+        }
+    }
+
+    /// `removes` reaches only the agent's gate, so the human's verdict for
+    /// these is the table's write.
+    #[test]
+    fn the_human_path_reads_a_redis_trim_or_a_fixed_time_expiry_as_a_write() {
+        for text in [
+            "XADD s MAXLEN 0 * f v",
+            "SET k v EXAT 1",
+            "SET k v PXAT 1",
+            "GETEX k EXAT 1",
+            "GETEX k PXAT 1",
+            "HSETEX h EXAT 1 FIELDS 1 f v",
+            "HGETEX h PXAT 1 FIELDS 1 f",
+            "set k v exat 1",
+        ] {
+            assert_eq!(classify(Engine::Redis, text), Verdict::WRITE, "{text}");
         }
     }
 

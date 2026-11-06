@@ -456,6 +456,8 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
     (Engine::Redis, "persist", "PERSIST k"),
     (Engine::Redis, "expire at a past time", "EXPIREAT k 1"),
     (Engine::Redis, "expire at in milliseconds", "PEXPIREAT k 1"),
+    (Engine::Redis, "stream add", "XADD s * f v"),
+    (Engine::Redis, "set with a timeout", "SET k v EX 10"),
     (Engine::Redis, "rename", "RENAME a b"),
     (Engine::Redis, "store an intersection", "SINTERSTORE d a b"),
     (Engine::Redis, "copy over", "COPY a b REPLACE"),
@@ -481,6 +483,16 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
     ),
     (Engine::Redis, "stream delete", "XDEL s 1-1"),
     (Engine::Redis, "stream trim", "XTRIM s MAXLEN 0"),
+    (
+        Engine::Redis,
+        "stream add that trims",
+        "XADD s MAXLEN 0 * f v",
+    ),
+    (
+        Engine::Redis,
+        "stream add that trims by id",
+        "XADD s MINID 9999999999999-0 * f v",
+    ),
     (Engine::Redis, "json delete", "JSON.DEL d $"),
     (Engine::Redis, "time series delete", "TS.DEL t 0 1"),
     (
@@ -506,6 +518,27 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
         Engine::Redis,
         "hash field expire at zero",
         "HEXPIRE k 0 FIELDS 1 f",
+    ),
+    (Engine::Redis, "set at a fixed time", "SET k v EXAT 1"),
+    (
+        Engine::Redis,
+        "set at a fixed time in milliseconds",
+        "SET k v PXAT 1",
+    ),
+    (
+        Engine::Redis,
+        "get and expire at a fixed time",
+        "GETEX k EXAT 1",
+    ),
+    (
+        Engine::Redis,
+        "hash set at a fixed time",
+        "HSETEX h EXAT 1 FIELDS 1 f v",
+    ),
+    (
+        Engine::Redis,
+        "hash get and expire at a fixed time",
+        "HGETEX h PXAT 1 FIELDS 1 f",
     ),
     (Engine::Redis, "eval", "EVAL \"return 1\" 0"),
     (Engine::Redis, "eval sha", "EVALSHA abc 0"),

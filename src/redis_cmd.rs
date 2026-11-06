@@ -363,10 +363,13 @@ fn commands(text: &str) -> impl Iterator<Item = Command> + '_ {
 }
 
 /// Whether any command of `text` takes data out of the database: a name in
-/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, or an expiry
-/// whose timeout is not a positive integer written plainly (`EXPIRE k 0`
-/// deletes the key at once). The agent path refuses all of them, whatever the
-/// mode (GATE-07); the human path never asks.
+/// [`REMOVES`], `MIGRATE`, `XGROUP DESTROY` or `DELCONSUMER`, an `XADD` that
+/// trims (`MAXLEN` or `MINID`), an expiry whose timeout is not a positive
+/// integer written plainly (`EXPIRE k 0` deletes the key at once), or a
+/// `SET`, `GETEX`, `HSETEX` or `HGETEX` with an absolute expiry (`EXAT` or
+/// `PXAT`), which deletes the key or field at once when the time has passed.
+/// The agent path refuses all of them, whatever the mode (GATE-07); the human
+/// path never asks.
 pub(crate) fn removes(text: &str) -> bool {
     commands(text).any(|command| removes_data(&command))
 }
@@ -385,8 +388,26 @@ fn removes_data(command: &Command) -> bool {
                 || !timeout.bytes().all(|byte| byte.is_ascii_digit())
                 || timeout.starts_with('0')
         }
+        // An `XADD` that trims is an `XTRIM`, and `LIMIT` only ever follows
+        // `MAXLEN` or `MINID`.
+        "XADD" => has_option(command, &["MAXLEN", "MINID"]),
+        // ponytail: the words are matched anywhere after the name, so a key,
+        // field or value spelled like an option word is refused as well. The
+        // ceiling is that this reads words and not each command's option
+        // grammar; the upgrade path is reading the grammar.
+        "SET" | "GETEX" | "HSETEX" | "HGETEX" => has_option(command, &["EXAT", "PXAT"]),
         name => REMOVES.contains(&name),
     }
+}
+
+/// Whether any word after the command's name is one of `options`, compared
+/// without regard to case.
+fn has_option(command: &Command, options: &[&str]) -> bool {
+    command.words.iter().skip(1).any(|word| {
+        options
+            .iter()
+            .any(|option| word.eq_ignore_ascii_case(option.as_bytes()))
+    })
 }
 
 /// Whether any command of `text` runs a script the server holds, or loads one:
@@ -918,7 +939,9 @@ const WRITES: &[&str] = &[
 /// Commands that take data out of the database, one word each: what the agent
 /// path's GATE-07 refuses on Redis whatever the mode. The human path never
 /// reads this list. Names that decide by an argument or a subcommand
-/// (`MIGRATE`, `XGROUP DESTROY`, the `EXPIRE` family) are in [`removes`].
+/// (`MIGRATE`, `XGROUP DESTROY`, an `XADD` that trims, the `EXPIRE` family,
+/// `EXAT` and `PXAT` on `SET`, `GETEX`, `HSETEX` and `HGETEX`) are in
+/// [`removes`].
 ///
 /// ponytail: these overwrite or move data without a removal flag and stay
 /// approvable (D-23): `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` and `HPEXPIREAT`
@@ -927,9 +950,16 @@ const WRITES: &[&str] = &[
 /// destination, and `LMOVE`, `BLMOVE`, `RPOPLPUSH`, `BRPOPLPUSH`, `SMOVE` and
 /// `MOVE` hand what leaves one key to another. The ceiling is that a pure
 /// function has no clock and does not know whether a destination exists, so
-/// the human reads the exact command before approving it. The upgrade path
-/// is a removal flag on those words, once the approval surface can show the
-/// destination's state.
+/// the human reads the exact command before approving it. The no-clock
+/// ceiling is answered two ways. The `EXAT` and `PXAT` options of `SET`,
+/// `GETEX`, `HSETEX` and `HGETEX` are refused whatever the time, in
+/// [`removes`]: an absolute time is the only expiry those four commands take
+/// that can delete, since `SET` and `GETEX` reject a non-positive `EX` or
+/// `PX`. The `*EXPIREAT` commands keep their time approvable, and a past one
+/// still deletes. `EX 0` and `PX 0` on `HSETEX` and `HGETEX` were not checked
+/// against the server and stay approvable. The upgrade path is a removal flag
+/// on those words, once the approval surface can show the destination's
+/// state.
 const REMOVES: &[&str] = &[
     "DEL",
     "UNLINK",
@@ -1302,10 +1332,65 @@ mod tests {
         ] {
             assert!(removes(text), "{text}");
         }
-        // A time in the past is not told apart from one in the future: a pure
-        // function has no clock, and the human reads the number.
+        // The `*EXPIREAT` commands do not tell a time in the past from one in
+        // the future: a pure function has no clock, and the human reads the
+        // number. The option forms are refused whatever the time, in
+        // `an_absolute_expiry_option_removes_whatever_its_time`.
         assert!(!removes("EXPIREAT k 1"));
         assert!(!removes("PEXPIREAT k 1"));
+    }
+
+    #[test]
+    fn a_stream_add_removes_only_when_it_trims() {
+        for text in [
+            "XADD s * f v",
+            "XADD s NOMKSTREAM * f v",
+            // The grid's guard read: `MAXLEN` decides only on `XADD`.
+            "LPOS l v COUNT 0 MAXLEN 1",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+        for text in [
+            "XADD s MAXLEN 0 * f v",
+            "XADD s MAXLEN ~ 1000 * f v",
+            "XADD s MINID = 9999999999999-0 * f v",
+            "xadd s minid 1 * f v",
+            "XADD s NOMKSTREAM MAXLEN ~ 10 LIMIT 5 * f v",
+        ] {
+            assert!(removes(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_expiry_option_removes_whatever_its_time() {
+        for text in [
+            "SET k v",
+            "SET k v EX 10",
+            "SET k v PX 10",
+            "SET k v KEEPTTL",
+            "GETEX k EX 10",
+            "GETEX k PERSIST",
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HGETEX h PERSIST FIELDS 1 f",
+        ] {
+            assert!(!removes(text), "{text}");
+        }
+        for text in [
+            "SET k v EXAT 1",
+            "SET k v NX PXAT 1 GET",
+            "set k v exat 4102444800",
+            "GETEX k EXAT 1",
+            "GETEX k PXAT 1",
+            "HSETEX h FXX EXAT 1 FIELDS 1 f v",
+            "HSETEX h PXAT 1 FIELDS 1 f v",
+            "HGETEX h EXAT 1 FIELDS 1 f",
+            "hgetex h pxat 1 fields 1 f",
+            // A value spelled like the option is read as the option, which
+            // fails safe.
+            "SET k EXAT",
+        ] {
+            assert!(removes(text), "{text}");
+        }
     }
 
     #[test]
