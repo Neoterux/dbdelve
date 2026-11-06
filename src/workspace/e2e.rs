@@ -11,7 +11,7 @@ use gpui_component::{Root, input::InputState};
 
 use super::Workspace;
 use crate::{
-    actions::{CancelQuery, ImportRowsFromClipboard},
+    actions::{CancelQuery, ImportRowsFromClipboard, SubmitConnection},
     connection_form::ConnectionForm,
     db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, SshTunnel},
     explain::analysis::Basis,
@@ -3063,9 +3063,10 @@ fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppCon
         // A new name on the same engine is not a reason to hide anything.
         save(&workspace, cx, "Renamed", false);
         assert!(agent_visible(&workspace, cx, "dev"));
-        assert_ne!(
-            notice(&workspace, cx).as_deref(),
-            Some("Renamed is hidden from agents because its engine changed.")
+        assert!(
+            !notice(&workspace, cx)
+                .unwrap_or_default()
+                .starts_with("Renamed is hidden from agents")
         );
         assert!(saved_visible("dev"));
 
@@ -3077,6 +3078,164 @@ fn a_mode_change_keeps_visibility_and_an_engine_change_hides(cx: &mut TestAppCon
             Some("Dev is hidden from agents because its engine changed.")
         );
         assert!(!saved_visible("dev"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_profile_read_as_postgres_by_the_fallback_loads_hidden_and_is_saved_hidden(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        // `note__toml_private` sends the file through the plain decode, which
+        // reads an engine this build cannot open as Postgres. The key is not a
+        // field, so it is dropped and the launch save round-trips cleanly.
+        let profiles = format!(
+            "{}\
+             [[profiles]]\nid = \"gone\"\nname = \"Gone\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\nengine = \"zz-unknown\"\nagent_visible = true\n\
+             note__toml_private = 1\n\n\
+             [[profiles]]\nid = \"odd\"\nname = \"Odd\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\nengine = \"generic\"\nagent_visible = true\n\n\
+             {}",
+            sqlite_profile("kept", "Kept", "agent_visible = true"),
+            sqlite_profile("later", "Later", ""),
+        );
+        let (workspace, cx) = launch_with_profiles(cx, &profiles);
+
+        for id in ["gone", "odd"] {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .expect("the profile was restored");
+                assert_eq!(profile.config.engine(), Engine::Postgres, "{id} fell back");
+                assert!(
+                    profile
+                        .session
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("Reading it as Postgres.")),
+                    "{id} says it was read as Postgres"
+                );
+            });
+        }
+
+        assert!(
+            !agent_visible(&workspace, cx, "gone"),
+            "gone is hidden once read as Postgres"
+        );
+        assert!(!agent_visible(&workspace, cx, "odd"), "odd is hidden too");
+        assert!(agent_visible(&workspace, cx, "kept"));
+        assert!(!agent_visible(&workspace, cx, "later"));
+
+        // Straight after launch, with no action: the hide is on disk, and the
+        // profile after the narrowed ones was not lost to an early save.
+        assert!(!saved_visible("gone"), "gone is saved hidden");
+        assert!(!saved_visible("odd"), "odd is saved hidden");
+        assert!(saved_visible("kept"), "a readable profile keeps its grant");
+        let saved = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        for id in ["kept", "gone", "odd", "later"] {
+            assert!(
+                saved.profiles.iter().any(|profile| profile.id == id),
+                "{id} survives the launch save"
+            );
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.agent.visibility_choices.is_empty(),
+                "the launch save leaves no pending choice"
+            );
+        });
+
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(!agent_visible(&workspace, cx, "gone"));
+        assert!(!saved_visible("gone"), "a later save keeps the hide");
+
+        // Another window grants it afterwards; this window adopts, not undoes.
+        let mut list = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        list.profiles
+            .iter_mut()
+            .find(|profile| profile.id == "gone")
+            .expect("the profile was saved")
+            .agent_visible = true;
+        store::save_profiles(&list).expect("the other window saves");
+        workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx));
+        assert!(agent_visible(&workspace, cx, "gone"));
+        assert!(saved_visible("gone"), "the other window's grant survives");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_unedited_save_keeps_visibility_and_a_new_host_hides(cx: &mut TestAppContext) {
+    use super::agent::AgentLookup;
+
+    store::tests::with_home(|| {
+        // Snowflake has a host and no password slot, so neither the save nor the
+        // reconnect reaches the keychain, and its connect fails on the missing
+        // key before it reaches the network.
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            "[[profiles]]\nid = \"warehouse\"\nname = \"Warehouse\"\n\
+             host = \"dev.example.invalid\"\ndatabase = \"ANALYTICS\"\nuser = \"TIM\"\n\
+             engine = \"snowflake\"\naccount = \"myorg-myaccount\"\n\
+             private_key = \"/no-such-dir/dbdelve-e2e.p8\"\nagent_visible = true\n",
+        );
+        let index = workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "warehouse")
+                .expect("the saved profile is restored");
+            workspace.activate(index, cx);
+            index
+        });
+        cx.run_until_parked();
+        assert!(agent_visible(&workspace, cx, "warehouse"));
+        let notice = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .and_then(|profile| profile.session.notice.clone())
+            })
+        };
+
+        // The edit form submitted as it opened leaves the connection alone.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.edit_profile(index, window, cx);
+            workspace.submit_connection(&SubmitConnection, window, cx);
+        });
+        workspace.read_with(cx, |workspace, _| assert!(workspace.form.is_none()));
+        assert!(agent_visible(&workspace, cx, "warehouse"));
+        assert!(saved_visible("warehouse"));
+        assert!(
+            !notice(&workspace, cx)
+                .unwrap_or_default()
+                .starts_with("Warehouse is hidden from agents")
+        );
+
+        // A new host alone points the consent at a server the owner did not name.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let mut config = workspace.profiles[index].config.clone();
+            if let ConnectionConfig::Snowflake(account) = &mut config {
+                account.host = Some("prod.example.invalid".into());
+            }
+            workspace.save_profile("warehouse", "Warehouse".into(), config, None, window, cx);
+        });
+        assert!(!agent_visible(&workspace, cx, "warehouse"));
+        assert!(!saved_visible("warehouse"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(matches!(
+                workspace.agent_profile("Warehouse"),
+                Err(AgentLookup::NotAvailable)
+            ));
+        });
+        assert_eq!(
+            notice(&workspace, cx).as_deref(),
+            Some("Warehouse is hidden from agents because its connection changed.")
+        );
         quit(workspace, cx);
     });
 }

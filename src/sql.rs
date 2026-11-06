@@ -2641,8 +2641,8 @@ struct Parsed {
     )]
     alters: bool,
     /// Whether any statement the parse judged leaves its session changed: a
-    /// transaction bracket, a `SET`, a `USE`, a temporary table, a variable
-    /// target, a savepoint. Read off the statements themselves, never off
+    /// transaction bracket, a `SET`, a `USE`, a temporary table, a temporary
+    /// view, a variable target, a savepoint. Read off the statements themselves, never off
     /// [`leaves`], which says nothing on an engine that keeps no session and
     /// also flags plain reads of what the session holds.
     #[cfg_attr(
@@ -2659,8 +2659,12 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     scripts: bool,
-    /// Whether any Redis command is one that returns credentials or other
-    /// clients' details: `CONFIG GET`, `CLIENT LIST` (D-27).
+    /// Whether any statement is one that returns credentials, password hashes,
+    /// the user's privileges or other clients' details (D-27): the Redis
+    /// commands `CONFIG GET`, `CLIENT LIST`, `ACL LIST` and `ACL GETUSER`, a
+    /// MongoDB `currentOp` in any spelling (the command, the `$currentOp` stage
+    /// and the `db.currentOp()` helper) and `connectionStatus` asked for its
+    /// privileges. SQL leaves it false.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
@@ -2711,7 +2715,14 @@ impl Parsed {
 /// own statements reads it. This adds what an agent cannot be allowed to do
 /// unseen and the queue does not care about: a savepoint, which brackets a
 /// transaction an agent has no way to end, and a session change inside a
-/// branch.
+/// branch, and a `SELECT ... INTO` a temporary table or variable that sits
+/// under a set operation or in parentheses, where [`Leaves::add`] looks only at
+/// a bare `SELECT`.
+///
+/// A temporary view is added for a reason of its own. It is searched ahead of
+/// the permanent schema (Postgres's `pg_temp`, SQLite's `temp`), so it shadows
+/// a table of the same name for every later statement on the session, and a
+/// write approved after it would hit the view, not the table the human read.
 fn changes_session(statement: &Statement) -> bool {
     match statement {
         Statement::Savepoint { .. }
@@ -2727,11 +2738,35 @@ fn changes_session(statement: &Statement) -> bool {
         Statement::StartTransaction { statements, .. } if !statements.is_empty() => {
             statements.iter().any(changes_session)
         }
+        Statement::CreateView(view) if view.temporary => true,
+        Statement::Query(query) if selects_into_session(&query.body) => true,
         _ => {
             let mut leaves = Leaves::default();
             leaves.add(statement);
             leaves != Leaves::default()
         }
+    }
+}
+
+/// Whether a `SELECT ... INTO` anywhere in `body` makes a temporary table or
+/// a variable that lasts the session. It restates the predicate [`Leaves::add`]
+/// applies to a bare `SELECT`: [`Leaves::add`] reads only that one shape and is
+/// left as it is because the user's queue reads it, so a set operation or
+/// parentheses would otherwise hide the target from the agent's gate.
+fn selects_into_session(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(select) => select.into.as_ref().is_some_and(|into| {
+            into.temporary
+                || into
+                    .targets
+                    .iter()
+                    .any(|target| target.to_string().starts_with(['#', '@']))
+        }),
+        SetExpr::Query(query) => selects_into_session(&query.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            selects_into_session(left) || selects_into_session(right)
+        }
+        _ => false,
     }
 }
 
@@ -2795,6 +2830,7 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
         return Parsed {
             removes: crate::mql::removes(sql),
             scripts: crate::mql::runs_script(sql),
+            discloses: crate::mql::discloses(sql),
             ..Parsed::counted(crate::mql::classify(sql), crate::mql::statements(sql).len())
         };
     };

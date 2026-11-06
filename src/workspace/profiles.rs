@@ -122,6 +122,7 @@ impl Workspace {
                 return;
             }
         };
+        let read_as_postgres = unreadable_engine.is_some();
         let stored_queries = stored_buffers(
             stored.open_queries,
             stored.next_query_id,
@@ -173,6 +174,9 @@ impl Workspace {
             session.notice = Some(message);
         }
         let id = stored.id.clone();
+        if read_as_postgres && stored.agent_visible {
+            self.agent.visibility_choices.insert(id.clone());
+        }
         self.profiles.push(Profile {
             id: stored.id,
             name: stored.name,
@@ -194,8 +198,13 @@ impl Workspace {
             // A silenced kind this build cannot read is dropped, which only
             // means that kind still asks.
             // Absent reads as hidden: the flag is a grant, and a file written
-            // before it existed granted nothing.
-            agent_visible: stored.agent_visible,
+            // before it existed granted nothing. A profile read as Postgres
+            // hides too: the grant was for the engine it named, not this one.
+            // The id is this window's unsaved choice so the save `Workspace::new`
+            // makes once every profile is in writes the hide, where
+            // `adopt_saved_visibility` would read the file's grant back; a save
+            // from here would write a partial list.
+            agent_visible: stored.agent_visible && !read_as_postgres,
             confirmed: stored
                 .confirmed
                 .iter()
@@ -827,10 +836,14 @@ impl Workspace {
         let password = password_to_persist(&config, Origin::Form).map(str::to_string);
         let profile = &mut self.profiles[index];
         let reconnect = profile.config.needs_reconnect(&config);
-        // The dialog that granted visibility stated what the old engine holds
-        // server-side; a new engine makes those facts stale.
+        // The visibility dialog's consent was given for the target it described.
+        // A new engine makes its stated server-side facts stale; any other change
+        // `needs_reconnect` sees points that consent at a server the owner did
+        // not name. The whole of `needs_reconnect` counts, a timeout or TLS edit
+        // included: narrowing needs no consent, and one definition of a changed
+        // target is all there is to keep in step.
         let engine_changed = profile.config.engine() != config.engine();
-        let hide = engine_changed && profile.agent_visible;
+        let hide = (engine_changed || reconnect) && profile.agent_visible;
         let syntax = config.engine().syntax();
         if profile.config.engine().syntax() != syntax {
             profile.session.set_syntax(syntax, window, cx);
@@ -840,10 +853,12 @@ impl Workspace {
         profile.config = config;
         if hide {
             self.set_agent_visible(id, false, cx);
-            self.note(
-                format!("{name} is hidden from agents because its engine changed."),
-                cx,
-            );
+            let notice = if engine_changed {
+                format!("{name} is hidden from agents because its engine changed.")
+            } else {
+                format!("{name} is hidden from agents because its connection changed.")
+            };
+            self.note(notice, cx);
         }
 
         // Only what was typed. A blank field is not an instruction to forget the
