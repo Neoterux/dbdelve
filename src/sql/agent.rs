@@ -639,6 +639,8 @@ mod tests {
             "GETEX k PXAT 1",
             "HSETEX h EXAT 1 FIELDS 1 f v",
             "HGETEX h PXAT 1 FIELDS 1 f",
+            "HSETEX h EX 0 FIELDS 1 f v",
+            "HGETEX h PX 0 FIELDS 1 f",
             "set k v exat 1",
         ] {
             redis_always(text, refused(Refusal::Delete));
@@ -719,6 +721,8 @@ mod tests {
             "GETEX k PXAT 1",
             "HSETEX h EXAT 1 FIELDS 1 f v",
             "HGETEX h PXAT 1 FIELDS 1 f",
+            "HSETEX h EX 0 FIELDS 1 f v",
+            "HGETEX h PX 0 FIELDS 1 f",
             "set k v exat 1",
         ] {
             assert_eq!(classify(Engine::Redis, text), Verdict::WRITE, "{text}");
