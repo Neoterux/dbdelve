@@ -319,7 +319,9 @@ pub struct SqlSpec {
     /// the verdict has to: a call to one needs more than Read-only wherever it
     /// sits in the statement. A deny-list of named functions, not an allow-list
     /// of safe ones -- a function that is not here, a user-defined one included,
-    /// stays a read. Lower-case, matched against the name as written.
+    /// stays a read on the human path. The agent path asks for a call
+    /// [`SqlSpec::builtin_functions`] does not name at Read-write and Full.
+    /// Lower-case, matched against the name as written.
     pub denied_functions: &'static [&'static str],
     /// Functions that read a file, a URL, a program or another server, or run
     /// text that may, so an agent's read of one asks the human first: the rows
@@ -334,6 +336,18 @@ pub struct SqlSpec {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     pub egress_functions: &'static [&'static str],
+    /// The engine's built-in functions that change nothing: one name per line
+    /// under `#` comment lines, from a file in `src/db/functions/`, matched
+    /// against a bare, unquoted call name. On the agent path a call to a name
+    /// not here asks at Read-write and Full. On Generic it is also the human
+    /// path's list of reads. A missing name costs one approval; a wrongly
+    /// listed one is a breach, so each list is the engine's own catalog
+    /// filtered by its purity data where one exists.
+    pub builtin_functions: &'static str,
+    /// Whether the server tells function names apart by case, so
+    /// [`SqlSpec::builtin_functions`] is matched as spelled. ClickHouse is the
+    /// example: a user `todate` can sit beside the built-in `toDate`.
+    pub case_sensitive_functions: bool,
     /// Whether a quoted string in a table position is read as a file or a URL
     /// (DuckDB's replacement scan: `FROM 'data.csv'`). The agent path asks for
     /// approval on any statement of such an engine that holds a path-shaped
@@ -397,6 +411,10 @@ impl SqlSpec {
         stateless_requests: false,
         denied_functions: &[],
         egress_functions: &[],
+        // Empty is the fail-safe default: an engine that sets nothing asks for
+        // every call.
+        builtin_functions: "",
+        case_sensitive_functions: false,
         bare_path_reads: false,
         plain_settings: &[],
         transactions: true,
@@ -409,6 +427,52 @@ impl SqlSpec {
         (self.transactions && !self.implicit_transaction).then(|| self.transaction.opening())
     }
 }
+
+/// Names sqlparser reads as a call that a catalog may not list: the standard's
+/// grammar-defined functions and the standard window functions. The generated
+/// built-in lists and the live pins add these to what the catalog answers.
+#[cfg(test)]
+pub(crate) const GRAMMAR_FUNCTIONS: &[&str] = &[
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    "cast",
+    "try_cast",
+    "extract",
+    "position",
+    "substring",
+    "trim",
+    "overlay",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "current_user",
+    "session_user",
+    "user",
+    "current_catalog",
+    "current_schema",
+    "system_user",
+    "grouping",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
+];
 
 /// No brackets, not even for SQL Server: the grammar every gate in `sql.rs`
 /// parses with has none, and the pin does not move. The standard quote names
@@ -999,6 +1063,8 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
             "transaction_isolation",
             "xmloption",
         ],
+        // From pg_catalog.pg_proc, filtered by volatility; pinned by a live test.
+        builtin_functions: include_str!("functions/postgres.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1086,6 +1152,8 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
             "sql_big_selects",
             "max_join_size",
         ],
+        // From the help tables, filtered by hand; no test pins it.
+        builtin_functions: include_str!("functions/mysql.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1183,6 +1251,8 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
             "sql_big_selects",
             "max_join_size",
         ],
+        // From information_schema.sql_functions, filtered by hand; no test pins it.
+        builtin_functions: include_str!("functions/mariadb.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1242,6 +1312,10 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
         // Inert while `rusqlite` is built without its `load_extension`
         // feature, and listed so enabling it cannot quietly open a hole.
         denied_functions: &["load_extension"],
+        // Generated from the bundled build by
+        // `the_built_in_list_is_written_from_the_bundled_catalog` and pinned by
+        // `the_built_in_list_is_the_bundled_catalogs_answer`.
+        builtin_functions: include_str!("functions/sqlite.txt"),
         // No `plain_settings`, deliberately: SQLite has no `SET` statement. It
         // configures through `PRAGMA`, a different statement type that already
         // needs Full, so a `SET` here is one the server rejects and stopping it
@@ -1293,6 +1367,9 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
         // Inert for the same reason as SQLite's. The rest of Turso's function
         // set has not been surveyed.
         denied_functions: &["load_extension"],
+        // SQLite's list: Turso's own function set has not been surveyed, so a
+        // name SQLite lacks asks, and one Turso lacks costs nothing.
+        builtin_functions: include_str!("functions/sqlite.txt"),
         // No `plain_settings`, for the reason SQLite has none: configuration is
         // `PRAGMA`, which is already Full, and there is no `SET` to allow.
         ..SqlSpec::ANSI
@@ -1367,6 +1444,14 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // by a parenthesis and stopped until the profile is upgraded; both
         // are recorded in the corpus as accepted false positives.
         denied_functions: &["nextval", "setval", "query", "json_execute_serialized_sql"],
+        // Generated from the bundled build by
+        // `the_built_in_list_is_written_from_the_bundled_catalog` and pinned by
+        // `the_built_in_list_is_the_bundled_catalogs_answer`.
+        // ponytail: scalar, aggregate and macro functions only. A table function
+        // reads files or the database's own state and `has_side_effects` says
+        // nothing about it, so `FROM duckdb_tables()` asks. Upgrade path: a reviewed
+        // list of local table functions, as ClickHouse's file has.
+        builtin_functions: include_str!("functions/duckdb.txt"),
         // Every table function of the embedded build's `duckdb_functions()`
         // that reads a file (`read_*`, `parquet_*`, `*_scan`, `glob`,
         // `sniff_csv`), DBDelve's own `read_xlsx` among them, then the
@@ -1530,6 +1615,8 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // request on the SQL API, which answers even `USE` with a refusal, so
         // an allow-list would protect nothing. A `SET` here prompts and
         // changes nothing; the one extra arm is cheaper than a special case.
+        // From the vendor documentation, not a server: no catalog lists the built-ins, so no test pins it.
+        builtin_functions: include_str!("functions/snowflake.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1645,6 +1732,8 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
             "concat_null_yields_null",
             "xact_abort",
         ],
+        // From the vendor documentation, not a server: no catalog lists the built-ins, so no test pins it.
+        builtin_functions: include_str!("functions/mssql.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1958,6 +2047,9 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
             // `application_name`.
             "log_comment",
         ],
+        // From system.functions, filtered by category; pinned by a live test.
+        builtin_functions: include_str!("functions/clickhouse.txt"),
+        case_sensitive_functions: true,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -2008,6 +2100,8 @@ pub(crate) const GENERIC: EngineSpec = EngineSpec {
         // plugin target admits yet; false is the answer that cannot send an
         // offset to a server whose timestamp literal takes none (Db2).
         literal_offsets: false,
+        // Generic reads the list the human path always held: calls outside it need Read-write there. Hand-kept, no pin.
+        builtin_functions: include_str!("functions/generic.txt"),
         ..SqlSpec::ANSI
     },
     abilities: Abilities::NONE,
