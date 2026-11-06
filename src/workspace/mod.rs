@@ -1202,8 +1202,44 @@ impl Workspace {
     fn render_agent_mark(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = *theme(cx);
         let mark = self.agent_mark_state()?;
-        Some(ui::agent_mark(t, mark).into_any_element())
+        // Snapshotted before the closure, as the mode pill's `silenced` is:
+        // the menu is built when it opens, from what was drawn.
+        let now = agent::unix_millis();
+        let log: Vec<String> = self
+            .agent
+            .log
+            .iter()
+            .map(|entry| agent_log_label(entry, now))
+            .collect();
+        // On a wrapper: `dropdown_menu` wraps the button, so a margin on the
+        // button never reaches the titlebar's row.
+        Some(
+            div()
+                .child(ui::agent_mark(t, mark).dropdown_menu(move |menu, _, _| {
+                    log.iter().fold(menu, |menu, line| menu.label(line.clone()))
+                }))
+                .into_any_element(),
+        )
     }
+}
+
+/// One line of the agent call log, newest at the top of the menu: how long ago,
+/// the tool, the connection, and how the call ended. A name the agent gave that
+/// resolved nothing is quoted as asked for, so its words never read as a
+/// connection of DBDelve's.
+fn agent_log_label(entry: &agent::LogEntry, now: u64) -> String {
+    let age = ui::relative_age(now.saturating_sub(entry.at) / 1000);
+    let mut line = format!("{age} ago \u{b7} {}", entry.tool.name());
+    match (&entry.resolved, &entry.asked) {
+        (Some(name), _) => line.push_str(&format!(" \u{b7} {name}")),
+        (None, Some(asked)) => line.push_str(&format!(" \u{b7} asked for \"{asked}\"")),
+        (None, None) => {}
+    }
+    line.push_str(&format!(" \u{b7} {}", entry.status.as_str()));
+    if entry.requester_gone {
+        line.push_str(" \u{b7} no requester");
+    }
+    line
 }
 
 impl Render for Workspace {
