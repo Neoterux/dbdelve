@@ -10,6 +10,8 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
+use std::collections::VecDeque;
+
 use super::*;
 use crate::agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool};
 
@@ -30,6 +32,72 @@ pub(crate) struct AgentState {
     /// by those two actions only, and taken by the next save, so it is the one
     /// way this window changes `agent_access`.
     pub(crate) access_choice: Option<bool>,
+    /// The calls that have ended, newest first, at most [`LOG_CAP`].
+    pub(crate) log: VecDeque<LogEntry>,
+}
+
+// ponytail: the log is this session's own and keeps the last twenty calls,
+// because it is read by clicking the mark and a longer list is not read.
+// Phase 5 (READ-10, APPR-12) turns it into the audit, which is kept.
+pub(crate) const LOG_CAP: usize = 20;
+
+/// One call that ended. Names, a code and a time, and nothing the call carried:
+/// no row, no statement, no host, user or path. Held in memory and gone with
+/// the window.
+#[derive(Clone, Debug)]
+pub(crate) struct LogEntry {
+    /// Unix milliseconds when the call ended, as the palette's history keeps
+    /// its own.
+    pub(crate) at: u64,
+    pub(crate) id: CallId,
+    pub(crate) tool: Tool,
+    /// The profile's own name, as it read when the call resolved to it.
+    pub(crate) resolved: Option<String>,
+    /// What the agent called a connection that resolved to nothing: cut to 64
+    /// characters with control characters removed, and shown as the agent's
+    /// words, never as DBDelve's.
+    pub(crate) asked: Option<String>,
+    pub(crate) status: Status,
+    /// The answer could not be delivered, because its caller had already gone.
+    pub(crate) requester_gone: bool,
+}
+
+/// How many characters of an agent's own text the log keeps.
+const ASKED_CAP: usize = 64;
+
+pub(crate) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+impl AgentState {
+    /// Write one ended call at the front of the log. Called once per call, from
+    /// the places that answer it.
+    fn record(
+        &mut self,
+        id: CallId,
+        tool: Tool,
+        resolved: Option<String>,
+        asked: Option<&str>,
+        status: Status,
+    ) {
+        self.log.push_front(LogEntry {
+            at: unix_millis(),
+            id,
+            tool,
+            resolved,
+            asked: asked.map(|text| {
+                text.chars()
+                    .filter(|c| !c.is_control())
+                    .take(ASKED_CAP)
+                    .collect()
+            }),
+            status,
+            requester_gone: false,
+        });
+        self.log.truncate(LOG_CAP);
+    }
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -40,6 +108,10 @@ pub(crate) struct PendingCall {
     /// dialog and the sweeps read the profile by this id, so a rename or a
     /// second profile of the same name cannot change which one a call is about.
     pub(crate) profile_id: String,
+    pub(crate) tool: Tool,
+    /// The profile's own name when the call resolved, kept so the log can name
+    /// it after the profile is gone.
+    profile_name: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
@@ -374,6 +446,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// What the titlebar's agent mark shows: nothing while no bridge runs, the
+    /// dim mark while one listens alone, and the lit mark, with the count of
+    /// calls waiting, while an agent is attached or a call waits.
+    pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
+        self.agent.bridge.as_ref()?;
+        let attached = !self.agent.presence.is_empty() || !self.agent.calls.is_empty();
+        Some(if attached {
+            ui::AgentMark::Connected {
+                waiting: self.agent.calls.len(),
+            }
+        } else {
+            ui::AgentMark::Listening
+        })
+    }
+
     /// What an agent asked for. Opens no connection and starts no database
     /// work: the answer is read from the profile list as it stands.
     pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
@@ -388,6 +475,7 @@ impl Workspace {
             }
             Inbound::Call {
                 tool: Tool::ListConnections,
+                id,
                 reply,
                 ..
             } => {
@@ -407,6 +495,8 @@ impl Workspace {
                     status: Status::Executed,
                     text,
                 });
+                self.agent
+                    .record(id, Tool::ListConnections, None, None, Status::Executed);
             }
             Inbound::Call {
                 tool: Tool::Ping,
@@ -415,17 +505,26 @@ impl Workspace {
                 reply,
             } => {
                 let found = match connection.as_deref() {
-                    Some(name) => self.agent_profile(name).map(|profile| profile.id.clone()),
+                    Some(name) => self
+                        .agent_profile(name)
+                        .map(|profile| (profile.id.clone(), profile.name.clone())),
                     None => Err(AgentLookup::NotAvailable),
                 };
-                let profile_id = match found {
-                    Ok(profile_id) => profile_id,
+                let (profile_id, profile_name) = match found {
+                    Ok(found) => found,
                     Err(lookup) => {
                         // The caller may have hung up, and then nobody reads this.
                         let _ = reply.send(Reply {
                             status: Status::RefusedByGate,
                             text: lookup.to_string(),
                         });
+                        self.agent.record(
+                            id,
+                            Tool::Ping,
+                            None,
+                            connection.as_deref(),
+                            Status::RefusedByGate,
+                        );
                         return;
                     }
                 };
@@ -438,6 +537,8 @@ impl Workspace {
                 self.agent.calls.push(PendingCall {
                     id,
                     profile_id,
+                    tool: Tool::Ping,
+                    profile_name,
                     reply,
                     _expiry: expiry,
                 });
@@ -445,6 +546,12 @@ impl Workspace {
             }
             Inbound::Hangup { id } => {
                 self.finish_call(id, Status::Cancelled, String::new(), cx);
+            }
+            Inbound::Undelivered { id } => {
+                if let Some(entry) = self.agent.log.iter_mut().find(|entry| entry.id == id) {
+                    entry.requester_gone = true;
+                    cx.notify();
+                }
             }
         }
     }
@@ -472,6 +579,10 @@ impl Workspace {
             // The caller may have hung up, and then nobody reads this.
             let _ = call.reply.send(Reply { status, text });
         }
+        // Past the early return above, so a hangup that arrives after the call
+        // ended adds nothing: one entry per call, written here.
+        self.agent
+            .record(id, call.tool, Some(call.profile_name), None, status);
         if was_in_front {
             // The dialog took the keyboard when it went up and goes away with
             // the call, by whichever route the call ended.

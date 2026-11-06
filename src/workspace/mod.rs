@@ -1200,6 +1200,72 @@ impl Workspace {
             .children(self.settings_open.then(|| render_settings_panel(self, cx)))
             .into_any_element()
     }
+
+    /// The agent mark for a titlebar, or nothing while no bridge runs, so a
+    /// window with agent access off draws exactly what it always did. Every
+    /// titlebar asks for it, so no surface hides an agent that is attached.
+    fn render_agent_mark(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let mark = self.agent_mark_state()?;
+        // Snapshotted before the closure, as the mode pill's `silenced` is:
+        // the menu is built when it opens, from what was drawn.
+        let waiting = self.agent.calls.len();
+        let now = agent::unix_millis();
+        let log: Vec<String> = self
+            .agent
+            .log
+            .iter()
+            .map(|entry| agent_log_label(entry, now))
+            .collect();
+        // On a wrapper: `dropdown_menu` wraps the button, so a margin on the
+        // button never reaches the titlebar's row.
+        Some(
+            div()
+                .child(ui::agent_mark(t, mark).dropdown_menu(move |menu, _, _| {
+                    // The kill switch is the only item that can be selected, so
+                    // the keyboard reaches it with one step. The mark is drawn
+                    // only while access is on, so this is the one thing the
+                    // menu changes: turning access on is the palette's.
+                    let menu = menu
+                        .label(match waiting {
+                            0 => "No calls waiting".to_string(),
+                            1 => "1 call waiting for you".to_string(),
+                            n => format!("{n} calls waiting for you"),
+                        })
+                        .label("Agent access is on")
+                        .menu(
+                            "Disconnect agents and turn access off",
+                            Box::new(DisconnectAgents),
+                        );
+                    if log.is_empty() {
+                        menu
+                    } else {
+                        log.iter()
+                            .fold(menu.separator(), |menu, line| menu.label(line.clone()))
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
+/// One line of the agent call log, newest at the top of the menu: how long ago,
+/// the tool, the connection, and how the call ended. A name the agent gave that
+/// resolved nothing is quoted as asked for, so its words never read as a
+/// connection of DBDelve's.
+fn agent_log_label(entry: &agent::LogEntry, now: u64) -> String {
+    let age = ui::relative_age(now.saturating_sub(entry.at) / 1000);
+    let mut line = format!("{age} ago \u{b7} {}", entry.tool.name());
+    match (&entry.resolved, &entry.asked) {
+        (Some(name), _) => line.push_str(&format!(" \u{b7} {name}")),
+        (None, Some(asked)) => line.push_str(&format!(" \u{b7} asked for \"{asked}\"")),
+        (None, None) => {}
+    }
+    line.push_str(&format!(" \u{b7} {}", entry.status.as_str()));
+    if entry.requester_gone {
+        line.push_str(" \u{b7} no requester");
+    }
+    line
 }
 
 impl Render for Workspace {
@@ -1424,7 +1490,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -1470,7 +1542,13 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
                 .on_action(cx.listener(Self::reset_editor_zoom))
-                .child(titlebar(t, None, Vec::new(), Vec::new(), Vec::new()))
+                .child(titlebar(
+                    t,
+                    None,
+                    self.render_agent_mark(cx).into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.dialog_layer(
                     [("import-choice", self.render_import_choice(cx))],
@@ -2345,6 +2423,7 @@ impl Render for Workspace {
                         })
                         .into_any_element()
                 })
+                .chain(self.render_agent_mark(cx))
                 .chain(newer_release.map(|release| {
                     // On a wrapper: `dropdown_menu` wraps the button, so a
                     // margin on the button never reaches the titlebar's row.
