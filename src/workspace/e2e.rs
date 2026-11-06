@@ -4557,3 +4557,160 @@ fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+#[cfg(unix)]
+fn agent_mark_state(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::ui::AgentMark> {
+    workspace.read_with(cx, |workspace, _| workspace.agent_mark_state())
+}
+
+/// Whether the mark drew itself in the last frame, in either state.
+#[cfg(unix)]
+fn agent_mark_drawn(cx: &mut VisualTestContext) -> bool {
+    cx.debug_bounds("agent-mark-listening").is_some()
+        || cx.debug_bounds("agent-mark-connected").is_some()
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{ConnId, Inbound, tools::Tool},
+        ui::AgentMark,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+
+        assert!(!agent_mark_drawn(cx), "access is off");
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        assert!(cx.debug_bounds("agent-mark-connected").is_none());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceOpened { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 })
+        );
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+        assert!(cx.debug_bounds("agent-mark-listening").is_none());
+
+        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 1 })
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::PresenceClosed { conn: ConnId(1) }, cx)
+        });
+        settle(cx);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(agent_mark_state(&workspace, cx), None);
+        assert!(!agent_mark_drawn(cx), "the kill switch takes the mark away");
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_is_in_every_titlebar(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        // No saved profile: the welcome surface, unless the runner's `PG*`
+        // variables put a profile in front, which has the main titlebar.
+        let (workspace, cx) = launch_with_settings(cx, "agent_access = true", "");
+        cx.executor().allow_parking();
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+
+        // A profile in front, then the connection form over it.
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.profile().is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+
+        run_command(&workspace, cx, Command::NewConnection);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.form.is_some()));
+        assert!(cx.debug_bounds("agent-mark-listening").is_some());
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_mark_lights_when_a_running_shim_finds_access_turned_on(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use crate::ui::AgentMark;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let presence = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len())
+        };
+
+        // Claude Code already has DBDelve loaded: the shim runs and retries
+        // against a socket nothing listens at.
+        let shim = crate::agent::shim::testing::idle_shim(path, Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
+        settle(cx);
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        drive_until(cx, |cx| {
+            agent_mark_state(&workspace, cx) == Some(AgentMark::Connected { waiting: 0 })
+        });
+        // No call was made: the agent is there because its shim is.
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(shim.lines_after_handshake().is_empty());
+        settle(cx);
+        assert!(cx.debug_bounds("agent-mark-connected").is_some());
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert!(!agent_mark_drawn(cx));
+        assert_eq!(presence(cx), 0);
+        assert!(
+            !listening(&workspace, cx),
+            "the shim's retries bound nothing"
+        );
+
+        drop(shim);
+        quit(workspace, cx);
+    });
+}

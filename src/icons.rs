@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 74] = [
+const ICONS: [(&str, &IconData); 76] = [
     ("icons/git-fork.svg", icondata_lu::LuGitFork),
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
@@ -103,6 +103,8 @@ const ICONS: [(&str, &IconData); 74] = [
     ("icons/bot.svg", icondata_lu::LuBot),
     ("icons/engine-generic.svg", icondata_lu::LuDatabase),
     ("icons/plugin.svg", icondata_lu::LuPlug),
+    ("icons/plug.svg", icondata_lu::LuPlug),
+    ("icons/plug-zap.svg", icondata_lu::LuPlugZap),
 ];
 
 /// dbdelve's own names for the icons it draws, so a call site names a thing
@@ -192,6 +194,11 @@ pub mod icon {
     pub const RESET: &str = "icons/rotate-ccw.svg";
     /// A connection an agent may reach, beside its name.
     pub const AGENT_VISIBLE: &str = "icons/bot.svg";
+    /// The titlebar's mark while DBDelve listens for agents and none is there,
+    /// and while one is attached or a call waits. Lucide stand-ins: the one
+    /// brand set in the tree has no mark for the protocol.
+    pub const AGENT_LISTENING: &str = "icons/plug.svg";
+    pub const AGENT_CONNECTED: &str = "icons/plug-zap.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -333,6 +340,8 @@ mod tests {
             icon::CHOOSE,
             icon::NO_COLOR,
             icon::AGENT_VISIBLE,
+            icon::AGENT_LISTENING,
+            icon::AGENT_CONNECTED,
         ] {
             assert_draws(path);
         }
