@@ -12,14 +12,19 @@
 //! running is decided at each call, by whether its socket takes a connection.
 
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(unix)]
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        JsonObject, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+        ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     transport::stdio,
@@ -32,6 +37,8 @@ use rmcp::model::Tool as McpTool;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    sync::Mutex,
+    time::{Instant, MissedTickBehavior, interval, interval_at},
 };
 
 #[cfg(unix)]
@@ -42,6 +49,19 @@ use super::{Reply, Status, tools::Tool, wire};
 #[cfg(unix)]
 const NOT_RUNNING: &str = "DBDelve is not running, or its agent access is off.";
 
+// ponytail: Claude Code gives up on a call that stays silent for 30 seconds,
+// and a person answering a ping takes longer, so a waiting call says it is
+// still alive every 10: margin for a late tick, no setting.
+#[cfg(unix)]
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
+// ponytail: while DBDelve is closed or its agent access is off, an idle shim
+// makes one local connect every 2 seconds, so the window's mark lights within
+// that of access being turned on. The upgrade path is a watch on the socket's
+// directory instead of a poll.
+#[cfg(unix)]
+const PRESENCE_RETRY: Duration = Duration::from_secs(2);
+
 /// What the shim serves.
 #[cfg(unix)]
 pub(crate) struct Shim {
@@ -49,23 +69,110 @@ pub(crate) struct Shim {
     /// as it comes: a path that cannot be derived is the answer to every call,
     /// not a reason for the shim not to speak.
     socket: Result<PathBuf, String>,
+    progress_every: Duration,
+    presence_retry: Duration,
+    /// Whether this shim's one presence connection is open. A lock rather than
+    /// a flag because the check, the connect and marking it open are one step:
+    /// the idle retry and a call must not each open one.
+    presence: Arc<Mutex<bool>>,
 }
 
 #[cfg(unix)]
 impl Shim {
     pub(crate) fn new(socket: Result<PathBuf, String>) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            progress_every: PROGRESS_EVERY,
+            presence_retry: PRESENCE_RETRY,
+            presence: Arc::new(Mutex::new(false)),
+        }
     }
 
-    /// Carry one call to the app and bring back its answer.
-    async fn carry(&self, tool: Tool, connection: Option<String>) -> CallToolResult {
+    #[cfg(test)]
+    fn with_progress_every(mut self, every: Duration) -> Self {
+        self.progress_every = every;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_presence_retry(mut self, retry: Duration) -> Self {
+        self.presence_retry = retry;
+        self
+    }
+
+    /// Open this shim's presence connection if it is not open: what tells the
+    /// app that an agent is attached, though it may ask nothing. A failed
+    /// connect is silent and leaves it down; a call reports what it finds for
+    /// itself.
+    async fn ensure_presence(path: &Path, presence: &Arc<Mutex<bool>>) {
+        let mut open = presence.lock().await;
+        if *open {
+            return;
+        }
+        let Ok(mut stream) = UnixStream::connect(path).await else {
+            return;
+        };
+        let hello = wire::encode(&wire::Hello::Presence {
+            v: wire::PROTOCOL_VERSION,
+        });
+        if stream.write_all(hello.as_bytes()).await.is_err() {
+            return;
+        }
+        *open = true;
+        let presence = presence.clone();
+        tokio::spawn(async move {
+            // The app writes nothing on a presence, so any end of the read,
+            // an end of stream or an error, is the app having let it go.
+            let mut unread = [0u8; 64];
+            while let Ok(read) = stream.read(&mut unread).await {
+                if read == 0 {
+                    break;
+                }
+            }
+            *presence.lock().await = false;
+        });
+    }
+
+    /// Keep the presence connection open for as long as this runtime lives:
+    /// open it now, and look again every retry while it is down. The task
+    /// never touches the client's connection, so it can answer nothing, and a
+    /// presence that drops is never a reason for the shim to stop.
+    pub(crate) fn keep_presence(&self) {
+        let Ok(path) = self.socket.clone() else {
+            return;
+        };
+        let presence = self.presence.clone();
+        let retry = self.presence_retry;
+        tokio::spawn(async move {
+            // The first tick is at once.
+            let mut ticks = interval(retry);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                Shim::ensure_presence(&path, &presence).await;
+            }
+        });
+    }
+
+    /// Carry one call to the app and bring back its answer, telling the client
+    /// the call is alive while it waits. The call ends by the app's answer, by
+    /// the connection closing, or by the client cancelling it; no timer here
+    /// answers it.
+    async fn carry(
+        &self,
+        tool: Tool,
+        connection: Option<String>,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
         let path = match &self.socket {
             Ok(path) => path,
-            Err(text) => return answer(Status::AppNotRunning, text),
+            Err(text) => return Ok(answer(Status::AppNotRunning, text)),
         };
         let mut stream = match UnixStream::connect(path).await {
             Ok(stream) => stream,
-            Err(error) => return answer(Status::AppNotRunning, &failed_connect_text(&error)),
+            Err(error) => {
+                return Ok(answer(Status::AppNotRunning, &failed_connect_text(&error)));
+            }
         };
         let hello = wire::encode(&wire::Hello::Call {
             v: wire::PROTOCOL_VERSION,
@@ -73,11 +180,44 @@ impl Shim {
             connection,
         });
         if stream.write_all(hello.as_bytes()).await.is_err() {
-            return closed_without_answering();
+            return Ok(closed_without_answering());
         }
-        match read_reply(&mut stream).await {
-            Some(reply) => answer(reply.status, &reply.text),
-            None => closed_without_answering(),
+        // The token is on the context: the request's own `_meta` has already
+        // been moved there by the time the handler runs.
+        let token = context.meta.get_progress_token();
+        let mut ticks = interval_at(Instant::now() + self.progress_every, self.progress_every);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sent = 0.0;
+        // Built once: a tick must not rebuild the reader and lose what it
+        // has already buffered.
+        let reply = read_reply(&mut stream);
+        tokio::pin!(reply);
+        loop {
+            tokio::select! {
+                biased;
+                // Leaving drops the stream, which is the app's hangup, and
+                // the library drops the late answer of a cancelled request.
+                _ = context.ct.cancelled() => {
+                    return Err(ErrorData::internal_error("cancelled", None));
+                }
+                reply = &mut reply => {
+                    return Ok(match reply {
+                        Some(reply) => answer(reply.status, &reply.text),
+                        None => closed_without_answering(),
+                    });
+                }
+                _ = ticks.tick() => {
+                    if let Some(token) = &token {
+                        sent += 1.0;
+                        // A client that has gone fails this, and the call is
+                        // then ended by its cancel or the app's expiry.
+                        let _ = context
+                            .peer
+                            .notify_progress(ProgressNotificationParam::new(token.clone(), sent))
+                            .await;
+                    }
+                }
+            }
         }
     }
 }
@@ -108,10 +248,15 @@ impl ServerHandler for Shim {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Resolved before anything is opened: a call that is not one reaches
+        // no socket, presence included.
         let (tool, connection) = resolve(&request)?;
-        Ok(self.carry(tool, connection).await.into())
+        if let Ok(path) = &self.socket {
+            Self::ensure_presence(path, &self.presence).await;
+        }
+        Ok(self.carry(tool, connection, &context).await?.into())
     }
 }
 
@@ -209,7 +354,9 @@ pub(crate) fn run() -> i32 {
         }
     };
     runtime.block_on(async {
-        let service = match Shim::new(super::socket_path()).serve(stdio()).await {
+        let shim = Shim::new(super::socket_path());
+        shim.keep_presence();
+        let service = match shim.serve(stdio()).await {
             Ok(service) => service,
             Err(error) => {
                 eprintln!("The agent shim could not start serving: {error}.");
@@ -233,24 +380,29 @@ pub(crate) fn run() -> i32 {
     1
 }
 
+/// Drivers that run the real [`Shim`] over a duplex, shared with the tests of
+/// the plans that build on this one, so the library stays named here alone.
 #[cfg(all(test, unix))]
-mod tests {
-    use std::{future::Future, os::unix::net::UnixListener, sync::mpsc, thread};
+pub(crate) mod testing {
+    use std::{
+        sync::Arc,
+        thread::{self, JoinHandle},
+    };
 
     use serde_json::{Value, json};
     use tokio::{
         io::{DuplexStream, Lines, ReadHalf, WriteHalf, split},
-        time::{Duration, timeout},
+        sync::oneshot,
+        time::timeout,
     };
 
     use super::*;
-    use crate::agent::{Listener, tests::short_socket_path};
 
     /// Longer than anything here takes, so a wrong method name or a missing
     /// field fails the test instead of hanging it.
-    const PATIENCE: Duration = Duration::from_secs(5);
+    pub(super) const PATIENCE: Duration = Duration::from_secs(5);
 
-    fn block_on<T>(test: impl Future<Output = T>) -> T {
+    pub(super) fn block_on<T>(test: impl Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -259,8 +411,8 @@ mod tests {
     }
 
     /// The client end of a duplex whose other end the shim serves, speaking raw
-    /// JSON-RPC lines: rmcp's client side is not built.
-    struct Client {
+    /// JSON-RPC lines: the library's client side is not built.
+    pub(super) struct Client {
         lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
         writer: WriteHalf<DuplexStream>,
         next_id: u64,
@@ -268,8 +420,10 @@ mod tests {
 
     impl Client {
         /// Serving does not return until the first message arrives, so the
-        /// shim runs as its own task rather than before the client speaks.
-        fn serve(shim: Shim) -> Self {
+        /// shim runs as its own task rather than before the client speaks. The
+        /// presence retry runs too, as it does in the process.
+        pub(super) fn serve(shim: Shim) -> Self {
+            shim.keep_presence();
             let (client, server) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
                 if let Ok(service) = shim.serve(server).await {
@@ -284,14 +438,14 @@ mod tests {
             }
         }
 
-        async fn send(&mut self, message: Value) {
+        pub(super) async fn send(&mut self, message: Value) {
             self.writer
                 .write_all(format!("{message}\n").as_bytes())
                 .await
                 .expect("the shim takes the line");
         }
 
-        async fn line(&mut self) -> Value {
+        pub(super) async fn line(&mut self) -> Value {
             let line = timeout(PATIENCE, self.lines.next_line())
                 .await
                 .expect("the shim writes a line in time")
@@ -300,23 +454,47 @@ mod tests {
             serde_json::from_str(&line).expect("the shim writes JSON")
         }
 
-        /// The response to a new request, passing over anything the shim writes
-        /// that is not it.
-        async fn request(&mut self, method: &str, params: Value) -> Value {
+        /// The next line, or `None` when none comes within `within` or the shim
+        /// has closed its end.
+        pub(super) async fn line_within(&mut self, within: Duration) -> Option<Value> {
+            let line = timeout(within, self.lines.next_line()).await.ok()?;
+            let line = line.expect("the line reads")?;
+            Some(serde_json::from_str(&line).expect("the shim writes JSON"))
+        }
+
+        /// Send a request and return its id without waiting for the answer.
+        pub(super) async fn start(&mut self, method: &str, params: Value) -> u64 {
             let id = self.next_id;
             self.next_id += 1;
             self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
                 .await;
+            id
+        }
+
+        /// The response to a new request, and every other line the shim wrote
+        /// on the way to it.
+        pub(super) async fn request_with_notifications(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> (Vec<Value>, Value) {
+            let id = self.start(method, params).await;
+            let mut others = Vec::new();
             loop {
                 let message = self.line().await;
                 if message["id"] == id {
-                    return message;
+                    return (others, message);
                 }
+                others.push(message);
             }
         }
 
+        pub(super) async fn request(&mut self, method: &str, params: Value) -> Value {
+            self.request_with_notifications(method, params).await.1
+        }
+
         /// The legacy handshake, answered with the shim's result.
-        async fn initialize(&mut self) -> Value {
+        pub(super) async fn initialize(&mut self) -> Value {
             let answered = self
                 .request(
                     "initialize",
@@ -332,10 +510,235 @@ mod tests {
             answered
         }
 
-        async fn call(&mut self, tool: &str, arguments: Value) -> Value {
+        pub(super) async fn call(&mut self, tool: &str, arguments: Value) -> Value {
             self.request("tools/call", json!({"name": tool, "arguments": arguments}))
                 .await
         }
+    }
+
+    /// Run the real shim on a thread of its own, make one call through the
+    /// handshake, and return that call's JSON-RPC `result`, or its `error`.
+    pub(crate) fn call_through_the_shim(
+        socket: PathBuf,
+        tool: &str,
+        arguments: Value,
+    ) -> JoinHandle<Value> {
+        let tool = tool.to_string();
+        thread::spawn(move || {
+            block_on(async move {
+                let mut client = Client::serve(Shim::new(Ok(socket)));
+                client.initialize().await;
+                let answered = client.call(&tool, arguments).await;
+                answered
+                    .get("result")
+                    .or_else(|| answered.get("error"))
+                    .cloned()
+                    .expect("a response carries a result or an error")
+            })
+        })
+    }
+
+    /// A shim that has done its handshake and been asked nothing, running on a
+    /// thread of its own. Dropping it closes the client's end, which ends the
+    /// shim and its presence connection, and waits for that.
+    pub(crate) struct IdleShim {
+        written: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Option<oneshot::Sender<()>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl IdleShim {
+        /// Every line the shim wrote to its client after the handshake.
+        pub(crate) fn lines_after_handshake(&self) -> Vec<String> {
+            self.written.lock().expect("the lines are readable").clone()
+        }
+    }
+
+    impl Drop for IdleShim {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    pub(crate) fn idle_shim(socket: PathBuf, presence_retry: Duration) -> IdleShim {
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        let record = written.clone();
+        let thread = thread::spawn(move || {
+            block_on(async move {
+                let shim = Shim::new(Ok(socket)).with_presence_retry(presence_retry);
+                let mut client = Client::serve(shim);
+                client.initialize().await;
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        line = client.lines.next_line() => match line {
+                            Ok(Some(line)) => record
+                                .lock()
+                                .expect("the lines are writable")
+                                .push(line),
+                            _ => break,
+                        },
+                    }
+                }
+            })
+        });
+        IdleShim {
+            written,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{os::unix::net::UnixListener, sync::mpsc, thread};
+
+    use serde_json::{Value, json};
+
+    use super::{
+        testing::{self, Client, PATIENCE, block_on},
+        *,
+    };
+    use crate::agent::{CallId, ConnId, Inbound, Listener, tests::short_socket_path};
+
+    /// What the app side of a test heard from its connections.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Call(CallId, Tool),
+        Hangup(CallId),
+        PresenceOpened(ConnId),
+        PresenceClosed(ConnId),
+    }
+
+    /// What the app side of a test does with a call.
+    enum Behaviour {
+        /// Answer every call, after a wait.
+        Answer(Reply, Duration),
+        /// Leave the first call unanswered and answer every later one.
+        HoldFirstThenAnswer(Reply),
+        /// End every call without an answer.
+        DropCalls,
+    }
+
+    fn executed(text: &str) -> Reply {
+        Reply {
+            status: Status::Executed,
+            text: text.to_string(),
+        }
+    }
+
+    /// The app side: the real listener, with a consumer on a std thread that
+    /// reports what it hears.
+    struct App {
+        path: PathBuf,
+        listener: Option<Listener>,
+        heard: mpsc::Receiver<Seen>,
+    }
+
+    impl App {
+        fn bound_at(path: PathBuf, behaviour: Behaviour) -> Self {
+            let (inbound, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            let Ok(listener) = crate::agent::listen(&path, inbound) else {
+                panic!("the socket binds");
+            };
+            let (heard_by_test, heard) = mpsc::channel();
+            thread::spawn(move || {
+                let mut held = Vec::new();
+                let mut calls = 0;
+                while let Some(message) = incoming.blocking_recv() {
+                    let seen = match message {
+                        Inbound::Call {
+                            id, tool, reply, ..
+                        } => {
+                            calls += 1;
+                            match &behaviour {
+                                Behaviour::Answer(answer, after) => {
+                                    thread::sleep(*after);
+                                    let _ = reply.send(answer.clone());
+                                }
+                                Behaviour::HoldFirstThenAnswer(answer) if calls > 1 => {
+                                    let _ = reply.send(answer.clone());
+                                }
+                                Behaviour::HoldFirstThenAnswer(_) => held.push(reply),
+                                Behaviour::DropCalls => drop(reply),
+                            }
+                            Seen::Call(id, tool)
+                        }
+                        Inbound::Hangup { id } => {
+                            // Nobody is waiting on a held call once its caller
+                            // is gone, and keeping it would keep its thread.
+                            held.clear();
+                            Seen::Hangup(id)
+                        }
+                        Inbound::PresenceOpened { conn } => Seen::PresenceOpened(conn),
+                        Inbound::PresenceClosed { conn } => Seen::PresenceClosed(conn),
+                    };
+                    let _ = heard_by_test.send(seen);
+                }
+            });
+            Self {
+                path,
+                listener: Some(listener),
+                heard,
+            }
+        }
+
+        fn answering(reply: Reply) -> Self {
+            Self::bound_at(
+                short_socket_path(),
+                Behaviour::Answer(reply, Duration::ZERO),
+            )
+        }
+
+        /// Stop listening, as the kill switch does.
+        fn stop(&mut self) {
+            self.listener.take();
+        }
+
+        /// Everything heard until `done` holds of it or `within` runs out.
+        /// Waits without blocking the thread, because the shim under test runs
+        /// on this one.
+        async fn collect(&self, within: Duration, done: impl Fn(&[Seen]) -> bool) -> Vec<Seen> {
+            let mut heard = Vec::new();
+            let deadline = Instant::now() + within;
+            loop {
+                while let Ok(seen) = self.heard.try_recv() {
+                    heard.push(seen);
+                }
+                if done(&heard) || Instant::now() >= deadline {
+                    return heard;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    impl Drop for App {
+        fn drop(&mut self) {
+            self.listener.take();
+            let _ = std::fs::remove_dir_all(self.path.parent().expect("the path has a directory"));
+        }
+    }
+
+    fn opened(heard: &[Seen]) -> usize {
+        heard
+            .iter()
+            .filter(|seen| matches!(seen, Seen::PresenceOpened(_)))
+            .count()
+    }
+
+    fn called(heard: &[Seen]) -> usize {
+        heard
+            .iter()
+            .filter(|seen| matches!(seen, Seen::Call(..)))
+            .count()
     }
 
     /// What a client of the `2026-07-28` era puts on every request instead of
@@ -368,48 +771,6 @@ mod tests {
         response["result"]["content"][0]["text"]
             .as_str()
             .expect("a result carries text")
-    }
-
-    /// The app side: the real listener, with a consumer on a std thread that
-    /// answers every call with `reply` and reports the tool it was asked for.
-    struct App {
-        path: std::path::PathBuf,
-        listener: Option<Listener>,
-        calls: mpsc::Receiver<Tool>,
-    }
-
-    impl App {
-        fn answering(reply: Reply) -> Self {
-            let path = short_socket_path();
-            let (inbound, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-            let Ok(listener) = crate::agent::listen(&path, inbound) else {
-                panic!("the socket binds");
-            };
-            let (seen, calls) = mpsc::channel();
-            thread::spawn(move || {
-                while let Some(message) = incoming.blocking_recv() {
-                    if let crate::agent::Inbound::Call {
-                        tool, reply: to, ..
-                    } = message
-                    {
-                        let _ = seen.send(tool);
-                        let _ = to.send(reply.clone());
-                    }
-                }
-            });
-            Self {
-                path,
-                listener: Some(listener),
-                calls,
-            }
-        }
-    }
-
-    impl Drop for App {
-        fn drop(&mut self) {
-            self.listener.take();
-            let _ = std::fs::remove_dir_all(self.path.parent().expect("the path has a directory"));
-        }
     }
 
     #[test]
@@ -490,10 +851,7 @@ mod tests {
 
     #[test]
     fn a_call_rides_its_own_connection_and_returns_the_apps_answer() {
-        let app = App::answering(Reply {
-            status: Status::Executed,
-            text: "[]".to_string(),
-        });
+        let app = App::answering(executed("[]"));
         block_on(async {
             let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
             client.initialize().await;
@@ -503,9 +861,253 @@ mod tests {
                 answered["result"]["content"][0]["text"],
                 "status: executed\n[]"
             );
+            let heard = app
+                .collect(PATIENCE, |heard| called(heard) > 0 && opened(heard) > 0)
+                .await;
+            assert_eq!(called(&heard), 1, "{heard:?}");
+            assert!(
+                heard
+                    .iter()
+                    .any(|seen| matches!(seen, Seen::Call(_, Tool::ListConnections)))
+            );
         });
-        assert_eq!(app.calls.recv_timeout(PATIENCE), Ok(Tool::ListConnections));
-        assert!(app.calls.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_waiting_call_sends_progress_against_its_token() {
+        let app = App::bound_at(
+            short_socket_path(),
+            Behaviour::Answer(executed("done"), Duration::from_millis(300)),
+        );
+        block_on(async {
+            let shim =
+                Shim::new(Ok(app.path.clone())).with_progress_every(Duration::from_millis(50));
+            let mut client = Client::serve(shim);
+            client.initialize().await;
+            let (others, answered) = client
+                .request_with_notifications(
+                    "tools/call",
+                    json!({
+                        "name": "list_connections",
+                        "arguments": {},
+                        "_meta": {"progressToken": 7},
+                    }),
+                )
+                .await;
+            let progress: Vec<f64> = others
+                .iter()
+                .filter(|line| line["method"] == "notifications/progress")
+                .map(|line| {
+                    assert_eq!(line["params"]["progressToken"], 7, "{line}");
+                    line["params"]["progress"]
+                        .as_f64()
+                        .expect("progress is a number")
+                })
+                .collect();
+            assert!(progress.len() >= 2, "{others:?}");
+            assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                answered["result"]["content"][0]["text"],
+                "status: executed\ndone"
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancelled_call_hangs_up_its_connection() {
+        let app = App::bound_at(
+            short_socket_path(),
+            Behaviour::HoldFirstThenAnswer(executed("[]")),
+        );
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            let waiting = client
+                .start(
+                    "tools/call",
+                    json!({"name": "ping", "arguments": {"connection": "Orders"}}),
+                )
+                .await;
+            let heard = app.collect(PATIENCE, |heard| called(heard) > 0).await;
+            let Some(Seen::Call(id, _)) = heard
+                .into_iter()
+                .find(|seen| matches!(seen, Seen::Call(..)))
+            else {
+                panic!("the call reaches the app");
+            };
+
+            client
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": waiting},
+                }))
+                .await;
+            let heard = app
+                .collect(Duration::from_secs(1), |heard| {
+                    heard.contains(&Seen::Hangup(id))
+                })
+                .await;
+            assert!(heard.contains(&Seen::Hangup(id)), "{heard:?}");
+
+            // Nothing is written for the call that was cancelled.
+            while let Some(line) = client.line_within(Duration::from_millis(300)).await {
+                assert_ne!(line["id"], waiting, "{line}");
+            }
+
+            let answered = client.call("list_connections", json!({})).await;
+            assert_eq!(
+                answered["result"]["content"][0]["text"],
+                "status: executed\n[]"
+            );
+        });
+    }
+
+    #[test]
+    fn a_connection_closed_before_an_answer_reads_app_not_running() {
+        let app = App::bound_at(short_socket_path(), Behaviour::DropCalls);
+        let result =
+            testing::call_through_the_shim(app.path.clone(), "list_connections", json!({}))
+                .join()
+                .expect("the shim's thread ends");
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "status: app_not_running\nDBDelve closed the connection without answering."
+        );
+    }
+
+    #[test]
+    fn the_shim_holds_one_presence_and_reopens_it_on_the_next_call() {
+        let path = short_socket_path();
+        let mut first = App::bound_at(
+            path.clone(),
+            Behaviour::Answer(executed("[]"), Duration::ZERO),
+        );
+        block_on(async {
+            // Only a call can reopen presence within this test.
+            let shim = Shim::new(Ok(path.clone())).with_presence_retry(Duration::from_secs(60));
+            let mut client = Client::serve(shim);
+            client.initialize().await;
+            let heard = first.collect(PATIENCE, |heard| opened(heard) > 0).await;
+            assert_eq!(opened(&heard), 1, "{heard:?}");
+            let heard = first.collect(Duration::from_millis(200), |_| false).await;
+            assert_eq!(opened(&heard), 0, "a second presence was opened: {heard:?}");
+
+            // The app goes away, and the shim keeps serving.
+            first.stop();
+            let answered = client.call("list_connections", json!({})).await;
+            assert_eq!(
+                error_text(&answered),
+                format!("status: app_not_running\n{NOT_RUNNING}")
+            );
+
+            // It comes back: the next call reopens presence and is answered.
+            let second = App::bound_at(
+                path.clone(),
+                Behaviour::Answer(executed("[]"), Duration::ZERO),
+            );
+            let answered = client.call("list_connections", json!({})).await;
+            assert_eq!(
+                answered["result"]["content"][0]["text"],
+                "status: executed\n[]"
+            );
+            let heard = second
+                .collect(PATIENCE, |heard| opened(heard) > 0 && called(heard) > 0)
+                .await;
+            assert_eq!(opened(&heard), 1, "{heard:?}");
+            assert_eq!(called(&heard), 1, "{heard:?}");
+            let heard = second.collect(Duration::from_millis(200), |_| false).await;
+            assert_eq!(opened(&heard), 0, "a second presence was opened: {heard:?}");
+        });
+    }
+
+    #[test]
+    fn an_idle_shim_opens_presence_once_the_app_listens_without_any_call() {
+        let path = short_socket_path();
+        let retry = Duration::from_millis(50);
+        let idle = testing::idle_shim(path.clone(), retry);
+        block_on(async {
+            // Several retries fail silently with nothing bound.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let app = App::bound_at(path.clone(), Behaviour::DropCalls);
+
+            let heard = app
+                .collect(Duration::from_secs(1), |heard| opened(heard) > 0)
+                .await;
+            assert_eq!(opened(&heard), 1, "{heard:?}");
+            let Some(Seen::PresenceOpened(conn)) = heard
+                .into_iter()
+                .find(|seen| matches!(seen, Seen::PresenceOpened(_)))
+            else {
+                panic!("a presence opens");
+            };
+
+            // Left alone, it stays one presence and asks nothing.
+            let heard = app.collect(Duration::from_millis(300), |_| false).await;
+            assert_eq!(opened(&heard), 0, "{heard:?}");
+            assert_eq!(called(&heard), 0, "{heard:?}");
+            assert!(idle.lines_after_handshake().is_empty());
+
+            drop(idle);
+            let heard = app
+                .collect(PATIENCE, |heard| {
+                    heard.contains(&Seen::PresenceClosed(conn))
+                })
+                .await;
+            assert!(heard.contains(&Seen::PresenceClosed(conn)), "{heard:?}");
+        });
+    }
+
+    #[test]
+    fn a_ping_without_a_connection_name_is_an_invalid_params_error() {
+        let app = App::answering(executed("[]"));
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            for (tool, arguments) in [
+                ("ping", json!({})),
+                ("ping", json!({"connection": "a", "x": 1})),
+                ("ping", json!({"connection": 3})),
+                ("list_connections", json!({"connection": "a"})),
+                ("not_a_tool", json!({})),
+            ] {
+                let answered = client.call(tool, arguments).await;
+                assert_eq!(answered["error"]["code"], -32602, "{tool}: {answered}");
+            }
+            let heard = app.collect(Duration::from_millis(300), |_| false).await;
+            assert_eq!(called(&heard), 0, "{heard:?}");
+        });
+    }
+
+    #[test]
+    fn a_failed_connect_says_only_what_was_observed() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert_eq!(failed_connect_text(&Error::from(kind)), NOT_RUNNING);
+        }
+        assert_eq!(
+            failed_connect_text(&Error::from(ErrorKind::PermissionDenied)),
+            "Could not connect to DBDelve's agent socket: permission denied."
+        );
+        let other = failed_connect_text(&Error::from(ErrorKind::TimedOut));
+        assert_eq!(
+            other,
+            format!(
+                "Could not connect to DBDelve's agent socket: {}.",
+                Error::from(ErrorKind::TimedOut)
+            )
+        );
+        for text in [
+            NOT_RUNNING.to_string(),
+            other,
+            failed_connect_text(&Error::from(ErrorKind::PermissionDenied)),
+        ] {
+            for advice in ["try", "please", "should", "make sure", "restart"] {
+                assert!(!text.to_lowercase().contains(advice), "{text}");
+            }
+        }
     }
 }
 
