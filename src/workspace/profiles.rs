@@ -40,6 +40,7 @@ impl Workspace {
             .map(|profile| profile.stored())
             .collect::<Vec<_>>();
         let active = self.profile().map(|profile| profile.id.clone());
+        let agent_access = self.agent_access_to_save();
         let picked = fonts(cx);
         let fonts = store::StoredFonts {
             chrome: Some(picked.chrome.to_string()),
@@ -67,6 +68,7 @@ impl Workspace {
             client_sort: Some(self.settings.client_sort),
             qualify_completions: Some(self.settings.qualify_completions),
             welcomed: Some(self.settings.welcomed),
+            agent_access,
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };

@@ -371,6 +371,12 @@ pub enum Command {
     ShowToAgents(usize),
     /// Hide this connection from agents, at once and with no dialog.
     HideFromAgents(usize),
+    /// Open the socket agents reach DBDelve on, and keep access on across
+    /// launches.
+    TurnOnAgentAccess,
+    /// The kill switch: answer every waiting call `rejected`, close every
+    /// agent connection, and turn access off across launches.
+    DisconnectAgents,
     /// Put the palette back up over the projects this connection can join.
     ChooseProject(usize),
     /// `None` is No project.
@@ -475,10 +481,10 @@ pub enum Command {
     DownloadUpdate(String),
 }
 
-struct Item {
+pub(crate) struct Item {
     /// What the matcher scores, and what the row reads as. One string for both,
     /// so nothing can be found by text that is not on screen.
-    label: String,
+    pub(crate) label: String,
     /// What else the matcher scores, each on its own, for a row also found by
     /// what is drawn beside it: a connection by its host, which its detail
     /// shows. Built once per open.
@@ -1023,6 +1029,8 @@ pub fn remembered(scope: Scope, command: &Command) -> bool {
                 // did not open for it.
                 | Command::ShowToAgents(_)
                 | Command::HideFromAgents(_)
+                | Command::TurnOnAgentAccess
+                | Command::DisconnectAgents
         )
 }
 
@@ -3312,10 +3320,41 @@ fn welcome_items(workspace: &Workspace) -> Vec<Item> {
     let overrides = &workspace.settings.custom_keybindings;
     let mut items = starting_items(overrides);
     items.extend(appearance_items(overrides));
+    items.extend(agent_items(workspace));
     if !workspace.unavailable.is_empty() {
         items.extend(connection_items(workspace));
     }
     items
+}
+
+/// The one row that governs agent access: turning it on while this window is
+/// not listening, the kill switch while it is. Nothing on an OS the socket
+/// does not run on, where there is nothing to turn on. `cfg!`, not `#[cfg]`,
+/// so the row's code builds and is checked everywhere.
+pub(crate) fn agent_items(workspace: &Workspace) -> Vec<Item> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    let overrides = &workspace.settings.custom_keybindings;
+    vec![if workspace.agent.bridge.is_none() {
+        command(
+            "Turn agent access on",
+            icon::AGENT_VISIBLE,
+            Command::TurnOnAgentAccess,
+            AGENTS,
+        )
+    } else {
+        with_chord(
+            command(
+                "Disconnect agents and turn access off",
+                icon::AGENT_VISIBLE,
+                Command::DisconnectAgents,
+                AGENTS,
+            ),
+            "disconnect_agents",
+            overrides,
+        )
+    }]
 }
 
 fn command(label: &str, icon: &'static str, command: Command, group: &'static str) -> Item {
@@ -3430,6 +3469,7 @@ const EDITS: &str = "Edits";
 const RESULTS: &str = "Results";
 const TAB: &str = "Tab";
 const CONNECTION: &str = "Connection";
+const AGENTS: &str = "Agents";
 const PROJECT: &str = "Project";
 const APPEARANCE: &str = "Appearance";
 const WINDOW: &str = "Window";
@@ -4240,6 +4280,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         ));
     }
     items.extend(appearance_items(overrides));
+    items.extend(agent_items(workspace));
     if let Some(release) = &workspace.newer_release {
         items.push(command(
             &format!("Download dbdelve {}", release.version),
@@ -4931,6 +4972,14 @@ mod tests {
         for scope in [Scope::Commands, Scope::Connections] {
             assert!(!remembered(scope, &Command::ShowToAgents(0)));
             assert!(!remembered(scope, &Command::HideFromAgents(0)));
+        }
+    }
+
+    #[test]
+    fn agent_access_rows_are_never_remembered() {
+        for scope in [Scope::Commands, Scope::Connections] {
+            assert!(!remembered(scope, &Command::TurnOnAgentAccess));
+            assert!(!remembered(scope, &Command::DisconnectAgents));
         }
     }
 

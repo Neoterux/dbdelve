@@ -669,6 +669,8 @@ impl Workspace {
                     self.set_agent_visible(&id, false, cx);
                 }
             }
+            Command::TurnOnAgentAccess => self.turn_on_agent_access(cx),
+            Command::DisconnectAgents => self.disconnect_agents(cx),
             Command::ChooseProject(index) => {
                 self.open_palette(PaletteMode::MoveToProject(index), window, cx)
             }
