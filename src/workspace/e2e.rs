@@ -3707,15 +3707,53 @@ fn shown_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Op
     })
 }
 
-/// The labels of the palette's agent access row, which is one row or none.
+/// The labels of the palette's agent access row, which is one row or none: the
+/// registration row is there whatever the access, and has its own test.
 #[cfg(unix)]
 fn agent_access_rows(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
     workspace.read_with(cx, |workspace, _| {
         crate::palette::agent_items(workspace)
             .into_iter()
             .map(|item| item.label)
+            .filter(|label| label != "Copy Claude Code registration")
             .collect()
     })
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn copying_the_registration_puts_the_line_on_the_clipboard_and_says_so(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        assert!(workspace.read_with(cx, |workspace, _| {
+            crate::palette::agent_items(workspace)
+                .iter()
+                .any(|item| item.label == "Copy Claude Code registration")
+        }));
+
+        run_command(&workspace, cx, Command::CopyAgentRegistration);
+        let line = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("the line was copied");
+        // The name and the option depend on the variant this process runs
+        // under; the shape around them does not.
+        assert!(line.starts_with("claude mcp add --scope user "), "{line}");
+        assert!(line.ends_with("' mcp"), "{line}");
+        assert!(line.contains(" -- '/"), "{line}");
+        let notice = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .and_then(|profile| profile.session.notice.clone())
+        });
+        assert_eq!(
+            notice.as_deref(),
+            Some("Copied the Claude Code registration line.")
+        );
+    });
 }
 
 #[cfg(unix)]
