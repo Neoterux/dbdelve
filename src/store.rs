@@ -500,6 +500,13 @@ pub struct StoredSettings {
     /// before there was one.
     #[serde(default)]
     pub welcomed: Option<bool>,
+    /// Whether agents may reach this variant's windows over the socket.
+    /// Absent reads as off, including in a file written before the field
+    /// existed. Only a window's own access actions write it, through
+    /// `Workspace::agent_access_to_save`: every other save carries the file's
+    /// value forward, so one window's save never undoes another's choice.
+    #[serde(default)]
+    pub agent_access: Option<bool>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -2698,7 +2705,15 @@ user = ""
 
         let mut counter = LOCK.lock().unwrap_or_else(|error| error.into_inner());
         *counter += 1;
-        let home = std::env::temp_dir().join(format!(
+        // On Unix the home is short on purpose: the agent socket lives under
+        // it, and under macOS's `temp_dir()` that path is about 117 bytes
+        // against the 104 `sun_path` holds. Tests of the socket then bind the
+        // path the app derives, not a stand-in for it.
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir();
+        let home = root.join(format!(
             "dbdelve-store-test-{}-{}",
             std::process::id(),
             *counter
@@ -3748,6 +3763,7 @@ open_objects = []
                 client_sort: Some(true),
                 qualify_completions: Some(true),
                 welcomed: Some(true),
+                agent_access: Some(true),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),
@@ -3854,6 +3870,39 @@ open_objects = []
             .expect("a file predating settings must load")
             .settings;
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn agent_access_is_off_unless_saved_on() {
+        let read = |text: &str| {
+            decode_profiles(text, &[])
+                .expect("the file decodes")
+                .settings
+                .and_then(|settings| settings.agent_access)
+        };
+        assert_eq!(read(""), None);
+        assert_eq!(read("[settings]\ncheck_for_updates = false\n"), None);
+        assert_eq!(read("[settings]\nagent_access = true\n"), Some(true));
+        assert_eq!(read("[settings]\nagent_access = false\n"), Some(false));
+
+        // Written ahead of the tables whichever way it is set, or TOML would
+        // refuse the file.
+        for choice in [Some(true), Some(false)] {
+            let file = ProfileFile {
+                settings: Some(StoredSettings {
+                    agent_access: choice,
+                    custom_keybindings: Some(HashMap::from([(
+                        "apply_edits".to_string(),
+                        "cmd-shift-s".to_string(),
+                    )])),
+                    ..StoredSettings::default()
+                }),
+                ..ProfileFile::default()
+            };
+            let text = toml::to_string_pretty(&file).expect("the file encodes");
+            let decoded: ProfileFile = toml::from_str(&text).expect("the file decodes");
+            assert_eq!(decoded, file, "{text}");
+        }
     }
 
     #[test]

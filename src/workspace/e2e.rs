@@ -146,13 +146,23 @@ fn launch_with_profiles<'a>(
     cx: &'a mut TestAppContext,
     profiles: &str,
 ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    launch_with_settings(cx, "", profiles)
+}
+
+/// `launch_with_profiles` with more `[settings]` keys, such as
+/// `agent_access = true`.
+fn launch_with_settings<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+    profiles: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
     let directory = store::dbdelve_directory().expect("the test home has a data directory");
     std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
     let database = directory.join("e2e.db");
     std::fs::write(&database, b"").expect("the database file must be creatable");
     std::fs::write(
         directory.join("profiles.toml"),
-        format!("[settings]\ncheck_for_updates = false\n{profiles}")
+        format!("[settings]\ncheck_for_updates = false\n{settings}\n{profiles}")
             .replace("DB_PATH", &format!("{:?}", database.display().to_string())),
     )
     .expect("profiles.toml must be writable");
@@ -3672,6 +3682,126 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
         assert!(rest.is_empty());
         quit(workspace, cx);
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// What `agent_access` reads as in the file, which is what the next launch
+/// would act on.
+#[cfg(unix)]
+fn saved_agent_access() -> Option<bool> {
+    store::peek_profiles(&[])
+        .expect("profiles.toml reads back")
+        .settings
+        .and_then(|settings| settings.agent_access)
+}
+
+/// The notice where `Workspace::note` put it: on the profile in front, else on
+/// the connection form, else on the welcome surface.
+#[cfg(unix)]
+fn shown_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| match workspace.profile() {
+        Some(profile) => profile.session.shown_notice().map(str::to_string),
+        None => match &workspace.form {
+            Some(form) => form.error.clone(),
+            None => workspace.welcome_notice.clone(),
+        },
+    })
+}
+
+/// The labels of the palette's agent access row, which is one row or none.
+#[cfg(unix)]
+fn agent_access_rows(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    workspace.read_with(cx, |workspace, _| {
+        crate::palette::agent_items(workspace)
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    })
+}
+
+#[cfg(unix)]
+const PING_ORDERS: &str = r#"{"v":1,"kind":"call","tool":"ping","connection":"Orders"}"#;
+
+#[cfg(unix)]
+#[gpui::test]
+fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::{fs::PermissionsExt, net::UnixStream};
+
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        assert_eq!(agent_access_rows(&workspace, cx), ["Turn agent access on"]);
+        assert_eq!(saved_agent_access(), None);
+
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_some()));
+        assert!(path.exists(), "the socket is bound at the derived path");
+        let mode = std::fs::metadata(path.parent().expect("the socket has a directory"))
+            .expect("the directory exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(saved_agent_access(), Some(true));
+        assert_eq!(
+            agent_access_rows(&workspace, cx),
+            ["Disconnect agents and turn access off"]
+        );
+
+        // Another setting's save writes back what the file holds, not a copy
+        // this window made at launch.
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(false, cx));
+        assert_eq!(saved_agent_access(), Some(true));
+
+        let listed = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        drive_until(cx, |_| listed.is_finished());
+        let reply: Reply = serde_json::from_str(
+            listed
+                .join()
+                .expect("the client thread finished")
+                .trim_end(),
+        )
+        .expect("one answer frame");
+        assert_eq!(reply.status, Status::Executed);
+        assert!(reply.text.contains("Orders"), "{}", reply.text);
+
+        let ping = raw_call(&path, PING_ORDERS);
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        drive_until(cx, |_| ping.is_finished());
+        assert_eq!(
+            ping.join().expect("the client thread finished").trim_end(),
+            r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(workspace.read_with(cx, |workspace, _| workspace.agent.bridge.is_none()));
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "no file is left at the socket path"
+        );
+        assert!(UnixStream::connect(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(agent_access_rows(&workspace, cx), ["Turn agent access on"]);
+
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(true, cx));
+        assert_eq!(saved_agent_access(), Some(false));
+
+        // Pressed again with nothing listening, it changes nothing and says
+        // nothing.
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(saved_agent_access(), Some(false));
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        quit(workspace, cx);
     });
 }
 
