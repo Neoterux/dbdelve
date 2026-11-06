@@ -34,6 +34,8 @@ impl Workspace {
         if self.store_unreadable {
             return;
         }
+        self.adopt_saved_visibility(cx);
+        self.agent.visibility_choices.clear();
         let profiles = self
             .profiles
             .iter()
