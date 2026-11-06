@@ -4539,14 +4539,16 @@ const MEMBER_FORMS: &[&str] = &["nextval"];
 /// compares names and never reads what a string says. The list is therefore
 /// best-effort inside a `SELECT`, and a name missing from it is not a small
 /// matter. Where an engine holds Read-only on the server, the hold refuses a
-/// write that goes through the executor, but not a large-object write or a call
-/// carried inside a carrier's text: the conformance scenarios run both with the
-/// hold armed, so the list is what stops those. Where an engine has no hold,
-/// the list is the whole boundary. The same root cause reached the list five
-/// times: a spelling of a name, a sibling family of names, the functions that
-/// execute their text argument, one of those whose text argument the catalog
-/// does not name, so a shape probe over the catalog could not find it, and the
-/// functions in an extension outside `pg_catalog` that run text they are handed.
+/// write that goes through the executor, but not a large-object write, a file
+/// the server writes outside the database, or a call carried inside a carrier's
+/// text: the conformance scenarios run the first and last with the hold armed,
+/// so the list is what stops those. Where an engine has no hold, the list is
+/// the whole boundary. The same root cause reached the list six times: a
+/// spelling of a name, a sibling family of names, the functions that execute
+/// their text argument, one of those whose text argument the catalog does not
+/// name, so a shape probe over the catalog could not find it, the functions in
+/// an extension outside `pg_catalog` that run text they are handed, and the file
+/// functions a contrib extension (`adminpack`) installs into `pg_catalog`.
 fn calls_denied_function(engine: Engine, sql: &str) -> bool {
     calls_listed(
         engine,

@@ -3409,6 +3409,20 @@ mod tests {
         assert_eq!(databases.current.as_deref(), Some("postgres"));
     }
 
+    /// Drops the scratch database when the test ends, panicking or not.
+    /// The result is ignored: the test's own failure is the one worth
+    /// reading.
+    struct Scratch<'a>(&'a crate::db::Connection, String);
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.query(
+                &self.1,
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            );
+        }
+    }
+
     /// The extension carriers the Postgres deny-list names, run against the
     /// server with the Read-only hold armed. It works in a database of its own
     /// because the dev database is shared and an extension is database-wide,
@@ -3427,16 +3441,6 @@ mod tests {
         const SCRATCH: &str = "dbdelve_carriers_975";
         let at = "live_extension_carriers_agree_with_the_server";
         let drop_scratch = format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)");
-
-        /// Drops the scratch database when the test ends, panicking or not.
-        /// The result is ignored: the test's own failure is the one worth
-        /// reading.
-        struct Scratch<'a>(&'a Any, String);
-        impl Drop for Scratch<'_> {
-            fn drop(&mut self) {
-                let _ = self.0.query(&self.1, &Cancel::default(), Fetch::default());
-            }
-        }
 
         let maintenance = live_profile();
         for statement in [
@@ -3759,6 +3763,117 @@ mod tests {
                 // `quote_ident`; its new SRID is an integer.
                 "updategeometrysrid",
             ],
+        );
+    }
+
+    /// Every function `adminpack` owns, pinned against the Postgres deny and
+    /// egress lists with no carve-outs. It works in a database of its own
+    /// because the dev database is shared and an extension is installed per
+    /// database, and it needs the same kind of role as
+    /// [`live_extension_carriers_agree_with_the_server`], one that can create a
+    /// database and install an extension. The expected names come from the
+    /// PostgreSQL 16 documentation for `adminpack`, not from a run against a
+    /// server. A member a later version adds fails here by name. The extension
+    /// was removed in PostgreSQL 17, so on that server and later the test
+    /// asserts it is not offered.
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_every_function_adminpack_owns_is_on_the_deny_or_egress_list() {
+        use crate::db::{CancelToken as Cancel, Connection as Any};
+
+        const SCRATCH: &str = "dbdelve_adminpack";
+        let at = "live_every_function_adminpack_owns_is_on_the_deny_or_egress_list";
+        let maintenance = live_profile();
+        let ask = |connection: &Any, sql: &str| {
+            connection
+                .query(sql, &Cancel::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{at}: `{sql}` failed: {error}"))
+        };
+        let first_cell = |result: &QueryResult| {
+            result
+                .rows
+                .first()
+                .and_then(|row| row.get(0))
+                .map(str::to_string)
+        };
+
+        let version = first_cell(&ask(
+            &maintenance,
+            "SELECT current_setting('server_version_num')",
+        ))
+        .and_then(|text| text.parse::<u32>().ok())
+        .unwrap_or_else(|| panic!("{at}: the server did not report a version number"));
+        if version >= 170000 {
+            let offered = ask(
+                &maintenance,
+                "SELECT name FROM pg_catalog.pg_available_extensions WHERE name = 'adminpack'",
+            );
+            assert!(
+                offered.rows.is_empty(),
+                "{at}: a server of version {version} offers adminpack, which 17 removed"
+            );
+            return;
+        }
+
+        let drop_scratch = format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)");
+        for statement in [
+            drop_scratch.clone(),
+            format!("CREATE DATABASE {SCRATCH} TEMPLATE template0"),
+        ] {
+            ask(&maintenance, &statement);
+        }
+        // Declared after `maintenance` and before the scratch connection, so
+        // it drops between them: the drop's FORCE ends the scratch session.
+        let _scratch = Scratch(&maintenance, drop_scratch);
+        let scratch = Any::Postgres(
+            Connection::open(&ServerConfig {
+                database: SCRATCH.into(),
+                ..live_config()
+            })
+            .expect("the scratch database should open"),
+        );
+
+        ask(&scratch, "CREATE EXTENSION adminpack");
+        let members: Vec<String> = ask(
+            &scratch,
+            "SELECT DISTINCT p.proname FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::regclass \
+             AND d.objid = p.oid AND d.deptype = 'e' \
+             JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+             WHERE e.extname = 'adminpack' ORDER BY 1",
+        )
+        .rows
+        .iter()
+        .filter_map(|row| row.get(0).map(str::to_string))
+        .collect();
+
+        assert!(
+            !members.is_empty(),
+            "{at}: the catalog lists no function owned by adminpack"
+        );
+        for expected in [
+            "pg_file_write",
+            "pg_file_rename",
+            "pg_file_unlink",
+            "pg_file_sync",
+            "pg_logdir_ls",
+        ] {
+            assert!(
+                members.iter().any(|name| name == expected),
+                "{at}: adminpack does not own `{expected}`: {members:?}"
+            );
+        }
+        let sql = &Engine::Postgres.spec().sql;
+        let unlisted: Vec<_> = members
+            .iter()
+            .filter(|name| {
+                !sql.denied_functions.contains(&name.as_str())
+                    && !sql.egress_functions.contains(&name.as_str())
+            })
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "{at}: functions owned by adminpack on neither the deny-list nor the egress list: {unlisted:?}"
         );
     }
 

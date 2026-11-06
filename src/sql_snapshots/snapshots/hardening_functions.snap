@@ -58,6 +58,10 @@ source: src/sql_snapshots.rs
 [postgres] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT st_findextent('t', 'a') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[postgres] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[postgres] scalar: SELECT pg_file_sync('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [postgres] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -100,6 +104,7 @@ source: src/sql_snapshots.rs
 [postgres] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[postgres] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [postgres] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -182,6 +187,10 @@ source: src/sql_snapshots.rs
 [mysql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mysql] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mysql] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -224,6 +233,7 @@ source: src/sql_snapshots.rs
 [mysql] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mysql] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mysql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -306,6 +316,10 @@ source: src/sql_snapshots.rs
 [mariadb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mariadb] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [mariadb] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -348,6 +362,7 @@ source: src/sql_snapshots.rs
 [mariadb] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mariadb] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mariadb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -430,6 +445,10 @@ source: src/sql_snapshots.rs
 [sqlite] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[sqlite] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -472,6 +491,7 @@ source: src/sql_snapshots.rs
 [sqlite] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[sqlite] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [sqlite] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -554,6 +574,10 @@ source: src/sql_snapshots.rs
 [turso] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[turso] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -596,6 +620,7 @@ source: src/sql_snapshots.rs
 [turso] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[turso] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [turso] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -678,6 +703,10 @@ source: src/sql_snapshots.rs
 [duckdb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[duckdb] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -720,6 +749,7 @@ source: src/sql_snapshots.rs
 [duckdb] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[duckdb] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [duckdb] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -802,6 +832,10 @@ source: src/sql_snapshots.rs
 [snowflake] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[snowflake] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -844,6 +878,7 @@ source: src/sql_snapshots.rs
 [snowflake] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[snowflake] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [snowflake] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -926,6 +961,10 @@ source: src/sql_snapshots.rs
 [clickhouse] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[clickhouse] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -968,6 +1007,7 @@ source: src/sql_snapshots.rs
 [clickhouse] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[clickhouse] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [clickhouse] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1050,6 +1090,10 @@ source: src/sql_snapshots.rs
 [mssql] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT st_findextent('t', 'a') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[mssql] scalar: SELECT pg_file_sync('x') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT get_lock('k', 1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_lock('k') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1092,6 +1136,7 @@ source: src/sql_snapshots.rs
 [mssql] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
+[mssql] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [mssql] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1174,6 +1219,10 @@ source: src/sql_snapshots.rs
 [mongodb] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT st_findextent('t', 'a') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_file_rename('x', 'y') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_file_unlink('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] scalar: SELECT pg_file_sync('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] scalar: SELECT release_all_locks() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1216,6 +1265,7 @@ source: src/sql_snapshots.rs
 [mongodb] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[mongodb] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control user-defined call: SELECT my_function(1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [mongodb] control plain projection: SELECT a, b FROM t => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
@@ -1298,6 +1348,10 @@ source: src/sql_snapshots.rs
 [redis] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT st_findextent('t', 'a') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_file_rename('x', 'y') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_file_unlink('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] scalar: SELECT pg_file_sync('x') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_lock('k') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] scalar: SELECT release_all_locks() => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1340,6 +1394,7 @@ source: src/sql_snapshots.rs
 [redis] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
+[redis] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [Unreadable] gate ro=Some(Upgrade(ReadWrite)) rw=Some(RunOnce) full=Some(RunOnce)|
 [redis] control user-defined call: SELECT my_function(1) => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [redis] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
@@ -1422,6 +1477,10 @@ source: src/sql_snapshots.rs
 [generic] scalar: SELECT connectby('rel', 'k', 'p', '0', 0) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] scalar: SELECT xpath_table('id', 'doc', 'rel', '/r/a', 'true') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] scalar: SELECT st_findextent('t', 'a') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] scalar: SELECT pg_file_write('x', 'abc', false) => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_file_rename('x', 'y') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_file_unlink('x') => |classify=Full [] gate ro=Some(Upgrade(Full)) rw=Some(Upgrade(Full)) full=None|
+[generic] scalar: SELECT pg_file_sync('x') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] scalar: SELECT get_lock('k', 1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] scalar: SELECT release_lock('k') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] scalar: SELECT release_all_locks() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
@@ -1464,6 +1523,7 @@ source: src/sql_snapshots.rs
 [generic] control file reader: SELECT * FROM read_csv('f.csv') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] control file string factor: SELECT * FROM 'f.csv' => |classify=ReadOnly [] gate ro=None rw=None full=None|
 [generic] control pg_read_file: SELECT pg_read_file('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
+[generic] control pg_logdir_ls: SELECT * FROM pg_logdir_ls() => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] control load_file: SELECT LOAD_FILE('/etc/hostname') => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] control user-defined call: SELECT my_function(1) => |classify=ReadWrite [] gate ro=Some(Upgrade(ReadWrite)) rw=None full=None|
 [generic] control plain projection: SELECT a, b FROM t => |classify=ReadOnly [] gate ro=None rw=None full=None|
