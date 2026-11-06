@@ -3697,7 +3697,6 @@ fn saved_agent_access() -> Option<bool> {
 
 /// The notice where `Workspace::note` put it: on the profile in front, else on
 /// the connection form, else on the welcome surface.
-#[cfg(unix)]
 fn shown_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
     workspace.read_with(cx, |workspace, _| match workspace.profile() {
         Some(profile) => profile.session.shown_notice().map(str::to_string),
@@ -4036,10 +4035,11 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
         drive_until(cx, |cx| {
             workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
         });
-        assert!(
-            editor_has_keyboard(&workspace, cx),
-            "the chord is pressed with the keyboard in the editor"
-        );
+        // A waiting ping's dialog holds the keyboard, so the chord is pressed
+        // from inside it, and has to reach the workspace from there.
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert!(dialog_has_keyboard(&workspace, cx));
 
         cx.simulate_keystrokes("secondary-shift-k");
         drive_until(cx, |_| {
@@ -4059,6 +4059,9 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
             "a presence is closed, and is sent nothing"
         );
         assert!(pending_calls(&workspace, cx).is_empty());
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.agent.presence.is_empty());
             assert!(workspace.agent.bridge.is_none());
@@ -4195,6 +4198,222 @@ fn the_ways_to_import_show_only_where_rows_can_be_imported(cx: &mut TestAppConte
         settle(cx);
         assert!(!drawn("paste-rows", cx), "read-only has nothing to invite");
 
+        quit(workspace, cx);
+    });
+}
+
+/// The call the ping dialog is about.
+fn front_ping_id(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::agent::CallId> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.front_ping().map(|call| call.id)
+    })
+}
+
+fn denied() -> crate::agent::Reply {
+    crate::agent::Reply {
+        status: crate::agent::Status::Rejected,
+        text: "The ping was denied in DBDelve.".to_string(),
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_ping_through_the_shim_waits_for_the_human_and_answers_executed(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let visible = "agent_visible = true";
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("orders", "Orders", visible),
+                sqlite_profile("reports", "Reports", visible),
+            ]
+            .concat(),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "ping",
+            serde_json::json!({ "connection": "Reports" }),
+        );
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(ringed_button(&workspace, cx), 0);
+        assert!(!shim.is_finished(), "the agent waits for the human");
+
+        let approve = cx
+            .debug_bounds("agent-ping-approve")
+            .expect("the dialog draws Approve");
+        cx.simulate_click(approve.center(), gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "status: executed\nThe ping was approved in DBDelve."
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let reports = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "reports")
+                .expect("the profile was restored");
+            assert!(
+                matches!(reports.state, ProfileState::Idle),
+                "approving a ping opened a connection"
+            );
+        });
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(ringed_button(&workspace, cx), 0);
+
+        for key in ["right", "left", "tab"] {
+            press(cx, key);
+            assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"), "{key}");
+            assert_eq!(ringed_button(&workspace, cx), 0, "{key}");
+            assert_eq!(pending_calls(&workspace, cx), [id], "{key}");
+            assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty), "{key}");
+        }
+
+        press(cx, "enter");
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        press(cx, "escape");
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{EXPIRY, Inbound, Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+
+        // Hung up.
+        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id }, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(
+            answers.try_recv().is_err(),
+            "a hung-up call is sent nothing"
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // Expired.
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        cx.executor()
+            .advance_clock(EXPIRY + std::time::Duration::from_secs(1));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(
+            answers.try_recv().ok().map(|reply| reply.status),
+            Some(Status::Expired)
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // Cut off. No bridge runs here: the kill switch answers every pending
+        // call first, with or without one.
+        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(
+            answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn pings_are_answered_oldest_first(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Reply, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let (first, first_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (second, second_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_ping_id(&workspace, cx), Some(first));
+
+        workspace.update(cx, |workspace, cx| workspace.approve_ping(first, cx));
+        settle(cx);
+        assert_eq!(
+            first_answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Executed,
+                text: "The ping was approved in DBDelve.".to_string(),
+            })
+        );
+        assert_eq!(pending_calls(&workspace, cx), [second]);
+        assert_eq!(front_ping_id(&workspace, cx), Some(second));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(
+            second_answers.try_recv().err(),
+            Some(TryRecvError::Empty),
+            "the second ping was answered by the first's approval"
+        );
         quit(workspace, cx);
     });
 }

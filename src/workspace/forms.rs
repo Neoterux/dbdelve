@@ -12,7 +12,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable};
 
-use super::agent::visibility_facts;
+use super::agent::{ping_prompt, visibility_facts};
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -998,6 +998,8 @@ impl Workspace {
                 if all { 3 } else { 2 }
             }
             Some("import-rows") | None => 0,
+            // Deny alone: Approve is click-only and never a stop.
+            Some("agent-ping") => 1,
             Some(_) => 2 + checkbox,
         }
     }
@@ -1129,6 +1131,8 @@ impl Workspace {
             ("pending-run", _) => self.cancel_pending_run(cx),
             ("agent-visibility", 0) => self.confirm_agent_visibility(cx),
             ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
+            // Every index denies: no key approves a ping.
+            ("agent-ping", _) => _ = self.deny_front_ping(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
             ("delete", 0) => match deleting {
@@ -1560,6 +1564,103 @@ impl Workspace {
                                             },
                                         ),
                                         t,
+                                    ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What an agent's ping asks the human: a test for one connection, named by
+    /// the profile's own current name read by id, never by anything the agent
+    /// sent. Deny is the ring's only stop; Approve is a click and nothing else.
+    /// Nothing is drawn unless the oldest waiting call still has its profile.
+    pub(crate) fn render_agent_ping(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = popup_theme(cx);
+        let call = self.front_ping()?;
+        let id = call.id;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == call.profile_id)?;
+        let deny_workspace = cx.entity().downgrade();
+        let approve_workspace = deny_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Agent"))
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text)
+                                .child("Ping from an agent"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(ping_prompt(&profile.name)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    self.choice(
+                                        "agent-ping",
+                                        0,
+                                        button(
+                                            "deny-agent-ping",
+                                            "Deny",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = deny_workspace.update(cx, |workspace, cx| {
+                                                    workspace.deny_ping(id, cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                )
+                                // Outside the ring, and with an id of this call
+                                // alone: a press that began on one call's button
+                                // cannot finish on the next call's.
+                                .child(
+                                    div().debug_selector(|| "agent-ping-approve".into()).child(
+                                        button(
+                                            format!("approve-ping-{}", id.0),
+                                            "Approve",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        // A key cannot move onto it, so a key
+                                        // cannot press it.
+                                        .tab_stop(false)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = approve_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.approve_ping(id, cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
                                     ),
                                 ),
                         ),
