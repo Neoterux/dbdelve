@@ -122,6 +122,7 @@ impl Workspace {
                 return;
             }
         };
+        let read_as_postgres = unreadable_engine.is_some();
         let stored_queries = stored_buffers(
             stored.open_queries,
             stored.next_query_id,
@@ -173,6 +174,9 @@ impl Workspace {
             session.notice = Some(message);
         }
         let id = stored.id.clone();
+        if read_as_postgres && stored.agent_visible {
+            self.agent.visibility_choices.insert(id.clone());
+        }
         self.profiles.push(Profile {
             id: stored.id,
             name: stored.name,
@@ -194,8 +198,13 @@ impl Workspace {
             // A silenced kind this build cannot read is dropped, which only
             // means that kind still asks.
             // Absent reads as hidden: the flag is a grant, and a file written
-            // before it existed granted nothing.
-            agent_visible: stored.agent_visible,
+            // before it existed granted nothing. A profile read as Postgres
+            // hides too: the grant was for the engine it named, not this one.
+            // The id is this window's unsaved choice so the save `Workspace::new`
+            // makes once every profile is in writes the hide, where
+            // `adopt_saved_visibility` would read the file's grant back; a save
+            // from here would write a partial list.
+            agent_visible: stored.agent_visible && !read_as_postgres,
             confirmed: stored
                 .confirmed
                 .iter()
