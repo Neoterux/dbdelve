@@ -1427,7 +1427,13 @@ impl Render for Workspace {
                         .child(self.render_connection_form(window, cx)),
                 )
                 .children(self.dialog_layer(
-                    [("import-choice", self.render_import_choice(cx))],
+                    [
+                        // First, so it is drawn behind every other dialog: an
+                        // agent's unsolicited ping never covers one the user
+                        // is already answering.
+                        ("agent-ping", self.render_agent_ping(cx)),
+                        ("import-choice", self.render_import_choice(cx)),
+                    ],
                     window,
                     cx,
                 ))
@@ -2358,6 +2364,10 @@ impl Render for Workspace {
             .child(self.beside_settings(main_pane, cx))
             .children(self.dialog_layer(
                 [
+                    // First, so it is drawn behind every other dialog: an
+                    // agent's unsolicited ping never covers one the user is
+                    // already answering, and `escape` reaches it last.
+                    ("agent-ping", self.render_agent_ping(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),
