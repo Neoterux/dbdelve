@@ -4012,6 +4012,106 @@ fn the_kill_switch_holds_across_two_windows_of_the_same_variant(cx: &mut TestApp
     });
 }
 
+#[cfg(unix)]
+const PRESENCE: &str = r#"{"v":1,"kind":"presence"}"#;
+
+#[cfg(unix)]
+const REJECTED: &str = r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#;
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let pings = [raw_call(&path, PING_ORDERS), raw_call(&path, PING_ORDERS)];
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
+        let presence = raw_call(&path, PRESENCE);
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
+        });
+        assert!(
+            editor_has_keyboard(&workspace, cx),
+            "the chord is pressed with the keyboard in the editor"
+        );
+
+        cx.simulate_keystrokes("secondary-shift-k");
+        drive_until(cx, |_| {
+            pings.iter().all(|ping| ping.is_finished()) && presence.is_finished()
+        });
+        for ping in pings {
+            // A whole frame, then the end of the connection: a bare end of
+            // file would read as an empty string.
+            assert_eq!(
+                ping.join().expect("the client thread finished"),
+                format!("{REJECTED}\n")
+            );
+        }
+        assert_eq!(
+            presence.join().expect("the client thread finished"),
+            "",
+            "a presence is closed, and is sent nothing"
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.presence.is_empty());
+            assert!(workspace.agent.bridge.is_none());
+        });
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_answers_its_chord_on_every_surface(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        // No profile: the welcome surface. A runner whose `PG*` variables make
+        // a profile in front of it drives the main pane instead, which has
+        // the same binding; the form is driven below either way.
+        let (workspace, cx) = launch_with_settings(cx, "agent_access = true", "");
+        cx.executor().allow_parking();
+        assert!(listening(&workspace, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus.focus(window, cx)
+        });
+        settle(cx);
+        cx.simulate_keystrokes("secondary-shift-k");
+        settle(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+
+        // The connection form, opened over a profile.
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "agent_access = true",
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        assert!(listening(&workspace, cx));
+        run_command(&workspace, cx, Command::NewConnection);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.form.is_some()));
+        cx.simulate_keystrokes("secondary-shift-k");
+        settle(cx);
+        assert!(!listening(&workspace, cx));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(saved_agent_access(), Some(false));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

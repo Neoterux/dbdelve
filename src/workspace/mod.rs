@@ -34,6 +34,7 @@ pub(crate) use profiles::unavailable_reason;
 pub(crate) use projects::project_name_refusal;
 pub(crate) use queries::error_in_buffer;
 
+use crate::actions::DisconnectAgents;
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
@@ -857,6 +858,15 @@ impl Workspace {
         }
     }
 
+    fn disconnect_agents_action(
+        &mut self,
+        _: &DisconnectAgents,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.disconnect_agents(cx);
+    }
+
     pub(crate) fn note(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.notice = Some(message);
@@ -1401,6 +1411,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::submit_connection))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::next_profile))
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
@@ -1436,6 +1447,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::select_theme))
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::open_connection_form))
+                .on_action(cx.listener(Self::disconnect_agents_action))
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
@@ -2199,6 +2211,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::rollback_transaction))
             .on_action(cx.listener(Self::switch_connection))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::disconnect_agents_action))
             .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
             // Unregistered under the import dialog, which stops only the
