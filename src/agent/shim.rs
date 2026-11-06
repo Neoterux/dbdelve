@@ -380,6 +380,59 @@ pub(crate) fn run() -> i32 {
     1
 }
 
+/// The line that registers this DBDelve with Claude Code, for the user to paste
+/// into a terminal: `claude mcp add` in user scope, so that every project sees
+/// the server, and the absolute path of the file Claude Code is to start with
+/// `mcp`. DBDelve never runs the line or reads what it changes; it is text.
+///
+/// A non-empty `appimage` is the path named in place of `executable`, because
+/// an AppImage's own executable path is a mount that is gone with the process.
+/// A non-empty `variant` is the raw `DBDELVE_VARIANT`: it names the server
+/// `dbdelve-<variant>`, so two builds register side by side, and it is passed
+/// on as `-e`, because the shim finds the app's socket by that variable and
+/// without it would look for the release build's. The option follows the name:
+/// `-e` takes every word after it until `--`, so before the name it would take
+/// the name.
+pub(crate) fn registration_line(
+    executable: &std::path::Path,
+    appimage: Option<&std::ffi::OsStr>,
+    variant: Option<&str>,
+) -> String {
+    let path = match appimage {
+        Some(file) if !file.is_empty() => file.to_string_lossy(),
+        _ => executable.to_string_lossy(),
+    };
+    // A variant may hold a space, and the shell would split the line there.
+    let word = |text: String| {
+        if text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '='))
+        {
+            text
+        } else {
+            single_quoted(&text)
+        }
+    };
+    let (name, environment) = match variant.filter(|variant| !variant.is_empty()) {
+        Some(variant) => (
+            word(format!("dbdelve-{variant}")),
+            format!(" -e {}", word(format!("DBDELVE_VARIANT={variant}"))),
+        ),
+        None => ("dbdelve".to_string(), String::new()),
+    };
+    format!(
+        "claude mcp add --scope user {name}{environment} -- {} mcp",
+        single_quoted(&path)
+    )
+}
+
+/// `text` as one shell word whose every character is literal: a single quote
+/// cannot be written inside single quotes, so it closes them, is escaped, and
+/// opens them again.
+fn single_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Drivers that run the real [`Shim`] over a duplex, shared with the tests of
 /// the plans that build on this one, so the library stays named here alone.
 #[cfg(all(test, unix))]
@@ -1078,6 +1131,57 @@ mod tests {
             let heard = app.collect(Duration::from_millis(300), |_| false).await;
             assert_eq!(called(&heard), 0, "{heard:?}");
         });
+    }
+
+    #[test]
+    fn the_registration_line_quotes_the_path_and_names_the_variant() {
+        use std::ffi::OsStr;
+
+        let release = Path::new("/Applications/DBDelve.app/Contents/MacOS/DBDelve");
+        assert_eq!(
+            registration_line(release, None, None),
+            "claude mcp add --scope user dbdelve -- \
+             '/Applications/DBDelve.app/Contents/MacOS/DBDelve' mcp"
+        );
+        // An empty variant is the release.
+        assert_eq!(
+            registration_line(release, None, Some("")),
+            registration_line(release, None, None)
+        );
+
+        let dev = Path::new("/Users/a/DBDelve Dev.app/Contents/MacOS/DBDelve Dev");
+        assert_eq!(
+            registration_line(dev, None, Some("dev")),
+            "claude mcp add --scope user dbdelve-dev -e DBDELVE_VARIANT=dev -- \
+             '/Users/a/DBDelve Dev.app/Contents/MacOS/DBDelve Dev' mcp"
+        );
+
+        // `$` stays literal in single quotes, and a quote closes and reopens them.
+        assert_eq!(
+            registration_line(Path::new("/tmp/it's $HOME/dbdelve"), None, None),
+            r"claude mcp add --scope user dbdelve -- '/tmp/it'\''s $HOME/dbdelve' mcp"
+        );
+
+        let appimage = OsStr::new("/home/a/Apps/DBDelve.AppImage");
+        assert_eq!(
+            registration_line(
+                Path::new("/tmp/.mount_x/usr/bin/dbdelve"),
+                Some(appimage),
+                None
+            ),
+            "claude mcp add --scope user dbdelve -- '/home/a/Apps/DBDelve.AppImage' mcp"
+        );
+        assert_eq!(
+            registration_line(release, Some(OsStr::new("")), None),
+            registration_line(release, None, None)
+        );
+
+        // A variant with a space is one word each in the name and the option.
+        assert_eq!(
+            registration_line(release, None, Some("my build")),
+            "claude mcp add --scope user 'dbdelve-my build' -e 'DBDELVE_VARIANT=my build' -- \
+             '/Applications/DBDelve.app/Contents/MacOS/DBDelve' mcp"
+        );
     }
 
     #[test]
