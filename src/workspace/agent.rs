@@ -707,7 +707,7 @@ mod tests {
                 // cannot state an answer the gate contradicts.
                 let (stated, other) = match agent_gate(engine, "SELECT my_udf(a) FROM t", mode) {
                     AgentVerdict::Run => (Some(RUNS), WAITS),
-                    AgentVerdict::Approve(_) => (Some(WAITS), RUNS),
+                    AgentVerdict::Approve(..) => (Some(WAITS), RUNS),
                     AgentVerdict::Refuse(_) => (None, ""),
                 };
                 let facts = visibility_facts(engine, mode);

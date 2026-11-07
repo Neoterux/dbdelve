@@ -1379,7 +1379,7 @@ mod tests {
                         &sql,
                         crate::sql::Mode::ReadWrite
                     ),
-                    crate::sql::AgentVerdict::Approve(_)
+                    crate::sql::AgentVerdict::Approve(..)
                 ),
                 "{sql} is not asked about"
             );

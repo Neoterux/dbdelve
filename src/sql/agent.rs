@@ -25,7 +25,9 @@
 //!    `Refuse(NotSent)`, after the count so two commands are `MoreThanOne`.
 //! 4. `DROP` is `Refuse(Drop)`, `TRUNCATE` is `Refuse(Truncate)`, any `DELETE`
 //!    the walk reached, filtered or not, is `Refuse(Delete)`, and an `ALTER
-//!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`.
+//!    TABLE` carrying anything but `ADD COLUMN` is `Refuse(Alter)`. On MongoDB
+//!    and Redis a command seen to remove data is `Refuse(Delete)`, a Redis
+//!    expiry whose timeout is not a plain positive number among them.
 //! 5. A server-side script (a Redis `EVAL`, `FCALL` and their read-only forms,
 //!    a MongoDB `$where`) is `Refuse(Script)`, and a command that returns
 //!    credentials, password hashes, the user's privileges or other clients'
@@ -44,21 +46,29 @@
 //! 8. `gate(&verdict, mode, &[])` stopping the statement for the mode is
 //!    `Refuse(NeedsMode { needed, held })`. The silenced list is always empty,
 //!    so a kind a human silenced changes nothing for an agent.
-//! 9. A write the profile's mode allows is `Approve(verdict)`.
+//! 9. A write the profile's mode allows is `Approve(verdict, expiry)`. The
+//!    `expiry` is `Some` for a Redis command that schedules a removal:
+//!    `EXPIRE`, `PEXPIRE`, `HEXPIRE` or `HPEXPIRE` with a positive timeout;
+//!    `EXPIREAT`, `PEXPIREAT`, `HEXPIREAT` or `HPEXPIREAT` at any time; `SET`,
+//!    `GETEX`, `HSETEX` or `HGETEX` carrying a positive `EX` or `PX`, or `EXAT`
+//!    or `PXAT`; and `SETEX` or `PSETEX` with a positive seconds or
+//!    milliseconds argument. Its text is the wording the approval surface
+//!    states beside the statement. The gate has no clock, so the text says a
+//!    time already past removes at once.
 //! 10. A read that calls one of the engine's `egress_functions`, or on DuckDB
 //!     holds a string that looks like a path ([`reads_a_bare_path`]), is
-//!     `Approve(verdict)` with a Read-only verdict, in every mode: it reaches a
-//!     file, a URL, a program or another server, and the human sees the
-//!     statement first. After every refusal and after step 9, so a refused
+//!     `Approve(verdict, None)` with a Read-only verdict, in every mode: it
+//!     reaches a file, a URL, a program or another server, and the human sees
+//!     the statement first. After every refusal and after step 9, so a refused
 //!     statement stays refused and a write that also reads a file is approved
 //!     as the write it is. It narrows what the mode lets run and never widens
 //!     it.
 //! 11. A read that calls a function its engine's `builtin_functions` does not
-//!     name is `Approve(verdict)` with a Read-only verdict at Read-write and
-//!     Full, and `Run`s at Read-only: the call may be a user-defined function
-//!     that writes, and at Read-write and Full no engine holds one back. The
-//!     name is judged as written, so a schema-qualified or quoted one is
-//!     unlisted. It narrows what the mode lets run and never widens it.
+//!     name is `Approve(verdict, None)` with a Read-only verdict at Read-write
+//!     and Full, and `Run`s at Read-only: the call may be a user-defined
+//!     function that writes, and at Read-write and Full no engine holds one
+//!     back. The name is judged as written, so a schema-qualified or quoted one
+//!     is unlisted. It narrows what the mode lets run and never widens it.
 //! 12. Anything else is a read, and `Run`s.
 //!
 //! The mode stays the ceiling: `Run` and `Approve` both imply that `gate` with
@@ -85,10 +95,37 @@ pub(crate) enum AgentVerdict {
     /// A read: nothing is asked of the human.
     Run,
     /// A write the profile's mode allows: it waits for the human, who sees the
-    /// exact statement first.
-    Approve(Verdict),
+    /// exact statement first. The expiry is what the statement schedules
+    /// beyond itself, where it schedules one, for the approval to state
+    /// beside the statement.
+    Approve(Verdict, Option<Expiry>),
     /// Not allowed on any profile, or not on this one.
     Refuse(Refusal),
+}
+
+/// What an approved Redis write schedules beyond the statement itself: a
+/// removal when a time passes. The gate has no clock, so it cannot tell a time
+/// still to come from one already past, which removes at once; the text says
+/// both, and is what the approval states beside the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// The key.
+    Key,
+    /// The named fields of a hash.
+    Field,
+}
+
+impl fmt::Display for Expiry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expiry::Key => f.write_str(
+                "Sets an expiry: the key is removed when the time passes. A time already past removes it at once.",
+            ),
+            Expiry::Field => f.write_str(
+                "Sets an expiry: the named fields are removed when the time passes. A time already past removes them at once.",
+            ),
+        }
+    }
 }
 
 /// Why a statement was refused. One variant per reason, so a refusal is
@@ -258,7 +295,7 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         // so they are approved like one. The human reads the statement before
         // approving it (D-23). The upgrade path is a removal flag on a
         // replacing insert in the walk, which would refuse them as `Delete`.
-        return AgentVerdict::Approve(verdict);
+        return AgentVerdict::Approve(verdict, read.expiry);
     }
     // The egress list, read by the same scan as the deny-list but never by the
     // human path, so DBDelve's own file opens stay reads, and DuckDB's quoted
@@ -270,7 +307,7 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
         || reads_a_bare_path(engine, sql)
         || (mode >= Mode::ReadWrite && read.unlisted_call)
     {
-        return AgentVerdict::Approve(verdict);
+        return AgentVerdict::Approve(verdict, None);
     }
     AgentVerdict::Run
 }
@@ -421,7 +458,11 @@ mod tests {
             "SELECT pg_catalog.pg_read_file('x')",
             "SELECT a FROM t WHERE b IN (SELECT pg_read_file('x'))",
         ] {
-            always(Engine::Postgres, text, AgentVerdict::Approve(Verdict::READ));
+            always(
+                Engine::Postgres,
+                text,
+                AgentVerdict::Approve(Verdict::READ, None),
+            );
         }
         for (engine, text) in [
             (Engine::MySql, "SELECT load_file('/etc/hosts')"),
@@ -437,7 +478,7 @@ mod tests {
             ),
             (Engine::ClickHouse, "SELECT * FROM eval('SELECT 1')"),
         ] {
-            always(engine, text, AgentVerdict::Approve(Verdict::READ));
+            always(engine, text, AgentVerdict::Approve(Verdict::READ, None));
         }
     }
 
@@ -464,7 +505,7 @@ mod tests {
         for mode in [Mode::ReadWrite, Mode::Full] {
             assert_eq!(
                 postgres(sync, mode),
-                AgentVerdict::Approve(Verdict::WRITE),
+                AgentVerdict::Approve(Verdict::WRITE, None),
                 "{mode:?}"
             );
         }
@@ -490,7 +531,11 @@ mod tests {
             // The accepted false positive, recorded in the corpus.
             "SELECT * FROM t WHERE v = '1.2'",
         ] {
-            always(Engine::DuckDb, text, AgentVerdict::Approve(Verdict::READ));
+            always(
+                Engine::DuckDb,
+                text,
+                AgentVerdict::Approve(Verdict::READ, None),
+            );
         }
         for text in [
             "SELECT * FROM t WHERE ts = '2024-01-02 03:04:05'",
@@ -533,7 +578,7 @@ mod tests {
             for mode in [Mode::ReadWrite, Mode::Full] {
                 assert_eq!(
                     postgres(text, mode),
-                    AgentVerdict::Approve(Verdict::READ),
+                    AgentVerdict::Approve(Verdict::READ, None),
                     "{mode:?}: {text}"
                 );
             }
@@ -557,7 +602,7 @@ mod tests {
         for mode in [Mode::ReadWrite, Mode::Full] {
             assert_eq!(
                 ask("SELECT todate(a) FROM t", mode),
-                AgentVerdict::Approve(Verdict::READ),
+                AgentVerdict::Approve(Verdict::READ, None),
                 "{mode:?}"
             );
         }
@@ -583,7 +628,7 @@ mod tests {
         );
         assert_eq!(
             postgres("INSERT INTO t SELECT pg_read_file('x')", Mode::ReadWrite),
-            AgentVerdict::Approve(Verdict::WRITE)
+            AgentVerdict::Approve(Verdict::WRITE, None)
         );
         for text in [
             "SELECT nextval('s'), pg_read_file('x')",
@@ -592,7 +637,7 @@ mod tests {
             assert_eq!(postgres(text, Mode::ReadOnly), needs_read_write(), "{text}");
             assert_eq!(
                 postgres(text, Mode::ReadWrite),
-                AgentVerdict::Approve(Verdict::WRITE),
+                AgentVerdict::Approve(Verdict::WRITE, None),
                 "{text}"
             );
         }
@@ -600,7 +645,11 @@ mod tests {
             "SELECT lower(a), pg_read_file('x') FROM t",
             "SELECT pg_read_file('x'), lower(a) FROM t",
         ] {
-            always(Engine::Postgres, text, AgentVerdict::Approve(Verdict::READ));
+            always(
+                Engine::Postgres,
+                text,
+                AgentVerdict::Approve(Verdict::READ, None),
+            );
         }
         for mode in Mode::ALL {
             assert_eq!(
@@ -729,7 +778,7 @@ mod tests {
                 for mode in [Mode::ReadWrite, Mode::Full] {
                     assert_eq!(
                         agent_gate(engine, text, mode),
-                        AgentVerdict::Approve(Verdict::READ),
+                        AgentVerdict::Approve(Verdict::READ, None),
                         "{engine:?} {mode:?}: {text}"
                     );
                 }
@@ -827,15 +876,8 @@ mod tests {
             "XADD s MAXLEN 0 * f v",
             "XADD s MINID 9999999999999-0 * f v",
             "xadd s maxlen ~ 0 limit 10 * f v",
-            "SET k v EXAT 1",
-            "SET k v PXAT 1",
-            "GETEX k EXAT 1",
-            "GETEX k PXAT 1",
-            "HSETEX h EXAT 1 FIELDS 1 f v",
-            "HGETEX h PXAT 1 FIELDS 1 f",
             "HSETEX h EX 0 FIELDS 1 f v",
             "HGETEX h PX 0 FIELDS 1 f",
-            "set k v exat 1",
         ] {
             redis_always(text, refused(Refusal::Delete));
         }
@@ -877,29 +919,113 @@ mod tests {
         for text in [
             "SET k v",
             "HSET h f v",
-            "EXPIRE k 10",
             "PERSIST k",
-            "EXPIREAT k 1",
-            "PEXPIREAT k 1",
             "RENAME a b",
             "SINTERSTORE d a b",
             "COPY a b REPLACE",
             "LMOVE a b LEFT RIGHT",
             "SMOVE a b m",
             "XADD s * f v",
-            "SET k v EX 10",
             "GETEX k PERSIST",
-            "HSETEX h EX 10 FIELDS 1 f v",
+            "SET k v EX 0",
+            "SETEX k 0 v",
             "HGETEX h FIELDS 1 f",
         ] {
             assert_eq!(redis(text, Mode::ReadOnly), needs_read_write(), "{text}");
             for mode in [Mode::ReadWrite, Mode::Full] {
                 assert_eq!(
                     redis(text, mode),
-                    AgentVerdict::Approve(Verdict::WRITE),
+                    AgentVerdict::Approve(Verdict::WRITE, None),
                     "{mode:?}: {text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_redis_expiry_of_a_key_is_approved_and_named_and_refused_at_read_only() {
+        for text in [
+            "SET k v EXAT 1",
+            "SET k v PXAT 1",
+            "set k v exat 1",
+            "SET k v EX 10",
+            "SET k v PX 10",
+            "GETEX k EX 10",
+            "GETEX k EXAT 1",
+            "GETEX k PXAT 1",
+            "EXPIRE k 10",
+            "PEXPIRE k 10",
+            "EXPIRE k 10 NX",
+            "EXPIREAT k 1",
+            "PEXPIREAT k 1",
+            "expireat k 4102444800",
+            "SETEX k 10 v",
+            "PSETEX k 10 v",
+            "setex k 10 v",
+        ] {
+            assert_eq!(redis(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    redis(text, mode),
+                    AgentVerdict::Approve(Verdict::WRITE, Some(Expiry::Key)),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_redis_expiry_of_hash_fields_is_approved_and_named_for_the_fields() {
+        for text in [
+            "HEXPIRE h 10 FIELDS 1 f",
+            "HPEXPIRE h 10 FIELDS 1 f",
+            "HEXPIREAT h 1 FIELDS 1 f",
+            "HPEXPIREAT h 1 FIELDS 1 f",
+            "HSETEX h EX 10 FIELDS 1 f v",
+            "HSETEX h FXX EXAT 1 FIELDS 1 f v",
+            "HSETEX h PXAT 1 FIELDS 1 f v",
+            "HGETEX h PX 1 FIELDS 1 f",
+            "HGETEX h EXAT 1 FIELDS 1 f",
+            "hgetex h pxat 1 fields 1 f",
+        ] {
+            assert_eq!(redis(text, Mode::ReadOnly), needs_read_write(), "{text}");
+            for mode in [Mode::ReadWrite, Mode::Full] {
+                assert_eq!(
+                    redis(text, mode),
+                    AgentVerdict::Approve(Verdict::WRITE, Some(Expiry::Field)),
+                    "{mode:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_expiry_approval_says_what_is_removed_and_when() {
+        let AgentVerdict::Approve(_, Some(expiry)) = redis("SET k v EXAT 1", Mode::ReadWrite)
+        else {
+            panic!("an absolute expiry is approved with its expiry named");
+        };
+        let text = expiry.to_string();
+        assert_eq!(
+            text,
+            "Sets an expiry: the key is removed when the time passes. A time already past removes it at once."
+        );
+        for advice in ["try", "should", "please", "instead", "upgrade"] {
+            assert!(!text.contains(advice), "{advice}: {text}");
+        }
+
+        let AgentVerdict::Approve(_, Some(expiry)) =
+            redis("HSETEX h EX 10 FIELDS 1 f v", Mode::ReadWrite)
+        else {
+            panic!("a hash field expiry is approved with its expiry named");
+        };
+        let text = expiry.to_string();
+        assert_eq!(
+            text,
+            "Sets an expiry: the named fields are removed when the time passes. A time already past removes them at once."
+        );
+        for advice in ["try", "should", "please", "instead", "upgrade"] {
+            assert!(!text.contains(advice), "{advice}: {text}");
         }
     }
 
@@ -1120,7 +1246,7 @@ mod tests {
             for mode in [Mode::ReadWrite, Mode::Full] {
                 assert_eq!(
                     mongodb(text, mode),
-                    AgentVerdict::Approve(Verdict::WRITE),
+                    AgentVerdict::Approve(Verdict::WRITE, None),
                     "{mode:?}: {text}"
                 );
             }
@@ -1170,7 +1296,7 @@ mod tests {
             );
             for mode in [Mode::ReadWrite, Mode::Full] {
                 assert!(
-                    matches!(agent_gate(engine, &sql, mode), AgentVerdict::Approve(_)),
+                    matches!(agent_gate(engine, &sql, mode), AgentVerdict::Approve(..)),
                     "{engine:?} {mode:?}: {sql}"
                 );
             }
@@ -1189,7 +1315,7 @@ mod tests {
             for mode in [Mode::ReadWrite, Mode::Full] {
                 assert_eq!(
                     agent_gate(engine, sql, mode),
-                    AgentVerdict::Approve(Verdict::WRITE),
+                    AgentVerdict::Approve(Verdict::WRITE, None),
                     "{engine:?} {mode:?}"
                 );
             }
@@ -1211,7 +1337,7 @@ mod tests {
                 for mode in [Mode::ReadWrite, Mode::Full] {
                     assert_eq!(
                         agent_gate(engine, sql, mode),
-                        AgentVerdict::Approve(Verdict::WRITE),
+                        AgentVerdict::Approve(Verdict::WRITE, None),
                         "{engine:?} {mode:?}: {sql}"
                     );
                 }
@@ -1224,7 +1350,8 @@ mod tests {
             // Only Postgres's dialect reads the keyword; another engine must
             // say it cannot, never run it.
             assert!(
-                (held == needs_read_write() && approved == AgentVerdict::Approve(Verdict::WRITE))
+                (held == needs_read_write()
+                    && approved == AgentVerdict::Approve(Verdict::WRITE, None))
                     || held == refused(Refusal::Unreadable) && approved == held,
                 "{engine:?}: {held:?} {approved:?}"
             );
@@ -1462,7 +1589,7 @@ mod tests {
         let update = "EXPLAIN ANALYZE UPDATE t SET a = 1 WHERE id = 1";
         assert_eq!(
             postgres(update, Mode::ReadWrite),
-            AgentVerdict::Approve(Verdict::WRITE)
+            AgentVerdict::Approve(Verdict::WRITE, None)
         );
         assert_eq!(postgres(update, Mode::ReadOnly), needs_read_write());
     }
@@ -1488,7 +1615,7 @@ mod tests {
         for engine in sql_engines() {
             assert_eq!(
                 agent_gate(engine, add, Mode::ReadWrite),
-                AgentVerdict::Approve(Verdict::WRITE),
+                AgentVerdict::Approve(Verdict::WRITE, None),
                 "{engine:?}"
             );
         }
@@ -1499,7 +1626,7 @@ mod tests {
                 "ALTER TABLE t UPDATE a = 1 WHERE id = 1",
                 Mode::ReadWrite
             ),
-            AgentVerdict::Approve(Verdict::WRITE)
+            AgentVerdict::Approve(Verdict::WRITE, None)
         );
     }
 
@@ -1748,7 +1875,7 @@ mod tests {
                 assert!(
                     matches!(
                         agent_gate(engine, text, Mode::ReadWrite),
-                        AgentVerdict::Approve(_)
+                        AgentVerdict::Approve(..)
                     ),
                     "{engine:?}: {text}"
                 );
@@ -1890,7 +2017,7 @@ mod tests {
         ] {
             assert_eq!(
                 agent_gate(engine, sql, Mode::ReadWrite),
-                AgentVerdict::Approve(Verdict::WRITE),
+                AgentVerdict::Approve(Verdict::WRITE, None),
                 "{engine:?}: {sql}"
             );
         }
