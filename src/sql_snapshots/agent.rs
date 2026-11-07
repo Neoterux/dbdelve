@@ -504,6 +504,42 @@ const NONSQL_KINDS: &[(Engine, &str, &str)] = &[
     (Engine::Redis, "expire at in milliseconds", "PEXPIREAT k 1"),
     (Engine::Redis, "stream add", "XADD s * f v"),
     (Engine::Redis, "set with a timeout", "SET k v EX 10"),
+    (
+        Engine::Redis,
+        "set with a timeout the server rejects",
+        "SET k v EX 0",
+    ),
+    (Engine::Redis, "get and expire", "GETEX k EX 10"),
+    (
+        Engine::Redis,
+        "hash field expire",
+        "HEXPIRE h 10 FIELDS 1 f",
+    ),
+    (
+        Engine::Redis,
+        "hash field expire at a fixed time in milliseconds",
+        "HPEXPIREAT h 1 FIELDS 1 f",
+    ),
+    (
+        Engine::Redis,
+        "hash set with a timeout",
+        "HSETEX h EX 10 FIELDS 1 f v",
+    ),
+    (
+        Engine::Redis,
+        "hash get and expire",
+        "HGETEX h EX 10 FIELDS 1 f",
+    ),
+    (
+        Engine::Redis,
+        "set with an expiry in seconds",
+        "SETEX k 10 v",
+    ),
+    (
+        Engine::Redis,
+        "set with an expiry in milliseconds",
+        "PSETEX k 10 v",
+    ),
     (Engine::Redis, "rename", "RENAME a b"),
     (Engine::Redis, "store an intersection", "SINTERSTORE d a b"),
     (Engine::Redis, "copy over", "COPY a b REPLACE"),
@@ -765,7 +801,10 @@ fn answers(engine: Engine, text: &str) -> String {
 fn answer(verdict: &AgentVerdict) -> String {
     match verdict {
         AgentVerdict::Run => "run".to_owned(),
-        AgentVerdict::Approve(verdict) => format!("approve({:?})", verdict.mode),
+        AgentVerdict::Approve(verdict, None) => format!("approve({:?})", verdict.mode),
+        AgentVerdict::Approve(verdict, Some(expiry)) => {
+            format!("approve({:?}, {expiry:?})", verdict.mode)
+        }
         AgentVerdict::Refuse(refusal) => format!("refuse({refusal:?})"),
     }
 }
@@ -851,7 +890,7 @@ fn every_run_or_approve_cell_is_one_the_mode_already_allows() {
         let verdict = sql::classify(engine, &text);
         for mode in Mode::ALL {
             match sql::agent_gate(engine, &text, mode) {
-                AgentVerdict::Run | AgentVerdict::Approve(_) => assert_eq!(
+                AgentVerdict::Run | AgentVerdict::Approve(..) => assert_eq!(
                     sql::gate(&verdict, mode, &[]),
                     None,
                     "{engine:?} {mode:?} {case}: {text:?}"

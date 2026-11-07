@@ -52,7 +52,7 @@ mod agent;
         reason = "the agent tools (Phase 4) are the first caller"
     )
 )]
-pub(crate) use agent::{AgentVerdict, Refusal, agent_gate};
+pub(crate) use agent::{AgentVerdict, Expiry, Refusal, agent_gate};
 
 /// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
@@ -2687,6 +2687,14 @@ struct Parsed {
         expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
     )]
     unlisted_call: bool,
+    /// What a Redis command schedules beyond itself, read by
+    /// [`crate::redis_cmd::expiry`]. Other engines leave it `None`. Only the
+    /// agent path reads it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
+    )]
+    expiry: Option<Expiry>,
 }
 
 impl Parsed {
@@ -2702,6 +2710,7 @@ impl Parsed {
             discloses: false,
             unsent: false,
             unlisted_call: false,
+            expiry: None,
         }
     }
 
@@ -2716,6 +2725,7 @@ impl Parsed {
             discloses: false,
             unsent: false,
             unlisted_call,
+            expiry: None,
         }
     }
 }
@@ -2831,6 +2841,7 @@ fn parsed(engine: Engine, sql: &str) -> Parsed {
             // Where a line does not split, `classify` has already said
             // `Unreadable`, which the agent path asks first.
             unsent: crate::redis_cmd::parse(sql).is_err(),
+            expiry: crate::redis_cmd::expiry(sql),
             ..Parsed::counted(
                 crate::redis_cmd::classify(sql),
                 crate::redis_cmd::statements(sql).len(),
