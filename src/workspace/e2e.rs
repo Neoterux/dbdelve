@@ -5795,6 +5795,52 @@ fn an_agent_reads_rows_through_the_shim_on_a_connection_of_its_own(cx: &mut Test
 }
 
 #[gpui::test]
+fn a_read_keeps_the_first_rows_and_runs_as_written(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150) \
+             INSERT INTO t (id) SELECT i FROM n;",
+            "",
+        );
+        cx.executor().allow_parking();
+        let mut read = |sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the read answered")
+        };
+
+        let long = read("SELECT id FROM t ORDER BY id");
+        assert_eq!(long.status, Status::Executed, "{}", long.text);
+        assert!(
+            long.text
+                .starts_with("truncated: 100 of at least 100 rows shown (row cap)\ncolumns: "),
+            "{}",
+            long.text
+        );
+        let row_lines = |text: &str| text.lines().filter(|line| line.starts_with("[\"")).count();
+        assert_eq!(row_lines(&long.text), 100, "{}", long.text);
+
+        let limited = read("SELECT id FROM t ORDER BY id LIMIT 3");
+        assert_eq!(limited.status, Status::Executed, "{}", limited.text);
+        assert!(
+            limited.text.starts_with("truncated: none (3 rows)\n"),
+            "{}",
+            limited.text
+        );
+        assert_eq!(row_lines(&limited.text), 3, "{}", limited.text);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_statement_that_needs_approval_is_refused_and_never_reaches_the_server(
     cx: &mut TestAppContext,
 ) {
