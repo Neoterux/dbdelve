@@ -1413,6 +1413,34 @@ impl ConnectionConfig {
         }
     }
 
+    /// `self` with its statement timeout set to `seconds`, 0 for none. The
+    /// setter beside [`Self::statement_timeout`], for a caller that opens a
+    /// connection under a bound of its own.
+    #[must_use]
+    pub fn with_statement_timeout(mut self, seconds: u32) -> Self {
+        match &mut self {
+            Self::Postgres(PostgresConfig { server, .. })
+            | Self::MySql(server)
+            | Self::MariaDb(server)
+            | Self::SqlServer(server)
+            | Self::ClickHouse(server)
+            | Self::Redis(server) => server.statement_timeout = seconds,
+            Self::MongoDb(mongo) => mongo.server.statement_timeout = seconds,
+            Self::Sqlite {
+                statement_timeout, ..
+            }
+            | Self::Turso {
+                statement_timeout, ..
+            }
+            | Self::DuckDb {
+                statement_timeout, ..
+            } => *statement_timeout = seconds,
+            Self::Snowflake(account) => account.statement_timeout = seconds,
+            Self::External(external) => external.statement_timeout = seconds,
+        }
+        self
+    }
+
     /// Whether replacing `self` with `edited` has to be reconnected for.
     ///
     /// A blank password in `edited` is not a change: the edit form never shows
@@ -3581,9 +3609,61 @@ pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<std:
     command.spawn()
 }
 
+/// One config of every shape, each with no statement timeout, for the tests
+/// that must reach every arm of a match on [`ConnectionConfig`].
+#[cfg(test)]
+pub(crate) fn every_shape() -> Vec<ConnectionConfig> {
+    vec![
+        ConnectionConfig::postgres(ServerConfig::default()),
+        ConnectionConfig::MySql(ServerConfig::default()),
+        ConnectionConfig::MariaDb(ServerConfig::default()),
+        ConnectionConfig::SqlServer(ServerConfig::default()),
+        ConnectionConfig::Sqlite {
+            path: "/tmp/a.db".into(),
+            statement_timeout: 0,
+        },
+        ConnectionConfig::Turso {
+            path: "/tmp/b.db".into(),
+            statement_timeout: 0,
+        },
+        ConnectionConfig::DuckDb {
+            path: "/tmp/c.duckdb".into(),
+            statement_timeout: 0,
+            database: String::new(),
+            schema: None,
+        },
+        ConnectionConfig::Snowflake(SnowflakeConfig::default()),
+        ConnectionConfig::ClickHouse(ServerConfig::default()),
+        ConnectionConfig::MongoDb(MongoConfig::default()),
+        ConnectionConfig::Redis(ServerConfig::default()),
+        ConnectionConfig::External(ExternalConfig {
+            plugin: crate::store::tests::odbc_plugin(),
+            speaks: Engine::Generic,
+            connection: "DSN=x".into(),
+            user: String::new(),
+            password: String::new(),
+            statement_timeout: 0,
+            ssh: None,
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_timeout_is_set_on_every_kind_of_connection() {
+        let shapes = every_shape();
+        assert_eq!(shapes.len(), 12, "a variant was added without a shape here");
+        for config in shapes {
+            let engine = config.engine();
+            let bounded = config.clone().with_statement_timeout(17);
+            assert_eq!(bounded.statement_timeout(), 17, "{engine:?}");
+            // Setting it back leaves the config as it was, so nothing else moved.
+            assert_eq!(bounded.with_statement_timeout(0), config, "{engine:?}");
+        }
+    }
 
     #[test]
     fn a_bounded_feed_holds_a_push_past_its_bound_until_rows_are_taken() {

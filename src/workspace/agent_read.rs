@@ -25,6 +25,29 @@ use crate::{
 // the model asks for. The upgrade is a setting, if a user ever needs one.
 pub(crate) const AGENT_ROWS: usize = 100;
 
+// ponytail: the longest an agent's statement runs when the profile sets no
+// timeout of its own, so no agent connection is ever unbounded. A profile's own
+// shorter timeout wins. The upgrade is a setting, if a user ever needs one.
+pub(crate) const AGENT_TIMEOUT: u32 = 30;
+
+/// The statement timeout in seconds an agent connection carries, given the
+/// profile's own: the smaller of the two, with 0 (none) meaning the agent's.
+pub(crate) fn agent_timeout(user: u32) -> u32 {
+    match user {
+        0 => AGENT_TIMEOUT,
+        user => user.min(AGENT_TIMEOUT),
+    }
+}
+
+/// The config an agent connection is opened from: the profile's, bounded by
+/// [`agent_timeout`]. [`Lane::opened_from`] stays the profile's own config, the
+/// value it is compared with.
+pub(crate) fn agent_config(config: &ConnectionConfig) -> ConnectionConfig {
+    config
+        .clone()
+        .with_statement_timeout(agent_timeout(config.statement_timeout()))
+}
+
 /// Said when the agent's connection could not be made. Names nothing about
 /// where the database is: the reason is the server's and may carry a host, a
 /// user or a path.
@@ -136,7 +159,7 @@ impl Workspace {
                 let connection = match cached {
                     Some(connection) => connection,
                     None => {
-                        let mut config = config;
+                        let mut config = agent_config(&config);
                         // A file engine has nothing to authenticate to, so it
                         // never reaches the keychain.
                         if let Some(slot) = config.password_mut()
@@ -221,5 +244,37 @@ impl Workspace {
             }
         };
         self.agent_answered(id, name, None, reply, status, text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_timeout_is_the_users_capped_or_the_agents_own() {
+        assert_eq!(agent_timeout(0), AGENT_TIMEOUT);
+        assert_eq!(agent_timeout(5), 5);
+        assert_eq!(agent_timeout(AGENT_TIMEOUT), AGENT_TIMEOUT);
+        assert_eq!(agent_timeout(AGENT_TIMEOUT + 1), AGENT_TIMEOUT);
+        assert_eq!(agent_timeout(u32::MAX), AGENT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_agent_config_carries_the_capped_timeout() {
+        for config in crate::db::every_shape() {
+            for user in [0, 5, AGENT_TIMEOUT, AGENT_TIMEOUT + 1] {
+                let profile = config.clone().with_statement_timeout(user);
+                let agent = agent_config(&profile);
+                let engine = profile.engine();
+                assert_eq!(
+                    agent.statement_timeout(),
+                    agent_timeout(user),
+                    "{engine:?} at {user}"
+                );
+                // Only the timeout differs from what the profile holds.
+                assert_eq!(agent.with_statement_timeout(user), profile, "{engine:?}");
+            }
+        }
     }
 }
