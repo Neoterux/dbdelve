@@ -45,13 +45,7 @@ pub(crate) struct Table {
 pub(crate) fn text(tables: &[Table], further: usize) -> String {
     let mut out = String::new();
     out.push_str("truncated: ");
-    out.push_str(&match tables.first() {
-        Some(table) => cut(table),
-        None => "none (0 rows)".to_string(),
-    });
-    if further > 0 {
-        out.push_str(&format!("; {further} further result sets are not shown"));
-    }
+    out.push_str(&header(tables, further));
     out.push('\n');
     for table in tables {
         let heads: Vec<_> = table
@@ -71,18 +65,68 @@ pub(crate) fn text(tables: &[Table], further: usize) -> String {
     out
 }
 
+/// What the first line says after `truncated: `. One table reads `none (N
+/// rows)` when nothing was cut, and otherwise `S of T rows shown (reasons)`,
+/// `T` being a number or `at least` one. Several tables read `none` or name
+/// each cut table by its label. The result sets that were not included are a
+/// reason on the last table, since they would have come after it.
 // ponytail: the wording of a cut is the least a reader needs to know that rows
 // are missing and how many there were. The upgrade is a second line that says
 // what to ask for next, if agents turn out to need it.
-fn cut(table: &Table) -> String {
-    let shown = table.rows.len();
-    match table.total {
-        Total::Exact(total) if total == shown => format!("none ({})", rows(total)),
-        Total::Exact(total) => format!("yes (the first {shown} of {})", rows(total)),
-        Total::AtLeast(total) => {
-            format!("yes (the first {shown} of at least {})", rows(total))
+fn header(tables: &[Table], further: usize) -> String {
+    match tables {
+        [] if further == 0 => "none (0 rows)".to_string(),
+        [] => cut(0, Total::Exact(0), further).unwrap_or_default(),
+        [table] => cut(table.rows.len(), table.total, further)
+            .unwrap_or_else(|| format!("none ({})", rows(table.rows.len()))),
+        _ => {
+            let cuts: Vec<String> = tables
+                .iter()
+                .enumerate()
+                .filter_map(|(at, table)| {
+                    let further = if at + 1 == tables.len() { further } else { 0 };
+                    let cut = cut(table.rows.len(), table.total, further)?;
+                    Some(format!("{}: {cut}", table.label))
+                })
+                .collect();
+            if cuts.is_empty() {
+                "none".to_string()
+            } else {
+                cuts.join("; ")
+            }
         }
     }
+}
+
+/// How a table was cut, or `None` when it was not.
+fn cut(shown: usize, total: Total, further: usize) -> Option<String> {
+    let mut reasons = Vec::new();
+    let of = match total {
+        Total::Exact(total) => {
+            if total > shown {
+                reasons.push("row cap".to_string());
+            }
+            total.to_string()
+        }
+        // A statement that was stopped at the limit has more behind it.
+        Total::AtLeast(total) => {
+            reasons.push("row cap".to_string());
+            format!("at least {total}")
+        }
+    };
+    if further > 0 {
+        reasons.push(match further {
+            1 => "1 further result set not shown".to_string(),
+            _ => format!("{further} further result sets not shown"),
+        });
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{shown} of {of} rows shown ({})",
+        reasons.join(", ")
+    ))
 }
 
 fn rows(count: usize) -> String {
@@ -149,31 +193,91 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_table_says_how_many_rows_it_kept_and_how_many_there_were() {
-        let table = |total| Table {
+    fn the_header_says_how_many_rows_were_shown_of_what_total() {
+        let table = |count: usize, total| Table {
             label: "columns",
             heads: vec![head("n", None)],
-            rows: vec![vec![Some("1".to_string())]],
+            rows: (0..count).map(|n| vec![Some(n.to_string())]).collect(),
             total,
         };
-        let first = |total, further| {
-            text(&[table(total)], further)
+        let first = |count, total, further| {
+            text(&[table(count, total)], further)
                 .lines()
                 .next()
                 .expect("a text has a first line")
                 .to_string()
         };
         assert_eq!(
-            first(Total::Exact(5), 0),
-            "truncated: yes (the first 1 of 5 rows)"
+            first(100, Total::Exact(100), 0),
+            "truncated: none (100 rows)"
         );
         assert_eq!(
-            first(Total::AtLeast(1), 0),
-            "truncated: yes (the first 1 of at least 1 row)"
+            first(100, Total::Exact(150), 0),
+            "truncated: 100 of 150 rows shown (row cap)"
         );
         assert_eq!(
-            first(Total::Exact(1), 2),
-            "truncated: none (1 row); 2 further result sets are not shown"
+            first(100, Total::AtLeast(100), 0),
+            "truncated: 100 of at least 100 rows shown (row cap)"
+        );
+        assert_eq!(first(1, Total::Exact(1), 0), "truncated: none (1 row)");
+        assert_eq!(
+            first(3, Total::Exact(3), 2),
+            "truncated: 3 of 3 rows shown (2 further result sets not shown)"
+        );
+        assert_eq!(
+            first(100, Total::AtLeast(100), 2),
+            "truncated: 100 of at least 100 rows shown (row cap, 2 further result sets not shown)"
+        );
+        assert_eq!(
+            text(&[table(0, Total::Exact(0))], 0),
+            "truncated: none (0 rows)\ncolumns: [{\"name\":\"n\",\"type\":null}]\n"
+        );
+    }
+
+    #[test]
+    fn several_tables_name_each_one_that_was_cut() {
+        let table = |label, count: usize, total| Table {
+            label,
+            heads: vec![head("n", None)],
+            rows: (0..count).map(|n| vec![Some(n.to_string())]).collect(),
+            total,
+        };
+        let first = |tables: &[Table], further| {
+            text(tables, further)
+                .lines()
+                .next()
+                .expect("a text has a first line")
+                .to_string()
+        };
+        assert_eq!(
+            first(
+                &[
+                    table("columns", 2, Total::Exact(2)),
+                    table("indexes", 1, Total::Exact(1))
+                ],
+                0
+            ),
+            "truncated: none"
+        );
+        assert_eq!(
+            first(
+                &[
+                    table("columns", 2, Total::Exact(2)),
+                    table("indexes", 1, Total::Exact(4))
+                ],
+                0
+            ),
+            "truncated: indexes: 1 of 4 rows shown (row cap)"
+        );
+        assert_eq!(
+            first(
+                &[
+                    table("columns", 1, Total::Exact(3)),
+                    table("indexes", 1, Total::Exact(4))
+                ],
+                0
+            ),
+            "truncated: columns: 1 of 3 rows shown (row cap); indexes: 1 of 4 rows shown (row cap)"
         );
     }
 }
