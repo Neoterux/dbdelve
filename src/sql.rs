@@ -2618,46 +2618,26 @@ struct Parsed {
     /// How many statements the parse that was judged produced, MariaDB's
     /// executable comments expanded, so a statement a comment carries is
     /// counted.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     statements: usize,
     /// Whether any statement the walk reached is a `DELETE`, whatever its
     /// shape: top level, a CTE's body, under `EXPLAIN ANALYZE`, in an `IF` or a
     /// scripting block, a ClickHouse mutation that amounts to one. On MongoDB
     /// and Redis it is whether any statement or command removes data, which
     /// those engines' own readers decide.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     removes: bool,
     /// Whether any `ALTER TABLE` the walk reached carries an operation other
     /// than `ADD COLUMN`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     alters: bool,
     /// Whether any statement the parse judged leaves its session changed: a
     /// transaction bracket, a `SET`, a `USE`, a temporary table, a temporary
     /// view, a variable target, a savepoint. Read off the statements themselves, never off
     /// [`leaves`], which says nothing on an engine that keeps no session and
     /// also flags plain reads of what the session holds.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     session: bool,
     /// Whether any statement is one a server-side script runs from: a Redis
     /// `EVAL` or `FCALL` (the read-only forms too), `SCRIPT LOAD`, `FUNCTION
     /// LOAD`, a MongoDB `$where`, `$function` or `$accumulator`. SQL leaves it
     /// false: its functions are the deny-list's.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     scripts: bool,
     /// Whether any statement is one that returns credentials, password hashes,
     /// the user's privileges or other clients' details (D-27): the Redis
@@ -2665,35 +2645,19 @@ struct Parsed {
     /// MongoDB `currentOp` in any spelling (the command, the `$currentOp` stage
     /// and the `db.currentOp()` helper) and `connectionStatus` asked for its
     /// privileges. SQL leaves it false.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     discloses: bool,
     /// Whether a Redis line splits but is a command the editor never sends
     /// (`MONITOR`, `SELECT`): [`classify`] rates it a read because it is never
     /// sent, so only this tells it from a read that is.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     unsent: bool,
     /// Whether any statement the judged parse holds calls a function the
     /// engine's built-in list does not name, in any clause, in `FROM` or under
     /// `EXPLAIN`. The agent path reads it; the human path never does, except
     /// through Generic's raise in [`parsed`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     unlisted_call: bool,
     /// What a Redis command schedules beyond itself, read by
     /// [`crate::redis_cmd::expiry`]. Other engines leave it `None`. Only the
     /// agent path reads it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     expiry: Option<Expiry>,
 }
 

@@ -23,7 +23,7 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{CallId, ConnId, Declined, Inbound, Reply, Status, ipc, tools::Tool, wire};
+use super::{CallArgs, CallId, ConnId, Declined, Inbound, Reply, Status, ipc, tools::Tool, wire};
 
 // ponytail: a first frame is a few bytes written the moment the shim
 // connects, so five seconds is patience, not a measurement; a slower peer is
@@ -220,10 +220,22 @@ fn serve(stream: UnixStream, shared: &Shared, inbound: &UnboundedSender<Inbound>
     let _ = stream.set_read_timeout(None);
     match wire::decode_hello(&line) {
         Ok(wire::Hello::Call {
-            tool, connection, ..
+            tool,
+            connection,
+            sql,
+            ..
         }) => {
             drop(registered);
-            call(&stream, CallId(conn.0), tool, connection, shared, inbound);
+            let args = CallArgs { sql };
+            call(
+                &stream,
+                CallId(conn.0),
+                tool,
+                connection,
+                args,
+                shared,
+                inbound,
+            );
         }
         Ok(wire::Hello::Presence { .. }) => presence(&stream, conn, shared, inbound),
         Err(_) => {}
@@ -259,6 +271,7 @@ fn call(
     id: CallId,
     tool: Tool,
     connection: Option<String>,
+    args: CallArgs,
     shared: &Shared,
     inbound: &UnboundedSender<Inbound>,
 ) {
@@ -279,6 +292,7 @@ fn call(
         id,
         tool,
         connection,
+        args,
         reply,
     };
     if inbound.send(call).is_err() {
@@ -377,7 +391,7 @@ mod tests {
     use std::{io::ErrorKind, sync::mpsc::RecvTimeoutError};
 
     use super::*;
-    use crate::agent::tests::short_socket_path;
+    use crate::agent::tests::{frame, short_socket_path};
 
     const QUIET: Duration = Duration::from_millis(300);
 
@@ -473,7 +487,8 @@ mod tests {
     #[test]
     fn a_call_over_the_cap_is_refused_by_gate_naming_the_cap() {
         let rig = Rig::new(FIRST_FRAME_TIMEOUT);
-        let call = br#"{"v":1,"kind":"call","tool":"list_connections"}"#;
+        let call = frame(r#""kind":"call","tool":"list_connections""#);
+        let call = call.as_bytes();
         let mut held = Vec::new();
         let mut unanswered = Vec::new();
         for _ in 0..CALL_CAP {
@@ -499,7 +514,7 @@ mod tests {
         // sent nothing on, so the presence is the next thing to arrive.
         let mut presence = rig.client();
         presence
-            .write_all(b"{\"v\":1,\"kind\":\"presence\"}\n")
+            .write_all(format!("{}\n", frame(r#""kind":"presence""#)).as_bytes())
             .expect("the frame is sent");
         assert!(matches!(
             rig.inbound.recv_timeout(Duration::from_secs(5)),
@@ -511,9 +526,10 @@ mod tests {
     #[test]
     fn a_presence_connection_opens_and_closes_without_counting_as_a_call() {
         let rig = Rig::new(FIRST_FRAME_TIMEOUT);
-        let frame = b"{\"v\":1,\"kind\":\"presence\"}\n";
+        let presence_line = format!("{}\n", frame(r#""kind":"presence""#));
+        let presence_line = presence_line.as_bytes();
         let mut client = rig.client();
-        client.write_all(frame).expect("the frame is sent");
+        client.write_all(presence_line).expect("the frame is sent");
         let Ok(Inbound::PresenceOpened { conn }) = rig.inbound.recv_timeout(Duration::from_secs(5))
         else {
             panic!("the presence opens");
@@ -530,7 +546,9 @@ mod tests {
         let mut presences = Vec::new();
         for _ in 0..=CALL_CAP {
             let mut presence = rig.client();
-            presence.write_all(frame).expect("the frame is sent");
+            presence
+                .write_all(presence_line)
+                .expect("the frame is sent");
             presences.push(presence);
             assert!(matches!(
                 rig.inbound.recv_timeout(Duration::from_secs(5)),
@@ -538,8 +556,10 @@ mod tests {
             ));
         }
         let mut call = rig.client();
-        call.write_all(b"{\"v\":1,\"kind\":\"call\",\"tool\":\"list_connections\"}\n")
-            .expect("the frame is sent");
+        call.write_all(
+            format!("{}\n", frame(r#""kind":"call","tool":"list_connections""#)).as_bytes(),
+        )
+        .expect("the frame is sent");
         assert!(matches!(
             rig.inbound.recv_timeout(Duration::from_secs(5)),
             Ok(Inbound::Call { .. })
@@ -551,7 +571,9 @@ mod tests {
         let rig = Rig::new(FIRST_FRAME_TIMEOUT);
         let mut client = rig.client();
         client
-            .write_all(b"{\"v\":1,\"kind\":\"call\",\"tool\":\"list_connections\"}\n")
+            .write_all(
+                format!("{}\n", frame(r#""kind":"call","tool":"list_connections""#)).as_bytes(),
+            )
             .expect("the frame is sent");
         let Ok(Inbound::Call { id, reply, .. }) = rig.inbound.recv_timeout(Duration::from_secs(5))
         else {
@@ -623,7 +645,7 @@ mod tests {
         let mut slow = rig.client();
         let started = Instant::now();
         // Each byte comes well inside the limit; the frame as a whole does not.
-        for byte in b"{\"v\":1,\"kind\":\"presence\"}" {
+        for byte in frame(r#""kind":"presence""#).as_bytes() {
             if slow.write_all(&[*byte]).is_err() {
                 break;
             }
@@ -639,7 +661,7 @@ mod tests {
         let mut rig = Rig::new(FIRST_FRAME_TIMEOUT);
         let mut presence = rig.client();
         presence
-            .write_all(b"{\"v\":1,\"kind\":\"presence\"}\n")
+            .write_all(format!("{}\n", frame(r#""kind":"presence""#)).as_bytes())
             .expect("the frame is sent");
         assert!(matches!(
             rig.inbound.recv_timeout(Duration::from_secs(5)),

@@ -18,6 +18,7 @@
     )
 )]
 
+pub(crate) mod result;
 pub(crate) mod shim;
 pub(crate) mod tools;
 
@@ -53,7 +54,8 @@ pub(crate) fn socket_is_live() -> bool {
 /// `cancelled` is the app's, logged only, because the caller has already gone;
 /// `rejected` is the human's no, from the dialog or the kill switch;
 /// `app_not_running` is the shim's, for a connection that failed or closed
-/// without an answer.
+/// without an answer; `failed` is the app's, for a statement that failed, ran
+/// out of time, or a connection that would not open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Status {
@@ -63,6 +65,7 @@ pub(crate) enum Status {
     Cancelled,
     Expired,
     AppNotRunning,
+    Failed,
 }
 
 impl Status {
@@ -76,6 +79,7 @@ impl Status {
             Status::Cancelled => "cancelled",
             Status::Expired => "expired",
             Status::AppNotRunning => "app_not_running",
+            Status::Failed => "failed",
         }
     }
 }
@@ -103,6 +107,15 @@ pub(crate) struct CallId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnId(pub(crate) u64);
 
+/// The arguments a call carries beyond the connection it names, across the
+/// socket boundary. One field per argument a tool reads, so none is ever
+/// carried unread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CallArgs {
+    /// The statement `execute_sql` was asked to run, exactly as written.
+    pub(crate) sql: Option<String>,
+}
+
 /// What a connection thread tells the window.
 pub(crate) enum Inbound {
     /// A call, with the one-slot channel its answer goes back on. Dropping the
@@ -113,6 +126,7 @@ pub(crate) enum Inbound {
         tool: Tool,
         /// The profile name the agent gave, if it gave one.
         connection: Option<String>,
+        args: CallArgs,
         reply: std::sync::mpsc::SyncSender<Reply>,
     },
     /// The caller closed its connection, so nobody is waiting for the call
@@ -176,7 +190,13 @@ pub(crate) mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use super::Status;
+    use super::{Status, wire::PROTOCOL_VERSION};
+
+    /// A first frame at this build's version: `fields` is the rest of the
+    /// object, so no test spells the version it speaks.
+    pub(crate) fn frame(fields: &str) -> String {
+        format!(r#"{{"v":{PROTOCOL_VERSION},{fields}}}"#)
+    }
 
     #[test]
     fn a_status_reads_as_the_string_serde_writes() {
@@ -187,6 +207,7 @@ pub(crate) mod tests {
             Status::Cancelled,
             Status::Expired,
             Status::AppNotRunning,
+            Status::Failed,
         ] {
             assert_eq!(
                 serde_json::to_value(status).expect("a status serializes"),

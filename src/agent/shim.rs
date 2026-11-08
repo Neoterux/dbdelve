@@ -42,7 +42,7 @@ use tokio::{
 };
 
 #[cfg(unix)]
-use super::{Reply, Status, tools::Tool, wire};
+use super::{CallArgs, Reply, Status, tools::Tool, wire};
 
 /// What an agent is told when it cannot reach the app. The shim cannot tell an
 /// app that is closed from one with its agent access off, so it says both.
@@ -162,6 +162,7 @@ impl Shim {
         &self,
         tool: Tool,
         connection: Option<String>,
+        args: CallArgs,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = match &self.socket {
@@ -178,6 +179,7 @@ impl Shim {
             v: wire::PROTOCOL_VERSION,
             tool,
             connection,
+            sql: args.sql,
         });
         if stream.write_all(hello.as_bytes()).await.is_err() {
             return Ok(closed_without_answering());
@@ -252,34 +254,55 @@ impl ServerHandler for Shim {
     ) -> Result<CallToolResponse, ErrorData> {
         // Resolved before anything is opened: a call that is not one reaches
         // no socket, presence included.
-        let (tool, connection) = resolve(&request)?;
+        let (tool, connection, args) = resolve(&request)?;
         if let Ok(path) = &self.socket {
             Self::ensure_presence(path, &self.presence).await;
         }
-        Ok(self.carry(tool, connection, &context).await?.into())
+        Ok(self.carry(tool, connection, args, &context).await?.into())
     }
 }
 
-/// The tool a request names and the connection it gives, or why the request is
-/// not one. An unknown tool or an argument the tool does not take is a protocol
+/// The tool a request names, the connection it gives and the other arguments it
+/// carries, or why the request is not one. An unknown tool or an argument the tool does not take is a protocol
 /// error answered here, not a tool result, and it never reaches the app.
 #[cfg(unix)]
-fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>), ErrorData> {
+fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>, CallArgs), ErrorData> {
     let tool = Tool::from_name(&request.name).ok_or_else(|| {
         ErrorData::invalid_params(format!("There is no tool named `{}`.", request.name), None)
     })?;
     let none = JsonObject::new();
     let arguments = request.arguments.as_ref().unwrap_or(&none);
     match tool {
-        Tool::ListConnections if arguments.is_empty() => Ok((tool, None)),
+        Tool::ListConnections if arguments.is_empty() => Ok((tool, None, CallArgs::default())),
         Tool::ListConnections => Err(ErrorData::invalid_params(
             "`list_connections` takes no arguments.",
             None,
         )),
         Tool::Ping => match (arguments.len(), arguments.get("connection")) {
-            (1, Some(serde_json::Value::String(name))) => Ok((tool, Some(name.clone()))),
+            (1, Some(serde_json::Value::String(name))) => {
+                Ok((tool, Some(name.clone()), CallArgs::default()))
+            }
             _ => Err(ErrorData::invalid_params(
                 "`ping` takes one string argument, `connection`.",
+                None,
+            )),
+        },
+        Tool::ExecuteSql => match (
+            arguments.len(),
+            arguments.get("connection"),
+            arguments.get("sql"),
+        ) {
+            (2, Some(serde_json::Value::String(name)), Some(serde_json::Value::String(sql))) => {
+                Ok((
+                    tool,
+                    Some(name.clone()),
+                    CallArgs {
+                        sql: Some(sql.clone()),
+                    },
+                ))
+            }
+            _ => Err(ErrorData::invalid_params(
+                "`execute_sql` takes two string arguments, `connection` and `sql`.",
                 None,
             )),
         },
@@ -840,7 +863,10 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             );
             let listed = client.request("tools/list", json!({})).await;
-            assert_eq!(listed_names(&listed), ["list_connections", "ping"]);
+            assert_eq!(
+                listed_names(&listed),
+                ["list_connections", "execute_sql", "ping"]
+            );
         });
     }
 
@@ -865,7 +891,10 @@ mod tests {
             let listed = client
                 .request("tools/list", json!({"_meta": modern_meta()}))
                 .await;
-            assert_eq!(listed_names(&listed), ["list_connections", "ping"]);
+            assert_eq!(
+                listed_names(&listed),
+                ["list_connections", "execute_sql", "ping"]
+            );
         });
     }
 
@@ -1134,6 +1163,64 @@ mod tests {
             let heard = app.collect(Duration::from_millis(300), |_| false).await;
             assert_eq!(called(&heard), 0, "{heard:?}");
         });
+    }
+
+    #[test]
+    fn execute_sql_takes_a_connection_and_a_statement_and_nothing_else() {
+        // The app side reads the frame as the wire carries it, so the test
+        // sees what the shim wrote and not what it meant to.
+        let path = short_socket_path();
+        std::fs::create_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the directory is made");
+        let listener = UnixListener::bind(&path).expect("the socket binds");
+        let (frames, written) = mpsc::channel();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() && line.contains("\"call\"")
+                {
+                    let _ = frames.send(line);
+                    let _ = stream.write_all(b"{\"status\":\"executed\",\"text\":\"ok\"}\n");
+                }
+            }
+        });
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(path.clone())));
+            client.initialize().await;
+            for arguments in [
+                json!({"connection": "Orders"}),
+                json!({"sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": 3}),
+                json!({"connection": 3, "sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "limit": 5}),
+            ] {
+                let answered = client.call("execute_sql", arguments.clone()).await;
+                assert_eq!(answered["error"]["code"], -32602, "{arguments}: {answered}");
+            }
+            assert!(
+                written.try_recv().is_err(),
+                "an invalid call reached the socket"
+            );
+
+            let answered = client
+                .call(
+                    "execute_sql",
+                    json!({"connection": "Orders", "sql": "SELECT 1"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "execute_sql");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["sql"], "SELECT 1");
+        });
+        let _ = std::fs::remove_dir_all(path.parent().expect("the path has a directory"));
     }
 
     #[test]

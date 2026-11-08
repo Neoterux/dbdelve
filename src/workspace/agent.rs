@@ -10,10 +10,14 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::mpsc::SyncSender};
 
+use super::agent_read::{self, NEEDS_APPROVAL};
 use super::*;
-use crate::agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool};
+use crate::{
+    agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool},
+    sql::{AgentVerdict, agent_gate},
+};
 
 /// What the agent bridge holds while it is running.
 #[derive(Default)]
@@ -38,6 +42,8 @@ pub(crate) struct AgentState {
     pub(crate) visibility_choices: HashSet<String>,
     /// The calls that have ended, newest first, at most [`LOG_CAP`].
     pub(crate) log: VecDeque<LogEntry>,
+    /// The agent's own connections, by profile id: never the user's.
+    pub(crate) lanes: HashMap<String, agent_read::Lane>,
 }
 
 // ponytail: the log is this session's own and keeps the last twenty calls,
@@ -78,7 +84,7 @@ pub(crate) fn unix_millis() -> u64 {
 impl AgentState {
     /// Write one ended call at the front of the log. Called once per call, from
     /// the places that answer it.
-    fn record(
+    pub(super) fn record(
         &mut self,
         id: CallId,
         tool: Tool,
@@ -554,10 +560,66 @@ impl Workspace {
                     .record(id, Tool::ListConnections, None, None, Status::Executed);
             }
             Inbound::Call {
+                tool: Tool::ExecuteSql,
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility(cx);
+                let found = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(|profile| {
+                        (
+                            profile.id.clone(),
+                            profile.name.clone(),
+                            profile.config.engine(),
+                            profile.mode,
+                        )
+                    }),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let (profile_id, profile_name, engine, mode) = match found {
+                    Ok(found) => found,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Status::RefusedByGate,
+                            lookup.to_string(),
+                        );
+                        return;
+                    }
+                };
+                // The schema requires a statement, so only an injected call
+                // has none; it is the empty statement.
+                let sql = args.sql.unwrap_or_default();
+                let refused = match agent_gate(engine, &sql, mode) {
+                    AgentVerdict::Run => {
+                        self.run_agent_sql(id, profile_id, sql, reply, cx);
+                        return;
+                    }
+                    // The verdict's contents are what an approval will show,
+                    // which agents do not get.
+                    AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
+                    AgentVerdict::Refuse(reason) => reason.to_string(),
+                };
+                self.agent_answered(
+                    id,
+                    Some(profile_name),
+                    None,
+                    &reply,
+                    Status::RefusedByGate,
+                    refused,
+                );
+            }
+            Inbound::Call {
                 tool: Tool::Ping,
                 id,
                 connection,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility(cx);
                 let found = match connection.as_deref() {
@@ -610,6 +672,24 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// Answer an `execute_sql` call at once and log it: the end of a call that
+    /// never waits for anyone. `resolved` is the profile's own name, `asked` what the agent
+    /// called a connection that resolved to nothing.
+    pub(super) fn agent_answered(
+        &mut self,
+        id: CallId,
+        resolved: Option<String>,
+        asked: Option<&str>,
+        reply: &SyncSender<Reply>,
+        status: Status,
+        text: String,
+    ) {
+        // The caller may have hung up, and then nobody reads this.
+        let _ = reply.send(Reply { status, text });
+        self.agent
+            .record(id, Tool::ExecuteSql, resolved, asked, status);
     }
 
     /// The one door every call ends through: answered, expired or hung up.
