@@ -5,6 +5,7 @@
 //! inherent impl rather than types of their own.
 
 mod agent;
+mod agent_read;
 mod commands;
 #[cfg(test)]
 mod e2e;

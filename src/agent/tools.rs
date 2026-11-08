@@ -10,6 +10,8 @@ use serde_json::{Map, Value, json};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Tool {
     ListConnections,
+    /// Runs one statement the gate lets an agent run without asking.
+    ExecuteSql,
     /// Asks the person at the window to answer: nothing runs for it, so it
     /// only ever waits to be answered, to expire, or to be hung up.
     Ping,
@@ -17,12 +19,13 @@ pub(crate) enum Tool {
 
 impl Tool {
     /// Every tool, in the order the agent is shown them.
-    pub(crate) const ALL: [Tool; 2] = [Tool::ListConnections, Tool::Ping];
+    pub(crate) const ALL: [Tool; 3] = [Tool::ListConnections, Tool::ExecuteSql, Tool::Ping];
 
     /// The name the agent calls it by: the spelling serde writes for it.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Tool::ListConnections => "list_connections",
+            Tool::ExecuteSql => "execute_sql",
             Tool::Ping => "ping",
         }
     }
@@ -36,13 +39,16 @@ impl Tool {
             Tool::ListConnections => {
                 "Lists the DBDelve connections the user has made visible to agents, by name and engine."
             }
+            Tool::ExecuteSql => {
+                "Runs one read statement on a named connection exactly as written and returns the first rows, header first. A statement that would change data is not run."
+            }
             Tool::Ping => {
                 "Asks the user, in the DBDelve window, to answer a test from the agent for one connection. Waits until the user answers. Opens no database connection and runs nothing."
             }
         }
     }
 
-    /// The JSON Schema of the arguments the tool takes. Neither takes more
+    /// The JSON Schema of the arguments the tool takes. None takes more
     /// than it names, so an argument it does not know is refused up front
     /// rather than ignored.
     pub(crate) fn input_schema(self) -> Map<String, Value> {
@@ -50,6 +56,10 @@ impl Tool {
         schema.insert("type".to_string(), json!("object"));
         let properties = match self {
             Tool::ListConnections => json!({}),
+            Tool::ExecuteSql => {
+                schema.insert("required".to_string(), json!(["connection", "sql"]));
+                json!({ "connection": { "type": "string" }, "sql": { "type": "string" } })
+            }
             Tool::Ping => {
                 schema.insert("required".to_string(), json!(["connection"]));
                 json!({ "connection": { "type": "string" } })
@@ -82,5 +92,13 @@ mod tests {
             assert_eq!(schema["additionalProperties"], false);
         }
         assert_eq!(Tool::Ping.input_schema()["required"], json!(["connection"]));
+        assert_eq!(Tool::ALL.len(), 3);
+        let schema = Tool::ExecuteSql.input_schema();
+        assert_eq!(schema["required"], json!(["connection", "sql"]));
+        assert_eq!(
+            schema["properties"]["connection"],
+            json!({"type": "string"})
+        );
+        assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));
     }
 }

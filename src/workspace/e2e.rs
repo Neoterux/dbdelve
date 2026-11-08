@@ -10,6 +10,8 @@ use gpui::{
 use gpui_component::{Root, input::InputState};
 
 use super::Workspace;
+#[cfg(unix)]
+use crate::agent::tests::frame;
 use crate::{
     actions::{CancelQuery, ImportRowsFromClipboard, SubmitConnection},
     connection_form::ConnectionForm,
@@ -3601,7 +3603,7 @@ fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let client = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| client.is_finished());
         let answer = client.join().expect("the client thread finished");
 
@@ -3655,7 +3657,7 @@ fn the_window_holds_a_presence_for_as_long_as_the_connection_is_open(cx: &mut Te
 
         let mut stream =
             std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
-        std::io::Write::write_all(&mut stream, b"{\"v\":1,\"kind\":\"presence\"}\n")
+        std::io::Write::write_all(&mut stream, format!("{}\n", presence()).as_bytes())
             .expect("the frame is written");
         drive_until(cx, |cx| open(cx) == 1);
         drop(stream);
@@ -3679,6 +3681,26 @@ fn inject_call(
     crate::agent::CallId,
     std::sync::mpsc::Receiver<crate::agent::Reply>,
 ) {
+    inject_call_with(
+        workspace,
+        cx,
+        tool,
+        connection,
+        crate::agent::CallArgs::default(),
+    )
+}
+
+/// [`inject_call`] for a call that carries arguments beyond its connection.
+fn inject_call_with(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tool: crate::agent::tools::Tool,
+    connection: Option<&str>,
+    args: crate::agent::CallArgs,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = crate::agent::CallId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let (reply, answers) = std::sync::mpsc::sync_channel(1);
@@ -3686,11 +3708,47 @@ fn inject_call(
         id,
         tool,
         connection: connection.map(str::to_string),
+        args,
         reply,
     };
     workspace.update(cx, |workspace, cx| workspace.on_agent_message(call, cx));
     (id, answers)
 }
+
+/// The app launched on a visible SQLite profile `Orders` (id `orders`) holding
+/// a database `schema` has been run against, and a hidden one `Secret` on the
+/// same file. `extra` is more scalar keys for `Orders`, such as its mode. The
+/// profile is never connected: the file is written before anything opens it.
+fn agent_sqlite<'a>(
+    cx: &'a mut TestAppContext,
+    schema: &str,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        // The app connects the first profile at launch, and `Orders` is to be
+        // one the user never connected.
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            sqlite_profile(
+                "orders",
+                "Orders",
+                &format!("agent_visible = true\n{extra}"),
+            ),
+        ]
+        .concat(),
+    );
+    let database = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(&database)
+        .and_then(|connection| connection.execute_batch(schema))
+        .expect("the schema must apply");
+    (workspace, cx)
+}
+
+const ORDERS_SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
+     INSERT INTO t VALUES (1, 'a@x'), (2, NULL), (3, 'c@x');";
 
 fn pending_calls(
     workspace: &Entity<Workspace>,
@@ -3800,7 +3858,8 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let ping = b"{\"v\":1,\"kind\":\"call\",\"tool\":\"ping\",\"connection\":\"Orders\"}\n";
+        let ping = format!("{}\n", ping_orders());
+        let ping = ping.as_bytes();
         let connect = || {
             let mut stream = UnixStream::connect(&path).expect("the socket accepts a client");
             stream.write_all(ping).expect("the frame is written");
@@ -3916,7 +3975,9 @@ fn copying_the_registration_puts_the_line_on_the_clipboard_and_says_so(cx: &mut 
 }
 
 #[cfg(unix)]
-const PING_ORDERS: &str = r#"{"v":1,"kind":"call","tool":"ping","connection":"Orders"}"#;
+fn ping_orders() -> String {
+    frame(r#""kind":"call","tool":"ping","connection":"Orders""#)
+}
 
 #[cfg(unix)]
 #[gpui::test]
@@ -3956,7 +4017,7 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
         workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(false, cx));
         assert_eq!(saved_agent_access(), Some(true));
 
-        let listed = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let listed = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| listed.is_finished());
         let reply: Reply = serde_json::from_str(
             listed
@@ -3968,7 +4029,7 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
         assert_eq!(reply.status, Status::Executed);
         assert!(reply.text.contains("Orders"), "{}", reply.text);
 
-        let ping = raw_call(&path, PING_ORDERS);
+        let ping = raw_call(&path, &ping_orders());
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
 
         run_command(&workspace, cx, Command::DisconnectAgents);
@@ -4209,7 +4270,9 @@ fn the_kill_switch_holds_across_two_windows_of_the_same_variant(cx: &mut TestApp
 }
 
 #[cfg(unix)]
-const PRESENCE: &str = r#"{"v":1,"kind":"presence"}"#;
+fn presence() -> String {
+    frame(r#""kind":"presence""#)
+}
 
 #[cfg(unix)]
 const REJECTED: &str = r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#;
@@ -4226,9 +4289,12 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
         run_command(&workspace, cx, Command::TurnOnAgentAccess);
         let path = crate::agent::socket_path().expect("the test home gives a socket path");
 
-        let pings = [raw_call(&path, PING_ORDERS), raw_call(&path, PING_ORDERS)];
+        let pings = [
+            raw_call(&path, &ping_orders()),
+            raw_call(&path, &ping_orders()),
+        ];
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
-        let presence = raw_call(&path, PRESENCE);
+        let presence = raw_call(&path, &presence());
         drive_until(cx, |cx| {
             workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
         });
@@ -5320,7 +5386,7 @@ fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mu
 
         let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
         client
-            .write_all(format!("{PING_ORDERS}\n").as_bytes())
+            .write_all(format!("{}\n", ping_orders()).as_bytes())
             .expect("the frame is written");
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
         let id = pending_calls(&workspace, cx)[0];
@@ -5597,7 +5663,7 @@ fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_cho
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let client = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| client.is_finished());
         let answer = client.join().expect("the client thread finished");
         let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
@@ -5623,5 +5689,79 @@ fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_cho
         workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
         quit(workspace, cx);
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_reads_rows_through_the_shim_on_a_connection_of_its_own(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let untouched = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                (
+                    matches!(orders.state, ProfileState::Idle),
+                    orders.session.queries.len(),
+                    orders.session.objects.len(),
+                )
+            })
+        };
+        let before = untouched(cx);
+        assert!(before.0, "the user never connected Orders");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "execute_sql",
+            serde_json::json!({
+                "connection": "Orders",
+                "sql": "SELECT id, email FROM t ORDER BY id",
+            }),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        assert!(
+            text.starts_with("status: executed\ntruncated: none (3 rows)\ncolumns: "),
+            "{text}"
+        );
+        assert!(text.contains("[\"1\","), "{text}");
+        assert!(text.contains("null]"), "{text}");
+
+        assert_eq!(
+            untouched(cx),
+            before,
+            "the agent's read moved the user's profile"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.calls.is_empty(), "a read asks nobody");
+            assert_eq!(workspace.agent.lanes.len(), 1);
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let lane = workspace
+                .agent
+                .lanes
+                .get("orders")
+                .expect("the read opened a lane for Orders");
+            assert!(lane.opened_from == orders.config);
+        });
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
     });
 }
