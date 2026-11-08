@@ -3715,6 +3715,25 @@ fn inject_call_with(
     (id, answers)
 }
 
+/// An `execute_sql` call for `Orders` carrying `sql`, injected.
+fn inject_sql(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: &str,
+    sql: &str,
+) -> std::sync::mpsc::Receiver<crate::agent::Reply> {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some(connection),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+        },
+    )
+    .1
+}
+
 /// The app launched on a visible SQLite profile `Orders` (id `orders`) holding
 /// a database `schema` has been run against, and a hidden one `Secret` on the
 /// same file. `extra` is more scalar keys for `Orders`, such as its mode. The
@@ -3749,6 +3768,15 @@ fn agent_sqlite<'a>(
 
 const ORDERS_SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
      INSERT INTO t VALUES (1, 'a@x'), (2, NULL), (3, 'c@x');";
+
+fn rows_in_orders() -> i64 {
+    let database = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(database)
+        .and_then(|connection| connection.query_row("SELECT count(*) FROM t", [], |row| row.get(0)))
+        .expect("the table is readable")
+}
 
 fn pending_calls(
     workspace: &Entity<Workspace>,
@@ -5762,6 +5790,81 @@ fn an_agent_reads_rows_through_the_shim_on_a_connection_of_its_own(cx: &mut Test
         });
 
         workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_statement_that_needs_approval_is_refused_and_never_reaches_the_server(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let answers = inject_sql(&workspace, cx, "Orders", "INSERT INTO t VALUES (9, 'z')");
+        cx.run_until_parked();
+        let reply = answers.try_recv().expect("the gate answers at once");
+        assert_eq!(reply.status, Status::RefusedByGate);
+        assert_eq!(reply.text, super::agent_read::NEEDS_APPROVAL);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.calls.is_empty());
+        });
+        assert_eq!(rows_in_orders(), 3);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refused_statement_answers_the_reason_it_was_refused(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for (connection, sql, reason) in [
+            (
+                "Orders",
+                "DROP TABLE t",
+                "DROP is refused for agent statements",
+            ),
+            ("Orders", "SELECT 1; SELECT 2", "more than one statement"),
+            (
+                "Secret",
+                "SELECT 1",
+                "no agent-visible connection has that name",
+            ),
+        ] {
+            let answers = inject_sql(&workspace, cx, connection, sql);
+            cx.run_until_parked();
+            let reply = answers.try_recv().expect("the gate answers at once");
+            assert_eq!(reply.status, Status::RefusedByGate, "{sql}");
+            assert_eq!(reply.text, reason, "{sql}");
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+        });
+        assert_eq!(rows_in_orders(), 3);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_empty_statement_is_refused_without_opening_a_connection(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for sql in ["", "   "] {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            cx.run_until_parked();
+            let reply = answers.try_recv().expect("the gate answers at once");
+            assert_eq!(reply.status, Status::RefusedByGate, "{sql:?}");
+            assert_eq!(reply.text, "there is no statement to run", "{sql:?}");
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+        });
         quit(workspace, cx);
     });
 }
