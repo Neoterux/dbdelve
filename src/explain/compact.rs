@@ -923,11 +923,31 @@ mod tests {
     #[test]
     #[ignore = "requires the compose databases"]
     fn live_the_plan_fixtures_match_the_compose_servers() {
-        check_captures(&[Capture {
-            variable: "dbdelve_MYSQL_URL",
-            fixture: "plan-mysql-tabular.txt",
-            mode: ExplainMode::Plan,
-            sql: MYSQL_JOIN,
-        }]);
+        check_captures(&[
+            Capture {
+                variable: "dbdelve_MYSQL_URL",
+                fixture: "plan-mysql-tabular.txt",
+                mode: ExplainMode::Plan,
+                sql: MYSQL_JOIN,
+            },
+            Capture {
+                variable: "dbdelve_MARIADB_URL",
+                fixture: "plan-mariadb-tabular.txt",
+                mode: ExplainMode::Plan,
+                sql: MYSQL_JOIN,
+            },
+            Capture {
+                variable: "dbdelve_MARIADB_URL",
+                fixture: "plan-mariadb-analyze.txt",
+                mode: ExplainMode::Analyze,
+                sql: MYSQL_JOIN,
+            },
+            Capture {
+                variable: "dbdelve_CLICKHOUSE_URL",
+                fixture: "plan-clickhouse.txt",
+                mode: ExplainMode::Plan,
+                sql: "SELECT id, name, plan, balance FROM accounts WHERE active",
+            },
+        ]);
     }
 }
