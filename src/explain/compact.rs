@@ -34,8 +34,7 @@ use crate::db::{Engine, Row};
 
 /// How many nodes a plan prints, ancestors counted.
 // ponytail: provisional. Plan 05-10 sets it from the D-18 token measurement of
-// this module's output; until then it is the largest figure that keeps the
-// large fixture's compact text under what that plan expects to allow.
+// this module's output; 24 is the figure it starts from, not a measured one.
 pub(crate) const NODE_CAP: usize = 24;
 
 /// How many findings are listed before the rest are counted.
@@ -64,8 +63,6 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Str
 /// long before its closing line. The four header parts are always written; a
 /// plan that is [`degenerate`] prints its own lines under `tree:` instead of
 /// its one node.
-// ponytail: a finding is listed before the tree, so one on a node the byte cut
-// removes still names it; the closing line says how many nodes were cut.
 pub(crate) fn compact_within(
     plan: &Plan,
     analysis: &Analysis,
@@ -155,6 +152,8 @@ pub(crate) fn tabular_text(columns: &[String], rows: &[Row]) -> String {
 /// detail lines, a `... N nodes not shown` line, or one raw line.
 struct Block {
     lines: Vec<String>,
+    /// The node it prints, when it is one.
+    node: Option<usize>,
     /// How many printed nodes (or raw lines) this block is.
     printed: usize,
     /// How many nodes (or raw lines) are lost when it is cut.
@@ -172,39 +171,9 @@ fn render(
     let shown = kept.iter().filter(|kept| **kept).count();
     // A raw plan is one node, so a node cap of 0 is the only way it is cut.
     let raw = raw.filter(|_| shown > 0);
-    let mut lines = vec![header(plan, analysis)];
-    // A finding is only as good as the node it names, and that node has to be
-    // in the tree below for the line to be checked against it. One on a node
-    // that was cut is counted and left out, so the list is no longer than the
-    // tree is.
-    let listed = &analysis.findings[..analysis.findings.len().min(FINDINGS_CAP)];
-    let (shown_findings, left_out): (Vec<Finding>, Vec<Finding>) =
-        listed.iter().partition(|finding| kept[node_of(**finding)]);
-    if analysis.findings.is_empty() {
-        lines.push("findings: none".to_string());
-    } else {
-        lines.push("findings:".to_string());
-        lines.extend(
-            shown_findings
-                .iter()
-                .map(|finding| finding_line(plan, analysis, *finding)),
-        );
-        if !left_out.is_empty() {
-            let count = left_out.len();
-            lines.push(format!(
-                "  ... {count} finding{} on nodes not shown",
-                if count == 1 { "" } else { "s" }
-            ));
-        }
-        let past = analysis.findings.len() - listed.len();
-        if past > 0 {
-            lines.push(format!(
-                "  ... {past} more finding{} past the first {FINDINGS_CAP}",
-                if past == 1 { "" } else { "s" }
-            ));
-        }
-    }
-    lines.push(if shown == 0 { "tree: none" } else { "tree:" }.to_string());
+    let header = header(plan, analysis);
+    let mut findings = findings_lines(plan, analysis, |index| kept[index]);
+    let tree = if shown == 0 { "tree: none" } else { "tree:" };
 
     let blocks = match raw {
         Some(text) => raw_blocks(text),
@@ -220,16 +189,40 @@ fn render(
         max_nodes,
         total.max(shown),
         true,
-        raw.is_some(),
+        raw.map(|_| blocks.len()),
     );
-    let mut used = widest.len() + 1 + lines.iter().map(|line| line.len() + 1).sum::<usize>();
-    let mut cut = blocks.len();
-    for (at, block) in blocks.iter().enumerate() {
-        used = used.saturating_add(block.lines.iter().map(|line| line.len() + 1).sum::<usize>());
-        if used > max_bytes {
-            cut = at;
-            break;
+    let size = |lines: &[String]| lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let cut_with = |before: usize| {
+        let mut used = before;
+        for (at, block) in blocks.iter().enumerate() {
+            used = used.saturating_add(size(&block.lines));
+            if used > max_bytes {
+                return at;
+            }
         }
+        blocks.len()
+    };
+    let before =
+        |findings: &[String]| widest.len() + 1 + header.len() + 1 + size(findings) + tree.len() + 1;
+    let mut cut = cut_with(before(&findings));
+    if cut < blocks.len() {
+        // The cut removes nodes a finding may name, and a finding names only a
+        // node that is printed: the ones on cut nodes are counted instead, and
+        // room is left for the line that counts them.
+        let counted = findings
+            .iter()
+            .any(|line| line.ends_with("on nodes not shown"));
+        let spare = if analysis.findings.is_empty() || counted {
+            0
+        } else {
+            format!("  ... {FINDINGS_CAP} findings on nodes not shown").len() + 1
+        };
+        cut = cut_with(before(&findings) + spare);
+        let mut printed = vec![false; plan.nodes.len()];
+        for node in blocks[..cut].iter().filter_map(|block| block.node) {
+            printed[node] = true;
+        }
+        findings = findings_lines(plan, analysis, |index| printed[index]);
     }
     let printed: usize = blocks[..cut].iter().map(|block| block.printed).sum();
     let lost: usize = blocks[cut..].iter().map(|block| block.weight).sum();
@@ -239,11 +232,12 @@ fn render(
         max_nodes,
         printed,
         cut < blocks.len(),
-        raw.is_some(),
+        raw.map(|_| blocks.len()),
     );
     text.push('\n');
-    for line in lines
-        .iter()
+    for line in std::iter::once(&header)
+        .chain(&findings)
+        .chain(std::iter::once(&tree.to_string()))
         .chain(blocks[..cut].iter().flat_map(|block| &block.lines))
     {
         text.push_str(line);
@@ -256,6 +250,46 @@ fn render(
         ));
     }
     text
+}
+
+/// The `findings:` block. A finding is only as good as the node it names, and
+/// that node has to be in the tree below for the line to be checked against it.
+/// One on a node `is_shown` refuses is counted and left out, so the list is no
+/// longer than the tree is, and findings past [`FINDINGS_CAP`] are counted on
+/// a line of their own.
+fn findings_lines(
+    plan: &Plan,
+    analysis: &Analysis,
+    is_shown: impl Fn(usize) -> bool,
+) -> Vec<String> {
+    if analysis.findings.is_empty() {
+        return vec!["findings: none".to_string()];
+    }
+    let listed = &analysis.findings[..analysis.findings.len().min(FINDINGS_CAP)];
+    let (shown, left_out): (Vec<Finding>, Vec<Finding>) = listed
+        .iter()
+        .partition(|finding| is_shown(node_of(**finding)));
+    let mut lines = vec!["findings:".to_string()];
+    lines.extend(
+        shown
+            .iter()
+            .map(|finding| finding_line(plan, analysis, *finding)),
+    );
+    if !left_out.is_empty() {
+        let count = left_out.len();
+        lines.push(format!(
+            "  ... {count} finding{} on nodes not shown",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+    let past = analysis.findings.len() - listed.len();
+    if past > 0 {
+        lines.push(format!(
+            "  ... {past} more finding{} past the first {FINDINGS_CAP}",
+            if past == 1 { "" } else { "s" }
+        ));
+    }
+    lines
 }
 
 /// The tree as blocks in plan order: each kept node with its detail lines, and
@@ -272,6 +306,7 @@ fn node_blocks(plan: &Plan, analysis: &Analysis, kept: &[bool]) -> Vec<Block> {
                 "{}... {dropped} nodes not shown",
                 indent(child_depth)
             )],
+            node: None,
             printed: 0,
             weight: dropped,
         })
@@ -286,6 +321,7 @@ fn node_blocks(plan: &Plan, analysis: &Analysis, kept: &[bool]) -> Vec<Block> {
             lines.extend(detail_lines(plan, index));
             blocks.push(Block {
                 lines,
+                node: Some(index),
                 printed: 1,
                 weight: 1,
             });
@@ -306,6 +342,7 @@ fn raw_blocks(text: &str) -> Vec<Block> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| Block {
             lines: vec![format!("  | {}", one_line(line))],
+            node: None,
             printed: 1,
             weight: 1,
         })
@@ -314,19 +351,19 @@ fn raw_blocks(text: &str) -> Vec<Block> {
 
 /// The first line: whether anything was cut and by what rule. `shown` is what
 /// was printed, `by_bytes` whether the reply budget cut the tree short, and
-/// `raw` whether the tree is a plan's own lines.
+/// `raw` how many lines the tree is when it is a plan's own.
 fn truncation(
     plan: &Plan,
     analysis: &Analysis,
     max_nodes: usize,
     shown: usize,
     by_bytes: bool,
-    raw: bool,
+    raw: Option<usize>,
 ) -> String {
     let nodes = plan.nodes.len();
-    if raw {
+    if let Some(total) = raw {
         return match by_bytes {
-            true => format!("truncated: kept {shown} of the plan's lines (reply budget)"),
+            true => format!("truncated: kept {shown} of {total} plan lines (reply budget)"),
             false => "truncated: none".to_string(),
         };
     }
@@ -1353,6 +1390,19 @@ mod tests {
         assert!(!whole_tree[printed.len()].trim_start().starts_with('|'));
         let (shown, _) = printed_and_counted(&out);
         assert_eq!(shown.len() + more, 59);
+        // A finding names only a node that is printed; the rest are counted.
+        let findings = block(&out, "findings:");
+        assert!(findings.iter().any(|line| node_index(line).is_some()));
+        for line in &findings {
+            if let Some(index) = node_index(line) {
+                assert!(shown.contains(&index), "{line}");
+            }
+        }
+        assert!(
+            findings
+                .iter()
+                .any(|line| line.ends_with(" on nodes not shown"))
+        );
         assert!(lines[0].starts_with(&format!("truncated: kept {} of 59 nodes", shown.len())));
 
         let (columns, rows) = read_fixture(CLICKHOUSE);
@@ -1365,7 +1415,11 @@ mod tests {
             full.len() - 10,
         );
         let last = out.lines().last().expect("a last line");
-        assert!(last.starts_with("  ... "), "{last}");
+        assert!(
+            out.starts_with("truncated: kept 5 of 7 plan lines (reply budget)\n"),
+            "{out}"
+        );
+        assert_eq!(last, "  ... 2 more plan lines not shown (reply budget)");
         assert!(
             last.ends_with(" more plan lines not shown (reply budget)"),
             "{last}"
