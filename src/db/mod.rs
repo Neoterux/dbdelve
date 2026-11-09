@@ -1024,6 +1024,7 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
         // Same reason: a URL has nowhere to say it either.
         ssh: None,
         schema: None,
+        read_only: false,
     })
 }
 
@@ -1104,6 +1105,11 @@ pub struct ServerConfig {
     /// [`Target::picks_schema`]. None leaves the server's
     /// `search_path` alone.
     pub schema: Option<String>,
+    /// Hold every session opened from this config to reads from its first
+    /// statement. A flag for an agent's connection, set only by
+    /// [`ConnectionConfig::with_read_only_hold`]: it is never stored, and a
+    /// user's own connection never carries it.
+    pub read_only: bool,
 }
 
 impl ServerConfig {
@@ -1466,6 +1472,24 @@ impl ConnectionConfig {
         self
     }
 
+    /// `self` with the read-only hold set where a session takes one: every
+    /// Postgres, MySQL and MariaDB session opened from the result starts
+    /// read-only, the side and cancel sessions a connection opens for itself
+    /// included. Nothing else changes in any config. The other server engines
+    /// take no session setting (`read_only_statement` answers none) or carry
+    /// the hold on each request, and a file engine is opened read-only by
+    /// [`Connection::open_for_agent`]; none has a flag to set.
+    #[must_use]
+    pub fn with_read_only_hold(mut self) -> Self {
+        if let Self::Postgres(PostgresConfig { server, .. })
+        | Self::MySql(server)
+        | Self::MariaDb(server) = &mut self
+        {
+            server.read_only = true;
+        }
+        self
+    }
+
     /// The strings an error bound for an agent must never carry (D-26): the
     /// hosts, ports as text, users, file paths as stored and home-expanded, the
     /// tunnel's own, an external connection string, and the password when there
@@ -1679,6 +1703,16 @@ impl Connection {
     /// nothing -- so the open is what keeps a write from it, and a statement
     /// the gate misjudged still cannot change the file. This is defence in
     /// depth behind `sql::agent_gate`, as `set_read_only`'s own comment says.
+    ///
+    /// A server engine is opened from [`ConnectionConfig::with_read_only_hold`],
+    /// so every session opened from that config -- the side session
+    /// `sizes()` reads through and the sessions that cancel a statement
+    /// included -- starts read-only on Postgres, MySQL and MariaDB. SQL
+    /// Server, Snowflake, MongoDB and Redis take no session setting, so
+    /// `sql::agent_gate` holds every statement the agent sends to reads there;
+    /// MongoDB's `sizes()` runs DBDelve's fixed `$collStats` aggregation on
+    /// the agent's own client and opens no other session. ClickHouse carries
+    /// the hold on each request.
     pub fn open_for_agent(config: ConnectionConfig) -> Result<Self, DbError> {
         let connection = match config {
             ConnectionConfig::Sqlite {
@@ -1699,7 +1733,7 @@ impl Connection {
                     connection.opened_on(Some(database).filter(|name| !name.is_empty()), schema),
                 )
             }),
-            config => Self::open(config),
+            config => Self::open(config.with_read_only_hold()),
         }?;
         connection.set_read_only(true)?;
         Ok(connection)
@@ -3880,6 +3914,23 @@ mod tests {
             assert_eq!(bounded.statement_timeout(), 17, "{engine:?}");
             // Setting it back leaves the config as it was, so nothing else moved.
             assert_eq!(bounded.with_statement_timeout(0), config, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn the_read_only_hold_is_set_only_where_a_session_takes_one() {
+        for config in every_shape() {
+            let engine = config.engine();
+            let mut held = config.clone().with_read_only_hold();
+            let takes_one = matches!(engine, Engine::Postgres | Engine::MySql | Engine::MariaDb);
+            if let Some(server) = held.server() {
+                assert_eq!(server.read_only, takes_one, "{engine:?}");
+            }
+            if let Some(server) = held.server_mut() {
+                server.read_only = false;
+            }
+            // Every other field, and every other shape, is as it was.
+            assert_eq!(held, config, "{engine:?}");
         }
     }
 

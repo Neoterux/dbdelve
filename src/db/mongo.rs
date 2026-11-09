@@ -219,6 +219,7 @@ pub fn config_from_url(url: &str) -> Result<MongoConfig, String> {
             statement_timeout: 0,
             ssh: None,
             schema: None,
+            read_only: false,
         },
         srv,
         options,

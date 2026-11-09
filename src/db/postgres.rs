@@ -531,6 +531,7 @@ pub fn config_from_url(url: &str) -> Result<PostgresConfig, String> {
             statement_timeout: 0,
             ssh: None,
             schema: None,
+            read_only: false,
         },
         service,
     })
@@ -561,20 +562,26 @@ fn connection_string(server: &ServerConfig) -> String {
     // that resolves but drops packets pins the UI in "Connecting…" for
     // minutes with no cancel.
     parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
+    // A session default set once, here, rather than a `SET` prepended to the
+    // user's submission -- see `ServerConfig::statement_timeout`. It rides in
+    // as a startup option because `options` is the only channel libpq has for
+    // one, and nothing collides with it: dbdelve's URL parser has no `options`
+    // field, so a user-supplied one never reaches here. `statement_timeout`
+    // counts milliseconds when given a bare number. The read-only hold shares
+    // the one `options` parameter, so an agent's sessions add no startup
+    // parameter beyond what the timeout already sends a pooler.
+    let mut options = Vec::new();
     if server.statement_timeout > 0 {
-        // A session default set once, here, rather than a `SET` prepended to
-        // the user's submission -- see `ServerConfig::statement_timeout`. It
-        // rides in as a startup option because `options` is the only channel
-        // libpq has for one, and nothing collides with it: dbdelve's URL parser
-        // has no `options` field, so a user-supplied one never reaches here.
-        // `statement_timeout` counts milliseconds when given a bare number.
-        parts.push(format!(
-            "options={}",
-            quote(&format!(
-                "-c statement_timeout={}",
-                u64::from(server.statement_timeout) * 1_000
-            ))
+        options.push(format!(
+            "-c statement_timeout={}",
+            u64::from(server.statement_timeout) * 1_000
         ));
+    }
+    if server.read_only {
+        options.push("-c default_transaction_read_only=on".to_string());
+    }
+    if !options.is_empty() {
+        parts.push(format!("options={}", quote(&options.join(" "))));
     }
     parts.join(" ")
 }
@@ -1229,8 +1236,14 @@ impl Connection {
     /// waiting on a relation's lock never holds the mutex a user's query waits
     /// on. The side connection is dropped on return.
     pub fn sizes(&self) -> Result<Sizes, DbError> {
-        let side = Self::connect(&self.server(), self.tunnel.clone())?;
-        assemble_sizes(side.internal_query(SIZES_SQL)?)
+        assemble_sizes(self.side_session()?.internal_query(SIZES_SQL)?)
+    }
+
+    /// A session of its own, built from this connection's config, so it
+    /// carries whatever that config holds -- the read-only hold of an agent's
+    /// connection included -- from its first statement.
+    fn side_session(&self) -> Result<Self, DbError> {
+        Self::connect(&self.server(), self.tunnel.clone())
     }
 
     pub fn references(&self, schema: &str, relation: &str) -> Result<Vec<Reference>, DbError> {
@@ -1876,6 +1889,7 @@ mod tests {
             statement_timeout: 0,
             ssh: None,
             schema: None,
+            read_only: false,
         }
     }
 
@@ -1896,6 +1910,7 @@ mod tests {
             statement_timeout: 0,
             ssh: None,
             schema: None,
+            read_only: false,
         }
     }
 
@@ -1973,6 +1988,42 @@ mod tests {
             connection_string(&config).contains("options='-c statement_timeout=30000'"),
             "{}",
             connection_string(&config)
+        );
+    }
+
+    #[test]
+    fn a_read_only_hold_rides_in_the_startup_options() {
+        let held = |statement_timeout| {
+            connection_string(&ServerConfig {
+                statement_timeout,
+                read_only: true,
+                ..config()
+            })
+        };
+        let string = held(30);
+        assert!(
+            string.contains(
+                "options='-c statement_timeout=30000 -c default_transaction_read_only=on'"
+            ),
+            "{string}"
+        );
+        assert_eq!(string.matches("options=").count(), 1, "{string}");
+        let string = held(0);
+        assert!(
+            string.contains("options='-c default_transaction_read_only=on'"),
+            "{string}"
+        );
+        let string = connection_string(&ServerConfig {
+            statement_timeout: 30,
+            ..config()
+        });
+        assert!(
+            !string.contains("default_transaction_read_only"),
+            "{string}"
+        );
+        assert!(
+            !connection_string(&config()).contains("default_transaction_read_only"),
+            "an unheld config sends no hold"
         );
     }
 
@@ -2448,6 +2499,7 @@ mod tests {
                     statement_timeout: 0,
                     ssh: None,
                     schema: None,
+                    read_only: false,
                 },
                 service: None,
             }
@@ -2887,6 +2939,59 @@ mod tests {
             error.message
         );
         assert!(connection.query("SELECT 1", Fetch::default()).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_side_session_sizes_opens_is_read_only() {
+        let plain = Connection::open(&live_config()).expect("connection should open");
+        plain
+            .query(
+                "DROP TABLE IF EXISTS dbdelve_side_probe; \
+                 CREATE TABLE dbdelve_side_probe (x integer); \
+                 INSERT INTO dbdelve_side_probe SELECT generate_series(1, 5); \
+                 ANALYZE dbdelve_side_probe",
+                Fetch::default(),
+            )
+            .expect("the probe table should be created");
+
+        let held = Connection::open(&ServerConfig {
+            read_only: true,
+            ..live_config()
+        })
+        .expect("a held connection should open");
+        let side = held.side_session().expect("the side session should open");
+        let setting = side
+            .query("SHOW transaction_read_only", Fetch::default())
+            .expect("the setting should read");
+        assert_eq!(setting.rows, vec![vec![Some("on".to_string())]]);
+        let refusal = side
+            .query(
+                "INSERT INTO dbdelve_side_probe VALUES (1)",
+                Fetch::default(),
+            )
+            .expect_err("a held side session must refuse a write");
+        assert!(
+            refusal.message.contains("read-only"),
+            "the server's own words: {}",
+            refusal.message
+        );
+        let sizes = held
+            .sizes()
+            .expect("sizes should load on a held connection");
+        assert!(
+            sizes["public"].contains_key("dbdelve_side_probe"),
+            "the hold must not empty the estimates"
+        );
+
+        // The seeded rows are all there is: the refused write did not land.
+        let count = plain
+            .query("SELECT count(*) FROM dbdelve_side_probe", Fetch::default())
+            .expect("the plain connection should read");
+        assert_eq!(count.rows, vec![vec![Some("5".to_string())]]);
+        plain
+            .query("DROP TABLE dbdelve_side_probe", Fetch::default())
+            .expect("the probe table should drop");
     }
 
     #[test]

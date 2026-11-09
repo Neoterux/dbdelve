@@ -1250,6 +1250,7 @@ mod tests {
                 statement_timeout: 0,
                 ssh: None,
                 schema: None,
+                read_only: false,
             }
         );
         assert_eq!(
