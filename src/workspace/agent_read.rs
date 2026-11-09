@@ -12,11 +12,11 @@
 //! wrapped around it or rewritten, so the gate's verdict is about what the
 //! server receives.
 
-use std::sync::mpsc::SyncSender;
+use std::{collections::VecDeque, sync::mpsc::SyncSender};
 
 use super::*;
 use crate::{
-    agent::{CallId, Reply, Status, result},
+    agent::{CallId, Reply, Status, result, tools::Tool},
     db::{CancelToken, Connection, ConnectionConfig, DbError, Fetch, QueryResult},
 };
 
@@ -139,18 +139,59 @@ fn account_end(message: &str, at: usize) -> Option<usize> {
 pub(crate) const NEEDS_APPROVAL: &str =
     "statements that need the user's approval are not run for agents";
 
-/// A connection of the agent's own to one profile's database.
+/// The agent's calls on one profile, and the connection of its own they share.
+///
+/// One call runs at a time: the connection runs one statement, and a call that
+/// arrived while another ran would otherwise be answered with the first's rows
+/// or cancel the first's statement. Later calls wait here, in the order they
+/// came, and never in [`AgentState::calls`](super::agent::AgentState::calls),
+/// which holds only what a person is asked about: a read draws no dialog and
+/// is not a waiting call.
 pub(crate) struct Lane {
-    /// The config it was opened from, its password slot as the profile holds
-    /// it (blank when the keychain has it), so a profile whose config has
-    /// since changed is told apart from one that has not.
+    /// The config `connection` was opened from, its password slot as the
+    /// profile holds it (blank when the keychain has it), so a profile whose
+    /// config has since changed is told apart from one that has not. Without a
+    /// connection it is the config the next read opens from.
     pub(crate) opened_from: ConnectionConfig,
-    pub(crate) connection: Connection,
+    /// `None` until a read opens it, and again after one that ended early or
+    /// failed.
+    pub(crate) connection: Option<Connection>,
     /// What an error that came back through this connection must not say
     /// ([`ConnectionConfig::identifying_text`] of the config it opened with,
     /// its password included). It lives exactly as long as the connection,
     /// which holds the same strings.
     pub(crate) hidden: Vec<String>,
+    pub(crate) running: Option<Running>,
+    pub(crate) waiting: VecDeque<Waiting>,
+}
+
+/// The call a lane is working on. Dropping it drops the work, which is what
+/// keeps a result that comes back late from landing.
+pub(crate) struct Running {
+    pub(crate) id: CallId,
+    tool: Tool,
+    profile_name: String,
+    reply: SyncSender<Reply>,
+    /// What stops the statement on the server when the call ends early.
+    cancel: CancelToken,
+    /// The lane's connection the statement runs on, when the lane had one. A
+    /// read that opens its own has none to hand until it lands.
+    connection: Option<Connection>,
+    _work: gpui::Task<()>,
+}
+
+/// A call that has not started: it holds its caller's reply and what to do.
+pub(crate) struct Waiting {
+    pub(crate) id: CallId,
+    tool: Tool,
+    profile_name: String,
+    reply: SyncSender<Reply>,
+    work: AgentWork,
+}
+
+/// What a waiting call will do once its lane is free.
+pub(crate) enum AgentWork {
+    Query { sql: String },
 }
 
 /// What the blocking half of a read came back with.
@@ -202,10 +243,9 @@ fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
 }
 
 impl Workspace {
-    /// Run one statement the gate let through, on the agent's own connection
-    /// to `profile_id`, and answer the call with its first rows. Opens the
-    /// connection on first use, off the foreground, and keeps it for the next
-    /// call.
+    /// Take one statement the gate let through for `profile_id`: it runs on
+    /// the agent's own connection to that profile when the lane is free, and
+    /// after the calls ahead of it when not. Answers with its first rows.
     pub(crate) fn run_agent_sql(
         &mut self,
         id: CallId,
@@ -230,95 +270,137 @@ impl Workspace {
             );
             return;
         };
-        let config = profile.config.clone();
-        let engine = config.engine();
-        let cached = self
-            .agent
+        let (profile_name, config) = (profile.name.clone(), profile.config.clone());
+        self.agent
             .lanes
-            .get(&profile_id)
-            .filter(|lane| lane.opened_from == config)
-            .map(|lane| (lane.connection.clone(), lane.hidden.clone()));
-
-        let task = spawn_blocking(cx.background_executor(), {
-            let profile_id = profile_id.clone();
-            let config = config.clone();
-            move || {
-                let (connection, hidden) = match cached {
-                    Some(cached) => cached,
-                    None => {
-                        let mut config = agent_config(&config);
-                        // A file engine has nothing to authenticate to, so it
-                        // never reaches the keychain.
-                        if let Some(slot) = config.password_mut()
-                            && slot.is_empty()
-                        {
-                            match store::password(&profile_id) {
-                                Ok(Some(password)) => *slot = password,
-                                Ok(None) => {}
-                                Err(_) => return Ran::NotOpened,
-                            }
-                        }
-                        // Taken after the password is in: it is one of the
-                        // strings a server's error may echo.
-                        let hidden = config.identifying_text();
-                        let Ok(connection) = Connection::open(config) else {
-                            return Ran::NotOpened;
-                        };
-                        // The hold is what makes a read the gate misjudged
-                        // harmless, so a connection that cannot take it is
-                        // not one the agent may use.
-                        if connection.set_read_only(true).is_err() {
-                            return Ran::NotOpened;
-                        }
-                        (connection, hidden)
-                    }
-                };
-                let result = connection.query(
-                    &sql,
-                    &CancelToken::default(),
-                    Fetch {
-                        limit: Some(AGENT_ROWS),
-                        reads_only: crate::sql::stoppable(engine, &sql),
-                        ..Fetch::default()
-                    },
-                );
-                Ran::Done {
-                    connection,
-                    hidden,
-                    result,
-                }
-            }
-        });
-
-        cx.spawn(async move |workspace, cx| {
-            let ran = task.await;
-            // The window may have closed meanwhile, and then nobody is left to
-            // answer.
-            let _ = workspace.update(cx, |workspace, _| {
-                workspace.land_agent_read(id, &profile_id, config, ran, &reply);
+            .entry(profile_id.clone())
+            .or_insert_with(|| Lane {
+                opened_from: config,
+                connection: None,
+                hidden: Vec::new(),
+                running: None,
+                waiting: VecDeque::new(),
+            })
+            .waiting
+            .push_back(Waiting {
+                id,
+                tool: Tool::ExecuteSql,
+                profile_name,
+                reply,
+                work: AgentWork::Query { sql },
             });
-        })
-        .detach();
+        self.start_next(&profile_id, cx);
     }
 
-    /// Take what a read came back with: keep its connection, and answer.
+    /// Start the oldest waiting call of `profile_id`'s lane if nothing runs
+    /// there, opening the lane's connection first when it has none or when the
+    /// profile's config is no longer the one it opened from. A lane left with
+    /// nothing to do and no connection is removed.
+    pub(crate) fn start_next(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(lane) = self.agent.lanes.get_mut(profile_id) else {
+            return;
+        };
+        if lane.running.is_some() {
+            return;
+        }
+        if lane.waiting.is_empty() {
+            if lane.connection.is_none() {
+                self.agent.lanes.remove(profile_id);
+            }
+            return;
+        }
+        let Some(config) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.config.clone())
+        else {
+            // The profile went with calls still waiting: no sweep is meant to
+            // leave one behind, and none is run for a profile that is gone.
+            self.end_lane(
+                profile_id,
+                Status::Rejected,
+                super::agent::NO_LONGER_AVAILABLE,
+                cx,
+            );
+            return;
+        };
+        let Some(lane) = self.agent.lanes.get_mut(profile_id) else {
+            return;
+        };
+        if lane.opened_from != config {
+            // ponytail: a changed connection is reopened on the next read
+            // rather than on the change, since nothing is read until then.
+            lane.connection = None;
+            lane.hidden.clear();
+            lane.opened_from = config.clone();
+        }
+        let Some(Waiting {
+            id,
+            tool,
+            profile_name,
+            reply,
+            work: AgentWork::Query { sql },
+        }) = lane.waiting.pop_front()
+        else {
+            return;
+        };
+        let cached = lane
+            .connection
+            .clone()
+            .map(|connection| (connection, lane.hidden.clone()));
+        let engine = config.engine();
+        let cancel = CancelToken::default();
+
+        let task = spawn_blocking(cx.background_executor(), {
+            let profile_id = profile_id.to_string();
+            let cancel = cancel.clone();
+            move || read_on(cached, &profile_id, &config, &sql, &cancel, engine)
+        });
+        let work = cx.spawn({
+            let profile_id = profile_id.to_string();
+            async move |workspace, cx| {
+                let ran = task.await;
+                // The window may have closed meanwhile, and then nobody is
+                // left to answer.
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.land_agent_read(id, &profile_id, engine, ran, cx);
+                });
+            }
+        });
+        if let Some(lane) = self.agent.lanes.get_mut(profile_id) {
+            lane.running = Some(Running {
+                id,
+                tool,
+                profile_name,
+                reply,
+                cancel,
+                connection: lane.connection.clone(),
+                _work: work,
+            });
+        }
+    }
+
+    /// Take what a read came back with: keep its connection and answer. A read
+    /// whose call ended meanwhile finds nothing running under its id, and what
+    /// it came back with is dropped.
     fn land_agent_read(
         &mut self,
         id: CallId,
         profile_id: &str,
-        opened_from: ConnectionConfig,
+        engine: Engine,
         ran: Ran,
-        reply: &SyncSender<Reply>,
+        cx: &mut Context<Self>,
     ) {
-        let name = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map(|profile| profile.name.clone());
-        let engine = opened_from.engine();
+        let Some(lane) = self.agent.lanes.get_mut(profile_id) else {
+            return;
+        };
+        if lane.running.as_ref().is_none_or(|running| running.id != id) {
+            return;
+        }
         let (status, text) = match ran {
             Ran::NotOpened => {
-                self.agent.lanes.remove(profile_id);
+                lane.connection = None;
                 (Status::Failed, OPEN_FAILED.to_string())
             }
             Ran::Done {
@@ -326,17 +408,8 @@ impl Workspace {
                 hidden,
                 result: Ok(result),
             } => {
-                // A profile removed while the read ran has no lane to keep.
-                if name.is_some() {
-                    self.agent.lanes.insert(
-                        profile_id.to_string(),
-                        Lane {
-                            opened_from,
-                            connection,
-                            hidden,
-                        },
-                    );
-                }
+                lane.connection = Some(connection);
+                lane.hidden = hidden;
                 (
                     Status::Executed,
                     result::text(&[table_of(engine, &result)], result.rest.len()),
@@ -347,15 +420,189 @@ impl Workspace {
                 result: Err(error),
                 ..
             } => {
-                // ponytail: every failure ends the lane rather than asking
-                // which ones end a session, since a Redis timeout closes it
-                // without `is_lost` knowing (D-02). The cost is one reopen
-                // after a failed statement.
-                self.agent.lanes.remove(profile_id);
+                // ponytail: every failure ends the connection rather than
+                // asking which ones end a session, since a Redis timeout
+                // closes it without `is_lost` knowing (D-02). The cost is one
+                // reopen after a failed statement.
+                lane.connection = None;
                 (Status::Failed, scrubbed(&error.message, &hidden))
             }
         };
-        self.agent_answered(id, name, None, reply, status, text);
+        if status == Status::Failed {
+            lane.hidden.clear();
+        }
+        self.finish_read(id, status, text, false, cx);
+    }
+
+    /// End the read `id`, running or waiting, once: it is removed first, so a
+    /// call that two things end at once is answered and recorded by whichever
+    /// comes first. `early` is an end that is not the statement's own answer:
+    /// the statement is cancelled on the server and the lane's connection is
+    /// dropped. Then the lane's next call starts. Answers whether there was
+    /// such a call.
+    pub(super) fn finish_read(
+        &mut self,
+        id: CallId,
+        status: Status,
+        text: String,
+        early: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let found = self.agent.lanes.iter_mut().find_map(|(profile_id, lane)| {
+            if lane
+                .running
+                .as_ref()
+                .is_some_and(|running| running.id == id)
+            {
+                let running = lane.running.take()?;
+                if early {
+                    // ponytail: the connection is dropped rather than reused,
+                    // because a cancelled statement may still be finishing on
+                    // it and a cancel stops whatever the connection is running,
+                    // which would reach the next call. The cost is one reopen.
+                    lane.connection = None;
+                    lane.hidden.clear();
+                }
+                let stop = running
+                    .connection
+                    .map(|connection| (connection, running.cancel));
+                return Some((
+                    profile_id.clone(),
+                    running.tool,
+                    running.profile_name,
+                    running.reply,
+                    stop.filter(|_| early),
+                ));
+            }
+            let place = lane.waiting.iter().position(|waiting| waiting.id == id)?;
+            let waiting = lane.waiting.remove(place)?;
+            Some((
+                profile_id.clone(),
+                waiting.tool,
+                waiting.profile_name,
+                waiting.reply,
+                None,
+            ))
+        });
+        let Some((profile_id, tool, name, reply, stop)) = found else {
+            return false;
+        };
+        if let Some((connection, cancel)) = stop {
+            // A thread of its own: the pool may be full of the very statements
+            // this stops.
+            spawn_cancel(cx.background_executor(), move || connection.cancel(&cancel)).detach();
+        }
+        if status != Status::Cancelled {
+            // The caller may have hung up, and then nobody reads this.
+            let _ = reply.send(Reply { status, text });
+        }
+        self.agent.record(id, tool, Some(name), None, status);
+        self.start_next(&profile_id, cx);
+        cx.notify();
+        true
+    }
+
+    /// End every read of `profile_id`'s lane, the running one first and then
+    /// the waiting ones in the order they came, each with `status` and `text`,
+    /// and drop the lane with its connection. Nothing of the lane starts again.
+    pub(crate) fn end_lane(
+        &mut self,
+        profile_id: &str,
+        status: Status,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut lane) = self.agent.lanes.remove(profile_id) else {
+            return;
+        };
+        let running = lane.running.take();
+        if let Some(running) = &running
+            && let Some(connection) = running.connection.clone()
+        {
+            let cancel = running.cancel.clone();
+            spawn_cancel(cx.background_executor(), move || connection.cancel(&cancel)).detach();
+        }
+        let ended = running
+            .map(|running| {
+                (
+                    running.id,
+                    running.tool,
+                    running.profile_name,
+                    running.reply,
+                )
+            })
+            .into_iter()
+            .chain(lane.waiting.drain(..).map(|waiting| {
+                (
+                    waiting.id,
+                    waiting.tool,
+                    waiting.profile_name,
+                    waiting.reply,
+                )
+            }));
+        for (id, tool, name, reply) in ended {
+            let _ = reply.send(Reply {
+                status,
+                text: text.to_string(),
+            });
+            self.agent.record(id, tool, Some(name), None, status);
+        }
+        cx.notify();
+    }
+}
+
+/// The blocking half of a read: open the agent's connection unless the lane
+/// has one, and run the statement on it as written.
+fn read_on(
+    cached: Option<(Connection, Vec<String>)>,
+    profile_id: &str,
+    config: &ConnectionConfig,
+    sql: &str,
+    cancel: &CancelToken,
+    engine: Engine,
+) -> Ran {
+    let (connection, hidden) = match cached {
+        Some(cached) => cached,
+        None => {
+            let mut config = agent_config(config);
+            // A file engine has nothing to authenticate to, so it never
+            // reaches the keychain.
+            if let Some(slot) = config.password_mut()
+                && slot.is_empty()
+            {
+                match store::password(profile_id) {
+                    Ok(Some(password)) => *slot = password,
+                    Ok(None) => {}
+                    Err(_) => return Ran::NotOpened,
+                }
+            }
+            // Taken after the password is in: it is one of the strings a
+            // server's error may echo.
+            let hidden = config.identifying_text();
+            let Ok(connection) = Connection::open(config) else {
+                return Ran::NotOpened;
+            };
+            // The hold is what makes a read the gate misjudged harmless, so a
+            // connection that cannot take it is not one the agent may use.
+            if connection.set_read_only(true).is_err() {
+                return Ran::NotOpened;
+            }
+            (connection, hidden)
+        }
+    };
+    let result = connection.query(
+        sql,
+        cancel,
+        Fetch {
+            limit: Some(AGENT_ROWS),
+            reads_only: crate::sql::stoppable(engine, sql),
+            ..Fetch::default()
+        },
+    );
+    Ran::Done {
+        connection,
+        hidden,
+        result,
     }
 }
 

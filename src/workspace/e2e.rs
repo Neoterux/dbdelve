@@ -6047,3 +6047,237 @@ fn a_read_that_outlasts_the_agent_timeout_is_stopped(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// What an injected read answered, waiting on the executor for it.
+fn answer_of(
+    cx: &mut VisualTestContext,
+    answers: &std::sync::mpsc::Receiver<crate::agent::Reply>,
+) -> crate::agent::Reply {
+    let mut reply = None;
+    drive_until(cx, |_| {
+        reply = reply.take().or_else(|| answers.try_recv().ok());
+        reply.is_some()
+    });
+    reply.expect("the call answered")
+}
+
+/// The statuses the log holds for `id`.
+fn logged(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: crate::agent::CallId,
+) -> Vec<crate::agent::Status> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .agent
+            .log
+            .iter()
+            .filter(|entry| entry.id == id)
+            .map(|entry| entry.status)
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn calls_on_one_profile_run_one_at_a_time_in_arrival_order(cx: &mut TestAppContext) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let sql = |sql: &str| crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+        };
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            sql("SELECT 1"),
+        );
+        let (second, second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            sql("SELECT 2"),
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert_eq!(lane.running.as_ref().map(|running| running.id), Some(first));
+            assert_eq!(
+                lane.waiting
+                    .iter()
+                    .map(|waiting| waiting.id)
+                    .collect::<Vec<_>>(),
+                [second]
+            );
+        });
+
+        let one = answer_of(cx, &first_answers);
+        let two = answer_of(cx, &second_answers);
+        assert_eq!(one.status, Status::Executed, "{}", one.text);
+        assert_eq!(two.status, Status::Executed, "{}", two.text);
+        assert!(one.text.contains("[\"1\"]"), "{}", one.text);
+        assert!(two.text.contains("[\"2\"]"), "{}", two.text);
+        // Newest first: the second ended after the first.
+        workspace.read_with(cx, |workspace, _| {
+            let ended: Vec<_> = workspace.agent.log.iter().map(|entry| entry.id).collect();
+            assert_eq!(ended, [second, first]);
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.running.is_none() && lane.waiting.is_empty());
+            assert!(lane.connection.is_some());
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 1".to_string()),
+            },
+        );
+        let (second, second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 2".to_string()),
+            },
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: second }, cx)
+        });
+        assert_eq!(
+            second_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected),
+            "nothing is sent to a caller that hung up"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.waiting.is_empty());
+            assert_eq!(lane.running.as_ref().map(|running| running.id), Some(first));
+        });
+
+        let one = answer_of(cx, &first_answers);
+        assert_eq!(one.status, Status::Executed, "{}", one.text);
+        cx.run_until_parked();
+        assert_eq!(logged(&workspace, cx, second), [Status::Cancelled]);
+        assert_eq!(logged(&workspace, cx, first), [Status::Executed]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 1".to_string()),
+            },
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.agent.lanes.get("orders").is_none_or(|lane| {
+                    lane.running.is_none() && lane.waiting.is_empty() && lane.connection.is_none()
+                }),
+                "the read's lane still holds it"
+            );
+        });
+
+        // The read's late result changes nothing.
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(
+            first_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected)
+        );
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+
+        let (_, next_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 3".to_string()),
+            },
+        );
+        let next = answer_of(cx, &next_answers);
+        assert_eq!(next.status, Status::Executed, "{}", next.text);
+        assert!(next.text.contains("[\"3\"]"), "{}", next.text);
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) {
+    use crate::{agent::Status, ui::AgentMark};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.running.is_some(), "the read is running");
+            assert!(workspace.front_ping().is_none());
+            assert!(workspace.agent.calls.is_empty());
+        });
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 })
+        );
+        // A frame with the read still running: no dialog goes up for it.
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
