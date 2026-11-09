@@ -1521,8 +1521,21 @@ impl ConnectionConfig {
     pub fn identifying_text(&self) -> Vec<String> {
         let mut found = Identifying::default();
         match self {
-            Self::Postgres(PostgresConfig { server, .. })
-            | Self::MySql(server)
+            Self::Postgres(postgres) => {
+                found.server(&postgres.server);
+                // What a service file and the `PG*` variables fill in is what
+                // the connection is made with, so it is what an error may echo.
+                // Read here as `open_agent` reads it, on a background thread.
+                //
+                // ponytail: a password found in `.pgpass` is not here: that
+                // lookup is private to the driver's connect. The upgrade is
+                // the driver handing back what it resolved.
+                if let Ok(resolved) = postgres.resolved() {
+                    found.server(&resolved);
+                }
+                found.name(&self.endpoint());
+            }
+            Self::MySql(server)
             | Self::MariaDb(server)
             | Self::SqlServer(server)
             | Self::ClickHouse(server)
@@ -1545,6 +1558,7 @@ impl ConnectionConfig {
             }
             Self::External(external) => {
                 found.name(&external.connection);
+                found.connection_string(&external.connection);
                 found.name(&external.user);
                 found.name(&external.password);
             }
@@ -1631,6 +1645,44 @@ impl Identifying {
     fn path(&mut self, text: &str) {
         self.name(text);
         self.name(&crate::store::home_expanded(text).to_string_lossy());
+    }
+
+    /// The values of the keys that say where a connection string goes or who
+    /// goes there, as a driver may echo them one at a time. Not every value:
+    /// `Encrypt=yes` would hide every "yes" in every error.
+    ///
+    /// ponytail: a value in braces that holds a `;` is cut at it, and a key
+    /// this list does not know is not read. The upgrade is the plugin saying
+    /// which parts of its string are identifying.
+    fn connection_string(&mut self, text: &str) {
+        const IDENTIFYING: [&str; 18] = [
+            "server",
+            "host",
+            "hostname",
+            "address",
+            "addr",
+            "network address",
+            "data source",
+            "port",
+            "uid",
+            "user",
+            "user id",
+            "username",
+            "pwd",
+            "password",
+            "database",
+            "dbq",
+            "dsn",
+            "initial catalog",
+        ];
+        for part in text.split(';') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            if IDENTIFYING.contains(&key.trim().to_ascii_lowercase().as_str()) {
+                self.name(value.trim().trim_matches(['{', '}']).trim());
+            }
+        }
     }
 
     fn server(&mut self, server: &ServerConfig) {
@@ -4023,6 +4075,56 @@ mod tests {
         assert!(!config.identifying_text().iter().any(|text| text == "pw"));
         *config.password_mut().expect("Postgres has a password") = "pw".into();
         assert!(config.identifying_text().iter().any(|text| text == "pw"));
+    }
+
+    #[test]
+    fn identifying_text_of_a_connection_string_holds_where_and_who_but_not_the_switches() {
+        let config = ConnectionConfig::External(ExternalConfig {
+            plugin: crate::store::tests::odbc_plugin(),
+            speaks: Engine::Generic,
+            connection: "Driver={ODBC Driver 18};Server=db.internal,1433;UID=svc;PWD={p w};\
+                         Encrypt=yes;Database=ledger"
+                .into(),
+            user: String::new(),
+            password: String::new(),
+            statement_timeout: 0,
+            ssh: None,
+        });
+        let found = config.identifying_text();
+        for string in ["db.internal,1433", "svc", "p w", "ledger"] {
+            assert!(found.iter().any(|seen| seen == string), "{string}");
+        }
+        for string in ["yes", "ODBC Driver 18", "Encrypt"] {
+            assert!(!found.iter().any(|seen| seen == string), "{string}");
+        }
+    }
+
+    #[test]
+    fn identifying_text_of_a_postgres_service_holds_what_the_service_supplies() {
+        use std::io::Write;
+
+        crate::store::tests::with_home(|| {
+            let home = std::env::var("HOME").expect("the test home is set");
+            let file = std::path::Path::new(&home).join(".pg_service.conf");
+            std::fs::File::create(&file)
+                .and_then(|mut file| {
+                    file.write_all(
+                        b"[agent]\nhost=svc.internal\nuser=svc_user\npassword=svc_pw\n\
+                          sslmode=verify-full\nsslrootcert=/certs/svc-root.pem\n",
+                    )
+                })
+                .expect("the service file is written");
+            let config = ConnectionConfig::Postgres(PostgresConfig {
+                server: ServerConfig::default(),
+                service: Some("agent".into()),
+            });
+            let found = config.identifying_text();
+            // The service's own settings come before any `PG*` variable, as in
+            // libpq, so the environment of the machine running this changes none.
+            for wanted in ["svc.internal", "svc_user", "svc_pw", "/certs/svc-root.pem"] {
+                assert!(found.iter().any(|seen| seen == wanted), "{wanted}");
+            }
+        });
     }
 
     #[test]
