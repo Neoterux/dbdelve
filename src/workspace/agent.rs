@@ -45,6 +45,9 @@ pub(crate) struct AgentState {
     pub(crate) log: VecDeque<LogEntry>,
     /// The agent's own connections, by profile id: never the user's.
     pub(crate) lanes: HashMap<String, agent_read::Lane>,
+    /// What opens an agent's connection; `None` is the real open. Tests put
+    /// one here to stand in for an open that never returns.
+    pub(crate) opener: Option<agent_read::Opener>,
 }
 
 // ponytail: the log is this session's own and keeps the last twenty calls,

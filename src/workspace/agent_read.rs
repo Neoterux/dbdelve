@@ -12,7 +12,7 @@
 //! wrapped around it or rewritten, so the gate's verdict is about what the
 //! server receives.
 
-use std::{collections::VecDeque, sync::mpsc::SyncSender};
+use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Duration};
 
 use super::*;
 use crate::{
@@ -29,6 +29,26 @@ pub(crate) const AGENT_ROWS: usize = 100;
 // timeout of its own, so no agent connection is ever unbounded. A profile's own
 // shorter timeout wins. The upgrade is a setting, if a user ever needs one.
 pub(crate) const AGENT_TIMEOUT: u32 = 30;
+
+// ponytail: the longest any one call lives, from the moment it starts to its
+// answer: the open, a tunnel, a keychain prompt nobody answers and one
+// statement at its [`AGENT_TIMEOUT`]. Time spent waiting behind other calls is
+// not counted; it is bounded by their deadlines and by the call cap. The
+// upgrade is a deadline per tool.
+pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Said for a call that ran past [`CALL_DEADLINE`]. Names the same 60 seconds;
+/// a test holds the two together, since a constant cannot be built from one.
+const DEADLINE_PASSED: &str = "The call did not finish within 60 seconds.";
+
+/// What opens the agent's connection to a profile and says what an error from
+/// it must not name. `None` in [`AgentState::opener`](super::agent::AgentState::opener)
+/// is [`open_agent`]; a test puts one here that never returns.
+pub(crate) type Opener = fn(
+    &gpui::BackgroundExecutor,
+    ConnectionConfig,
+    String,
+) -> gpui::Task<Result<(Connection, Vec<String>), DbError>>;
 
 /// The statement timeout in seconds an agent connection carries, given the
 /// profile's own: the smaller of the two, with 0 (none) meaning the agent's.
@@ -178,6 +198,9 @@ pub(crate) struct Running {
     /// read that opens its own has none to hand until it lands.
     connection: Option<Connection>,
     _work: gpui::Task<()>,
+    /// Ends the call at [`CALL_DEADLINE`]. Dropped with the call, whatever
+    /// ended it, so it never fires for one that is over.
+    _deadline: gpui::Task<()>,
 }
 
 /// A call that has not started: it holds its caller's reply and what to do.
@@ -352,21 +375,40 @@ impl Workspace {
         let engine = config.engine();
         let cancel = CancelToken::default();
 
-        let task = spawn_blocking(cx.background_executor(), {
-            let profile_id = profile_id.to_string();
-            let cancel = cancel.clone();
-            move || read_on(cached, &profile_id, &config, &sql, &cancel, engine)
-        });
+        // Called here and not in the task, so what opens is decided when the
+        // call starts.
+        let opening = match cached {
+            Some(cached) => gpui::Task::ready(Ok(cached)),
+            None => {
+                let open = self.agent.opener.unwrap_or(open_agent);
+                open(cx.background_executor(), config, profile_id.to_string())
+            }
+        };
         let work = cx.spawn({
             let profile_id = profile_id.to_string();
+            let cancel = cancel.clone();
             async move |workspace, cx| {
-                let ran = task.await;
+                let ran = match opening.await {
+                    Ok((connection, hidden)) => {
+                        spawn_blocking(cx.background_executor(), move || {
+                            read_on(connection, hidden, &sql, &cancel, engine)
+                        })
+                        .await
+                    }
+                    Err(_) => Ran::NotOpened,
+                };
                 // The window may have closed meanwhile, and then nobody is
                 // left to answer.
                 let _ = workspace.update(cx, |workspace, cx| {
                     workspace.land_agent_read(id, &profile_id, engine, ran, cx);
                 });
             }
+        });
+        let deadline = cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(CALL_DEADLINE).await;
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.finish_call(id, Status::Failed, DEADLINE_PASSED.to_string(), cx)
+            });
         });
         if let Some(lane) = self.agent.lanes.get_mut(profile_id) {
             lane.running = Some(Running {
@@ -377,6 +419,7 @@ impl Workspace {
                 cancel,
                 connection: lane.connection.clone(),
                 _work: work,
+                _deadline: deadline,
             });
         }
     }
@@ -551,45 +594,51 @@ impl Workspace {
     }
 }
 
-/// The blocking half of a read: open the agent's connection unless the lane
-/// has one, and run the statement on it as written.
+/// Open the agent's connection to a profile and hold it read-only, with the
+/// strings an error through it must not name.
+fn open_agent(
+    executor: &gpui::BackgroundExecutor,
+    config: ConnectionConfig,
+    profile_id: String,
+) -> gpui::Task<Result<(Connection, Vec<String>), DbError>> {
+    spawn_blocking(executor, move || {
+        let mut config = agent_config(&config);
+        // A file engine has nothing to authenticate to, so it never reaches
+        // the keychain.
+        if let Some(slot) = config.password_mut()
+            && slot.is_empty()
+        {
+            match store::password(&profile_id) {
+                Ok(Some(password)) => *slot = password,
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(DbError {
+                        message: error,
+                        position: None,
+                    });
+                }
+            }
+        }
+        // Taken after the password is in: it is one of the strings a server's
+        // error may echo.
+        let hidden = config.identifying_text();
+        let connection = Connection::open(config)?;
+        // The hold is what makes a read the gate misjudged harmless, so a
+        // connection that cannot take it is not one the agent may use.
+        connection.set_read_only(true)?;
+        Ok((connection, hidden))
+    })
+}
+
+/// The blocking half of a read: run the statement on the agent's connection as
+/// written.
 fn read_on(
-    cached: Option<(Connection, Vec<String>)>,
-    profile_id: &str,
-    config: &ConnectionConfig,
+    connection: Connection,
+    hidden: Vec<String>,
     sql: &str,
     cancel: &CancelToken,
     engine: Engine,
 ) -> Ran {
-    let (connection, hidden) = match cached {
-        Some(cached) => cached,
-        None => {
-            let mut config = agent_config(config);
-            // A file engine has nothing to authenticate to, so it never
-            // reaches the keychain.
-            if let Some(slot) = config.password_mut()
-                && slot.is_empty()
-            {
-                match store::password(profile_id) {
-                    Ok(Some(password)) => *slot = password,
-                    Ok(None) => {}
-                    Err(_) => return Ran::NotOpened,
-                }
-            }
-            // Taken after the password is in: it is one of the strings a
-            // server's error may echo.
-            let hidden = config.identifying_text();
-            let Ok(connection) = Connection::open(config) else {
-                return Ran::NotOpened;
-            };
-            // The hold is what makes a read the gate misjudged harmless, so a
-            // connection that cannot take it is not one the agent may use.
-            if connection.set_read_only(true).is_err() {
-                return Ran::NotOpened;
-            }
-            (connection, hidden)
-        }
-    };
     let result = connection.query(
         sql,
         cancel,
@@ -609,6 +658,11 @@ fn read_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deadline_text_names_the_deadline() {
+        assert!(DEADLINE_PASSED.contains(&format!("{} seconds", CALL_DEADLINE.as_secs())));
+    }
 
     #[test]
     fn the_agent_timeout_is_the_users_capped_or_the_agents_own() {
