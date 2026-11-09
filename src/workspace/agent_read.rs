@@ -1186,11 +1186,11 @@ impl Declined {
 
 /// The statement an `explain_query` call sends, or the answer it gets instead.
 ///
-/// Every check comes before anything is composed or sent, in this order: an
-/// input that is already an EXPLAIN; an engine with no plan; `analyze` on an
-/// engine with no analyzed plan, which is never answered with a plain plan; a
-/// statement the engine cannot explain. Then the engine composes its EXPLAIN
-/// and [`agent_gate`] judges that exact text, so an ANALYZE follows the verdict
+/// Every check comes before anything is sent, in this order: an input that is
+/// already an EXPLAIN; an engine with no plan; `analyze` on an engine with no
+/// analyzed plan, which is never answered with a plain plan, and where the
+/// engine composes its EXPLAIN; a statement the engine cannot explain. Then
+/// [`agent_gate`] judges that composed text, so an ANALYZE follows the verdict
 /// of the statement it wraps. Only `Run` returns the statement, and that string
 /// is what is sent.
 pub(crate) fn explain_statement(
@@ -1213,15 +1213,12 @@ pub(crate) fn explain_statement(
     } else {
         ExplainMode::Plan
     };
-    if engine.explain_prefix(explaining).is_none() {
+    let Some(composed) = engine.explain(explaining, sql) else {
         return Err(Declined::said(Status::Executed, no_analyzed_plan(engine)));
-    }
+    };
     if let Err(message) = crate::sql::explainable(engine, sql) {
         return Err(Declined::said(Status::RefusedByGate, message));
     }
-    let Some(composed) = engine.explain(explaining, sql) else {
-        return Err(Declined::said(Status::Executed, no_plan(engine)));
-    };
     let verdict = agent_gate(engine, &composed, mode);
     // What an approval would show is not for the agent.
     let text = match &verdict {
