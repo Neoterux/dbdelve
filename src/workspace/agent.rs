@@ -160,7 +160,8 @@ pub(crate) struct LogEntry {
     pub(crate) shown: Option<usize>,
     pub(crate) total: Option<Total>,
     pub(crate) elapsed_ms: u64,
-    /// The full error of a call that failed, which the agent was not given.
+    /// The error of a call that failed, which the agent was not given, cut at
+    /// [`AUDIT_SQL_CAP`] characters.
     pub(crate) error: Option<String>,
 }
 
@@ -218,23 +219,25 @@ impl AgentState {
             status,
             requester_gone: false,
             verdict: facts.verdict,
-            sql: facts.sql.map(clipped_sql),
+            sql: facts.sql.map(clipped),
             shown: facts.shown,
             total: facts.total,
             elapsed_ms: facts.elapsed_ms,
-            error: facts.error,
+            error: facts.error.map(clipped),
         });
         self.log.truncate(AUDIT_CAP);
     }
 }
 
-/// `sql` cut at [`AUDIT_SQL_CAP`] characters, on a character boundary.
-fn clipped_sql(mut sql: String) -> String {
-    if let Some((cut, _)) = sql.char_indices().nth(AUDIT_SQL_CAP) {
-        sql.truncate(cut);
-        sql.push_str(SQL_CLIPPED);
+/// `text` cut at [`AUDIT_SQL_CAP`] characters, on a character boundary: a
+/// statement, or an error that may echo one. The dialog draws every entry on
+/// every frame.
+fn clipped(mut text: String) -> String {
+    if let Some((cut, _)) = text.char_indices().nth(AUDIT_SQL_CAP) {
+        text.truncate(cut);
+        text.push_str(SQL_CLIPPED);
     }
-    sql
+    text
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -1093,6 +1096,30 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_audit_entry_keeps_a_cut_of_a_long_error_as_it_does_of_a_long_statement() {
+        let mut state = AgentState::default();
+        let long = "e".repeat(AUDIT_SQL_CAP * 3);
+        state.record(
+            CallId(1),
+            Tool::ExecuteSql,
+            None,
+            None,
+            Status::Failed,
+            CallFacts {
+                sql: Some(long.clone()),
+                error: Some(long),
+                ..CallFacts::default()
+            },
+        );
+        let entry = state.log.front().expect("the call is logged");
+        for kept in [entry.sql.as_deref(), entry.error.as_deref()] {
+            let kept = kept.expect("kept");
+            assert_eq!(kept.chars().count(), AUDIT_SQL_CAP + SQL_CLIPPED.len());
+            assert!(kept.ends_with(SQL_CLIPPED));
+        }
+    }
 
     #[test]
     fn the_dialog_states_the_engines_hold_and_that_rows_leave_the_machine() {
