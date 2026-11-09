@@ -119,6 +119,9 @@ pub(crate) struct CallArgs {
     pub(crate) schema: Option<String>,
     /// The table `describe_table` was asked about, exactly as written.
     pub(crate) table: Option<String>,
+    /// Whether `explain_query` was asked to run the statement to measure it.
+    /// `None` is not asked, which is `false`.
+    pub(crate) analyze: Option<bool>,
 }
 
 /// What a connection thread tells the window.
