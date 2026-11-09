@@ -527,9 +527,12 @@ impl Workspace {
                             AgentWork::Query { sql } => {
                                 read_on(connection, hidden, &sql, &cancel, engine)
                             }
-                            AgentWork::Catalog { schema } => {
-                                list_on(connection, hidden, schema.as_deref(), None)
-                            }
+                            AgentWork::Catalog { schema } => list_on(
+                                connection,
+                                hidden,
+                                schema.as_deref(),
+                                engine.agent_catalog_note(),
+                            ),
                         })
                         .await
                     }
@@ -1012,6 +1015,35 @@ mod tests {
                 .is_some_and(|line| line.starts_with("columns: "))
         );
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn a_redis_catalog_reply_carries_the_preview_note() {
+        let catalog = Catalog {
+            schemas: vec![schema(
+                "db0",
+                vec![relation("keys", RelationKind::Table, None, Some(7))],
+            )],
+            database: None,
+        };
+        let note = Engine::Redis.agent_catalog_note();
+        let note_line = format!("note: {}\n", note.expect("Redis has a note"));
+        let schemas = schemas_text(&catalog, note);
+        assert!(
+            schemas.starts_with(&format!("truncated: none (1 row)\n{note_line}columns: ")),
+            "{schemas}"
+        );
+        let tables = tables_text(&catalog, "db0", note).expect("the schema is there");
+        assert!(
+            tables.starts_with(&format!("truncated: none (1 row)\n{note_line}columns: ")),
+            "{tables}"
+        );
+        assert!(
+            tables.ends_with("[\"keys\",\"table\",null,\"7\"]\n"),
+            "{tables}"
+        );
+        // Another engine's reply has no such line.
+        assert!(!schemas_text(&catalog, Engine::Sqlite.agent_catalog_note()).contains("note: "));
     }
 
     #[test]

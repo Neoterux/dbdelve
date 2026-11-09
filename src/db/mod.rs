@@ -732,6 +732,19 @@ impl Engine {
         }
     }
 
+    /// What an agent is told about a catalog whose shape is DBDelve's own and
+    /// not the server's. Static, so it names nothing of any profile. Redis has
+    /// no schemas or tables: the preview maps each database to a schema and
+    /// its keyspace to one relation.
+    pub fn agent_catalog_note(self) -> Option<&'static str> {
+        match self.syntax() {
+            Syntax::Redis => Some(
+                "This is DBDelve's preview shape of Redis: each database is a schema holding the relation `keys`, with the columns key, type, ttl and value. Keys are read with commands.",
+            ),
+            Syntax::Sql | Syntax::Mongo => None,
+        }
+    }
+
     /// Why a statement `sql::classify` cannot read is refused in Read-only,
     /// finishing "dbdelve can't parse this, and …".
     pub fn unreadable_reason(self) -> &'static str {
@@ -5451,6 +5464,17 @@ mod tests {
             error.message,
             "Catalog query returned unknown relation kind unknown."
         );
+    }
+
+    #[test]
+    fn only_redis_has_an_agent_catalog_note() {
+        for engine in Engine::ALL {
+            let note = engine.agent_catalog_note();
+            assert_eq!(note.is_some(), engine == Engine::Redis, "{engine:?}");
+        }
+        let note = Engine::Redis.agent_catalog_note().expect("Redis has one");
+        assert!(note.contains("`keys`") && note.contains("read with commands"));
+        assert!(!note.contains('\n'));
     }
 
     #[test]
