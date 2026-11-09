@@ -524,7 +524,7 @@ impl Connection {
                         ))
                     })?,
                 };
-                outcome.map_err(|error| plain_error(error.kind.to_string()))
+                outcome.map_err(|error| statement_error(&error.kind))
             })
         })?
     }
@@ -1771,6 +1771,20 @@ fn connect_error(error: &Error, config: &MongoConfig, tls: bool) -> DbError {
     })
 }
 
+/// What a statement's failure says. The driver's text for a failed server
+/// selection lists every member of the topology it looked at, and for a
+/// `mongodb+srv` or replica-set profile those are discovered hosts that no
+/// profile field holds, so those kinds are said without it. The server's own
+/// words for anything it answered stay.
+fn statement_error(kind: &ErrorKind) -> DbError {
+    plain_error(match kind {
+        ErrorKind::ServerSelection { .. } => "No server was available to run the statement.".into(),
+        ErrorKind::DnsResolve { .. } => "A server's address could not be resolved.".into(),
+        ErrorKind::Io(io) => format!("The connection to the server failed: {}.", io.kind()),
+        kind => kind.to_string(),
+    })
+}
+
 /// A panic inside the driver would take the background thread with it, and
 /// is a failure to report rather than a crash.
 fn guarded<T>(call: impl FnOnce() -> T) -> Result<T, DbError> {
@@ -1863,7 +1877,7 @@ impl<'a> Run<'a> {
                 };
                 tokio::select! {
                     outcome = operation(session).into_future() => {
-                        Some(outcome.map_err(|error| plain_error(error.kind.to_string())))
+                        Some(outcome.map_err(|error| statement_error(&error.kind)))
                     }
                     Ok(()) = stopped => Some(Err(plain_error("Cancelled.".into()))),
                     () = bound => None,
@@ -2951,6 +2965,22 @@ mod tests {
         // Refused or unanswered fails the same way in plaintext.
         assert!(!tls_not_offered(&io(std::io::ErrorKind::ConnectionRefused)));
         assert!(!tls_not_offered(&io(std::io::ErrorKind::TimedOut)));
+    }
+
+    #[test]
+    fn a_statement_failing_on_the_socket_does_not_say_where_it_was_going() {
+        let reset = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset by 10.0.0.5:27017 (replica-2.internal)",
+        );
+        let said = statement_error(&Error::from(reset).kind).message;
+        assert_eq!(
+            said,
+            "The connection to the server failed: connection reset."
+        );
+        // What a server answered is its own to say.
+        let custom = Error::custom("a message the server wrote").kind;
+        assert!(!statement_error(&custom).message.is_empty());
     }
 
     #[test]
