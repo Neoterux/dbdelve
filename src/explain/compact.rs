@@ -30,17 +30,23 @@ use super::{
 };
 
 /// How many nodes a plan prints, ancestors counted.
+// ponytail: provisional. Plan 05-10 sets it from the D-18 token measurement of
+// this module's output; until then it is the largest figure that keeps the
+// large fixture's compact text under what that plan expects to allow.
 pub(crate) const NODE_CAP: usize = 24;
 
 /// How many findings are listed before the rest are counted.
+// ponytail: ten findings read as a list; more than that is a plan where
+// everything is slow, and the count says so without spending the reply on it.
 pub(crate) const FINDINGS_CAP: usize = 10;
 
 /// `plan` as compact text, from the `analysis` built over it. When the plan has
-/// more than `max_nodes` nodes, the `max_nodes` heaviest are kept with every
-/// ancestor of each, so the shape of the tree survives and the heaviest node is
-/// never the one cut; the first line says so, and each kept node that lost
-/// descendants says how many. A finding on a node that was cut is counted, not
-/// listed.
+/// more than `max_nodes` nodes, at most `max_nodes` are printed with their
+/// ancestors counted: the heaviest node first, its whole chain kept even when
+/// that is longer than `max_nodes`, then the nodes the first [`FINDINGS_CAP`]
+/// findings name, then the rest by value, each only while its whole chain still
+/// fits. The first line says so, and each kept node that lost descendants says
+/// how many. A finding on a node that was cut is counted, not listed.
 pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> String {
     let kept = kept(plan, analysis, max_nodes);
     let shown = kept.iter().filter(|kept| **kept).count();
@@ -52,10 +58,9 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Str
     // in the tree below for the line to be checked against it. One on a node
     // that was cut is counted and left out, so the list is no longer than the
     // tree is.
-    let (shown_findings, left_out): (Vec<Finding>, Vec<Finding>) = analysis
-        .findings
-        .iter()
-        .partition(|finding| kept[node_of(**finding)]);
+    let listed = &analysis.findings[..analysis.findings.len().min(FINDINGS_CAP)];
+    let (shown_findings, left_out): (Vec<Finding>, Vec<Finding>) =
+        listed.iter().partition(|finding| kept[node_of(**finding)]);
     if analysis.findings.is_empty() {
         lines.push("findings: none".to_string());
     } else {
@@ -70,6 +75,13 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Str
             lines.push(format!(
                 "  ... {count} finding{} on nodes not shown",
                 if count == 1 { "" } else { "s" }
+            ));
+        }
+        let past = analysis.findings.len() - listed.len();
+        if past > 0 {
+            lines.push(format!(
+                "  ... {past} more finding{} past the first {FINDINGS_CAP}",
+                if past == 1 { "" } else { "s" }
             ));
         }
     }
@@ -112,16 +124,23 @@ fn truncation(plan: &Plan, analysis: &Analysis, max_nodes: usize, shown: usize) 
         return "truncated: none".to_string();
     }
     let rule = match analysis.basis {
-        Basis::Measured => format!("top {max_nodes} by self time, with their ancestors"),
-        Basis::PlannerCost => format!("top {max_nodes} by self cost, with their ancestors"),
+        Basis::Measured => format!(
+            "heaviest first, then findings, then by self time; at most {max_nodes} with ancestors"
+        ),
+        Basis::PlannerCost => format!(
+            "heaviest first, then findings, then by self cost; at most {max_nodes} with ancestors"
+        ),
         Basis::Structure => format!("first {max_nodes} in plan order"),
     };
     format!("truncated: kept {shown} of {nodes} nodes ({rule})")
 }
 
-/// Which nodes to print: the `max_nodes` with the highest value, ties in the
-/// plan's order and nodes with no value last, and every ancestor of each. A plan
-/// with no values ranks nothing, so it keeps the first `max_nodes` as printed.
+/// Which nodes to print, at most `max_nodes` of them with ancestors counted: the
+/// heaviest node and its whole chain first, even past `max_nodes`, then the
+/// nodes of the first [`FINDINGS_CAP`] findings, then the rest by value, ties in
+/// the plan's order and nodes with no value last. Each is kept with its
+/// not-yet-kept ancestors only when all of them still fit. A plan with no values
+/// ranks nothing, so it keeps the first `max_nodes` as printed.
 fn kept(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Vec<bool> {
     let mut ranked: Vec<usize> = (0..plan.nodes.len()).collect();
     // A stable sort, so equal values stay in document order.
@@ -133,23 +152,45 @@ fn kept(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Vec<bool> {
             (None, None) => Ordering::Equal,
         },
     );
+    let order = ranked
+        .first()
+        .copied()
+        .into_iter()
+        .chain(
+            analysis
+                .findings
+                .iter()
+                .take(FINDINGS_CAP)
+                .map(|finding| node_of(*finding)),
+        )
+        .chain(ranked.iter().copied());
     let mut kept = vec![false; plan.nodes.len()];
-    for index in ranked.into_iter().take(max_nodes) {
-        // A node already kept as an ancestor has had its own ancestors kept
-        // too, and so has the first kept ancestor the walk below meets.
-        if std::mem::replace(&mut kept[index], true) {
+    let mut count = 0;
+    for index in order {
+        if count >= max_nodes {
+            break;
+        }
+        if kept[index] {
             continue;
         }
+        // The node and the ancestors above it that are not kept yet. A kept
+        // ancestor has had its own ancestors kept too, so the walk ends there.
+        let mut chain = vec![index];
         let mut depth = plan.nodes[index].depth;
         for above in (0..index).rev() {
-            if depth == 0 {
+            if depth == 0 || kept[above] && plan.nodes[above].depth < depth {
                 break;
             }
             if plan.nodes[above].depth < depth {
-                if std::mem::replace(&mut kept[above], true) {
-                    break;
-                }
+                chain.push(above);
                 depth = plan.nodes[above].depth;
+            }
+        }
+        // The heaviest node's chain is kept whole whatever the cap is.
+        if count == 0 || count + chain.len() <= max_nodes {
+            count += chain.len();
+            for node in chain {
+                kept[node] = true;
             }
         }
     }
@@ -901,7 +942,7 @@ mod tests {
         let out = compact(&plan, &Analysis::new(&plan, Engine::Postgres), NODE_CAP);
         // Plan 05-10 measures the tokens of this text and sets `NODE_CAP` from it;
         // a change to this number means that measurement is stale.
-        assert_eq!(out.len(), 0);
+        assert_eq!(out.len(), 6375);
         assert_eq!(
             out,
             include_str!("../testdata/plan-postgres-large.capped.compact.txt")
