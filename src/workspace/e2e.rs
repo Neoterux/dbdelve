@@ -6296,6 +6296,36 @@ fn a_hung_open_ends_its_call_at_the_deadline_and_frees_the_lane(cx: &mut TestApp
     });
 }
 
+#[gpui::test]
+fn a_deadline_and_a_hangup_on_the_same_call_end_it_once(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent_read::CALL_DEADLINE;
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(|executor, _, _| executor.spawn(std::future::pending()));
+        });
+        let (first, first_answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        cx.executor()
+            .advance_clock(CALL_DEADLINE + Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+        assert_eq!(
+            first_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected),
+            "nothing is sent after the hangup"
+        );
+        quit(workspace, cx);
+    });
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) {
