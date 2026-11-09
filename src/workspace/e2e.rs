@@ -6491,6 +6491,93 @@ fn calls_on_one_profile_run_one_at_a_time_in_arrival_order(cx: &mut TestAppConte
     });
 }
 
+/// `agent_sqlite`'s two profiles with a DuckDB profile `Ducks`, visible to the
+/// agent, on a file of its own. Answers the file's path.
+fn agent_duckdb<'a>(
+    cx: &'a mut TestAppContext,
+    path: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    launch_with_profiles(
+        cx,
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            format!(
+                "[[profiles]]\nid = \"ducks\"\nname = \"Ducks\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"duckdb\"\npath = {path:?}\nagent_visible = true\n"
+            ),
+        ]
+        .concat(),
+    )
+}
+
+#[gpui::test]
+fn an_agent_read_on_a_duckdb_file_sees_the_latest_commit(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("ducks.duckdb").display().to_string();
+        // The user's own instance, held open for the whole test.
+        let user = ::duckdb::Connection::open(&path).expect("the file opens");
+        user.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)")
+            .expect("the schema applies");
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        cx.executor().allow_parking();
+
+        let count = |cx: &mut VisualTestContext| {
+            let answers = inject_sql(&workspace, cx, "Ducks", "SELECT count(*) FROM t");
+            let answer = answer_of(cx, &answers);
+            assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+            workspace.read_with(cx, |workspace, _| {
+                let lane = workspace.agent.lanes.get("ducks");
+                assert!(
+                    lane.is_none_or(|lane| lane.connection.is_none()),
+                    "a DuckDB read keeps no connection"
+                );
+            });
+            answer.text
+        };
+        let first = count(cx);
+        assert!(first.contains("[\"1\"]"), "{first}");
+        user.execute_batch("INSERT INTO t VALUES (2)")
+            .expect("the user commits a row");
+        let second = count(cx);
+        assert!(second.contains("[\"2\"]"), "{second}");
+        drop(user);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_read_on_an_in_memory_duckdb_profile_is_refused_by_name(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_duckdb(cx, "");
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Ducks", "SELECT 1");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::RefusedByGate, "{}", answer.text);
+        assert_eq!(
+            answer.text,
+            "This connection is an in-memory DuckDB database, which has no separate connection an agent can read."
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "nothing was opened");
+            let entry = workspace.agent.log.front().expect("the refusal is logged");
+            assert_eq!(entry.status, Status::RefusedByGate);
+            assert_eq!(entry.resolved.as_deref(), Some("Ducks"));
+            assert!(
+                matches!(&entry.verdict, Some(crate::workspace::agent::AuditVerdict::Refuse(reason)) if reason.contains("in-memory DuckDB")),
+                "{:?}",
+                entry.verdict
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
