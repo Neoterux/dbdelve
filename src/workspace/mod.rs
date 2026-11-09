@@ -36,6 +36,8 @@ use gpui_component::{
 };
 
 pub(crate) use import_dialog::PreviewGrid;
+#[cfg(test)]
+pub(crate) use profiles::restored;
 pub(crate) use profiles::unavailable_reason;
 pub(crate) use projects::project_name_refusal;
 pub(crate) use queries::error_in_buffer;

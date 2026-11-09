@@ -54,8 +54,85 @@ pub(crate) fn agent_config(config: &ConnectionConfig) -> ConnectionConfig {
 pub(crate) const OPEN_FAILED: &str =
     "DBDelve could not open the agent's connection to this database.";
 
-/// Said when a statement the agent was allowed to run returned an error.
-pub(crate) const STATEMENT_FAILED: &str = "The database returned an error for this statement.";
+// ponytail: Claude Code trims an error result past about 11,000 characters, so
+// a statement's error is cut well before that. The upgrade is a setting.
+pub(crate) const ERROR_CAP: usize = 4_000;
+
+/// What replaces a hidden string in an error an agent reads.
+const HIDDEN: &str = "[hidden]";
+
+/// What an error cut at [`ERROR_CAP`] ends with.
+const CLIPPED: &str = " [clipped]";
+
+/// A character of a name: what a hidden string must not be glued to.
+fn in_a_name(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `message` with every string of `hidden` replaced by `[hidden]` wherever it
+/// stands whole, then cut to [`ERROR_CAP`] characters.
+///
+/// A string stands whole when the character before and after it, if its own
+/// edge is a name character, is not one: `sa` goes from `by sa.` and `'sa'`
+/// and stays in `usage`. There is no length below which a string is let
+/// through. Case is ignored in ASCII, because a server re-cases what it echoes
+/// (Snowflake upper-cases identifiers). Longer strings are tried first, so
+/// `db.internal:5432` goes as one marker rather than a marker and a port. A
+/// MySQL account, `'user'@'host'`, goes as one, whatever it is made of.
+pub(crate) fn scrubbed(message: &str, hidden: &[String]) -> String {
+    let mut hidden: Vec<&str> = hidden
+        .iter()
+        .map(String::as_str)
+        .filter(|text| !text.is_empty())
+        .collect();
+    hidden.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    let bytes = message.as_bytes();
+    let mut out = String::with_capacity(message.len());
+    let mut at = 0;
+    while at < message.len() {
+        let end = account_end(message, at).or_else(|| {
+            hidden.iter().find_map(|text| {
+                let end = at + text.len();
+                let first = text.as_bytes()[0];
+                let last = text.as_bytes()[text.len() - 1];
+                (bytes.get(at..end)?.eq_ignore_ascii_case(text.as_bytes())
+                    && !(in_a_name(first) && at > 0 && in_a_name(bytes[at - 1]))
+                    && !(in_a_name(last) && bytes.get(end).is_some_and(|&next| in_a_name(next))))
+                .then_some(end)
+            })
+        });
+        match end {
+            Some(end) => {
+                out.push_str(HIDDEN);
+                at = end;
+            }
+            None => {
+                let character = message[at..].chars().next().unwrap_or_default();
+                out.push(character);
+                at += character.len_utf8().max(1);
+            }
+        }
+    }
+    match out.char_indices().nth(ERROR_CAP) {
+        Some((cut, _)) => {
+            out.truncate(cut);
+            out.push_str(CLIPPED);
+            out
+        }
+        None => out,
+    }
+}
+
+/// Where the account spelled `'user'@'host'` at `at` ends, if one starts there.
+fn account_end(message: &str, at: usize) -> Option<usize> {
+    let rest = message[at..].strip_prefix('\'')?;
+    // The user ends at the next quote, which must open the host: a quote that
+    // closes something else is not an account.
+    let (_, after_user) = rest.split_once('\'')?;
+    let host = after_user.strip_prefix("@'")?;
+    let (_, after_host) = host.split_once('\'')?;
+    Some(message.len() - after_host.len())
+}
 
 /// Said for a statement that needs the user's approval: it is not run for an
 /// agent, and no connection is opened for it.
@@ -69,6 +146,11 @@ pub(crate) struct Lane {
     /// since changed is told apart from one that has not.
     pub(crate) opened_from: ConnectionConfig,
     pub(crate) connection: Connection,
+    /// What an error that came back through this connection must not say
+    /// ([`ConnectionConfig::identifying_text`] of the config it opened with,
+    /// its password included). It lives exactly as long as the connection,
+    /// which holds the same strings.
+    pub(crate) hidden: Vec<String>,
 }
 
 /// What the blocking half of a read came back with.
@@ -81,14 +163,19 @@ enum Ran {
     NotOpened,
     Done {
         connection: Connection,
+        hidden: Vec<String>,
         result: Result<QueryResult, DbError>,
     },
 }
 
-/// One result set as the agent reads it.
-fn table_of(result: &QueryResult) -> result::Table {
-    let rows: Vec<Vec<Option<String>>> = result
-        .rows
+/// One result set as the agent reads it. A Postgres spatial cell is rendered
+/// first, as an export renders it, so hex EWKB never spends the agent's tokens.
+fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
+    let mut shown = result.rows.clone();
+    for (row, column, _, value) in db::render(db::unrendered(engine, result)) {
+        shown[row].replace(&[(column, Some(value.as_str()))]);
+    }
+    let rows: Vec<Vec<Option<String>>> = shown
         .iter()
         .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
         .collect();
@@ -150,14 +237,14 @@ impl Workspace {
             .lanes
             .get(&profile_id)
             .filter(|lane| lane.opened_from == config)
-            .map(|lane| lane.connection.clone());
+            .map(|lane| (lane.connection.clone(), lane.hidden.clone()));
 
         let task = spawn_blocking(cx.background_executor(), {
             let profile_id = profile_id.clone();
             let config = config.clone();
             move || {
-                let connection = match cached {
-                    Some(connection) => connection,
+                let (connection, hidden) = match cached {
+                    Some(cached) => cached,
                     None => {
                         let mut config = agent_config(&config);
                         // A file engine has nothing to authenticate to, so it
@@ -171,6 +258,9 @@ impl Workspace {
                                 Err(_) => return Ran::NotOpened,
                             }
                         }
+                        // Taken after the password is in: it is one of the
+                        // strings a server's error may echo.
+                        let hidden = config.identifying_text();
                         let Ok(connection) = Connection::open(config) else {
                             return Ran::NotOpened;
                         };
@@ -180,7 +270,7 @@ impl Workspace {
                         if connection.set_read_only(true).is_err() {
                             return Ran::NotOpened;
                         }
-                        connection
+                        (connection, hidden)
                     }
                 };
                 let result = connection.query(
@@ -192,7 +282,11 @@ impl Workspace {
                         ..Fetch::default()
                     },
                 );
-                Ran::Done { connection, result }
+                Ran::Done {
+                    connection,
+                    hidden,
+                    result,
+                }
             }
         });
 
@@ -221,9 +315,17 @@ impl Workspace {
             .iter()
             .find(|profile| profile.id == profile_id)
             .map(|profile| profile.name.clone());
+        let engine = opened_from.engine();
         let (status, text) = match ran {
-            Ran::NotOpened => (Status::Failed, OPEN_FAILED.to_string()),
-            Ran::Done { connection, result } => {
+            Ran::NotOpened => {
+                self.agent.lanes.remove(profile_id);
+                (Status::Failed, OPEN_FAILED.to_string())
+            }
+            Ran::Done {
+                connection,
+                hidden,
+                result: Ok(result),
+            } => {
                 // A profile removed while the read ran has no lane to keep.
                 if name.is_some() {
                     self.agent.lanes.insert(
@@ -231,16 +333,26 @@ impl Workspace {
                         Lane {
                             opened_from,
                             connection,
+                            hidden,
                         },
                     );
                 }
-                match result {
-                    Ok(result) => (
-                        Status::Executed,
-                        result::text(&[table_of(&result)], result.rest.len()),
-                    ),
-                    Err(_) => (Status::Failed, STATEMENT_FAILED.to_string()),
-                }
+                (
+                    Status::Executed,
+                    result::text(&[table_of(engine, &result)], result.rest.len()),
+                )
+            }
+            Ran::Done {
+                hidden,
+                result: Err(error),
+                ..
+            } => {
+                // ponytail: every failure ends the lane rather than asking
+                // which ones end a session, since a Redis timeout closes it
+                // without `is_lost` knowing (D-02). The cost is one reopen
+                // after a failed statement.
+                self.agent.lanes.remove(profile_id);
+                (Status::Failed, scrubbed(&error.message, &hidden))
             }
         };
         self.agent_answered(id, name, None, reply, status, text);
@@ -276,5 +388,117 @@ mod tests {
                 assert_eq!(agent.with_statement_timeout(user), profile, "{engine:?}");
             }
         }
+    }
+
+    /// Whether `text` holds `name` bounded by anything but a name character,
+    /// in any ASCII case.
+    fn stands_whole(text: &str, name: &str) -> bool {
+        let (text, name) = (text.to_ascii_lowercase(), name.to_ascii_lowercase());
+        let in_a_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        text.match_indices(&name).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            let first = name.chars().next().is_some_and(in_a_name);
+            let last = name.chars().next_back().is_some_and(in_a_name);
+            !(first && before.is_some_and(in_a_name)) && !(last && after.is_some_and(in_a_name))
+        })
+    }
+
+    #[test]
+    fn an_error_naming_the_profile_is_scrubbed_before_the_agent_reads_it() {
+        let configs = restored(include_str!("../testdata/every-engine.toml"));
+        assert!(!configs.is_empty());
+        for (id, config) in &configs {
+            let hidden = config.identifying_text();
+            for name in &hidden {
+                for message in [
+                    format!("could not reach {name}."),
+                    format!("user '{name}' denied"),
+                    format!("\"{name}\""),
+                    format!("{name}@host"),
+                    name.to_ascii_uppercase(),
+                ] {
+                    let clean = scrubbed(&message, &hidden);
+                    assert!(
+                        !stands_whole(&clean, name),
+                        "{id}: {name:?} survives in {clean:?} from {message:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            scrubbed(
+                "SELECT command denied to user 'app'@'10.0.0.5' for table 't'",
+                &[]
+            ),
+            "SELECT command denied to user [hidden] for table 't'"
+        );
+        let long = "x".repeat(ERROR_CAP + 500);
+        let clipped = scrubbed(&long, &[]);
+        assert_eq!(clipped.chars().count(), ERROR_CAP + CLIPPED.chars().count());
+        assert!(clipped.ends_with(" [clipped]"));
+        let wide = "é".repeat(ERROR_CAP + 500);
+        let clipped = scrubbed(&wide, &["é".to_string()]);
+        assert!(clipped.chars().count() <= ERROR_CAP + CLIPPED.chars().count());
+        let exact = "y".repeat(ERROR_CAP);
+        assert_eq!(scrubbed(&exact, &[]), exact);
+        let multibyte = "é".repeat(ERROR_CAP + 500);
+        let clipped = scrubbed(&multibyte, &[]);
+        assert!(clipped.starts_with("éé") && clipped.ends_with(" [clipped]"));
+    }
+
+    #[test]
+    fn a_name_is_scrubbed_only_where_it_stands_whole() {
+        let hidden: Vec<String> = ["sa", "db.internal", "db.internal:5432"]
+            .map(String::from)
+            .into();
+        for (message, scrubbed_to) in [
+            ("usage of sa_role by sa.", "usage of sa_role by [hidden]."),
+            ("cannot reach db.internal.", "cannot reach [hidden]."),
+            ("at db.internal:5432,", "at [hidden],"),
+            ("subdb.internal", "subdb.internal"),
+            (
+                "SA 'sa' \"sa\" sa@host",
+                "[hidden] '[hidden]' \"[hidden]\" [hidden]@host",
+            ),
+        ] {
+            assert_eq!(scrubbed(message, &hidden), scrubbed_to, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_quote_that_closes_something_else_is_not_an_account() {
+        assert_eq!(
+            scrubbed("user 'x' near 'app'@'host' denied", &[]),
+            "user 'x' near [hidden] denied"
+        );
+        assert_eq!(scrubbed("it's 'a' and b@c", &[]), "it's 'a' and b@c");
+    }
+
+    #[test]
+    fn a_spatial_cell_reaches_the_agent_rendered_not_as_hex() {
+        use crate::db::{Column, Engine, Row};
+        let point = "0101000000000000000000F03F0000000000000040";
+        let result = QueryResult {
+            columns: vec![
+                Column {
+                    name: "geom".into(),
+                    data_type: Some("geometry".into()),
+                },
+                Column {
+                    name: "note".into(),
+                    data_type: Some("text".into()),
+                },
+            ],
+            rows: vec![Row::new([Some(point), Some(point)]).expect("a row")],
+            ..QueryResult::default()
+        };
+        let table = table_of(Engine::Postgres, &result);
+        let geometry = table.rows[0][0].as_deref().expect("a cell");
+        assert!(geometry.starts_with("POINT"), "{geometry}");
+        assert_eq!(table.rows[0][1].as_deref(), Some(point));
+        // Another engine's cells are not read as EWKB.
+        let other = table_of(Engine::MySql, &result);
+        assert_eq!(other.rows[0][0].as_deref(), Some(point));
     }
 }

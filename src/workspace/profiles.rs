@@ -2307,6 +2307,27 @@ fn restored_config(
     })
 }
 
+/// Each profile of a `profiles.toml` fixture as the window would restore it, by
+/// id, for the tests that need one of every engine's config.
+#[cfg(test)]
+pub(crate) fn restored(text: &str) -> Vec<(String, ConnectionConfig)> {
+    let store::ProfileList { profiles, .. } =
+        store::decode_profiles(text, &[]).expect("the fixture loads");
+    profiles
+        .iter()
+        .map(|stored| {
+            let engine = Engine::parse(stored.engine.as_deref().unwrap_or("postgres"))
+                .expect("a known engine");
+            let sslmode = stored
+                .sslmode
+                .as_deref()
+                .map_or(Ok(SslMode::default()), SslMode::parse)
+                .expect("a known sslmode");
+            (stored.id.clone(), stored_config(stored, engine, sslmode))
+        })
+        .collect()
+}
+
 /// The connection a stored profile on a built-in `engine` describes, with
 /// `sslmode` as [`Workspace::restore_profile`] read it.
 fn stored_config(
@@ -2531,21 +2552,7 @@ mod tests {
     use super::*;
 
     fn restored(text: &str) -> Vec<(String, ConnectionConfig)> {
-        let store::ProfileList { profiles, .. } =
-            store::decode_profiles(text, &[]).expect("the fixture loads");
-        profiles
-            .iter()
-            .map(|stored| {
-                let engine = Engine::parse(stored.engine.as_deref().unwrap_or("postgres"))
-                    .expect("a known engine");
-                let sslmode = stored
-                    .sslmode
-                    .as_deref()
-                    .map_or(Ok(SslMode::default()), SslMode::parse)
-                    .expect("a known sslmode");
-                (stored.id.clone(), stored_config(stored, engine, sslmode))
-            })
-            .collect()
+        super::restored(text)
     }
 
     fn restored_configs(text: &str) -> String {

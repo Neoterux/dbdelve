@@ -1441,6 +1441,55 @@ impl ConnectionConfig {
         self
     }
 
+    /// The strings an error bound for an agent must never carry (D-26): the
+    /// hosts, ports as text, users, file paths as stored and home-expanded, the
+    /// tunnel's own, an external connection string, and the password when there
+    /// is one. Blanks are left out. [`Self::endpoint`] is the same string for
+    /// every built-in engine as `listed_endpoint`, so one call covers both.
+    pub fn identifying_text(&self) -> Vec<String> {
+        let mut found = Identifying::default();
+        match self {
+            Self::Postgres(PostgresConfig { server, .. })
+            | Self::MySql(server)
+            | Self::MariaDb(server)
+            | Self::SqlServer(server)
+            | Self::ClickHouse(server)
+            | Self::Redis(server) => {
+                found.server(server);
+                found.name(&self.endpoint());
+            }
+            Self::MongoDb(mongo) => {
+                found.server(&mongo.server);
+                found.name(&self.endpoint());
+            }
+            Self::Sqlite { path, .. } | Self::Turso { path, .. } => found.path(path),
+            Self::DuckDb { path, .. } if path == DUCKDB_IN_MEMORY => {}
+            Self::DuckDb { path, .. } => found.path(path),
+            Self::Snowflake(account) => {
+                found.name(&account.account);
+                found.name(&account.host());
+                found.name(&account.user);
+                found.path(&account.private_key);
+            }
+            Self::External(external) => {
+                found.name(&external.connection);
+                found.name(&external.user);
+                found.name(&external.password);
+            }
+        }
+        if let Some(tunnel) = self.ssh() {
+            found.name(&tunnel.host);
+            if let Some(port) = tunnel.port {
+                found.name(&port.to_string());
+            }
+            found.name(&tunnel.user);
+            if let Some(identity) = &tunnel.identity_file {
+                found.path(identity);
+            }
+        }
+        found.0
+    }
+
     /// Whether replacing `self` with `edited` has to be reconnected for.
     ///
     /// A blank password in `edited` is not a change: the edit form never shows
@@ -1491,6 +1540,40 @@ impl ConnectionConfig {
                 format!("{} · {}", self.endpoint(), target.label())
             }
             (Driver::Plugin(_), _) => target.label(),
+        }
+    }
+}
+
+/// What [`ConnectionConfig::identifying_text`] has collected: no blank, no repeat.
+#[derive(Default)]
+struct Identifying(Vec<String>);
+
+impl Identifying {
+    fn name(&mut self, text: &str) {
+        if !text.trim().is_empty() && !self.0.iter().any(|seen| seen == text) {
+            self.0.push(text.to_string());
+        }
+    }
+
+    /// A path as written and as the file is opened, `~` expanded.
+    fn path(&mut self, text: &str) {
+        self.name(text);
+        self.name(&crate::store::home_expanded(text).to_string_lossy());
+    }
+
+    fn server(&mut self, server: &ServerConfig) {
+        self.name(&server.host);
+        // A seed list names each server on its own in what a driver says.
+        for seed in server.host.split(',') {
+            self.name(seed.trim());
+        }
+        if let Some(port) = server.port {
+            self.name(&port.to_string());
+        }
+        self.name(&server.user);
+        self.name(&server.password);
+        if let Some(root) = &server.root_certificate {
+            self.path(root);
         }
     }
 }
@@ -3662,6 +3745,86 @@ mod tests {
             assert_eq!(bounded.statement_timeout(), 17, "{engine:?}");
             // Setting it back leaves the config as it was, so nothing else moved.
             assert_eq!(bounded.with_statement_timeout(0), config, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn identifying_text_names_every_host_port_user_path_and_password() {
+        let configs = crate::workspace::restored(include_str!("../testdata/every-engine.toml"));
+        let wanted = |id: &str| -> Vec<String> {
+            let (_, config) = configs.iter().find(|(name, _)| name == id).expect(id);
+            config.identifying_text()
+        };
+        let expanded = crate::store::home_expanded("~/.ssh/id_ed25519")
+            .to_string_lossy()
+            .into_owned();
+        for (id, strings) in [
+            ("pg", vec!["db.internal", "5432", "ada", "/certs/ca.pem"]),
+            (
+                "pg",
+                vec![
+                    "bastion.internal",
+                    "2222",
+                    "jump",
+                    "~/.ssh/id_ed25519",
+                    &expanded,
+                ],
+            ),
+            ("alias", vec!["localhost", "postgres"]),
+            ("mysql", vec!["mysql.internal", "3306", "root"]),
+            ("maria", vec!["127.0.0.1", "3307", "dbdelve"]),
+            ("lite", vec!["/Users/ada/data/app.sqlite"]),
+            ("turso", vec!["/Users/ada/data/edge.db"]),
+            ("duck", vec!["/Users/ada/data/lake.duckdb"]),
+            (
+                "snow",
+                vec![
+                    "acme-prod",
+                    "acme-prod.snowflakecomputing.com",
+                    "ADA",
+                    "/Users/ada/.ssh/snowflake.p8",
+                ],
+            ),
+            (
+                "mssql",
+                vec!["sql.internal", "1433", "sa", "/certs/mssql.pem"],
+            ),
+            ("mongo", vec!["cluster0.example.net", "ada"]),
+            ("redis", vec!["cache.internal", "6379", "default"]),
+            ("clk", vec!["ch.internal", "8443", "ada", "/certs/ch.pem"]),
+            ("clk", vec!["bastion.internal", "jump"]),
+        ] {
+            let found = wanted(id);
+            for string in strings {
+                assert!(found.iter().any(|seen| seen == string), "{id}: {string}");
+            }
+        }
+        for (id, config) in &configs {
+            let found = config.identifying_text();
+            assert!(found.iter().all(|text| !text.trim().is_empty()), "{id}");
+            let mut once = found.clone();
+            once.sort();
+            once.dedup();
+            assert_eq!(once.len(), found.len(), "{id} repeats a string");
+        }
+        let (_, mut config) = configs
+            .into_iter()
+            .find(|(id, _)| id == "pg")
+            .expect("the fixture has a Postgres profile");
+        assert!(!config.identifying_text().iter().any(|text| text == "pw"));
+        *config.password_mut().expect("Postgres has a password") = "pw".into();
+        assert!(config.identifying_text().iter().any(|text| text == "pw"));
+    }
+
+    #[test]
+    fn identifying_text_of_every_shape_holds_nothing_blank() {
+        for config in every_shape() {
+            assert!(
+                config
+                    .identifying_text()
+                    .iter()
+                    .all(|text| !text.trim().is_empty())
+            );
         }
     }
 
