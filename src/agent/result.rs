@@ -89,33 +89,41 @@ impl Written<'_> {
 /// included. The first line says whether rows were left out, so a reader knows
 /// what it has before it reads a row. The whole text is at most
 /// [`RESULT_BUDGET`] bytes: rows are dropped from the end, never cut through.
+///
+/// `note` is a sentence of DBDelve's own, written as one `note: ` line after
+/// the header. It is a constant of the caller's, never a value from the
+/// database, so it can hold no newline of its own.
 // ponytail: callers pass one table, or a handful of catalog tables. The
 // header is part of the budget and every table's leading line is written even
 // when no row follows it, so the budget holds for a few tables and not for
 // thousands.
-pub(crate) fn text(tables: &[Table], further: usize) -> String {
+pub(crate) fn text(tables: &[Table], further: usize, note: Option<&str>) -> String {
     let mut written: Vec<Written> = tables.iter().map(write).collect();
-    let mut body: usize = written
-        .iter()
-        .map(|w| w.lead.len() + w.rows.iter().map(|(line, _)| line.len()).sum::<usize>())
-        .sum();
+    let note = note
+        .map(|note| format!("note: {note}\n"))
+        .unwrap_or_default();
+    let mut body: usize = note.len()
+        + written
+            .iter()
+            .map(|w| w.lead.len() + w.rows.iter().map(|(line, _)| line.len()).sum::<usize>())
+            .sum::<usize>();
     loop {
         let head = header(&written, further);
         // `truncated: ` and the newline are the line's own.
         if "truncated: ".len() + head.len() + 1 + body <= RESULT_BUDGET {
-            return assemble(&written, &head);
+            return assemble(&written, &head, &note);
         }
         let Some(last) = written.iter_mut().rev().find(|w| w.kept > 0) else {
             // Nothing is left to drop: the leading lines are all there is.
-            return assemble(&written, &head);
+            return assemble(&written, &head, &note);
         };
         last.kept -= 1;
         body -= last.rows[last.kept].0.len();
     }
 }
 
-fn assemble(written: &[Written], head: &str) -> String {
-    let mut out = format!("truncated: {head}\n");
+fn assemble(written: &[Written], head: &str, note: &str) -> String {
+    let mut out = format!("truncated: {head}\n{note}");
     for w in written {
         out.push_str(&w.lead);
         for (line, _) in &w.rows[..w.kept] {
@@ -318,11 +326,36 @@ mod tests {
             total: Total::Exact(2),
         };
         assert_eq!(
-            text(&[table], 0),
+            text(&[table], 0, None),
             "truncated: none (2 rows)\n\
              columns: [{\"name\":\"id\",\"type\":\"int4\"},{\"name\":\"email\",\"type\":null}]\n\
              [\"1\",\"a@x\"]\n\
              [\"2\",null]\n"
+        );
+    }
+
+    #[test]
+    fn a_note_is_one_line_after_the_header_and_counts_toward_the_budget() {
+        let table = || wide(12, &"a".repeat(1_900), Total::Exact(12));
+        let note = "n".repeat(300);
+        let out = text(&[wide(1, "a", Total::Exact(1))], 0, Some(&note));
+        let mut lines = out.lines();
+        assert_eq!(lines.next(), Some("truncated: none (1 row)"));
+        assert_eq!(lines.next(), Some(format!("note: {note}").as_str()));
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("columns: "))
+        );
+        // Twelve of these rows fit alone, and a note that takes the room of
+        // one of them costs it.
+        assert!(text(&[table()], 0, None).starts_with("truncated: none (12 rows)\n"));
+        let crowded = text(&[table()], 0, Some(&"n".repeat(1_300)));
+        assert!(crowded.len() <= RESULT_BUDGET, "{}", crowded.len());
+        assert!(
+            crowded.starts_with("truncated: 11 of 12 rows shown (byte budget)\nnote: "),
+            "{}",
+            &crowded[..70]
         );
     }
 
@@ -337,7 +370,7 @@ mod tests {
             ],
             total: Total::Exact(2),
         };
-        let out = text(&[table], 0);
+        let out = text(&[table], 0, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 4, "{out:?}");
         assert!(lines[0].starts_with("truncated: "));
@@ -356,7 +389,7 @@ mod tests {
             total,
         };
         let first = |count, total, further| {
-            text(&[table(count, total)], further)
+            text(&[table(count, total)], further, None)
                 .lines()
                 .next()
                 .expect("a text has a first line")
@@ -384,7 +417,7 @@ mod tests {
             "truncated: 100 of at least 100 rows shown (row cap, 2 further result sets not shown)"
         );
         assert_eq!(
-            text(&[table(0, Total::Exact(0))], 0),
+            text(&[table(0, Total::Exact(0))], 0, None),
             "truncated: none (0 rows)\ncolumns: [{\"name\":\"n\",\"type\":null}]\n"
         );
     }
@@ -398,7 +431,7 @@ mod tests {
             total,
         };
         let first = |tables: &[Table], further| {
-            text(tables, further)
+            text(tables, further, None)
                 .lines()
                 .next()
                 .expect("a text has a first line")
@@ -448,7 +481,7 @@ mod tests {
 
     #[test]
     fn a_result_is_cut_at_a_row_boundary_under_the_budget_with_its_header_first() {
-        let out = text(&[wide(100, &"a".repeat(500), Total::Exact(100))], 0);
+        let out = text(&[wide(100, &"a".repeat(500), Total::Exact(100))], 0, None);
         assert!(out.len() <= RESULT_BUDGET, "{}", out.len());
         assert!(out.ends_with("\"]\n"), "the text ends after a whole row");
         let mut lines = out.lines();
@@ -476,15 +509,15 @@ mod tests {
             table.rows[12][0] = Some("a".repeat(last));
             table
         };
-        let last = RESULT_BUDGET - text(&[table(0)], 0).len();
-        let kept = text(&[table(last)], 0);
+        let last = RESULT_BUDGET - text(&[table(0)], 0, None).len();
+        let kept = text(&[table(last)], 0, None);
         assert_eq!(kept.len(), RESULT_BUDGET);
         assert!(
             kept.starts_with("truncated: none (13 rows)\n"),
             "{}",
             &kept[..60]
         );
-        let over = text(&[table(last + 1)], 0);
+        let over = text(&[table(last + 1)], 0, None);
         assert!(over.len() <= RESULT_BUDGET);
         assert!(
             over.starts_with("truncated: 12 of 13 rows shown (byte budget)\n"),
@@ -497,7 +530,7 @@ mod tests {
     #[test]
     fn an_oversized_cell_is_clipped_on_a_character_boundary() {
         let cell = "\u{20ac}".repeat(CELL_CAP + 10);
-        let out = text(&[wide(1, &cell, Total::Exact(1))], 0);
+        let out = text(&[wide(1, &cell, Total::Exact(1))], 0, None);
         let row: Vec<String> = serde_json::from_str(out.lines().nth(2).expect("a row line"))
             .expect("the row is a JSON array");
         assert_eq!(
@@ -512,7 +545,7 @@ mod tests {
             Some("truncated: 1 of 1 rows shown (clipped cells)")
         );
         // A cell of exactly the cap is left alone.
-        let whole = text(&[wide(1, &"x".repeat(CELL_CAP), Total::Exact(1))], 0);
+        let whole = text(&[wide(1, &"x".repeat(CELL_CAP), Total::Exact(1))], 0, None);
         assert!(whole.starts_with("truncated: none (1 row)\n"));
     }
 
@@ -522,7 +555,7 @@ mod tests {
         table.heads = (0..5_000)
             .map(|n| head(&format!("column_{n:04}"), None))
             .collect();
-        let out = text(&[table], 0);
+        let out = text(&[table], 0, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "{out:?}");
         assert!(lines[0].contains("(byte budget)"), "{}", lines[0]);
@@ -537,7 +570,7 @@ mod tests {
     fn the_reasons_are_listed_in_one_order() {
         let mut table = wide(60, &"a".repeat(500), Total::AtLeast(60));
         table.rows[0][0] = Some("b".repeat(CELL_CAP + 1));
-        let out = text(&[table], 2);
+        let out = text(&[table], 2, None);
         let shown = out.lines().filter(|line| line.starts_with("[\"")).count();
         assert_eq!(
             out.lines().next(),

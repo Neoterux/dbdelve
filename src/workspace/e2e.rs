@@ -3759,6 +3759,7 @@ fn inject_sql(
         Some(connection),
         crate::agent::CallArgs {
             sql: Some(sql.to_string()),
+            ..Default::default()
         },
     )
     .1
@@ -5567,6 +5568,7 @@ fn every_agent_call_is_audited_with_its_verdict_and_never_its_rows(cx: &mut Test
             Some("Orders"),
             crate::agent::CallArgs {
                 sql: Some(sql.to_string()),
+                ..Default::default()
             },
         );
         let reply = answer_of(cx, &answers);
@@ -6088,6 +6090,155 @@ fn an_agent_reads_rows_through_the_shim_on_a_connection_of_its_own(cx: &mut Test
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_walks_a_catalog_through_the_shim(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        session::ProfileState,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE a (id INTEGER PRIMARY KEY);\
+             CREATE TABLE b (id INTEGER PRIMARY KEY);\
+             CREATE VIEW v AS SELECT id FROM a;",
+            "",
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let untouched = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                (
+                    matches!(orders.state, ProfileState::Idle),
+                    orders.session.queries.len(),
+                    orders.session.objects.len(),
+                )
+            })
+        };
+        let before = untouched(cx);
+        assert!(before.0, "the user never connected Orders");
+        let mut call = |tool: &str, arguments: serde_json::Value| {
+            let shim =
+                crate::agent::shim::testing::call_through_the_shim(path.clone(), tool, arguments);
+            drive_until(cx, |_| shim.is_finished());
+            let result = shim.join().expect("the shim's thread ends");
+            (
+                result["isError"] == true,
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("a result carries text")
+                    .to_string(),
+            )
+        };
+
+        let (failed, schemas) = call("list_schemas", serde_json::json!({"connection": "Orders"}));
+        assert!(!failed, "{schemas}");
+        assert!(
+            schemas.starts_with("status: executed\ntruncated: none (1 row)\ncolumns: "),
+            "{schemas}"
+        );
+        assert!(schemas.ends_with("\n[\"main\"]\n"), "{schemas}");
+
+        let (failed, tables) = call(
+            "list_tables",
+            serde_json::json!({"connection": "Orders", "schema": "main"}),
+        );
+        assert!(!failed, "{tables}");
+        assert!(
+            tables.starts_with("status: executed\ntruncated: none (3 rows)\ncolumns: "),
+            "{tables}"
+        );
+        let rows: Vec<&str> = tables
+            .lines()
+            .filter(|line| line.starts_with("[\""))
+            .collect();
+        assert_eq!(rows.len(), 3, "{tables}");
+        assert!(rows[0].starts_with("[\"a\",\"table\",null,"), "{tables}");
+        assert!(rows[1].starts_with("[\"b\",\"table\",null,"), "{tables}");
+        assert!(rows[2].starts_with("[\"v\",\"view\",null,"), "{tables}");
+
+        let (failed, missing) = call(
+            "list_tables",
+            serde_json::json!({"connection": "Orders", "schema": "nope"}),
+        );
+        assert!(failed, "{missing}");
+        assert_eq!(
+            missing,
+            format!("status: failed\n{}", super::agent_read::NO_SUCH_SCHEMA)
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [
+                (Tool::ListTables, Status::Failed),
+                (Tool::ListTables, Status::Executed),
+                (Tool::ListSchemas, Status::Executed),
+            ]
+        );
+        for entry in &log {
+            assert!(entry.verdict.is_none() && entry.sql.is_none(), "{entry:?}");
+        }
+        assert_eq!(log[1].shown, Some(3));
+        assert_eq!(log[2].shown, Some(1));
+
+        assert_eq!(
+            untouched(cx),
+            before,
+            "the agent's catalog read moved the user's profile"
+        );
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for (tool, name) in [
+            (Tool::ListSchemas, "Secret"),
+            (Tool::ListTables, "Secret"),
+            (Tool::ListSchemas, "Nope"),
+        ] {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                tool,
+                Some(name),
+                crate::agent::CallArgs {
+                    schema: Some("main".to_string()),
+                    ..Default::default()
+                },
+            );
+            let reply = answers.try_recv().expect("a refusal is answered at once");
+            assert_eq!(
+                reply.status,
+                Status::RefusedByGate,
+                "{name}: {}",
+                reply.text
+            );
+        }
+        workspace.read_with(cx, |workspace, _| assert!(workspace.agent.lanes.is_empty()));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_read_keeps_the_first_rows_and_runs_as_written(cx: &mut TestAppContext) {
     use crate::agent::Status;
@@ -6476,6 +6627,7 @@ fn calls_on_one_profile_run_one_at_a_time_in_arrival_order(cx: &mut TestAppConte
         cx.executor().allow_parking();
         let sql = |sql: &str| crate::agent::CallArgs {
             sql: Some(sql.to_string()),
+            ..Default::default()
         };
         let (first, first_answers) = inject_call_with(
             &workspace,
@@ -6624,6 +6776,7 @@ fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
             Some("Orders"),
             crate::agent::CallArgs {
                 sql: Some("SELECT 1".to_string()),
+                ..Default::default()
             },
         );
         let (second, second_answers) = inject_call_with(
@@ -6633,6 +6786,7 @@ fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
             Some("Orders"),
             crate::agent::CallArgs {
                 sql: Some("SELECT 2".to_string()),
+                ..Default::default()
             },
         );
         workspace.update(cx, |workspace, cx| {
@@ -6674,6 +6828,7 @@ fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppConte
             Some("Orders"),
             crate::agent::CallArgs {
                 sql: Some("SELECT 1".to_string()),
+                ..Default::default()
             },
         );
         workspace.update(cx, |workspace, cx| {
@@ -6706,6 +6861,7 @@ fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppConte
             Some("Orders"),
             crate::agent::CallArgs {
                 sql: Some("SELECT 3".to_string()),
+                ..Default::default()
             },
         );
         let next = answer_of(cx, &next_answers);
@@ -6731,6 +6887,7 @@ fn inject_orders_read(
         Some("Orders"),
         crate::agent::CallArgs {
             sql: Some(sql.to_string()),
+            ..Default::default()
         },
     )
 }
@@ -6862,6 +7019,7 @@ fn inject_read(
         Some(connection),
         crate::agent::CallArgs {
             sql: Some(sql.to_string()),
+            ..Default::default()
         },
     )
 }
