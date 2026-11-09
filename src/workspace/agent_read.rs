@@ -1341,6 +1341,94 @@ mod tests {
     }
 
     #[test]
+    fn explain_analyze_follows_the_wrapped_statement() {
+        let mode = Mode::ReadWrite;
+        let composed = explain_statement(Engine::Postgres, "SELECT a FROM t", true, mode)
+            .expect("an analyzed read runs");
+        assert_eq!(composed, "EXPLAIN ANALYZE SELECT a FROM t");
+
+        let held = explain_statement(
+            Engine::Postgres,
+            "UPDATE t SET a = 1 WHERE id = 1",
+            true,
+            mode,
+        )
+        .expect_err("an analyzed update waits for a person");
+        assert_eq!(held.status, Status::RefusedByGate);
+        assert_eq!(held.text, NEEDS_APPROVAL);
+
+        let removed = explain_statement(Engine::Postgres, "DELETE FROM t WHERE id = 1", true, mode)
+            .expect_err("an analyzed delete is refused");
+        assert_eq!(removed.status, Status::RefusedByGate);
+        assert_eq!(
+            removed.text,
+            "deleting data is refused for agent statements"
+        );
+
+        // A leading keyword says nothing: this reads as a SELECT and deletes.
+        let writable = "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d";
+        for mode in Mode::ALL {
+            let refused = explain_statement(Engine::Postgres, writable, true, mode)
+                .expect_err("an analyzed writable CTE is never run");
+            assert_eq!(refused.status, Status::RefusedByGate);
+        }
+
+        let refused = explain_statement(Engine::MongoDb, "db.c.deleteMany({})", true, mode)
+            .expect_err("a delete is not explained");
+        assert_eq!(refused.status, Status::RefusedByGate);
+        assert_eq!(
+            Err(refused.text),
+            crate::sql::explainable(Engine::MongoDb, "db.c.deleteMany({})")
+        );
+    }
+
+    /// The compose Postgres, from the standard `PG*` variables, opened the way
+    /// the agent opens it.
+    fn live_agent_connection() -> Connection {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+        let config = ConnectionConfig::postgres(crate::db::ServerConfig {
+            host: var("PGHOST"),
+            port: std::env::var("PGPORT")
+                .ok()
+                .map(|port| port.parse().expect("PGPORT must be a number")),
+            database: var("PGDATABASE"),
+            user: var("PGUSER"),
+            password: std::env::var("PGPASSWORD").unwrap_or_default(),
+            // The compose database speaks no TLS, and this test is the one
+            // place a plaintext connection is the point.
+            sslmode: crate::db::SslMode::Disable,
+            root_certificate: None,
+            statement_timeout: 0,
+            ssh: None,
+            schema: None,
+            read_only: false,
+        });
+        Connection::open_for_agent(config).expect("the compose Postgres opens for the agent")
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_an_explain_analyze_on_postgres_reads_a_measured_plan() {
+        let connection = live_agent_connection();
+        let statement = explain_statement(
+            Engine::Postgres,
+            "SELECT * FROM accounts",
+            true,
+            Mode::ReadOnly,
+        )
+        .expect("an analyzed read runs");
+        let Ran::Done { result, .. } =
+            explain_on(connection, Vec::new(), &statement, &CancelToken::default())
+        else {
+            panic!("the plan was not drained");
+        };
+        let (status, text) = plan_reply(Engine::Postgres, &result.expect("the server plans it"));
+        assert_eq!(status, Status::Executed);
+        assert!(text.contains("analyzed=yes"), "{text}");
+        assert!(text.contains("findings"), "{text}");
+    }
+
+    #[test]
     fn tables_are_listed_with_their_kind_parent_and_estimate() {
         let catalog = Catalog {
             schemas: vec![schema(
