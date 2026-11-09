@@ -738,8 +738,9 @@ impl Workspace {
                         engine: profile.config.engine().as_str(),
                     })
                     .collect();
-                let text = serde_json::to_string(&visible)
-                    .expect("names and engine spellings always serialize");
+                // Names and engine spellings always serialize; an empty list
+                // is what the impossible case would say.
+                let text = serde_json::to_string(&visible).unwrap_or_else(|_| "[]".to_string());
                 // The caller may have hung up, and then nobody reads this.
                 let _ = reply.send(Reply {
                     status: Status::Executed,

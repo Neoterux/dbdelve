@@ -300,7 +300,9 @@ fn rows(count: usize) -> String {
 }
 
 fn json_line(value: &impl serde::Serialize) -> String {
-    serde_json::to_string(value).expect("strings, nulls and objects of them always serialize")
+    // Strings, nulls and objects of them always serialize; the empty line is
+    // what the impossible case would write, and no row is taken for one.
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 #[cfg(test)]
