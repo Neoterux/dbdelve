@@ -160,9 +160,7 @@ impl Shim {
     /// answers it.
     async fn carry(
         &self,
-        tool: Tool,
-        connection: Option<String>,
-        args: CallArgs,
+        hello: String,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = match &self.socket {
@@ -175,12 +173,6 @@ impl Shim {
                 return Ok(answer(Status::AppNotRunning, &failed_connect_text(&error)));
             }
         };
-        let hello = wire::encode(&wire::Hello::Call {
-            v: wire::PROTOCOL_VERSION,
-            tool,
-            connection,
-            sql: args.sql,
-        });
         if stream.write_all(hello.as_bytes()).await.is_err() {
             return Ok(closed_without_answering());
         }
@@ -255,10 +247,28 @@ impl ServerHandler for Shim {
         // Resolved before anything is opened: a call that is not one reaches
         // no socket, presence included.
         let (tool, connection, args) = resolve(&request)?;
+        // Encoded before anything is opened, because the app drops a first
+        // frame past its limit and the agent would be told the app had closed.
+        let hello = wire::encode(&wire::Hello::Call {
+            v: wire::PROTOCOL_VERSION,
+            tool,
+            connection,
+            sql: args.sql,
+        });
+        if hello.len() as u64 > wire::FRAME_LIMIT {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "The call is {} bytes once encoded; DBDelve reads a call of at most {}.",
+                    hello.len(),
+                    wire::FRAME_LIMIT
+                ),
+                None,
+            ));
+        }
         if let Ok(path) = &self.socket {
             Self::ensure_presence(path, &self.presence).await;
         }
-        Ok(self.carry(tool, connection, args, &context).await?.into())
+        Ok(self.carry(hello, &context).await?.into())
     }
 }
 
@@ -1180,6 +1190,29 @@ mod tests {
             }
             let heard = app.collect(Duration::from_millis(300), |_| false).await;
             assert_eq!(called(&heard), 0, "{heard:?}");
+        });
+    }
+
+    #[test]
+    fn a_statement_too_long_for_a_frame_is_refused_before_any_connection() {
+        let app = App::answering(executed("[]"));
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            // The second is short enough to look fine and is widened past the
+            // limit by JSON writing each control character as six bytes.
+            for sql in ["x".repeat(70_000), "\u{1}".repeat(16_000)] {
+                let answered = client
+                    .call("execute_sql", json!({"connection": "Orders", "sql": sql}))
+                    .await;
+                assert_eq!(answered["error"]["code"], -32602, "{answered}");
+                let message = answered["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains("65536"), "{message}");
+            }
+            let heard = app.collect(Duration::from_millis(300), |_| false).await;
+            assert_eq!(called(&heard), 0, "{heard:?}");
+            // The idle presence opens on its own; a refused call adds none.
+            assert!(opened(&heard) <= 1, "{heard:?}");
         });
     }
 
