@@ -1499,12 +1499,11 @@ fn resolve_edit_target(probed: &[ProbedColumn], table: &KeyedTable) -> Option<Ed
 
 /// A relation name is user data and can contain a quote.
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
-    template
-        .replace("{schema}", &super::Engine::Postgres.quote_literal(schema))
-        .replace(
-            "{relation}",
-            &super::Engine::Postgres.quote_literal(relation),
-        )
+    super::fill_placeholders(
+        template,
+        &super::Engine::Postgres.quote_literal(schema),
+        &super::Engine::Postgres.quote_literal(relation),
+    )
 }
 
 /// A result read off the wire, held across the reads [`Connection::run`]
@@ -2686,6 +2685,18 @@ mod tests {
         assert_eq!(
             sql,
             "WHERE namespace.nspname = 'public' AND class.relname = 'odd''name'"
+        );
+    }
+
+    #[test]
+    fn a_schema_named_like_a_placeholder_is_not_substituted_into() {
+        assert_eq!(
+            structure_sql(
+                "WHERE namespace.nspname = {schema} AND class.relname = {relation}",
+                "{relation}",
+                "a'b",
+            ),
+            "WHERE namespace.nspname = '{relation}' AND class.relname = 'a''b'"
         );
     }
 

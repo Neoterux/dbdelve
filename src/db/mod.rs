@@ -3731,9 +3731,47 @@ pub(crate) fn every_shape() -> Vec<ConnectionConfig> {
     ]
 }
 
+/// `template` with `{schema}` and `{relation}` replaced by the two literals,
+/// each already quoted for its engine.
+///
+/// One pass over the template, not a replace per placeholder: a schema that is
+/// itself named `{relation}` would otherwise have the relation spliced into
+/// the quotes the schema was just given. Any other brace word is left as written.
+pub(super) fn fill_placeholders(template: &str, schema: &str, relation: &str) -> String {
+    let mut sql = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        sql.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let (placeholder, value) = if rest.starts_with("{schema}") {
+            ("{schema}", schema)
+        } else if rest.starts_with("{relation}") {
+            ("{relation}", relation)
+        } else {
+            sql.push('{');
+            rest = &rest[1..];
+            continue;
+        };
+        sql.push_str(value);
+        rest = &rest[placeholder.len()..];
+    }
+    sql.push_str(rest);
+    sql
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholders_are_filled_in_one_pass() {
+        assert_eq!(
+            fill_placeholders("{schema}.{relation} {x}", "'{relation}'", "'a''b'"),
+            "'{relation}'.'a''b' {x}"
+        );
+        assert_eq!(fill_placeholders("SELECT 1", "'s'", "'r'"), "SELECT 1");
+        assert_eq!(fill_placeholders("{ {schema}", "'s'", "'r'"), "{ 's'");
+    }
 
     #[test]
     fn the_agent_timeout_is_set_on_every_kind_of_connection() {
