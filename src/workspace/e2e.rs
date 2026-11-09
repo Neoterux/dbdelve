@@ -6281,3 +6281,307 @@ fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) 
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
     });
 }
+
+/// An `execute_sql` call on `connection`, injected, with its id.
+fn inject_read(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: &str,
+    sql: &str,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some(connection),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+        },
+    )
+}
+
+/// The app launched on visible `Orders` and `Billing` over one database that
+/// `schema` has been run against. Neither is connected for the user.
+fn orders_and_billing<'a>(
+    cx: &'a mut TestAppContext,
+    schema: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let visible = "agent_visible = true";
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            sqlite_profile("orders", "Orders", visible),
+            sqlite_profile("billing", "Billing", visible),
+        ]
+        .concat(),
+    );
+    rusqlite::Connection::open(
+        store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db"),
+    )
+    .and_then(|connection| connection.execute_batch(schema))
+    .expect("the schema must apply");
+    (workspace, cx)
+}
+
+fn no_lane_for(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
+    workspace.read_with(cx, |workspace, _| !workspace.agent.lanes.contains_key(id))
+}
+
+#[gpui::test]
+fn hiding_or_removing_a_profile_ends_its_reads_and_drops_its_connection(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (running, running_answers) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        let (waiting, waiting_answers) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        let (_, billing_answers) = inject_read(&workspace, cx, "Billing", "SELECT 3");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("orders", false, cx)
+        });
+        assert_eq!(running_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(waiting_answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "orders"));
+        assert_eq!(
+            logged(&workspace, cx, running),
+            [crate::agent::Status::Rejected]
+        );
+        assert_eq!(
+            logged(&workspace, cx, waiting),
+            [crate::agent::Status::Rejected]
+        );
+        // Billing is another profile's lane, and it answers as it would have.
+        let billing = answer_of(cx, &billing_answers);
+        assert_eq!(
+            billing.status,
+            crate::agent::Status::Executed,
+            "{}",
+            billing.text
+        );
+        assert!(running_answers.try_recv().is_err(), "answered twice");
+        cx.run_until_parked();
+        assert!(no_lane_for(&workspace, cx, "orders"));
+
+        // Removal reaches a lane that has its connection, too.
+        let (first, first_answers) = inject_read(&workspace, cx, "Billing", "SELECT 4");
+        let (second, second_answers) = inject_read(&workspace, cx, "Billing", "SELECT 5");
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "billing")
+                .expect("Billing is in the list");
+            workspace.remove_profile(index, cx)
+        });
+        assert_eq!(first_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(second_answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "billing"));
+        assert_eq!(logged(&workspace, cx, first).len(), 1);
+        assert_eq!(logged(&workspace, cx, second).len(), 1);
+        cx.run_until_parked();
+        assert!(first_answers.try_recv().is_err(), "answered twice");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_hide_adopted_from_another_window_ends_the_running_read(cx: &mut TestAppContext) {
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (id, answers) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .agent
+                    .lanes
+                    .get("orders")
+                    .is_some_and(|lane| lane.running.is_some())
+            );
+        });
+
+        // Another window hides Orders: only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        let text = text.replacen("agent_visible = true\n", "", 1);
+        std::fs::write(&file, text).expect("profiles.toml is written");
+        assert!(!saved_visible("orders"));
+
+        let (_, listed) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        assert!(listed.try_recv().is_ok());
+        assert_eq!(answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "orders"));
+        assert_eq!(logged(&workspace, cx, id), [crate::agent::Status::Rejected]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_kill_switch_ends_every_running_read(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (_, orders) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        let (_, waiting) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        let (_, billing) = inject_read(&workspace, cx, "Billing", "SELECT 3");
+
+        workspace.update(cx, |workspace, cx| workspace.disconnect_agents(cx));
+        let turned_off = Reply {
+            status: Status::Rejected,
+            text: "Agent access was turned off in DBDelve.".to_string(),
+        };
+        for answers in [&orders, &waiting, &billing] {
+            assert_eq!(answers.try_recv().ok(), Some(turned_off.clone()));
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty());
+        });
+        cx.run_until_parked();
+        for answers in [&orders, &waiting, &billing] {
+            assert!(answers.try_recv().is_err(), "answered twice");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_profile_whose_connection_changed_is_reopened_for_the_next_read(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('one');",
+            "",
+        );
+        cx.executor().allow_parking();
+        let other = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("other.db");
+        rusqlite::Connection::open(&other)
+            .and_then(|connection| {
+                connection.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('two');")
+            })
+            .expect("the second file is written");
+
+        let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT v FROM t");
+        let first = answer_of(cx, &answers);
+        assert!(first.text.contains("[\"one\"]"), "{}", first.text);
+
+        // The connection changes in place, with no hide.
+        workspace.update(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let crate::db::ConnectionConfig::Sqlite { path, .. } = &mut orders.config else {
+                panic!("Orders is a SQLite profile");
+            };
+            *path = other.display().to_string();
+        });
+        let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT v FROM t");
+        let second = answer_of(cx, &answers);
+        assert!(second.text.contains("[\"two\"]"), "{}", second.text);
+        workspace.read_with(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.opened_from == orders.config);
+            assert!(lane.connection.is_some());
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_read_leaves_the_users_open_transaction_alone(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "PRAGMA journal_mode=wal; CREATE TABLE t (id INTEGER); \
+             INSERT INTO t VALUES (1), (2);",
+            "mode = \"read-write\"",
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "orders")
+                .expect("Orders is in the list");
+            workspace.activate(index, cx);
+        });
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .is_some_and(|profile| matches!(profile.state, ProfileState::Connected(_)))
+            })
+        });
+
+        let run = |cx: &mut VisualTestContext, sql: &str| {
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(sql);
+            cx.simulate_keystrokes("secondary-enter");
+            settle(cx);
+        };
+        run(cx, "BEGIN");
+        run(cx, "INSERT INTO t VALUES (3)");
+        let user = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("Orders is in front");
+                (
+                    profile.in_transaction,
+                    profile.generation,
+                    matches!(profile.state, ProfileState::Connected(_)),
+                )
+            })
+        };
+        let before = user(cx);
+        assert!(before.0, "the user's transaction is open");
+
+        let count = |cx: &mut VisualTestContext| {
+            let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT count(*) FROM t");
+            answer_of(cx, &answers)
+        };
+        let seen = count(cx);
+        assert_eq!(seen.status, crate::agent::Status::Executed, "{}", seen.text);
+        assert!(
+            seen.text.contains("[\"2\"]"),
+            "only committed rows: {}",
+            seen.text
+        );
+        assert_eq!(
+            user(cx),
+            before,
+            "the agent's read moved the user's session"
+        );
+
+        run(cx, "COMMIT");
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { .. } => {}
+            QueryState::Failed(error) => panic!("the commit failed: {error}"),
+            _ => panic!("the commit never completed"),
+        });
+        assert!(!user(cx).0, "the commit closed the transaction");
+        let after = count(cx);
+        assert!(after.text.contains("[\"3\"]"), "{}", after.text);
+        quit(workspace, cx);
+    });
+}
