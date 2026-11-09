@@ -7435,9 +7435,7 @@ fn a_hide_adopted_from_another_window_ends_the_running_read(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn reads_in_a_burst_look_at_the_saved_visibility_once_and_a_later_one_sees_a_hide(
-    cx: &mut TestAppContext,
-) {
+fn a_read_after_a_hide_saved_by_another_window_is_refused_at_once(cx: &mut TestAppContext) {
     use crate::agent::Status;
 
     store::tests::with_home(|| {
@@ -7454,15 +7452,10 @@ fn reads_in_a_burst_look_at_the_saved_visibility_once_and_a_later_one_sees_a_hid
         std::fs::write(&file, text.replacen("agent_visible = true\n", "", 1))
             .expect("profiles.toml is written");
 
-        // Within the reuse window the file is not read again for a read.
+        // The file changed, so the very next read takes the hide on.
         let (_, second) = inject_read(&workspace, cx, "Orders", "SELECT 2");
-        assert_eq!(answer_of(cx, &second).status, Status::Executed);
-
-        cx.executor()
-            .advance_clock(super::agent::VISIBILITY_REUSE + std::time::Duration::from_millis(1));
-        let (_, third) = inject_read(&workspace, cx, "Orders", "SELECT 3");
-        let third = answer_of(cx, &third);
-        assert_eq!(third.status, Status::RefusedByGate, "{}", third.text);
+        let second = answer_of(cx, &second);
+        assert_eq!(second.status, Status::RefusedByGate, "{}", second.text);
         quit(workspace, cx);
     });
 }
