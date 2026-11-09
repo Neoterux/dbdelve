@@ -1518,6 +1518,9 @@ impl ConnectionConfig {
     /// tunnel's own, an external connection string, and the password when there
     /// is one. Blanks are left out. [`Self::endpoint`] is the same string for
     /// every built-in engine as `listed_endpoint`, so one call covers both.
+    ///
+    /// A Postgres profile on a service reads the service file here, so this is
+    /// asked on a background thread and never on the window's.
     pub fn identifying_text(&self) -> Vec<String> {
         let mut found = Identifying::default();
         match self {
@@ -1679,8 +1682,41 @@ impl Identifying {
             let Some((key, value)) = part.split_once('=') else {
                 continue;
             };
-            if IDENTIFYING.contains(&key.trim().to_ascii_lowercase().as_str()) {
-                self.name(value.trim().trim_matches(['{', '}']).trim());
+            let key = key.trim().to_ascii_lowercase();
+            if !IDENTIFYING.contains(&key.as_str()) {
+                continue;
+            }
+            let value = value.trim().trim_matches(['{', '}']).trim();
+            self.name(value);
+            // SQL Server spells a server `tcp:host,port`: a driver may name
+            // just the host, as it does for a seed list. A password or a user
+            // is one value, commas and all.
+            if !matches!(
+                key.as_str(),
+                "server"
+                    | "host"
+                    | "hostname"
+                    | "address"
+                    | "addr"
+                    | "network address"
+                    | "data source"
+            ) {
+                continue;
+            }
+            for piece in value.split(',') {
+                let piece = piece.trim();
+                let piece = match piece.split_once(':') {
+                    Some((protocol, host))
+                        if matches!(
+                            protocol.to_ascii_lowercase().as_str(),
+                            "tcp" | "np" | "lpc"
+                        ) =>
+                    {
+                        host
+                    }
+                    _ => piece,
+                };
+                self.name(piece);
             }
         }
     }
@@ -4082,7 +4118,7 @@ mod tests {
         let config = ConnectionConfig::External(ExternalConfig {
             plugin: crate::store::tests::odbc_plugin(),
             speaks: Engine::Generic,
-            connection: "Driver={ODBC Driver 18};Server=db.internal,1433;UID=svc;PWD={p w};\
+            connection: "Driver={ODBC Driver 18};Server=tcp:db.internal,1433;UID=svc;PWD={p w};\
                          Encrypt=yes;Database=ledger"
                 .into(),
             user: String::new(),
@@ -4091,7 +4127,14 @@ mod tests {
             ssh: None,
         });
         let found = config.identifying_text();
-        for string in ["db.internal,1433", "svc", "p w", "ledger"] {
+        for string in [
+            "tcp:db.internal,1433",
+            "db.internal",
+            "1433",
+            "svc",
+            "p w",
+            "ledger",
+        ] {
             assert!(found.iter().any(|seen| seen == string), "{string}");
         }
         for string in ["yes", "ODBC Driver 18", "Encrypt"] {
