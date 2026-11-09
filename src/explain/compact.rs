@@ -12,7 +12,9 @@
 //! does. Every server string is put on one line and written after an
 //! indentation and an `n<index>` or `| ` prefix, except the summary's two time
 //! values, which sit inside quotes on the `plan:` line with backslash and quote
-//! escaped. Everything this module writes is ASCII.
+//! escaped. Every server line is clipped at [`PLAN_LINE_CAP`] characters.
+//! Everything this module writes is ASCII; the raw lines of a plan that is a
+//! table or flat text are the server's own words, and may not be.
 #![cfg_attr(
     not(test),
     expect(
@@ -41,6 +43,12 @@ pub(crate) const NODE_CAP: usize = 24;
 // everything is slow, and the count says so without spending the reply on it.
 pub(crate) const FINDINGS_CAP: usize = 10;
 
+/// How many characters of one server line are printed.
+// ponytail: a plan line is a label, a condition or a raw line; 300 characters
+// holds every real one and stops the 20 KB `IN (...)` list a generated query
+// writes. A line that is cut says so and is not recoverable from the plan view.
+pub(crate) const PLAN_LINE_CAP: usize = 300;
+
 /// `plan` as compact text, from the `analysis` built over it. When the plan has
 /// more than `max_nodes` nodes, at most `max_nodes` are printed with their
 /// ancestors counted: the heaviest node first, its whole chain kept even when
@@ -49,12 +57,122 @@ pub(crate) const FINDINGS_CAP: usize = 10;
 /// fits. The first line says so, and each kept node that lost descendants says
 /// how many. A finding on a node that was cut is counted, not listed.
 pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> String {
+    compact_within(plan, analysis, max_nodes, usize::MAX)
+}
+
+/// [`compact`], cut between node blocks so that the text is at most `max_bytes`
+/// long before its closing line. The four header parts are always written; a
+/// plan that is [`degenerate`] prints its own lines under `tree:` instead of
+/// its one node.
+// ponytail: a finding is listed before the tree, so one on a node the byte cut
+// removes still names it; the closing line says how many nodes were cut.
+pub(crate) fn compact_within(
+    plan: &Plan,
+    analysis: &Analysis,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> String {
+    let raw = degenerate(plan).then_some(plan.text.as_str());
+    render(plan, analysis, raw, max_nodes, max_bytes)
+}
+
+/// The compact text of a plan as the `explain_query` tool replies with it:
+/// `rows` parsed the way the plan view parses them, and when that is a table or
+/// flat text instead of a tree, its raw lines. A table prints a line of
+/// `column=value` pairs per row.
+pub(crate) fn agent_plan(
+    columns: &[String],
+    rows: &[Row],
+    engine: Engine,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> String {
+    let plan = parse(columns, rows);
+    let raw = degenerate(&plan).then(|| {
+        if columns.len() > 1 {
+            tabular_text(columns, rows)
+        } else {
+            plan.text.clone()
+        }
+    });
+    let analysis = Analysis::new(&plan, engine);
+    render(&plan, &analysis, raw.as_deref(), max_nodes, max_bytes)
+}
+
+/// Whether `plan` parsed to a shell and not a tree: one node with no figures
+/// and no heading, at least one detail line, and every non-empty line of the
+/// plan's text accounted for by that node and the summary. A MongoDB document
+/// is one such node too, but its text is a whole pretty-printed JSON document
+/// and never matches.
+pub(crate) fn degenerate(plan: &Plan) -> bool {
+    let [node] = plan.nodes.as_slice() else {
+        return false;
+    };
+    let lines = plan
+        .text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    node.estimated.is_none()
+        && node.actual.is_none()
+        && node.heading.is_none()
+        && !node.detail.is_empty()
+        && lines == 1 + node.detail.len() + plan.summary.len()
+}
+
+/// A result table as lines of text: one line per row, `name=value` pairs
+/// separated by two spaces, `NULL` for a missing cell. A value holding a space,
+/// an `=`, a quote or a backslash, or nothing, is written in double quotes with
+/// backslash and quote escaped.
+pub(crate) fn tabular_text(columns: &[String], rows: &[Row]) -> String {
+    let mut text = String::new();
+    for row in rows {
+        let pairs: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(at, name)| {
+                let cell = match row.get(at) {
+                    None => "NULL".to_string(),
+                    Some(cell) => {
+                        let cell = one_line(cell);
+                        if cell.is_empty() || cell.contains([' ', '=', '"', '\\']) {
+                            format!("\"{}\"", escaped(&cell))
+                        } else {
+                            cell
+                        }
+                    }
+                };
+                format!("{}={cell}", one_line(name))
+            })
+            .collect();
+        text.push_str(&pairs.join("  "));
+        text.push('\n');
+    }
+    text
+}
+
+/// One piece of the tree that is cut whole or not at all: a node with its
+/// detail lines, a `... N nodes not shown` line, or one raw line.
+struct Block {
+    lines: Vec<String>,
+    /// How many printed nodes (or raw lines) this block is.
+    printed: usize,
+    /// How many nodes (or raw lines) are lost when it is cut.
+    weight: usize,
+}
+
+fn render(
+    plan: &Plan,
+    analysis: &Analysis,
+    raw: Option<&str>,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> String {
     let kept = kept(plan, analysis, max_nodes);
     let shown = kept.iter().filter(|kept| **kept).count();
-    let mut lines = vec![
-        truncation(plan, analysis, max_nodes, shown),
-        header(plan, analysis),
-    ];
+    // A raw plan is one node, so a node cap of 0 is the only way it is cut.
+    let raw = raw.filter(|_| shown > 0);
+    let mut lines = vec![header(plan, analysis)];
     // A finding is only as good as the node it names, and that node has to be
     // in the tree below for the line to be checked against it. One on a node
     // that was cut is counted and left out, so the list is no longer than the
@@ -86,42 +204,133 @@ pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Str
             ));
         }
     }
-    if shown == 0 {
-        lines.push("tree: none".to_string());
-    } else {
-        lines.push("tree:".to_string());
-        // The kept nodes on the path down to the node being read, each with its
-        // child indent and how many of its descendants were dropped. The first
-        // entry stands for the plan itself, whose dropped roots are counted too.
-        let mut open: Vec<(usize, usize)> = vec![(0, 0)];
-        let not_shown = |(child_depth, dropped): (usize, usize)| {
-            (dropped > 0).then(|| format!("{}... {dropped} nodes not shown", indent(child_depth)))
-        };
-        for (index, node) in plan.nodes.iter().enumerate() {
-            while open.len() > 1 && open.last().is_some_and(|(child, _)| *child > node.depth) {
-                lines.extend(open.pop().and_then(not_shown));
-            }
-            if kept[index] {
-                open.push((node.depth + 1, 0));
-                lines.push(node_line(plan, analysis, index));
-                lines.extend(detail_lines(plan, index));
-            } else if let Some((_, dropped)) = open.last_mut() {
-                *dropped += 1;
-            }
-        }
-        while let Some(entry) = open.pop() {
-            lines.extend(not_shown(entry));
+    lines.push(if shown == 0 { "tree: none" } else { "tree:" }.to_string());
+
+    let blocks = match raw {
+        Some(text) => raw_blocks(text),
+        None if shown == 0 => Vec::new(),
+        None => node_blocks(plan, analysis, &kept),
+    };
+    // What is written before the tree, with the first line at the longest it
+    // can be, so that the cut never lands the text past its budget.
+    let total: usize = blocks.iter().map(|block| block.printed).sum();
+    let widest = truncation(
+        plan,
+        analysis,
+        max_nodes,
+        total.max(shown),
+        true,
+        raw.is_some(),
+    );
+    let mut used = widest.len() + 1 + lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let mut cut = blocks.len();
+    for (at, block) in blocks.iter().enumerate() {
+        used = used.saturating_add(block.lines.iter().map(|line| line.len() + 1).sum::<usize>());
+        if used > max_bytes {
+            cut = at;
+            break;
         }
     }
-    let mut text = lines.join("\n");
+    let printed: usize = blocks[..cut].iter().map(|block| block.printed).sum();
+    let lost: usize = blocks[cut..].iter().map(|block| block.weight).sum();
+    let mut text = truncation(
+        plan,
+        analysis,
+        max_nodes,
+        printed,
+        cut < blocks.len(),
+        raw.is_some(),
+    );
     text.push('\n');
+    for line in lines
+        .iter()
+        .chain(blocks[..cut].iter().flat_map(|block| &block.lines))
+    {
+        text.push_str(line);
+        text.push('\n');
+    }
+    if cut < blocks.len() {
+        let what = if raw.is_some() { "plan lines" } else { "nodes" };
+        text.push_str(&format!(
+            "  ... {lost} more {what} not shown (reply budget)\n"
+        ));
+    }
     text
 }
 
-/// The first line: whether anything was cut and by what rule.
-fn truncation(plan: &Plan, analysis: &Analysis, max_nodes: usize, shown: usize) -> String {
+/// The tree as blocks in plan order: each kept node with its detail lines, and
+/// where a kept node or the plan itself lost descendants, a line counting them.
+fn node_blocks(plan: &Plan, analysis: &Analysis, kept: &[bool]) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    // The kept nodes on the path down to the node being read, each with its
+    // child indent and how many of its descendants were dropped. The first
+    // entry stands for the plan itself, whose dropped roots are counted too.
+    let mut open: Vec<(usize, usize)> = vec![(0, 0)];
+    let not_shown = |(child_depth, dropped): (usize, usize)| {
+        (dropped > 0).then(|| Block {
+            lines: vec![format!(
+                "{}... {dropped} nodes not shown",
+                indent(child_depth)
+            )],
+            printed: 0,
+            weight: dropped,
+        })
+    };
+    for (index, node) in plan.nodes.iter().enumerate() {
+        while open.len() > 1 && open.last().is_some_and(|(child, _)| *child > node.depth) {
+            blocks.extend(open.pop().and_then(not_shown));
+        }
+        if kept[index] {
+            open.push((node.depth + 1, 0));
+            let mut lines = vec![node_line(plan, analysis, index)];
+            lines.extend(detail_lines(plan, index));
+            blocks.push(Block {
+                lines,
+                printed: 1,
+                weight: 1,
+            });
+        } else if let Some((_, dropped)) = open.last_mut() {
+            *dropped += 1;
+        }
+    }
+    while let Some(entry) = open.pop() {
+        blocks.extend(not_shown(entry));
+    }
+    blocks
+}
+
+/// A plan's own text, one block per non-empty line, each written after `  | `
+/// like a detail line so that it cannot start a line of its own.
+fn raw_blocks(text: &str) -> Vec<Block> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Block {
+            lines: vec![format!("  | {}", one_line(line))],
+            printed: 1,
+            weight: 1,
+        })
+        .collect()
+}
+
+/// The first line: whether anything was cut and by what rule. `shown` is what
+/// was printed, `by_bytes` whether the reply budget cut the tree short, and
+/// `raw` whether the tree is a plan's own lines.
+fn truncation(
+    plan: &Plan,
+    analysis: &Analysis,
+    max_nodes: usize,
+    shown: usize,
+    by_bytes: bool,
+    raw: bool,
+) -> String {
     let nodes = plan.nodes.len();
-    if max_nodes >= nodes {
+    if raw {
+        return match by_bytes {
+            true => format!("truncated: kept {shown} of the plan's lines (reply budget)"),
+            false => "truncated: none".to_string(),
+        };
+    }
+    if max_nodes >= nodes && !by_bytes {
         return "truncated: none".to_string();
     }
     let rule = match analysis.basis {
@@ -133,7 +342,8 @@ fn truncation(plan: &Plan, analysis: &Analysis, max_nodes: usize, shown: usize) 
         ),
         Basis::Structure => format!("first {max_nodes} in plan order"),
     };
-    format!("truncated: kept {shown} of {nodes} nodes ({rule})")
+    let budget = if by_bytes { "; reply budget" } else { "" };
+    format!("truncated: kept {shown} of {nodes} nodes ({rule}{budget})")
 }
 
 /// Which nodes to print, at most `max_nodes` of them with ancestors counted: the
@@ -196,41 +406,6 @@ fn kept(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Vec<bool> {
         }
     }
     kept
-}
-
-/// How many characters of one server line are printed.
-pub(crate) const PLAN_LINE_CAP: usize = 300;
-
-fn clipped(text: &str) -> String {
-    text.to_string()
-}
-
-pub(crate) fn degenerate(_plan: &Plan) -> bool {
-    false
-}
-
-pub(crate) fn tabular_text(_columns: &[String], _rows: &[Row]) -> String {
-    String::new()
-}
-
-pub(crate) fn compact_within(
-    plan: &Plan,
-    analysis: &Analysis,
-    max_nodes: usize,
-    _max_bytes: usize,
-) -> String {
-    compact(plan, analysis, max_nodes)
-}
-
-pub(crate) fn agent_plan(
-    columns: &[String],
-    rows: &[Row],
-    engine: Engine,
-    max_nodes: usize,
-    max_bytes: usize,
-) -> String {
-    let plan = parse(columns, rows);
-    compact_within(&plan, &Analysis::new(&plan, engine), max_nodes, max_bytes)
 }
 
 /// The `plan:` line: what the numbers are, in `key=value` pairs.
@@ -417,17 +592,29 @@ fn value(text: Option<&str>) -> String {
 }
 
 /// `text` on one line: every control character, and the two Unicode line
-/// separators, becomes a space.
+/// separators, becomes a space. Cut at [`PLAN_LINE_CAP`] characters.
 fn one_line(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
+    clipped(
+        &text
+            .chars()
+            .map(|c| {
+                if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>(),
+    )
+}
+
+/// `text` cut after [`PLAN_LINE_CAP`] characters, never inside one, with a
+/// marker saying so.
+fn clipped(text: &str) -> String {
+    match text.char_indices().nth(PLAN_LINE_CAP) {
+        Some((end, _)) => format!("{} [clipped]", &text[..end]),
+        None => text.to_string(),
+    }
 }
 
 /// `text` for inside double quotes: a backslash and a double quote each get a
@@ -1114,17 +1301,16 @@ mod tests {
                 "Seq Scan on {long}  (cost=0.00..10.00 rows=10 width=4)\n  Filter: ({long})\n"
             ));
             let out = whole(&plan);
-            let kept: String = long.chars().take(PLAN_LINE_CAP).collect();
-            let detail = format!("    | Filter: ({kept}");
+            // The cap counts the whole detail text, `Filter: (` included.
+            let detail: String = format!("Filter: ({long})")
+                .chars()
+                .take(PLAN_LINE_CAP)
+                .collect();
             let line = out
                 .lines()
                 .find(|line| line.starts_with("    | Filter: ("))
                 .expect("a detail line");
-            // The detail text is cut at its cap, and the marker follows it.
-            let text = line.strip_prefix("    | ").expect("the prefix");
-            assert!(text.chars().count() <= PLAN_LINE_CAP + " [clipped]".len());
-            assert!(line.ends_with(" [clipped]"), "{filler}");
-            assert!(line.starts_with(&detail[..detail.len().min(line.len())]));
+            assert_eq!(line, format!("    | {detail} [clipped]"), "{filler}");
             let label = out
                 .lines()
                 .find(|line| line.contains(" n0 ") || line.starts_with("  n0 "));
@@ -1170,7 +1356,14 @@ mod tests {
         assert!(lines[0].starts_with(&format!("truncated: kept {} of 59 nodes", shown.len())));
 
         let (columns, rows) = read_fixture(CLICKHOUSE);
-        let out = agent_plan(&columns, &rows, Engine::ClickHouse, NODE_CAP, 450);
+        let full = agent_plan(&columns, &rows, Engine::ClickHouse, NODE_CAP, usize::MAX);
+        let out = agent_plan(
+            &columns,
+            &rows,
+            Engine::ClickHouse,
+            NODE_CAP,
+            full.len() - 10,
+        );
         let last = out.lines().last().expect("a last line");
         assert!(last.starts_with("  ... "), "{last}");
         assert!(
