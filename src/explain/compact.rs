@@ -371,7 +371,8 @@ fn number(figure: f64) -> String {
 mod tests {
     use super::super::{Actual, parse};
     use super::*;
-    use crate::db::{Engine, rows};
+    use crate::db::{CancelToken, Connection, ConnectionConfig, Engine, ExplainMode, Fetch, rows};
+    use std::path::Path;
 
     const PARALLEL: &str = include_str!("../testdata/plan-postgres-parallel.txt");
     const CTE: &str = include_str!("../testdata/plan-postgres-cte-subplan.txt");
@@ -830,5 +831,103 @@ mod tests {
             plan.nodes.len(),
             compact.len()
         );
+    }
+
+    /// One plan a compose server answers in a form the Postgres parser does not
+    /// read: which server, what is explained and how, and the fixture that holds
+    /// the answer.
+    struct Capture {
+        variable: &'static str,
+        fixture: &'static str,
+        mode: ExplainMode,
+        sql: &'static str,
+    }
+
+    /// What `Row`s are written as in a fixture: one tab-separated line per row,
+    /// `\N` for NULL, and a tab or newline inside a value as `\t` or `\n`.
+    // ponytail: a literal backslash is not escaped, so a value reading `\N` or
+    // `\t` is ambiguous. Plans carry none; escape it when a fixture does.
+    fn fixture_text(columns: &[String], rows: &[crate::db::Row]) -> String {
+        let escape = |cell: &str| cell.replace('\t', "\\t").replace('\n', "\\n");
+        let mut text = columns
+            .iter()
+            .map(|name| escape(name))
+            .collect::<Vec<_>>()
+            .join("\t");
+        text.push('\n');
+        for row in rows {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|cell| cell.map_or_else(|| "\\N".to_string(), escape))
+                .collect();
+            text.push_str(&cells.join("\t"));
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Each `Capture` is run on its compose server through `Engine::explain`,
+    /// the call the plan tool makes. With `DBDELVE_PLAN_FIXTURES_OUT` set the
+    /// answers are written there as the fixtures; without it the columns each
+    /// server answers with must be the committed fixture's header, so a server
+    /// that changes the shape of its plan fails here.
+    fn check_captures(captures: &[Capture]) {
+        let out = std::env::var("DBDELVE_PLAN_FIXTURES_OUT").ok();
+        for capture in captures {
+            let url = std::env::var(capture.variable)
+                .unwrap_or_else(|_| panic!("{} is required", capture.variable));
+            let config = ConnectionConfig::from_url(&url).expect("the URL should parse");
+            let engine = config.engine();
+            let connection = Connection::open(config).expect("connection should open");
+            let statement = engine
+                .explain(capture.mode, capture.sql)
+                .expect("the engine plans a statement");
+            let result = connection
+                .query(&statement, &CancelToken::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{statement}: {}", error.message));
+            assert!(
+                !result.rows.is_empty(),
+                "{} answered no rows",
+                capture.fixture
+            );
+            let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+            let text = fixture_text(&columns, &result.rows);
+            match &out {
+                Some(dir) => std::fs::write(Path::new(dir).join(capture.fixture), &text)
+                    .expect("the fixture writes"),
+                None => {
+                    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("src/testdata")
+                        .join(capture.fixture);
+                    let committed = std::fs::read_to_string(&path).expect("the fixture reads");
+                    let header = committed.lines().next().unwrap_or_default();
+                    assert_eq!(
+                        header,
+                        text.lines().next().unwrap_or_default(),
+                        "{} no longer has the columns the server answers with",
+                        capture.fixture
+                    );
+                }
+            }
+        }
+    }
+
+    /// The join the MySQL and MariaDB fixtures plan, over `dev/mysql/init`.
+    const MYSQL_JOIN: &str = "SELECT accounts.name, orders.number, orders.total \
+        FROM accounts JOIN orders ON orders.account_id = accounts.id \
+        WHERE orders.total > 100";
+
+    /// Captures the plans of the engines whose answer is a table or flat text
+    /// from the compose servers (`dbdelve_MYSQL_URL` and its siblings), the
+    /// fixtures 05-03's fallback and 05-09's tool are tested against.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_plan_fixtures_match_the_compose_servers() {
+        check_captures(&[Capture {
+            variable: "dbdelve_MYSQL_URL",
+            fixture: "plan-mysql-tabular.txt",
+            mode: ExplainMode::Plan,
+            sql: MYSQL_JOIN,
+        }]);
     }
 }
