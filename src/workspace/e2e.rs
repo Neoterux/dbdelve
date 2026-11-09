@@ -6001,3 +6001,49 @@ fn a_connection_that_will_not_open_answers_a_fixed_sentence(cx: &mut TestAppCont
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_read_that_outlasts_the_agent_timeout_is_stopped(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "statement_timeout = 1");
+        cx.executor().allow_parking();
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        // Real time: the connection's own timer interrupts the statement.
+        let read = |cx: &mut VisualTestContext, sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the read answered")
+        };
+
+        let started = std::time::Instant::now();
+        let runaway = read(
+            cx,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+             SELECT count(*) FROM n",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the runaway ran {:?}",
+            started.elapsed()
+        );
+        assert_eq!(runaway.status, Status::Failed, "{}", runaway.text);
+        assert!(!names_whole(&runaway.text, &database), "{}", runaway.text);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.agent.lanes.contains_key("orders"));
+        });
+
+        let fresh = read(cx, "SELECT 1");
+        assert_eq!(fresh.status, Status::Executed, "{}", fresh.text);
+        quit(workspace, cx);
+    });
+}
