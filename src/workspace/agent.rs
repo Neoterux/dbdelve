@@ -313,8 +313,14 @@ pub(crate) fn ping_prompt(name: &str) -> String {
 /// no server anything: the hold is what the engine is built to do while the
 /// profile is Read-only, not what a live role allows. The sentence about a call
 /// to a function DBDelve does not list is what `agent_gate` answers such a call
-/// in that mode, and is left out where the gate refuses it.
-pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
+/// in that mode, and is left out where the gate refuses it. `read_can_block_commits`
+/// is [`db::ConnectionConfig::agent_read_can_block_commits`], read by the caller
+/// so this stays pure.
+pub(crate) fn visibility_facts(
+    engine: Engine,
+    mode: Mode,
+    read_can_block_commits: bool,
+) -> Vec<String> {
     let mut facts = vec![
         format!("This connection's access level is {}.", mode.label()),
         engine.read_only_hold().to_string(),
@@ -332,6 +338,13 @@ pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
                 .push("Calls to functions DBDelve does not list run without approval.".to_string());
         }
     }
+    if read_can_block_commits {
+        facts.push(
+            "An agent's read in progress can make your commit on this file wait, and then fail \
+             with \"database is locked\"."
+                .to_string(),
+        );
+    }
     facts
 }
 
@@ -344,6 +357,7 @@ impl Workspace {
         let Some(profile) = self.profiles.get(index) else {
             return;
         };
+        self.agent_visibility_blocks_commits = profile.config.agent_read_can_block_commits();
         self.agent_visibility_prompt = Some(profile.id.clone());
         cx.notify();
     }
@@ -938,7 +952,7 @@ mod tests {
     fn the_dialog_states_the_engines_hold_and_that_rows_leave_the_machine() {
         for engine in Engine::ALL {
             for mode in Mode::ALL {
-                let facts = visibility_facts(engine, mode);
+                let facts = visibility_facts(engine, mode, false);
                 assert!(facts.iter().any(|fact| fact == engine.read_only_hold()));
                 assert!(
                     facts
@@ -970,7 +984,7 @@ mod tests {
                     AgentVerdict::Approve(..) => (Some(WAITS), RUNS),
                     AgentVerdict::Refuse(_) => (None, ""),
                 };
-                let facts = visibility_facts(engine, mode);
+                let facts = visibility_facts(engine, mode, false);
                 let count = |sentence: &str| facts.iter().filter(|fact| *fact == sentence).count();
                 match stated {
                     Some(stated) => {
@@ -983,6 +997,26 @@ mod tests {
                             0,
                             "{engine:?} {mode:?}: {facts:?}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_dialog_states_the_commit_wait_only_when_a_read_can_block_it() {
+        const WAIT: &str = "An agent's read in progress can make your commit on this file wait, \
+                            and then fail with \"database is locked\".";
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                let count = |facts: &[String]| facts.iter().filter(|fact| *fact == WAIT).count();
+                let blocked = visibility_facts(engine, mode, true);
+                assert_eq!(count(&blocked), 1, "{engine:?} {mode:?}: {blocked:?}");
+                let free = visibility_facts(engine, mode, false);
+                assert_eq!(count(&free), 0, "{engine:?} {mode:?}: {free:?}");
+                for fact in blocked.iter().chain(&free) {
+                    for word in ["yet", "Phase", "MCP", "try", "should", "upgrade"] {
+                        assert!(!fact.contains(word), "{engine:?} {mode:?}: {fact}");
                     }
                 }
             }

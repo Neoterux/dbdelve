@@ -3374,6 +3374,36 @@ fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mu
 }
 
 #[gpui::test]
+fn the_visibility_dialog_names_the_commit_wait_only_for_a_rollback_journal_file(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        let blocks = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            run_command(workspace, cx, Command::ShowToAgents(0));
+            let blocks =
+                workspace.read_with(cx, |workspace, _| workspace.agent_visibility_blocks_commits);
+            workspace.update(cx, |workspace, _| workspace.agent_visibility_prompt = None);
+            blocks
+        };
+
+        rusqlite::Connection::open(&database)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
+            .expect("the schema must apply");
+        assert!(blocks(&workspace, cx));
+
+        rusqlite::Connection::open(&database)
+            .and_then(|connection| connection.execute_batch("PRAGMA journal_mode = WAL;"))
+            .expect("the journal mode must change");
+        assert!(!blocks(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn hiding_a_profile_takes_one_action_and_no_dialog(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) =
