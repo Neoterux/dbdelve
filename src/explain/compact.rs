@@ -26,8 +26,9 @@ use std::cmp::Ordering;
 use super::{
     Plan, PlanNode, WASTEFUL_MIN_REMOVED,
     analysis::{Analysis, Basis, Direction, Finding, percent_text},
-    wasteful,
+    parse, wasteful,
 };
+use crate::db::{Engine, Row};
 
 /// How many nodes a plan prints, ancestors counted.
 // ponytail: provisional. Plan 05-10 sets it from the D-18 token measurement of
@@ -195,6 +196,41 @@ fn kept(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> Vec<bool> {
         }
     }
     kept
+}
+
+/// How many characters of one server line are printed.
+pub(crate) const PLAN_LINE_CAP: usize = 300;
+
+fn clipped(text: &str) -> String {
+    text.to_string()
+}
+
+pub(crate) fn degenerate(_plan: &Plan) -> bool {
+    false
+}
+
+pub(crate) fn tabular_text(_columns: &[String], _rows: &[Row]) -> String {
+    String::new()
+}
+
+pub(crate) fn compact_within(
+    plan: &Plan,
+    analysis: &Analysis,
+    max_nodes: usize,
+    _max_bytes: usize,
+) -> String {
+    compact(plan, analysis, max_nodes)
+}
+
+pub(crate) fn agent_plan(
+    columns: &[String],
+    rows: &[Row],
+    engine: Engine,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> String {
+    let plan = parse(columns, rows);
+    compact_within(&plan, &Analysis::new(&plan, engine), max_nodes, max_bytes)
 }
 
 /// The `plan:` line: what the numbers are, in `key=value` pairs.
@@ -947,6 +983,201 @@ mod tests {
             out,
             include_str!("../testdata/plan-postgres-large.capped.compact.txt")
         );
+    }
+
+    /// A fixture file as the columns and rows the server answered with.
+    fn read_fixture(text: &str) -> (Vec<String>, Vec<Row>) {
+        let unescape = |cell: &str| cell.replace("\\t", "\t").replace("\\n", "\n");
+        let mut lines = text.lines();
+        let columns = lines
+            .next()
+            .expect("a header line")
+            .split('\t')
+            .map(unescape)
+            .collect();
+        let rows = lines
+            .map(|line| {
+                Row::new(
+                    line.split('\t')
+                        .map(|cell| (cell != "\\N").then(|| unescape(cell))),
+                )
+                .expect("the row fits")
+            })
+            .collect();
+        (columns, rows)
+    }
+
+    const MYSQL: &str = include_str!("../testdata/plan-mysql-tabular.txt");
+    const MARIADB: &str = include_str!("../testdata/plan-mariadb-tabular.txt");
+    const MARIADB_ANALYZE: &str = include_str!("../testdata/plan-mariadb-analyze.txt");
+    const CLICKHOUSE: &str = include_str!("../testdata/plan-clickhouse.txt");
+
+    #[test]
+    fn a_tabular_or_flat_plan_prints_its_raw_lines_under_the_tree() {
+        for (fixture, engine, golden) in [
+            (
+                MYSQL,
+                Engine::MySql,
+                include_str!("../testdata/plan-mysql-tabular.compact.txt"),
+            ),
+            (
+                MARIADB,
+                Engine::MariaDb,
+                include_str!("../testdata/plan-mariadb-tabular.compact.txt"),
+            ),
+            (
+                MARIADB_ANALYZE,
+                Engine::MariaDb,
+                include_str!("../testdata/plan-mariadb-analyze.compact.txt"),
+            ),
+            (
+                CLICKHOUSE,
+                Engine::ClickHouse,
+                include_str!("../testdata/plan-clickhouse.compact.txt"),
+            ),
+        ] {
+            let (columns, rows) = read_fixture(fixture);
+            assert!(degenerate(&parse(&columns, &rows)), "{engine:?}");
+            let out = agent_plan(&columns, &rows, engine, NODE_CAP, usize::MAX);
+            assert_eq!(out, golden);
+            let tree: Vec<&str> = out
+                .lines()
+                .skip_while(|line| *line != "tree:")
+                .skip(1)
+                .collect();
+            assert!(!tree.is_empty());
+            assert!(
+                tree.iter().all(|line| line.starts_with("  | ")),
+                "{engine:?}"
+            );
+            if columns.len() > 1 {
+                assert_eq!(tree.len(), rows.len());
+                assert!(
+                    tree.iter()
+                        .all(|line| line.starts_with("  | id=") && line.contains("  select_type="))
+                );
+                assert!(tree.iter().all(|line| line.contains("  table=")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_tabular_row_is_written_as_name_value_pairs() {
+        let columns = ["a", "b", "c", "d"].map(String::from);
+        let rows =
+            [Row::new([Some("x y"), None, Some(""), Some("p=\"q\\")]).expect("the row fits")];
+        assert_eq!(
+            tabular_text(&columns, &rows),
+            "a=\"x y\"  b=NULL  c=\"\"  d=\"p=\\\"q\\\\\"\n"
+        );
+    }
+
+    #[test]
+    fn a_drawn_plan_is_never_read_as_flat() {
+        for text in [PARALLEL, CTE, SPILL, LARGE] {
+            assert!(!degenerate(&one_column(text)));
+        }
+        let sqlite = parse(
+            &["id", "parent", "notused", "detail"].map(String::from),
+            &rows(vec![vec![
+                Some("3".into()),
+                Some("0".into()),
+                Some("0".into()),
+                Some("SCAN accounts".into()),
+            ]]),
+        );
+        assert!(!degenerate(&sqlite));
+        // One stage, one detail line and no figures: the shape of a flat plan,
+        // told apart only by its text being a whole document.
+        let reply: mongodb::bson::Document = serde_json::from_str(
+            r#"{"queryPlanner":{"winningPlan":{"stage":"COLLSCAN","direction":"forward"}},"ok":1}"#,
+        )
+        .expect("the reply parses");
+        let columns: Vec<String> = reply.keys().cloned().collect();
+        let row = Row::new(
+            reply
+                .values()
+                .map(|value| serde_json::to_string(value).ok()),
+        )
+        .expect("the row fits");
+        let mongo = parse(&columns, &[row]);
+        assert_eq!(mongo.nodes.len(), 1);
+        assert!(!mongo.nodes[0].detail.is_empty());
+        assert!(!degenerate(&mongo));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_cap_is_clipped_with_a_marker() {
+        for filler in ["x", "\u{e9}", "\u{1d11e}"] {
+            let long = filler.repeat(20_000);
+            let plan = one_column(&format!(
+                "Seq Scan on {long}  (cost=0.00..10.00 rows=10 width=4)\n  Filter: ({long})\n"
+            ));
+            let out = whole(&plan);
+            let kept: String = long.chars().take(PLAN_LINE_CAP).collect();
+            let detail = format!("    | Filter: ({kept}");
+            let line = out
+                .lines()
+                .find(|line| line.starts_with("    | Filter: ("))
+                .expect("a detail line");
+            // The detail text is cut at its cap, and the marker follows it.
+            let text = line.strip_prefix("    | ").expect("the prefix");
+            assert!(text.chars().count() <= PLAN_LINE_CAP + " [clipped]".len());
+            assert!(line.ends_with(" [clipped]"), "{filler}");
+            assert!(line.starts_with(&detail[..detail.len().min(line.len())]));
+            let label = out
+                .lines()
+                .find(|line| line.contains(" n0 ") || line.starts_with("  n0 "));
+            let label = label.expect("a node line");
+            assert!(label.contains(" [clipped]"));
+            assert!(label.chars().count() < 2 * PLAN_LINE_CAP);
+        }
+    }
+
+    #[test]
+    fn a_plan_past_the_byte_budget_is_cut_between_nodes() {
+        let columns = ["QUERY PLAN".to_string()];
+        let rows = rows(vec![vec![Some(LARGE.to_string())]]);
+        let full = agent_plan(&columns, &rows, Engine::Postgres, 59, usize::MAX);
+        let out = agent_plan(&columns, &rows, Engine::Postgres, 59, 4_000);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("truncated: kept "));
+        assert!(lines[0].ends_with("; reply budget)"), "{}", lines[0]);
+        assert!(lines[1].starts_with("plan: "));
+        assert!(lines[2].starts_with("findings:"));
+        let last = lines.last().expect("a last line");
+        let more = last
+            .strip_prefix("  ... ")
+            .and_then(|rest| rest.strip_suffix(" more nodes not shown (reply budget)"))
+            .and_then(|count| count.parse::<usize>().ok())
+            .expect("a closing line");
+        assert!(out.len() <= 4_000 + last.len() + 1);
+
+        let tree_of = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|line| *line != "tree:")
+                .skip(1)
+                .map(str::to_string)
+                .collect()
+        };
+        let (cut, whole_tree) = (tree_of(&out), tree_of(&full));
+        let printed = &cut[..cut.len() - 1];
+        assert_eq!(printed, &whole_tree[..printed.len()]);
+        // The cut falls before a node, never between a node and its detail.
+        assert!(!whole_tree[printed.len()].trim_start().starts_with('|'));
+        let (shown, _) = printed_and_counted(&out);
+        assert_eq!(shown.len() + more, 59);
+        assert!(lines[0].starts_with(&format!("truncated: kept {} of 59 nodes", shown.len())));
+
+        let (columns, rows) = read_fixture(CLICKHOUSE);
+        let out = agent_plan(&columns, &rows, Engine::ClickHouse, NODE_CAP, 450);
+        let last = out.lines().last().expect("a last line");
+        assert!(last.starts_with("  ... "), "{last}");
+        assert!(
+            last.ends_with(" more plan lines not shown (reply budget)"),
+            "{last}"
+        );
+        assert!(out.lines().skip_while(|l| *l != "tree:").skip(1).count() > 1);
     }
 
     #[test]
