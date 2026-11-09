@@ -16,7 +16,7 @@
 //! the server receives.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::mpsc::SyncSender,
     time::{Duration, Instant},
 };
@@ -337,7 +337,7 @@ enum Ran {
     Done {
         connection: Connection,
         hidden: Vec<String>,
-        result: Result<QueryResult, DbError>,
+        result: Result<Shaped, DbError>,
     },
     /// A catalog call came back: `None` is a name the catalog does not hold.
     Listed {
@@ -367,6 +367,15 @@ impl Ran {
     }
 }
 
+/// What a statement's result became for the agent, written on the thread that
+/// ran the statement: a result can hold one very large cell, and copying it
+/// into text is not work for the thread that draws the window.
+struct Shaped {
+    text: String,
+    /// How many rows went back and how many there were.
+    rows: (usize, Total),
+}
+
 /// A catalog reply and how many rows it lists.
 struct Listing {
     text: String,
@@ -376,13 +385,27 @@ struct Listing {
 /// One result set as the agent reads it. A Postgres spatial cell is rendered
 /// first, as an export renders it, so hex EWKB never spends the agent's tokens.
 fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
-    let mut shown = result.rows.clone();
-    for (row, column, _, value) in db::render(db::unrendered(engine, result)) {
-        shown[row].replace(&[(column, Some(value.as_str()))]);
-    }
-    let rows: Vec<Vec<Option<String>>> = shown
+    // Only the cells that wait on their type are copied out and replaced; the
+    // rest are read where they stand.
+    let rendered: HashMap<(usize, usize), String> = db::render(db::unrendered(engine, result))
+        .into_iter()
+        .map(|(row, column, _, value)| ((row, column), value))
+        .collect();
+    let rows: Vec<Vec<Option<String>>> = result
+        .rows
         .iter()
-        .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
+        .enumerate()
+        .map(|(at, row)| {
+            row.iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    rendered
+                        .get(&(at, column))
+                        .cloned()
+                        .or_else(|| cell.map(str::to_string))
+                })
+                .collect()
+        })
         .collect();
     // A statement stopped at the limit has no known count: the server was not
     // asked for the rest.
@@ -403,6 +426,25 @@ fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
             .collect(),
         rows,
         total,
+    }
+}
+
+/// A statement's rows as the agent reads them.
+fn shaped(engine: Engine, result: &QueryResult) -> Shaped {
+    let table = table_of(engine, result);
+    let rows = (table.rows.len(), table.total);
+    Shaped {
+        text: result::text(&[table], result.rest.len(), None),
+        rows,
+    }
+}
+
+/// A plan as the agent reads it.
+fn shaped_plan(engine: Engine, result: &QueryResult) -> Shaped {
+    let (_, text) = plan_reply(engine, result);
+    Shaped {
+        text,
+        rows: (result.rows.len(), Total::Exact(result.rows.len())),
     }
 }
 
@@ -625,7 +667,7 @@ impl Workspace {
                 // The window may have closed meanwhile, and then nobody is
                 // left to answer.
                 let _ = workspace.update(cx, |workspace, cx| {
-                    workspace.land_agent_read(id, &profile_id, engine, ran, cx);
+                    workspace.land_agent_read(id, &profile_id, ran, cx);
                 });
             }
         });
@@ -678,14 +720,7 @@ impl Workspace {
     /// Take what a read came back with: keep its connection and answer. A read
     /// whose call ended meanwhile finds nothing running under its id, and what
     /// it came back with is dropped.
-    fn land_agent_read(
-        &mut self,
-        id: CallId,
-        profile_id: &str,
-        engine: Engine,
-        ran: Ran,
-        cx: &mut Context<Self>,
-    ) {
+    fn land_agent_read(&mut self, id: CallId, profile_id: &str, ran: Ran, cx: &mut Context<Self>) {
         let Some(lane) = self.agent.lanes.get_mut(profile_id) else {
             return;
         };
@@ -700,7 +735,6 @@ impl Workspace {
             Some(Tool::DescribeTable) => NOT_IN_CATALOG,
             _ => NO_SUCH_SCHEMA,
         };
-        let explaining = tool == Some(Tool::ExplainQuery);
         let (status, text) = match ran {
             Ran::NotOpened(error) => {
                 lane.connection = None;
@@ -710,7 +744,7 @@ impl Workspace {
             Ran::Done {
                 connection,
                 hidden,
-                result: Ok(result),
+                result: Ok(Shaped { text, rows }),
             } => {
                 // A DuckDB connection is let go here, so the next call opens
                 // afresh and sees what the user has committed since.
@@ -718,17 +752,8 @@ impl Workspace {
                     lane.connection = Some(connection);
                     lane.hidden = hidden;
                 }
-                if explaining {
-                    ended.rows = Some((result.rows.len(), Total::Exact(result.rows.len())));
-                    plan_reply(engine, &result)
-                } else {
-                    let table = table_of(engine, &result);
-                    ended.rows = Some((table.rows.len(), table.total));
-                    (
-                        Status::Executed,
-                        result::text(&[table], result.rest.len(), None),
-                    )
-                }
+                ended.rows = Some(rows);
+                (Status::Executed, text)
             }
             Ran::Listed {
                 connection,
@@ -956,7 +981,9 @@ fn run_work(
             schema.as_deref(),
             engine.agent_catalog_note(),
         ),
-        AgentWork::Explain { statement } => explain_on(connection, hidden, &statement, cancel),
+        AgentWork::Explain { statement } => {
+            explain_on(connection, hidden, &statement, cancel, engine)
+        }
         AgentWork::Structure { schema, table } => describe_on(
             connection,
             hidden,
@@ -988,7 +1015,7 @@ fn read_on(
     Ran::Done {
         connection,
         hidden,
-        result,
+        result: result.map(|result| shaped(engine, &result)),
     }
 }
 
@@ -1000,6 +1027,7 @@ fn explain_on(
     hidden: Vec<String>,
     statement: &str,
     cancel: &CancelToken,
+    engine: Engine,
 ) -> Ran {
     let result = connection.query(
         statement,
@@ -1012,7 +1040,7 @@ fn explain_on(
     Ran::Done {
         connection,
         hidden,
-        result,
+        result: result.map(|result| shaped_plan(engine, &result)),
     }
 }
 
@@ -1623,13 +1651,16 @@ mod tests {
             Mode::ReadOnly,
         )
         .expect("an analyzed read runs");
-        let Ran::Done { result, .. } =
-            explain_on(connection, Vec::new(), &statement, &CancelToken::default())
-        else {
+        let Ran::Done { result, .. } = explain_on(
+            connection,
+            Vec::new(),
+            &statement,
+            &CancelToken::default(),
+            Engine::Postgres,
+        ) else {
             panic!("the plan was not drained");
         };
-        let (status, text) = plan_reply(Engine::Postgres, &result.expect("the server plans it"));
-        assert_eq!(status, Status::Executed);
+        let text = result.expect("the server plans it").text;
         assert!(text.contains("analyzed=yes"), "{text}");
         assert!(text.contains("findings"), "{text}");
     }
@@ -2016,5 +2047,42 @@ mod tests {
         // Another engine's cells are not read as EWKB.
         let other = table_of(Engine::MySql, &result);
         assert_eq!(other.rows[0][0].as_deref(), Some(point));
+    }
+
+    #[test]
+    fn the_reply_is_written_where_the_statement_ran_with_a_wide_cell_clipped() {
+        let dir = std::env::temp_dir().join(format!("dbdelve-agent-shaped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the directory is made");
+        let path = dir.join("shaped.db");
+        let _ = std::fs::remove_file(&path);
+        rusqlite::Connection::open(&path).expect("the file is made");
+        let connection = Connection::open_for_agent(ConnectionConfig::Sqlite {
+            path: path.to_string_lossy().into_owned(),
+            statement_timeout: 0,
+        })
+        .expect("the agent opens the file");
+        let ran = read_on(
+            connection,
+            Vec::new(),
+            "SELECT replace(hex(zeroblob(3000)), '0', 'x') AS wide",
+            &CancelToken::default(),
+            Engine::Sqlite,
+        );
+        let Ran::Done { result, .. } = ran else {
+            panic!("the statement ran");
+        };
+        let shaped = result.expect("the statement answered");
+        // The text the window sends is already final: the header says a cell
+        // was clipped and from how long.
+        assert!(
+            shaped
+                .text
+                .starts_with("truncated: 1 of 1 rows shown (clipped cells)"),
+            "{}",
+            &shaped.text[..80]
+        );
+        assert!(shaped.text.contains("[clipped from 6000 characters]"));
+        assert_eq!(shaped.rows, (1, Total::Exact(1)));
+        std::fs::remove_dir_all(&dir).expect("the directory goes");
     }
 }
