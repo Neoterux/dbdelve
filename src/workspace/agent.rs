@@ -41,7 +41,7 @@ pub(crate) struct AgentState {
     /// save has written yet. Every other profile's flag is the file's: see
     /// [`Workspace::adopt_saved_visibility`].
     pub(crate) visibility_choices: HashSet<String>,
-    /// The calls that have ended, newest first, at most [`LOG_CAP`].
+    /// The calls that have ended, newest first, at most [`AUDIT_CAP`].
     pub(crate) log: VecDeque<LogEntry>,
     /// The agent's own connections, by profile id: never the user's.
     pub(crate) lanes: HashMap<String, agent_read::Lane>,
@@ -50,10 +50,11 @@ pub(crate) struct AgentState {
     pub(crate) opener: Option<agent_read::Opener>,
 }
 
-// ponytail: the log is this session's own and keeps the last twenty calls,
-// because it is read by clicking the mark and a longer list is not read.
-// Phase 5 (READ-10, APPR-12) turns it into the audit, which is kept.
-pub(crate) const LOG_CAP: usize = 20;
+// ponytail: the audit is this session's own and keeps the last five hundred
+// calls, in memory only, because it is read in a dialog and a longer list is
+// not read. Phase 6's persisted record of approvals (APPR-12) is the upgrade:
+// it is what outlives the window.
+pub(crate) const AUDIT_CAP: usize = 500;
 
 /// How many characters of an agent's own statement an audit entry keeps.
 const AUDIT_SQL_CAP: usize = 4096;
@@ -173,7 +174,7 @@ impl AgentState {
             elapsed_ms: facts.elapsed_ms,
             error: facts.error,
         });
-        self.log.truncate(LOG_CAP);
+        self.log.truncate(AUDIT_CAP);
     }
 }
 
