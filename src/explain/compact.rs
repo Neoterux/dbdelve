@@ -29,6 +29,12 @@ use super::{
     wasteful,
 };
 
+/// How many nodes a plan prints, ancestors counted.
+pub(crate) const NODE_CAP: usize = 24;
+
+/// How many findings are listed before the rest are counted.
+pub(crate) const FINDINGS_CAP: usize = 10;
+
 /// `plan` as compact text, from the `analysis` built over it. When the plan has
 /// more than `max_nodes` nodes, the `max_nodes` heaviest are kept with every
 /// ancestor of each, so the shape of the tree survives and the heaviest node is
@@ -689,31 +695,47 @@ mod tests {
         let out = compact(&plan, &analysis, 8);
         let nodes = plan.nodes.len();
 
-        // The expectation is worked out here the long way: the heaviest eight,
-        // then each one's parent, and its parent's, up to a root.
-        let mut ranked: Vec<usize> = (0..nodes).collect();
+        // The expectation is worked out here the long way: the heaviest node and
+        // its whole chain, then the nodes of the first findings, then the rest by
+        // value, each with the ancestors it lacks, while the total stays within 8.
         let value = |index: usize| analysis.nodes[index].value.unwrap_or(f64::MIN);
-        ranked.sort_by(|a, b| value(*b).total_cmp(&value(*a)).then(a.cmp(b)));
+        let mut by_value: Vec<usize> = (0..nodes).collect();
+        by_value.sort_by(|a, b| value(*b).total_cmp(&value(*a)).then(a.cmp(b)));
+        let mut order = vec![by_value[0]];
+        for finding in analysis.findings.iter().take(FINDINGS_CAP) {
+            order.push(node_of(*finding));
+        }
+        order.extend(by_value.iter().copied());
         let mut expected = vec![false; nodes];
-        for &selected in &ranked[..8] {
+        for selected in order {
+            let mut chain = Vec::new();
             let mut at = Some(selected);
             while let Some(index) = at {
-                expected[index] = true;
+                if expected[index] {
+                    break;
+                }
+                chain.push(index);
                 at = (0..index)
                     .rev()
                     .find(|above| plan.nodes[*above].depth < plan.nodes[index].depth);
+            }
+            let have = expected.iter().filter(|kept| **kept).count();
+            if have == 0 || have + chain.len() <= 8 {
+                for index in chain {
+                    expected[index] = true;
+                }
             }
         }
         let tree: Vec<&str> = out.lines().skip_while(|line| *line != "tree:").collect();
         let shown: Vec<usize> = tree.iter().filter_map(|line| node_index(line)).collect();
         let want: Vec<usize> = (0..nodes).filter(|index| expected[*index]).collect();
         assert_eq!(shown, want);
-        assert!(shown.len() > 8 && shown.len() < nodes);
+        assert!(shown.len() <= 8 && shown.len() < nodes);
         assert_eq!(
             out.lines().next(),
             Some(
                 format!(
-                    "truncated: kept {} of {nodes} nodes (top 8 by self time, with their ancestors)",
+                    "truncated: kept {} of {nodes} nodes (heaviest first, then findings, then by self time; at most 8 with ancestors)",
                     shown.len()
                 )
                 .as_str()
@@ -757,7 +779,9 @@ mod tests {
         let out = compact(&tied, &Analysis::new(&tied, Engine::Postgres), 2);
         assert_eq!(
             out.lines().next(),
-            Some("truncated: kept 2 of 3 nodes (top 2 by self time, with their ancestors)")
+            Some(
+                "truncated: kept 2 of 3 nodes (heaviest first, then findings, then by self time; at most 2 with ancestors)"
+            )
         );
         assert!(out.contains("n0 first") && out.contains("n1 second") && !out.contains("third"));
         assert!(out.ends_with("  ... 1 nodes not shown\n"));
@@ -772,6 +796,115 @@ mod tests {
         assert_eq!(
             out,
             include_str!("../testdata/plan-postgres-large.compact.txt")
+        );
+    }
+
+    /// The printed node indexes and the count the `... N nodes not shown` lines
+    /// add up to, of a compact plan.
+    fn printed_and_counted(out: &str) -> (Vec<usize>, usize) {
+        let tree = block(out, "tree:");
+        let counted = tree
+            .iter()
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix("... ")?
+                    .strip_suffix(" nodes not shown")?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .sum();
+        (
+            tree.iter().filter_map(|line| node_index(line)).collect(),
+            counted,
+        )
+    }
+
+    #[test]
+    fn the_node_cap_counts_ancestors_and_keeps_the_heaviest_chain() {
+        let plan = one_column(LARGE);
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let nodes = plan.nodes.len();
+        assert_eq!(nodes, 59);
+        let value = |index: usize| analysis.nodes[index].value.unwrap_or(f64::MIN);
+        let heaviest = (0..nodes).fold(0, |best, index| {
+            if value(index) > value(best) {
+                index
+            } else {
+                best
+            }
+        });
+        let chain = plan.nodes[heaviest].depth + 1;
+        for cap in 1..=nodes {
+            let out = compact(&plan, &analysis, cap);
+            let (shown, counted) = printed_and_counted(&out);
+            assert!(
+                shown.len() <= cap.max(chain),
+                "cap {cap} printed {}",
+                shown.len()
+            );
+            assert!(shown.contains(&heaviest), "cap {cap}");
+            for line in block(&out, "findings:") {
+                if let Some(index) = node_index(line) {
+                    assert!(shown.contains(&index), "cap {cap}: {line}");
+                }
+            }
+            assert_eq!(shown.len() + counted, nodes, "cap {cap}");
+        }
+        let (shown, _) = printed_and_counted(&compact(&plan, &analysis, 8));
+        assert!(shown.len() <= 8, "it printed 38 before: {}", shown.len());
+    }
+
+    #[test]
+    fn a_chain_deeper_than_the_cap_is_kept_whole() {
+        // Five nested loops, the innermost the only one that does any work.
+        let mut text = String::new();
+        for level in 0..5 {
+            let total = 50.0 - 0.1 * f64::from(level);
+            let pad = " ".repeat(4 * level as usize);
+            let arrow = if level == 0 { "" } else { "  ->  " };
+            text.push_str(&format!(
+                "{pad}{arrow}Nested Loop  (cost=0.00..100.00 rows=1 width=4) (actual time=0.010..{total:.3} rows=1 loops=1)\n"
+            ));
+        }
+        let plan = one_column(&text);
+        assert_eq!(plan.nodes.len(), 5);
+        assert_eq!(plan.nodes[4].depth, 4);
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        let (shown, counted) = printed_and_counted(&compact(&plan, &analysis, 2));
+        assert_eq!(shown, [0, 1, 2, 3, 4]);
+        assert_eq!(counted, 0);
+    }
+
+    #[test]
+    fn findings_are_listed_up_to_their_cap() {
+        let mut text = "Append  (cost=0.00..15.00 rows=15000 width=4) (actual time=0.010..15.000 rows=15000 loops=1)\n".to_string();
+        for leaf in 0..15 {
+            text.push_str(&format!(
+                "  ->  Seq Scan on t{leaf}  (cost=0.00..1.00 rows=1 width=4) (actual time=0.010..1.000 rows=1000 loops=1)\n"
+            ));
+        }
+        let plan = one_column(&text);
+        let analysis = Analysis::new(&plan, Engine::Postgres);
+        assert_eq!(analysis.findings.len(), 15);
+        let out = compact(&plan, &analysis, usize::MAX);
+        let findings = block(&out, "findings:");
+        assert_eq!(findings.len(), FINDINGS_CAP + 1);
+        assert_eq!(
+            findings.last(),
+            Some(&"  ... 5 more findings past the first 10")
+        );
+    }
+
+    #[test]
+    fn the_large_fixture_at_the_node_cap_is_pinned() {
+        let plan = one_column(LARGE);
+        let out = compact(&plan, &Analysis::new(&plan, Engine::Postgres), NODE_CAP);
+        // Plan 05-10 measures the tokens of this text and sets `NODE_CAP` from it;
+        // a change to this number means that measurement is stale.
+        assert_eq!(out.len(), 0);
+        assert_eq!(
+            out,
+            include_str!("../testdata/plan-postgres-large.capped.compact.txt")
         );
     }
 
