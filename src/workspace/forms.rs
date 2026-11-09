@@ -1602,9 +1602,7 @@ impl Workspace {
                         .child(super::agent_log_label(entry, now)),
                 ];
                 if let Some(verdict) = &entry.verdict {
-                    lines.push(div().text_color(t.text_muted).child(match verdict {
-                        agent::AuditVerdict::Run => "Ran".to_string(),
-                    }));
+                    lines.push(div().text_color(t.text_muted).child(verdict.line()));
                 }
                 if let (Some(shown), Some(total)) = (entry.shown, entry.total) {
                     let of = match total {

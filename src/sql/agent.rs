@@ -74,10 +74,6 @@
 //! The mode stays the ceiling: `Run` and `Approve` both imply that `gate` with
 //! the same mode and no silenced kind lets the statement through, and the
 //! corpus in `sql_snapshots::agent` holds that over every cell.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-)]
 
 use std::fmt;
 

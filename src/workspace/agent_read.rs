@@ -312,8 +312,14 @@ impl Workspace {
                 None,
                 None,
                 &reply,
-                Status::RefusedByGate,
-                super::agent::AgentLookup::NotAvailable.to_string(),
+                Reply {
+                    status: Status::RefusedByGate,
+                    text: super::agent::AgentLookup::NotAvailable.to_string(),
+                },
+                CallFacts {
+                    elapsed_ms: elapsed_ms(arrived),
+                    ..CallFacts::default()
+                },
             );
             return;
         };
