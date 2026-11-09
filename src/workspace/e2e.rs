@@ -7435,6 +7435,39 @@ fn a_hide_adopted_from_another_window_ends_the_running_read(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn reads_in_a_burst_look_at_the_saved_visibility_once_and_a_later_one_sees_a_hide(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (_, first) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        assert_eq!(answer_of(cx, &first).status, Status::Executed);
+
+        // Another window hides Orders: only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        std::fs::write(&file, text.replacen("agent_visible = true\n", "", 1))
+            .expect("profiles.toml is written");
+
+        // Within the reuse window the file is not read again for a read.
+        let (_, second) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        assert_eq!(answer_of(cx, &second).status, Status::Executed);
+
+        cx.executor()
+            .advance_clock(super::agent::VISIBILITY_REUSE + std::time::Duration::from_millis(1));
+        let (_, third) = inject_read(&workspace, cx, "Orders", "SELECT 3");
+        let third = answer_of(cx, &third);
+        assert_eq!(third.status, Status::RefusedByGate, "{}", third.text);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_kill_switch_ends_every_running_read(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
 
