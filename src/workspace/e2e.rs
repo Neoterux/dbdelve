@@ -5914,3 +5914,90 @@ fn an_empty_statement_is_refused_without_opening_a_connection(cx: &mut TestAppCo
         quit(workspace, cx);
     });
 }
+
+/// Whether `text` holds `name` with a character outside a name on each side.
+fn names_whole(text: &str, name: &str) -> bool {
+    let in_a_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(in_a_name)
+            && !text[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(in_a_name)
+    })
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_failed_statement_answers_the_servers_words_without_the_path(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let socket = crate::agent::socket_path().expect("the test home gives a socket path");
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        let ask = |cx: &mut VisualTestContext, sql: String| {
+            let shim = crate::agent::shim::testing::call_through_the_shim(
+                socket.clone(),
+                "execute_sql",
+                serde_json::json!({ "connection": "Orders", "sql": sql }),
+            );
+            drive_until(cx, |_| shim.is_finished());
+            let result = shim.join().expect("the shim's thread ends");
+            result["content"][0]["text"]
+                .as_str()
+                .expect("a result carries text")
+                .to_string()
+        };
+
+        // The agent names the database file itself, so the server's message
+        // repeats it.
+        let failed = ask(cx, format!("SELECT * FROM \"{database}\""));
+        assert!(failed.starts_with("status: failed"), "{failed}");
+        assert!(failed.contains("no such table"), "{failed}");
+        assert!(failed.contains("[hidden]"), "{failed}");
+        assert!(!names_whole(&failed, &database), "{failed}");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.agent.lanes.contains_key("orders"));
+        });
+
+        let fresh = ask(cx, "SELECT 1".to_string());
+        assert!(fresh.starts_with("status: executed"), "{fresh}");
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_connection_that_will_not_open_answers_a_fixed_sentence(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        // A directory where the database file was: nothing can open it.
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        std::fs::remove_file(&database).expect("the database file is there");
+        std::fs::create_dir(&database).expect("a directory takes its place");
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        let mut reply = None;
+        drive_until(cx, |_| {
+            reply = reply.take().or_else(|| answers.try_recv().ok());
+            reply.is_some()
+        });
+        let reply = reply.expect("the call answered");
+        assert_eq!(reply.status, Status::Failed);
+        assert_eq!(reply.text, super::agent_read::OPEN_FAILED);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty());
+        });
+        quit(workspace, cx);
+    });
+}
