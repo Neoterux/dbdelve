@@ -22,7 +22,10 @@ use super::agent::{AuditVerdict, CallFacts, elapsed_ms};
 use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
-    db::{CancelToken, Connection, ConnectionConfig, DbError, Fetch, QueryResult},
+    db::{
+        CancelToken, Catalog, Connection, ConnectionConfig, DbError, Fetch, QueryResult,
+        RelationKind,
+    },
 };
 
 // ponytail: an agent is told the first hundred rows, and the tool takes no
@@ -197,8 +200,9 @@ pub(crate) struct Running {
     tool: Tool,
     profile_name: String,
     reply: SyncSender<Reply>,
-    /// The statement as the agent sent it, for the audit.
-    sql: String,
+    /// The statement as the agent sent it, for the audit. A catalog call has
+    /// none.
+    sql: Option<String>,
     /// When the call reached the window, for the audit's elapsed time.
     arrived: Instant,
     /// What stops the statement on the server when the call ends early.
@@ -224,8 +228,37 @@ pub(crate) struct Waiting {
 
 /// What a waiting call will do once its lane is free.
 pub(crate) enum AgentWork {
-    Query { sql: String },
+    Query {
+        sql: String,
+    },
+    /// The agent connection's catalog: its schemas, or with `schema` the
+    /// relations of that one. DBDelve reads it through the driver and sends no
+    /// statement of its own for it.
+    Catalog {
+        schema: Option<String>,
+    },
 }
+
+impl AgentWork {
+    fn tool(&self) -> Tool {
+        match self {
+            AgentWork::Query { .. } => Tool::ExecuteSql,
+            AgentWork::Catalog { schema: None } => Tool::ListSchemas,
+            AgentWork::Catalog { schema: Some(_) } => Tool::ListTables,
+        }
+    }
+
+    /// The statement the audit records, for the work that sends one.
+    fn sql(&self) -> Option<String> {
+        match self {
+            AgentWork::Query { sql } => Some(sql.clone()),
+            AgentWork::Catalog { .. } => None,
+        }
+    }
+}
+
+/// Said for a `list_tables` call whose schema the catalog does not hold.
+pub(crate) const NO_SUCH_SCHEMA: &str = "there is no schema of that name";
 
 /// What the audit learns of a read from how it ended, beyond what it sent.
 #[derive(Default)]
@@ -237,12 +270,14 @@ pub(super) struct Ended {
     pub(super) error: Option<String>,
 }
 
-/// What a read that ended records of itself: the gate let it run, so what it
-/// sent and how long it took, and what `ended` adds.
-fn facts_of(sql: String, arrived: Instant, ended: Ended) -> CallFacts {
+/// What a read that ended records of itself: for a statement, that the gate
+/// let it run and what it sent; for a catalog call, which has no statement
+/// and so no verdict, nothing of either. Then how long it took, and what
+/// `ended` adds.
+fn facts_of(sql: Option<String>, arrived: Instant, ended: Ended) -> CallFacts {
     CallFacts {
-        verdict: Some(AuditVerdict::Run),
-        sql: Some(sql),
+        verdict: sql.is_some().then_some(AuditVerdict::Run),
+        sql,
         shown: ended.rows.map(|(shown, _)| shown),
         total: ended.rows.map(|(_, total)| total),
         elapsed_ms: elapsed_ms(arrived),
@@ -264,6 +299,18 @@ enum Ran {
         hidden: Vec<String>,
         result: Result<QueryResult, DbError>,
     },
+    /// A catalog call came back: `None` is a schema the catalog does not hold.
+    Listed {
+        connection: Connection,
+        hidden: Vec<String>,
+        listed: Result<Option<Listing>, DbError>,
+    },
+}
+
+/// A catalog reply and how many rows it lists.
+struct Listing {
+    text: String,
+    rows: usize,
 }
 
 /// One result set as the agent reads it. A Postgres spatial cell is rendered
@@ -312,6 +359,21 @@ impl Workspace {
         arrived: Instant,
         cx: &mut Context<Self>,
     ) {
+        self.run_agent_work(id, profile_id, AgentWork::Query { sql }, reply, arrived, cx);
+    }
+
+    /// Take work for `profile_id`'s lane, on the same terms as
+    /// [`Workspace::run_agent_sql`]: the profile must be one an agent may read,
+    /// and the work waits its turn on the agent's own connection.
+    pub(crate) fn run_agent_work(
+        &mut self,
+        id: CallId,
+        profile_id: String,
+        work: AgentWork,
+        reply: SyncSender<Reply>,
+        arrived: Instant,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self
             .profiles
             .iter()
@@ -320,6 +382,7 @@ impl Workspace {
             // The profile went between the gate and here.
             self.agent_answered(
                 id,
+                work.tool(),
                 None,
                 None,
                 &reply,
@@ -340,6 +403,7 @@ impl Workspace {
             let name = profile.name.clone();
             self.agent_answered(
                 id,
+                work.tool(),
                 Some(name),
                 None,
                 &reply,
@@ -348,8 +412,11 @@ impl Workspace {
                     text: refusal.to_string(),
                 },
                 CallFacts {
-                    verdict: Some(AuditVerdict::Refuse(refusal.to_string())),
-                    sql: Some(sql),
+                    // A catalog call has no statement to judge, so no verdict.
+                    verdict: work
+                        .sql()
+                        .map(|_| AuditVerdict::Refuse(refusal.to_string())),
+                    sql: work.sql(),
                     elapsed_ms: elapsed_ms(arrived),
                     ..CallFacts::default()
                 },
@@ -370,11 +437,11 @@ impl Workspace {
             .waiting
             .push_back(Waiting {
                 id,
-                tool: Tool::ExecuteSql,
+                tool: work.tool(),
                 profile_name,
                 reply,
                 arrived,
-                work: AgentWork::Query { sql },
+                work,
             });
         self.start_next(&profile_id, cx);
     }
@@ -428,7 +495,7 @@ impl Workspace {
             profile_name,
             reply,
             arrived,
-            work: AgentWork::Query { sql },
+            work,
         }) = lane.waiting.pop_front()
         else {
             return;
@@ -439,7 +506,7 @@ impl Workspace {
             .map(|connection| (connection, lane.hidden.clone()));
         let engine = config.engine();
         let cancel = CancelToken::default();
-        let sent = sql.clone();
+        let sent = work.sql();
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
@@ -450,14 +517,19 @@ impl Workspace {
                 open(cx.background_executor(), config, profile_id.to_string())
             }
         };
-        let work = cx.spawn({
+        let task = cx.spawn({
             let profile_id = profile_id.to_string();
             let cancel = cancel.clone();
             async move |workspace, cx| {
                 let ran = match opening.await {
                     Ok((connection, hidden)) => {
-                        spawn_blocking(cx.background_executor(), move || {
-                            read_on(connection, hidden, &sql, &cancel, engine)
+                        spawn_blocking(cx.background_executor(), move || match work {
+                            AgentWork::Query { sql } => {
+                                read_on(connection, hidden, &sql, &cancel, engine)
+                            }
+                            AgentWork::Catalog { schema } => {
+                                list_on(connection, hidden, schema.as_deref(), None)
+                            }
                         })
                         .await
                     }
@@ -486,7 +558,7 @@ impl Workspace {
                 arrived,
                 cancel,
                 connection: lane.connection.clone(),
-                _work: work,
+                _work: task,
                 _deadline: deadline,
             });
         }
@@ -529,11 +601,38 @@ impl Workspace {
                 }
                 let table = table_of(engine, &result);
                 ended.rows = Some((table.rows.len(), table.total));
-                (Status::Executed, result::text(&[table], result.rest.len()))
+                (
+                    Status::Executed,
+                    result::text(&[table], result.rest.len(), None),
+                )
+            }
+            Ran::Listed {
+                connection,
+                hidden,
+                listed: Ok(listed),
+            } => {
+                // Kept on the same terms as a read's: the catalog call ended
+                // cleanly, and so did the connection it ran on.
+                if !lane.opened_from.agent_opens_per_call() {
+                    lane.connection = Some(connection);
+                    lane.hidden = hidden;
+                }
+                match listed {
+                    Some(Listing { text, rows }) => {
+                        ended.rows = Some((rows, Total::Exact(rows)));
+                        (Status::Executed, text)
+                    }
+                    None => (Status::Failed, NO_SUCH_SCHEMA.to_string()),
+                }
             }
             Ran::Done {
                 hidden,
                 result: Err(error),
+                ..
+            }
+            | Ran::Listed {
+                hidden,
+                listed: Err(error),
                 ..
             } => {
                 // ponytail: every failure ends the connection rather than
@@ -546,7 +645,9 @@ impl Workspace {
                 (Status::Failed, text)
             }
         };
-        if status == Status::Failed {
+        // An answer that is not an error leaves the connection, and what an
+        // error through it must not say, as they were.
+        if status == Status::Failed && lane.connection.is_none() {
             lane.hidden.clear();
         }
         self.finish_read(id, status, text, false, ended, cx);
@@ -597,13 +698,16 @@ impl Workspace {
             }
             let place = lane.waiting.iter().position(|waiting| waiting.id == id)?;
             let waiting = lane.waiting.remove(place)?;
-            let AgentWork::Query { sql } = waiting.work;
             Some((
                 profile_id.clone(),
                 waiting.tool,
                 waiting.profile_name,
                 waiting.reply,
-                facts_of(sql, waiting.arrived, std::mem::take(&mut ended)),
+                facts_of(
+                    waiting.work.sql(),
+                    waiting.arrived,
+                    std::mem::take(&mut ended),
+                ),
                 None,
             ))
         });
@@ -657,13 +761,12 @@ impl Workspace {
             })
             .into_iter()
             .chain(lane.waiting.drain(..).map(|waiting| {
-                let AgentWork::Query { sql } = waiting.work;
                 (
                     waiting.id,
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
-                    facts_of(sql, waiting.arrived, Ended::default()),
+                    facts_of(waiting.work.sql(), waiting.arrived, Ended::default()),
                 )
             }));
         for (id, tool, name, reply, facts) in ended {
@@ -738,9 +841,207 @@ fn read_on(
     }
 }
 
+/// The blocking half of a catalog call: read the catalog on the agent's
+/// connection and write it as the agent reads it. `schema` is `None` for the
+/// schemas and a name for the relations of that one.
+fn list_on(
+    connection: Connection,
+    hidden: Vec<String>,
+    schema: Option<&str>,
+    note: Option<&str>,
+) -> Ran {
+    let listed = list(&connection, schema, note);
+    Ran::Listed {
+        connection,
+        hidden,
+        listed,
+    }
+}
+
+fn list(
+    connection: &Connection,
+    schema: Option<&str>,
+    note: Option<&str>,
+) -> Result<Option<Listing>, DbError> {
+    let mut catalog = connection.catalog()?;
+    let Some(schema) = schema else {
+        let rows = catalog.schemas.len();
+        let text = schemas_text(&catalog, note);
+        return Ok(Some(Listing { text, rows }));
+    };
+    let Some(rows) = catalog
+        .schemas
+        .iter()
+        .find(|held| held.name == schema)
+        .map(|held| held.relations.len())
+    else {
+        // Nothing is asked of the server for a schema that is not there.
+        return Ok(None);
+    };
+    // The estimate is optional, and the query behind it can need privileges
+    // the catalog does not, so a failure here leaves the rows `null`.
+    if let Ok(sizes) = connection.sizes() {
+        catalog.set_sizes(&sizes);
+    }
+    Ok(tables_text(&catalog, schema, note).map(|text| Listing { text, rows }))
+}
+
+fn table_of_names(heads: &[&str], rows: Vec<Vec<Option<String>>>) -> result::Table {
+    result::Table {
+        label: "columns",
+        heads: heads
+            .iter()
+            .map(|name| result::Head {
+                name: name.to_string(),
+                data_type: None,
+            })
+            .collect(),
+        total: Total::Exact(rows.len()),
+        rows,
+    }
+}
+
+/// The reply for `list_schemas`: one row per schema, in name order. The names
+/// are the database's own and go out as they are; `note` is DBDelve's.
+fn schemas_text(catalog: &Catalog, note: Option<&str>) -> String {
+    let rows = catalog
+        .by_name()
+        .into_iter()
+        .map(|(_, schema)| vec![Some(schema.name.clone())])
+        .collect();
+    result::text(&[table_of_names(&["name"], rows)], 0, note)
+}
+
+/// The reply for `list_tables`: one row per relation of `schema`, with its
+/// kind, the relation it is a partition of and the row estimate, `null` where
+/// there is none. `None` is a schema the catalog does not hold.
+fn tables_text(catalog: &Catalog, schema: &str, note: Option<&str>) -> Option<String> {
+    let schema = catalog.schemas.iter().find(|held| held.name == schema)?;
+    let rows = schema
+        .relations
+        .iter()
+        .map(|relation| {
+            vec![
+                Some(relation.name.clone()),
+                Some(kind_name(relation.kind).to_string()),
+                relation.partition_of.clone(),
+                relation.rows.map(|rows| rows.to_string()),
+            ]
+        })
+        .collect();
+    let heads = ["name", "kind", "partition_of", "rows"];
+    Some(result::text(&[table_of_names(&heads, rows)], 0, note))
+}
+
+fn kind_name(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "table",
+        RelationKind::PartitionedTable => "partitioned table",
+        RelationKind::View => "view",
+        RelationKind::MaterializedView => "materialized view",
+        RelationKind::ForeignTable => "foreign table",
+        RelationKind::Dictionary => "dictionary",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relation(
+        name: &str,
+        kind: RelationKind,
+        parent: Option<&str>,
+        rows: Option<u64>,
+    ) -> crate::db::Relation {
+        crate::db::Relation {
+            name: name.to_string(),
+            kind,
+            partition_of: parent.map(str::to_string),
+            size: None,
+            rows,
+        }
+    }
+
+    fn schema(name: &str, relations: Vec<crate::db::Relation>) -> crate::db::Schema {
+        crate::db::Schema {
+            name: name.to_string(),
+            relations,
+            routines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tables_are_listed_with_their_kind_parent_and_estimate() {
+        let catalog = Catalog {
+            schemas: vec![schema(
+                "public",
+                vec![
+                    relation("orders", RelationKind::Table, None, Some(42)),
+                    relation("orders_2024", RelationKind::Table, Some("orders"), None),
+                    relation("v", RelationKind::View, None, None),
+                ],
+            )],
+            database: None,
+        };
+        let text = tables_text(&catalog, "public", None).expect("the schema is there");
+        assert_eq!(
+            text,
+            "truncated: none (3 rows)\n\
+             columns: [{\"name\":\"name\",\"type\":null},{\"name\":\"kind\",\"type\":null},\
+             {\"name\":\"partition_of\",\"type\":null},{\"name\":\"rows\",\"type\":null}]\n\
+             [\"orders\",\"table\",null,\"42\"]\n\
+             [\"orders_2024\",\"table\",\"orders\",null]\n\
+             [\"v\",\"view\",null,null]\n"
+        );
+        assert_eq!(tables_text(&catalog, "Public", None), None);
+    }
+
+    #[test]
+    fn a_schema_with_no_relations_lists_none() {
+        let catalog = Catalog {
+            schemas: vec![schema("empty", Vec::new())],
+            database: None,
+        };
+        let text = tables_text(&catalog, "empty", None).expect("the schema is there");
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("truncated: none (0 rows)"));
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("columns: "))
+        );
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn schemas_are_listed_in_name_order() {
+        let catalog = Catalog {
+            schemas: vec![schema("b", Vec::new()), schema("a", Vec::new())],
+            database: None,
+        };
+        assert_eq!(
+            schemas_text(&catalog, None),
+            "truncated: none (2 rows)\n\
+             columns: [{\"name\":\"name\",\"type\":null}]\n\
+             [\"a\"]\n\
+             [\"b\"]\n"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_relation_has_its_own_name() {
+        let kinds = [
+            RelationKind::Table,
+            RelationKind::PartitionedTable,
+            RelationKind::View,
+            RelationKind::MaterializedView,
+            RelationKind::ForeignTable,
+            RelationKind::Dictionary,
+        ];
+        let names: std::collections::HashSet<_> = kinds.into_iter().map(kind_name).collect();
+        assert_eq!(names.len(), kinds.len());
+    }
 
     #[test]
     fn the_deadline_text_names_the_deadline() {

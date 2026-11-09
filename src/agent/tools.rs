@@ -10,6 +10,10 @@ use serde_json::{Map, Value, json};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Tool {
     ListConnections,
+    /// Lists a connection's schemas from its catalog.
+    ListSchemas,
+    /// Lists one schema's relations from the connection's catalog.
+    ListTables,
     /// Runs one statement the gate lets an agent run without asking.
     ExecuteSql,
     /// Asks the person at the window to answer: nothing runs for it, so it
@@ -19,12 +23,20 @@ pub(crate) enum Tool {
 
 impl Tool {
     /// Every tool, in the order the agent is shown them.
-    pub(crate) const ALL: [Tool; 3] = [Tool::ListConnections, Tool::ExecuteSql, Tool::Ping];
+    pub(crate) const ALL: [Tool; 5] = [
+        Tool::ListConnections,
+        Tool::ListSchemas,
+        Tool::ListTables,
+        Tool::ExecuteSql,
+        Tool::Ping,
+    ];
 
     /// The name the agent calls it by: the spelling serde writes for it.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Tool::ListConnections => "list_connections",
+            Tool::ListSchemas => "list_schemas",
+            Tool::ListTables => "list_tables",
             Tool::ExecuteSql => "execute_sql",
             Tool::Ping => "ping",
         }
@@ -38,6 +50,10 @@ impl Tool {
         match self {
             Tool::ListConnections => {
                 "Lists the DBDelve connections the user has made visible to agents, by name and engine."
+            }
+            Tool::ListSchemas => "Lists the schemas of a named connection, in name order.",
+            Tool::ListTables => {
+                "Lists the tables and views of one schema of a named connection, with each one's kind, its parent when it is a partition, and its estimated row count."
             }
             Tool::ExecuteSql => {
                 "Runs one read statement on a named connection exactly as written and returns the first rows, header first. A statement that would change data is not run."
@@ -56,6 +72,14 @@ impl Tool {
         schema.insert("type".to_string(), json!("object"));
         let properties = match self {
             Tool::ListConnections => json!({}),
+            Tool::ListSchemas => {
+                schema.insert("required".to_string(), json!(["connection"]));
+                json!({ "connection": { "type": "string" } })
+            }
+            Tool::ListTables => {
+                schema.insert("required".to_string(), json!(["connection", "schema"]));
+                json!({ "connection": { "type": "string" }, "schema": { "type": "string" } })
+            }
             Tool::ExecuteSql => {
                 schema.insert("required".to_string(), json!(["connection", "sql"]));
                 json!({ "connection": { "type": "string" }, "sql": { "type": "string" } })
@@ -92,7 +116,14 @@ mod tests {
             assert_eq!(schema["additionalProperties"], false);
         }
         assert_eq!(Tool::Ping.input_schema()["required"], json!(["connection"]));
-        assert_eq!(Tool::ALL.len(), 3);
+        assert_eq!(Tool::ALL.len(), 5);
+        assert_eq!(
+            Tool::ListSchemas.input_schema()["required"],
+            json!(["connection"])
+        );
+        let schema = Tool::ListTables.input_schema();
+        assert_eq!(schema["required"], json!(["connection", "schema"]));
+        assert_eq!(schema["properties"]["schema"], json!({"type": "string"}));
         let schema = Tool::ExecuteSql.input_schema();
         assert_eq!(schema["required"], json!(["connection", "sql"]));
         assert_eq!(

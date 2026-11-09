@@ -12,7 +12,7 @@
 
 use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
-use super::agent_read::{self, NEEDS_APPROVAL};
+use super::agent_read::{self, AgentWork, NEEDS_APPROVAL};
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
@@ -748,6 +748,7 @@ impl Workspace {
                     Err(lookup) => {
                         self.agent_answered(
                             id,
+                            Tool::ExecuteSql,
                             None,
                             connection.as_deref(),
                             &reply,
@@ -779,6 +780,7 @@ impl Workspace {
                 };
                 self.agent_answered(
                     id,
+                    Tool::ExecuteSql,
                     Some(profile_name),
                     None,
                     &reply,
@@ -792,6 +794,51 @@ impl Workspace {
                         elapsed_ms: elapsed_ms(arrived),
                         ..CallFacts::default()
                     },
+                );
+            }
+            Inbound::Call {
+                tool: tool @ (Tool::ListSchemas | Tool::ListTables),
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility(cx);
+                let profile_id = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(|profile| profile.id.clone()),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let profile_id = match profile_id {
+                    Ok(profile_id) => profile_id,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            tool,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The schema is required for `list_tables`, so only an
+                // injected call has none; it names no schema the catalog holds.
+                let schema = (tool == Tool::ListTables).then(|| args.schema.unwrap_or_default());
+                self.run_agent_work(
+                    id,
+                    profile_id,
+                    AgentWork::Catalog { schema },
+                    reply,
+                    arrived,
+                    cx,
                 );
             }
             Inbound::Call {
@@ -856,12 +903,17 @@ impl Workspace {
         }
     }
 
-    /// Answer an `execute_sql` call at once and log it: the end of a call that
-    /// never waits for anyone. `resolved` is the profile's own name, `asked` what the agent
-    /// called a connection that resolved to nothing.
+    /// Answer a read call at once and log it: the end of a call that never
+    /// waits for anyone. `resolved` is the profile's own name, `asked` what the
+    /// agent called a connection that resolved to nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's identity, its two names, both halves of the answer and its facts are each one thing; a struct of them would be built once per call to be taken apart at once"
+    )]
     pub(super) fn agent_answered(
         &mut self,
         id: CallId,
+        tool: Tool,
         resolved: Option<String>,
         asked: Option<&str>,
         reply: &SyncSender<Reply>,
@@ -871,8 +923,7 @@ impl Workspace {
         let status = answer.status;
         // The caller may have hung up, and then nobody reads this.
         let _ = reply.send(answer);
-        self.agent
-            .record(id, Tool::ExecuteSql, resolved, asked, status, facts);
+        self.agent.record(id, tool, resolved, asked, status, facts);
     }
 
     /// The one door every call ends through: answered, expired or hung up.
