@@ -797,7 +797,7 @@ impl Workspace {
                 );
             }
             Inbound::Call {
-                tool: tool @ (Tool::ListSchemas | Tool::ListTables),
+                tool: tool @ (Tool::ListSchemas | Tool::ListTables | Tool::DescribeTable),
                 id,
                 connection,
                 args,
@@ -829,17 +829,19 @@ impl Workspace {
                         return;
                     }
                 };
-                // The schema is required for `list_tables`, so only an
-                // injected call has none; it names no schema the catalog holds.
-                let schema = (tool == Tool::ListTables).then(|| args.schema.unwrap_or_default());
-                self.run_agent_work(
-                    id,
-                    profile_id,
-                    AgentWork::Catalog { schema },
-                    reply,
-                    arrived,
-                    cx,
-                );
+                // The names are required by the tools that take them, so only
+                // an injected call lacks one; it names nothing the catalog holds.
+                let work = match tool {
+                    Tool::DescribeTable => AgentWork::Structure {
+                        schema: args.schema.unwrap_or_default(),
+                        table: args.table.unwrap_or_default(),
+                    },
+                    Tool::ListTables => AgentWork::Catalog {
+                        schema: Some(args.schema.unwrap_or_default()),
+                    },
+                    _ => AgentWork::Catalog { schema: None },
+                };
+                self.run_agent_work(id, profile_id, work, reply, arrived, cx);
             }
             Inbound::Call {
                 tool: Tool::Ping,

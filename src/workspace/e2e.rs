@@ -6203,6 +6203,92 @@ fn an_agent_walks_a_catalog_through_the_shim(cx: &mut TestAppContext) {
     });
 }
 
+const DESCRIBED_SCHEMA: &str = "CREATE TABLE teams (id INTEGER PRIMARY KEY);\
+     CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT NOT NULL DEFAULT 'x', \
+     team INTEGER REFERENCES teams(id));\
+     CREATE UNIQUE INDEX t_email ON t (email);";
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_describes_a_table_through_the_shim(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        session::ProfileState,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, DESCRIBED_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "describe_table",
+            serde_json::json!({"connection": "Orders", "schema": "main", "table": "t"}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        assert!(text.starts_with("status: executed\ntruncated: "), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let after = |label: &str| {
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with(&format!("{label}: ")))
+                .unwrap_or_else(|| panic!("no `{label}` table in {text}"));
+            &lines[at + 1..]
+        };
+        let columns = after("columns");
+        assert_eq!(columns[0], "[\"id\",\"INTEGER\",\"false\",null]", "{text}");
+        assert_eq!(
+            columns[1], "[\"email\",\"TEXT\",\"false\",\"'x'\"]",
+            "{text}"
+        );
+        assert_eq!(columns[2], "[\"team\",\"INTEGER\",\"true\",null]", "{text}");
+        assert_eq!(after("primary_key")[0], "[\"id\"]", "{text}");
+        assert_eq!(
+            after("foreign_keys")[0],
+            "[\"team\",\"main\",\"teams\",\"id\"]",
+            "{text}"
+        );
+        assert!(
+            after("indexes")
+                .iter()
+                .any(|line| line.starts_with("[\"t_email\",\"unique\",")),
+            "{text}"
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [(Tool::DescribeTable, Status::Executed)]
+        );
+        assert!(
+            log[0].verdict.is_none() && log[0].sql.is_none(),
+            "{:?}",
+            log[0]
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            assert!(
+                matches!(orders.state, ProfileState::Idle),
+                "the agent's describe moved the user's profile"
+            );
+        });
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
     cx: &mut TestAppContext,

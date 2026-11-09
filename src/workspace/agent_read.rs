@@ -23,8 +23,8 @@ use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
     db::{
-        CancelToken, Catalog, Connection, ConnectionConfig, DbError, Fetch, QueryResult,
-        RelationKind,
+        CancelToken, Catalog, Connection, ConnectionConfig, DbError, Fetch, IndexKind, QueryResult,
+        RelationKind, Structure,
     },
 };
 
@@ -237,6 +237,11 @@ pub(crate) enum AgentWork {
     Catalog {
         schema: Option<String>,
     },
+    /// One relation's definition, read through the driver like the catalog.
+    Structure {
+        schema: String,
+        table: String,
+    },
 }
 
 impl AgentWork {
@@ -245,6 +250,7 @@ impl AgentWork {
             AgentWork::Query { .. } => Tool::ExecuteSql,
             AgentWork::Catalog { schema: None } => Tool::ListSchemas,
             AgentWork::Catalog { schema: Some(_) } => Tool::ListTables,
+            AgentWork::Structure { .. } => Tool::DescribeTable,
         }
     }
 
@@ -252,13 +258,17 @@ impl AgentWork {
     fn sql(&self) -> Option<String> {
         match self {
             AgentWork::Query { sql } => Some(sql.clone()),
-            AgentWork::Catalog { .. } => None,
+            AgentWork::Catalog { .. } | AgentWork::Structure { .. } => None,
         }
     }
 }
 
 /// Said for a `list_tables` call whose schema the catalog does not hold.
 pub(crate) const NO_SUCH_SCHEMA: &str = "there is no schema of that name";
+
+/// Said for a `describe_table` call whose schema or relation the catalog does
+/// not hold.
+pub(crate) const NOT_IN_CATALOG: &str = "there is no table or view of that name in that schema";
 
 /// What the audit learns of a read from how it ended, beyond what it sent.
 #[derive(Default)]
@@ -299,7 +309,7 @@ enum Ran {
         hidden: Vec<String>,
         result: Result<QueryResult, DbError>,
     },
-    /// A catalog call came back: `None` is a schema the catalog does not hold.
+    /// A catalog call came back: `None` is a name the catalog does not hold.
     Listed {
         connection: Connection,
         hidden: Vec<String>,
@@ -533,6 +543,13 @@ impl Workspace {
                                 schema.as_deref(),
                                 engine.agent_catalog_note(),
                             ),
+                            AgentWork::Structure { schema, table } => describe_on(
+                                connection,
+                                hidden,
+                                &schema,
+                                &table,
+                                engine.agent_catalog_note(),
+                            ),
                         })
                         .await
                     }
@@ -585,6 +602,12 @@ impl Workspace {
             return;
         }
         let mut ended = Ended::default();
+        // What a catalog call that found nothing says: which tool asked decides
+        // whether it was a schema or a relation.
+        let not_found = match lane.running.as_ref().map(|running| running.tool) {
+            Some(Tool::DescribeTable) => NOT_IN_CATALOG,
+            _ => NO_SUCH_SCHEMA,
+        };
         let (status, text) = match ran {
             Ran::NotOpened(error) => {
                 lane.connection = None;
@@ -625,7 +648,7 @@ impl Workspace {
                         ended.rows = Some((rows, Total::Exact(rows)));
                         (Status::Executed, text)
                     }
-                    None => (Status::Failed, NO_SUCH_SCHEMA.to_string()),
+                    None => (Status::Failed, not_found.to_string()),
                 }
             }
             Ran::Done {
@@ -889,6 +912,55 @@ fn list(
     Ok(tables_text(&catalog, schema, note).map(|text| Listing { text, rows }))
 }
 
+/// The blocking half of `describe_table`: see [`describe`].
+fn describe_on(
+    connection: Connection,
+    hidden: Vec<String>,
+    schema: &str,
+    table: &str,
+    note: Option<&str>,
+) -> Ran {
+    let listed = connection.catalog().and_then(|catalog| {
+        describe(&catalog, schema, table, note, |s, t| {
+            connection.structure(s, t)
+        })
+    });
+    Ran::Listed {
+        connection,
+        hidden,
+        listed,
+    }
+}
+
+/// Describe `table` of `schema`, once the catalog holds both by exact name.
+///
+/// The catalog is looked in first, and `load` is called only for a pair found
+/// there: MongoDB opens whatever database it is given, so a name the agent
+/// made up must never reach a loader. `None` is a pair the catalog does not
+/// hold.
+fn describe(
+    catalog: &Catalog,
+    schema: &str,
+    table: &str,
+    note: Option<&str>,
+    load: impl FnOnce(&str, &str) -> Result<Structure, DbError>,
+) -> Result<Option<Listing>, DbError> {
+    let held = catalog
+        .schemas
+        .iter()
+        .find(|held| held.name == schema)
+        .is_some_and(|held| held.relations.iter().any(|relation| relation.name == table));
+    if !held {
+        return Ok(None);
+    }
+    let structure = load(schema, table)?;
+    let rows = structure.columns.len();
+    Ok(Some(Listing {
+        text: structure_text(&structure, note),
+        rows,
+    }))
+}
+
 fn table_of_names(heads: &[&str], rows: Vec<Vec<Option<String>>>) -> result::Table {
     result::Table {
         label: "columns",
@@ -936,6 +1008,92 @@ fn tables_text(catalog: &Catalog, schema: &str, note: Option<&str>) -> Option<St
     Some(result::text(&[table_of_names(&heads, rows)], 0, note))
 }
 
+/// The reply for `describe_table`: four tables, in the order the agent reads a
+/// table's shape. An index's key entries are one JSON array in one cell,
+/// because an entry can itself hold a comma. The names are the database's own.
+fn structure_text(structure: &Structure, note: Option<&str>) -> String {
+    let labelled = |label: &'static str, heads: &[&str], rows: Vec<Vec<Option<String>>>| {
+        let mut table = table_of_names(heads, rows);
+        table.label = label;
+        table
+    };
+    let columns = structure
+        .columns
+        .iter()
+        .map(|column| {
+            vec![
+                Some(column.name.clone()),
+                Some(column.data_type.clone()),
+                Some(column.nullable.to_string()),
+                column.default.clone(),
+            ]
+        })
+        .collect();
+    let primary_key = structure
+        .primary_key()
+        .into_iter()
+        .map(|name| vec![Some(name)])
+        .collect();
+    let foreign_keys = structure
+        .foreign_keys
+        .iter()
+        .map(|key| {
+            vec![
+                Some(key.column.clone()),
+                Some(key.referenced_schema.clone()),
+                Some(key.referenced_table.clone()),
+                Some(key.referenced_column.clone()),
+            ]
+        })
+        .collect();
+    let indexes = structure
+        .indexes
+        .iter()
+        .map(|index| {
+            vec![
+                Some(index.name.clone()),
+                Some(index_kind_name(index.kind).to_string()),
+                Some(
+                    serde_json::to_string(&index.columns)
+                        .expect("a list of strings always serializes"),
+                ),
+                index.predicate.clone(),
+            ]
+        })
+        .collect();
+    result::text(
+        &[
+            labelled("columns", &["name", "type", "nullable", "default"], columns),
+            labelled("primary_key", &["column"], primary_key),
+            labelled(
+                "foreign_keys",
+                &[
+                    "column",
+                    "references_schema",
+                    "references_table",
+                    "references_column",
+                ],
+                foreign_keys,
+            ),
+            labelled(
+                "indexes",
+                &["name", "kind", "columns", "predicate"],
+                indexes,
+            ),
+        ],
+        0,
+        note,
+    )
+}
+
+fn index_kind_name(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Primary => "primary",
+        IndexKind::Unique => "unique",
+        IndexKind::Plain => "plain",
+    }
+}
+
 fn kind_name(kind: RelationKind) -> &'static str {
     match kind {
         RelationKind::Table => "table",
@@ -950,6 +1108,7 @@ fn kind_name(kind: RelationKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{ColumnDefinition, ForeignKey, Index, NamedDefinition};
 
     fn relation(
         name: &str,
@@ -998,6 +1157,145 @@ mod tests {
              [\"v\",\"view\",null,null]\n"
         );
         assert_eq!(tables_text(&catalog, "Public", None), None);
+    }
+
+    fn column(
+        name: &str,
+        data_type: &str,
+        nullable: bool,
+        default: Option<&str>,
+    ) -> ColumnDefinition {
+        ColumnDefinition {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable,
+            default: default.map(str::to_string),
+        }
+    }
+
+    /// The lines of a reply that start with `label: ` and the row lines after
+    /// each, up to the next label.
+    fn section<'a>(text: &'a str, label: &str) -> Vec<&'a str> {
+        let labels = ["columns: ", "primary_key: ", "foreign_keys: ", "indexes: "];
+        let start = format!("{label}: ");
+        let mut lines = text.lines().skip_while(|line| !line.starts_with(&start));
+        let mut found = vec![lines.next().expect("the label is there")];
+        found.extend(lines.take_while(|line| !labels.iter().any(|l| line.starts_with(l))));
+        found
+    }
+
+    #[test]
+    fn a_structure_is_described_in_four_labelled_tables() {
+        let structure = Structure {
+            columns: vec![
+                column("id", "integer", false, None),
+                column("email", "text", true, Some("'x'")),
+            ],
+            indexes: vec![
+                Index {
+                    name: "by_email".to_string(),
+                    kind: IndexKind::Unique,
+                    columns: vec!["lower(email)".to_string(), "id".to_string()],
+                    predicate: None,
+                    definition: String::new(),
+                },
+                Index {
+                    name: "live".to_string(),
+                    kind: IndexKind::Plain,
+                    columns: vec!["a, b".to_string()],
+                    predicate: Some("a > 0".to_string()),
+                    definition: String::new(),
+                },
+            ],
+            constraints: vec![NamedDefinition {
+                name: "t_pkey".to_string(),
+                definition: "PRIMARY KEY (id)".to_string(),
+            }],
+            foreign_keys: vec![ForeignKey {
+                column: "team".to_string(),
+                referenced_schema: "main".to_string(),
+                referenced_table: "teams".to_string(),
+                referenced_column: "id".to_string(),
+            }],
+            referenced_by: Vec::new(),
+        };
+        let text = structure_text(&structure, None);
+        let labels: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(": ").map(|(label, _)| label))
+            .filter(|label| ["columns", "primary_key", "foreign_keys", "indexes"].contains(label))
+            .collect();
+        assert_eq!(
+            labels,
+            ["columns", "primary_key", "foreign_keys", "indexes"]
+        );
+        assert_eq!(
+            section(&text, "columns")[1..],
+            [
+                "[\"id\",\"integer\",\"false\",null]",
+                "[\"email\",\"text\",\"true\",\"'x'\"]"
+            ]
+        );
+        assert_eq!(section(&text, "primary_key")[1..], ["[\"id\"]"]);
+        assert_eq!(
+            section(&text, "foreign_keys")[1..],
+            ["[\"team\",\"main\",\"teams\",\"id\"]"]
+        );
+        assert_eq!(
+            section(&text, "indexes")[1..],
+            [
+                "[\"by_email\",\"unique\",\"[\\\"lower(email)\\\",\\\"id\\\"]\",null]",
+                "[\"live\",\"plain\",\"[\\\"a, b\\\"]\",\"a > 0\"]"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_keys_or_indexes_is_described_with_empty_tables() {
+        let structure = Structure {
+            columns: vec![
+                column("a", "text", true, None),
+                column("b", "text", true, None),
+            ],
+            ..Structure::default()
+        };
+        let text = structure_text(&structure, None);
+        assert_eq!(section(&text, "columns").len(), 3, "{text}");
+        for label in ["primary_key", "foreign_keys", "indexes"] {
+            assert_eq!(section(&text, label).len(), 1, "{label}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_pair_the_catalog_does_not_hold_never_reaches_the_loader() {
+        let catalog = Catalog {
+            schemas: vec![schema(
+                "main",
+                vec![relation("t", RelationKind::Table, None, None)],
+            )],
+            database: None,
+        };
+        let refuse = |_: &str, _: &str| -> Result<Structure, DbError> {
+            panic!("the loader was handed a name the catalog does not hold")
+        };
+        for (schema, table) in [
+            ("main", "nope"),
+            ("other", "t"),
+            ("Main", "t"),
+            ("main", "T"),
+        ] {
+            assert!(
+                matches!(describe(&catalog, schema, table, None, refuse), Ok(None)),
+                "{schema}.{table}"
+            );
+        }
+        let mut asked = Vec::new();
+        let held = describe(&catalog, "main", "t", None, |schema, table| {
+            asked.push((schema.to_string(), table.to_string()));
+            Ok(Structure::default())
+        });
+        assert!(matches!(held, Ok(Some(_))));
+        assert_eq!(asked, [("main".to_string(), "t".to_string())]);
     }
 
     #[test]

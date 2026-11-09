@@ -255,6 +255,7 @@ impl ServerHandler for Shim {
             connection,
             sql: args.sql,
             schema: args.schema,
+            table: args.table,
         });
         if hello.len() as u64 > wire::FRAME_LIMIT {
             return Err(ErrorData::invalid_params(
@@ -324,6 +325,31 @@ fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>, Cal
             }
             _ => Err(ErrorData::invalid_params(
                 "`list_tables` takes two string arguments, `connection` and `schema`.",
+                None,
+            )),
+        },
+        Tool::DescribeTable => match (
+            arguments.len(),
+            arguments.get("connection"),
+            arguments.get("schema"),
+            arguments.get("table"),
+        ) {
+            (
+                3,
+                Some(serde_json::Value::String(name)),
+                Some(serde_json::Value::String(schema)),
+                Some(serde_json::Value::String(table)),
+            ) => Ok((
+                tool,
+                Some(name.clone()),
+                CallArgs {
+                    schema: Some(schema.clone()),
+                    table: Some(table.clone()),
+                    ..CallArgs::default()
+                },
+            )),
+            _ => Err(ErrorData::invalid_params(
+                "`describe_table` takes three string arguments, `connection`, `schema` and `table`.",
                 None,
             )),
         },
@@ -911,6 +937,7 @@ mod tests {
                     "list_connections",
                     "list_schemas",
                     "list_tables",
+                    "describe_table",
                     "execute_sql",
                     "ping"
                 ]
@@ -945,6 +972,7 @@ mod tests {
                     "list_connections",
                     "list_schemas",
                     "list_tables",
+                    "describe_table",
                     "execute_sql",
                     "ping"
                 ]
@@ -979,6 +1007,10 @@ mod tests {
                     (
                         "list_tables",
                         json!({"connection": "Orders", "schema": "main"}),
+                    ),
+                    (
+                        "describe_table",
+                        json!({"connection": "Orders", "schema": "main", "table": "t"}),
                     ),
                     ("ping", json!({"connection": "Orders"})),
                 ] {
@@ -1362,6 +1394,27 @@ mod tests {
                     "list_tables",
                     json!({"connection": "Orders", "schema": "main", "limit": 5}),
                 ),
+                ("describe_table", json!({})),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "table": "t"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": 3}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": 3, "schema": "main", "table": "t"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": "t", "limit": 5}),
+                ),
             ] {
                 let answered = client.call(tool, arguments.clone()).await;
                 assert_eq!(
@@ -1400,6 +1453,23 @@ mod tests {
             assert_eq!(frame["tool"], "list_tables");
             assert_eq!(frame["connection"], "Orders");
             assert_eq!(frame["schema"], "main");
+            assert!(frame.get("table").is_none(), "{frame}");
+
+            let answered = client
+                .call(
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": "t"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "describe_table");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["schema"], "main");
+            assert_eq!(frame["table"], "t");
         });
         let _ = std::fs::remove_dir_all(path.parent().expect("the path has a directory"));
     }
