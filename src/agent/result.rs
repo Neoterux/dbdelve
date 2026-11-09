@@ -583,4 +583,94 @@ mod tests {
             )
         );
     }
+
+    /// Not a check: writes the widest reply this module allows, once per kind of
+    /// value that costs the most tokens per byte, to the directory in
+    /// `DBDELVE_RESULT_OUT`. Plan 05-10 has the tokens of those files counted
+    /// and sets [`RESULT_BUDGET`] from the highest count.
+    #[test]
+    #[ignore = "measurement aid: writes DBDELVE_RESULT_OUT"]
+    fn the_worst_case_replies_are_written_for_measurement() {
+        // CI runs every ignored test, this one included; with no directory named
+        // there is nothing to write.
+        let Ok(dir) = std::env::var("DBDELVE_RESULT_OUT") else {
+            return;
+        };
+        // A fixed generator, so a second run writes the same bytes.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let hex = |next: &mut dyn FnMut() -> u64, len: usize| -> String {
+            (0..len)
+                .map(|_| char::from(b"0123456789abcdef"[(next() % 16) as usize]))
+                .collect()
+        };
+        let uuid = |next: &mut dyn FnMut() -> u64| {
+            format!(
+                "{}-{}-{}-{}-{}",
+                hex(next, 8),
+                hex(next, 4),
+                hex(next, 4),
+                hex(next, 4),
+                hex(next, 12)
+            )
+        };
+        let base64 = |next: &mut dyn FnMut() -> u64| -> String {
+            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let body: String = (0..62)
+                .map(|_| char::from(alphabet[(next() % 64) as usize]))
+                .collect();
+            format!("{body}==")
+        };
+        let json = |next: &mut dyn FnMut() -> u64| {
+            format!(
+                "{{\"id\":\"{}\",\"tags\":[\"{}\",\"{}\"],\"n\":{},\"ok\":true,\"at\":null}}",
+                uuid(next),
+                hex(next, 6),
+                hex(next, 6),
+                next() % 100_000
+            )
+        };
+        let cjk = |next: &mut dyn FnMut() -> u64| -> String {
+            (0..40)
+                .map(|_| {
+                    char::from_u32(0x4E00 + (next() % 0x51A5) as u32).expect("a CJK ideograph")
+                })
+                .collect()
+        };
+        // Enough rows that every text is cut by the budget: the cheapest cells
+        // are 36 bytes, so a few thousand rows is several times the budget.
+        let rows = 3_000;
+        type Cell<'a> = &'a dyn Fn(&mut dyn FnMut() -> u64) -> String;
+        let hex64 = |next: &mut dyn FnMut() -> u64| hex(next, 64);
+        let families: [(&str, Vec<Cell>); 6] = [
+            ("uuid", vec![&uuid; 4]),
+            ("hex", vec![&hex64; 4]),
+            ("base64", vec![&base64; 4]),
+            ("json", vec![&json; 4]),
+            ("cjk", vec![&cjk; 4]),
+            ("mixed", vec![&uuid, &base64, &json, &cjk]),
+        ];
+        for (name, cells) in families {
+            let table = Table {
+                label: "columns",
+                heads: (0..4).map(|i| head(&format!("c{i}"), None)).collect(),
+                rows: (0..rows)
+                    .map(|_| cells.iter().map(|cell| Some(cell(&mut next))).collect())
+                    .collect(),
+                total: Total::AtLeast(rows),
+            };
+            let out = text(&[table], 0, None);
+            assert!(out.starts_with("truncated: "), "{name}");
+            assert!(out.len() <= RESULT_BUDGET, "{name}: {}", out.len());
+            let shown = out.lines().filter(|line| line.starts_with("[\"")).count();
+            assert!(shown < rows, "{name}: the text was not cut");
+            std::fs::write(format!("{dir}/{name}.txt"), &out).expect("the output writes");
+            println!("{name}: bytes={} rows_shown={shown}", out.len());
+        }
+    }
 }
