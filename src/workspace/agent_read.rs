@@ -12,11 +12,16 @@
 //! wrapped around it or rewritten, so the gate's verdict is about what the
 //! server receives.
 
-use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::SyncSender,
+    time::{Duration, Instant},
+};
 
+use super::agent::{AuditVerdict, CallFacts, elapsed_ms};
 use super::*;
 use crate::{
-    agent::{CallId, Reply, Status, result, tools::Tool},
+    agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
     db::{CancelToken, Connection, ConnectionConfig, DbError, Fetch, QueryResult},
 };
 
@@ -192,6 +197,10 @@ pub(crate) struct Running {
     tool: Tool,
     profile_name: String,
     reply: SyncSender<Reply>,
+    /// The statement as the agent sent it, for the audit.
+    sql: String,
+    /// When the call reached the window, for the audit's elapsed time.
+    arrived: Instant,
     /// What stops the statement on the server when the call ends early.
     cancel: CancelToken,
     /// The lane's connection the statement runs on, when the lane had one. A
@@ -209,12 +218,26 @@ pub(crate) struct Waiting {
     tool: Tool,
     profile_name: String,
     reply: SyncSender<Reply>,
+    arrived: Instant,
     work: AgentWork,
 }
 
 /// What a waiting call will do once its lane is free.
 pub(crate) enum AgentWork {
     Query { sql: String },
+}
+
+/// What a read that ended records of itself: the gate let it run, so what it
+/// sent and how long it took, and `rows` when it was answered with a result.
+fn facts_of(sql: String, arrived: Instant, rows: Option<(usize, Total)>) -> CallFacts {
+    CallFacts {
+        verdict: Some(AuditVerdict::Run),
+        sql: Some(sql),
+        shown: rows.map(|(shown, _)| shown),
+        total: rows.map(|(_, total)| total),
+        elapsed_ms: elapsed_ms(arrived),
+        error: None,
+    }
 }
 
 /// What the blocking half of a read came back with.
@@ -275,6 +298,7 @@ impl Workspace {
         profile_id: String,
         sql: String,
         reply: SyncSender<Reply>,
+        arrived: Instant,
         cx: &mut Context<Self>,
     ) {
         let Some(profile) = self
@@ -310,6 +334,7 @@ impl Workspace {
                 tool: Tool::ExecuteSql,
                 profile_name,
                 reply,
+                arrived,
                 work: AgentWork::Query { sql },
             });
         self.start_next(&profile_id, cx);
@@ -363,6 +388,7 @@ impl Workspace {
             tool,
             profile_name,
             reply,
+            arrived,
             work: AgentWork::Query { sql },
         }) = lane.waiting.pop_front()
         else {
@@ -374,6 +400,7 @@ impl Workspace {
             .map(|connection| (connection, lane.hidden.clone()));
         let engine = config.engine();
         let cancel = CancelToken::default();
+        let sent = sql.clone();
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
@@ -416,6 +443,8 @@ impl Workspace {
                 tool,
                 profile_name,
                 reply,
+                sql: sent,
+                arrived,
                 cancel,
                 connection: lane.connection.clone(),
                 _work: work,
@@ -441,6 +470,7 @@ impl Workspace {
         if lane.running.as_ref().is_none_or(|running| running.id != id) {
             return;
         }
+        let mut rows = None;
         let (status, text) = match ran {
             Ran::NotOpened => {
                 lane.connection = None;
@@ -453,10 +483,9 @@ impl Workspace {
             } => {
                 lane.connection = Some(connection);
                 lane.hidden = hidden;
-                (
-                    Status::Executed,
-                    result::text(&[table_of(engine, &result)], result.rest.len()),
-                )
+                let table = table_of(engine, &result);
+                rows = Some((table.rows.len(), table.total));
+                (Status::Executed, result::text(&[table], result.rest.len()))
             }
             Ran::Done {
                 hidden,
@@ -474,14 +503,15 @@ impl Workspace {
         if status == Status::Failed {
             lane.hidden.clear();
         }
-        self.finish_read(id, status, text, false, cx);
+        self.finish_read(id, status, text, false, rows, cx);
     }
 
     /// End the read `id`, running or waiting, once: it is removed first, so a
     /// call that two things end at once is answered and recorded by whichever
     /// comes first. `early` is an end that is not the statement's own answer:
     /// the statement is cancelled on the server and the lane's connection is
-    /// dropped. Then the lane's next call starts. Answers whether there was
+    /// dropped. `rows` is how many rows went back and how many there were, for
+    /// the audit. Then the lane's next call starts. Answers whether there was
     /// such a call.
     pub(super) fn finish_read(
         &mut self,
@@ -489,6 +519,7 @@ impl Workspace {
         status: Status,
         text: String,
         early: bool,
+        rows: Option<(usize, Total)>,
         cx: &mut Context<Self>,
     ) -> bool {
         let found = self.agent.lanes.iter_mut().find_map(|(profile_id, lane)| {
@@ -514,20 +545,23 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
+                    facts_of(running.sql, running.arrived, rows),
                     stop.filter(|_| early),
                 ));
             }
             let place = lane.waiting.iter().position(|waiting| waiting.id == id)?;
             let waiting = lane.waiting.remove(place)?;
+            let AgentWork::Query { sql } = waiting.work;
             Some((
                 profile_id.clone(),
                 waiting.tool,
                 waiting.profile_name,
                 waiting.reply,
+                facts_of(sql, waiting.arrived, None),
                 None,
             ))
         });
-        let Some((profile_id, tool, name, reply, stop)) = found else {
+        let Some((profile_id, tool, name, reply, facts, stop)) = found else {
             return false;
         };
         if let Some((connection, cancel)) = stop {
@@ -539,7 +573,7 @@ impl Workspace {
             // The caller may have hung up, and then nobody reads this.
             let _ = reply.send(Reply { status, text });
         }
-        self.agent.record(id, tool, Some(name), None, status);
+        self.agent.record(id, tool, Some(name), None, status, facts);
         self.start_next(&profile_id, cx);
         cx.notify();
         true
@@ -572,23 +606,26 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
+                    facts_of(running.sql, running.arrived, None),
                 )
             })
             .into_iter()
             .chain(lane.waiting.drain(..).map(|waiting| {
+                let AgentWork::Query { sql } = waiting.work;
                 (
                     waiting.id,
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
+                    facts_of(sql, waiting.arrived, None),
                 )
             }));
-        for (id, tool, name, reply) in ended {
+        for (id, tool, name, reply, facts) in ended {
             let _ = reply.send(Reply {
                 status,
                 text: text.to_string(),
             });
-            self.agent.record(id, tool, Some(name), None, status);
+            self.agent.record(id, tool, Some(name), None, status, facts);
         }
         cx.notify();
     }

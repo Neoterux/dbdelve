@@ -10,12 +10,12 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::{collections::VecDeque, sync::mpsc::SyncSender};
+use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
 use super::agent_read::{self, NEEDS_APPROVAL};
 use super::*;
 use crate::{
-    agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool},
+    agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
     sql::{AgentVerdict, agent_gate},
 };
 
@@ -55,9 +55,37 @@ pub(crate) struct AgentState {
 // Phase 5 (READ-10, APPR-12) turns it into the audit, which is kept.
 pub(crate) const LOG_CAP: usize = 20;
 
-/// One call that ended. Names, a code and a time, and nothing the call carried:
-/// no row, no statement, no host, user or path. Held in memory and gone with
-/// the window.
+/// How many characters of an agent's own statement an audit entry keeps.
+const AUDIT_SQL_CAP: usize = 4096;
+
+/// What an entry's SQL ends with once it was cut at [`AUDIT_SQL_CAP`].
+const SQL_CLIPPED: &str = " [clipped]";
+
+/// What was decided about a statement before it ran, as the audit says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuditVerdict {
+    /// The gate let it through and it ran on the agent's own connection.
+    Run,
+}
+
+/// What a call knew about itself at its end, beyond who made it and how it
+/// ended. A call that has none of these, such as a ping, takes the default.
+#[derive(Default)]
+pub(crate) struct CallFacts {
+    pub(crate) verdict: Option<AuditVerdict>,
+    /// The statement exactly as the agent sent it.
+    pub(crate) sql: Option<String>,
+    /// How many rows went back to the agent, and how many there were.
+    pub(crate) shown: Option<usize>,
+    pub(crate) total: Option<Total>,
+    /// Whole milliseconds from the call's arrival to its end.
+    pub(crate) elapsed_ms: u64,
+    pub(crate) error: Option<String>,
+}
+
+/// One call that ended: its names, its code, its time and what the agent sent.
+/// Never a row: the audit shows that a read happened and how much came back,
+/// not what was in it. Held in memory and gone with the window.
 #[derive(Clone, Debug)]
 pub(crate) struct LogEntry {
     /// Unix milliseconds when the call ended, as the palette's history keeps
@@ -74,6 +102,27 @@ pub(crate) struct LogEntry {
     pub(crate) status: Status,
     /// The answer could not be delivered, because its caller had already gone.
     pub(crate) requester_gone: bool,
+    /// `None` for the tools that carry no statement.
+    pub(crate) verdict: Option<AuditVerdict>,
+    /// The agent's statement, cut at [`AUDIT_SQL_CAP`] characters.
+    pub(crate) sql: Option<String>,
+    pub(crate) shown: Option<usize>,
+    pub(crate) total: Option<Total>,
+    pub(crate) elapsed_ms: u64,
+    /// The full error of a call that failed, which the agent was not given.
+    pub(crate) error: Option<String>,
+}
+
+impl LogEntry {
+    /// Whether the agent was given fewer rows than there were, or than the
+    /// statement could have returned.
+    pub(crate) fn capped(&self) -> bool {
+        match (self.shown, self.total) {
+            (_, Some(Total::AtLeast(_))) => true,
+            (Some(shown), Some(Total::Exact(total))) => total > shown,
+            _ => false,
+        }
+    }
 }
 
 /// How many characters of an agent's own text the log keeps.
@@ -85,9 +134,16 @@ pub(crate) fn unix_millis() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
+/// Whole milliseconds since `arrived`, truncated.
+pub(crate) fn elapsed_ms(arrived: Instant) -> u64 {
+    arrived.elapsed().as_millis() as u64
+}
+
 impl AgentState {
     /// Write one ended call at the front of the log. Called once per call, from
-    /// the places that answer it.
+    /// the places that answer it. Entries are ordered by insertion and never by
+    /// their time, so two calls that end in the same millisecond keep the order
+    /// they ended in.
     pub(super) fn record(
         &mut self,
         id: CallId,
@@ -95,6 +151,7 @@ impl AgentState {
         resolved: Option<String>,
         asked: Option<&str>,
         status: Status,
+        facts: CallFacts,
     ) {
         self.log.push_front(LogEntry {
             at: unix_millis(),
@@ -109,9 +166,24 @@ impl AgentState {
             }),
             status,
             requester_gone: false,
+            verdict: facts.verdict,
+            sql: facts.sql.map(clipped_sql),
+            shown: facts.shown,
+            total: facts.total,
+            elapsed_ms: facts.elapsed_ms,
+            error: facts.error,
         });
         self.log.truncate(LOG_CAP);
     }
+}
+
+/// `sql` cut at [`AUDIT_SQL_CAP`] characters, on a character boundary.
+fn clipped_sql(mut sql: String) -> String {
+    if let Some((cut, _)) = sql.char_indices().nth(AUDIT_SQL_CAP) {
+        sql.truncate(cut);
+        sql.push_str(SQL_CLIPPED);
+    }
+    sql
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -127,6 +199,8 @@ pub(crate) struct PendingCall {
     /// it after the profile is gone.
     profile_name: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
+    /// When the call reached [`Workspace::on_agent_message`].
+    arrived: Instant,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
     _expiry: gpui::Task<()>,
@@ -264,6 +338,23 @@ impl Workspace {
             cx.notify();
         }
         drawn
+    }
+
+    /// Put up the `Agent activity` dialog. Changes nothing but what is drawn.
+    pub(crate) fn show_agent_activity(&mut self, cx: &mut Context<Self>) {
+        self.agent_audit_open = true;
+        cx.notify();
+    }
+
+    /// Close the dialog and hand the keyboard back. Answers whether it was
+    /// open, so `escape` is only spent on a dialog that was drawn.
+    pub(crate) fn close_agent_audit(&mut self, cx: &mut Context<Self>) -> bool {
+        if !std::mem::take(&mut self.agent_audit_open) {
+            return false;
+        }
+        self.refocus_front();
+        cx.notify();
+        true
     }
 
     /// Make a profile visible to agents or hide it. Keyed by id, never by
@@ -538,6 +629,7 @@ impl Workspace {
     /// What an agent asked for. Opens no connection and starts no database
     /// work: the answer is read from the profile list as it stands.
     pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
+        let arrived = Instant::now();
         match message {
             Inbound::PresenceOpened { conn } => {
                 self.agent.presence.push(conn);
@@ -570,8 +662,17 @@ impl Workspace {
                     status: Status::Executed,
                     text,
                 });
-                self.agent
-                    .record(id, Tool::ListConnections, None, None, Status::Executed);
+                self.agent.record(
+                    id,
+                    Tool::ListConnections,
+                    None,
+                    None,
+                    Status::Executed,
+                    CallFacts {
+                        elapsed_ms: elapsed_ms(arrived),
+                        ..CallFacts::default()
+                    },
+                );
             }
             Inbound::Call {
                 tool: Tool::ExecuteSql,
@@ -611,7 +712,7 @@ impl Workspace {
                 let sql = args.sql.unwrap_or_default();
                 let refused = match agent_gate(engine, &sql, mode) {
                     AgentVerdict::Run => {
-                        self.run_agent_sql(id, profile_id, sql, reply, cx);
+                        self.run_agent_sql(id, profile_id, sql, reply, arrived, cx);
                         return;
                     }
                     // The verdict's contents are what an approval will show,
@@ -656,6 +757,7 @@ impl Workspace {
                             None,
                             connection.as_deref(),
                             Status::RefusedByGate,
+                            CallFacts::default(),
                         );
                         return;
                     }
@@ -672,6 +774,7 @@ impl Workspace {
                     tool: Tool::Ping,
                     profile_name,
                     reply,
+                    arrived,
                     _expiry: expiry,
                 });
                 cx.notify();
@@ -702,8 +805,14 @@ impl Workspace {
     ) {
         // The caller may have hung up, and then nobody reads this.
         let _ = reply.send(Reply { status, text });
-        self.agent
-            .record(id, Tool::ExecuteSql, resolved, asked, status);
+        self.agent.record(
+            id,
+            Tool::ExecuteSql,
+            resolved,
+            asked,
+            status,
+            CallFacts::default(),
+        );
     }
 
     /// The one door every call ends through: answered, expired or hung up.
@@ -723,7 +832,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
-            return self.finish_read(id, status, text, true, cx);
+            return self.finish_read(id, status, text, true, None, cx);
         };
         let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
@@ -733,8 +842,17 @@ impl Workspace {
         }
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
-        self.agent
-            .record(id, call.tool, Some(call.profile_name), None, status);
+        self.agent.record(
+            id,
+            call.tool,
+            Some(call.profile_name),
+            None,
+            status,
+            CallFacts {
+                elapsed_ms: elapsed_ms(call.arrived),
+                ..CallFacts::default()
+            },
+        );
         if was_in_front {
             // The dialog took the keyboard when it went up and goes away with
             // the call, by whichever route the call ended.

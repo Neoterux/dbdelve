@@ -17,6 +17,7 @@ use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
 use crate::actions::{ConfirmDialog, NextDialogButton, PreviousDialogButton, TickDialogBox};
+use crate::agent::result::Total;
 use crate::connection_form::{ConnectionTest, Reported, dialects, suggested_dialect};
 use crate::explorer::{
     Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase, Shortcuts,
@@ -1000,6 +1001,7 @@ impl Workspace {
             Some("import-rows") | None => 0,
             // Deny alone: Approve is click-only and never a stop.
             Some("agent-ping") => 1,
+            Some("agent-audit") => 1,
             Some(_) => 2 + checkbox,
         }
     }
@@ -1133,6 +1135,7 @@ impl Workspace {
             ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
             // Every index denies: no key approves a ping.
             ("agent-ping", _) => _ = self.deny_front_ping(cx),
+            ("agent-audit", _) => _ = self.close_agent_audit(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
             ("delete", 0) => match deleting {
@@ -1566,6 +1569,135 @@ impl Workspace {
                                         t,
                                     ),
                                 ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What agents did this session, newest first: one block per call with its
+    /// tool, connection, verdict, row counts, time and statement, and the full
+    /// error of a call that failed. Never a row. Drawn below the titlebar, as
+    /// the ping is, so the mark stays reachable.
+    ///
+    /// ponytail: every entry is laid out while the dialog is open. The upgrade
+    /// is a virtual list, if five hundred entries ever prove slow.
+    pub(crate) fn render_agent_audit(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.agent_audit_open {
+            return None;
+        }
+        let t = popup_theme(cx);
+        let code = fonts(cx).editor.clone();
+        let now = agent::unix_millis();
+        let text_size = px(layout::chrome(layout::TEXT_SM));
+        let close_workspace = cx.entity().downgrade();
+        let entries: Vec<Div> = self
+            .agent
+            .log
+            .iter()
+            .map(|entry| {
+                let mut lines = vec![
+                    div()
+                        .text_color(t.text)
+                        .child(super::agent_log_label(entry, now)),
+                ];
+                if let Some(verdict) = &entry.verdict {
+                    lines.push(div().text_color(t.text_muted).child(match verdict {
+                        agent::AuditVerdict::Run => "Ran".to_string(),
+                    }));
+                }
+                if let (Some(shown), Some(total)) = (entry.shown, entry.total) {
+                    let of = match total {
+                        Total::Exact(total) => total.to_string(),
+                        Total::AtLeast(total) => format!("at least {total}"),
+                    };
+                    let capped = if entry.capped() { ", capped" } else { "" };
+                    lines.push(div().text_color(t.text_muted).child(format!(
+                        "{shown} rows shown of {of}{capped}, {} ms",
+                        entry.elapsed_ms
+                    )));
+                } else {
+                    lines.push(
+                        div()
+                            .text_color(t.text_muted)
+                            .child(format!("{} ms", entry.elapsed_ms)),
+                    );
+                }
+                if let Some(sql) = &entry.sql {
+                    lines.push(
+                        div()
+                            .debug_selector(|| "agent-audit-sql".into())
+                            .font_family(code.clone())
+                            .text_color(t.text_muted)
+                            .child(sql.clone()),
+                    );
+                }
+                if let Some(error) = &entry.error {
+                    lines.push(div().text_color(t.text_muted).child(error.clone()));
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(layout::SPACE_XS))
+                    .children(lines)
+            })
+            .collect();
+
+        Some(
+            div()
+                .absolute()
+                .top(px(layout::TITLEBAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Agent activity"))
+                        .child(
+                            div()
+                                .id("agent-audit-list")
+                                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(layout::SPACE_MD))
+                                .text_size(text_size)
+                                .when(entries.is_empty(), |list| {
+                                    list.child(
+                                        div()
+                                            .debug_selector(|| "agent-audit-empty".into())
+                                            .text_color(t.text_muted)
+                                            .child("No agent calls in this session."),
+                                    )
+                                })
+                                .children(entries),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                self.choice(
+                                    "agent-audit",
+                                    0,
+                                    button(
+                                        "close-agent-audit",
+                                        "Close",
+                                        Tone::Quiet,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = close_workspace.update(cx, |workspace, cx| {
+                                                workspace.close_agent_audit(cx);
+                                            });
+                                        },
+                                    ),
+                                    t,
+                                ),
+                            ),
                         ),
                 )
                 .into_any_element(),
