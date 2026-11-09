@@ -67,6 +67,41 @@ const SQL_CLIPPED: &str = " [clipped]";
 pub(crate) enum AuditVerdict {
     /// The gate let it through and it ran on the agent's own connection.
     Run,
+    /// The gate held it for a person: the lowest mode that lets it run, and the
+    /// expiry text of a statement that schedules a removal.
+    Approve { mode: Mode, expiry: Option<String> },
+    /// The gate refused it, for this reason.
+    Refuse(String),
+}
+
+impl AuditVerdict {
+    /// The line the Agent activity dialog shows for it.
+    pub(crate) fn line(&self) -> String {
+        match self {
+            Self::Run => "Ran".to_string(),
+            Self::Approve {
+                mode,
+                expiry: Some(expiry),
+            } => format!("Needs approval at {}. {expiry}", mode.label()),
+            Self::Approve { mode, expiry: None } => {
+                format!("Needs approval at {}", mode.label())
+            }
+            Self::Refuse(reason) => format!("Refused: {reason}"),
+        }
+    }
+
+    /// What the audit says of a gate verdict that held or refused a statement;
+    /// `None` for `Run`, which the read itself gives its verdict.
+    fn held_by(verdict: AgentVerdict) -> Option<Self> {
+        match verdict {
+            AgentVerdict::Run => None,
+            AgentVerdict::Approve(verdict, expiry) => Some(Self::Approve {
+                mode: verdict.mode,
+                expiry: expiry.map(|expiry| expiry.to_string()),
+            }),
+            AgentVerdict::Refuse(reason) => Some(Self::Refuse(reason.to_string())),
+        }
+    }
 }
 
 /// What a call knew about itself at its end, beyond who made it and how it
@@ -702,8 +737,14 @@ impl Workspace {
                             None,
                             connection.as_deref(),
                             &reply,
-                            Status::RefusedByGate,
-                            lookup.to_string(),
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
                         );
                         return;
                     }
@@ -711,13 +752,14 @@ impl Workspace {
                 // The schema requires a statement, so only an injected call
                 // has none; it is the empty statement.
                 let sql = args.sql.unwrap_or_default();
-                let refused = match agent_gate(engine, &sql, mode) {
+                let verdict = agent_gate(engine, &sql, mode);
+                // The verdict's contents are what an approval will show,
+                // which agents do not get.
+                let refused = match &verdict {
                     AgentVerdict::Run => {
                         self.run_agent_sql(id, profile_id, sql, reply, arrived, cx);
                         return;
                     }
-                    // The verdict's contents are what an approval will show,
-                    // which agents do not get.
                     AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
                     AgentVerdict::Refuse(reason) => reason.to_string(),
                 };
@@ -726,8 +768,16 @@ impl Workspace {
                     Some(profile_name),
                     None,
                     &reply,
-                    Status::RefusedByGate,
-                    refused,
+                    Reply {
+                        status: Status::RefusedByGate,
+                        text: refused,
+                    },
+                    CallFacts {
+                        verdict: AuditVerdict::held_by(verdict),
+                        sql: Some(sql),
+                        elapsed_ms: elapsed_ms(arrived),
+                        ..CallFacts::default()
+                    },
                 );
             }
             Inbound::Call {
@@ -801,19 +851,14 @@ impl Workspace {
         resolved: Option<String>,
         asked: Option<&str>,
         reply: &SyncSender<Reply>,
-        status: Status,
-        text: String,
+        answer: Reply,
+        facts: CallFacts,
     ) {
+        let status = answer.status;
         // The caller may have hung up, and then nobody reads this.
-        let _ = reply.send(Reply { status, text });
-        self.agent.record(
-            id,
-            Tool::ExecuteSql,
-            resolved,
-            asked,
-            status,
-            CallFacts::default(),
-        );
+        let _ = reply.send(answer);
+        self.agent
+            .record(id, Tool::ExecuteSql, resolved, asked, status, facts);
     }
 
     /// The one door every call ends through: answered, expired or hung up.
@@ -942,6 +987,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_approval_with_an_expiry_is_audited_with_its_text() {
+        use crate::sql::{Expiry, Verdict};
+
+        let verdict = Verdict {
+            mode: Mode::ReadWrite,
+            destructive: Vec::new(),
+        };
+        assert_eq!(
+            AuditVerdict::held_by(AgentVerdict::Approve(verdict.clone(), Some(Expiry::Key))),
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadWrite,
+                expiry: Some(Expiry::Key.to_string()),
+            })
+        );
+        assert_eq!(
+            AuditVerdict::held_by(AgentVerdict::Approve(verdict, None)),
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadWrite,
+                expiry: None,
+            })
+        );
+        assert_eq!(AuditVerdict::held_by(AgentVerdict::Run), None);
     }
 
     #[test]

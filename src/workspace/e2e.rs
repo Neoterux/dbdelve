@@ -5567,6 +5567,63 @@ fn every_agent_call_is_audited_with_its_verdict_and_never_its_rows(cx: &mut Test
     });
 }
 
+#[gpui::test]
+fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAppContext) {
+    use super::agent::AuditVerdict;
+    use crate::{actions::ShowAgentActivity, agent::Status, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let insert = "INSERT INTO t VALUES (9, 'z')";
+        let drop = "DROP TABLE t";
+        inject_sql(&workspace, cx, "Orders", insert);
+        inject_sql(&workspace, cx, "Orders", drop);
+        cx.run_until_parked();
+
+        let log = agent_log(&workspace, cx);
+        let refusal = "DROP is refused for agent statements";
+        // Newest first: the DROP, then the INSERT.
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            (log[0].status, log[0].verdict.clone(), log[0].sql.as_deref()),
+            (
+                Status::RefusedByGate,
+                Some(AuditVerdict::Refuse(refusal.to_string())),
+                Some(drop)
+            )
+        );
+        assert_eq!(
+            (log[1].status, log[1].verdict.clone(), log[1].sql.as_deref()),
+            (
+                Status::RefusedByGate,
+                Some(AuditVerdict::Approve {
+                    mode: Mode::ReadWrite,
+                    expiry: None
+                }),
+                Some(insert)
+            )
+        );
+        for entry in &log {
+            assert_eq!((entry.shown, entry.total), (None, None), "{entry:?}");
+        }
+
+        assert_eq!(
+            log[0].verdict.as_ref().map(|v| v.line()),
+            Some(format!("Refused: {refusal}"))
+        );
+        assert_eq!(
+            log[1].verdict.as_ref().map(|v| v.line()).as_deref(),
+            Some("Needs approval at Read-write")
+        );
+        // The dialog draws both entries with their statements.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(cx.debug_bounds("agent-audit-sql").is_some());
+        quit(workspace, cx);
+    });
+}
+
 #[test]
 fn an_entry_is_capped_when_the_agent_was_given_fewer_rows_than_there_were() {
     use super::agent::LogEntry;
