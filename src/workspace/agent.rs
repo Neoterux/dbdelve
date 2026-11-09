@@ -12,7 +12,7 @@
 
 use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
-use super::agent_read::{self, AgentWork, NEEDS_APPROVAL};
+use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, explain_statement};
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
@@ -795,6 +795,77 @@ impl Workspace {
                         ..CallFacts::default()
                     },
                 );
+            }
+            Inbound::Call {
+                tool: Tool::ExplainQuery,
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility(cx);
+                let found = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(|profile| {
+                        (
+                            profile.id.clone(),
+                            profile.name.clone(),
+                            profile.config.engine(),
+                            profile.mode,
+                        )
+                    }),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let (profile_id, profile_name, engine, mode) = match found {
+                    Ok(found) => found,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            Tool::ExplainQuery,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The schema requires a statement, so only an injected call
+                // has none; it is the empty statement.
+                let sql = args.sql.unwrap_or_default();
+                match explain_statement(engine, &sql, args.analyze.unwrap_or(false), mode) {
+                    Ok(statement) => self.run_agent_work(
+                        id,
+                        profile_id,
+                        AgentWork::Explain { statement },
+                        reply,
+                        arrived,
+                        cx,
+                    ),
+                    Err(declined) => self.agent_answered(
+                        id,
+                        Tool::ExplainQuery,
+                        Some(profile_name),
+                        None,
+                        &reply,
+                        Reply {
+                            status: declined.status,
+                            text: declined.text,
+                        },
+                        CallFacts {
+                            verdict: declined.verdict.and_then(AuditVerdict::held_by),
+                            sql: declined.sql,
+                            elapsed_ms: elapsed_ms(arrived),
+                            ..CallFacts::default()
+                        },
+                    ),
+                }
             }
             Inbound::Call {
                 tool: tool @ (Tool::ListSchemas | Tool::ListTables | Tool::DescribeTable),

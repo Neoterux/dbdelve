@@ -10,7 +10,10 @@
 //! The statement is sent exactly as the agent wrote it, after
 //! [`crate::sql::agent_gate`] judged that text. Nothing is appended to it,
 //! wrapped around it or rewritten, so the gate's verdict is about what the
-//! server receives.
+//! server receives. The one exception is `explain_query`, which sends the
+//! engine's EXPLAIN of the statement: [`explain_statement`] composes it first
+//! and the gate judges that composed text, so the verdict is again about what
+//! the server receives.
 
 use std::{
     collections::VecDeque,
@@ -23,15 +26,24 @@ use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
     db::{
-        CancelToken, Catalog, Connection, ConnectionConfig, DbError, Fetch, IndexKind, QueryResult,
-        RelationKind, Structure,
+        CancelToken, Catalog, Connection, ConnectionConfig, DbError, ExplainMode, Fetch, IndexKind,
+        QueryResult, RelationKind, Structure,
     },
+    explain::compact,
+    sql::{AgentVerdict, agent_gate},
 };
 
 // ponytail: an agent is told the first hundred rows, and the tool takes no
 // count, so what a call can cost the model's context does not depend on what
 // the model asks for. The upgrade is a setting, if a user ever needs one.
 pub(crate) const AGENT_ROWS: usize = 100;
+
+// ponytail: the most rows of a plan that are read back. A real plan is tens of
+// lines, and an ANALYZE has already run the statement by the time they arrive,
+// so the rows are drained rather than stopped; the ceiling only keeps a server
+// that answers a plan with a table from filling memory. The upgrade is a setting,
+// if a plan ever needs more.
+pub(crate) const PLAN_ROWS: usize = 10_000;
 
 // ponytail: the longest an agent's statement runs when the profile sets no
 // timeout of its own, so no agent connection is ever unbounded. A profile's own
@@ -242,6 +254,11 @@ pub(crate) enum AgentWork {
         schema: String,
         table: String,
     },
+    /// The engine's EXPLAIN of the agent's statement, already composed and
+    /// already judged by the gate as this exact text.
+    Explain {
+        statement: String,
+    },
 }
 
 impl AgentWork {
@@ -251,6 +268,7 @@ impl AgentWork {
             AgentWork::Catalog { schema: None } => Tool::ListSchemas,
             AgentWork::Catalog { schema: Some(_) } => Tool::ListTables,
             AgentWork::Structure { .. } => Tool::DescribeTable,
+            AgentWork::Explain { .. } => Tool::ExplainQuery,
         }
     }
 
@@ -258,6 +276,7 @@ impl AgentWork {
     fn sql(&self) -> Option<String> {
         match self {
             AgentWork::Query { sql } => Some(sql.clone()),
+            AgentWork::Explain { statement } => Some(statement.clone()),
             AgentWork::Catalog { .. } | AgentWork::Structure { .. } => None,
         }
     }
@@ -543,6 +562,9 @@ impl Workspace {
                                 schema.as_deref(),
                                 engine.agent_catalog_note(),
                             ),
+                            AgentWork::Explain { statement } => {
+                                explain_on(connection, hidden, &statement, &cancel)
+                            }
                             AgentWork::Structure { schema, table } => describe_on(
                                 connection,
                                 hidden,
@@ -604,10 +626,12 @@ impl Workspace {
         let mut ended = Ended::default();
         // What a catalog call that found nothing says: which tool asked decides
         // whether it was a schema or a relation.
-        let not_found = match lane.running.as_ref().map(|running| running.tool) {
+        let tool = lane.running.as_ref().map(|running| running.tool);
+        let not_found = match tool {
             Some(Tool::DescribeTable) => NOT_IN_CATALOG,
             _ => NO_SUCH_SCHEMA,
         };
+        let explaining = tool == Some(Tool::ExplainQuery);
         let (status, text) = match ran {
             Ran::NotOpened(error) => {
                 lane.connection = None;
@@ -625,12 +649,17 @@ impl Workspace {
                     lane.connection = Some(connection);
                     lane.hidden = hidden;
                 }
-                let table = table_of(engine, &result);
-                ended.rows = Some((table.rows.len(), table.total));
-                (
-                    Status::Executed,
-                    result::text(&[table], result.rest.len(), None),
-                )
+                if explaining {
+                    ended.rows = Some((result.rows.len(), Total::Exact(result.rows.len())));
+                    plan_reply(engine, &result)
+                } else {
+                    let table = table_of(engine, &result);
+                    ended.rows = Some((table.rows.len(), table.total));
+                    (
+                        Status::Executed,
+                        result::text(&[table], result.rest.len(), None),
+                    )
+                }
             }
             Ran::Listed {
                 connection,
@@ -867,6 +896,30 @@ fn read_on(
     }
 }
 
+/// The blocking half of `explain_query`: send the composed EXPLAIN as it is
+/// and read the whole plan back. Drained, never stopped at a limit: an ANALYZE
+/// has already run the statement it wraps when the first row arrives.
+fn explain_on(
+    connection: Connection,
+    hidden: Vec<String>,
+    statement: &str,
+    cancel: &CancelToken,
+) -> Ran {
+    let result = connection.query(
+        statement,
+        cancel,
+        Fetch {
+            limit: Some(PLAN_ROWS),
+            ..Fetch::default()
+        },
+    );
+    Ran::Done {
+        connection,
+        hidden,
+        result,
+    }
+}
+
 /// The blocking half of a catalog call: read the catalog on the agent's
 /// connection and write it as the agent reads it. `schema` is `None` for the
 /// schemas and a name for the relations of that one.
@@ -959,6 +1012,130 @@ fn describe(
         text: structure_text(&structure, note),
         rows,
     }))
+}
+
+/// Said for a statement that is already an EXPLAIN: wrapping it again would
+/// ask the server to explain an explanation.
+pub(crate) const ALREADY_EXPLAIN: &str = "the statement is already an EXPLAIN";
+
+/// Said for an engine that has no way to ask for a plan.
+fn no_plan(engine: Engine) -> String {
+    format!("DBDelve does not read query plans from {}.", engine.label())
+}
+
+/// Said for `analyze` on an engine that can plan but not measure. Nothing is
+/// run, and a plain plan is not given in its place.
+fn no_analyzed_plan(engine: Engine) -> String {
+    format!(
+        "DBDelve reads no analyzed plan from {}; nothing was run.",
+        engine.label()
+    )
+}
+
+/// Said for an answer that held no plan node.
+fn empty_plan(engine: Engine) -> String {
+    format!("{} returned no plan DBDelve could read.", engine.label())
+}
+
+/// What `explain_statement` answered without sending anything: how, and what
+/// the audit records of it. `verdict` and `sql` are set when the gate judged a
+/// composed statement.
+#[derive(Debug)]
+pub(crate) struct Declined {
+    pub(crate) status: Status,
+    pub(crate) text: String,
+    pub(crate) verdict: Option<AgentVerdict>,
+    pub(crate) sql: Option<String>,
+}
+
+impl Declined {
+    fn said(status: Status, text: String) -> Self {
+        Declined {
+            status,
+            text,
+            verdict: None,
+            sql: None,
+        }
+    }
+}
+
+/// The statement an `explain_query` call sends, or the answer it gets instead.
+///
+/// Every check comes before anything is composed or sent, in this order: an
+/// input that is already an EXPLAIN; an engine with no plan; `analyze` on an
+/// engine with no analyzed plan, which is never answered with a plain plan; a
+/// statement the engine cannot explain. Then the engine composes its EXPLAIN
+/// and [`agent_gate`] judges that exact text, so an ANALYZE follows the verdict
+/// of the statement it wraps. Only `Run` returns the statement, and that string
+/// is what is sent.
+pub(crate) fn explain_statement(
+    engine: Engine,
+    sql: &str,
+    analyze: bool,
+    mode: Mode,
+) -> Result<String, Declined> {
+    if crate::sql::typed_explain(engine, sql).is_some() {
+        return Err(Declined::said(
+            Status::RefusedByGate,
+            ALREADY_EXPLAIN.to_string(),
+        ));
+    }
+    if engine.explain_prefix(ExplainMode::Plan).is_none() {
+        return Err(Declined::said(Status::Executed, no_plan(engine)));
+    }
+    let explaining = if analyze {
+        ExplainMode::Analyze
+    } else {
+        ExplainMode::Plan
+    };
+    if engine.explain_prefix(explaining).is_none() {
+        return Err(Declined::said(Status::Executed, no_analyzed_plan(engine)));
+    }
+    if let Err(message) = crate::sql::explainable(engine, sql) {
+        return Err(Declined::said(Status::RefusedByGate, message));
+    }
+    let Some(composed) = engine.explain(explaining, sql) else {
+        return Err(Declined::said(Status::Executed, no_plan(engine)));
+    };
+    let verdict = agent_gate(engine, &composed, mode);
+    // What an approval would show is not for the agent.
+    let text = match &verdict {
+        AgentVerdict::Run => return Ok(composed),
+        AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
+        AgentVerdict::Refuse(reason) => reason.to_string(),
+    };
+    Err(Declined {
+        status: Status::RefusedByGate,
+        text,
+        verdict: Some(verdict),
+        sql: Some(composed),
+    })
+}
+
+/// The reply for a plan that came back: the compact text, findings before the
+/// tree, or a sentence when no node could be read.
+fn plan_reply(engine: Engine, result: &QueryResult) -> (Status, String) {
+    let columns: Vec<String> = result
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    if crate::explain::parse(&columns, &result.rows)
+        .nodes
+        .is_empty()
+    {
+        return (Status::Executed, empty_plan(engine));
+    }
+    (
+        Status::Executed,
+        compact::agent_plan(
+            &columns,
+            &result.rows,
+            engine,
+            compact::NODE_CAP,
+            result::RESULT_BUDGET,
+        ),
+    )
 }
 
 fn table_of_names(heads: &[&str], rows: Vec<Vec<Option<String>>>) -> result::Table {
@@ -1131,6 +1308,36 @@ mod tests {
             relations,
             routines: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_statement_is_sent_only_as_the_composed_explain_the_gate_ran() {
+        let select = "SELECT * FROM t";
+        let composed = explain_statement(Engine::Postgres, select, false, Mode::ReadOnly)
+            .expect("a plain plan of a read runs");
+        assert_eq!(composed, "EXPLAIN SELECT * FROM t");
+        let composed = explain_statement(Engine::Postgres, select, true, Mode::ReadOnly)
+            .expect("an analyzed plan of a read runs");
+        assert_eq!(composed, "EXPLAIN ANALYZE SELECT * FROM t");
+
+        // An ANALYZE of a write is never sent, and says what the gate judged.
+        for mode in Mode::ALL {
+            let held = explain_statement(Engine::Postgres, "UPDATE t SET a = 1", true, mode)
+                .expect_err("an analyzed update is not run");
+            assert_eq!(held.status, Status::RefusedByGate);
+            assert_eq!(
+                held.sql.as_deref(),
+                Some("EXPLAIN ANALYZE UPDATE t SET a = 1")
+            );
+            assert!(held.verdict.is_some());
+            assert_ne!(held.text, "");
+            let removed = explain_statement(Engine::Postgres, "DELETE FROM t", true, mode)
+                .expect_err("an analyzed delete is not run");
+            assert_eq!(removed.status, Status::RefusedByGate);
+        }
+        let held = explain_statement(Engine::Postgres, "UPDATE t SET a = 1", true, Mode::Full)
+            .expect_err("a person approves it first");
+        assert_eq!(held.text, NEEDS_APPROVAL);
     }
 
     #[test]

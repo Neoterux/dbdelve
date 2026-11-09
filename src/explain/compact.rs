@@ -15,13 +15,6 @@
 //! escaped. Every server line is clipped at [`PLAN_LINE_CAP`] characters.
 //! Everything this module writes is ASCII; the raw lines of a plan that is a
 //! table or flat text are the server's own words, and may not be.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the explain_query tool (Phase 5) is the first caller"
-    )
-)]
 
 use std::cmp::Ordering;
 
@@ -55,6 +48,8 @@ pub(crate) const PLAN_LINE_CAP: usize = 300;
 /// findings name, then the rest by value, each only while its whole chain still
 /// fits. The first line says so, and each kept node that lost descendants says
 /// how many. A finding on a node that was cut is counted, not listed.
+// The reply always has a byte budget, so only the tests ask for no cut.
+#[cfg(test)]
 pub(crate) fn compact(plan: &Plan, analysis: &Analysis, max_nodes: usize) -> String {
     compact_within(plan, analysis, max_nodes, usize::MAX)
 }
@@ -85,15 +80,16 @@ pub(crate) fn agent_plan(
     max_bytes: usize,
 ) -> String {
     let plan = parse(columns, rows);
-    let raw = degenerate(&plan).then(|| {
-        if columns.len() > 1 {
-            tabular_text(columns, rows)
-        } else {
-            plan.text.clone()
-        }
-    });
     let analysis = Analysis::new(&plan, engine);
-    render(&plan, &analysis, raw.as_deref(), max_nodes, max_bytes)
+    // A table's rows are written as pairs; flat text is the plan's own text,
+    // which `compact_within` already prints for a plan that is degenerate.
+    match degenerate(&plan) && columns.len() > 1 {
+        true => {
+            let raw = tabular_text(columns, rows);
+            render(&plan, &analysis, Some(&raw), max_nodes, max_bytes)
+        }
+        false => compact_within(&plan, &analysis, max_nodes, max_bytes),
+    }
 }
 
 /// Whether `plan` parsed to a shell and not a tree: one node with no figures

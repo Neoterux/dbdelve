@@ -7439,3 +7439,77 @@ fn an_agent_read_leaves_the_users_open_transaction_alone(cx: &mut TestAppContext
         quit(workspace, cx);
     });
 }
+
+const EXPLAINED_SCHEMA: &str = "CREATE TABLE a (id INTEGER PRIMARY KEY);\
+     CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, x INTEGER);\
+     CREATE INDEX b_x ON b (x);";
+
+const EXPLAINED_QUERY: &str = "SELECT * FROM a JOIN b ON a.id = b.a_id WHERE b.x = 1";
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_explains_a_query_and_reads_findings_first(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        workspace::agent::AuditVerdict,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, EXPLAINED_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "explain_query",
+            serde_json::json!({"connection": "Orders", "sql": EXPLAINED_QUERY}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        let body = text
+            .strip_prefix("status: executed\n")
+            .unwrap_or_else(|| panic!("not executed: {text}"));
+        let lines: Vec<&str> = body.lines().collect();
+        let at = |start: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(start))
+                .unwrap_or_else(|| panic!("no `{start}` line in {text}"))
+        };
+        let (truncated, plan, findings, tree) = (
+            at("truncated:"),
+            at("plan: engine=sqlite analyzed=no"),
+            at("findings"),
+            at("tree:"),
+        );
+        assert!(
+            truncated < plan && plan < findings && findings < tree,
+            "{text}"
+        );
+        assert!(
+            lines[tree..].iter().any(|line| line.contains("n0")),
+            "{text}"
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [(Tool::ExplainQuery, Status::Executed)]
+        );
+        let sql = log[0]
+            .sql
+            .as_deref()
+            .expect("the audit holds the statement");
+        assert!(sql.starts_with("EXPLAIN QUERY PLAN SELECT"), "{sql}");
+        assert_eq!(log[0].verdict, Some(AuditVerdict::Run));
+        assert!(log[0].error.is_none(), "{:?}", log[0]);
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
