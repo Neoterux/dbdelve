@@ -57,10 +57,10 @@ pub(crate) struct AgentState {
 pub(crate) const AUDIT_CAP: usize = 500;
 
 /// How many characters of an agent's own statement an audit entry keeps.
-const AUDIT_SQL_CAP: usize = 4096;
+pub(super) const AUDIT_SQL_CAP: usize = 4096;
 
 /// What an entry's SQL ends with once it was cut at [`AUDIT_SQL_CAP`].
-const SQL_CLIPPED: &str = " [clipped]";
+pub(super) const SQL_CLIPPED: &str = " [clipped]";
 
 /// What was decided about a statement before it ran, as the audit says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -878,7 +878,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
-            return self.finish_read(id, status, text, true, None, cx);
+            return self.finish_read(id, status, text, true, Default::default(), cx);
         };
         let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);

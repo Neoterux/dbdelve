@@ -6267,6 +6267,101 @@ fn a_connection_that_will_not_open_answers_a_fixed_sentence(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn a_failed_call_keeps_its_full_error_in_the_audit_only(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        let read = |cx: &mut VisualTestContext, sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the call answered")
+        };
+
+        // The statement names the file, so the server's words repeat it.
+        let named = format!("SELECT * FROM \"{}\"", database.display());
+        let failed = read(cx, &named);
+        assert_eq!(failed.status, Status::Failed, "{}", failed.text);
+        assert!(
+            !names_whole(&failed.text, &database.display().to_string()),
+            "{}",
+            failed.text
+        );
+        let missing = read(cx, "SELECT * FROM missing");
+        assert_eq!(missing.status, Status::Failed, "{}", missing.text);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log[0].sql.as_deref(), Some("SELECT * FROM missing"));
+        let error = log[0].error.as_deref().expect("the failure is audited");
+        assert!(error.contains("no such table: missing"), "{error}");
+        let error = log[1].error.as_deref().expect("the failure is audited");
+        assert!(error.contains("no such table"), "{error}");
+        assert!(
+            error.contains(&database.display().to_string()),
+            "the audit keeps the path: {error}"
+        );
+
+        // A directory where the database file was: nothing can open it.
+        std::fs::remove_file(&database).expect("the database file is there");
+        std::fs::create_dir(&database).expect("a directory takes its place");
+        let reply = read(cx, "SELECT 1");
+        assert_eq!(reply.status, Status::Failed);
+        assert_eq!(reply.text, super::agent_read::OPEN_FAILED);
+        let log = agent_log(&workspace, cx);
+        let opened = log[0]
+            .error
+            .as_deref()
+            .expect("the open failure is audited");
+        assert!(
+            opened.contains(&database.display().to_string()),
+            "the audit keeps the full open error: {opened}"
+        );
+        for entry in &log {
+            assert_eq!(entry.status, Status::Failed);
+        }
+        assert!(
+            !reply.text.contains(opened),
+            "the full error reached the agent: {}",
+            reply.text
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_long_statement_is_clipped_in_the_audit_on_a_character_boundary(cx: &mut TestAppContext) {
+    use super::agent::{AUDIT_SQL_CAP, SQL_CLIPPED};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let sql = format!("SELECT '{}'", "\u{2026}".repeat(5000));
+        let answers = inject_sql(&workspace, cx, "Orders", &sql);
+        let mut reply = None;
+        drive_until(cx, |_| {
+            reply = reply.take().or_else(|| answers.try_recv().ok());
+            reply.is_some()
+        });
+        let log = agent_log(&workspace, cx);
+        let kept = log[0].sql.as_deref().expect("the statement is audited");
+        assert_eq!(
+            kept.chars().count(),
+            AUDIT_SQL_CAP + SQL_CLIPPED.chars().count()
+        );
+        assert!(kept.ends_with(SQL_CLIPPED));
+        assert!(sql.starts_with(&kept[..kept.len() - SQL_CLIPPED.len()]));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_read_that_outlasts_the_agent_timeout_is_stopped(cx: &mut TestAppContext) {
     use crate::agent::Status;
 

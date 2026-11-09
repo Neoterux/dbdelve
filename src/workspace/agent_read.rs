@@ -227,16 +227,26 @@ pub(crate) enum AgentWork {
     Query { sql: String },
 }
 
+/// What the audit learns of a read from how it ended, beyond what it sent.
+#[derive(Default)]
+pub(super) struct Ended {
+    /// How many rows went back and how many there were, when it was answered
+    /// with a result.
+    pub(super) rows: Option<(usize, Total)>,
+    /// The full error of a read that failed, which the agent was not given.
+    pub(super) error: Option<String>,
+}
+
 /// What a read that ended records of itself: the gate let it run, so what it
-/// sent and how long it took, and `rows` when it was answered with a result.
-fn facts_of(sql: String, arrived: Instant, rows: Option<(usize, Total)>) -> CallFacts {
+/// sent and how long it took, and what `ended` adds.
+fn facts_of(sql: String, arrived: Instant, ended: Ended) -> CallFacts {
     CallFacts {
         verdict: Some(AuditVerdict::Run),
         sql: Some(sql),
-        shown: rows.map(|(shown, _)| shown),
-        total: rows.map(|(_, total)| total),
+        shown: ended.rows.map(|(shown, _)| shown),
+        total: ended.rows.map(|(_, total)| total),
         elapsed_ms: elapsed_ms(arrived),
-        error: None,
+        error: ended.error,
     }
 }
 
@@ -246,8 +256,9 @@ fn facts_of(sql: String, arrived: Instant, rows: Option<(usize, Total)>) -> Call
     reason = "one value per read, moved straight into its landing"
 )]
 enum Ran {
-    /// The connection could not be made, or could not be held read-only.
-    NotOpened,
+    /// The connection could not be made, or could not be held read-only, for
+    /// this reason.
+    NotOpened(DbError),
     Done {
         connection: Connection,
         hidden: Vec<String>,
@@ -428,7 +439,7 @@ impl Workspace {
                         })
                         .await
                     }
-                    Err(_) => Ran::NotOpened,
+                    Err(error) => Ran::NotOpened(error),
                 };
                 // The window may have closed meanwhile, and then nobody is
                 // left to answer.
@@ -476,10 +487,11 @@ impl Workspace {
         if lane.running.as_ref().is_none_or(|running| running.id != id) {
             return;
         }
-        let mut rows = None;
+        let mut ended = Ended::default();
         let (status, text) = match ran {
-            Ran::NotOpened => {
+            Ran::NotOpened(error) => {
                 lane.connection = None;
+                ended.error = Some(error.message);
                 (Status::Failed, OPEN_FAILED.to_string())
             }
             Ran::Done {
@@ -490,7 +502,7 @@ impl Workspace {
                 lane.connection = Some(connection);
                 lane.hidden = hidden;
                 let table = table_of(engine, &result);
-                rows = Some((table.rows.len(), table.total));
+                ended.rows = Some((table.rows.len(), table.total));
                 (Status::Executed, result::text(&[table], result.rest.len()))
             }
             Ran::Done {
@@ -503,21 +515,23 @@ impl Workspace {
                 // closes it without `is_lost` knowing (D-02). The cost is one
                 // reopen after a failed statement.
                 lane.connection = None;
-                (Status::Failed, scrubbed(&error.message, &hidden))
+                let text = scrubbed(&error.message, &hidden);
+                ended.error = Some(error.message);
+                (Status::Failed, text)
             }
         };
         if status == Status::Failed {
             lane.hidden.clear();
         }
-        self.finish_read(id, status, text, false, rows, cx);
+        self.finish_read(id, status, text, false, ended, cx);
     }
 
     /// End the read `id`, running or waiting, once: it is removed first, so a
     /// call that two things end at once is answered and recorded by whichever
     /// comes first. `early` is an end that is not the statement's own answer:
     /// the statement is cancelled on the server and the lane's connection is
-    /// dropped. `rows` is how many rows went back and how many there were, for
-    /// the audit. Then the lane's next call starts. Answers whether there was
+    /// dropped. `ended` is what the audit learns from the end: the rows that went
+    /// back, or the full error. Then the lane's next call starts. Answers whether there was
     /// such a call.
     pub(super) fn finish_read(
         &mut self,
@@ -525,7 +539,7 @@ impl Workspace {
         status: Status,
         text: String,
         early: bool,
-        rows: Option<(usize, Total)>,
+        mut ended: Ended,
         cx: &mut Context<Self>,
     ) -> bool {
         let found = self.agent.lanes.iter_mut().find_map(|(profile_id, lane)| {
@@ -551,7 +565,7 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, rows),
+                    facts_of(running.sql, running.arrived, std::mem::take(&mut ended)),
                     stop.filter(|_| early),
                 ));
             }
@@ -563,7 +577,7 @@ impl Workspace {
                 waiting.tool,
                 waiting.profile_name,
                 waiting.reply,
-                facts_of(sql, waiting.arrived, None),
+                facts_of(sql, waiting.arrived, std::mem::take(&mut ended)),
                 None,
             ))
         });
@@ -612,7 +626,7 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, None),
+                    facts_of(running.sql, running.arrived, Ended::default()),
                 )
             })
             .into_iter()
@@ -623,7 +637,7 @@ impl Workspace {
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
-                    facts_of(sql, waiting.arrived, None),
+                    facts_of(sql, waiting.arrived, Ended::default()),
                 )
             }));
         for (id, tool, name, reply, facts) in ended {
