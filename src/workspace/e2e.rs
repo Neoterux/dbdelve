@@ -7446,6 +7446,27 @@ const EXPLAINED_SCHEMA: &str = "CREATE TABLE a (id INTEGER PRIMARY KEY);\
 
 const EXPLAINED_QUERY: &str = "SELECT * FROM a JOIN b ON a.id = b.a_id WHERE b.x = 1";
 
+/// An `explain_query` call for `Orders`, injected, and its answer.
+fn explain_call(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+    analyze: Option<bool>,
+) -> crate::agent::Reply {
+    let (_, answers) = inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExplainQuery,
+        Some("Orders"),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            analyze,
+            ..Default::default()
+        },
+    );
+    answer_of(cx, &answers)
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn an_agent_explains_a_query_and_reads_findings_first(cx: &mut TestAppContext) {
@@ -7510,6 +7531,62 @@ fn an_agent_explains_a_query_and_reads_findings_first(cx: &mut TestAppContext) {
         assert_eq!(log[0].verdict, Some(AuditVerdict::Run));
         assert!(log[0].error.is_none(), "{:?}", log[0]);
         workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_plain_plan_of_an_update_changes_nothing(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\
+             INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+            "mode = \"read-write\"",
+        );
+        let values = || -> Vec<String> {
+            let database = store::dbdelve_directory()
+                .expect("the test home has a data directory")
+                .join("e2e.db");
+            let connection = rusqlite::Connection::open(database).expect("the database opens");
+            let mut statement = connection
+                .prepare("SELECT v FROM t ORDER BY id")
+                .expect("the table is readable");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("the rows read")
+                .collect::<Result<_, _>>()
+                .expect("every value is text")
+        };
+        let before = values();
+        let reply = explain_call(&workspace, cx, "UPDATE t SET v = 'changed'", None);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        assert!(reply.text.contains("tree:"), "{}", reply.text);
+        assert_eq!(values(), before, "a plain plan changed the table");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_omitted_analyze_explains_exactly_as_false(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, EXPLAINED_SCHEMA, "");
+        let omitted = explain_call(&workspace, cx, EXPLAINED_QUERY, None);
+        let asked_false = explain_call(&workspace, cx, EXPLAINED_QUERY, Some(false));
+        assert_eq!(
+            omitted.status,
+            crate::agent::Status::Executed,
+            "{}",
+            omitted.text
+        );
+        assert_eq!(omitted.status, asked_false.status);
+        assert_eq!(omitted.text, asked_false.text);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), 2);
+        assert!(log[0].sql.is_some());
+        assert_eq!(log[0].sql, log[1].sql);
         quit(workspace, cx);
     });
 }
