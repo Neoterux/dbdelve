@@ -7590,3 +7590,211 @@ fn an_omitted_analyze_explains_exactly_as_false(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// Whether `text` holds `name` as a whole token in any ASCII case: a token
+/// character is one of `[A-Za-z0-9_]`, and `name` is not part of a longer run of
+/// them. Written here rather than borrowed from the scrub so the test does not
+/// trust the code it checks.
+fn names_whole_any_case(text: &str, name: &str) -> bool {
+    let in_a_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let (text, name) = (text.to_ascii_lowercase(), name.to_ascii_lowercase());
+    text.match_indices(&name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(in_a_name)
+            && !text[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(in_a_name)
+    })
+}
+
+/// `profiles.toml` as another window would leave it with profile `id` saved
+/// as agent-visible or not.
+fn save_visibility_as_another_window(id: &str, visible: bool) {
+    let file = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("profiles.toml");
+    let mut saved: toml::Table = std::fs::read_to_string(&file)
+        .expect("profiles.toml reads")
+        .parse()
+        .expect("profiles.toml parses");
+    let profile = saved["profiles"]
+        .as_array_mut()
+        .expect("profiles are an array")
+        .iter_mut()
+        .find(|profile| profile["id"].as_str() == Some(id))
+        .and_then(toml::Value::as_table_mut)
+        .expect("the profile is saved");
+    if visible {
+        profile.insert("agent_visible".into(), true.into());
+    } else {
+        profile.remove("agent_visible");
+    }
+    std::fs::write(
+        &file,
+        toml::to_string(&saved).expect("profiles.toml serializes"),
+    )
+    .expect("profiles.toml is written");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn list_connections_names_each_engine_by_name_and_engine_only(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let fixture = include_str!("../testdata/every-engine.toml");
+        let configs = super::restored(fixture);
+        let mut stored: toml::Table = fixture.parse().expect("the fixture parses");
+        let mut profiles = stored
+            .remove("profiles")
+            .and_then(|profiles| match profiles {
+                toml::Value::Array(profiles) => Some(profiles),
+                _ => None,
+            })
+            .expect("the fixture holds profiles");
+        // What the agent should be told about each profile, taken from the
+        // fixture and the config the window restores from it.
+        let mut expected = Vec::new();
+        let mut identifying = Vec::new();
+        for profile in &mut profiles {
+            let table = profile.as_table_mut().expect("a profile is a table");
+            table.insert("agent_visible".into(), true.into());
+            let id = table["id"].as_str().expect("a profile has an id");
+            let config = &configs
+                .iter()
+                .find(|(restored, _)| restored == id)
+                .expect("every profile restores")
+                .1;
+            identifying.extend(config.identifying_text());
+            expected.push(serde_json::json!({
+                "name": table["name"].as_str().expect("a profile has a name"),
+                "engine": config.engine().as_str(),
+            }));
+        }
+        assert!(expected.len() >= 13, "the fixture shrank: {expected:?}");
+        assert!(
+            identifying.iter().any(|text| text == "sa"),
+            "SQL Server's two-letter user is among what is scanned for"
+        );
+        let only_profiles = toml::Table::from_iter([("profiles".to_string(), profiles.into())]);
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &toml::to_string(&only_profiles).expect("the profiles serialize"),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let socket = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            socket,
+            "list_connections",
+            serde_json::json!({}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        let body = text
+            .strip_prefix(&format!("status: {}\n", Status::Executed.as_str()))
+            .unwrap_or_else(|| panic!("not executed: {text}"));
+
+        let listed: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(body).expect("the body is an array of objects");
+        assert_eq!(listed.len(), expected.len(), "{body}");
+        for (entry, wanted) in listed.iter().zip(&expected) {
+            let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["engine", "name"], "{entry:?}");
+            assert_eq!(&serde_json::Value::Object(entry.clone()), wanted);
+        }
+
+        // With the values the agent is meant to get taken out, nothing about
+        // where a database is, or how to get in, is left to find.
+        let mut left = body.to_string();
+        for wanted in &expected {
+            for key in ["name", "engine"] {
+                let value = serde_json::to_string(&wanted[key]).expect("a string serializes");
+                left = left.replacen(&value, "", 1);
+            }
+        }
+        assert_eq!(
+            left,
+            format!(
+                "[{}]",
+                vec![r#"{"name":,"engine":}"#; expected.len()].join(",")
+            )
+        );
+        for text in &identifying {
+            assert!(!names_whole_any_case(&left, text), "{text:?} in {left}");
+        }
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn list_connections_reads_empty_byte_exact_and_after_a_hide_elsewhere(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let name = "Ünï \"q\"";
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("odd", name, ""));
+        cx.executor().allow_parking();
+        let listed = |cx: &mut VisualTestContext| {
+            let (_, answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+            answer_of(cx, &answers)
+        };
+
+        let none = listed(cx);
+        assert_eq!((none.status, none.text.as_str()), (Status::Executed, "[]"));
+
+        // Another window shows it.
+        save_visibility_as_another_window("odd", true);
+        let shown = listed(cx);
+        assert_eq!(shown.status, Status::Executed);
+        assert_eq!(shown.text, r#"[{"name":"Ünï \"q\"","engine":"sqlite"}]"#);
+
+        let schemas = |cx: &mut VisualTestContext, asked: &str| {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                Tool::ListSchemas,
+                Some(asked),
+                CallArgs::default(),
+            );
+            answer_of(cx, &answers)
+        };
+        let found = schemas(cx, name);
+        assert_eq!(found.status, Status::Executed, "{}", found.text);
+        for spelling in [
+            "ünï \"q\"",
+            "ÜNÏ \"Q\"",
+            " Ünï \"q\"",
+            "Ünï \"q\" ",
+            // The same letters, composed the other way.
+            "U\u{308}ni\u{308} \"q\"",
+        ] {
+            let refused = schemas(cx, spelling);
+            assert_eq!(refused.status, Status::RefusedByGate, "{spelling:?}");
+            assert_eq!(
+                refused.text, "no agent-visible connection has that name",
+                "{spelling:?}"
+            );
+        }
+
+        // Another window hides it again before the next call.
+        save_visibility_as_another_window("odd", false);
+        let hidden = listed(cx);
+        assert_eq!(
+            (hidden.status, hidden.text.as_str()),
+            (Status::Executed, "[]")
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.profiles[0].agent_visible);
+        });
+        quit(workspace, cx);
+    });
+}
