@@ -38,6 +38,8 @@ pub(super) enum Hello {
         sql: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schema: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
     },
     /// An agent is attached. Asks nothing, and ends when the connection does.
     Presence { v: u32 },
@@ -106,6 +108,7 @@ mod tests {
             connection: Some("Orders".to_string()),
             sql: Some("SELECT 1".to_string()),
             schema: None,
+            table: None,
         };
         let line = encode(&hello);
         assert!(line.ends_with('\n'));
@@ -178,6 +181,7 @@ mod tests {
                 connection: Some("Orders".to_string()),
                 sql: Some("SELECT 1".to_string()),
                 schema: None,
+                table: None,
             })
         );
 

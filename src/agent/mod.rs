@@ -114,8 +114,11 @@ pub(crate) struct ConnId(pub(crate) u64);
 pub(crate) struct CallArgs {
     /// The statement `execute_sql` was asked to run, exactly as written.
     pub(crate) sql: Option<String>,
-    /// The schema `list_tables` was asked about, exactly as written.
+    /// The schema `list_tables` or `describe_table` was asked about, exactly as
+    /// written.
     pub(crate) schema: Option<String>,
+    /// The table `describe_table` was asked about, exactly as written.
+    pub(crate) table: Option<String>,
 }
 
 /// What a connection thread tells the window.

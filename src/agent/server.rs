@@ -224,10 +224,11 @@ fn serve(stream: UnixStream, shared: &Shared, inbound: &UnboundedSender<Inbound>
             connection,
             sql,
             schema,
+            table,
             ..
         }) => {
             drop(registered);
-            let args = CallArgs { sql, schema };
+            let args = CallArgs { sql, schema, table };
             call(
                 &stream,
                 CallId(conn.0),
