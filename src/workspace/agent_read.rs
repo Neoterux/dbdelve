@@ -249,6 +249,7 @@ pub(crate) struct Waiting {
 }
 
 /// What a waiting call will do once its lane is free.
+#[derive(Clone)]
 pub(crate) enum AgentWork {
     Query {
         sql: String,
@@ -344,6 +345,26 @@ enum Ran {
         hidden: Vec<String>,
         listed: Result<Option<Listing>, DbError>,
     },
+}
+
+impl Ran {
+    /// Whether the statement failed and the session it ran on is gone, so
+    /// nothing sent on that connection again can succeed.
+    fn session_lost(&self) -> bool {
+        match self {
+            Ran::Done {
+                connection,
+                result: Err(_),
+                ..
+            }
+            | Ran::Listed {
+                connection,
+                listed: Err(_),
+                ..
+            } => connection.is_lost(),
+            Ran::NotOpened(_) | Ran::Done { .. } | Ran::Listed { .. } => false,
+        }
+    }
 }
 
 /// A catalog reply and how many rows it lists.
@@ -549,53 +570,57 @@ impl Workspace {
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
-        let opening = match cached {
+        let open = self.agent.opener.unwrap_or(open_agent);
+        let mut reused = cached.is_some();
+        let mut opening = match cached {
             Some(cached) => gpui::Task::ready(Ok(cached)),
-            None => {
-                let open = self.agent.opener.unwrap_or(open_agent);
-                open(cx.background_executor(), config, profile_id.to_string())
-            }
+            None => open(
+                cx.background_executor(),
+                config.clone(),
+                profile_id.to_string(),
+            ),
         };
         let task = cx.spawn({
             let profile_id = profile_id.to_string();
             let cancel = cancel.clone();
             async move |workspace, cx| {
-                let ran = match opening.await {
-                    Ok((connection, hidden)) => {
-                        // Before the statement is sent, so every end of the
-                        // call after this point has a connection to cancel
-                        // on. A call that ended during the open finds nothing
-                        // running under its id, and sends no statement.
-                        let held = workspace.update(cx, |workspace, _| {
-                            workspace.hold_agent_connection(id, &profile_id, &connection)
-                        });
-                        if !held.unwrap_or(false) {
-                            return;
-                        }
-                        spawn_blocking(cx.background_executor(), move || match work {
-                            AgentWork::Query { sql } => {
-                                read_on(connection, hidden, &sql, &cancel, engine)
-                            }
-                            AgentWork::Catalog { schema } => list_on(
-                                connection,
-                                hidden,
-                                schema.as_deref(),
-                                engine.agent_catalog_note(),
-                            ),
-                            AgentWork::Explain { statement } => {
-                                explain_on(connection, hidden, &statement, &cancel)
-                            }
-                            AgentWork::Structure { schema, table } => describe_on(
-                                connection,
-                                hidden,
-                                &schema,
-                                &table,
-                                engine.agent_catalog_note(),
-                            ),
-                        })
-                        .await
+                let ran = loop {
+                    let (connection, hidden) = match opening.await {
+                        Ok(opened) => opened,
+                        Err(error) => break Ran::NotOpened(error),
+                    };
+                    // Before the statement is sent, so every end of the call
+                    // after this point has a connection to cancel on. A call
+                    // that ended during the open finds nothing running under
+                    // its id, and sends no statement.
+                    let held = workspace.update(cx, |workspace, _| {
+                        workspace.hold_agent_connection(id, &profile_id, &connection)
+                    });
+                    if !held.unwrap_or(false) {
+                        return;
                     }
-                    Err(error) => Ran::NotOpened(error),
+                    let (ran, lost) = spawn_blocking(cx.background_executor(), {
+                        let (work, cancel) = (work.clone(), cancel.clone());
+                        move || {
+                            let ran = run_work(work, connection, hidden, &cancel, engine);
+                            // Asked only of a connection that sat idle between
+                            // calls and then failed: the driver learns the
+                            // server dropped it from the statement that finds
+                            // out, so nothing before one can tell.
+                            let lost = reused && ran.session_lost();
+                            (ran, lost)
+                        }
+                    })
+                    .await;
+                    if !lost {
+                        break ran;
+                    }
+                    // ponytail: the one reopen is a retry of a read that
+                    // failed on a dead session, and a read that died with the
+                    // session while running is run again, inside the same
+                    // call deadline. The upgrade is telling the two apart.
+                    reused = false;
+                    opening = open(cx.background_executor(), config.clone(), profile_id.clone());
                 };
                 // The window may have closed meanwhile, and then nobody is
                 // left to answer.
@@ -913,6 +938,33 @@ fn open_agent(
         let connection = Connection::open_for_agent(config)?;
         Ok((connection, hidden))
     })
+}
+
+/// The blocking half of any call: what `work` asks, on `connection`.
+fn run_work(
+    work: AgentWork,
+    connection: Connection,
+    hidden: Vec<String>,
+    cancel: &CancelToken,
+    engine: Engine,
+) -> Ran {
+    match work {
+        AgentWork::Query { sql } => read_on(connection, hidden, &sql, cancel, engine),
+        AgentWork::Catalog { schema } => list_on(
+            connection,
+            hidden,
+            schema.as_deref(),
+            engine.agent_catalog_note(),
+        ),
+        AgentWork::Explain { statement } => explain_on(connection, hidden, &statement, cancel),
+        AgentWork::Structure { schema, table } => describe_on(
+            connection,
+            hidden,
+            &schema,
+            &table,
+            engine.agent_catalog_note(),
+        ),
+    }
 }
 
 /// The blocking half of a read: run the statement on the agent's connection as
