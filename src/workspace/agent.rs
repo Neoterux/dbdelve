@@ -28,8 +28,9 @@ pub(crate) struct AgentState {
     /// The presence connections open now: agents attached, whether or not they
     /// have asked anything.
     pub(crate) presence: Vec<crate::agent::ConnId>,
-    /// The calls waiting on an answer, found by their id and never by their
-    /// place in this list.
+    /// The calls waiting on an answer from a person, found by their id and
+    /// never by their place in this list. Reads are not here: they wait for
+    /// nobody, and live in their [`agent_read::Lane`].
     pub(crate) calls: Vec<PendingCall>,
     /// What this window's own access action decided and no save has written
     /// yet: `true` from turning access on, `false` from the kill switch. Set
@@ -138,7 +139,7 @@ const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDel
 
 /// What every call waiting on a profile is told when it is hidden or removed.
 /// One sentence for both, so the agent cannot tell which happened.
-const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
+pub(super) const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
@@ -290,7 +291,8 @@ impl Workspace {
     }
 
     /// Answer every call waiting on this profile `rejected`, oldest first, each
-    /// once. Calls waiting on any other profile are left as they are.
+    /// once, and end its reads, running and waiting, and drop its agent
+    /// connection. Calls on any other profile are left as they are.
     pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let waiting: Vec<CallId> = self
             .agent
@@ -302,6 +304,7 @@ impl Workspace {
         for id in waiting {
             self.finish_call(id, Status::Rejected, NO_LONGER_AVAILABLE.to_string(), cx);
         }
+        self.end_lane(profile_id, Status::Rejected, NO_LONGER_AVAILABLE, cx);
     }
 
     /// The call the ping dialog is about: the oldest one whose profile is still
@@ -474,7 +477,8 @@ impl Workspace {
     /// The kill switch: nothing an agent started stays open, and nothing
     /// listens until the user turns access on again. In order:
     ///
-    /// 1. Every pending call is answered `rejected`. This comes first and runs
+    /// 1. Every pending call and every read, running or waiting, is answered
+    ///    `rejected` and every agent connection is dropped. This comes first and runs
     ///    with or without a bridge, because dropping the bridge never closes a
     ///    call's connection: each call's writer thread sends its frame and then
     ///    closes its own socket, so a waiting client reads a whole answer and
@@ -494,6 +498,10 @@ impl Workspace {
         for id in pending {
             self.finish_call(id, Status::Rejected, TURNED_OFF.to_string(), cx);
         }
+        let lanes: Vec<String> = self.agent.lanes.keys().cloned().collect();
+        for profile_id in lanes {
+            self.end_lane(&profile_id, Status::Rejected, TURNED_OFF, cx);
+        }
         let was_serving = self.agent.bridge.is_some();
         self.drop_bridge();
         if was_serving || self.saved_agent_access() == Some(true) {
@@ -511,7 +519,10 @@ impl Workspace {
     /// calls waiting, while an agent is attached or a call waits.
     pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
         self.agent.bridge.as_ref()?;
-        let attached = !self.agent.presence.is_empty() || !self.agent.calls.is_empty();
+        // A read in flight is an agent attached, though nobody is asked.
+        let attached = !self.agent.presence.is_empty()
+            || !self.agent.calls.is_empty()
+            || self.agent.lanes.values().any(|lane| lane.running.is_some());
         Some(if attached {
             ui::AgentMark::Connected {
                 waiting: self.agent.calls.len(),
@@ -694,8 +705,10 @@ impl Workspace {
 
     /// The one door every call ends through: answered, expired or hung up.
     /// It removes the call by id before it replies, so two things ending the
-    /// same call at once produce one outcome and at most one reply. Answers
-    /// whether there was such a call.
+    /// same call at once produce one outcome and at most one reply. It looks
+    /// among the pings first and then among the reads of every lane
+    /// ([`Workspace::finish_read`]), where a running read is cancelled on the
+    /// server. Answers whether there was such a call.
     ///
     /// A `Cancelled` call is dropped without a reply, because its caller has
     /// gone and nobody would read one.
@@ -707,7 +720,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
-            return false;
+            return self.finish_read(id, status, text, true, cx);
         };
         let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
