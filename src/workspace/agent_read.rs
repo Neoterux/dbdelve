@@ -219,13 +219,23 @@ pub(crate) struct Running {
     arrived: Instant,
     /// What stops the statement on the server when the call ends early.
     cancel: CancelToken,
-    /// The lane's connection the statement runs on, when the lane had one. A
-    /// read that opens its own has none to hand until it lands.
+    /// The connection the statement runs on, held here as soon as it exists so
+    /// a cancel can reach it: a call that opens its own, as the first of a lane
+    /// and every DuckDB call do, has none until its open returns. `None` only
+    /// while that open is still in flight, when no statement has been sent.
     connection: Option<Connection>,
     _work: gpui::Task<()>,
     /// Ends the call at [`CALL_DEADLINE`]. Dropped with the call, whatever
     /// ended it, so it never fires for one that is over.
     _deadline: gpui::Task<()>,
+}
+
+impl Running {
+    /// Whether a cancel has a connection to go to.
+    #[cfg(test)]
+    pub(crate) fn holds_connection(&self) -> bool {
+        self.connection.is_some()
+    }
 }
 
 /// A call that has not started: it holds its caller's reply and what to do.
@@ -552,6 +562,16 @@ impl Workspace {
             async move |workspace, cx| {
                 let ran = match opening.await {
                     Ok((connection, hidden)) => {
+                        // Before the statement is sent, so every end of the
+                        // call after this point has a connection to cancel
+                        // on. A call that ended during the open finds nothing
+                        // running under its id, and sends no statement.
+                        let held = workspace.update(cx, |workspace, _| {
+                            workspace.hold_agent_connection(id, &profile_id, &connection)
+                        });
+                        if !held.unwrap_or(false) {
+                            return;
+                        }
                         spawn_blocking(cx.background_executor(), move || match work {
                             AgentWork::Query { sql } => {
                                 read_on(connection, hidden, &sql, &cancel, engine)
@@ -599,10 +619,34 @@ impl Workspace {
                 sql: sent,
                 arrived,
                 cancel,
-                connection: lane.connection.clone(),
+                connection: None,
                 _work: task,
                 _deadline: deadline,
             });
+        }
+    }
+
+    /// Remember `connection` as the one running call `id` is on, so a hangup,
+    /// the deadline, a hide or the kill switch can cancel the statement there.
+    /// Answers whether `id` is still the call running on `profile_id`'s lane.
+    fn hold_agent_connection(
+        &mut self,
+        id: CallId,
+        profile_id: &str,
+        connection: &Connection,
+    ) -> bool {
+        let running = self
+            .agent
+            .lanes
+            .get_mut(profile_id)
+            .and_then(|lane| lane.running.as_mut())
+            .filter(|running| running.id == id);
+        match running {
+            Some(running) => {
+                running.connection = Some(connection.clone());
+                true
+            }
+            None => false,
         }
     }
 

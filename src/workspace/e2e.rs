@@ -7004,6 +7004,73 @@ fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppConte
     });
 }
 
+/// Whether the read running on `profile_id`'s lane holds the connection a
+/// cancel would be sent to, stepping the scheduler one task at a time until it
+/// does or the read has answered. The test scheduler runs a statement inline,
+/// so a statement that is still running cannot be waited on here; what can be
+/// shown is that the connection is reachable before the statement is sent.
+fn connection_is_held_before_the_statement_runs(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    profile_id: &str,
+    answers: &std::sync::mpsc::Receiver<crate::agent::Reply>,
+) -> bool {
+    loop {
+        let held = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .agent
+                .lanes
+                .get(profile_id)
+                .and_then(|lane| lane.running.as_ref())
+                .is_some_and(|running| running.holds_connection())
+        });
+        if held {
+            return true;
+        }
+        if answers.try_recv().is_ok() || !cx.executor().tick() {
+            return false;
+        }
+    }
+}
+
+#[gpui::test]
+fn the_first_read_of_a_lane_can_be_cancelled_on_the_connection_it_opened(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.connection.is_none(), "the lane starts cold");
+        });
+        assert!(
+            connection_is_held_before_the_statement_runs(&workspace, cx, "orders", &answers),
+            "a hangup, the deadline, a hide or the kill switch would have no connection to cancel on"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_duckdb_read_can_be_cancelled_on_the_connection_it_opened(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("ducks.duckdb").display().to_string();
+        ::duckdb::Connection::open(&path)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER)"))
+            .expect("the schema applies");
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Ducks", "SELECT count(*) FROM t");
+        assert!(
+            connection_is_held_before_the_statement_runs(&workspace, cx, "ducks", &answers),
+            "a DuckDB lane keeps no connection, so only the running call can hand one to a cancel"
+        );
+        quit(workspace, cx);
+    });
+}
+
 /// An `execute_sql` call on `Orders` carrying `sql`, injected, with its id.
 fn inject_orders_read(
     workspace: &Entity<Workspace>,
