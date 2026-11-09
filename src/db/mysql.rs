@@ -339,38 +339,66 @@ fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn
     }
 }
 
+/// What a profile's connection runs once at connect, as session defaults.
+///
+/// The read-only hold comes first, for an agent's config
+/// ([`ServerConfig::read_only`]); a session that holds it starts read-only,
+/// before any statement of its own. The timeout is never spliced into the
+/// user's own submission -- see `ServerConfig::statement_timeout` for what
+/// it does and does not bound. MySQL's `max_execution_time` counts
+/// milliseconds and MariaDB's `max_statement_time` seconds, and a server too
+/// old to know the variable fails the connect here rather than the statement
+/// later.
+fn init_statements(server: &ServerConfig, engine: Engine) -> Vec<String> {
+    let mut init = Vec::new();
+    if server.read_only {
+        init.extend(read_only_hold(engine));
+    }
+    match server.statement_timeout {
+        0 => {}
+        seconds if engine == Engine::MariaDb => {
+            init.push(format!("SET SESSION max_statement_time = {seconds}"));
+        }
+        seconds => init.push(format!(
+            "SET SESSION max_execution_time = {}",
+            u64::from(seconds) * 1_000
+        )),
+    }
+    init
+}
+
+/// The statement that holds a session to reads, in the spelling
+/// [`Connection::set_read_only`](super::Connection::set_read_only) sends.
+fn read_only_hold(engine: Engine) -> Option<String> {
+    super::read_only_statement(engine, true).map(str::to_string)
+}
+
 /// The connection a profile keeps.
 fn connect(
     server: &ServerConfig,
     engine: Engine,
     dial: Option<SocketAddr>,
 ) -> Result<Conn, DbError> {
-    open(server, || match server.statement_timeout {
-        0 => base_options(server, dial),
-        // Run once at connect as a session default, never spliced into the
-        // user's own submission — see `ServerConfig::statement_timeout` for
-        // what this does and does not bound. MySQL's `max_execution_time`
-        // counts milliseconds and MariaDB's `max_statement_time` seconds, and a
-        // server too old to know the variable fails the connect here rather
-        // than the statement later.
-        seconds => base_options(server, dial).init(vec![if engine == Engine::MariaDb {
-            format!("SET SESSION max_statement_time = {seconds}")
-        } else {
-            format!(
-                "SET SESSION max_execution_time = {}",
-                u64::from(seconds) * 1_000
-            )
-        }]),
+    let init = init_statements(server, engine);
+    open(server, || match init.is_empty() {
+        true => base_options(server, dial),
+        false => base_options(server, dial).init(init.clone()),
     })
 }
 
 /// The throwaway connection a cancel opens: the same fields, but bounded end
-/// to end and with no init statement it has no use for.
-fn cancel_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder {
+/// to end. It runs no timeout statement it has no use for, only the read-only
+/// hold when the config carries one -- `KILL QUERY` and the `PROCESSLIST` read
+/// both run in a read-only session.
+fn cancel_options(server: &ServerConfig, engine: Engine, dial: Option<SocketAddr>) -> OptsBuilder {
     let timeout = Some(Duration::from_secs(CANCEL_TIMEOUT_SECONDS));
-    base_options(server, dial)
+    let options = base_options(server, dial)
         .read_timeout(timeout)
-        .write_timeout(timeout)
+        .write_timeout(timeout);
+    match server.read_only.then(|| read_only_hold(engine)).flatten() {
+        Some(hold) => options.init(vec![hold]),
+        None => options,
+    }
 }
 
 /// A live connection. Cloneable so a background task can take one without
@@ -466,7 +494,7 @@ impl Connection {
     pub fn cancel(&self) -> Result<(), DbError> {
         let server = &self.server;
         let dial = self.dial()?;
-        let mut connection = open(server, || cancel_options(server, dial))?;
+        let mut connection = open(server, || cancel_options(server, self.engine, dial))?;
         connection
             .query_drop(format!("KILL QUERY {}", self.connection_id))
             .map_err(|error| DbError {
@@ -499,7 +527,10 @@ impl Connection {
         for _ in 0..2 {
             if side.is_none() {
                 let dial = self.dial().ok()?;
-                *side = open(&self.server, || cancel_options(&self.server, dial)).ok();
+                *side = open(&self.server, || {
+                    cancel_options(&self.server, self.engine, dial)
+                })
+                .ok();
             }
             match ask(side.as_mut()?) {
                 Ok(answer) => return Some(answer),
@@ -731,16 +762,23 @@ impl Connection {
     /// table for its statistics never holds the mutex a user's query waits on.
     /// The side connection is dropped on return.
     pub fn sizes(&self) -> Result<Sizes, DbError> {
+        let side = self.side_session()?;
+        assemble_sizes(side.internal_query(&SIZES_SQL.replace("{system}", SYSTEM_SCHEMAS))?)
+    }
+
+    /// A session of its own, built from this connection's config, so it
+    /// carries whatever that config holds -- the read-only hold of an agent's
+    /// connection included -- from its first statement.
+    fn side_session(&self) -> Result<Self, DbError> {
         let connection = connect(&self.server, self.engine, self.dial()?)?;
-        let side = Self {
+        Ok(Self {
             connection_id: connection.connection_id(),
             server: self.server.clone(),
             engine: self.engine,
             connection: Arc::new(Mutex::new(connection)),
             tunnel: self.tunnel.clone(),
             side: Arc::default(),
-        };
-        assemble_sizes(side.internal_query(&SIZES_SQL.replace("{system}", SYSTEM_SCHEMAS))?)
+        })
     }
 
     pub fn references(&self, schema: &str, relation: &str) -> Result<Vec<Reference>, DbError> {
@@ -1455,12 +1493,60 @@ mod tests {
             statement_timeout: 5,
             ..ServerConfig::default()
         };
-        let opts: ::mysql::Opts = cancel_options(&server, None).into();
+        let opts: ::mysql::Opts = cancel_options(&server, Engine::MySql, None).into();
 
         let timeout = Some(Duration::from_secs(CANCEL_TIMEOUT_SECONDS));
         assert_eq!(opts.get_read_timeout(), timeout.as_ref());
         assert_eq!(opts.get_write_timeout(), timeout.as_ref());
         assert!(opts.get_init().is_empty());
+    }
+
+    #[test]
+    fn a_read_only_hold_runs_at_connect() {
+        let server = |read_only, statement_timeout| ServerConfig {
+            read_only,
+            statement_timeout,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            init_statements(&server(true, 30), Engine::MySql),
+            [
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET SESSION max_execution_time = 30000"
+            ]
+        );
+        assert_eq!(
+            init_statements(&server(true, 30), Engine::MariaDb),
+            [
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET SESSION max_statement_time = 30"
+            ]
+        );
+        assert_eq!(
+            init_statements(&server(true, 0), Engine::MySql),
+            ["SET SESSION TRANSACTION READ ONLY"]
+        );
+        assert!(init_statements(&server(false, 0), Engine::MySql).is_empty());
+        assert_eq!(
+            init_statements(&server(false, 30), Engine::MariaDb),
+            ["SET SESSION max_statement_time = 30"]
+        );
+    }
+
+    #[test]
+    fn a_held_cancel_session_runs_the_hold() {
+        let init = |read_only, statement_timeout| {
+            let server = ServerConfig {
+                read_only,
+                statement_timeout,
+                ..ServerConfig::default()
+            };
+            let opts: ::mysql::Opts = cancel_options(&server, Engine::MySql, None).into();
+            opts.get_init().to_vec()
+        };
+        assert_eq!(init(true, 5), ["SET SESSION TRANSACTION READ ONLY"]);
+        assert_eq!(init(true, 0), ["SET SESSION TRANSACTION READ ONLY"]);
+        assert!(init(false, 5).is_empty());
     }
 
     #[test]
@@ -1529,6 +1615,88 @@ mod tests {
         let started = Instant::now();
         let _ = connection.query("SELECT SLEEP(30)", Fetch::default());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// One test over both servers: an agent's config holds every session
+    /// opened from it, the one `sizes()` reads through and the one that
+    /// cancels a statement included.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_side_session_sizes_opens_is_read_only() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let plain = live(engine);
+            for statement in [
+                "DROP TABLE IF EXISTS dbdelve_side_probe",
+                "CREATE TABLE dbdelve_side_probe (x int)",
+                "INSERT INTO dbdelve_side_probe VALUES (1), (2), (3)",
+                "ANALYZE TABLE dbdelve_side_probe",
+            ] {
+                plain
+                    .query(statement, Fetch::default())
+                    .unwrap_or_else(|error| panic!("{engine:?}: {statement}: {error}"));
+            }
+
+            let held = Connection::open(
+                &ServerConfig {
+                    sslmode: SslMode::Disable,
+                    read_only: true,
+                    ..live_config(engine)
+                },
+                engine,
+            )
+            .expect("a held connection should open");
+            let side = held.side_session().expect("the side session should open");
+            // MySQL 8.4 dropped `tx_read_only`, which MariaDB still spells so.
+            let variable = match engine {
+                Engine::MariaDb => "@@SESSION.tx_read_only",
+                _ => "@@SESSION.transaction_read_only",
+            };
+            let setting = side
+                .query(&format!("SELECT {variable}"), Fetch::default())
+                .expect("the setting should read");
+            assert_eq!(setting.rows, vec![vec![Some("1".into())]], "{engine:?}");
+            let refusal = side
+                .query(
+                    "INSERT INTO dbdelve_side_probe VALUES (4)",
+                    Fetch::default(),
+                )
+                .expect_err("a held side session must refuse a write");
+            assert!(
+                refusal.message.contains("READ ONLY"),
+                "{engine:?}, the server's own words: {}",
+                refusal.message
+            );
+            let sizes = held
+                .sizes()
+                .expect("sizes should load on a held connection");
+            assert!(
+                sizes["dbdelve_dev"].contains_key("dbdelve_side_probe"),
+                "{engine:?}: the hold must not empty the estimates"
+            );
+
+            // A held cancel session still stops a running statement.
+            let sleeper = held.clone();
+            let started = Instant::now();
+            let running = std::thread::spawn(move || {
+                let _ = sleeper.query("SELECT SLEEP(10)", Fetch::default());
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            held.cancel().expect("the KILL QUERY should send");
+            running.join().expect("the sleeping statement should end");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{engine:?}: a held cancel session did not stop the statement"
+            );
+
+            // The seeded rows are all there is: the refused write did not land.
+            let count = plain
+                .query("SELECT count(*) FROM dbdelve_side_probe", Fetch::default())
+                .expect("the plain connection should read");
+            assert_eq!(count.rows, vec![vec![Some("3".into())]], "{engine:?}");
+            plain
+                .query("DROP TABLE dbdelve_side_probe", Fetch::default())
+                .expect("the probe table should drop");
+        }
     }
 
     fn live_profile(engine: Engine) -> super::super::Connection {
