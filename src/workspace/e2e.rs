@@ -6290,6 +6290,53 @@ fn an_agent_describes_a_table_through_the_shim(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn an_agent_describes_a_table_and_an_unknown_name_reads_as_missing(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, DESCRIBED_SCHEMA, "");
+        cx.executor().allow_parking();
+        let mut describe = |schema: &str, table: &str| {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                Tool::DescribeTable,
+                Some("Orders"),
+                CallArgs {
+                    schema: Some(schema.to_string()),
+                    table: Some(table.to_string()),
+                    ..CallArgs::default()
+                },
+            );
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the call answered")
+        };
+
+        let held = describe("main", "t");
+        assert_eq!(held.status, Status::Executed, "{}", held.text);
+        for (schema, table) in [
+            ("main", "nope"),
+            ("other", "t"),
+            ("MAIN", "t"),
+            ("main", "T"),
+        ] {
+            let missing = describe(schema, table);
+            assert_eq!(missing.status, Status::Failed, "{schema}.{table}");
+            assert_eq!(
+                missing.text,
+                super::agent_read::NOT_IN_CATALOG,
+                "{schema}.{table}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
     cx: &mut TestAppContext,
 ) {
