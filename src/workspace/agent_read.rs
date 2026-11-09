@@ -1382,6 +1382,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explain_defaults_to_the_plain_plan_and_never_downgrades_analyze() {
+        for engine in Engine::ALL {
+            let plain = explain_statement(engine, "SELECT 1", false, Mode::ReadOnly);
+            match engine.explain_prefix(ExplainMode::Plan) {
+                Some(_) => {
+                    // Mongo and SQL alike: whatever is sent is what the engine
+                    // composes for a plan, and only the gate may stop it.
+                    if let Ok(composed) = &plain {
+                        assert_eq!(
+                            Some(composed.clone()),
+                            engine.explain(ExplainMode::Plan, "SELECT 1")
+                        );
+                    }
+                }
+                None => assert!(plain.is_err(), "{engine:?} has no plan to ask for"),
+            }
+
+            let analyzed = explain_statement(engine, "SELECT 1", true, Mode::ReadOnly);
+            if matches!(engine, Engine::Postgres | Engine::MySql | Engine::MariaDb) {
+                assert!(plain.is_ok() && analyzed.is_ok(), "{engine:?} runs a read");
+            }
+            if let Ok(composed) = &analyzed {
+                assert_eq!(
+                    Some(composed.clone()),
+                    engine.explain(ExplainMode::Analyze, "SELECT 1"),
+                    "{engine:?} answered analyze with another plan"
+                );
+            }
+            if engine.explain_prefix(ExplainMode::Plan).is_some()
+                && engine.explain_prefix(ExplainMode::Analyze).is_none()
+            {
+                let said = analyzed.expect_err("no analyzed plan is run");
+                assert_eq!(said.status, Status::Executed);
+                assert_eq!(
+                    said.text,
+                    format!(
+                        "DBDelve reads no analyzed plan from {}; nothing was run.",
+                        engine.label()
+                    )
+                );
+                assert!(said.sql.is_none());
+            }
+        }
+        // Not left to the loop above: it must have found these two.
+        for engine in [Engine::Sqlite, Engine::ClickHouse] {
+            let said = explain_statement(engine, "SELECT 1", true, Mode::Full)
+                .expect_err("neither measures a plan");
+            assert_eq!(said.status, Status::Executed);
+            assert_eq!(
+                said.text,
+                format!(
+                    "DBDelve reads no analyzed plan from {}; nothing was run.",
+                    engine.label()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_engine_without_a_plan_says_so_in_a_sentence() {
+        for engine in [
+            Engine::Turso,
+            Engine::DuckDb,
+            Engine::Snowflake,
+            Engine::SqlServer,
+            Engine::Redis,
+            Engine::Generic,
+        ] {
+            for analyze in [false, true] {
+                let said = explain_statement(engine, "SELECT 1", analyze, Mode::Full)
+                    .expect_err("there is no plan to ask for");
+                assert_eq!(said.status, Status::Executed, "{engine:?}");
+                assert_eq!(
+                    said.text,
+                    format!("DBDelve does not read query plans from {}.", engine.label())
+                );
+                assert!(said.sql.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_explain_typed_by_the_agent_is_refused() {
+        for (engine, sql) in [
+            (Engine::Postgres, "EXPLAIN SELECT 1"),
+            (Engine::MongoDb, r#"db.c.find({}).explain("queryPlanner")"#),
+        ] {
+            for analyze in [false, true] {
+                let refused = explain_statement(engine, sql, analyze, Mode::Full)
+                    .expect_err("an explanation is not explained again");
+                assert_eq!(refused.status, Status::RefusedByGate, "{engine:?}");
+                assert_eq!(refused.text, "the statement is already an EXPLAIN");
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_that_parses_to_nothing_says_so() {
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            assert_eq!(
+                plan_reply(engine, &QueryResult::default()),
+                (
+                    Status::Executed,
+                    format!("{} returned no plan DBDelve could read.", engine.label())
+                )
+            );
+        }
+    }
+
     /// The compose Postgres, from the standard `PG*` variables, opened the way
     /// the agent opens it.
     fn live_agent_connection() -> Connection {
