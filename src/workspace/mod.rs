@@ -42,7 +42,7 @@ pub(crate) use profiles::unavailable_reason;
 pub(crate) use projects::project_name_refusal;
 pub(crate) use queries::error_in_buffer;
 
-use crate::actions::DisconnectAgents;
+use crate::actions::{DisconnectAgents, ShowAgentActivity};
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
@@ -357,6 +357,9 @@ pub(crate) struct Workspace {
     pub(crate) agent_visibility_prompt: Option<String>,
     /// The agent bridge: the socket, and the calls waiting on this window.
     pub(crate) agent: agent::AgentState,
+    /// Whether the `Agent activity` dialog is up. Only the popover's item
+    /// opens it and only its own close and `escape` end it.
+    pub(crate) agent_audit_open: bool,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -521,6 +524,7 @@ impl Workspace {
             collapsed_projects: HashSet::new(),
             theme_before_preview: None,
             agent_visibility_prompt: None,
+            agent_audit_open: false,
             agent: agent::AgentState::default(),
             opacity_input,
             focus: cx.focus_handle(),
@@ -883,6 +887,15 @@ impl Workspace {
         self.disconnect_agents(cx);
     }
 
+    fn show_agent_activity_action(
+        &mut self,
+        _: &ShowAgentActivity,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_agent_activity(cx);
+    }
+
     pub(crate) fn note(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.notice = Some(message);
@@ -1221,39 +1234,26 @@ impl Workspace {
         // Snapshotted before the closure, as the mode pill's `silenced` is:
         // the menu is built when it opens, from what was drawn.
         let waiting = self.agent.calls.len();
-        let now = agent::unix_millis();
-        let log: Vec<String> = self
-            .agent
-            .log
-            .iter()
-            .map(|entry| agent_log_label(entry, now))
-            .collect();
         // On a wrapper: `dropdown_menu` wraps the button, so a margin on the
         // button never reaches the titlebar's row.
         Some(
             div()
                 .child(ui::agent_mark(t, mark).dropdown_menu(move |menu, _, _| {
-                    // The kill switch is the only item that can be selected, so
+                    // The kill switch is the first item that can be selected, so
                     // the keyboard reaches it with one step. The mark is drawn
-                    // only while access is on, so this is the one thing the
-                    // menu changes: turning access on is the palette's.
-                    let menu = menu
-                        .label(match waiting {
-                            0 => "No calls waiting".to_string(),
-                            1 => "1 call waiting for you".to_string(),
-                            n => format!("{n} calls waiting for you"),
-                        })
-                        .label("Agent access is on")
-                        .menu(
-                            "Disconnect agents and turn access off",
-                            Box::new(DisconnectAgents),
-                        );
-                    if log.is_empty() {
-                        menu
-                    } else {
-                        log.iter()
-                            .fold(menu.separator(), |menu, line| menu.label(line.clone()))
-                    }
+                    // only while access is on, so turning access on is the
+                    // palette's; the item after it reads what agents did.
+                    menu.label(match waiting {
+                        0 => "No calls waiting".to_string(),
+                        1 => "1 call waiting for you".to_string(),
+                        n => format!("{n} calls waiting for you"),
+                    })
+                    .label("Agent access is on")
+                    .menu(
+                        "Disconnect agents and turn access off",
+                        Box::new(DisconnectAgents),
+                    )
+                    .menu("Agent activity", Box::new(ShowAgentActivity))
                 }))
                 .into_any_element(),
         )
@@ -1494,6 +1494,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::submit_connection))
                 .on_action(cx.listener(Self::disconnect_agents_action))
+                .on_action(cx.listener(Self::show_agent_activity_action))
                 .on_action(cx.listener(Self::next_profile))
                 .on_action(cx.listener(Self::zoom_editor_in))
                 .on_action(cx.listener(Self::zoom_editor_out))
@@ -1520,6 +1521,7 @@ impl Render for Workspace {
                         // agent's unsolicited ping never covers one the user
                         // is already answering.
                         ("agent-ping", self.render_agent_ping(cx)),
+                        ("agent-audit", self.render_agent_audit(cx)),
                         ("import-choice", self.render_import_choice(cx)),
                     ],
                     window,
@@ -1542,6 +1544,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::show_editor))
                 .on_action(cx.listener(Self::open_connection_form))
                 .on_action(cx.listener(Self::disconnect_agents_action))
+                .on_action(cx.listener(Self::show_agent_activity_action))
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
@@ -1562,7 +1565,10 @@ impl Render for Workspace {
                 ))
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.dialog_layer(
-                    [("import-choice", self.render_import_choice(cx))],
+                    [
+                        ("agent-audit", self.render_agent_audit(cx)),
+                        ("import-choice", self.render_import_choice(cx)),
+                    ],
                     window,
                     cx,
                 ))
@@ -2342,6 +2348,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::switch_connection))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::disconnect_agents_action))
+            .on_action(cx.listener(Self::show_agent_activity_action))
             .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
             // Unregistered under the import dialog, which stops only the
@@ -2493,6 +2500,7 @@ impl Render for Workspace {
                     // agent's unsolicited ping never covers one the user is
                     // already answering, and `escape` reaches it last.
                     ("agent-ping", self.render_agent_ping(cx)),
+                    ("agent-audit", self.render_agent_audit(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),

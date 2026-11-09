@@ -5465,6 +5465,12 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         asked: Some("Nope".to_string()),
         status: Status::RefusedByGate,
         requester_gone: false,
+        verdict: None,
+        sql: None,
+        shown: None,
+        total: None,
+        elapsed_ms: 0,
+        error: None,
     };
     assert_eq!(
         agent_log_label(&entry, 1_000_000 + 125_000),
@@ -5491,6 +5497,148 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         agent_log_label(&entry, 1_000_000),
         "moments ago \u{b7} list_connections \u{b7} executed"
     );
+}
+
+#[gpui::test]
+fn every_agent_call_is_audited_with_its_verdict_and_never_its_rows(cx: &mut TestAppContext) {
+    use crate::agent::{Status, result::Total, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('secret-cell-value');",
+            "",
+        );
+        cx.executor().allow_parking();
+        let sql = "SELECT v FROM t";
+        let (id, answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some(sql.to_string()),
+            },
+        );
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        assert!(reply.text.contains("secret-cell-value"), "{}", reply.text);
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+
+        let log = agent_log(&workspace, cx);
+        let read = log
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("the read is audited");
+        assert_eq!(read.tool, Tool::ExecuteSql);
+        assert_eq!(read.resolved.as_deref(), Some("Orders"));
+        assert_eq!(read.status, Status::Executed);
+        assert_eq!(read.verdict, Some(super::agent::AuditVerdict::Run));
+        assert_eq!(read.sql.as_deref(), Some(sql));
+        assert_eq!((read.shown, read.total), (Some(1), Some(Total::Exact(1))));
+        assert!(!read.capped());
+        assert_eq!(read.error, None);
+        for entry in &log {
+            assert!(
+                !format!("{entry:?}").contains("secret-cell-value"),
+                "a row value reached the audit: {entry:?}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[test]
+fn an_entry_is_capped_when_the_agent_was_given_fewer_rows_than_there_were() {
+    use super::agent::LogEntry;
+    use crate::agent::{CallId, Status, result::Total, tools::Tool};
+
+    let entry = LogEntry {
+        at: 0,
+        id: CallId(1),
+        tool: Tool::ExecuteSql,
+        resolved: None,
+        asked: None,
+        status: Status::Executed,
+        requester_gone: false,
+        verdict: None,
+        sql: None,
+        shown: Some(100),
+        total: Some(Total::Exact(100)),
+        elapsed_ms: 0,
+        error: None,
+    };
+    assert!(!entry.capped());
+    let more = LogEntry {
+        total: Some(Total::Exact(101)),
+        ..entry.clone()
+    };
+    assert!(more.capped());
+    let stopped = LogEntry {
+        total: Some(Total::AtLeast(100)),
+        ..entry.clone()
+    };
+    assert!(stopped.capped());
+    let none = LogEntry {
+        shown: None,
+        total: None,
+        ..entry
+    };
+    assert!(!none.capped());
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_audit_opens_from_the_popover_and_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use crate::{actions::ShowAgentActivity, agent::Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // What the popover's item dispatches.
+        let open = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+            settle(cx);
+        };
+        open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+        assert!(
+            cx.debug_bounds("agent-audit-empty").is_some(),
+            "an empty audit says so"
+        );
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        let sql = "SELECT id FROM t";
+        let answers = inject_sql(&workspace, cx, "Orders", sql);
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        settle(cx);
+        open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(cx.debug_bounds("agent-audit-empty").is_none());
+        assert!(
+            cx.debug_bounds("agent-audit-sql").is_some(),
+            "the statement is drawn"
+        );
+        assert_eq!(
+            agent_log(&workspace, cx)[0].sql.as_deref(),
+            Some(sql),
+            "what is drawn is what the agent sent"
+        );
+        // Its one button closes it too.
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
 }
 
 #[cfg(unix)]
