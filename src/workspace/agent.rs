@@ -12,7 +12,7 @@
 
 use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
-use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, explain_statement};
+use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
@@ -733,17 +733,12 @@ impl Workspace {
             } => {
                 self.adopt_saved_visibility(cx);
                 let found = match connection.as_deref() {
-                    Some(name) => self.agent_profile(name).map(|profile| {
-                        (
-                            profile.id.clone(),
-                            profile.name.clone(),
-                            profile.config.engine(),
-                            profile.mode,
-                        )
-                    }),
+                    Some(name) => self
+                        .agent_profile(name)
+                        .map(|profile| (Resolved::of(profile), profile.mode)),
                     None => Err(AgentLookup::NotAvailable),
                 };
-                let (profile_id, profile_name, engine, mode) = match found {
+                let (resolved, mode) = match found {
                     Ok(found) => found,
                     Err(lookup) => {
                         self.agent_answered(
@@ -767,12 +762,13 @@ impl Workspace {
                 // The schema requires a statement, so only an injected call
                 // has none; it is the empty statement.
                 let sql = args.sql.unwrap_or_default();
+                let engine = resolved.config.engine();
                 let verdict = agent_gate(engine, &sql, mode);
                 // The verdict's contents are what an approval will show,
                 // which agents do not get.
                 let refused = match &verdict {
                     AgentVerdict::Run => {
-                        self.run_agent_sql(id, profile_id, sql, reply, arrived, cx);
+                        self.run_agent_sql(id, resolved, sql, reply, arrived, cx);
                         return;
                     }
                     AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
@@ -781,7 +777,7 @@ impl Workspace {
                 self.agent_answered(
                     id,
                     Tool::ExecuteSql,
-                    Some(profile_name),
+                    Some(resolved.name),
                     None,
                     &reply,
                     Reply {
@@ -805,17 +801,12 @@ impl Workspace {
             } => {
                 self.adopt_saved_visibility(cx);
                 let found = match connection.as_deref() {
-                    Some(name) => self.agent_profile(name).map(|profile| {
-                        (
-                            profile.id.clone(),
-                            profile.name.clone(),
-                            profile.config.engine(),
-                            profile.mode,
-                        )
-                    }),
+                    Some(name) => self
+                        .agent_profile(name)
+                        .map(|profile| (Resolved::of(profile), profile.mode)),
                     None => Err(AgentLookup::NotAvailable),
                 };
-                let (profile_id, profile_name, engine, mode) = match found {
+                let (resolved, mode) = match found {
                     Ok(found) => found,
                     Err(lookup) => {
                         self.agent_answered(
@@ -839,10 +830,11 @@ impl Workspace {
                 // The schema requires a statement, so only an injected call
                 // has none; it is the empty statement.
                 let sql = args.sql.unwrap_or_default();
+                let engine = resolved.config.engine();
                 match explain_statement(engine, &sql, args.analyze.unwrap_or(false), mode) {
                     Ok(statement) => self.run_agent_work(
                         id,
-                        profile_id,
+                        resolved,
                         AgentWork::Explain { statement },
                         reply,
                         arrived,
@@ -851,7 +843,7 @@ impl Workspace {
                     Err(declined) => self.agent_answered(
                         id,
                         Tool::ExplainQuery,
-                        Some(profile_name),
+                        Some(resolved.name),
                         None,
                         &reply,
                         Reply {
@@ -875,12 +867,12 @@ impl Workspace {
                 reply,
             } => {
                 self.adopt_saved_visibility(cx);
-                let profile_id = match connection.as_deref() {
-                    Some(name) => self.agent_profile(name).map(|profile| profile.id.clone()),
+                let resolved = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(Resolved::of),
                     None => Err(AgentLookup::NotAvailable),
                 };
-                let profile_id = match profile_id {
-                    Ok(profile_id) => profile_id,
+                let resolved = match resolved {
+                    Ok(resolved) => resolved,
                     Err(lookup) => {
                         self.agent_answered(
                             id,
@@ -912,7 +904,7 @@ impl Workspace {
                     },
                     _ => AgentWork::Catalog { schema: None },
                 };
-                self.run_agent_work(id, profile_id, work, reply, arrived, cx);
+                self.run_agent_work(id, resolved, work, reply, arrived, cx);
             }
             Inbound::Call {
                 tool: Tool::Ping,
