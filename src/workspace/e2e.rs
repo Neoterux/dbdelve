@@ -6239,6 +6239,63 @@ fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppConte
     });
 }
 
+/// An `execute_sql` call on `Orders` carrying `sql`, injected, with its id.
+fn inject_orders_read(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some("Orders"),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+        },
+    )
+}
+
+#[gpui::test]
+fn a_hung_open_ends_its_call_at_the_deadline_and_frees_the_lane(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent_read::CALL_DEADLINE;
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(|executor, _, _| executor.spawn(std::future::pending()));
+        });
+        let (first, first_answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        let (_, second_answers) = inject_orders_read(&workspace, cx, "SELECT 2");
+
+        cx.executor()
+            .advance_clock(CALL_DEADLINE - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(first_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(second_answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        workspace.update(cx, |workspace, _| workspace.agent.opener = None);
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let one = answer_of(cx, &first_answers);
+        assert_eq!(one.status, Status::Failed);
+        assert_eq!(one.text, "The call did not finish within 60 seconds.");
+        assert_eq!(logged(&workspace, cx, first), [Status::Failed]);
+
+        let two = answer_of(cx, &second_answers);
+        assert_eq!(two.status, Status::Executed, "{}", two.text);
+        assert!(two.text.contains("[\"2\"]"), "{}", two.text);
+        quit(workspace, cx);
+    });
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) {
