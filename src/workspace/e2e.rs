@@ -7071,6 +7071,93 @@ fn a_duckdb_read_can_be_cancelled_on_the_connection_it_opened(cx: &mut TestAppCo
     });
 }
 
+/// How many times, and as which backend, [`open_live_postgres`] opened.
+static LIVE_OPENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LIVE_BACKEND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The compose Postgres from the `PG*` variables, as the live tests reach it.
+fn live_postgres() -> crate::db::ConnectionConfig {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    crate::db::ConnectionConfig::postgres(crate::db::ServerConfig {
+        host: var("PGHOST"),
+        port: std::env::var("PGPORT")
+            .ok()
+            .map(|port| port.parse().expect("PGPORT must be a number")),
+        database: var("PGDATABASE"),
+        user: var("PGUSER"),
+        password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        sslmode: crate::db::SslMode::Disable,
+        ..crate::db::ServerConfig::default()
+    })
+}
+
+/// An [`agent_read::Opener`](super::agent_read::Opener) that opens the live
+/// Postgres whatever profile asked, and remembers which backend it got.
+fn open_live_postgres(
+    executor: &gpui::BackgroundExecutor,
+    _: crate::db::ConnectionConfig,
+    _: String,
+) -> gpui::Task<Result<(crate::db::Connection, Vec<String>), crate::db::DbError>> {
+    use std::sync::atomic::Ordering;
+
+    super::spawn_blocking(executor, || {
+        let connection = crate::db::Connection::open_for_agent(live_postgres())?;
+        let backend = connection.query(
+            "SELECT pg_backend_pid()",
+            &crate::db::CancelToken::default(),
+            crate::db::Fetch::default(),
+        )?;
+        let backend = backend.rows[0].get(0).unwrap_or_default().parse();
+        LIVE_BACKEND.store(backend.unwrap_or_default(), Ordering::SeqCst);
+        LIVE_OPENS.fetch_add(1, Ordering::SeqCst);
+        Ok((connection, Vec::new()))
+    })
+}
+
+#[gpui::test]
+#[ignore = "requires the compose databases"]
+fn live_a_read_reopens_the_session_a_server_dropped_while_the_lane_was_idle(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::Ordering;
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(open_live_postgres);
+        });
+        LIVE_OPENS.store(0, Ordering::SeqCst);
+
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        let first = answer_of(cx, &answers);
+        assert_eq!(first.status, Status::Executed, "{}", first.text);
+        assert_eq!(LIVE_OPENS.load(Ordering::SeqCst), 1);
+
+        // The server ends the session while nobody is using it.
+        let other = crate::db::Connection::open(live_postgres()).expect("a second session opens");
+        other
+            .query(
+                &format!(
+                    "SELECT pg_terminate_backend({})",
+                    LIVE_BACKEND.load(Ordering::SeqCst)
+                ),
+                &crate::db::CancelToken::default(),
+                crate::db::Fetch::default(),
+            )
+            .expect("the backend is terminated");
+
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 2");
+        let second = answer_of(cx, &answers);
+        assert_eq!(second.status, Status::Executed, "{}", second.text);
+        assert!(second.text.contains("[\"2\"]"), "{}", second.text);
+        assert_eq!(LIVE_OPENS.load(Ordering::SeqCst), 2, "one reopen");
+        quit(workspace, cx);
+    });
+}
+
 /// An `execute_sql` call on `Orders` carrying `sql`, injected, with its id.
 fn inject_orders_read(
     workspace: &Entity<Workspace>,
