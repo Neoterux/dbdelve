@@ -7798,3 +7798,168 @@ fn list_connections_reads_empty_byte_exact_and_after_a_hide_elsewhere(cx: &mut T
         quit(workspace, cx);
     });
 }
+
+const MOVED_SCHEMA: &str = "CREATE TABLE a (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\
+     CREATE UNIQUE INDEX a_email ON a (email);\
+     CREATE VIEW v AS SELECT id FROM a;\
+     INSERT INTO a VALUES (1, 'x@y'), (2, 'z@y');";
+
+#[gpui::test]
+fn no_reply_dbdelve_writes_depends_on_where_the_file_is(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Reply, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, MOVED_SCHEMA, "");
+        cx.executor().allow_parking();
+        let home = store::dbdelve_directory().expect("the test home has a data directory");
+        let first = home.join("e2e.db");
+        // Another directory with another name, holding the same bytes.
+        let elsewhere = home.join("moved-away-from-here");
+        std::fs::create_dir(&elsewhere).expect("the directory is made");
+        let second = elsewhere.join("orders-copy.sqlite");
+        std::fs::copy(&first, &second).expect("the database is copied");
+
+        // The agent names the file in one statement, so the server's own
+        // message repeats it.
+        let calls = |path: &str| -> Vec<(Tool, CallArgs)> {
+            let args = |schema: Option<&str>, table: Option<&str>, sql: Option<&str>| CallArgs {
+                schema: schema.map(str::to_string),
+                table: table.map(str::to_string),
+                sql: sql.map(str::to_string),
+                ..CallArgs::default()
+            };
+            vec![
+                (Tool::ListConnections, args(None, None, None)),
+                (Tool::ListSchemas, args(None, None, None)),
+                (Tool::ListTables, args(Some("main"), None, None)),
+                (Tool::ListTables, args(Some("nope"), None, None)),
+                (Tool::DescribeTable, args(Some("main"), Some("a"), None)),
+                (Tool::DescribeTable, args(Some("main"), Some("nope"), None)),
+                (
+                    Tool::ExecuteSql,
+                    args(None, None, Some("SELECT id, email FROM a ORDER BY id")),
+                ),
+                (
+                    Tool::ExecuteSql,
+                    args(None, None, Some(&format!("SELECT * FROM \"{path}\""))),
+                ),
+                (
+                    Tool::ExplainQuery,
+                    args(None, None, Some("SELECT * FROM a WHERE email = 'x'")),
+                ),
+            ]
+        };
+        let mut ask = |path: &std::path::Path| -> Vec<Reply> {
+            workspace.update(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter_mut()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                let crate::db::ConnectionConfig::Sqlite { path: stored, .. } = &mut orders.config
+                else {
+                    panic!("Orders is a SQLite profile");
+                };
+                *stored = path.display().to_string();
+            });
+            calls(&path.display().to_string())
+                .into_iter()
+                .map(|(tool, args)| {
+                    let connection = (tool != Tool::ListConnections).then_some("Orders");
+                    let (_, answers) = inject_call_with(&workspace, cx, tool, connection, args);
+                    answer_of(cx, &answers)
+                })
+                .collect()
+        };
+        let there = ask(&first);
+        let here = ask(&second);
+
+        assert_eq!(there.len(), here.len());
+        let stored_and_expanded = |path: &std::path::Path| {
+            let stored = path.display().to_string();
+            let expanded = store::home_expanded(&stored).display().to_string();
+            [stored, expanded]
+        };
+        let paths: Vec<String> = [&first, &second]
+            .into_iter()
+            .flat_map(|path| stored_and_expanded(path))
+            .collect();
+        for (at, (a, b)) in there.iter().zip(&here).enumerate() {
+            assert_eq!(a, b, "call {at} answered differently for the moved file");
+            for path in &paths {
+                assert!(
+                    !names_whole_any_case(&a.text, path),
+                    "call {at} names {path}: {}",
+                    a.text
+                );
+                assert!(
+                    !names_whole_any_case(&b.text, path),
+                    "call {at} names {path}: {}",
+                    b.text
+                );
+            }
+        }
+        // The replies were real answers, not two matching refusals.
+        let statuses: Vec<_> = there.iter().map(|reply| reply.status).collect();
+        use crate::agent::Status::{Executed, Failed};
+        assert_eq!(
+            statuses,
+            [
+                Executed, Executed, Executed, Failed, Executed, Failed, Executed, Failed, Executed
+            ],
+            "{there:#?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_the_agents_statement_selects_is_returned_as_is(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let own_path = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            &format!("CREATE TABLE t (note TEXT); INSERT INTO t VALUES ('{own_path}');"),
+            "",
+        );
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT note FROM t");
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        // The database's own data, so DBDelve leaves it exactly as stored.
+        let row = serde_json::to_string(&[&own_path]).expect("a row serializes");
+        assert!(
+            reply.text.lines().any(|line| line == row),
+            "{row} is not a line of {}",
+            reply.text
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// D-26: a reply builder is handed what the database holds, never what a
+/// profile says about where it is or how to get in.
+#[test]
+fn no_reply_builder_takes_a_connection_config_or_a_profile() {
+    let source = include_str!("agent_read.rs");
+    for builder in [
+        "schemas_text",
+        "tables_text",
+        "structure_text",
+        "plan_reply",
+    ] {
+        let start = source
+            .find(&format!("fn {builder}("))
+            .unwrap_or_else(|| panic!("{builder} is gone from agent_read.rs"));
+        let signature = &source[start..start + source[start..].find('{').expect("a body")];
+        for held in ["ConnectionConfig", "Profile"] {
+            assert!(!signature.contains(held), "{builder} takes {held}");
+        }
+    }
+}
