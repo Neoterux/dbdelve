@@ -349,12 +349,13 @@ fn failed_connect_text(error: &std::io::Error) -> String {
 }
 
 /// The one answer line a call gets, read without holding the runtime: a line
-/// is at most the frame limit, and one that does not end in a newline, or does
-/// not decode, is no answer.
+/// is at most the reply limit, which is wider than a request's because an
+/// answer carries rows, and one that does not end in a newline, or does not
+/// decode, is no answer.
 #[cfg(unix)]
 async fn read_reply(stream: &mut UnixStream) -> Option<Reply> {
     let mut line = Vec::new();
-    let mut reader = BufReader::new(stream.take(wire::FRAME_LIMIT));
+    let mut reader = BufReader::new(stream.take(wire::REPLY_LIMIT));
     reader.read_until(b'\n', &mut line).await.ok()?;
     if line.pop() != Some(b'\n') {
         return None;
@@ -954,6 +955,23 @@ mod tests {
                 heard
                     .iter()
                     .any(|seen| matches!(seen, Seen::Call(_, Tool::ListConnections)))
+            );
+        });
+    }
+
+    #[test]
+    fn a_reply_past_the_old_frame_limit_arrives_whole() {
+        let mut text = "truncated: none (1 rows)\n".to_string();
+        text.push_str(&"x".repeat(100_000 - text.len()));
+        let app = App::answering(executed(&text));
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            let answered = client.call("list_connections", json!({})).await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            assert_eq!(
+                answered["result"]["content"][0]["text"],
+                format!("status: executed\n{text}")
             );
         });
     }
