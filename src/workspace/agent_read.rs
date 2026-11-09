@@ -1355,10 +1355,9 @@ fn structure_text(structure: &Structure, note: Option<&str>) -> String {
             vec![
                 Some(index.name.clone()),
                 Some(index_kind_name(index.kind).to_string()),
-                Some(
-                    serde_json::to_string(&index.columns)
-                        .expect("a list of strings always serializes"),
-                ),
+                // A list of strings always serializes; an empty list is what
+                // the impossible case would say.
+                Some(serde_json::to_string(&index.columns).unwrap_or_else(|_| "[]".to_string())),
                 index.predicate.clone(),
             ]
         })
