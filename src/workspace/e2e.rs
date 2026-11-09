@@ -5341,12 +5341,31 @@ fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppCont
         for _ in 0..25 {
             inject_call(&workspace, cx, Tool::ListConnections, None);
         }
+        // Thirty entries are held; one fewer than the cap evicts nothing, and
+        // the oldest, `listed`, is still the last of them.
+        for _ in 0..(super::agent::AUDIT_CAP - 1 - 5 - 25) {
+            inject_call(&workspace, cx, Tool::ListConnections, None);
+        }
         let log = agent_log(&workspace, cx);
-        assert_eq!(log.len(), super::agent::LOG_CAP);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP - 1);
+        assert_eq!(log.last().map(|entry| entry.id), Some(listed));
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP);
+        assert_eq!(log.last().map(|entry| entry.id), Some(listed));
+        // The next call is the one that evicts, and it evicts the oldest.
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP);
+        assert!(log.iter().all(|entry| entry.id != listed));
         let mut ids: Vec<_> = log.iter().map(|entry| entry.id.0).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), super::agent::LOG_CAP, "a call was logged twice");
+        assert_eq!(
+            ids.len(),
+            super::agent::AUDIT_CAP,
+            "a call was logged twice"
+        );
         quit(workspace, cx);
     });
 }
@@ -5637,6 +5656,46 @@ fn the_agent_audit_opens_from_the_popover_and_hands_the_keyboard_back(cx: &mut T
         press(cx, "enter");
         assert_eq!(front_dialog(&workspace, cx), None);
         assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_audit_lists_calls_newest_first_by_when_they_ended(cx: &mut TestAppContext) {
+    use std::time::Instant;
+
+    use crate::agent::{Inbound, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let began = Instant::now();
+        let (first, _first_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        let (second, _second_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        let (third, _third_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(third, cx));
+        let ended: Vec<_> = agent_log(&workspace, cx)
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ended, [third, second, first]);
+
+        // A hangup for a call that is over adds nothing and moves nothing.
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        let after: Vec<_> = agent_log(&workspace, cx)
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(after, ended);
+
+        let waited = began.elapsed().as_millis() as u64;
+        for entry in agent_log(&workspace, cx) {
+            assert!(entry.elapsed_ms <= waited, "{entry:?} after {waited} ms");
+        }
         quit(workspace, cx);
     });
 }
