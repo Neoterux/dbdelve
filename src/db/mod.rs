@@ -1644,6 +1644,42 @@ impl Connection {
         }
     }
 
+    /// Open the connection an agent reads through, held to reads: SQLite and
+    /// DuckDB are opened read-only by the engine itself, Turso takes
+    /// `PRAGMA query_only` (its read-only open is shared process-wide, see
+    /// [`turso::Connection::open_query_only`]), and every engine then takes
+    /// [`Connection::set_read_only`].
+    ///
+    /// A file database has no session to hold -- `set_read_only` sends it
+    /// nothing -- so the open is what keeps a write from it, and a statement
+    /// the gate misjudged still cannot change the file. This is defence in
+    /// depth behind `sql::agent_gate`, as `set_read_only`'s own comment says.
+    pub fn open_for_agent(config: ConnectionConfig) -> Result<Self, DbError> {
+        let connection = match config {
+            ConnectionConfig::Sqlite {
+                path,
+                statement_timeout,
+            } => sqlite::Connection::open_read_only(&path, statement_timeout).map(Self::Sqlite),
+            ConnectionConfig::Turso {
+                path,
+                statement_timeout,
+            } => turso::Connection::open_query_only(&path, statement_timeout).map(Self::Turso),
+            ConnectionConfig::DuckDb {
+                path,
+                statement_timeout,
+                database,
+                schema,
+            } => duckdb::Connection::open_read_only(&path, statement_timeout).map(|connection| {
+                Self::DuckDb(
+                    connection.opened_on(Some(database).filter(|name| !name.is_empty()), schema),
+                )
+            }),
+            config => Self::open(config),
+        }?;
+        connection.set_read_only(true)?;
+        Ok(connection)
+    }
+
     /// Run one statement verbatim.
     ///
     /// The SQL is never rewritten — no limit injected, no reformatting. A
@@ -3690,6 +3726,42 @@ pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<std:
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     command.spawn()
+}
+
+/// What an agent's connection to a file database does while the user's own
+/// stays open on the same file: `config` is the file, `user` the connection the
+/// user holds, with one committed row in `t`. The agent's connection reads that
+/// row, a write on it is refused and leaves one row. Answers the refusal.
+#[cfg(test)]
+pub(crate) fn assert_agent_open_reads_and_refuses_a_write(
+    config: ConnectionConfig,
+    user: &Connection,
+) -> String {
+    let count = |connection: &Connection| {
+        connection
+            .query(
+                "SELECT count(*) FROM t",
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("a count")
+            .rows[0]
+            .get(0)
+            .expect("a cell")
+            .to_string()
+    };
+    let agent = Connection::open_for_agent(config).expect("the agent's connection opens");
+    assert_eq!(count(&agent), "1");
+    let refusal = agent
+        .query(
+            "INSERT INTO t VALUES (2)",
+            &CancelToken::default(),
+            Fetch::default(),
+        )
+        .expect_err("the engine refuses the write");
+    assert_eq!(count(&agent), "1");
+    assert_eq!(count(user), "1");
+    refusal.message
 }
 
 /// One config of every shape, each with no statement timeout, for the tests

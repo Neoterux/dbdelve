@@ -679,10 +679,10 @@ fn open_agent(
         // Taken after the password is in: it is one of the strings a server's
         // error may echo.
         let hidden = config.identifying_text();
-        let connection = Connection::open(config)?;
-        // The hold is what makes a read the gate misjudged harmless, so a
-        // connection that cannot take it is not one the agent may use.
-        connection.set_read_only(true)?;
+        // Opened through `open_for_agent`: the hold is what makes a read the gate
+        // misjudged harmless, so a connection that cannot take it is not one the
+        // agent may use.
+        let connection = Connection::open_for_agent(config)?;
         Ok((connection, hidden))
     })
 }
