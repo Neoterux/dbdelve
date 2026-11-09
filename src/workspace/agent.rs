@@ -10,11 +10,7 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::{
-    collections::VecDeque,
-    sync::mpsc::SyncSender,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
 use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
 use super::*;
@@ -47,9 +43,9 @@ pub(crate) struct AgentState {
     pub(crate) visibility_choices: HashSet<String>,
     /// The calls that have ended, newest first, at most [`AUDIT_CAP`].
     pub(crate) log: VecDeque<LogEntry>,
-    /// When [`Workspace::adopt_saved_visibility`] last read the file, on the
-    /// background executor's clock.
-    pub(crate) visibility_read_at: Option<Instant>,
+    /// [`store::profiles_stamp`] as [`Workspace::adopt_saved_visibility`] last
+    /// found it, taken before that read.
+    pub(crate) visibility_stamp: Option<(std::time::SystemTime, u64)>,
     /// The agent's own connections, by profile id: never the user's.
     pub(crate) lanes: HashMap<String, agent_read::Lane>,
     /// What opens an agent's connection; `None` is the real open. Tests put
@@ -62,14 +58,6 @@ pub(crate) struct AgentState {
 // not read. Phase 6's persisted record of approvals (APPR-12) is the upgrade:
 // it is what outlives the window.
 pub(crate) const AUDIT_CAP: usize = 500;
-
-// ponytail: a read of a statement or a catalog reuses the visibility the file
-// held within this long, so a burst of calls costs the window's own thread one
-// read of `profiles.toml` and not one each. A hide made in another window can
-// therefore be missed by such a call for up to this long; a hide made here
-// never is, and `list_connections` and `ping` always read the file. The upgrade
-// is a watcher on the file, off the window's thread.
-pub(crate) const VISIBILITY_REUSE: Duration = Duration::from_secs(1);
 
 /// How many characters of an agent's own statement an audit entry keeps.
 pub(super) const AUDIT_SQL_CAP: usize = 4096;
@@ -589,7 +577,8 @@ impl Workspace {
     /// ponytail: the read and the write that follows are not one step across
     /// processes, as for `agent_access`; the upgrade is the same lock.
     pub(crate) fn adopt_saved_visibility(&mut self, cx: &mut Context<Self>) {
-        self.agent.visibility_read_at = Some(cx.background_executor().now());
+        // Taken before the read, so a save landing during it reads as a change.
+        self.agent.visibility_stamp = store::profiles_stamp();
         let Some(saved) = store::peek_profiles(&self.plugins) else {
             return;
         };
@@ -613,15 +602,17 @@ impl Workspace {
     }
 
     /// [`Workspace::adopt_saved_visibility`] for a call that runs a statement
-    /// or reads a catalog, which can come many at once: the file is read only
-    /// when [`VISIBILITY_REUSE`] has passed since it last was.
+    /// or reads a catalog, which can come many at once: the file is read and
+    /// parsed again only when its modified time or length moved, so a hide
+    /// saved by another window is never missed and an unchanged file costs one
+    /// `stat` on the window's thread.
+    ///
+    /// ponytail: a save that keeps the length within the file system's time
+    /// resolution reads as unchanged; that resolution is nanoseconds on APFS
+    /// and ext4 and 100 ns on NTFS, and a visibility flip changes the length.
     fn adopt_saved_visibility_for_read(&mut self, cx: &mut Context<Self>) {
-        let now = cx.background_executor().now();
-        let recent = self
-            .agent
-            .visibility_read_at
-            .is_some_and(|at| now.saturating_duration_since(at) < VISIBILITY_REUSE);
-        if !recent {
+        let stamp = store::profiles_stamp();
+        if stamp.is_none() || stamp != self.agent.visibility_stamp {
             self.adopt_saved_visibility(cx);
         }
     }
