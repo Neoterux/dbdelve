@@ -1002,9 +1002,11 @@ fn resolve_edit_target(
 }
 
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
-    template
-        .replace("{schema}", &Engine::MySql.quote_literal(schema))
-        .replace("{relation}", &Engine::MySql.quote_literal(relation))
+    super::fill_placeholders(
+        template,
+        &Engine::MySql.quote_literal(schema),
+        &Engine::MySql.quote_literal(relation),
+    )
 }
 
 /// Every row's value for one column, for the catalog queries that return a
@@ -1469,6 +1471,18 @@ mod tests {
                 "odd'name",
             ),
             "WHERE TABLE_SCHEMA = 'dbdelve_dev' AND TABLE_NAME = 'odd''name'"
+        );
+    }
+
+    #[test]
+    fn a_schema_named_like_a_placeholder_is_not_substituted_into() {
+        assert_eq!(
+            structure_sql(
+                "WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {relation}",
+                "{relation}",
+                "a'b",
+            ),
+            "WHERE TABLE_SCHEMA = '{relation}' AND TABLE_NAME = 'a''b'"
         );
     }
 
