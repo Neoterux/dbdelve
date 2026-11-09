@@ -734,6 +734,7 @@ impl ConnectionForm {
                 ],
             )?,
             schema: None,
+            read_only: false,
         })
     }
 }
@@ -1449,6 +1450,7 @@ mod tests {
             statement_timeout: 0,
             ssh: None,
             schema: None,
+            read_only: false,
         };
         let typed = ConnectionConfig::postgres(server("hunter2"));
         assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));

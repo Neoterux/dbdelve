@@ -2369,6 +2369,7 @@ fn stored_config(
                 statement_timeout: stored.statement_timeout.unwrap_or_default(),
                 ssh: stored.ssh.clone(),
                 schema: stored.schema.clone(),
+                read_only: false,
             };
             match engine {
                 Engine::MySql => ConnectionConfig::MySql(server),
