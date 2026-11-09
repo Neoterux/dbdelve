@@ -39,30 +39,153 @@ pub(crate) struct Table {
     pub(crate) total: Total,
 }
 
+// ponytail: Claude Code saves a successful result to a file once it passes a
+// token cap or 50,000 characters, and an agent that is handed a file path
+// instead of rows has lost the read. 24,000 bytes sits under both for any
+// tokenizer ratio above one byte per token. The bytes stand in for tokens
+// until 05-10 measures tokens per byte on a worst-case result; the upgrade is
+// the measured number.
+pub(crate) const RESULT_BUDGET: usize = 24_000;
+
+// ponytail: a cell past 2,000 characters is a document, not a value. The clip
+// stops one cell of a JSON column from taking the whole budget and leaves the
+// agent a marker that says how much was left out; the upgrade is a tool that
+// reads one cell whole.
+pub(crate) const CELL_CAP: usize = 2_000;
+
+/// One table as it will be written: its leading line and its rows as lines.
+struct Written<'a> {
+    table: &'a Table,
+    /// The `columns:` line, or the count that replaces it.
+    lead: String,
+    /// A row's line, newline included, and whether a cell of it was clipped.
+    rows: Vec<(String, bool)>,
+    /// How many of `rows` are written.
+    kept: usize,
+    /// The names were too many to list, and the rows went with them.
+    unlisted: bool,
+}
+
+impl Written<'_> {
+    fn clipped(&self) -> bool {
+        self.rows[..self.kept].iter().any(|(_, clipped)| *clipped)
+    }
+
+    fn cut(&self, further: usize) -> Option<String> {
+        cut(
+            Cut {
+                shown: self.kept,
+                listed: self.table.rows.len(),
+                total: self.table.total,
+                budget: self.unlisted || self.kept < self.table.rows.len(),
+                clipped: self.clipped(),
+            },
+            further,
+        )
+    }
+}
+
 /// The reply text for `tables`, with `further` result sets that were not
 /// included. The first line says whether rows were left out, so a reader knows
-/// what it has before it reads a row.
+/// what it has before it reads a row. The whole text is at most
+/// [`RESULT_BUDGET`] bytes: rows are dropped from the end, never cut through.
+// ponytail: callers pass one table, or a handful of catalog tables. The
+// header is part of the budget and every table's leading line is written even
+// when no row follows it, so the budget holds for a few tables and not for
+// thousands.
 pub(crate) fn text(tables: &[Table], further: usize) -> String {
-    let mut out = String::new();
-    out.push_str("truncated: ");
-    out.push_str(&header(tables, further));
-    out.push('\n');
-    for table in tables {
-        let heads: Vec<_> = table
-            .heads
-            .iter()
-            .map(|head| json!({ "name": head.name, "type": head.data_type }))
-            .collect();
-        out.push_str(table.label);
-        out.push_str(": ");
-        out.push_str(&json_line(&heads));
-        out.push('\n');
-        for row in &table.rows {
-            out.push_str(&json_line(row));
-            out.push('\n');
+    let mut written: Vec<Written> = tables.iter().map(write).collect();
+    let mut body: usize = written
+        .iter()
+        .map(|w| w.lead.len() + w.rows.iter().map(|(line, _)| line.len()).sum::<usize>())
+        .sum();
+    loop {
+        let head = header(&written, further);
+        // `truncated: ` and the newline are the line's own.
+        if "truncated: ".len() + head.len() + 1 + body <= RESULT_BUDGET {
+            return assemble(&written, &head);
+        }
+        let Some(last) = written.iter_mut().rev().find(|w| w.kept > 0) else {
+            // Nothing is left to drop: the leading lines are all there is.
+            return assemble(&written, &head);
+        };
+        last.kept -= 1;
+        body -= last.rows[last.kept].0.len();
+    }
+}
+
+fn assemble(written: &[Written], head: &str) -> String {
+    let mut out = format!("truncated: {head}\n");
+    for w in written {
+        out.push_str(&w.lead);
+        for (line, _) in &w.rows[..w.kept] {
+            out.push_str(line);
         }
     }
     out
+}
+
+/// A table as lines, with every cell clipped to [`CELL_CAP`] characters.
+fn write(table: &Table) -> Written<'_> {
+    let heads: Vec<_> = table
+        .heads
+        .iter()
+        .map(|head| json!({ "name": head.name, "type": head.data_type }))
+        .collect();
+    let lead = format!("{}: {}\n", table.label, json_line(&heads));
+    // A list of names that alone takes half the budget would leave no room
+    // for what the agent asked about.
+    if lead.len() > RESULT_BUDGET / 2 {
+        return Written {
+            table,
+            lead: format!(
+                "{}: {} columns (names not listed: they exceed the reply budget)\n",
+                table.label,
+                table.heads.len()
+            ),
+            rows: Vec::new(),
+            kept: 0,
+            unlisted: true,
+        };
+    }
+    let rows: Vec<(String, bool)> = table
+        .rows
+        .iter()
+        .map(|row| {
+            let mut clipped = false;
+            let cells: Vec<Option<String>> = row
+                .iter()
+                .map(|cell| {
+                    cell.as_ref().map(|cell| match clip(cell) {
+                        Some(shorter) => {
+                            clipped = true;
+                            shorter
+                        }
+                        None => cell.clone(),
+                    })
+                })
+                .collect();
+            (format!("{}\n", json_line(&cells)), clipped)
+        })
+        .collect();
+    Written {
+        table,
+        lead,
+        kept: rows.len(),
+        rows,
+        unlisted: false,
+    }
+}
+
+/// The cell cut to [`CELL_CAP`] characters and marked, or `None` when it is
+/// short enough. The marker is inside the string, so it is JSON like the rest.
+fn clip(cell: &str) -> Option<String> {
+    let (at, _) = cell.char_indices().nth(CELL_CAP)?;
+    Some(format!(
+        "{} [clipped from {} characters]",
+        &cell[..at],
+        cell.chars().count()
+    ))
 }
 
 /// What the first line says after `truncated: `. One table reads `none (N
@@ -73,20 +196,30 @@ pub(crate) fn text(tables: &[Table], further: usize) -> String {
 // ponytail: the wording of a cut is the least a reader needs to know that rows
 // are missing and how many there were. The upgrade is a second line that says
 // what to ask for next, if agents turn out to need it.
-fn header(tables: &[Table], further: usize) -> String {
-    match tables {
+fn header(written: &[Written], further: usize) -> String {
+    match written {
         [] if further == 0 => "none (0 rows)".to_string(),
-        [] => cut(0, Total::Exact(0), further).unwrap_or_default(),
-        [table] => cut(table.rows.len(), table.total, further)
-            .unwrap_or_else(|| format!("none ({})", rows(table.rows.len()))),
+        [] => cut(
+            Cut {
+                shown: 0,
+                listed: 0,
+                total: Total::Exact(0),
+                budget: false,
+                clipped: false,
+            },
+            further,
+        )
+        .unwrap_or_default(),
+        [one] => one
+            .cut(further)
+            .unwrap_or_else(|| format!("none ({})", rows(one.kept))),
         _ => {
-            let cuts: Vec<String> = tables
+            let cuts: Vec<String> = written
                 .iter()
                 .enumerate()
-                .filter_map(|(at, table)| {
-                    let further = if at + 1 == tables.len() { further } else { 0 };
-                    let cut = cut(table.rows.len(), table.total, further)?;
-                    Some(format!("{}: {cut}", table.label))
+                .filter_map(|(at, w)| {
+                    let further = if at + 1 == written.len() { further } else { 0 };
+                    Some(format!("{}: {}", w.table.label, w.cut(further)?))
                 })
                 .collect();
             if cuts.is_empty() {
@@ -98,12 +231,27 @@ fn header(tables: &[Table], further: usize) -> String {
     }
 }
 
-/// How a table was cut, or `None` when it was not.
-fn cut(shown: usize, total: Total, further: usize) -> Option<String> {
+/// What was done to one table's rows.
+struct Cut {
+    /// Rows written.
+    shown: usize,
+    /// Rows the table was given.
+    listed: usize,
+    total: Total,
+    /// Rows or names were left out to stay inside the byte budget.
+    budget: bool,
+    /// A written cell was clipped.
+    clipped: bool,
+}
+
+/// How a table was cut, or `None` when it was not. The reasons are always in
+/// one order: `row cap`, `byte budget`, `clipped cells`, then the result sets
+/// not included.
+fn cut(cut: Cut, further: usize) -> Option<String> {
     let mut reasons = Vec::new();
-    let of = match total {
+    let of = match cut.total {
         Total::Exact(total) => {
-            if total > shown {
+            if total > cut.listed {
                 reasons.push("row cap".to_string());
             }
             total.to_string()
@@ -114,6 +262,12 @@ fn cut(shown: usize, total: Total, further: usize) -> Option<String> {
             format!("at least {total}")
         }
     };
+    if cut.budget {
+        reasons.push("byte budget".to_string());
+    }
+    if cut.clipped {
+        reasons.push("clipped cells".to_string());
+    }
     if further > 0 {
         reasons.push(match further {
             1 => "1 further result set not shown".to_string(),
@@ -124,7 +278,8 @@ fn cut(shown: usize, total: Total, further: usize) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{shown} of {of} rows shown ({})",
+        "{} of {of} rows shown ({})",
+        cut.shown,
         reasons.join(", ")
     ))
 }
@@ -278,6 +433,121 @@ mod tests {
                 0
             ),
             "truncated: columns: 1 of 3 rows shown (row cap); indexes: 1 of 4 rows shown (row cap)"
+        );
+    }
+
+    /// A one-column table of `count` rows of `cell`.
+    fn wide(count: usize, cell: &str, total: Total) -> Table {
+        Table {
+            label: "columns",
+            heads: vec![head("c", None)],
+            rows: (0..count).map(|_| vec![Some(cell.to_string())]).collect(),
+            total,
+        }
+    }
+
+    #[test]
+    fn a_result_is_cut_at_a_row_boundary_under_the_budget_with_its_header_first() {
+        let out = text(&[wide(100, &"a".repeat(500), Total::Exact(100))], 0);
+        assert!(out.len() <= RESULT_BUDGET, "{}", out.len());
+        assert!(out.ends_with("\"]\n"), "the text ends after a whole row");
+        let mut lines = out.lines();
+        let shown = out.lines().filter(|line| line.starts_with("[\"")).count();
+        assert!((1..100).contains(&shown), "{shown}");
+        assert_eq!(
+            lines.next(),
+            Some(format!("truncated: {shown} of 100 rows shown (byte budget)").as_str())
+        );
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("columns: "))
+        );
+        // Every row line that is there is a whole one.
+        assert!(lines.all(|line| line.len() == 504 && line.ends_with("\"]")));
+    }
+
+    #[test]
+    fn a_result_exactly_at_the_budget_is_kept_whole() {
+        // Every character added to the last cell is one byte of text, so the
+        // empty one says how many are left.
+        let table = |last: usize| {
+            let mut table = wide(13, &"a".repeat(1_900), Total::Exact(13));
+            table.rows[12][0] = Some("a".repeat(last));
+            table
+        };
+        let last = RESULT_BUDGET - text(&[table(0)], 0).len();
+        let kept = text(&[table(last)], 0);
+        assert_eq!(kept.len(), RESULT_BUDGET);
+        assert!(
+            kept.starts_with("truncated: none (13 rows)\n"),
+            "{}",
+            &kept[..60]
+        );
+        let over = text(&[table(last + 1)], 0);
+        assert!(over.len() <= RESULT_BUDGET);
+        assert!(
+            over.starts_with("truncated: 12 of 13 rows shown (byte budget)\n"),
+            "{}",
+            &over[..60]
+        );
+        assert_eq!(over.lines().count(), 14);
+    }
+
+    #[test]
+    fn an_oversized_cell_is_clipped_on_a_character_boundary() {
+        let cell = "\u{20ac}".repeat(CELL_CAP + 10);
+        let out = text(&[wide(1, &cell, Total::Exact(1))], 0);
+        let row: Vec<String> = serde_json::from_str(out.lines().nth(2).expect("a row line"))
+            .expect("the row is a JSON array");
+        assert_eq!(
+            row[0],
+            format!(
+                "{} [clipped from 2010 characters]",
+                "\u{20ac}".repeat(CELL_CAP)
+            )
+        );
+        assert_eq!(
+            out.lines().next(),
+            Some("truncated: 1 of 1 rows shown (clipped cells)")
+        );
+        // A cell of exactly the cap is left alone.
+        let whole = text(&[wide(1, &"x".repeat(CELL_CAP), Total::Exact(1))], 0);
+        assert!(whole.starts_with("truncated: none (1 row)\n"));
+    }
+
+    #[test]
+    fn too_many_columns_to_list_are_counted_instead() {
+        let mut table = wide(3, "x", Total::Exact(3));
+        table.heads = (0..5_000)
+            .map(|n| head(&format!("column_{n:04}"), None))
+            .collect();
+        let out = text(&[table], 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:?}");
+        assert!(lines[0].contains("(byte budget)"), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            "columns: 5000 columns (names not listed: they exceed the reply budget)"
+        );
+        assert!(out.len() <= RESULT_BUDGET);
+    }
+
+    #[test]
+    fn the_reasons_are_listed_in_one_order() {
+        let mut table = wide(60, &"a".repeat(500), Total::AtLeast(60));
+        table.rows[0][0] = Some("b".repeat(CELL_CAP + 1));
+        let out = text(&[table], 2);
+        let shown = out.lines().filter(|line| line.starts_with("[\"")).count();
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                format!(
+                    "truncated: {shown} of at least 60 rows shown (row cap, byte budget, \
+                     clipped cells, 2 further result sets not shown)"
+                )
+                .as_str()
+            )
         );
     }
 }

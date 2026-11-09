@@ -1,6 +1,6 @@
 //! The frames a call is made of: newline-delimited JSON, one object per line,
-//! at most [`FRAME_LIMIT`] bytes. A connection opens with one [`Hello`] and is
-//! answered with one `Reply` line.
+//! at most [`FRAME_LIMIT`] bytes, or [`REPLY_LIMIT`] for the answer. A
+//! connection opens with one [`Hello`] and is answered with one `Reply` line.
 
 use std::io::{self, BufRead, Read};
 
@@ -16,6 +16,14 @@ pub(super) const PROTOCOL_VERSION: u32 = 2;
 // statement, so 64 KiB is beyond any statement worth reading back as rows; the
 // cap is what stops a connection from making the app buffer without end.
 pub(super) const FRAME_LIMIT: u64 = 64 * 1024;
+
+// ponytail: an answer is the app's text under `RESULT_BUDGET`, and JSON writes
+// each `"` and `\` as two bytes, so the worst case is twice the text plus the
+// frame's own keys; the assert below is what keeps the two numbers honest. A
+// request keeps `FRAME_LIMIT`: only the answer carries rows.
+pub(super) const REPLY_LIMIT: u64 = 256 * 1024;
+
+const _: () = assert!(2 * super::result::RESULT_BUDGET as u64 + 4096 <= REPLY_LIMIT);
 
 /// The first frame of a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,5 +182,17 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let mut empty = Cursor::new(Vec::new());
         assert!(matches!(read_frame(&mut empty, FRAME_LIMIT), Ok(None)));
+    }
+
+    #[test]
+    fn the_largest_reply_fits_the_reply_limit() {
+        let text: String = (0..crate::agent::result::RESULT_BUDGET)
+            .map(|at| if at % 2 == 0 { '"' } else { '\\' })
+            .collect();
+        let line = encode(&Reply {
+            status: Status::Executed,
+            text,
+        });
+        assert!(line.len() as u64 <= REPLY_LIMIT, "{}", line.len());
     }
 }
