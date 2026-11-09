@@ -1173,6 +1173,31 @@ impl ConnectionConfig {
         }
     }
 
+    /// Whether this is a DuckDB database that lives only inside the user's own
+    /// instance: a blank path or [`DUCKDB_IN_MEMORY`].
+    fn is_duckdb_in_memory(&self) -> bool {
+        matches!(self, Self::DuckDb { path, .. }
+            if matches!(path.trim(), "" | DUCKDB_IN_MEMORY))
+    }
+
+    /// Whether an agent's connection is opened for each call and dropped when
+    /// it ends, rather than kept: true only for a DuckDB file. A second DuckDB
+    /// instance's view of the file is frozen at open, so a kept one would read
+    /// a copy that goes stale as the user commits.
+    pub fn agent_opens_per_call(&self) -> bool {
+        matches!(self, Self::DuckDb { .. }) && !self.is_duckdb_in_memory()
+    }
+
+    /// Why an agent may not read this profile at all, when it may not: an
+    /// in-memory DuckDB database exists only inside the user's own instance,
+    /// so an agent's connection would open an empty one and read it as the
+    /// user's. Asked before anything opens.
+    pub fn agent_refusal(&self) -> Option<&'static str> {
+        self.is_duckdb_in_memory().then_some(
+            "This connection is an in-memory DuckDB database, which has no separate connection an agent can read.",
+        )
+    }
+
     pub fn engine(&self) -> Engine {
         match self {
             Self::Postgres(_) => Engine::Postgres,
@@ -5475,6 +5500,40 @@ mod tests {
                 "{engine:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_duckdb_file_is_opened_per_call_and_only_in_memory_is_refused() {
+        let in_memory = |path: &str| ConnectionConfig::duckdb(path.to_string(), 0);
+        let mut per_call = vec![];
+        let mut refused = vec![];
+        for config in every_shape().into_iter().chain([
+            in_memory(""),
+            in_memory("  "),
+            in_memory(DUCKDB_IN_MEMORY),
+        ]) {
+            let name = format!(
+                "{:?} {}",
+                config.engine(),
+                config.identifying_text().join(",")
+            );
+            if config.agent_opens_per_call() {
+                per_call.push(name.clone());
+            }
+            if config.agent_refusal().is_some() {
+                refused.push(name);
+            }
+        }
+        assert_eq!(per_call, ["DuckDb /tmp/c.duckdb"]);
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        assert!(refused.iter().all(|name| name.starts_with("DuckDb")));
+        assert_eq!(
+            in_memory(DUCKDB_IN_MEMORY).agent_refusal(),
+            Some(
+                "This connection is an in-memory DuckDB database, which has no separate connection an agent can read."
+            )
+        );
+        assert!(!in_memory("").agent_opens_per_call());
     }
 
     #[test]

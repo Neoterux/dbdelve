@@ -334,6 +334,28 @@ impl Workspace {
             );
             return;
         };
+        if let Some(refusal) = profile.config.agent_refusal() {
+            // Before a lane exists: nothing is opened for a profile an agent
+            // cannot read.
+            let name = profile.name.clone();
+            self.agent_answered(
+                id,
+                Some(name),
+                None,
+                &reply,
+                Reply {
+                    status: Status::RefusedByGate,
+                    text: refusal.to_string(),
+                },
+                CallFacts {
+                    verdict: Some(AuditVerdict::Refuse(refusal.to_string())),
+                    sql: Some(sql),
+                    elapsed_ms: elapsed_ms(arrived),
+                    ..CallFacts::default()
+                },
+            );
+            return;
+        }
         let (profile_name, config) = (profile.name.clone(), profile.config.clone());
         self.agent
             .lanes
@@ -499,8 +521,12 @@ impl Workspace {
                 hidden,
                 result: Ok(result),
             } => {
-                lane.connection = Some(connection);
-                lane.hidden = hidden;
+                // A DuckDB connection is let go here, so the next call opens
+                // afresh and sees what the user has committed since.
+                if !lane.opened_from.agent_opens_per_call() {
+                    lane.connection = Some(connection);
+                    lane.hidden = hidden;
+                }
                 let table = table_of(engine, &result);
                 ended.rows = Some((table.rows.len(), table.total));
                 (Status::Executed, result::text(&[table], result.rest.len()))
