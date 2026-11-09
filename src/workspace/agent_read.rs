@@ -174,6 +174,25 @@ fn account_end(message: &str, at: usize) -> Option<usize> {
     Some(message.len() - after_host.len())
 }
 
+/// The profile an agent's call resolved to, taken from the list in the turn
+/// that resolved it. [`Workspace::run_agent_work`] is handed this and not an id
+/// to look up again: nothing between the two can change the list.
+pub(crate) struct Resolved {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) config: ConnectionConfig,
+}
+
+impl Resolved {
+    pub(super) fn of(profile: &Profile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            config: profile.config.clone(),
+        }
+    }
+}
+
 /// Said for a statement that needs the user's approval: it is not run for an
 /// agent, and no connection is opened for it.
 pub(crate) const NEEDS_APPROVAL: &str =
@@ -455,58 +474,39 @@ impl Workspace {
     pub(crate) fn run_agent_sql(
         &mut self,
         id: CallId,
-        profile_id: String,
+        profile: Resolved,
         sql: String,
         reply: SyncSender<Reply>,
         arrived: Instant,
         cx: &mut Context<Self>,
     ) {
-        self.run_agent_work(id, profile_id, AgentWork::Query { sql }, reply, arrived, cx);
+        self.run_agent_work(id, profile, AgentWork::Query { sql }, reply, arrived, cx);
     }
 
-    /// Take work for `profile_id`'s lane, on the same terms as
+    /// Take work for `profile`'s lane, on the same terms as
     /// [`Workspace::run_agent_sql`]: the profile must be one an agent may read,
     /// and the work waits its turn on the agent's own connection.
     pub(crate) fn run_agent_work(
         &mut self,
         id: CallId,
-        profile_id: String,
+        profile: Resolved,
         work: AgentWork,
         reply: SyncSender<Reply>,
         arrived: Instant,
         cx: &mut Context<Self>,
     ) {
-        let Some(profile) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-        else {
-            // The profile went between the gate and here.
-            self.agent_answered(
-                id,
-                work.tool(),
-                None,
-                None,
-                &reply,
-                Reply {
-                    status: Status::RefusedByGate,
-                    text: super::agent::AgentLookup::NotAvailable.to_string(),
-                },
-                CallFacts {
-                    elapsed_ms: elapsed_ms(arrived),
-                    ..CallFacts::default()
-                },
-            );
-            return;
-        };
-        if let Some(refusal) = profile.config.agent_refusal() {
+        let Resolved {
+            id: profile_id,
+            name: profile_name,
+            config,
+        } = profile;
+        if let Some(refusal) = config.agent_refusal() {
             // Before a lane exists: nothing is opened for a profile an agent
             // cannot read.
-            let name = profile.name.clone();
             self.agent_answered(
                 id,
                 work.tool(),
-                Some(name),
+                Some(profile_name),
                 None,
                 &reply,
                 Reply {
@@ -525,7 +525,6 @@ impl Workspace {
             );
             return;
         }
-        let (profile_name, config) = (profile.name.clone(), profile.config.clone());
         self.agent
             .lanes
             .entry(profile_id.clone())
@@ -571,8 +570,10 @@ impl Workspace {
             .find(|profile| profile.id == profile_id)
             .map(|profile| profile.config.clone())
         else {
-            // The profile went with calls still waiting: no sweep is meant to
-            // leave one behind, and none is run for a profile that is gone.
+            // Not expected to run: the only place a profile leaves the list is
+            // `remove_profile`, which ends this lane in the same turn through
+            // `reject_calls_for`. Kept so that if a profile ever did go with
+            // calls waiting, each is answered and none is stranded.
             self.end_lane(
                 profile_id,
                 Status::Rejected,
