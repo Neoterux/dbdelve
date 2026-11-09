@@ -355,6 +355,10 @@ pub(crate) struct Workspace {
     /// dialog sets it, and `set_agent_visible` grants visibility only to the
     /// profile it names.
     pub(crate) agent_visibility_prompt: Option<String>,
+    /// Whether an agent's read of the profile in [`Self::agent_visibility_prompt`]
+    /// can make the owner's commit wait. Read from the file once, when the
+    /// dialog opens, so drawing it never touches the disk.
+    pub(crate) agent_visibility_blocks_commits: bool,
     /// The agent bridge: the socket, and the calls waiting on this window.
     pub(crate) agent: agent::AgentState,
     /// Whether the `Agent activity` dialog is up. Only the popover's item
@@ -524,6 +528,7 @@ impl Workspace {
             collapsed_projects: HashSet::new(),
             theme_before_preview: None,
             agent_visibility_prompt: None,
+            agent_visibility_blocks_commits: false,
             agent_audit_open: false,
             agent: agent::AgentState::default(),
             opacity_input,

@@ -1133,6 +1133,26 @@ fn open_file(path: &std::path::Path, read_only: bool) -> Result<rusqlite::Connec
     )
 }
 
+/// Whether the file at `path` is in WAL journal mode, read from its header:
+/// after the `SQLite format 3\0` magic, bytes 18 and 19 are the file format
+/// write and read versions, 2 and 2 for WAL and 1 and 1 for a rollback journal.
+/// `None` for a file that is missing, shorter than the fields, or not a SQLite
+/// database, so a caller can tell "rollback" from "cannot say".
+pub(super) fn journal_is_wal(path: &str) -> Option<bool> {
+    use std::io::Read;
+
+    let mut header = Vec::with_capacity(100);
+    std::fs::File::open(crate::store::home_expanded(path))
+        .ok()?
+        .take(100)
+        .read_to_end(&mut header)
+        .ok()?;
+    if header.len() < 20 || !header.starts_with(b"SQLite format 3\0") {
+        return None;
+    }
+    Some(header[18] == 2 && header[19] == 2)
+}
+
 /// End the transaction a failed batch left open, and say so in the error.
 ///
 /// SQLite stops the batch at the failing statement, so the `COMMIT` dbdelve wrote
@@ -2385,6 +2405,40 @@ CREATE TRIGGER accounts_touch AFTER INSERT ON Accounts BEGIN SELECT 1; END;"
             }),
             _guard: None,
         }
+    }
+
+    #[test]
+    fn a_files_journal_mode_is_read_from_its_header() {
+        let dir = std::env::temp_dir().join(format!("dbdelve-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = dir.join("wal.db");
+        let rollback = dir.join("rollback.db");
+        let empty = dir.join("empty.db");
+        let text = dir.join("text.db");
+        for path in [&wal, &rollback, &empty, &text] {
+            let _ = std::fs::remove_file(path);
+        }
+        rusqlite::Connection::open(&wal)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (id INTEGER);")
+            .unwrap();
+        rusqlite::Connection::open(&rollback)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (id INTEGER);")
+            .unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::write(
+            &text,
+            "this is a text file that is longer than a header's magic and version bytes",
+        )
+        .unwrap();
+        let read = |path: &std::path::Path| journal_is_wal(&path.to_string_lossy());
+        assert_eq!(read(&wal), Some(true));
+        assert_eq!(read(&rollback), Some(false));
+        assert_eq!(read(&empty), None);
+        assert_eq!(read(&text), None);
+        assert_eq!(read(&dir.join("missing.db")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

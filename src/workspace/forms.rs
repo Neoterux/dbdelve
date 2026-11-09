@@ -1490,7 +1490,11 @@ impl Workspace {
         let t = popup_theme(cx);
         let id = self.agent_visibility_prompt.as_deref()?;
         let profile = self.profiles.iter().find(|profile| profile.id == id)?;
-        let facts = visibility_facts(profile.config.engine(), profile.mode);
+        let facts = visibility_facts(
+            profile.config.engine(),
+            profile.mode,
+            self.agent_visibility_blocks_commits,
+        );
         let cancel_workspace = cx.entity().downgrade();
         let confirm_workspace = cancel_workspace.clone();
 

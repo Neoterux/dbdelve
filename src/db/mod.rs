@@ -1204,6 +1204,16 @@ impl ConnectionConfig {
         )
     }
 
+    /// Whether an agent's read of this connection can make the user's commit
+    /// wait: a SQLite file not in WAL mode, where a reader holds off the
+    /// writer's commit lock until it ends. Turso does not (probed), and no
+    /// other engine shares a file lock with its readers. A file whose header
+    /// cannot be read counts as rollback, SQLite's default. Reads the file's
+    /// header, so it is asked once when a dialog opens.
+    pub fn agent_read_can_block_commits(&self) -> bool {
+        matches!(self, Self::Sqlite { path, .. } if sqlite::journal_is_wal(path) != Some(true))
+    }
+
     pub fn engine(&self) -> Engine {
         match self {
             Self::Postgres(_) => Engine::Postgres,
