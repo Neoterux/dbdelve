@@ -1762,6 +1762,18 @@ impl Workspace {
             .iter()
             .find(|profile| profile.id == call.profile_id)?;
         let engine = profile.config.engine();
+        // What Approve will compare the pending statement with: the source
+        // string, never the marked text drawn from it. Written only on a
+        // change, so a frame costs one comparison.
+        {
+            let mut shown = self.approval_shown.borrow_mut();
+            if shown
+                .as_ref()
+                .is_none_or(|(shown_id, sql)| *shown_id != id || *sql != approval.sql)
+            {
+                *shown = Some((id, approval.sql.clone()));
+            }
+        }
         let code = fonts(cx).editor.clone();
         // A marker is DBDelve's own, drawn in the accent so it cannot pass for
         // the statement's text.
