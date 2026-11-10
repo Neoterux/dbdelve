@@ -77,7 +77,11 @@
 
 use std::fmt;
 
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::{
+    ast::Statement,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer},
+};
 
 use crate::db::Engine;
 
@@ -321,25 +325,65 @@ pub(crate) enum ApprovalKind {
     UnlistedCall,
 }
 
+/// The kind of a statement [`agent_gate`] approved with `verdict`. It asks the
+/// predicates step 10 asks rather than restating them, so what the dialog says
+/// cannot contradict the gate: a write is the step-9 verdict at Read-write, and
+/// of the reads the gate approves the ones that are not egress are the ones
+/// that call an unlisted function.
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
-pub(crate) fn approval_kind(_engine: Engine, _sql: &str, _verdict: &Verdict) -> ApprovalKind {
-    ApprovalKind::Write
+pub(crate) fn approval_kind(engine: Engine, sql: &str, verdict: &Verdict) -> ApprovalKind {
+    if verdict.mode == Mode::ReadWrite {
+        ApprovalKind::Write
+    } else if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[])
+        || reads_a_bare_path(engine, sql)
+    {
+        ApprovalKind::EgressRead
+    } else {
+        ApprovalKind::UnlistedCall
+    }
 }
 
+/// The statements `sql` parses to on `engine`, or none where it is not SQL or
+/// does not parse. The typed parse decides, as the gate's does, so a word in a
+/// comment or a string literal cannot stand in for the statement.
+fn typed_statements(engine: Engine, sql: &str) -> Vec<Statement> {
+    dialect(engine)
+        .and_then(|dialect| Parser::parse_sql(dialect.as_ref(), sql).ok())
+        .unwrap_or_default()
+}
+
+/// Whether `sql` is a Postgres `CREATE INDEX CONCURRENTLY`. Only Postgres
+/// leaves an invalid index behind when a concurrent build stops, which is what
+/// the answer to a stopped write tells the agent about.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the approved write's answer reads it")
 )]
-pub(crate) fn creates_index_concurrently(_engine: Engine, _sql: &str) -> bool {
-    false
+pub(crate) fn creates_index_concurrently(engine: Engine, sql: &str) -> bool {
+    engine == Engine::Postgres
+        && typed_statements(engine, sql).iter().any(
+            |statement| matches!(statement, Statement::CreateIndex(index) if index.concurrently),
+        )
 }
 
+/// Whether the server's row count for `sql` is the rows it changed. A count of
+/// zero is also what a command with no row count reports (see
+/// [`crate::db::QueryResult::rows_affected`]), so it means "no rows" only for
+/// these four statements.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the approved write's answer reads it")
 )]
-pub(crate) fn counts_rows(_engine: Engine, _sql: &str) -> bool {
-    false
+pub(crate) fn counts_rows(engine: Engine, sql: &str) -> bool {
+    matches!(
+        typed_statements(engine, sql).as_slice(),
+        [
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Merge(_)
+                | Statement::Delete(_)
+        ]
+    )
 }
 
 /// Whether `sql`, on an engine that reads a quoted string in a table position
