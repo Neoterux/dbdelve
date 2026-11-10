@@ -76,6 +76,8 @@ pub(crate) struct AgentState {
 // exist when it began. The upgrade is a setting.
 pub(crate) const ARM_DELAY: Duration = Duration::from_millis(1500);
 
+pub(super) const NOT_RECORDED: &str = "";
+
 /// What an approval that was approved is told when the statement, the
 /// connection or the profile's access level is not what it was when the person
 /// was shown it. Nothing was opened.
