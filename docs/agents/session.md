@@ -117,8 +117,10 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   (`agent-approval`): the first entry of every `dialog_layer` list, so it is
   drawn behind every dialog the user is already answering, and below the
   titlebar. Deny is its one ring stop and Approve is a single mouse click that
-  works only after it has been on screen for `ARM_DELAY`; every key denies, so
-  no keystroke already in flight can approve what the person has not read.
+  works only after it has been on screen for `ARM_DELAY`, uncovered by another
+  dialog or the palette, counted afresh each time it is shown again; every key
+  denies, so no keystroke already in flight can approve what the person has
+  not read.
   Two records are kept of a call, for two readers. The Agent activity dialog
   reads the in-memory log (`AgentState::log`, at most `AUDIT_CAP`), this
   session's own: names, a code, a time, the statement cut at `AUDIT_SQL_CAP`

@@ -923,24 +923,45 @@ impl Workspace {
         if behind.is_none() && !self.dialog_focus.contains_focused(window, cx) {
             self.focus_before_dialog.replace(window.focused(cx));
         }
+        // The palette is drawn over every dialog without changing which one is
+        // in front, so an approval under it is not being shown either.
+        let covered = self.palette.is_some();
         // An approval's Approve counts its wait from when the person can see the
-        // dialog: raised to the front, or a different call come to the front.
+        // dialog: raised to the front, a different call come to the front, or
+        // the palette over it gone.
         if front == Some("agent-approval")
             && let Some(id) = self.front_approval_id()
-            && (raised || self.agent.revealed != Some(id))
         {
-            cx.on_next_frame(window, |workspace, window, cx| {
-                workspace.reveal_approval(window, cx)
-            });
+            if covered {
+                // Forgotten, so it is revealed afresh once the palette goes;
+                // the window still asks for attention once, as it may be
+                // behind another application.
+                if self.agent.revealed.is_some() || self.agent.attended != Some(id) {
+                    cx.on_next_frame(window, move |workspace, window, cx| {
+                        if workspace.agent.attended != Some(id) {
+                            workspace.reveal_approval(window, cx);
+                        }
+                        workspace.agent.revealed = None;
+                    });
+                }
+            } else if raised || self.agent.revealed != Some(id) {
+                cx.on_next_frame(window, |workspace, window, cx| {
+                    workspace.reveal_approval(window, cx)
+                });
+            }
         }
-        // An Approve is live only while its own dialog is the one in front: a
-        // dialog raised over it, or another call in front of it, ends the arm,
-        // so what comes back to the front is armed afresh.
+        // An Approve is live only while its own dialog is the one in front and
+        // nothing covers it: a dialog or the palette raised over it, or another
+        // call in front of it, ends the arm, so what is shown again is armed
+        // afresh.
         if self.agent.armed.is_some()
-            && (front != Some("agent-approval") || self.front_approval_id() != self.agent.armed)
+            && (covered
+                || front != Some("agent-approval")
+                || self.front_approval_id() != self.agent.armed)
         {
             cx.on_next_frame(window, |workspace, _, cx| {
-                if workspace.dialog_in_front.get() != Some("agent-approval")
+                if workspace.palette.is_some()
+                    || workspace.dialog_in_front.get() != Some("agent-approval")
                     || workspace.front_approval_id() != workspace.agent.armed
                 {
                     workspace.agent.armed = None;

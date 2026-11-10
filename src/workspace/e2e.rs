@@ -5418,6 +5418,64 @@ fn an_approval_covered_by_another_dialog_is_not_armed_until_it_is_shown_again(
     });
 }
 
+#[gpui::test]
+fn an_approval_under_the_palette_is_not_armed_until_the_palette_closes(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use super::agent::ARM_DELAY;
+    use crate::actions::CommandPalette;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let armed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.agent.armed);
+        let open_palette = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.dispatch_action(Box::new(CommandPalette), cx));
+            settle(cx);
+            assert!(workspace.read_with(cx, |w, _| w.palette.is_some()));
+        };
+        let close_palette = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.close_palette(window, cx)
+            });
+            settle(cx);
+        };
+
+        // A call that arrives under the palette.
+        open_palette(cx);
+        let (id, _answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.agent.attended),
+            Some(id),
+            "the window asks for attention all the same"
+        );
+        cx.executor()
+            .advance_clock(ARM_DELAY + Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), None, "armed under the palette");
+
+        close_palette(cx);
+        assert_eq!(armed(cx), None, "armed the moment the palette closed");
+        cx.executor()
+            .advance_clock(ARM_DELAY - Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), None);
+        cx.executor().advance_clock(Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), Some(id));
+
+        // The palette opened over an armed approval disarms it until it closes.
+        open_palette(cx);
+        assert_eq!(armed(cx), None, "still armed under the palette");
+        close_palette(cx);
+        assert_eq!(armed(cx), None);
+        cx.executor().advance_clock(ARM_DELAY);
+        settle(cx);
+        assert_eq!(armed(cx), Some(id));
+        quit(workspace, cx);
+    });
+}
+
 /// A press and release of the left button at `at`, with the counts a person's
 /// double click or a window-activating click carries.
 fn mouse_press(
