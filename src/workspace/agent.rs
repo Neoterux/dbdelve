@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
+use super::agent_read::{self, AgentWork, Approved, Resolved, explain_statement};
 use super::agent_write;
 use super::*;
 use crate::{
@@ -765,17 +765,41 @@ impl Workspace {
                     // the same file.
                     Err(error) => (Status::Failed, NOT_RECORDED, Some(error)),
                     Ok(()) => {
-                        self.start_write(
-                            id,
-                            profile_id,
-                            profile_name,
-                            approval.config,
-                            approval.sql,
-                            held,
-                            reply,
-                            arrived,
-                            cx,
-                        );
+                        match held {
+                            // What the person read runs on the profile's
+                            // read-only lane, which a write fails against.
+                            Some(
+                                verdict @ AuditVerdict::Approve {
+                                    mode: Mode::ReadOnly,
+                                    ..
+                                },
+                            ) => self.run_agent_work(
+                                id,
+                                Resolved {
+                                    id: profile_id,
+                                    name: profile_name,
+                                    config: approval.config,
+                                },
+                                AgentWork::Query {
+                                    sql: approval.sql,
+                                    approved: Some(Approved { verdict, engine }),
+                                },
+                                reply,
+                                arrived,
+                                cx,
+                            ),
+                            held => self.start_write(
+                                id,
+                                profile_id,
+                                profile_name,
+                                approval.config,
+                                approval.sql,
+                                held,
+                                reply,
+                                arrived,
+                                cx,
+                            ),
+                        }
                         self.finish_approval(was_in_front, cx);
                         return;
                     }
@@ -1126,11 +1150,14 @@ impl Workspace {
                         self.run_agent_sql(id, resolved, sql, reply, arrived, cx);
                         return;
                     }
-                    // A write is held for a person, unless nothing can run it
-                    // for an agent on this engine: then it is refused here,
-                    // before there is a pending call or a dialog to be shown.
-                    AgentVerdict::Approve(held, _) if held.mode == Mode::ReadWrite => {
-                        match resolved.config.agent_write_refusal() {
+                    // Everything the gate approves is held for a person, a
+                    // read of a file or a call it does not list included. A
+                    // write is refused here, before there is a pending call or
+                    // a dialog to be shown, when nothing can run it for an
+                    // agent on this engine.
+                    AgentVerdict::Approve(held, _) => {
+                        let write = held.mode == Mode::ReadWrite;
+                        match resolved.config.agent_write_refusal().filter(|_| write) {
                             Some(refusal) => (
                                 refusal.to_string(),
                                 Some(AuditVerdict::Refuse(refusal.to_string())),
@@ -1155,9 +1182,6 @@ impl Workspace {
                                 return;
                             }
                         }
-                    }
-                    AgentVerdict::Approve(..) => {
-                        (NEEDS_APPROVAL.to_string(), AuditVerdict::held_by(verdict))
                     }
                     AgentVerdict::Refuse(reason) => {
                         (reason.to_string(), AuditVerdict::held_by(verdict))

@@ -7286,11 +7286,11 @@ fn an_agent_read_on_a_duckdb_file_sees_the_latest_commit(cx: &mut TestAppContext
 /// both under the test home. Answers the workspace, the user's own instance of
 /// the file (held open for the whole test) and the CSV's path.
 #[cfg(unix)]
-fn agent_duckdb_with_csv<'a>(
-    cx: &'a mut TestAppContext,
+fn agent_duckdb_with_csv(
+    cx: &mut TestAppContext,
 ) -> (
     Entity<Workspace>,
-    &'a mut VisualTestContext,
+    &mut VisualTestContext,
     ::duckdb::Connection,
     String,
 ) {
@@ -7338,7 +7338,7 @@ fn an_approved_read_of_a_file_runs_read_only_and_answers_rows(cx: &mut TestAppCo
         assert!(
             answer
                 .text
-                .starts_with("truncated: none (1 rows)\ncolumns: [{\"name\":\"n\""),
+                .starts_with("truncated: none (1 row)\ncolumns: [{\"name\":\"n\""),
             "{}",
             answer.text
         );

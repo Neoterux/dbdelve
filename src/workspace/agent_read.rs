@@ -193,9 +193,9 @@ impl Resolved {
     }
 }
 
-/// Said for a statement that needs the user's approval at Read-only access:
-/// it is not run for an agent, and no connection is opened for it. A write at
-/// Read-write waits for the person instead.
+/// Said for an `explain_query` of a statement that needs the user's approval:
+/// it is not run for an agent, and no connection is opened for it.
+/// `execute_sql` holds such a statement for the person instead.
 pub(crate) const NEEDS_APPROVAL: &str =
     "statements that need the user's approval are not run for agents";
 
@@ -237,6 +237,9 @@ pub(crate) struct Running {
     sql: Option<String>,
     /// When the call reached the window, for the audit's elapsed time.
     arrived: Instant,
+    /// The approval a person gave the statement, which the audit says instead
+    /// of that the gate let it run.
+    approved: Option<Approved>,
     /// What stops the statement on the server when the call ends early.
     cancel: CancelToken,
     /// The connection the statement runs on, held here as soon as it exists so
@@ -271,25 +274,21 @@ pub(crate) struct Waiting {
 /// What a waiting call will do once its lane is free.
 #[derive(Clone)]
 pub(crate) enum AgentWork {
+    /// A statement. `approved` is what a person's approval of it left, for a
+    /// read the gate held for them; a read the gate let run has none.
     Query {
         sql: String,
+        approved: Option<Approved>,
     },
     /// The agent connection's catalog: its schemas, or with `schema` the
     /// relations of that one. DBDelve reads it through the driver and sends no
     /// statement of its own for it.
-    Catalog {
-        schema: Option<String>,
-    },
+    Catalog { schema: Option<String> },
     /// One relation's definition, read through the driver like the catalog.
-    Structure {
-        schema: String,
-        table: String,
-    },
+    Structure { schema: String, table: String },
     /// The engine's EXPLAIN of the agent's statement, already composed and
     /// already judged by the gate as this exact text.
-    Explain {
-        statement: String,
-    },
+    Explain { statement: String },
 }
 
 impl AgentWork {
@@ -303,10 +302,18 @@ impl AgentWork {
         }
     }
 
+    /// The approval this work ran under, if a person gave one.
+    fn approved(&self) -> Option<Approved> {
+        match self {
+            AgentWork::Query { approved, .. } => approved.clone(),
+            _ => None,
+        }
+    }
+
     /// The statement the audit records, for the work that sends one.
     fn sql(&self) -> Option<String> {
         match self {
-            AgentWork::Query { sql } => Some(sql.clone()),
+            AgentWork::Query { sql, .. } => Some(sql.clone()),
             AgentWork::Explain { statement } => Some(statement.clone()),
             AgentWork::Catalog { .. } | AgentWork::Structure { .. } => None,
         }
@@ -330,7 +337,8 @@ pub(super) struct Ended {
     pub(super) error: Option<String>,
 }
 
-/// What a person's approval leaves on a read that ran after it.
+/// What a person's approval leaves on a read that ran after it: the verdict the
+/// dialog showed, and the engine the audit file names.
 #[derive(Clone)]
 pub(crate) struct Approved {
     pub(crate) verdict: AuditVerdict,
@@ -347,9 +355,13 @@ fn facts_of(
     arrived: Instant,
     ended: Ended,
 ) -> CallFacts {
-    let _ = approved;
     CallFacts {
-        verdict: sql.is_some().then_some(AuditVerdict::Run),
+        verdict: match &approved {
+            Some(approved) => Some(approved.verdict.clone()),
+            None => sql.is_some().then_some(AuditVerdict::Run),
+        },
+        decision: approved.as_ref().map(|_| Decision::Approved),
+        engine: approved.map(|approved| approved.engine),
         sql,
         shown: ended.rows.map(|(shown, _)| shown),
         total: ended.rows.map(|(_, total)| total),
@@ -495,7 +507,17 @@ impl Workspace {
         arrived: Instant,
         cx: &mut Context<Self>,
     ) {
-        self.run_agent_work(id, profile, AgentWork::Query { sql }, reply, arrived, cx);
+        self.run_agent_work(
+            id,
+            profile,
+            AgentWork::Query {
+                sql,
+                approved: None,
+            },
+            reply,
+            arrived,
+            cx,
+        );
     }
 
     /// Take work for `profile`'s lane, on the same terms as
@@ -625,6 +647,7 @@ impl Workspace {
         let engine = config.engine();
         let cancel = CancelToken::default();
         let sent = work.sql();
+        let approved = work.approved();
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
@@ -701,6 +724,7 @@ impl Workspace {
                 reply,
                 sql: sent,
                 arrived,
+                approved,
                 cancel,
                 connection: None,
                 _work: task,
@@ -859,7 +883,7 @@ impl Workspace {
                     running.reply,
                     facts_of(
                         running.sql,
-                        None,
+                        running.approved,
                         running.arrived,
                         std::mem::take(&mut ended),
                     ),
@@ -875,7 +899,7 @@ impl Workspace {
                 waiting.reply,
                 facts_of(
                     waiting.work.sql(),
-                    None,
+                    waiting.work.approved(),
                     waiting.arrived,
                     std::mem::take(&mut ended),
                 ),
@@ -927,7 +951,12 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, None, running.arrived, Ended::default()),
+                    facts_of(
+                        running.sql,
+                        running.approved,
+                        running.arrived,
+                        Ended::default(),
+                    ),
                 )
             })
             .into_iter()
@@ -937,7 +966,12 @@ impl Workspace {
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
-                    facts_of(waiting.work.sql(), None, waiting.arrived, Ended::default()),
+                    facts_of(
+                        waiting.work.sql(),
+                        waiting.work.approved(),
+                        waiting.arrived,
+                        Ended::default(),
+                    ),
                 )
             }));
         for (id, tool, name, reply, facts) in ended {
@@ -996,7 +1030,7 @@ fn run_work(
     engine: Engine,
 ) -> Ran {
     match work {
-        AgentWork::Query { sql } => read_on(connection, hidden, &sql, cancel, engine),
+        AgentWork::Query { sql, .. } => read_on(connection, hidden, &sql, cancel, engine),
         AgentWork::Catalog { schema } => list_on(
             connection,
             hidden,
