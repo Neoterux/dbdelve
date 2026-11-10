@@ -180,6 +180,10 @@ fn sqlite_profile(id: &str, name: &str, extra: &str) -> String {
     )
 }
 
+/// Extra keys of a profile an agent may see and may write through, once a
+/// person approves.
+const VISIBLE_RW: &str = "agent_visible = true\nmode = \"read-write\"";
+
 fn agent_visible(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
     workspace.read_with(cx, |workspace, _| {
         workspace
@@ -3818,6 +3822,30 @@ fn pending_calls(
     })
 }
 
+/// An `execute_sql` call of [`UPDATE_ONE`] for `connection`, injected: what a
+/// Read-write profile holds for a person. Unlike [`inject_approval`] it does
+/// not say what happens to the call, so it serves a refusal and several waiting
+/// calls as well.
+fn inject_update(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: Option<&str>,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        connection,
+        crate::agent::CallArgs {
+            sql: Some(UPDATE_ONE.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
 /// An `execute_sql` call the gate holds for approval, injected. The call is
 /// pending when this returns.
 fn inject_approval(
@@ -3887,13 +3915,13 @@ fn audit_lines() -> Vec<serde_json::Value> {
 }
 
 #[gpui::test]
-fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
+fn an_approval_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
     cx: &mut TestAppContext,
 ) {
-    use crate::agent::{Reply, Status, tools::Tool};
+    use crate::agent::{Reply, Status};
 
     store::tests::with_home(|| {
-        let visible = "agent_visible = true";
+        let visible = VISIBLE_RW;
         let (workspace, cx) = launch_with_profiles(
             cx,
             &[
@@ -3910,14 +3938,14 @@ fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
         };
 
         for name in [Some("Secret"), Some("Nope"), Some("orders"), None] {
-            let (_, answers) = inject_call(&workspace, cx, Tool::Ping, name);
+            let (_, answers) = inject_update(&workspace, cx, name);
             assert_eq!(
                 answers.try_recv().ok(),
                 Some(refused("no agent-visible connection has that name")),
                 "{name:?}"
             );
         }
-        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Dup"));
+        let (_, answers) = inject_update(&workspace, cx, Some("Dup"));
         assert_eq!(
             answers.try_recv().ok(),
             Some(refused(
@@ -3930,17 +3958,14 @@ fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
 }
 
 #[gpui::test]
-fn an_unanswered_ping_expires_after_the_fixed_wait(cx: &mut TestAppContext) {
+fn an_unanswered_approval_expires_after_the_fixed_wait(cx: &mut TestAppContext) {
     use std::{sync::mpsc::TryRecvError, time::Duration};
 
-    use crate::agent::{EXPIRY, Reply, Status, tools::Tool};
+    use crate::agent::{EXPIRY, Reply, Status};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
         assert_eq!(pending_calls(&workspace, cx), [id]);
         assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
 
@@ -3960,13 +3985,14 @@ fn an_unanswered_ping_expires_after_the_fixed_wait(cx: &mut TestAppContext) {
         );
         assert!(pending_calls(&workspace, cx).is_empty());
         assert!(answers.try_recv().is_err(), "nothing else is ever sent");
+        assert_eq!(email_of(1).as_deref(), Some("a@x"), "the statement ran");
         quit(workspace, cx);
     });
 }
 
 #[cfg(unix)]
 #[gpui::test]
-fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
+fn hanging_up_withdraws_the_approval(cx: &mut TestAppContext) {
     use std::{
         io::{ErrorKind, Read, Write},
         os::unix::net::UnixStream,
@@ -3974,10 +4000,7 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
     };
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
         cx.executor().allow_parking();
         let path = crate::agent::tests::short_socket_path();
         workspace
@@ -3985,15 +4008,15 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let ping = format!("{}\n", ping_orders());
-        let ping = ping.as_bytes();
+        let held = format!("{}\n", update_orders());
+        let held = held.as_bytes();
         let connect = || {
             let mut stream = UnixStream::connect(&path).expect("the socket accepts a client");
-            stream.write_all(ping).expect("the frame is written");
+            stream.write_all(held).expect("the frame is written");
             stream
         };
 
-        let first = connect();
+        let mut first = connect();
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
         let first_id = pending_calls(&workspace, cx)[0];
         let mut second = connect();
@@ -4001,9 +4024,22 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
         let second_id = pending_calls(&workspace, cx)[1];
         assert_ne!(first_id, second_id);
 
-        drop(first);
+        // A caller that stops sending and waiting: it has hung up, and what it
+        // is owed is no answer at all.
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is set");
+        first
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the write half closes");
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
         assert_eq!(pending_calls(&workspace, cx), [second_id]);
+        let mut nothing = Vec::new();
+        first
+            .read_to_end(&mut nothing)
+            .expect("the connection ends");
+        assert!(nothing.is_empty(), "a withdrawn approval is sent nothing");
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
         second
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("the timeout is set");
@@ -4101,9 +4137,13 @@ fn copying_the_registration_puts_the_line_on_the_clipboard_and_says_so(cx: &mut 
     });
 }
 
+/// The frame of an `execute_sql` call for `Orders` that the gate holds for
+/// approval on a Read-write profile.
 #[cfg(unix)]
-fn ping_orders() -> String {
-    frame(r#""kind":"call","tool":"ping","connection":"Orders""#)
+fn update_orders() -> String {
+    frame(
+        r#""kind":"call","tool":"execute_sql","connection":"Orders","sql":"UPDATE t SET email = 'z@x' WHERE id = 1""#,
+    )
 }
 
 #[cfg(unix)]
@@ -4116,10 +4156,8 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
     use crate::agent::{Reply, Status};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         cx.executor().allow_parking();
         let path = crate::agent::socket_path().expect("the test home gives a socket path");
         assert_eq!(agent_access_rows(&workspace, cx), ["Turn agent access on"]);
@@ -4156,13 +4194,13 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
         assert_eq!(reply.status, Status::Executed);
         assert!(reply.text.contains("Orders"), "{}", reply.text);
 
-        let ping = raw_call(&path, &ping_orders());
+        let held = raw_call(&path, &update_orders());
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
 
         run_command(&workspace, cx, Command::DisconnectAgents);
-        drive_until(cx, |_| ping.is_finished());
+        drive_until(cx, |_| held.is_finished());
         assert_eq!(
-            ping.join().expect("the client thread finished").trim_end(),
+            held.join().expect("the client thread finished").trim_end(),
             r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#
         );
         assert!(pending_calls(&workspace, cx).is_empty());
@@ -4408,24 +4446,22 @@ const REJECTED: &str = r#"{"status":"rejected","text":"Agent access was turned o
 #[gpui::test]
 fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         cx.executor().allow_parking();
         run_command(&workspace, cx, Command::TurnOnAgentAccess);
         let path = crate::agent::socket_path().expect("the test home gives a socket path");
 
-        let pings = [
-            raw_call(&path, &ping_orders()),
-            raw_call(&path, &ping_orders()),
+        let held = [
+            raw_call(&path, &update_orders()),
+            raw_call(&path, &update_orders()),
         ];
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
         let presence = raw_call(&path, &presence());
         drive_until(cx, |cx| {
             workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
         });
-        // A waiting ping's dialog holds the keyboard, so the chord is pressed
+        // A waiting approval's dialog holds the keyboard, so the chord is pressed
         // from inside it, and has to reach the workspace from there.
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
@@ -4433,13 +4469,13 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
 
         cx.simulate_keystrokes("secondary-shift-k");
         drive_until(cx, |_| {
-            pings.iter().all(|ping| ping.is_finished()) && presence.is_finished()
+            held.iter().all(|call| call.is_finished()) && presence.is_finished()
         });
-        for ping in pings {
+        for call in held {
             // A whole frame, then the end of the connection: a bare end of
             // file would read as an empty string.
             assert_eq!(
-                ping.join().expect("the client thread finished"),
+                call.join().expect("the client thread finished"),
                 format!("{REJECTED}\n")
             );
         }
@@ -4916,66 +4952,6 @@ fn denied() -> crate::agent::Reply {
 
 #[cfg(unix)]
 #[gpui::test]
-fn a_ping_through_the_shim_waits_for_the_human_and_answers_executed(cx: &mut TestAppContext) {
-    use crate::session::ProfileState;
-
-    store::tests::with_home(|| {
-        let visible = "agent_visible = true";
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &[
-                sqlite_profile("orders", "Orders", visible),
-                sqlite_profile("reports", "Reports", visible),
-            ]
-            .concat(),
-        );
-        cx.executor().allow_parking();
-        run_command(&workspace, cx, Command::TurnOnAgentAccess);
-        let path = crate::agent::socket_path().expect("the test home gives a socket path");
-
-        let shim = crate::agent::shim::testing::call_through_the_shim(
-            path,
-            "ping",
-            serde_json::json!({ "connection": "Reports" }),
-        );
-        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
-        settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
-        assert_eq!(ringed_button(&workspace, cx), 0);
-        assert!(!shim.is_finished(), "the agent waits for the human");
-
-        let approve = cx
-            .debug_bounds("agent-ping-approve")
-            .expect("the dialog draws Approve");
-        cx.simulate_click(approve.center(), gpui::Modifiers::default());
-        settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), None);
-
-        drive_until(cx, |_| shim.is_finished());
-        let result = shim.join().expect("the shim's thread ends");
-        assert_eq!(result["isError"], false, "{result}");
-        assert_eq!(
-            result["content"][0]["text"],
-            "status: executed\nThe ping was approved in DBDelve."
-        );
-        workspace.read_with(cx, |workspace, _| {
-            let reports = workspace
-                .profiles
-                .iter()
-                .find(|profile| profile.id == "reports")
-                .expect("the profile was restored");
-            assert!(
-                matches!(reports.state, ProfileState::Idle),
-                "approving a ping opened a connection"
-            );
-        });
-        assert!(editor_has_keyboard(&workspace, cx));
-        quit(workspace, cx);
-    });
-}
-
-#[cfg(unix)]
-#[gpui::test]
 fn an_approved_statement_waits_for_the_human_and_runs_only_after_approve(cx: &mut TestAppContext) {
     use crate::{agent::Status, session::ProfileState, sql::Mode};
 
@@ -5313,17 +5289,13 @@ fn agent_audit_failure_runs_nothing(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
+fn enter_never_approves_an_approval(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
 
-    use crate::agent::tools::Tool;
-
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         assert_eq!(ringed_button(&workspace, cx), 0);
@@ -5342,7 +5314,7 @@ fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
         assert!(pending_calls(&workspace, cx).is_empty());
         assert!(editor_has_keyboard(&workspace, cx));
 
-        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         press(cx, "escape");
@@ -5354,19 +5326,33 @@ fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
-    cx: &mut TestAppContext,
-) {
-    use crate::agent::{EXPIRY, Inbound, Reply, Status, tools::Tool};
+fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use crate::agent::{EXPIRY, Inbound, Reply, Status};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+
+        // Approved.
+        let (_, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        approve_front(cx);
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // Denied.
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        settle(cx);
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
 
         // Hung up.
-        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         workspace.update(cx, |workspace, cx| {
@@ -5381,7 +5367,7 @@ fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
         assert!(editor_has_keyboard(&workspace, cx));
 
         // Expired.
-        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         cx.executor()
@@ -5396,7 +5382,7 @@ fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
 
         // Cut off. No bridge runs here: the kill switch answers every pending
         // call first, with or without one.
-        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         run_command(&workspace, cx, Command::DisconnectAgents);
@@ -5409,44 +5395,52 @@ fn a_ping_that_ends_elsewhere_closes_its_dialog_and_hands_the_keyboard_back(
             })
         );
         assert!(editor_has_keyboard(&workspace, cx));
+
+        // Hidden from agents: the profile is the second, after `Secret`.
+        let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        run_command(&workspace, cx, Command::HideFromAgents(1));
+        settle(cx);
+        assert_eq!(answers.try_recv().ok(), Some(swept()));
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        assert_eq!(email_of(1).as_deref(), Some("z@x"), "only the approved ran");
         quit(workspace, cx);
     });
 }
 
 #[gpui::test]
-fn pings_are_answered_oldest_first(cx: &mut TestAppContext) {
+fn approvals_are_shown_oldest_first(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
 
-    use crate::agent::{Reply, Status, tools::Tool};
-
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        let (first, first_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
-        let (second, second_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
+        let (first, first_answers) = inject_update(&workspace, cx, Some("Orders"));
+        let (second, second_answers) = inject_update(&workspace, cx, Some("Orders"));
+        let (third, third_answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         assert_eq!(front_ping_id(&workspace, cx), Some(first));
 
-        workspace.update(cx, |workspace, cx| workspace.approve_ping(first, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(first, cx));
         settle(cx);
-        assert_eq!(
-            first_answers.try_recv().ok(),
-            Some(Reply {
-                status: Status::Executed,
-                text: "The ping was approved in DBDelve.".to_string(),
-            })
-        );
-        assert_eq!(pending_calls(&workspace, cx), [second]);
+        assert_eq!(first_answers.try_recv().ok(), Some(denied()));
+        assert_eq!(pending_calls(&workspace, cx), [second, third]);
         assert_eq!(front_ping_id(&workspace, cx), Some(second));
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         assert_eq!(
             second_answers.try_recv().err(),
             Some(TryRecvError::Empty),
-            "the second ping was answered by the first's approval"
+            "the second approval was answered by the first's denial"
         );
+
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(second, cx));
+        settle(cx);
+        assert_eq!(second_answers.try_recv().ok(), Some(denied()));
+        assert_eq!(front_ping_id(&workspace, cx), Some(third));
+        assert_eq!(third_answers.try_recv().err(), Some(TryRecvError::Empty));
         quit(workspace, cx);
     });
 }
@@ -5462,10 +5456,8 @@ fn swept() -> crate::agent::Reply {
 fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
 
-    use crate::agent::tools::Tool;
-
     store::tests::with_home(|| {
-        let visible = "agent_visible = true";
+        let visible = VISIBLE_RW;
         let (workspace, cx) = launch_with_profiles(
             cx,
             &[
@@ -5476,12 +5468,10 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
             ]
             .concat(),
         );
-        let (first_shop, first_shop_answers) =
-            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
-        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
-        let (second_shop, second_shop_answers) =
-            inject_call(&workspace, cx, Tool::Ping, Some("Shop"));
-        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        let (first_shop, first_shop_answers) = inject_update(&workspace, cx, Some("Shop"));
+        let (orders, orders_answers) = inject_update(&workspace, cx, Some("Orders"));
+        let (second_shop, second_shop_answers) = inject_update(&workspace, cx, Some("Shop"));
+        let (reports, reports_answers) = inject_update(&workspace, cx, Some("Reports"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
         assert_eq!(front_ping_id(&workspace, cx), Some(first_shop));
@@ -5506,7 +5496,7 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
         assert_eq!(front_ping_id(&workspace, cx), Some(orders));
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
 
-        // Nothing waits on Reports once its ping is denied, so hiding it sends
+        // Nothing waits on Reports once its approval is denied, so hiding it sends
         // nothing and says nothing.
         workspace.update(cx, |workspace, cx| workspace.deny_ping(orders, cx));
         workspace.update(cx, |workspace, cx| workspace.deny_ping(reports, cx));
@@ -5525,10 +5515,8 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
 fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
 
-    use crate::agent::tools::Tool;
-
     store::tests::with_home(|| {
-        let visible = "agent_visible = true";
+        let visible = VISIBLE_RW;
         let (workspace, cx) = launch_with_profiles(
             cx,
             &[
@@ -5537,8 +5525,8 @@ fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
             ]
             .concat(),
         );
-        let (orders, orders_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
-        let (reports, reports_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Reports"));
+        let (orders, orders_answers) = inject_update(&workspace, cx, Some("Orders"));
+        let (reports, reports_answers) = inject_update(&workspace, cx, Some("Reports"));
         settle(cx);
         assert_eq!(front_ping_id(&workspace, cx), Some(orders));
 
@@ -5572,15 +5560,13 @@ fn agent_mark_drawn(cx: &mut VisualTestContext) -> bool {
 #[gpui::test]
 fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut TestAppContext) {
     use crate::{
-        agent::{ConnId, Inbound, tools::Tool},
+        agent::{ConnId, Inbound},
         ui::AgentMark,
     };
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         cx.executor().allow_parking();
         workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
         settle(cx);
@@ -5605,7 +5591,7 @@ fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut Te
         assert!(cx.debug_bounds("agent-mark-connected").is_some());
         assert!(cx.debug_bounds("agent-mark-listening").is_none());
 
-        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (id, _answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(
             agent_mark_state(&workspace, cx),
@@ -5726,22 +5712,20 @@ fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppCont
     use crate::agent::{EXPIRY, Inbound, Status, tools::Tool};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         let (listed, _listed_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
         // A name the agent made up, with a bell in it and far too long.
         let made_up = format!("Nope\u{7}{}", "x".repeat(80));
-        let (refused, _refused_answers) = inject_call(&workspace, cx, Tool::Ping, Some(&made_up));
-        let (expired, _expired_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (refused, _refused_answers) = inject_update(&workspace, cx, Some(&made_up));
+        let (expired, _expired_answers) = inject_update(&workspace, cx, Some("Orders"));
         cx.executor().advance_clock(EXPIRY + Duration::from_secs(1));
         cx.run_until_parked();
-        let (hung_up, _hung_up_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (hung_up, _hung_up_answers) = inject_update(&workspace, cx, Some("Orders"));
         workspace.update(cx, |workspace, cx| {
             workspace.on_agent_message(Inbound::Hangup { id: hung_up }, cx)
         });
-        let (denied, _denied_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (denied, _denied_answers) = inject_update(&workspace, cx, Some("Orders"));
         workspace.update(cx, |workspace, cx| workspace.deny_ping(denied, cx));
 
         let log = agent_log(&workspace, cx);
@@ -5809,19 +5793,17 @@ fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppCont
 
 #[gpui::test]
 fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
-    use crate::agent::{CallId, Inbound, Status, tools::Tool};
+    use crate::agent::{CallId, Inbound, Status};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        let (id, _answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
-        workspace.update(cx, |workspace, cx| workspace.approve_ping(id, cx));
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
+        let (id, _answers) = inject_update(&workspace, cx, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
         let log = agent_log(&workspace, cx);
         assert_eq!(
             (log.len(), log[0].status, log[0].requester_gone),
-            (1, Status::Executed, false)
+            (1, Status::Rejected, false)
         );
 
         // An id nothing logged is not a call this window answered.
@@ -5842,69 +5824,9 @@ fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut Te
         let log = agent_log(&workspace, cx);
         assert_eq!(
             (log.len(), log[0].status, log[0].requester_gone),
-            (1, Status::Executed, true)
+            (1, Status::Rejected, true)
         );
         quit(workspace, cx);
-    });
-}
-
-#[cfg(unix)]
-#[gpui::test]
-fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mut TestAppContext) {
-    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
-
-    use crate::agent::Status;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        cx.executor().allow_parking();
-        let path = crate::agent::tests::short_socket_path();
-        workspace
-            .update(cx, |workspace, cx| {
-                workspace.start_bridge_at(path.clone(), cx)
-            })
-            .expect("the socket binds");
-
-        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
-        client
-            .write_all(format!("{}\n", ping_orders()).as_bytes())
-            .expect("the frame is written");
-        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
-        let id = pending_calls(&workspace, cx)[0];
-
-        // The caller leaves, and the window is not run while the socket's
-        // threads see it: the answer below is given before the hangup is
-        // delivered, which is the race.
-        drop(client);
-        std::thread::sleep(Duration::from_millis(100));
-        workspace.update(cx, |workspace, cx| {
-            assert_eq!(
-                workspace.agent.calls.len(),
-                1,
-                "the hangup was delivered early, so this is not the race"
-            );
-            workspace.approve_ping(id, cx)
-        });
-        drive_until(cx, |cx| {
-            agent_log(&workspace, cx)
-                .iter()
-                .any(|entry| entry.id == id && entry.requester_gone)
-        });
-        cx.run_until_parked();
-        let entries: Vec<_> = agent_log(&workspace, cx)
-            .into_iter()
-            .filter(|entry| entry.id == id)
-            .collect();
-        assert_eq!(entries.len(), 1, "the late hangup logged the call again");
-        assert_eq!(entries[0].status, Status::Executed);
-        assert_eq!(agent_log(&workspace, cx).len(), 1);
-
-        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
-        quit(workspace, cx);
-        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
     });
 }
 
@@ -5916,7 +5838,7 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
     let entry = LogEntry {
         at: 1_000_000,
         id: CallId(1),
-        tool: Tool::Ping,
+        tool: Tool::ExecuteSql,
         resolved: None,
         asked: Some("Nope".to_string()),
         status: Status::RefusedByGate,
@@ -5930,7 +5852,7 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
     };
     assert_eq!(
         agent_log_label(&entry, 1_000_000 + 125_000),
-        "2m ago \u{b7} ping \u{b7} asked for \"Nope\" \u{b7} refused_by_gate"
+        "2m ago \u{b7} execute_sql \u{b7} asked for \"Nope\" \u{b7} refused_by_gate"
     );
     let entry = LogEntry {
         resolved: Some("Orders".to_string()),
@@ -5941,7 +5863,7 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
     };
     assert_eq!(
         agent_log_label(&entry, 1_000_000),
-        "moments ago \u{b7} ping \u{b7} Orders \u{b7} executed \u{b7} no requester"
+        "moments ago \u{b7} execute_sql \u{b7} Orders \u{b7} executed \u{b7} no requester"
     );
     let entry = LogEntry {
         resolved: None,
@@ -6167,14 +6089,12 @@ fn the_audit_lists_calls_newest_first_by_when_they_ended(cx: &mut TestAppContext
     use crate::agent::{Inbound, tools::Tool};
 
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         let began = Instant::now();
         let (first, _first_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
         let (second, _second_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
-        let (third, _third_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (third, _third_answers) = inject_update(&workspace, cx, Some("Orders"));
         workspace.update(cx, |workspace, cx| workspace.deny_ping(third, cx));
         let ended: Vec<_> = agent_log(&workspace, cx)
             .iter()
@@ -6254,21 +6174,17 @@ fn the_agent_popover_turns_access_off(cx: &mut TestAppContext) {
 
 #[cfg(unix)]
 #[gpui::test]
-fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the_dialog(
+fn turning_access_off_from_the_mark_while_an_approval_waits_rejects_it_and_closes_the_dialog(
     cx: &mut TestAppContext,
 ) {
-    use crate::agent::tools::Tool;
-
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         cx.executor().allow_parking();
         workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
         settle(cx);
         run_command(&workspace, cx, Command::TurnOnAgentAccess);
-        let (_, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
 
@@ -6293,7 +6209,7 @@ fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the
         assert_eq!(
             answers.try_recv().err(),
             Some(std::sync::mpsc::TryRecvError::Empty),
-            "opening the menu answered the ping"
+            "opening the menu answered the approval"
         );
 
         // By the pointer: the dialog holds the keyboard while it is up, so a
@@ -6332,17 +6248,13 @@ fn turning_access_off_from_the_mark_while_a_ping_waits_rejects_it_and_closes_the
 }
 
 #[gpui::test]
-fn a_click_on_the_ping_backdrop_below_the_titlebar_does_not_approve(cx: &mut TestAppContext) {
+fn a_click_on_the_approval_backdrop_below_the_titlebar_does_not_approve(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
 
-    use crate::agent::tools::Tool;
-
     store::tests::with_home(|| {
-        let (workspace, cx) = launch_with_profiles(
-            cx,
-            &sqlite_profile("orders", "Orders", "agent_visible = true"),
-        );
-        let (id, answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        let (workspace, cx) =
+            launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
 
@@ -7888,7 +7800,7 @@ fn a_deadline_and_a_hangup_on_the_same_call_end_it_once(cx: &mut TestAppContext)
 
 #[cfg(unix)]
 #[gpui::test]
-fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) {
+fn a_running_read_is_not_a_waiting_approval(cx: &mut TestAppContext) {
     use crate::{agent::Status, ui::AgentMark};
 
     store::tests::with_home(|| {
