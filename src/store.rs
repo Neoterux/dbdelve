@@ -2029,15 +2029,28 @@ pub(crate) const AUDIT_SLACK: usize = 4_000;
 /// CI's Windows clippy denies dead code.
 #[cfg(unix)]
 #[derive(Default)]
-pub(crate) struct AuditLog {}
+pub(crate) struct AuditLog {
+    /// How many lines the file holds, read from it by the first append and
+    /// kept from then on; `None` until then, and again after a write that
+    /// failed, which may have left the end of the file cut.
+    lines: Option<usize>,
+}
 
 #[cfg(unix)]
 impl AuditLog {
     /// Append `line`, which must hold no newline, as one line of the file.
     ///
     /// Created `0600` and kept there. The line and its newline go out in a
-    /// single `write_all`: two writes could leave a line without its end, and
-    /// the next append would then be glued onto it.
+    /// single `write_all`: two writes could leave a line without its end. A
+    /// file whose last line a crash left without one is ended first, so the
+    /// two never run together, and the cut line stays where it is: lines are
+    /// never parsed or rewritten here, only counted.
+    ///
+    /// Once the file passes [`AUDIT_SLACK`] lines it is rewritten to its
+    /// newest [`AUDIT_KEEP`]. They are kept verbatim and never merged the way
+    /// the history's are: a call's `started` line must stay a line of its own
+    /// beside its `outcome`, since the pair is the proof that a statement was
+    /// sent before it was answered.
     pub(crate) fn append(&mut self, line: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -2045,6 +2058,20 @@ impl AuditLog {
         fs::create_dir_all(&directory)
             .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
         let path = directory.join(AGENT_AUDIT_FILE);
+        let (mut lines, cut) = match self.lines {
+            Some(lines) => (lines, false),
+            None => match fs::read(&path) {
+                Ok(bytes) => {
+                    let cut = bytes.last().is_some_and(|last| *last != b'\n');
+                    let ended = bytes.iter().filter(|byte| **byte == b'\n').count();
+                    (ended + usize::from(cut), cut)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (0, false),
+                Err(error) => {
+                    return Err(format!("Could not read {}: {error}", path.display()));
+                }
+            },
+        };
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2053,12 +2080,43 @@ impl AuditLog {
             .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
         // A file that existed before with looser bits keeps none of them.
         secure(&path)?;
-        let mut text = String::with_capacity(line.len() + 1);
+        let mut text = String::with_capacity(line.len() + 2);
+        if cut {
+            text.push('\n');
+        }
         text.push_str(line);
         text.push('\n');
-        file.write_all(text.as_bytes())
-            .map_err(|error| format!("Could not write {}: {error}", path.display()))
+        if let Err(error) = file.write_all(text.as_bytes()) {
+            self.lines = None;
+            return Err(format!("Could not write {}: {error}", path.display()));
+        }
+        lines += 1;
+        if lines > AUDIT_SLACK
+            && let Some(kept) = keep_newest_audit_lines(&path)
+        {
+            lines = kept;
+        }
+        self.lines = Some(lines);
+        Ok(())
     }
+}
+
+/// Rewrite the audit to its newest [`AUDIT_KEEP`] lines, through
+/// [`write_file`] so a rewrite that fails halfway leaves the file as it was.
+/// Answers how many lines it holds now, or `None` when the rewrite did not
+/// happen: the file is still correct to read, it just keeps its length, and
+/// the next append tries again.
+///
+/// The text is read lossily: only a line cut by a crash can end in half a
+/// character, and it is not a line anything reads.
+#[cfg(unix)]
+fn keep_newest_audit_lines(path: &Path) -> Option<usize> {
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let kept = &lines[lines.len().saturating_sub(AUDIT_KEEP)..];
+    write_file(path, &kept.concat()).ok()?;
+    Some(kept.len())
 }
 
 #[cfg(test)]
