@@ -14,7 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_component::ActiveTheme;
+use gpui::WeakEntity;
+use gpui_component::{
+    ActiveTheme,
+    menu::{PopupMenu, PopupMenuItem},
+};
 
 use super::editing::Short;
 use super::*;
@@ -277,11 +281,17 @@ impl Workspace {
                 // wrote -- that rename is the one thing they could have got
                 // wrong, and the file name alone does not read it back.
                 let format = FileAs::for_path(&path, engine);
+                tracing::info!(
+                    format = format.extension(),
+                    rows,
+                    "export of shown rows started"
+                );
                 let target = match &connection {
                     Some(connection) => knowing_the_table(connection, &target, format, engine),
                     None => target,
                 };
                 let written = write_shown(&result, format, &target, engine, &path);
+                log_export(format, written.as_ref().map(|()| rows));
                 (path, format, written)
             })
             .await;
@@ -460,7 +470,9 @@ impl Workspace {
         let task = spawn_blocking(cx.background_executor(), {
             let (path, progress) = (path.clone(), progress.clone());
             move || {
-                export_every_row(
+                let format = FileAs::for_path(&path, engine);
+                tracing::info!(format = format.extension(), "export of every row started");
+                let ended = export_every_row(
                     &connection,
                     &refetch,
                     &target,
@@ -468,7 +480,9 @@ impl Workspace {
                     engine,
                     &path,
                     &progress,
-                )
+                );
+                log_export(format, ended.as_ref().copied());
+                ended
             }
         });
         let id = id.to_string();
@@ -670,6 +684,12 @@ impl Workspace {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The test platform's save panel drops the name it is offered.
+    pub(super) static SUGGESTED_NAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The save panel, opened on the home directory with `stem` named in it.
 fn choose_path(
     stem: &str,
@@ -678,6 +698,8 @@ fn choose_path(
 ) -> impl Future<Output = Option<PathBuf>> + use<> {
     let suggested = format!("{stem}.{}", format.extension());
     let directory = crate::store::home().unwrap_or_else(|_| PathBuf::from("/"));
+    #[cfg(test)]
+    SUGGESTED_NAMES.with_borrow_mut(|names| names.push(suggested.clone()));
     let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
     async move { chosen.await.ok()?.ok()? }
 }
@@ -748,6 +770,17 @@ pub(crate) fn refetch_refusal(
         );
     }
     None
+}
+
+/// The file's name and the failure's text stay out of the info line: either
+/// can carry a path through the user's home, and a failure quotes the SQL.
+fn log_export(format: FileAs, ended: Result<usize, &Ended>) {
+    let format = format.extension();
+    match ended {
+        Ok(rows) => tracing::info!(format, rows, "export finished"),
+        Err(Ended::Cancelled) => tracing::info!(format, "export cancelled"),
+        Err(Ended::Failed(_)) => tracing::warn!(format, "export failed"),
+    }
 }
 
 fn exported(rows: usize, format: FileAs, path: &Path) -> String {
@@ -1144,6 +1177,30 @@ mod tests {
     use crate::db::ConnectionConfig;
     use crate::export::Format;
 
+    #[test]
+    fn export_sql_is_offered_only_for_sql_engines() {
+        let labels = |sql| {
+            let exports = ExportMenu {
+                workspace: WeakEntity::new_invalid(),
+                sql,
+            }
+            .file_exports();
+            exports
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(true),
+            [
+                "Export CSV\u{2026}",
+                "Export JSON\u{2026}",
+                "Export SQL\u{2026}"
+            ]
+        );
+        assert_eq!(labels(false), ["Export CSV\u{2026}", "Export JSON\u{2026}"]);
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let directory =
             std::env::temp_dir().join(format!("dbdelve-export-{name}-{}", std::process::id()));
@@ -1491,5 +1548,72 @@ mod tests {
         }
         assert_eq!(run("SELECT * FROM notes ORDER BY id").rows, before);
         _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// The status bar's Export menu: the clipboard copy, then the file exports.
+/// Export SQL is left out, not greyed, on an engine whose rows are not SQL
+/// values, as its button was.
+#[derive(Clone)]
+pub(super) struct ExportMenu {
+    pub(super) workspace: WeakEntity<Workspace>,
+    pub(super) sql: bool,
+}
+
+impl ExportMenu {
+    pub(super) fn build(
+        &self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut gpui::Context<PopupMenu>,
+    ) -> PopupMenu {
+        let formats = self.workspace.clone();
+        let copy = self.workspace.clone();
+        let file = |(label, format): (&'static str, FileAs)| {
+            let workspace = self.workspace.clone();
+            PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                _ = workspace.update(cx, |workspace, cx| {
+                    workspace.export_results(format, cx);
+                });
+            })
+        };
+        let menu = menu
+            .item(
+                PopupMenuItem::new("Copy Results").on_click(move |_, _, cx| {
+                    _ = copy.update(cx, |workspace, cx| {
+                        workspace.copy_results_as(ClipboardFormat::Tsv, cx);
+                    });
+                }),
+            )
+            .submenu("Copy Results As", window, cx, move |submenu, _, _| {
+                ClipboardFormat::ALL
+                    .into_iter()
+                    .fold(submenu, |submenu, format| {
+                        let workspace = formats.clone();
+                        submenu.item(PopupMenuItem::new(format.label()).on_click(
+                            move |_, _, cx| {
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.copy_results_as(format, cx);
+                                });
+                            },
+                        ))
+                    })
+            })
+            .separator();
+        self.file_exports()
+            .into_iter()
+            .map(file)
+            .fold(menu, |menu, item| menu.item(item))
+    }
+
+    pub(super) fn file_exports(&self) -> Vec<(&'static str, FileAs)> {
+        let mut exports = vec![
+            ("Export CSV\u{2026}", FileAs::Rows(Format::Csv)),
+            ("Export JSON\u{2026}", FileAs::Rows(Format::Json)),
+        ];
+        if self.sql {
+            exports.push(("Export SQL\u{2026}", FileAs::Inserts));
+        }
+        exports
     }
 }

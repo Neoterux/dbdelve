@@ -7,8 +7,8 @@
 //! existing strategies is one more value here and its driver.
 
 use super::{
-    ColumnDefinition, Fields, RelationKind, Syntax, clickhouse, duckdb, mongo, mssql, mysql,
-    postgres, redis,
+    Builtin, ColumnDefinition, Fields, RelationKind, Syntax, builtins, clickhouse, duckdb, mongo,
+    mssql, mysql, postgres, redis,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -166,14 +166,12 @@ impl EngineSpec {
         super::is_numeric_type(&name) || self.numeric_types.contains(&base)
     }
 
-    /// [`Engine::writes_back`](super::Engine::writes_back). The ability is
-    /// asked apart from the types, so a cell nobody typed is no way past it.
+    /// [`Engine::writes_back`](super::Engine::writes_back).
     pub fn writes_back<'a>(&self, types: impl IntoIterator<Item = &'a str>) -> bool {
-        self.abilities.edits
-            && types.into_iter().all(|data_type| match self.syntax {
-                Syntax::Redis => crate::redis_cmd::edit::writes_back(data_type),
-                Syntax::Sql | Syntax::Mongo => !self.is_binary_type(data_type),
-            })
+        types.into_iter().all(|data_type| match self.syntax {
+            Syntax::Redis => crate::redis_cmd::edit::writes_back(data_type),
+            Syntax::Sql | Syntax::Mongo => !self.is_binary_type(data_type),
+        })
     }
 
     /// [`Engine::generates`](super::Engine::generates).
@@ -363,6 +361,9 @@ pub struct SqlSpec {
     /// Whether the write gate reads the terms a row named by every value
     /// carries: `toString(c) = '…'` and `c IS NULL`.
     pub row_terms: bool,
+    /// What completion offers beside the catalog: the functions and value
+    /// expressions the dialect has built in.
+    pub builtins: &'static [Builtin],
 }
 
 impl SqlSpec {
@@ -411,6 +412,7 @@ impl SqlSpec {
         plain_settings: &[],
         transactions: true,
         row_terms: false,
+        builtins: &[],
     };
 
     /// The word that opens a transaction around a generated multi-statement
@@ -1057,6 +1059,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         ],
         // From pg_catalog.pg_proc, filtered by volatility; pinned by a live test.
         builtin_functions: include_str!("functions/postgres.txt"),
+        builtins: builtins::postgres::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1146,6 +1149,7 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         ],
         // From the help tables, filtered by hand; no test pins it.
         builtin_functions: include_str!("functions/mysql.txt"),
+        builtins: builtins::mysql::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1245,6 +1249,7 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         ],
         // From information_schema.sql_functions, filtered by hand; no test pins it.
         builtin_functions: include_str!("functions/mariadb.txt"),
+        builtins: builtins::mysql::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1312,6 +1317,7 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
         // configures through `PRAGMA`, a different statement type that already
         // needs Full, so a `SET` here is one the server rejects and stopping it
         // costs nobody a working statement.
+        builtins: builtins::sqlite::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1364,6 +1370,7 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
         builtin_functions: include_str!("functions/sqlite.txt"),
         // No `plain_settings`, for the reason SQLite has none: configuration is
         // `PRAGMA`, which is already Full, and there is no `SET` to allow.
+        builtins: builtins::sqlite::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1511,6 +1518,7 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
             "preserve_insertion_order",
             "enable_progress_bar",
         ],
+        builtins: builtins::duckdb::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1609,6 +1617,7 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         // changes nothing; the one extra arm is cheaper than a special case.
         // From the vendor documentation, not a server: no catalog lists the built-ins, so no test pins it.
         builtin_functions: include_str!("functions/snowflake.txt"),
+        builtins: builtins::snowflake::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -1726,6 +1735,7 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         ],
         // From the vendor documentation, not a server: no catalog lists the built-ins, so no test pins it.
         builtin_functions: include_str!("functions/mssql.txt"),
+        builtins: builtins::sqlserver::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -2042,6 +2052,7 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
         // From system.functions, filtered by category; pinned by a live test.
         builtin_functions: include_str!("functions/clickhouse.txt"),
         case_sensitive_functions: true,
+        builtins: builtins::clickhouse::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities {
@@ -2094,6 +2105,7 @@ pub(crate) const GENERIC: EngineSpec = EngineSpec {
         literal_offsets: false,
         // Generic reads the list the human path always held: calls outside it need Read-write there. Hand-kept, no pin.
         builtin_functions: include_str!("functions/generic.txt"),
+        builtins: builtins::ansi::BUILTINS,
         ..SqlSpec::ANSI
     },
     abilities: Abilities::NONE,
