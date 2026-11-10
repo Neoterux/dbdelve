@@ -308,6 +308,40 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     AgentVerdict::Run
 }
 
+/// What an approvable statement does, which is what the approval says first.
+/// The three kinds are gate steps 9, 10 and 11, one to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) enum ApprovalKind {
+    /// It writes (step 9).
+    Write,
+    /// It reads a file, a URL, a program or another server (step 10).
+    EgressRead,
+    /// It calls a function its engine does not list, which may write (step 11).
+    UnlistedCall,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) fn approval_kind(_engine: Engine, _sql: &str, _verdict: &Verdict) -> ApprovalKind {
+    ApprovalKind::Write
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the approved write's answer reads it")
+)]
+pub(crate) fn creates_index_concurrently(_engine: Engine, _sql: &str) -> bool {
+    false
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the approved write's answer reads it")
+)]
+pub(crate) fn counts_rows(_engine: Engine, _sql: &str) -> bool {
+    false
+}
+
 /// Whether `sql`, on an engine that reads a quoted string in a table position
 /// as a file or a URL (`SELECT * FROM 'data.csv'`), holds a string literal or a
 /// `"`-quoted word with a `.`, `/` or `\` in it. False on every other engine.
@@ -442,6 +476,155 @@ mod tests {
                 expected,
                 "{engine:?} {mode:?}: {text}"
             );
+        }
+    }
+
+    /// Each approvable statement the dialog has to name, with the kind it is.
+    const APPROVABLE: &[(Engine, Mode, &str, ApprovalKind)] = &[
+        (
+            Engine::Postgres,
+            Mode::ReadWrite,
+            "UPDATE t SET a = 1",
+            ApprovalKind::Write,
+        ),
+        (
+            Engine::Sqlite,
+            Mode::ReadWrite,
+            "INSERT INTO t VALUES (1)",
+            ApprovalKind::Write,
+        ),
+        (
+            Engine::Postgres,
+            Mode::ReadOnly,
+            "SELECT * FROM pg_read_file('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::MySql,
+            Mode::ReadOnly,
+            "SELECT * FROM load_file('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::DuckDb,
+            Mode::ReadOnly,
+            "SELECT * FROM 'data.csv'",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::DuckDb,
+            Mode::ReadOnly,
+            "SELECT * FROM glob('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::Postgres,
+            Mode::ReadWrite,
+            "SELECT my_udf(a) FROM t",
+            ApprovalKind::UnlistedCall,
+        ),
+        (
+            Engine::Sqlite,
+            Mode::ReadWrite,
+            "SELECT my_udf(1)",
+            ApprovalKind::UnlistedCall,
+        ),
+    ];
+
+    #[test]
+    fn approval_kind_names_what_each_approvable_statement_does() {
+        for &(engine, mode, sql, kind) in APPROVABLE {
+            let AgentVerdict::Approve(verdict, _) = agent_gate(engine, sql, mode) else {
+                panic!("{engine:?} {mode:?} {sql}: the gate does not approve it");
+            };
+            assert_eq!(
+                approval_kind(engine, sql, &verdict),
+                kind,
+                "{engine:?} {mode:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_kind_never_contradicts_the_gate() {
+        let corpus = APPROVABLE
+            .iter()
+            .map(|&(_, _, sql, _)| sql)
+            .chain(["CREATE INDEX i ON t (a)"]);
+        for sql in corpus {
+            for engine in Engine::ALL {
+                for mode in Mode::ALL {
+                    if let AgentVerdict::Approve(verdict, _) = agent_gate(engine, sql, mode) {
+                        assert_eq!(
+                            approval_kind(engine, sql, &verdict) == ApprovalKind::Write,
+                            verdict.mode == Mode::ReadWrite,
+                            "{engine:?} {mode:?}: {sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn creates_index_concurrently_reads_the_parse() {
+        for sql in [
+            "CREATE INDEX CONCURRENTLY i ON t (a)",
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS i ON t (a)",
+        ] {
+            assert!(creates_index_concurrently(Engine::Postgres, sql), "{sql}");
+        }
+        for sql in [
+            "CREATE INDEX i ON t (a)",
+            "/* CONCURRENTLY */ CREATE INDEX i ON t (a)",
+            "SELECT 'CREATE INDEX CONCURRENTLY i ON t (a)'",
+            "CREATE INDEX CONCURRENTLY (",
+        ] {
+            assert!(!creates_index_concurrently(Engine::Postgres, sql), "{sql}");
+        }
+        for (engine, sql) in [
+            (Engine::MySql, "CREATE INDEX CONCURRENTLY i ON t (a)"),
+            (Engine::Sqlite, "CREATE INDEX CONCURRENTLY i ON t (a)"),
+            (Engine::MongoDb, "db.t.createIndex({a: 1})"),
+            (Engine::Redis, "SET k v"),
+        ] {
+            assert!(
+                !creates_index_concurrently(engine, sql),
+                "{engine:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_rows_only_for_statements_that_change_rows() {
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::Sqlite,
+            Engine::DuckDb,
+        ] {
+            for sql in [
+                "INSERT INTO t VALUES (1)",
+                "UPDATE t SET a = 1",
+                "DELETE FROM t WHERE a = 1",
+            ] {
+                assert!(counts_rows(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        assert!(counts_rows(
+            Engine::Postgres,
+            "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET a = 1"
+        ));
+        for (engine, sql) in [
+            (Engine::Postgres, "CREATE INDEX i ON t (a)"),
+            (Engine::Postgres, "CREATE TABLE u (a int)"),
+            (Engine::Postgres, "ALTER TABLE t ADD COLUMN b int"),
+            (Engine::Postgres, "SELECT 1"),
+            (Engine::Postgres, "UPDATE ("),
+            (Engine::MongoDb, "db.t.insertOne({a: 1})"),
+            (Engine::Redis, "SET k v"),
+        ] {
+            assert!(!counts_rows(engine, sql), "{engine:?}: {sql}");
         }
     }
 
