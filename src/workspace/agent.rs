@@ -1144,9 +1144,11 @@ impl Workspace {
     /// calls waiting, while an agent is attached or a call waits.
     pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
         self.agent.bridge.as_ref()?;
-        // A read in flight is an agent attached, though nobody is asked.
+        // A read or an approved write in flight is an agent attached, though
+        // nobody is asked.
         let attached = !self.agent.presence.is_empty()
             || !self.agent.calls.is_empty()
+            || !self.agent.writes.is_empty()
             || self.agent.lanes.values().any(|lane| lane.running.is_some());
         Some(if attached {
             ui::AgentMark::Connected {
