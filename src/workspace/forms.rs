@@ -1863,7 +1863,10 @@ impl Workspace {
                                             .tab_stop(false)
                                             .disabled(!armed)
                                             .on_click(
-                                                move |_, _, cx| {
+                                                move |event, _, cx| {
+                                                    if !approves(event) {
+                                                        return;
+                                                    }
                                                     _ = approve_workspace.update(
                                                         cx,
                                                         |workspace, cx| {
@@ -3950,9 +3953,41 @@ fn footer_status(
     }
 }
 
+/// Whether a click is one Approve answers.
+fn approves(_event: &gpui::ClickEvent) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approve_takes_only_a_single_ordinary_mouse_click() {
+        use gpui::{ClickEvent, MouseClickEvent, MouseDownEvent, MouseUpEvent};
+
+        let mouse = |count, first_mouse| {
+            ClickEvent::Mouse(MouseClickEvent {
+                down: MouseDownEvent {
+                    click_count: count,
+                    first_mouse,
+                    ..Default::default()
+                },
+                up: MouseUpEvent {
+                    click_count: count,
+                    ..Default::default()
+                },
+            })
+        };
+        assert!(approves(&mouse(1, false)), "a plain click");
+        assert!(!approves(&mouse(2, false)), "a double click");
+        assert!(!approves(&mouse(1, true)), "the click that woke the window");
+        assert!(
+            !approves(&ClickEvent::Keyboard(Default::default())),
+            "a key"
+        );
+        assert!(!approves(&ClickEvent::Touch(Default::default())), "a touch");
+    }
 
     #[test]
     fn a_help_notice_covers_the_form_status_without_replacing_it() {

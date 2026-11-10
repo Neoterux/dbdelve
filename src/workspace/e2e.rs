@@ -5306,6 +5306,214 @@ fn an_approval_covered_by_another_dialog_is_not_armed_until_it_is_shown_again(
     });
 }
 
+/// A press and release of the left button at `at`, with the counts a person's
+/// double click or a window-activating click carries.
+fn mouse_press(
+    cx: &mut VisualTestContext,
+    at: gpui::Point<gpui::Pixels>,
+    count: usize,
+    first: bool,
+) {
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: at,
+        modifiers: gpui::Modifiers::default(),
+        click_count: count,
+        first_mouse: first,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: at,
+        modifiers: gpui::Modifiers::default(),
+        click_count: count,
+    });
+    settle(cx);
+}
+
+/// Approve's centre, once it is drawn.
+fn approve_centre(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
+    cx.debug_bounds("agent-approval-approve")
+        .expect("the dialog draws Approve")
+        .center()
+}
+
+#[gpui::test]
+fn a_double_or_activating_click_never_approves(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        assert_eq!(workspace.read_with(cx, |w, _| w.agent.armed), Some(id));
+
+        let at = approve_centre(cx);
+        for (count, first) in [(2, false), (1, true)] {
+            mouse_press(cx, at, count, first);
+            assert_eq!(pending_calls(&workspace, cx), [id], "{count} {first}");
+            assert_eq!(
+                answers.try_recv().err(),
+                Some(TryRecvError::Empty),
+                "{count} {first}"
+            );
+            assert_eq!(email_of(1).as_deref(), Some("a@x"), "{count} {first}");
+        }
+
+        mouse_press(cx, at, 1, false);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_revealed_approval_arms_again(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent::ARM_DELAY;
+    use crate::{actions::ShowAgentActivity, agent::Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(ARM_DELAY);
+        settle(cx);
+        let armed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.agent.armed);
+        assert_eq!(armed(cx), Some(id), "armed the first time");
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        workspace.update(cx, |workspace, cx| workspace.close_agent_audit(cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert_eq!(armed(cx), None, "armed the moment it was uncovered");
+
+        let at = approve_centre(cx);
+        mouse_press(cx, at, 1, false);
+        assert_eq!(pending_calls(&workspace, cx), [id], "approved while inert");
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+
+        cx.executor()
+            .advance_clock(ARM_DELAY - Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), None, "armed a millisecond early");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), Some(id));
+
+        let at = approve_centre(cx);
+        mouse_press(cx, at, 1, false);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_next_approval_is_inert_after_the_first_is_answered(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent::ARM_DELAY;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (first, first_answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        let (second, second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some(UPDATE_ONE.to_string()),
+                ..Default::default()
+            },
+        );
+        settle(cx);
+        cx.executor().advance_clock(ARM_DELAY);
+        settle(cx);
+        let armed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.agent.armed);
+        assert_eq!(armed(cx), Some(first));
+
+        workspace.update(cx, |workspace, cx| workspace.deny_call(first, cx));
+        settle(cx);
+        assert_eq!(first_answers.try_recv().ok(), Some(denied()));
+        assert_eq!(pending_calls(&workspace, cx), [second]);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert_eq!(armed(cx), None, "the next call inherited the arm");
+
+        let at = approve_centre(cx);
+        mouse_press(cx, at, 1, false);
+        assert_eq!(pending_calls(&workspace, cx), [second]);
+        assert_eq!(second_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+
+        cx.executor()
+            .advance_clock(ARM_DELAY - Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), None, "armed a millisecond early");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), Some(second));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn approving_nothing_changes_nothing(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let shape = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, _| {
+                (w.agent.calls.len(), w.agent.log.len(), w.agent.writes.len())
+            })
+        };
+        let before = shape(cx);
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace.deny_front_approval(cx),
+                "escape spent on nothing"
+            );
+            workspace.approve_call(crate::agent::CallId(u64::MAX), cx);
+        });
+        assert_eq!(shape(cx), before, "nothing pending");
+
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.approve_call(crate::agent::CallId(u64::MAX), cx)
+        });
+        assert_eq!(pending_calls(&workspace, cx), [id], "an id never issued");
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        workspace.update(cx, |workspace, cx| workspace.deny_call(id, cx));
+        settle(cx);
+        assert_eq!(answers.try_recv().ok(), Some(denied()));
+        let denied_shape = shape(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.approve_call(id, cx);
+            assert!(!workspace.deny_front_approval(cx));
+        });
+        assert_eq!(shape(cx), denied_shape, "a call already denied");
+        // Its reply was sent once and the call dropped with it.
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Disconnected));
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_approval_for_a_profile_hidden_in_another_window_is_not_run(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
