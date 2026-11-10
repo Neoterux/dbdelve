@@ -5681,8 +5681,12 @@ fn the_approval_draws_its_own_statement_not_the_audit_copy() {
     let render = &render[..render
         .find("\n    pub(crate) fn ")
         .expect("another method follows the render")];
-    assert!(render.contains("code_lines_visible(&"), "{render}");
-    assert!(render.contains("approval.sql"));
+    // rustfmt breaks the call's arguments onto lines of their own.
+    let render = render.split_whitespace().collect::<String>();
+    assert!(
+        render.contains("code_lines_visible(&approval.sql"),
+        "{render}"
+    );
     assert!(!render.contains("agent.log"));
     assert!(!render.contains("code_lines(&"));
 }

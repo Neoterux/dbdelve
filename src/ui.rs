@@ -158,7 +158,6 @@ fn split_highlights<'a>(
 /// server will read: every character that is invisible or reorders what is
 /// around it is shown as an ASCII `[U+XXXX]` marker. For display only; what
 /// runs, and what is compared against it, is always the source text (D-29).
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) struct Visible {
     pub(crate) display: String,
     /// One entry per replaced character: its bytes in the source and its
@@ -166,7 +165,6 @@ pub(crate) struct Visible {
     map: Vec<(Range<usize>, Range<usize>)>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 impl Visible {
     /// `highlights` over the source text, moved onto the display. An end inside
     /// a replaced character lands on its marker's end, so a colour never stops
@@ -215,7 +213,6 @@ fn hides_in_text(c: char) -> bool {
         )
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn visible(text: &str) -> Visible {
     let mut display = String::with_capacity(text.len());
     let mut map = Vec::new();
@@ -237,7 +234,6 @@ pub(crate) fn visible(text: &str) -> Visible {
 /// marker cannot change what the grammar made of the statement. Lines break at
 /// `\n` only: `str::lines` would drop a carriage return and the empty line
 /// after a final newline, which are the things a reader needs to see.
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn code_lines_visible(
     text: &str,
     syntax: Syntax,
@@ -280,7 +276,6 @@ fn visible_lines(
 
 /// How big a statement is as the reader sees it: the lines drawn, and its bytes
 /// as UTF-8, which is what the server is sent.
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn size_fact(text: &str) -> String {
     let count = |n: usize, noun: &str| {
         format!(

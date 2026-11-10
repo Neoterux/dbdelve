@@ -28,7 +28,9 @@ use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
 use crate::session::PendingDelete;
 use crate::sql::{Destructive, Stop};
-use crate::ui::{Status, code_lines, dot, raised_card, row_icon_tinted};
+use crate::ui::{
+    Status, code_lines, code_lines_visible, dot, raised_card, row_icon_tinted, size_fact,
+};
 
 impl Workspace {
     pub(crate) fn render_connection_form(
@@ -1761,7 +1763,20 @@ impl Workspace {
             .find(|profile| profile.id == call.profile_id)?;
         let engine = profile.config.engine();
         let code = fonts(cx).editor.clone();
-        let lines = code_lines(&approval.sql, engine.syntax(), &cx.theme().highlight_theme);
+        // A marker is DBDelve's own, drawn in the accent so it cannot pass for
+        // the statement's text.
+        let marker = gpui::HighlightStyle {
+            color: Some(t.text.into()),
+            background_color: Some(t.accent.into()),
+            ..Default::default()
+        };
+        let lines = code_lines_visible(
+            &approval.sql,
+            engine.syntax(),
+            &cx.theme().highlight_theme,
+            marker,
+        );
+        let size = size_fact(&approval.sql);
         let held = match &approval.verdict {
             crate::sql::AgentVerdict::Approve(verdict, _) => Some(verdict.mode),
             _ => None,
@@ -1796,6 +1811,8 @@ impl Workspace {
                 .justify_center()
                 .child(
                     dialog(t)
+                        .w(px(layout::APPROVAL_DIALOG_WIDTH))
+                        .max_w(gpui::relative(0.9))
                         .child(section_label(t, "Agent"))
                         .child(
                             div()
@@ -1809,16 +1826,38 @@ impl Workspace {
                                 .text_color(t.text_muted)
                                 .child(facts),
                         )
+                        .child(
+                            div()
+                                .debug_selector(|| "agent-approval-label".into())
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child("Statement from the agent, exactly as sent"),
+                        )
                         // Nothing on this surface moves on its own, so the block
-                        // has no smooth-scroll modifier.
+                        // has no smooth-scroll modifier. One element per line,
+                        // so none is left out of a long statement.
                         .child(
                             div()
                                 .id("agent-approval-sql")
-                                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                                .debug_selector(|| "agent-approval-sql".into())
+                                .max_h(px(layout::APPROVAL_TEXT_MAX_HEIGHT))
                                 .overflow_y_scroll()
                                 .font_family(code)
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                .children(lines.into_iter().map(|line| div().child(line))),
+                                .children(lines.into_iter().enumerate().map(|(index, line)| {
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("agent-approval-line-{index}")
+                                        })
+                                        .child(line)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "agent-approval-size".into())
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(size),
                         )
                         .child(
                             div()
