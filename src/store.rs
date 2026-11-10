@@ -2051,6 +2051,12 @@ impl AuditLog {
     /// the history's are: a call's `started` line must stay a line of its own
     /// beside its `outcome`, since the pair is the proof that a statement was
     /// sent before it was answered.
+    ///
+    /// ponytail: the cut is by count, so a call still running when the file is
+    /// rewritten (an approved write may run ten minutes) can lose its `started`
+    /// line and keep its `outcome`, which still names the call, its statement
+    /// and its decision. The upgrade is moving the cut back to the first line
+    /// no earlier unmatched `started` line precedes.
     pub(crate) fn append(&mut self, line: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
 
