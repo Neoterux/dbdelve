@@ -1173,6 +1173,9 @@ pub enum ConnectionConfig {
     External(ExternalConfig),
 }
 
+/// What an agent is told when its write is aimed at a DuckDB database.
+pub const DUCKDB_WRITE_REFUSED: &str = "An agent's write is not run on a DuckDB database: a write from a second connection to the file is lost.";
+
 impl ConnectionConfig {
     /// A Postgres profile that names no connection service.
     pub fn postgres(server: ServerConfig) -> Self {
@@ -1215,6 +1218,10 @@ impl ConnectionConfig {
         self.is_duckdb_in_memory().then_some(
             "This connection is an in-memory DuckDB database, which has no separate connection an agent can read.",
         )
+    }
+
+    pub fn agent_write_refusal(&self) -> Option<&'static str> {
+        None
     }
 
     /// Whether an agent's read of this connection can make the user's commit
@@ -1848,6 +1855,10 @@ impl Connection {
         }?;
         connection.set_read_only(true)?;
         Ok(connection)
+    }
+
+    pub fn open_for_approved_write(config: ConnectionConfig) -> Result<Self, DbError> {
+        Self::open(config)
     }
 
     /// Run one statement verbatim.
@@ -5764,6 +5775,41 @@ mod tests {
             )
         );
         assert!(!in_memory("").agent_opens_per_call());
+    }
+
+    #[test]
+    fn only_duckdb_refuses_an_agent_write() {
+        let in_memory = ConnectionConfig::duckdb(DUCKDB_IN_MEMORY.to_string(), 0);
+        for config in every_shape().into_iter().chain([in_memory]) {
+            let expected = (config.engine() == Engine::DuckDb).then_some(DUCKDB_WRITE_REFUSED);
+            assert_eq!(
+                config.agent_write_refusal(),
+                expected,
+                "{:?}",
+                config.engine()
+            );
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "dbdelve-agent-write-refusal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is creatable");
+        let path = directory.join("never.duckdb");
+        let refused = Connection::open_for_approved_write(ConnectionConfig::duckdb(
+            path.display().to_string(),
+            0,
+        ));
+        match refused {
+            Ok(_) => panic!("a DuckDB write connection was opened"),
+            Err(error) => assert_eq!(error.message, DUCKDB_WRITE_REFUSED),
+        }
+        assert!(
+            !path.exists(),
+            "the refusal came after the file was created"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

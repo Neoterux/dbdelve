@@ -6,6 +6,7 @@
 
 mod agent;
 mod agent_read;
+mod agent_write;
 mod commands;
 #[cfg(test)]
 mod e2e;
