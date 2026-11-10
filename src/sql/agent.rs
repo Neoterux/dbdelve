@@ -363,16 +363,13 @@ pub(crate) fn creates_index_concurrently(engine: Engine, sql: &str) -> bool {
 /// Whether the server's row count for `sql` is the rows it changed. A count of
 /// zero is also what a command with no row count reports (see
 /// [`crate::db::QueryResult::rows_affected`]), so it means "no rows" only for
-/// these four statements.
+/// these two statements. `DELETE` and `MERGE` would count too, and are not
+/// listed because [`agent_gate`] approves neither: every `DELETE` is refused,
+/// and a `MERGE` needs Full.
 pub(crate) fn counts_rows(engine: Engine, sql: &str) -> bool {
     matches!(
         typed_statements(engine, sql).as_slice(),
-        [
-            Statement::Insert(_)
-                | Statement::Update(_)
-                | Statement::Merge(_)
-                | Statement::Delete(_)
-        ]
+        [Statement::Insert(_) | Statement::Update(_)]
     )
 }
 
@@ -637,18 +634,25 @@ mod tests {
             Engine::Sqlite,
             Engine::DuckDb,
         ] {
-            for sql in [
-                "INSERT INTO t VALUES (1)",
-                "UPDATE t SET a = 1",
-                "DELETE FROM t WHERE a = 1",
-            ] {
+            for sql in ["INSERT INTO t VALUES (1)", "UPDATE t SET a = 1"] {
                 assert!(counts_rows(engine, sql), "{engine:?}: {sql}");
             }
         }
-        assert!(counts_rows(
-            Engine::Postgres,
-            "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET a = 1"
-        ));
+        // Not counted because no agent can run them: every `DELETE` is refused,
+        // and a `MERGE` needs Full, which an agent is refused too.
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                for sql in [
+                    "DELETE FROM t WHERE a = 1",
+                    "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE",
+                ] {
+                    assert!(
+                        matches!(agent_gate(engine, sql, mode), AgentVerdict::Refuse(_)),
+                        "{engine:?} {mode:?}: {sql}"
+                    );
+                }
+            }
+        }
         for (engine, sql) in [
             (Engine::Postgres, "CREATE INDEX i ON t (a)"),
             (Engine::Postgres, "CREATE TABLE u (a int)"),
