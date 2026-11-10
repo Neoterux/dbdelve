@@ -101,10 +101,9 @@ pub(super) const NOT_RECORDED: &str =
 /// was shown it. Nothing was opened.
 pub(super) const CHANGED_SINCE_SHOWN: &str = "The statement, the connection or its access level changed after it was shown, so it was not run.";
 
-// ponytail: the audit is this session's own and keeps the last five hundred
-// calls, in memory only, because it is read in a dialog and a longer list is
-// not read. Phase 6's persisted record of approvals (APPR-12) is the upgrade:
-// it is what outlives the window.
+// ponytail: the list the Agent activity dialog reads is this session's own and
+// keeps the last five hundred calls, in memory only, because a longer list is
+// not read. `agent-audit.jsonl` is what outlives the window.
 pub(crate) const AUDIT_CAP: usize = 500;
 
 /// How many characters of an agent's own statement an audit entry keeps.
@@ -171,8 +170,8 @@ pub(crate) struct CallFacts {
     pub(crate) error: Option<String>,
     /// The caller hung up before the call ended.
     pub(crate) requester_gone: bool,
-    /// What the person decided about a statement that waited for them. A call
-    /// with one is written to the audit file when it ends.
+    /// What the person decided about a statement that waited for them. It also
+    /// keeps the audit file's statement whole.
     pub(crate) decision: Option<Decision>,
     /// The engine of the profile the call was about, for the audit file.
     pub(crate) engine: Option<Engine>,
@@ -187,8 +186,8 @@ pub(crate) enum Decision {
     Expired,
 }
 
-/// One line of `agent-audit.jsonl`, the record of statements that waited for a
-/// person. It names the statement, who decided and how the call ended, and
+/// One line of `agent-audit.jsonl`, the record of every call an agent made. It
+/// names the statement, who decided when a person did, and how the call ended, and
 /// never a row value: what the database held does not belong in a file kept
 /// for longer than a session. `v` leads so a later shape can be told apart.
 /// JSON escapes every newline, so text an agent sent cannot start a line.
@@ -198,7 +197,7 @@ pub(super) struct AuditLine<'a> {
     session: u64,
     id: u64,
     at: u64,
-    /// `started` before a write is opened, `outcome` once the call ended.
+    /// `started` before a statement is sent, `outcome` once the call ended.
     phase: &'static str,
     tool: Tool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,8 +216,9 @@ pub(super) struct AuditLine<'a> {
     elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
-    /// The statement whole, never cut at [`AUDIT_SQL_CAP`]: clipping the record
-    /// of what a person approved would defeat it.
+    /// The statement whole when a person approved it, and cut at
+    /// [`AUDIT_SQL_CAP`] characters otherwise: clipping the record of what a
+    /// person approved would defeat it.
     #[serde(skip_serializing_if = "Option::is_none")]
     sql: Option<&'a str>,
 }
@@ -296,33 +296,46 @@ impl AgentState {
         status: Status,
         facts: CallFacts,
     ) {
-        if let Some(decision) = facts.decision {
-            // The one place an outcome line is written, so the file and the
-            // log say the same of every call that waited.
-            let line = AuditLine {
-                v: 1,
-                session: self.session,
-                id: id.0,
-                at: unix_millis(),
-                phase: "outcome",
-                tool,
-                profile: resolved.as_deref(),
-                engine: facts.engine.map(Engine::as_str),
-                verdict: facts.verdict.as_ref().map(AuditVerdict::line),
-                decision: Some(decision),
-                status: Some(status),
-                requester_gone: facts.requester_gone,
-                shown: facts.shown,
-                elapsed_ms: facts.elapsed_ms,
-                error: facts.error.as_deref(),
-                sql: facts.sql.as_deref(),
-            };
-            if let Err(error) = self.persist(&line) {
-                // The call has ended and nothing can un-run it, so the only
-                // thing left to do is say that its record is missing. The
-                // error names the file and never the statement.
-                eprintln!("{error}");
-            }
+        // What the in-memory log keeps of the statement and of an error that
+        // may echo it, cut so the dialog stays cheap to draw.
+        let cut_sql = facts.sql.clone().map(clipped);
+        let cut_error = facts.error.clone().map(clipped);
+        // The one place an outcome line is written, so the file and the log say
+        // the same of every call, whether it waited or not. A call that waited
+        // for a person keeps its statement whole, since cutting the record of
+        // what was approved would defeat it; a plain read keeps the cut.
+        let waited = facts.decision.is_some();
+        let line = AuditLine {
+            v: 1,
+            session: self.session,
+            id: id.0,
+            at: unix_millis(),
+            phase: "outcome",
+            tool,
+            profile: resolved.as_deref(),
+            engine: facts.engine.map(Engine::as_str),
+            verdict: facts.verdict.as_ref().map(AuditVerdict::line),
+            decision: facts.decision,
+            status: Some(status),
+            requester_gone: facts.requester_gone,
+            shown: facts.shown,
+            elapsed_ms: facts.elapsed_ms,
+            error: if waited {
+                facts.error.as_deref()
+            } else {
+                cut_error.as_deref()
+            },
+            sql: if waited {
+                facts.sql.as_deref()
+            } else {
+                cut_sql.as_deref()
+            },
+        };
+        if let Err(error) = self.persist(&line) {
+            // The call has ended and nothing can un-run it, so the only thing
+            // left to do is say that its record is missing. The error names
+            // the file and never the statement.
+            eprintln!("{error}");
         }
         self.log.push_front(LogEntry {
             at: unix_millis(),
@@ -338,11 +351,11 @@ impl AgentState {
             status,
             requester_gone: facts.requester_gone,
             verdict: facts.verdict,
-            sql: facts.sql.map(clipped),
+            sql: cut_sql,
             shown: facts.shown,
             total: facts.total,
             elapsed_ms: facts.elapsed_ms,
-            error: facts.error.map(clipped),
+            error: cut_error,
             decision: facts.decision,
         });
         self.log.truncate(AUDIT_CAP);
@@ -350,6 +363,44 @@ impl AgentState {
 }
 
 impl AgentState {
+    /// Write the `started` line of a call that is about to run on a lane and
+    /// that no person approved (an approved one has its own, written before it
+    /// was handed on). Not fail-closed: a read changes nothing, so one whose
+    /// line could not be written still runs, and the failure names the file and
+    /// never the statement.
+    pub(super) fn note_started(
+        &mut self,
+        id: CallId,
+        tool: Tool,
+        profile: &str,
+        engine: Engine,
+        sql: Option<&str>,
+        arrived: Instant,
+    ) {
+        let cut = sql.map(|sql| clipped(sql.to_string()));
+        let line = AuditLine {
+            v: 1,
+            session: self.session,
+            id: id.0,
+            at: unix_millis(),
+            phase: "started",
+            tool,
+            profile: Some(profile),
+            engine: Some(engine.as_str()),
+            verdict: sql.map(|_| AuditVerdict::Run.line()),
+            decision: None,
+            status: None,
+            requester_gone: false,
+            shown: None,
+            elapsed_ms: elapsed_ms(arrived),
+            error: None,
+            sql: cut.as_deref(),
+        };
+        if let Err(error) = self.persist(&line) {
+            eprintln!("{error}");
+        }
+    }
+
     /// Write one line to the audit file. The one door to it, so the writes of
     /// the two phases cannot disagree about the file.
     #[cfg(unix)]
@@ -858,8 +909,8 @@ impl Workspace {
                     sql: Some(&approval.sql),
                 };
                 match self.agent.persist(&started) {
-                    // No decision on the failure: its outcome line would meet
-                    // the same file.
+                    // No decision on the failure: the statement was never
+                    // started, and its outcome line meets the same file.
                     Err(error) => (Status::Failed, NOT_RECORDED, Some(error)),
                     Ok(()) => {
                         match held {

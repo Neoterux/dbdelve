@@ -1301,6 +1301,9 @@ fn agent_log_label(entry: &agent::LogEntry, now: u64) -> String {
     if entry.requester_gone {
         line.push_str(" \u{b7} no requester");
     }
+    if entry.decision == Some(agent::Decision::Approved) {
+        line.push_str(" \u{b7} approved");
+    }
     line
 }
 

@@ -6231,15 +6231,7 @@ fn agent_audit_pairs_lines_by_call_in_the_order_they_happened(cx: &mut TestAppCo
         cx.executor().allow_parking();
         let (a, write) = running_write(&workspace, cx);
         let read = inject_sql(&workspace, cx, "Orders", "SELECT id FROM t");
-        let b = {
-            let answered = answer_of(cx, &read);
-            assert_eq!(answered.status, Status::Executed);
-            audit_lines()
-                .iter()
-                .find(|line| line["id"] != a.0)
-                .expect("the read left a line")["id"]
-                .clone()
-        };
+        assert_eq!(answer_of(cx, &read).status, Status::Executed);
         land_write(cx);
         assert_eq!(answer_of(cx, &write).status, Status::Executed);
 
@@ -6264,7 +6256,6 @@ fn agent_audit_pairs_lines_by_call_in_the_order_they_happened(cx: &mut TestAppCo
             ],
             "{lines:?}"
         );
-        assert_ne!(b, serde_json::json!(a.0));
         for line in &lines {
             assert_eq!(line["session"], lines[0]["session"]);
         }
