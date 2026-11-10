@@ -364,10 +364,6 @@ pub(crate) fn creates_index_concurrently(engine: Engine, sql: &str) -> bool {
 /// zero is also what a command with no row count reports (see
 /// [`crate::db::QueryResult::rows_affected`]), so it means "no rows" only for
 /// these four statements.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the approved write's answer reads it")
-)]
 pub(crate) fn counts_rows(engine: Engine, sql: &str) -> bool {
     matches!(
         typed_statements(engine, sql).as_slice(),

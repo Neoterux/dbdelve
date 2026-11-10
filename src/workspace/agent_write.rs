@@ -22,6 +22,7 @@ use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, tools::Tool},
     db::{CancelToken, Connection, ConnectionConfig, DbError, Engine, Fetch, QueryResult},
+    sql::counts_rows,
 };
 
 // ponytail: the longest an approved write is left to run where the engine has
@@ -140,16 +141,20 @@ pub(super) fn open_for_write(
     })
 }
 
-/// What an approved write answers: its rows when it returned any, otherwise the
-/// server's count, or that it ran when the server gave none.
-pub(super) fn written_text(engine: Engine, _sql: &str, result: &QueryResult) -> String {
+/// What an approved write answers: its rows when it returned any, the server's
+/// count when `sql` is a statement whose count is the rows it changed, and
+/// otherwise that it ran. A `CREATE INDEX` reports a count of 0 that means no
+/// count, so it is not read as "no row changed".
+pub(super) fn written_text(engine: Engine, sql: &str, result: &QueryResult) -> String {
     if !result.columns.is_empty() {
         return result::text(&[table_of(engine, result)], result.rest.len(), None);
     }
     match result.rows_affected {
-        Some(1) => "The server reported 1 row affected.".to_string(),
-        Some(count) => format!("The server reported {count} rows affected."),
-        None => "The statement ran.".to_string(),
+        Some(1) if counts_rows(engine, sql) => "The server reported 1 row affected.".to_string(),
+        Some(count) if counts_rows(engine, sql) => {
+            format!("The server reported {count} rows affected.")
+        }
+        _ => "The statement ran.".to_string(),
     }
 }
 

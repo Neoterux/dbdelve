@@ -53,10 +53,6 @@ mod agent;
     )
 )]
 pub(crate) use agent::{AgentVerdict, Expiry, Refusal, agent_gate};
-#[expect(
-    unused_imports,
-    reason = "the approval dialog and the approved write's answer are its readers"
-)]
 pub(crate) use agent::{ApprovalKind, approval_kind, counts_rows, creates_index_concurrently};
 
 /// The runnable statements of a query buffer, as byte ranges into it.
