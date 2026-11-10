@@ -155,8 +155,9 @@ fn split_highlights<'a>(
 }
 
 /// A statement's text as it is drawn for a human who must read what the
-/// server will read: every character that is invisible or reorders what is
-/// around it is shown as an ASCII `[U+XXXX]` marker. For display only; what
+/// server will read: every character that is invisible, blank, drawn as
+/// something it is not, or that reorders what is around it is shown as an
+/// ASCII `[U+XXXX]` marker (see [`hides_in_text`]). For display only; what
 /// runs, and what is compared against it, is always the source text (D-29).
 pub(crate) struct Visible {
     pub(crate) display: String,
@@ -192,25 +193,73 @@ impl Visible {
     }
 }
 
-/// Characters that read as nothing, or that move what is around them, in a
-/// statement the server reads byte for byte. `\n` and `\t` are drawn as
-/// themselves; every other control character is not.
+/// The code points beyond the control characters that draw as nothing, as a
+/// blank or as something they are not: Unicode 16.0's
+/// Default_Ignorable_Code_Point (the tag characters, the variation selectors,
+/// the Hangul fillers among them) and general category Cf (format), merged,
+/// with U+2800 BRAILLE PATTERN BLANK and the private-use areas (Co), which
+/// draw as whatever a font puts there; planes 15 and 16 are taken whole, their
+/// last two code points being noncharacters. Sorted and disjoint, for a binary
+/// search.
+///
+/// Unassigned code points (Cn) outside Default_Ignorable are not here: which
+/// are unassigned changes with each Unicode version, and the standard library
+/// has no table of them. A font draws one it has no glyph for as a box.
+const HIDDEN_RANGES: &[(char, char)] = &[
+    ('\u{ad}', '\u{ad}'),
+    ('\u{34f}', '\u{34f}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61c}', '\u{61c}'),
+    ('\u{6dd}', '\u{6dd}'),
+    ('\u{70f}', '\u{70f}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8e2}', '\u{8e2}'),
+    ('\u{115f}', '\u{1160}'),
+    ('\u{17b4}', '\u{17b5}'),
+    ('\u{180b}', '\u{180f}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{202a}', '\u{202e}'),
+    ('\u{2060}', '\u{206f}'),
+    ('\u{2800}', '\u{2800}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{e000}', '\u{f8ff}'),
+    ('\u{fe00}', '\u{fe0f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{ffa0}', '\u{ffa0}'),
+    ('\u{fff0}', '\u{fffb}'),
+    ('\u{110bd}', '\u{110bd}'),
+    ('\u{110cd}', '\u{110cd}'),
+    ('\u{13430}', '\u{1343f}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0000}', '\u{e0fff}'),
+    ('\u{f0000}', '\u{10ffff}'),
+];
+
+/// Characters that read as nothing, read as something they are not, or move
+/// what is around them, in a statement the server reads byte for byte. `\n`
+/// and `\t` are drawn as themselves; every other control character is not,
+/// nor any space but the ASCII one, which the server does not read as a
+/// space, nor anything in [`HIDDEN_RANGES`]. An emoji's variation selector is
+/// marked with the rest: what is drawn is what the server reads, not what the
+/// emoji would look like.
 fn hides_in_text(c: char) -> bool {
-    (c.is_control() && c != '\n' && c != '\t')
-        || matches!(
-            c,
-            '\u{61c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{200b}'..='\u{200d}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{ad}'
-                | '\u{feff}'
-                | '\u{2028}'
-                | '\u{2029}'
-        )
+    if c.is_ascii() {
+        return c.is_ascii_control() && c != '\n' && c != '\t';
+    }
+    c.is_control()
+        || c.is_whitespace()
+        || HIDDEN_RANGES
+            .binary_search_by(|&(low, high)| {
+                if high < c {
+                    std::cmp::Ordering::Less
+                } else if low > c {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
 }
 
 pub(crate) fn visible(text: &str) -> Visible {
@@ -1554,6 +1603,117 @@ mod tests {
         assert_eq!(visible("a\tb\nc").display, "a\tb\nc");
     }
 
+    /// Unicode 16.0's Default_Ignorable_Code_Point and general category Cf, as
+    /// `DerivedCoreProperties.txt` and `DerivedGeneralCategory.txt` list them,
+    /// kept apart from the merged table they are checked against.
+    const DEFAULT_IGNORABLE: &[(char, char)] = &[
+        ('\u{ad}', '\u{ad}'),
+        ('\u{34f}', '\u{34f}'),
+        ('\u{61c}', '\u{61c}'),
+        ('\u{115f}', '\u{1160}'),
+        ('\u{17b4}', '\u{17b5}'),
+        ('\u{180b}', '\u{180f}'),
+        ('\u{200b}', '\u{200f}'),
+        ('\u{202a}', '\u{202e}'),
+        ('\u{2060}', '\u{206f}'),
+        ('\u{3164}', '\u{3164}'),
+        ('\u{fe00}', '\u{fe0f}'),
+        ('\u{feff}', '\u{feff}'),
+        ('\u{ffa0}', '\u{ffa0}'),
+        ('\u{fff0}', '\u{fff8}'),
+        ('\u{1bca0}', '\u{1bca3}'),
+        ('\u{1d173}', '\u{1d17a}'),
+        ('\u{e0000}', '\u{e0fff}'),
+    ];
+    const FORMAT: &[(char, char)] = &[
+        ('\u{ad}', '\u{ad}'),
+        ('\u{600}', '\u{605}'),
+        ('\u{61c}', '\u{61c}'),
+        ('\u{6dd}', '\u{6dd}'),
+        ('\u{70f}', '\u{70f}'),
+        ('\u{890}', '\u{891}'),
+        ('\u{8e2}', '\u{8e2}'),
+        ('\u{180e}', '\u{180e}'),
+        ('\u{200b}', '\u{200f}'),
+        ('\u{202a}', '\u{202e}'),
+        ('\u{2060}', '\u{2064}'),
+        ('\u{2066}', '\u{206f}'),
+        ('\u{feff}', '\u{feff}'),
+        ('\u{fff9}', '\u{fffb}'),
+        ('\u{110bd}', '\u{110bd}'),
+        ('\u{110cd}', '\u{110cd}'),
+        ('\u{13430}', '\u{1343f}'),
+        ('\u{1bca0}', '\u{1bca3}'),
+        ('\u{1d173}', '\u{1d17a}'),
+        ('\u{e0001}', '\u{e0001}'),
+        ('\u{e0020}', '\u{e007f}'),
+    ];
+
+    #[test]
+    fn visible_characters_mark_every_default_ignorable_and_format_character() {
+        for (low, high) in DEFAULT_IGNORABLE.iter().chain(FORMAT) {
+            for c in *low..=*high {
+                assert_eq!(
+                    visible(&format!("a{c}b")).display,
+                    format!("a[U+{:04X}]b", c as u32),
+                    "U+{:04X}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_characters_mark_blank_letters_odd_spaces_and_private_use() {
+        for c in [
+            // Tag characters, the "ASCII smuggling" channel.
+            '\u{e0041}',
+            '\u{e007f}',
+            // Variation selectors, an emoji's VS16 among them.
+            '\u{fe0f}',
+            '\u{e0100}',
+            '\u{e01ef}',
+            '\u{180e}',
+            '\u{34f}',
+            '\u{206a}',
+            '\u{206f}',
+            // Hangul fillers: letters a server reads inside an identifier.
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
+            '\u{2800}',
+            // Spaces a server does not read as one.
+            '\u{a0}',
+            '\u{1680}',
+            '\u{2000}',
+            '\u{200a}',
+            '\u{202f}',
+            '\u{205f}',
+            '\u{3000}',
+            // Private use, which draws as whatever a font puts there.
+            '\u{e000}',
+            '\u{f8ff}',
+            '\u{f0000}',
+            '\u{10fffd}',
+        ] {
+            assert_eq!(
+                visible(&format!("a{c}b")).display,
+                format!("a[U+{:04X}]b", c as u32),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn the_hidden_ranges_are_sorted_and_disjoint() {
+        for pair in HIDDEN_RANGES.windows(2) {
+            assert!(pair[0].0 <= pair[0].1, "{pair:?}");
+            assert!(pair[0].1 < pair[1].0, "{pair:?}");
+        }
+    }
+
     #[test]
     fn visible_characters_keep_crlf_and_a_trailing_carriage_return() {
         let theme = HighlightTheme::default_dark();
@@ -1624,6 +1784,9 @@ mod tests {
         for text in [
             "UPDATE t SET a = 'é' WHERE id = 1",
             "SELECT '\u{1F600}' FROM t",
+            // A combining accent is drawn on the letter before it.
+            "UPDATE t SET a = 'e\u{301}' WHERE id = 1",
+            "SELECT '日本語', 'Ελληνικά', 'עברית', 'العربية', '한국어' FROM t",
         ] {
             let seen = visible(text);
             assert_eq!(seen.display, text);
