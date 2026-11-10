@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::agent::{AuditVerdict, CallFacts, Decision, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, audited_error, elapsed_ms};
 use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
@@ -334,7 +334,8 @@ pub(super) struct Ended {
     /// How many rows went back and how many there were, when it was answered
     /// with a result.
     pub(super) rows: Option<(usize, Total)>,
-    /// The full error of a read that failed, which the agent was not given.
+    /// What the audit keeps of the error of a read that failed:
+    /// [`audited_error`] of what the agent was given.
     pub(super) error: Option<String>,
 }
 
@@ -783,7 +784,12 @@ impl Workspace {
         let (status, text) = match ran {
             Ran::NotOpened(error) => {
                 lane.connection = None;
-                ended.error = Some(error.message);
+                // What the open's error must not name, as the config the lane
+                // opened from says; the keychain's password is never in it.
+                ended.error = Some(audited_error(&scrubbed(
+                    &error.message,
+                    &lane.opened_from.identifying_text(),
+                )));
                 (Status::Failed, OPEN_FAILED.to_string())
             }
             Ran::Done {
@@ -835,7 +841,7 @@ impl Workspace {
                 // reopen after a failed statement.
                 lane.connection = None;
                 let text = scrubbed(&error.message, &hidden);
-                ended.error = Some(error.message);
+                ended.error = Some(audited_error(&text));
                 (Status::Failed, text)
             }
         };

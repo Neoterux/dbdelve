@@ -6187,6 +6187,75 @@ fn agent_audit_never_records_a_row_value(cx: &mut TestAppContext) {
 
 #[cfg(unix)]
 #[gpui::test]
+fn agent_audit_keeps_no_row_value_or_host_from_a_failed_write(cx: &mut TestAppContext) {
+    use super::agent_write::Wrote;
+    use crate::{agent::Status, db::DbError};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        let fail_with = |workspace: &Entity<Workspace>,
+                         cx: &mut VisualTestContext,
+                         runner: super::agent_write::WriteRunner| {
+            workspace.update(cx, |workspace, _| {
+                workspace.agent.write_runner = Some(runner)
+            });
+            let (id, answers) = inject_update(workspace, cx, Some("Orders"));
+            approve_front(cx);
+            let answer = answer_of(cx, &answers);
+            assert_eq!(answer.status, Status::Failed);
+            let logged = workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .agent
+                    .log
+                    .front()
+                    .and_then(|entry| entry.error.clone())
+            });
+            (id, answer.text, logged)
+        };
+
+        let (id, answer, logged) = fail_with(&workspace, cx, |_, _, _, _, _| {
+            gpui::Task::ready(Wrote::Done {
+                hidden: Vec::new(),
+                result: Err(DbError {
+                    message: "duplicate key value violates unique constraint \"t_email_key\"\n\
+                              Key (email)=(a@x) already exists."
+                        .to_string(),
+                    position: None,
+                }),
+            })
+        });
+        assert!(answer.contains("Key (email)=(a@x)"), "{answer}");
+        let kept = "duplicate key value violates unique constraint …";
+        assert_eq!(logged.as_deref(), Some(kept));
+        let outcome = audit_of(id).pop().expect("the outcome was written");
+        assert_eq!(outcome["error"], kept);
+
+        let (id, answer, logged) = fail_with(&workspace, cx, |_, _, _, _, _| {
+            gpui::Task::ready(Wrote::NotOpened {
+                hidden: vec!["db.internal".to_string()],
+                error: DbError {
+                    message: "could not reach db.internal as 'alice'".to_string(),
+                    position: None,
+                },
+            })
+        });
+        assert_eq!(answer, super::agent_read::OPEN_FAILED);
+        let kept = "could not reach [hidden] as …";
+        assert_eq!(logged.as_deref(), Some(kept));
+        let outcome = audit_of(id).pop().expect("the outcome was written");
+        assert_eq!(outcome["error"], kept);
+
+        let file = serde_json::to_string(&audit_lines()).expect("the lines encode");
+        for value in ["a@x", "db.internal", "alice"] {
+            assert!(!file.contains(value), "{value} reached the file: {file}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
 fn agent_audit_cuts_a_read_and_keeps_an_approval_whole(cx: &mut TestAppContext) {
     use super::agent::{AUDIT_SQL_CAP, SQL_CLIPPED};
     use crate::agent::Status;
