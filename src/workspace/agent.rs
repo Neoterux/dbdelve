@@ -421,6 +421,10 @@ fn expired_text() -> String {
     )
 }
 
+/// What a denied call is told: the person read the statement and said no, and
+/// nothing ran.
+const DENIED: &str = "The ping was denied in DBDelve.";
+
 /// A running bridge. Neither field is read: holding them is the point.
 pub(crate) struct Bridge {
     _listener: crate::agent::Listener,
@@ -634,12 +638,7 @@ impl Workspace {
 
     /// The dialog's Deny, for a call named by id.
     pub(crate) fn deny_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
-        self.finish_call(
-            id,
-            Status::Rejected,
-            "The ping was denied in DBDelve.".to_string(),
-            cx,
-        );
+        self.finish_call(id, Status::Rejected, DENIED.to_string(), cx);
     }
 
     /// The call the dialog in front is about, when it asks for a statement to
@@ -1640,5 +1639,19 @@ mod tests {
                 assert!(!prompt.contains(word), "{name}: {prompt}");
             }
         }
+    }
+
+    #[test]
+    fn the_approval_texts_say_the_statement_was_not_run() {
+        for text in [DENIED.to_string(), expired_text()] {
+            assert!(text.contains("statement"), "{text}");
+            assert!(text.contains("not run"), "{text}");
+            assert!(text.contains("DBDelve"), "{text}");
+        }
+        assert!(
+            expired_text().contains(&format!("{} minutes", EXPIRY.as_secs() / 60)),
+            "{}",
+            expired_text()
+        );
     }
 }
