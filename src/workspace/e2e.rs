@@ -3878,7 +3878,7 @@ fn approve_front(cx: &mut VisualTestContext) {
     cx.executor().advance_clock(super::agent::ARM_DELAY);
     settle(cx);
     let approve = cx
-        .debug_bounds("agent-ping-approve")
+        .debug_bounds("agent-approval-approve")
         .expect("the dialog draws Approve");
     cx.simulate_click(approve.center(), gpui::Modifiers::default());
     settle(cx);
@@ -3980,7 +3980,8 @@ fn an_unanswered_approval_expires_after_the_fixed_wait(cx: &mut TestAppContext) 
             answers.try_recv().ok(),
             Some(Reply {
                 status: Status::Expired,
-                text: "Nobody answered the ping in DBDelve within 5 minutes.".to_string(),
+                text: "Nobody answered the approval in DBDelve within 5 minutes; the statement was not run."
+                    .to_string(),
             })
         );
         assert!(pending_calls(&workspace, cx).is_empty());
@@ -4464,7 +4465,7 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
         // A waiting approval's dialog holds the keyboard, so the chord is pressed
         // from inside it, and has to reach the workspace from there.
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert!(dialog_has_keyboard(&workspace, cx));
 
         cx.simulate_keystrokes("secondary-shift-k");
@@ -4946,7 +4947,7 @@ fn front_ping_id(
 fn denied() -> crate::agent::Reply {
     crate::agent::Reply {
         status: crate::agent::Status::Rejected,
-        text: "The ping was denied in DBDelve.".to_string(),
+        text: "The statement was denied in DBDelve and was not run.".to_string(),
     }
 }
 
@@ -4968,7 +4969,7 @@ fn an_approved_statement_waits_for_the_human_and_runs_only_after_approve(cx: &mu
         );
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert!(!shim.is_finished(), "the agent waits for the human");
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
@@ -5023,7 +5024,7 @@ fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
         let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
         let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         let state = |cx: &mut VisualTestContext| {
             workspace.read_with(cx, |workspace, _| {
                 (workspace.agent.revealed, workspace.agent.armed)
@@ -5032,7 +5033,7 @@ fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
         assert_eq!(state(cx), (Some(id), None), "the dialog was revealed");
 
         let approve = cx
-            .debug_bounds("agent-ping-approve")
+            .debug_bounds("agent-approval-approve")
             .expect("the dialog draws Approve");
         cx.simulate_click(approve.center(), gpui::Modifiers::default());
         settle(cx);
@@ -5086,7 +5087,7 @@ fn an_approval_covered_by_another_dialog_is_not_armed_until_it_is_shown_again(
 
         workspace.update(cx, |workspace, cx| workspace.close_agent_audit(cx));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(armed(cx), None, "armed the moment it was uncovered");
         cx.executor()
             .advance_clock(ARM_DELAY - Duration::from_millis(1));
@@ -5297,12 +5298,16 @@ fn enter_never_approves_an_approval(cx: &mut TestAppContext) {
             launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(ringed_button(&workspace, cx), 0);
 
         for key in ["right", "left", "tab"] {
             press(cx, key);
-            assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"), "{key}");
+            assert_eq!(
+                front_dialog(&workspace, cx),
+                Some("agent-approval"),
+                "{key}"
+            );
             assert_eq!(ringed_button(&workspace, cx), 0, "{key}");
             assert_eq!(pending_calls(&workspace, cx), [id], "{key}");
             assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty), "{key}");
@@ -5316,7 +5321,7 @@ fn enter_never_approves_an_approval(cx: &mut TestAppContext) {
 
         let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         press(cx, "escape");
         assert_eq!(answers.try_recv().ok(), Some(denied()));
         assert_eq!(front_dialog(&workspace, cx), None);
@@ -5335,7 +5340,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // Approved.
         let (_, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         approve_front(cx);
         assert_eq!(answer_of(cx, &answers).status, Status::Executed);
         assert_eq!(front_dialog(&workspace, cx), None);
@@ -5344,7 +5349,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // Denied.
         let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
         settle(cx);
         assert_eq!(answers.try_recv().ok(), Some(denied()));
@@ -5354,7 +5359,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // Hung up.
         let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         workspace.update(cx, |workspace, cx| {
             workspace.on_agent_message(Inbound::Hangup { id }, cx)
         });
@@ -5369,7 +5374,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // Expired.
         let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         cx.executor()
             .advance_clock(EXPIRY + std::time::Duration::from_secs(1));
         settle(cx);
@@ -5384,7 +5389,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // call first, with or without one.
         let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         run_command(&workspace, cx, Command::DisconnectAgents);
         assert_eq!(front_dialog(&workspace, cx), None);
         assert_eq!(
@@ -5399,7 +5404,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         // Hidden from agents: the profile is the second, after `Secret`.
         let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         run_command(&workspace, cx, Command::HideFromAgents(1));
         settle(cx);
         assert_eq!(answers.try_recv().ok(), Some(swept()));
@@ -5421,7 +5426,7 @@ fn approvals_are_shown_oldest_first(cx: &mut TestAppContext) {
         let (second, second_answers) = inject_update(&workspace, cx, Some("Orders"));
         let (third, third_answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(front_ping_id(&workspace, cx), Some(first));
 
         workspace.update(cx, |workspace, cx| workspace.deny_ping(first, cx));
@@ -5429,7 +5434,7 @@ fn approvals_are_shown_oldest_first(cx: &mut TestAppContext) {
         assert_eq!(first_answers.try_recv().ok(), Some(denied()));
         assert_eq!(pending_calls(&workspace, cx), [second, third]);
         assert_eq!(front_ping_id(&workspace, cx), Some(second));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(
             second_answers.try_recv().err(),
             Some(TryRecvError::Empty),
@@ -5473,7 +5478,7 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
         let (second_shop, second_shop_answers) = inject_update(&workspace, cx, Some("Shop"));
         let (reports, reports_answers) = inject_update(&workspace, cx, Some("Reports"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(front_ping_id(&workspace, cx), Some(first_shop));
 
         // Hiding the profile that is already hidden answers nothing.
@@ -5494,7 +5499,7 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
         assert_eq!(orders_answers.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(front_ping_id(&workspace, cx), Some(orders));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
 
         // Nothing waits on Reports once its approval is denied, so hiding it sends
         // nothing and says nothing.
@@ -5536,7 +5541,7 @@ fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
         assert_eq!(pending_calls(&workspace, cx), [reports]);
         assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(front_ping_id(&workspace, cx), Some(reports));
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         quit(workspace, cx);
     });
 }
@@ -6186,7 +6191,7 @@ fn turning_access_off_from_the_mark_while_an_approval_waits_rejects_it_and_close
         run_command(&workspace, cx, Command::TurnOnAgentAccess);
         let (_, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
 
         // The dialog stops under the titlebar, so the click reaches the mark.
         let mark = cx
@@ -6256,7 +6261,7 @@ fn a_click_on_the_approval_backdrop_below_the_titlebar_does_not_approve(cx: &mut
             launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
 
         let just_below_the_titlebar = gpui::point(
             gpui::px(12.),
@@ -6267,7 +6272,7 @@ fn a_click_on_the_approval_backdrop_below_the_titlebar_does_not_approve(cx: &mut
 
         assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(pending_calls(&workspace, cx), [id]);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         quit(workspace, cx);
     });
 }
@@ -7233,7 +7238,7 @@ fn an_approved_read_of_a_file_runs_read_only_and_answers_rows(cx: &mut TestAppCo
             &format!("SELECT count(*) AS n FROM '{csv}'"),
         );
         settle(cx);
-        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(
             answers.try_recv().err(),
             Some(std::sync::mpsc::TryRecvError::Empty),
@@ -7397,7 +7402,7 @@ fn an_agent_write_on_duckdb_is_refused_before_it_is_shown(cx: &mut TestAppContex
             }
         );
         settle(cx);
-        assert_ne!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_ne!(front_dialog(&workspace, cx), Some("agent-approval"));
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.agent.calls.is_empty(), "the write was held");
             assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
