@@ -800,7 +800,7 @@ impl Theme {
     /// appearance (`starting_theme`), and both are opaque: a blurred window
     /// reads as noise among a desktop full of others, so glass is something to
     /// pick, not a start.
-    fn built_in() -> [Self; 29] {
+    pub(crate) fn built_in() -> [Self; 29] {
         [
             Self::black(),
             Self::dark(),
