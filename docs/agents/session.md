@@ -112,22 +112,43 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   a call is addressed by its `CallId`, never by its place in a list.
   `finish_call` removes the call by id before it replies, so a call ended by
   two things at once answers at most once, and it writes the call's one log
-  line, so a hangup that arrives after the answer adds nothing. The log is
-  this session's own (`AgentState::log`, at most `LOG_CAP`): names, a code and
-  a time, never a row or a statement, and never written to disk. The ping
-  dialog is the first entry of every `dialog_layer` list, so it is drawn
-  behind every dialog the user is already answering, and only a click on
-  Approve answers it `executed`; every key answers `rejected`. Hiding or
-  removing a profile rejects the calls waiting on it, and the kill switch
-  answers every pending call before it drops the bridge, so a waiting client
-  reads a whole answer and not a bare end. The titlebar mark has three states
-  and is the same in all three titlebars: nothing while no bridge runs, the
-  MCP logo dim while one listens alone, and lit with the count of waiting calls
-  once a shim is attached or a call waits. It carries the kill switch and the
-  log in a popover, and the popover exists only while the mark does: turning
-  access on is the palette's. Nothing in it animates. The ping dialog starts
-  below the titlebar, so while a ping waits the mark and its kill switch can
-  still be clicked; the keyboard stays with the dialog, where every key denies.
+  line, so a hangup that arrives after the answer adds nothing. A statement
+  that waits for a person is drawn in the approval dialog
+  (`agent-approval`): the first entry of every `dialog_layer` list, so it is
+  drawn behind every dialog the user is already answering, and below the
+  titlebar. Deny is its one ring stop and Approve is a single mouse click that
+  works only after it has been on screen for `ARM_DELAY`; every key denies, so
+  no keystroke already in flight can approve what the person has not read.
+  Two records are kept of a call, for two readers. The Agent activity dialog
+  reads the in-memory log (`AgentState::log`, at most `AUDIT_CAP`), this
+  session's own: names, a code, a time, the statement cut at `AUDIT_SQL_CAP`
+  and never a row, and an approved call is labelled as one. What outlives the
+  window is `agent-audit.jsonl`, beside `profiles.toml` and one per storage
+  variant, `0600`: an `outcome` line for every call and a `started` line for
+  each statement that was sent (`AgentState::record`, `note_started`). The two
+  are paired by `(session, id)` and appended in the order the window handled
+  them, never sorted by time. A statement a person approved is kept whole and
+  its `started` line is written before anything is opened, and a write that
+  cannot be recorded is not run; a plain read's statement is cut as it is in
+  memory and its `started` line is best effort. No line holds a row value.
+  `store::AuditLog` counts the lines once and keeps the count, and past
+  `AUDIT_SLACK` lines rewrites the file to its newest `AUDIT_KEEP`, verbatim.
+  A line a crash left without its end is ended before the next is written. A
+  hangup withdraws a call that is still waiting for approval, and an approved
+  write that is already running finishes. Quitting does not wait for one, and
+  its `started` line is the trace it leaves. Hiding or removing a profile
+  rejects the calls waiting on it, and the kill switch answers every pending
+  call before it drops the bridge, so a waiting client reads a whole answer and
+  not a bare end. The wire speaks version 3; a shim already running from an
+  older build keeps speaking version 2 until its agent restarts it, and is
+  refused. The titlebar mark has three states and is the same in all three
+  titlebars: nothing while no bridge runs, the MCP logo dim while one listens
+  alone, and lit with the count of waiting calls once a shim is attached or a
+  call waits. It carries the kill switch and the log in a popover, and the
+  popover exists only while the mark does: turning access on is the palette's.
+  Nothing in it animates. The approval dialog starts below the titlebar, so
+  while one waits the mark and its kill switch can still be clicked; the
+  keyboard stays with the dialog, where every key denies.
 - **One window serves agents, and the lock beside the socket says which.** The
   window that binds holds an exclusive `flock` on `agent/s.lock` for as long as
   it serves, and the kernel lets go of it if the process dies. A window that

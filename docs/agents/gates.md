@@ -244,6 +244,20 @@ session state, calls nothing on the engine's `denied_functions` or
 `egress_functions` and, at Read-write and Full, calls only functions on its
 engine's built-in list.
 
+**An `Approve` waits for the human, and runs only what the dialog drew.** The
+call is held until the person approves, denies or lets it expire, and nothing
+stands in for that act. At Approve the gate runs again, on the exact string the
+dialog drew, against the profile's current mode: a different verdict, a
+profile whose connection has changed since or a byte of difference between the
+statement and what was drawn cancels the call as `refused_by_gate` and sends
+nothing. An approved statement whose verdict is Read-only runs on the profile's
+read-only lane; a Read-write one runs on a connection opened for that call and
+closed with it, so a session change the statement makes dies with the
+connection. A write
+aimed at a DuckDB database is refused (`DUCKDB_WRITE_REFUSED`), because a write
+from a second connection to the file is lost. `explain_query` still refuses a
+statement that needs approval and never waits for one.
+
 **The disclosure line is drawn per engine.** On Redis it is `CONFIG GET`,
 `CLIENT LIST`, `ACL LIST` and `ACL GETUSER`: plaintext secrets, every client's
 address and name, and every user's password hashes. On MongoDB it is `currentOp`
