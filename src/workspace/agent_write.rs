@@ -134,7 +134,7 @@ pub(super) fn open_for_write(
                     ..Fetch::default()
                 },
             )
-            .map(|result| written_text(engine, &result));
+            .map(|result| written_text(engine, &sql, &result));
         drop(connection);
         Wrote::Done { hidden, result }
     })
@@ -142,7 +142,7 @@ pub(super) fn open_for_write(
 
 /// What an approved write answers: its rows when it returned any, otherwise the
 /// server's count, or that it ran when the server gave none.
-pub(super) fn written_text(engine: Engine, result: &QueryResult) -> String {
+pub(super) fn written_text(engine: Engine, _sql: &str, result: &QueryResult) -> String {
     if !result.columns.is_empty() {
         return result::text(&[table_of(engine, result)], result.rest.len(), None);
     }
@@ -285,12 +285,20 @@ mod tests {
             rows_affected,
             ..QueryResult::default()
         };
-        for (affected, text) in [
-            (Some(1), "The server reported 1 row affected."),
-            (Some(3), "The server reported 3 rows affected."),
-            (None, "The statement ran."),
+        const UPDATE: &str = "UPDATE t SET a = 1";
+        const INDEX: &str = "CREATE INDEX i ON t (a)";
+        for (sql, affected, text) in [
+            (UPDATE, Some(1), "The server reported 1 row affected."),
+            (UPDATE, Some(3), "The server reported 3 rows affected."),
+            (INDEX, Some(0), "The statement ran."),
+            (INDEX, None, "The statement ran."),
+            (UPDATE, None, "The statement ran."),
         ] {
-            assert_eq!(written_text(Engine::Sqlite, &counted(affected)), text);
+            assert_eq!(
+                written_text(Engine::Sqlite, sql, &counted(affected)),
+                text,
+                "{sql} {affected:?}"
+            );
         }
 
         let returned = QueryResult {
@@ -300,7 +308,7 @@ mod tests {
             }],
             ..QueryResult::default()
         };
-        let text = written_text(Engine::Sqlite, &returned);
+        let text = written_text(Engine::Sqlite, "UPDATE t SET a = 1 RETURNING id", &returned);
         assert!(text.contains("id"), "{text}");
         assert!(!text.contains("affected"), "{text}");
     }
