@@ -7282,6 +7282,95 @@ fn an_agent_read_on_a_duckdb_file_sees_the_latest_commit(cx: &mut TestAppContext
     });
 }
 
+/// A DuckDB profile `Ducks` (Read-only) beside a CSV `rows.csv` of three rows,
+/// both under the test home. Answers the workspace, the user's own instance of
+/// the file (held open for the whole test) and the CSV's path.
+#[cfg(unix)]
+fn agent_duckdb_with_csv<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    Entity<Workspace>,
+    &'a mut VisualTestContext,
+    ::duckdb::Connection,
+    String,
+) {
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    let path = directory.join("ducks.duckdb").display().to_string();
+    let csv = directory.join("rows.csv");
+    std::fs::write(&csv, "id\n1\n2\n3\n").expect("the CSV is writable");
+    let user = ::duckdb::Connection::open(&path).expect("the file opens");
+    user.execute_batch("CREATE TABLE t (id INTEGER)")
+        .expect("the schema applies");
+    let (workspace, cx) = agent_duckdb(cx, &path);
+    cx.executor().allow_parking();
+    (workspace, cx, user, csv.display().to_string())
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_approved_read_of_a_file_runs_read_only_and_answers_rows(cx: &mut TestAppContext) {
+    use crate::{agent::Status, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx, user, csv) = agent_duckdb_with_csv(cx);
+        let (id, answers) = inject_approval(
+            &workspace,
+            cx,
+            "Ducks",
+            &format!("SELECT count(*) AS n FROM '{csv}'"),
+        );
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(
+            answers.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Empty),
+            "the read waits for the human"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+        assert!(
+            answer
+                .text
+                .starts_with("truncated: none (1 rows)\ncolumns: [{\"name\":\"n\""),
+            "{}",
+            answer.text
+        );
+        assert!(answer.text.contains("[\"3\"]"), "{}", answer.text);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+            let entry = workspace.agent.log.front().expect("the call is logged");
+            assert_eq!(entry.status, Status::Executed);
+            assert_eq!(
+                entry.verdict,
+                Some(super::agent::AuditVerdict::Approve {
+                    mode: Mode::ReadOnly,
+                    expiry: None
+                })
+            );
+        });
+        let lines = audit_lines();
+        let phase_of = |phase: &str| {
+            lines
+                .iter()
+                .position(|line| line["id"] == id.0 && line["phase"] == phase)
+                .unwrap_or_else(|| panic!("no {phase} line for the call: {lines:?}"))
+        };
+        let (started, outcome) = (phase_of("started"), phase_of("outcome"));
+        assert!(started < outcome, "the start is recorded before the end");
+        assert_eq!(lines[started]["decision"], "approved");
+        assert_eq!(lines[outcome]["decision"], "approved");
+        drop(user);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_agent_write_on_duckdb_is_refused_before_it_is_shown(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};

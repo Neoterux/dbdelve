@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::agent::{AuditVerdict, CallFacts, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, elapsed_ms};
 use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
@@ -330,11 +330,24 @@ pub(super) struct Ended {
     pub(super) error: Option<String>,
 }
 
+/// What a person's approval leaves on a read that ran after it.
+#[derive(Clone)]
+pub(crate) struct Approved {
+    pub(crate) verdict: AuditVerdict,
+    pub(crate) engine: Engine,
+}
+
 /// What a read that ended records of itself: for a statement, that the gate
 /// let it run and what it sent; for a catalog call, which has no statement
 /// and so no verdict, nothing of either. Then how long it took, and what
 /// `ended` adds.
-fn facts_of(sql: Option<String>, arrived: Instant, ended: Ended) -> CallFacts {
+fn facts_of(
+    sql: Option<String>,
+    approved: Option<Approved>,
+    arrived: Instant,
+    ended: Ended,
+) -> CallFacts {
+    let _ = approved;
     CallFacts {
         verdict: sql.is_some().then_some(AuditVerdict::Run),
         sql,
@@ -844,7 +857,12 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, std::mem::take(&mut ended)),
+                    facts_of(
+                        running.sql,
+                        None,
+                        running.arrived,
+                        std::mem::take(&mut ended),
+                    ),
                     stop.filter(|_| early),
                 ));
             }
@@ -857,6 +875,7 @@ impl Workspace {
                 waiting.reply,
                 facts_of(
                     waiting.work.sql(),
+                    None,
                     waiting.arrived,
                     std::mem::take(&mut ended),
                 ),
@@ -908,7 +927,7 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, Ended::default()),
+                    facts_of(running.sql, None, running.arrived, Ended::default()),
                 )
             })
             .into_iter()
@@ -918,7 +937,7 @@ impl Workspace {
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
-                    facts_of(waiting.work.sql(), waiting.arrived, Ended::default()),
+                    facts_of(waiting.work.sql(), None, waiting.arrived, Ended::default()),
                 )
             }));
         for (id, tool, name, reply, facts) in ended {
@@ -1409,6 +1428,32 @@ fn kind_name(kind: RelationKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::db::{ColumnDefinition, ForeignKey, Index, NamedDefinition};
+
+    #[test]
+    fn an_approved_read_is_not_audited_as_a_plain_read() {
+        let sql = || Some("SELECT 1".to_string());
+        let plain = facts_of(sql(), None, Instant::now(), Ended::default());
+        assert_eq!(plain.verdict, Some(AuditVerdict::Run));
+        assert_eq!(plain.decision, None);
+
+        let approved = Approved {
+            verdict: AuditVerdict::Approve {
+                mode: Mode::ReadOnly,
+                expiry: None,
+            },
+            engine: Engine::DuckDb,
+        };
+        let facts = facts_of(sql(), Some(approved), Instant::now(), Ended::default());
+        assert_eq!(
+            facts.verdict,
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadOnly,
+                expiry: None
+            })
+        );
+        assert_eq!(facts.decision, Some(Decision::Approved));
+        assert_eq!(facts.engine, Some(Engine::DuckDb));
+    }
 
     fn relation(
         name: &str,
