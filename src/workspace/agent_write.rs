@@ -7,7 +7,14 @@
 //! on the server, and a write interrupted half-way is worse than one that
 //! finishes, so nothing but its own result ends it.
 
-use std::{sync::mpsc::SyncSender, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+    },
+    time::Instant,
+};
 
 use super::agent::{AuditVerdict, CallFacts, Decision, elapsed_ms};
 use super::agent_read::{AGENT_ROWS, OPEN_FAILED, scrubbed, table_of};
@@ -56,13 +63,24 @@ pub(crate) struct Writing {
     /// The statement exactly as it was approved, for the audit.
     sql: String,
     verdict: Option<AuditVerdict>,
-    /// The caller hung up while the write ran. It is not cancelled for that.
+    /// The caller hung up while the window already knew, as a `Hangup` that
+    /// found this write running said. It is not cancelled for that.
     pub(super) requester_gone: bool,
+    /// The socket's own flag for the call, set by its hangup watcher before the
+    /// window hears of it. Read when the write ends, so a hangup the window has
+    /// not yet heard still counts.
+    gone: Arc<AtomicBool>,
     _work: gpui::Task<()>,
 }
 
+/// What opens, runs and answers an approved write: [`open_for_write`], or one a
+/// test puts in [`AgentState::write_runner`](super::agent::AgentState::write_runner),
+/// as `Opener` is for reads, to keep a write running.
+pub(crate) type WriteRunner =
+    fn(&gpui::BackgroundExecutor, ConnectionConfig, String, String, Engine) -> gpui::Task<Wrote>;
+
 /// What the blocking half of an approved write came back with.
-enum Wrote {
+pub(crate) enum Wrote {
     NotOpened(DbError),
     /// `hidden` is what an error from the server must not name.
     Done {
@@ -74,7 +92,7 @@ enum Wrote {
 /// Open a connection for this one call, run `sql` on it as written, build the
 /// answer and drop the connection before returning, so a runtime shutdown
 /// never happens on the window's thread.
-fn open_for_write(
+pub(super) fn open_for_write(
     executor: &gpui::BackgroundExecutor,
     config: ConnectionConfig,
     profile_id: String,
@@ -152,14 +170,15 @@ impl Workspace {
         verdict: Option<AuditVerdict>,
         reply: SyncSender<Reply>,
         arrived: Instant,
+        gone: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) {
         let engine = config.engine();
+        let run = self.agent.write_runner.unwrap_or(open_for_write);
         let work = cx.spawn({
             let sql = sql.clone();
             async move |workspace, cx| {
-                let wrote =
-                    open_for_write(cx.background_executor(), config, profile_id, sql, engine).await;
+                let wrote = run(cx.background_executor(), config, profile_id, sql, engine).await;
                 // The window may have closed meanwhile, and then nobody is
                 // left to answer.
                 let _ = workspace.update(cx, |workspace, cx| workspace.finish_write(id, wrote, cx));
@@ -174,6 +193,7 @@ impl Workspace {
             sql,
             verdict,
             requester_gone: false,
+            gone,
             _work: work,
         });
         cx.notify();
@@ -201,7 +221,13 @@ impl Workspace {
                 Some(error.message),
             ),
         };
-        // The caller may have hung up, and then nobody reads this.
+        // From the socket's flag as well as from a `Hangup` the window heard,
+        // and known before the outcome line is written: `Undelivered` arrives
+        // after it and could only change the in-memory entry.
+        let requester_gone = write.requester_gone;
+        // The caller may have hung up, and then nobody reads this; the reply is
+        // still sent, because a dropped sender would close the socket with no
+        // answer for a caller that is still there.
         let _ = write.reply.send(Reply { status, text });
         self.agent.record(
             id,
@@ -214,7 +240,7 @@ impl Workspace {
                 sql: Some(write.sql),
                 elapsed_ms: elapsed_ms(write.arrived),
                 error,
-                requester_gone: write.requester_gone,
+                requester_gone,
                 decision: Some(Decision::Approved),
                 engine: Some(write.engine),
                 ..CallFacts::default()

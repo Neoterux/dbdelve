@@ -9991,3 +9991,362 @@ fn home_draws_an_agents_approval_and_the_visibility_dialog(cx: &mut TestAppConte
         assert_eq!(email_of(1).as_deref(), Some("z@x"));
     });
 }
+
+/// How long the stand-in write runner holds an approved write before it opens
+/// anything: the test moves the clock to let it start and land.
+const WRITE_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A write that stays running for `hold` of the test scheduler's time and then
+/// runs for real, so a test decides when it starts and lands.
+fn held_write(
+    hold: std::time::Duration,
+    executor: &gpui::BackgroundExecutor,
+    config: ConnectionConfig,
+    profile_id: String,
+    sql: String,
+    engine: Engine,
+) -> gpui::Task<super::agent_write::Wrote> {
+    let executor = executor.clone();
+    executor.clone().spawn(async move {
+        executor.timer(hold).await;
+        super::agent_write::open_for_write(&executor, config, profile_id, sql, engine).await
+    })
+}
+
+/// Approved writes are held for [`WRITE_HOLD`] before they run.
+fn hold_writes(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, _| {
+        workspace.agent.write_runner = Some(|executor, config, id, sql, engine| {
+            held_write(WRITE_HOLD, executor, config, id, sql, engine)
+        });
+    });
+}
+
+fn writes_running(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<crate::agent::CallId> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .agent
+            .writes
+            .iter()
+            .map(|write| write.id)
+            .collect()
+    })
+}
+
+/// The audit lines of one call, in the order they were written.
+#[cfg(unix)]
+fn audit_of(id: crate::agent::CallId) -> Vec<serde_json::Value> {
+    audit_lines()
+        .into_iter()
+        .filter(|line| line["id"] == id.0)
+        .collect()
+}
+
+fn executed() -> crate::agent::Reply {
+    crate::agent::Reply {
+        status: crate::agent::Status::Executed,
+        text: "The server reported 1 row affected.".to_string(),
+    }
+}
+
+/// A held write approved and running, with its call's reply channel.
+fn running_write(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    hold_writes(workspace, cx);
+    let (id, answers) = inject_update(workspace, cx, Some("Orders"));
+    approve_front(cx);
+    assert_eq!(writes_running(workspace, cx), [id], "the write is running");
+    assert_eq!(email_of(1).as_deref(), Some("a@x"), "and has not landed");
+    (id, answers)
+}
+
+/// Let the held write start, run and land.
+fn land_write(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(WRITE_HOLD);
+    settle(cx);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_hangup_while_a_write_runs_lets_it_finish_and_audits_no_requester(cx: &mut TestAppContext) {
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = running_write(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id }, cx)
+        });
+        assert_eq!(
+            writes_running(&workspace, cx),
+            [id],
+            "a hangup stops nothing"
+        );
+        assert!(answers.try_recv().is_err(), "nothing was said yet");
+
+        land_write(cx);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        assert_eq!(answers.try_recv().ok(), Some(executed()));
+        let entry = agent_log(&workspace, cx)
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .expect("the call is logged");
+        assert_eq!(entry.status, Status::Executed);
+        assert!(entry.requester_gone);
+        let lines = audit_of(id);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["phase"], "started");
+        assert_eq!(lines[1]["phase"], "outcome");
+        assert_eq!(lines[1]["requester_gone"], true);
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_hangup_the_window_has_not_heard_still_marks_a_running_write_as_gone(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        hold_writes(&workspace, cx);
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
+        // The socket's own flag, as its watcher sets it, and no `Hangup` for
+        // the window to hear.
+        let gone = workspace.read_with(cx, |workspace, _| {
+            workspace.agent.calls[0].approval.gone.clone()
+        });
+        approve_front(cx);
+        assert_eq!(writes_running(&workspace, cx), [id]);
+        gone.store(true, std::sync::atomic::Ordering::Release);
+
+        land_write(cx);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        assert_eq!(answers.try_recv().ok(), Some(executed()));
+        let entry = agent_log(&workspace, cx)
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .expect("the call is logged");
+        assert_eq!(entry.status, Status::Executed);
+        assert!(
+            entry.requester_gone,
+            "known from the flag, not from Undelivered"
+        );
+        assert_eq!(audit_of(id)[1]["requester_gone"], true);
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_kill_switch_rejects_waiting_approvals_and_lets_a_running_write_finish(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (running, running_answers) = running_write(&workspace, cx);
+        let (waiting, waiting_answers) = inject_update(&workspace, cx, Some("Orders"));
+        assert_eq!(pending_calls(&workspace, cx), [waiting]);
+
+        run_command(&workspace, cx, Command::DisconnectAgents);
+        assert_eq!(
+            waiting_answers.try_recv().ok(),
+            Some(Reply {
+                status: Status::Rejected,
+                text: "Agent access was turned off in DBDelve.".to_string(),
+            })
+        );
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert_eq!(writes_running(&workspace, cx), [running]);
+        assert!(
+            running_answers.try_recv().is_err(),
+            "the write was not answered"
+        );
+
+        land_write(cx);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        assert_eq!(running_answers.try_recv().ok(), Some(executed()));
+        assert_eq!(
+            audit_of(running).last().expect("an outcome")["phase"],
+            "outcome"
+        );
+        assert_eq!(
+            audit_of(running).last().expect("an outcome")["status"],
+            "executed"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn hiding_a_profile_rejects_its_waiting_approvals_and_lets_its_running_write_finish(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (running, running_answers) = running_write(&workspace, cx);
+        let (waiting, waiting_answers) = inject_update(&workspace, cx, Some("Orders"));
+        assert_eq!(pending_calls(&workspace, cx), [waiting]);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("orders", false, cx)
+        });
+        settle(cx);
+        assert_eq!(waiting_answers.try_recv().ok(), Some(swept()));
+        assert!(pending_calls(&workspace, cx).is_empty());
+        assert_eq!(writes_running(&workspace, cx), [running]);
+        assert!(
+            running_answers.try_recv().is_err(),
+            "the write was not answered"
+        );
+
+        land_write(cx);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        assert_eq!(running_answers.try_recv().ok(), Some(executed()));
+        assert_eq!(
+            audit_of(running).last().expect("an outcome")["status"],
+            "executed"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_deadline_never_ends_an_approved_write(cx: &mut TestAppContext) {
+    use super::agent_read::CALL_DEADLINE;
+    use std::time::Duration;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.write_runner = Some(|executor, config, id, sql, engine| {
+                held_write(Duration::from_secs(90), executor, config, id, sql, engine)
+            });
+        });
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
+        approve_front(cx);
+        assert_eq!(writes_running(&workspace, cx), [id]);
+
+        cx.executor()
+            .advance_clock(CALL_DEADLINE + Duration::from_secs(1));
+        settle(cx);
+        assert_eq!(
+            writes_running(&workspace, cx),
+            [id],
+            "the read deadline passed"
+        );
+        assert!(answers.try_recv().is_err(), "nothing has been replied");
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+
+        cx.executor()
+            .advance_clock(Duration::from_secs(90) - CALL_DEADLINE);
+        settle(cx);
+        assert!(writes_running(&workspace, cx).is_empty());
+        assert_eq!(answers.try_recv().ok(), Some(executed()));
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn quitting_with_a_running_write_asks_nothing_and_leaves_its_started_line(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, _answers) = running_write(&workspace, cx);
+        assert_eq!(front_dialog(&workspace, cx), None, "no dialog is up");
+
+        quit(workspace, cx);
+        let lines = audit_of(id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["phase"], "started");
+        assert_eq!(email_of(1).as_deref(), Some("a@x"), "the write never ran");
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_waiting_approval_holds_no_connection_and_no_task_but_its_timers(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, _answers) = inject_update(&workspace, cx, Some("Orders"));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+
+        // GPUI's test scheduler is asked directly: a parked run returns while
+        // timers are pending too, so it cannot show that nothing is queued on
+        // the background executor.
+        let scheduler = cx.cx.dispatcher.scheduler().clone();
+        let nothing_on_the_background_executor = || {
+            assert_eq!(
+                scheduler.pending_task_counts().1,
+                0,
+                "a background task is queued"
+            );
+            assert!(
+                !scheduler.tick_background_only(),
+                "the background executor has work"
+            );
+        };
+        nothing_on_the_background_executor();
+
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.agent.armed),
+            Some(id),
+            "the arm fired"
+        );
+        nothing_on_the_background_executor();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_running_write_keeps_the_agent_mark_lit(cx: &mut TestAppContext) {
+    use crate::ui::AgentMark;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+
+        running_write(&workspace, cx);
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 }),
+            "no shim is attached and nothing waits, and a write runs"
+        );
+
+        land_write(cx);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
