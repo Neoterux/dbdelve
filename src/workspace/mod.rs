@@ -392,6 +392,10 @@ pub(crate) struct Workspace {
     /// refuse a statement that is not what the human read (GATE-10). Written
     /// by the render through `&self`.
     pub(crate) approval_shown: std::cell::RefCell<Option<(crate::agent::CallId, String)>>,
+    /// Where the approval's statement block is scrolled, by call, so the next
+    /// call opens at its first line and the scrollbar reads the same offset.
+    pub(crate) approval_scroll:
+        std::cell::RefCell<Option<(crate::agent::CallId, gpui::ScrollHandle)>>,
     /// See [`Workspace::welcome_project_focus`].
     pub(crate) welcome_project_focus: std::cell::RefCell<Vec<FocusHandle>>,
     pub(crate) newer_release: Option<update::Release>,
@@ -547,6 +551,7 @@ impl Workspace {
             dialog_choice: std::cell::Cell::default(),
             focus_before_dialog: std::cell::RefCell::default(),
             approval_shown: std::cell::RefCell::default(),
+            approval_scroll: std::cell::RefCell::default(),
             welcome_project_focus: std::cell::RefCell::default(),
             newer_release: None,
         };

@@ -124,8 +124,9 @@ pub mod layout {
     pub const DIALOG_TEXT_MAX_HEIGHT: f32 = 220.0;
     /// The approval card: wide enough for a typical statement line at the
     /// dialog's text size, and its statement block tall enough for about twenty
-    /// lines, capped so the buttons never leave the window. The line and byte
-    /// count says what is below the fold.
+    /// lines. On a shorter window the card is held to the window's height and
+    /// the block gives up its own first, so the buttons never leave it; the
+    /// block's scrollbar, always drawn, says there is more below the fold.
     pub const APPROVAL_DIALOG_WIDTH: f32 = 640.0;
     pub const APPROVAL_TEXT_MAX_HEIGHT: f32 = 360.0;
     /// Import Rows lays its options, mapping and preview side by side.

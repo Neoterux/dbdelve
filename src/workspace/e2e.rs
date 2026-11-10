@@ -5783,6 +5783,55 @@ fn the_approval_draws_every_line_of_a_long_statement(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn on_a_short_window_the_approval_keeps_deny_and_approve_on_screen(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        // A file not in WAL mode, so the write carries its lock fact too.
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let comments = (0..299)
+            .map(|n| format!("-- line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        inject_approval(
+            &workspace,
+            cx,
+            "Orders",
+            &format!("{comments}\n{UPDATE_ONE}"),
+        );
+        // A second call, so "1 more waiting" is drawn as well.
+        inject_update(&workspace, cx, Some("Orders"));
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(600.)));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert!(cx.debug_bounds("agent-approval-waiting").is_some());
+
+        let window = cx.update(|window, _| window.viewport_size());
+        assert_eq!(f32::from(window.height), 600.);
+        let window =
+            gpui::Bounds::from_corners(gpui::point(gpui::px(0.), gpui::px(0.)), window.into());
+        for button in ["agent-approval-0", "agent-approval-approve"] {
+            let bounds = cx.debug_bounds(button).expect("the button is drawn");
+            assert!(
+                window.contains(&bounds.origin) && window.contains(&bounds.bottom_right()),
+                "{button} at {bounds:?} is outside the window {window:?}"
+            );
+        }
+        let block = cx
+            .debug_bounds("agent-approval-sql")
+            .expect("the statement block is drawn");
+        assert!(
+            f32::from(block.size.height) > 40.,
+            "the statement is squeezed to {:?}",
+            block.size.height
+        );
+        let bar = cx
+            .debug_bounds("agent-approval-scrollbar")
+            .expect("the statement block draws a scrollbar");
+        assert_eq!(bar, block, "the scrollbar lies over the statement block");
+        quit(workspace, cx);
+    });
+}
+
 #[test]
 fn the_approval_draws_its_own_statement_not_the_audit_copy() {
     let forms = include_str!("forms.rs");

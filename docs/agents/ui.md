@@ -169,6 +169,9 @@ curves, and hover states are instant. These things move:
 - **The approval surface moves nothing.** An agent's approval dialog has no
   animation, no smooth scroll and no countdown: the statement is read where it
   stands, and a timer that counted down on screen would be a clock to beat.
+  The statement block's scrollbar is always drawn, never faded in, and on a
+  window too short for the whole card the block gives up its height first so
+  Deny and Approve stay on screen.
   Approve's arm is a one-shot timer (`ARM_DELAY`), not an animation, and ends
   in one redraw. The dialog asks the OS for attention once per call, when it is
   first drawn (`Window::request_attention`): a single dock bounce or taskbar
