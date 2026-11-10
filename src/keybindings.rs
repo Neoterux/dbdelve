@@ -40,8 +40,9 @@ use crate::{
         RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
         SetDefault, SetEmpty, SetMode, SetNull, ShowAllColumns, ShowEditor, ShowMessages,
         ShowReferences, SortActiveColumn, SubmitConnection, SwitchConnection, TickDialogBox,
-        ToggleAutoCommit, ToggleComment, ToggleNextJoin, TogglePinColumn, ToggleResultsFocus,
-        ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+        ToggleAutoCommit, ToggleComment, ToggleNextJoin, TogglePinColumn, ToggleResults,
+        ToggleResultsFocus, ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure,
+        ZoomEditorIn, ZoomEditorOut,
     },
     db::ExplainMode,
     export::RowsAs,
@@ -227,6 +228,8 @@ registry! {
     ("toggle_sidebar", "Toggle Sidebar", None, ["secondary-shift-s"], ToggleSidebar),
     // The kill switch for agent access. Unscoped, so it fires wherever focus is.
     ("disconnect_agents", "Disconnect Agents", None, ["secondary-shift-k"], DisconnectAgents),
+    // The chord VS Code folds its bottom panel with.
+    ("toggle_results", "Toggle Results", None, ["secondary-j"], ToggleResults),
     ("toggle_row_panel", "Toggle Row Panel", None, ["secondary-shift-i"], ToggleRowPanel),
     ("toggle_row_edit", "Toggle Row Panel Edit Mode", None, ["secondary-shift-e"], ToggleRowEdit),
     ("toggle_structure", "Toggle Data / Structure", None, ["secondary-shift-d"], ToggleStructure),
