@@ -136,6 +136,9 @@ pub(crate) enum Inbound {
         connection: Option<String>,
         args: CallArgs,
         reply: std::sync::mpsc::SyncSender<Reply>,
+        /// Set by the hangup watcher before it sends `Hangup`, so the window
+        /// can know the caller left before it hears so.
+        gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// The caller closed its connection, so nobody is waiting for the call
     /// any more. Sent for every call, answered or not, so one that arrives

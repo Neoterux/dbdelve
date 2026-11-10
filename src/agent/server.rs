@@ -302,6 +302,7 @@ fn call(
         connection,
         args,
         reply,
+        gone: Arc::new(AtomicBool::new(false)),
     };
     if inbound.send(call).is_err() {
         return;
@@ -609,6 +610,35 @@ mod tests {
             panic!("the window is told the answer found no one");
         };
         assert_eq!(undelivered, id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_carries_the_flag_its_hangup_sets() {
+        let rig = Rig::new(FIRST_FRAME_TIMEOUT);
+        let client = rig.client();
+        let mut writer = &client;
+        writer
+            .write_all(
+                format!("{}\n", frame(r#""kind":"call","tool":"list_connections""#)).as_bytes(),
+            )
+            .expect("the frame is sent");
+        let Ok(Inbound::Call { id, gone, .. }) = rig.inbound.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("the call reaches the window");
+        };
+        assert!(!gone.load(Ordering::Acquire), "the caller is still there");
+
+        drop(client);
+        let Ok(Inbound::Hangup { id: hung_up }) = rig.inbound.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("the hangup reaches the window");
+        };
+        assert_eq!(hung_up, id);
+        assert!(
+            gone.load(Ordering::Acquire),
+            "the window's own copy of the flag says the caller left"
+        );
     }
 
     #[test]
