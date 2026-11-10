@@ -1363,12 +1363,17 @@ impl Workspace {
                     }
                     // Everything the gate approves is held for a person, a
                     // read of a file or a call it does not list included. A
-                    // write is refused here, before there is a pending call or
-                    // a dialog to be shown, when nothing can run it for an
-                    // agent on this engine.
+                    // statement is refused here, before there is a pending call
+                    // or a dialog to be shown, when nothing can run it for an
+                    // agent on this profile: no read on an in-memory DuckDB,
+                    // and no write on DuckDB at all.
                     AgentVerdict::Approve(held, _) => {
                         let write = held.mode == Mode::ReadWrite;
-                        match resolved.config.agent_write_refusal().filter(|_| write) {
+                        let refusal = resolved
+                            .config
+                            .agent_refusal()
+                            .or_else(|| resolved.config.agent_write_refusal().filter(|_| write));
+                        match refusal {
                             Some(refusal) => (
                                 refusal.to_string(),
                                 Some(AuditVerdict::Refuse(refusal.to_string())),
