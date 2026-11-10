@@ -402,6 +402,10 @@ pub(crate) struct Approval {
     /// The profile's config at arrival, compared with the current one at
     /// Approve.
     pub(crate) config: ConnectionConfig,
+    /// Whether the statement holds the profile's SQLite file against the
+    /// user's own readers and writers while it runs, read once when the call
+    /// arrived.
+    pub(crate) locks_the_file: bool,
 }
 
 /// What a pending call is told when the kill switch ends it.
@@ -502,6 +506,22 @@ pub(crate) fn visibility_facts(
         );
     }
     facts
+}
+
+/// What the approval says of where the statement runs.
+pub(crate) const OWN_CONNECTION: &str = "Runs on DBDelve's own connection, not yours.";
+/// What the approval says of a concurrent index build.
+pub(crate) const INVALID_INDEX: &str =
+    "A concurrent index build that stops can leave an invalid index of that name on the server.";
+
+pub(crate) fn approval_facts(
+    _engine: Engine,
+    _mode: Mode,
+    _verdict: &AgentVerdict,
+    _sql: &str,
+    _locks_the_file: bool,
+) -> Vec<String> {
+    Vec::new()
 }
 
 impl Workspace {
@@ -1153,6 +1173,9 @@ impl Workspace {
                                     approval: Approval {
                                         sql,
                                         verdict,
+                                        locks_the_file: resolved
+                                            .config
+                                            .agent_read_can_block_commits(),
                                         config: resolved.config,
                                     },
                                     _expiry: expiry,
@@ -1430,6 +1453,119 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn corpus() -> [&'static str; 6] {
+        [
+            "UPDATE t SET a = 'Approve me'",
+            "SELECT my_udf('Approve me')",
+            "SELECT * FROM 'Approve me.csv'",
+            "CREATE INDEX CONCURRENTLY approve_me ON t (a)",
+            "SET k v EX 10",
+            "SELECT pg_read_file('Approve me')",
+        ]
+    }
+
+    #[test]
+    fn the_approval_facts_are_dbdelves_own() {
+        use crate::sql::{ApprovalKind, approval_kind};
+
+        let mut seen = 0;
+        for engine in Engine::ALL {
+            for mode in crate::sql::Mode::ALL {
+                for sql in corpus() {
+                    let verdict = agent_gate(engine, sql, mode);
+                    let AgentVerdict::Approve(held, _) = &verdict else {
+                        continue;
+                    };
+                    seen += 1;
+                    let facts = approval_facts(engine, mode, &verdict, sql, true);
+                    let at = format!("{engine:?} {mode:?} {sql}");
+                    let count = |fact: &str| facts.iter().filter(|each| *each == fact).count();
+                    assert_eq!(count(OWN_CONNECTION), 1, "{at}: {facts:?}");
+                    assert_eq!(
+                        count(&format!(
+                            "This connection's access level is {}; the statement needs {}.",
+                            mode.label(),
+                            held.mode.label()
+                        )),
+                        1,
+                        "{at}: {facts:?}"
+                    );
+                    assert_eq!(count(&crate::ui::size_fact(sql)), 1, "{at}: {facts:?}");
+                    let kinds = [
+                        (ApprovalKind::Write, "It changes data."),
+                        (
+                            ApprovalKind::EgressRead,
+                            "It reads a file, a URL or another server.",
+                        ),
+                        (
+                            ApprovalKind::UnlistedCall,
+                            "It calls a function DBDelve does not list; it runs on a read-only connection.",
+                        ),
+                    ];
+                    let kind = approval_kind(engine, sql, held);
+                    for (each, sentence) in kinds {
+                        assert_eq!(
+                            count(sentence),
+                            usize::from(each == kind),
+                            "{at}: {facts:?}"
+                        );
+                    }
+                    for fact in &facts {
+                        for own in ["Approve me", "approve_me"] {
+                            assert!(!fact.contains(own), "{at}: {fact}");
+                        }
+                        let lower = fact.to_lowercase();
+                        for word in ["yet", "phase", "mcp", "try", "should", "upgrade"] {
+                            assert!(!lower.contains(word), "{at}: {fact} says {word}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen > 20, "the corpus reached the approval {seen} times");
+    }
+
+    #[test]
+    fn the_approval_facts_add_only_what_the_statement_carries() {
+        use crate::sql::{Expiry, Mode};
+
+        let facts = |engine, sql: &str, locks| {
+            let verdict = agent_gate(engine, sql, Mode::ReadWrite);
+            assert!(matches!(verdict, AgentVerdict::Approve(..)), "{sql}");
+            approval_facts(engine, Mode::ReadWrite, &verdict, sql, locks)
+        };
+        let count =
+            |facts: &[String], fact: &str| facts.iter().filter(|each| *each == fact).count();
+
+        let plain = facts(Engine::Postgres, "UPDATE t SET a = 1", false);
+        assert_eq!(count(&plain, &Expiry::Key.to_string()), 0, "{plain:?}");
+        assert_eq!(count(&plain, &Expiry::Field.to_string()), 0, "{plain:?}");
+        assert_eq!(count(&plain, INVALID_INDEX), 0, "{plain:?}");
+        assert_eq!(count(&plain, "1 line, 18 bytes"), 1, "{plain:?}");
+
+        let index = facts(
+            Engine::Postgres,
+            "CREATE INDEX CONCURRENTLY i ON t (a)",
+            false,
+        );
+        assert_eq!(count(&index, INVALID_INDEX), 1, "{index:?}");
+
+        let expiring = facts(Engine::Redis, "SET k v EX 10", false);
+        assert_eq!(
+            count(&expiring, &Expiry::Key.to_string()),
+            1,
+            "{expiring:?}"
+        );
+
+        let lock = "While it runs it locks the file, and your own reads and writes on it wait.";
+        let write = facts(Engine::Sqlite, "UPDATE t SET a = 1", true);
+        assert_eq!(count(&write, lock), 1, "{write:?}");
+        let unlocked = facts(Engine::Sqlite, "UPDATE t SET a = 1", false);
+        assert_eq!(count(&unlocked, lock), 0, "{unlocked:?}");
+        let read = facts(Engine::DuckDb, "SELECT * FROM 'a.csv'", true);
+        assert_eq!(count(&read, lock), 0, "a read is no write: {read:?}");
+    }
 
     #[test]
     fn an_audit_entry_keeps_a_cut_of_a_long_error_as_it_does_of_a_long_statement() {

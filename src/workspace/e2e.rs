@@ -5692,6 +5692,116 @@ fn the_approval_draws_its_own_statement_not_the_audit_copy() {
 }
 
 #[gpui::test]
+fn the_approval_states_its_facts_and_how_many_more_wait(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        inject_update(&workspace, cx, Some("Orders"));
+        settle(cx);
+        assert_eq!(pending_calls(&workspace, cx).len(), 2);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert!(cx.debug_bounds("agent-approval-facts").is_some());
+        assert!(
+            cx.debug_bounds("agent-approval-waiting").is_some(),
+            "two wait and the count says so"
+        );
+
+        assert!(workspace.update(cx, |workspace, cx| workspace.deny_front_approval(cx)));
+        settle(cx);
+        assert_eq!(pending_calls(&workspace, cx).len(), 1);
+        assert!(cx.debug_bounds("agent-approval-facts").is_some());
+        assert!(
+            cx.debug_bounds("agent-approval-waiting").is_none(),
+            "nothing waits behind the last"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A statement whose first frame is past the wire's limit never reaches a
+/// dialog: the app's socket server closes the connection, and the shim refuses
+/// the call before it opens one. A statement within the limit is shown.
+#[cfg(unix)]
+#[gpui::test]
+fn a_statement_past_the_frame_limit_is_refused_before_any_dialog(cx: &mut TestAppContext) {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let update =
+            |filler: usize| format!("UPDATE t SET email = '{}' WHERE id = 1", "x".repeat(filler));
+        let nothing_happened = |cx: &mut VisualTestContext| {
+            settle(cx);
+            assert!(pending_calls(&workspace, cx).is_empty());
+            assert_eq!(front_dialog(&workspace, cx), None);
+            assert!(workspace.read_with(cx, |workspace, _| workspace.agent.log.is_empty()));
+            assert!(audit_lines().is_empty());
+            assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        };
+
+        // The app's own boundary, which every client meets: 64 KiB is
+        // `wire::FRAME_LIMIT`, and this is a first frame past it.
+        let sql = update(70_000);
+        let long = format!(
+            "{}\n",
+            frame(&format!(
+                r#""kind":"call","tool":"execute_sql","connection":"Orders","sql":"{sql}""#
+            ))
+        );
+        assert!(long.len() > 64 * 1024);
+        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is set");
+        // The server stops reading at its limit and closes, so the tail of
+        // the write may meet a closed socket.
+        let _ = client.write_all(long.as_bytes());
+        let mut heard = Vec::new();
+        // A reset is how some systems report a close with bytes unread.
+        let _ = client.read_to_end(&mut heard);
+        assert!(heard.is_empty(), "the app answered an oversized frame");
+        nothing_happened(cx);
+
+        // The same call through the shim, which refuses it first.
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path.clone(),
+            "execute_sql",
+            serde_json::json!({ "connection": "Orders", "sql": sql }),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let refused = shim.join().expect("the shim's thread ends");
+        assert_eq!(refused["code"], -32602, "{refused}");
+        let message = refused["message"].as_str().unwrap_or_default();
+        assert!(message.contains("65536"), "{message}");
+        nothing_happened(cx);
+
+        // A statement within the limit is the front approval, whole.
+        let within = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "execute_sql",
+            serde_json::json!({ "connection": "Orders", "sql": update(60_000) }),
+        );
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert!(cx.debug_bounds("agent-approval-size").is_some());
+        assert!(workspace.update(cx, |workspace, cx| workspace.deny_front_approval(cx)));
+        drive_until(cx, |_| within.is_finished());
+        let answered = within.join().expect("the shim's thread ends");
+        assert_eq!(answered["isError"], true, "{answered}");
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_approval_for_a_profile_hidden_in_another_window_is_not_run(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
 
