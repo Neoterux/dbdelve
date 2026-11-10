@@ -194,10 +194,11 @@ impl Resolved {
 }
 
 /// Said for an `explain_query` of a statement that needs the user's approval:
-/// it is not run for an agent, and no connection is opened for it.
-/// `execute_sql` holds such a statement for the person instead.
+/// the plan tool runs reads only, so an `EXPLAIN ANALYZE` of a write never goes
+/// through approval and no connection is opened for it. `execute_sql` holds such
+/// a statement for the person instead.
 pub(crate) const NOT_EXPLAINED: &str =
-    "statements that need the user's approval are not run for agents";
+    "a statement that needs the user's approval is not run by explain_query";
 
 /// The agent's calls on one profile, and the connection of its own they share.
 ///
