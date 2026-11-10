@@ -5287,6 +5287,29 @@ fn an_approved_statement_waits_for_the_human_and_runs_only_after_approve(cx: &mu
 }
 
 #[gpui::test]
+fn an_approved_ddl_says_it_ran_not_that_no_row_changed(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        for (sql, text) in [
+            ("CREATE INDEX i ON t (email)", "The statement ran."),
+            (
+                "UPDATE t SET email = 'q' WHERE id > 1",
+                "The server reported 2 rows affected.",
+            ),
+        ] {
+            let (_, answers) = inject_approval(&workspace, cx, "Orders", sql);
+            approve_front(cx);
+            let answer = answer_of(cx, &answers);
+            assert_eq!(answer.status, Status::Executed, "{sql}: {}", answer.text);
+            assert_eq!(answer.text, text, "{sql}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
     use std::{sync::mpsc::TryRecvError, time::Duration};
 
