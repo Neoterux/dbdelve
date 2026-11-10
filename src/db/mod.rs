@@ -698,6 +698,17 @@ impl Engine {
         self.spec().sql.count_all.aggregate()
     }
 
+    /// Whether this engine's statement timeout is DBDelve's own timer around
+    /// the driver call, rather than a bound the server keeps. A statement
+    /// stopped that way is only no longer waited for: the server may still
+    /// apply it. MongoDB and Redis are such engines. Postgres, MySQL,
+    /// MariaDB, ClickHouse and Snowflake cancel on the server; SQL Server
+    /// closes the connection, which rolls the statement back; the file engines
+    /// interrupt the statement in the driver; a plugin's driver owns its own.
+    pub fn times_out_on_the_client(self) -> bool {
+        false
+    }
+
     /// Whether the server holds a Read-only session to reads -- the backstop
     /// `read_only_statement` sets. Without one, a statement `sql::classify`
     /// cannot read has nothing behind it that would stop a write, so the gate
@@ -5896,6 +5907,17 @@ mod tests {
             "the refusal came after the file was created"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn only_client_timed_engines_say_a_write_may_still_land() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                engine.times_out_on_the_client(),
+                matches!(engine, Engine::MongoDb | Engine::Redis),
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]

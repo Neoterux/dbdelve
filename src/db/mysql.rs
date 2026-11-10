@@ -2331,6 +2331,36 @@ mod tests {
         assert_eq!(updated.rows_affected, Some(2));
     }
 
+    /// The write lane's session waits at most the lock wait it was opened
+    /// with, and the read lane's does not.
+    fn live_an_approved_write_session_carries_the_lock_wait(engine: Engine) {
+        use crate::db::{Connection as Open, ConnectionConfig};
+        let server = ServerConfig {
+            sslmode: SslMode::Disable,
+            ..live_config(engine)
+        };
+        let config = match engine {
+            Engine::MariaDb => ConnectionConfig::MariaDb(server),
+            _ => ConnectionConfig::MySql(server),
+        };
+        let wait = |connection: &Open| {
+            let result = connection
+                .query(
+                    "SELECT @@SESSION.lock_wait_timeout",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the server answers the read");
+            result.rows[0].get(0).unwrap_or_default().to_string()
+        };
+
+        let writer =
+            Open::open_for_approved_write(config.clone(), 30).expect("the write connection opens");
+        assert_eq!(wait(&writer), "30");
+        let reader = Open::open_for_agent(config).expect("the read connection opens");
+        assert_ne!(wait(&reader), "30");
+    }
+
     fn live_a_statements_warnings_arrive_as_messages(engine: Engine) {
         let connection = live(engine);
         let dropped = connection
@@ -2541,6 +2571,7 @@ mod tests {
         live_a_blank_database_connects_to_none,
         live_query_round_trip,
         live_a_write_reports_the_rows_it_affected,
+        live_an_approved_write_session_carries_the_lock_wait,
         live_a_statements_warnings_arrive_as_messages,
         live_a_multi_statement_submission_counts_the_warnings_it_cannot_list,
         live_a_multi_statement_selection_keeps_one_result_shape,
