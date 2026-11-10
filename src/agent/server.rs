@@ -296,18 +296,20 @@ fn call(
         return;
     };
     let (reply, answers) = mpsc::sync_channel(1);
+    // Made before the call is sent and shared with the window, so a window
+    // that has not yet heard the hangup can still know the caller left.
+    let gone = Arc::new(AtomicBool::new(false));
     let call = Inbound::Call {
         id,
         tool,
         connection,
         args,
         reply,
-        gone: Arc::new(AtomicBool::new(false)),
+        gone: gone.clone(),
     };
     if inbound.send(call).is_err() {
         return;
     }
-    let gone = Arc::new(AtomicBool::new(false));
     watch_for_hangup(stream, id, &gone, inbound);
     // A dropped sender is a call that ended without an answer: nothing is
     // written, and the stream closing is what the caller sees.

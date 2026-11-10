@@ -407,6 +407,10 @@ pub(crate) struct Approval {
     /// user's own readers and writers while it runs, read once when the call
     /// arrived.
     pub(crate) locks_the_file: bool,
+    /// Set by the socket's hangup watcher the moment the caller leaves, before
+    /// the window hears of it. Read at Approve, so a click that lands in that
+    /// gap starts nothing.
+    pub(crate) gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What a pending call is told when the kill switch ends it.
@@ -737,7 +741,9 @@ impl Workspace {
     }
 
     /// The dialog's Approve for a held statement. Does nothing until the call is
-    /// armed. Then the call is taken out of the waiting list and checked in
+    /// armed. Then the call is taken out of the waiting list, and ended as
+    /// `cancelled`, unrun and unrecorded as started, when its caller has already
+    /// left, even if the window has not heard so. Otherwise it is checked in
     /// this order: its profile, found by id and still visible to agents
     /// (`rejected` otherwise); the statement, which must be byte for byte what
     /// the dialog last drew for this call; and the gate's judgment of it now,
@@ -767,6 +773,35 @@ impl Workspace {
             ..
         } = call;
         let engine = approval.config.engine();
+        // Before anything is started. The caller may have left in the moment
+        // before the window heard of it; its call then ends as cancelled, with
+        // nothing recorded as started and nothing opened. A write that has
+        // started is never stopped (see [`agent_write`]), so this is the last
+        // point where the caller leaving changes what runs.
+        if approval.gone.load(std::sync::atomic::Ordering::Acquire) {
+            self.agent.record(
+                id,
+                Tool::ExecuteSql,
+                Some(profile_name),
+                None,
+                Status::Cancelled,
+                CallFacts {
+                    verdict: AuditVerdict::held_by(approval.verdict),
+                    sql: Some(approval.sql),
+                    elapsed_ms: elapsed_ms(arrived),
+                    requester_gone: true,
+                    // The person did click Approve; the call is what ended.
+                    decision: Some(Decision::Approved),
+                    engine: Some(engine),
+                    ..CallFacts::default()
+                },
+            );
+            // Nobody would read a reply, and dropping the sender unsent is how
+            // a cancelled call ends.
+            drop(reply);
+            self.finish_approval(was_in_front, cx);
+            return;
+        }
         let profile = self
             .profiles
             .iter()
@@ -1163,7 +1198,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
-                ..
+                gone,
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let found = match connection.as_deref() {
@@ -1232,6 +1267,7 @@ impl Workspace {
                                             .config
                                             .agent_read_can_block_commits(),
                                         config: resolved.config,
+                                        gone,
                                     },
                                     _expiry: expiry,
                                 });
