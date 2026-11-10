@@ -837,10 +837,12 @@ impl Workspace {
             cx.background_executor().timer(ARM_DELAY).await;
             _ = workspace.update(cx, |workspace, cx| {
                 // Only while the approval is what the person is looking at: a
-                // dialog over it that they are reading is not the approval
-                // being shown, and it is revealed again when that closes.
+                // dialog or the palette over it that they are reading is not
+                // the approval being shown, and it is revealed again when that
+                // closes.
                 if workspace.front_approval_id() == Some(id)
                     && workspace.dialog_in_front.get() == Some("agent-approval")
+                    && workspace.palette.is_none()
                 {
                     workspace.agent.armed = Some(id);
                     cx.notify();
