@@ -3953,9 +3953,16 @@ fn footer_status(
     }
 }
 
-/// Whether a click is one Approve answers.
-fn approves(_event: &gpui::ClickEvent) -> bool {
-    true
+/// Whether a click is one Approve answers: a single mouse click that is not the
+/// one that brought the window forward. Refused, each for its own reason:
+/// - a double click, whose second press may land on a button that appeared
+///   under the pointer after the first;
+/// - the activating click, which was aimed at the window and not at Approve;
+/// - a key, which must never approve (the button is not a tab stop, and
+///   `enter` on the dialog is Deny);
+/// - a touch, which has no place on a desktop dialog.
+fn approves(event: &gpui::ClickEvent) -> bool {
+    matches!(event, gpui::ClickEvent::Mouse(_)) && event.click_count() == 1 && !event.first_focus()
 }
 
 #[cfg(test)]
