@@ -127,7 +127,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   and never a row, and an approved call is labelled as one. What outlives the
   window is `agent-audit.jsonl`, beside `profiles.toml` and one per storage
   variant, `0600`: an `outcome` line for every call and a `started` line for
-  each statement that was sent (`AgentState::record`, `note_started`). The two
+  each call about to be sent to the server, a catalog listing's included, with
+  no statement (`AgentState::record`, `note_started`). An approved read's is
+  written at Approve, before it waits its turn on the lane, so one that a hide
+  or the kill switch ends while it waits has a `started` line and was never
+  sent. The two
   are paired by `(session, id)` and appended in the order the window handled
   them, never sorted by time. A statement a person approved is kept whole and
   its `started` line is written before anything is opened, and a write that
@@ -139,7 +143,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   later. The agent's answer keeps the whole scrubbed error. A value a server
   writes unquoted in its own words is the one thing the cut cannot tell apart.
   `store::AuditLog` counts the lines once and keeps the count, and past
-  `AUDIT_SLACK` lines rewrites the file to its newest `AUDIT_KEEP`, verbatim.
+  `AUDIT_SLACK` lines rewrites the file to its newest `AUDIT_KEEP`, verbatim;
+  the cut is by count, so a call that runs across it can keep its `outcome` and
+  lose its `started` line.
   A line a crash left without its end is ended before the next is written. A
   hangup withdraws a call that is still waiting for approval, and an approved
   write that is already running finishes. Quitting does not wait for one, and
