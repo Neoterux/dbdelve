@@ -161,25 +161,82 @@ fn split_highlights<'a>(
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) struct Visible {
     pub(crate) display: String,
+    /// One entry per replaced character: its bytes in the source and its
+    /// marker's bytes in the display, in source order.
     map: Vec<(Range<usize>, Range<usize>)>,
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 impl Visible {
-    /// `highlights` over the source text, moved onto the display.
+    /// `highlights` over the source text, moved onto the display. An end inside
+    /// a replaced character lands on its marker's end, so a colour never stops
+    /// halfway through a marker.
     pub(crate) fn remap(&self, highlights: &[(Range<usize>, HighlightStyle)]) -> Highlights {
-        highlights.to_vec()
+        highlights
+            .iter()
+            .map(|(range, style)| (self.at(range.start)..self.at(range.end), *style))
+            .filter(|(range, _)| !range.is_empty())
+            .collect()
     }
+
+    fn at(&self, offset: usize) -> usize {
+        let mut growth = 0;
+        for (source, shown) in &self.map {
+            if offset <= source.start {
+                break;
+            }
+            if offset < source.end {
+                return shown.end;
+            }
+            growth += shown.len() - source.len();
+        }
+        offset + growth
+    }
+}
+
+/// Characters that read as nothing, or that move what is around them, in a
+/// statement the server reads byte for byte. `\n` and `\t` are drawn as
+/// themselves; every other control character is not.
+fn hides_in_text(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(
+            c,
+            '\u{61c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200b}'..='\u{200d}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{ad}'
+                | '\u{feff}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn visible(text: &str) -> Visible {
-    Visible {
-        display: text.to_string(),
-        map: Vec::new(),
+    let mut display = String::with_capacity(text.len());
+    let mut map = Vec::new();
+    for (start, c) in text.char_indices() {
+        if hides_in_text(c) {
+            let from = display.len();
+            display.push_str(&format!("[U+{:04X}]", c as u32));
+            map.push((start..start + c.len_utf8(), from..display.len()));
+        } else {
+            display.push(c);
+        }
     }
+    Visible { display, map }
 }
 
+/// A statement as the editor colours it, one run per line, with every
+/// character [`visible`] marks drawn as its marker in `marker`'s style. The
+/// colours come from the source text and are moved onto the display, so a
+/// marker cannot change what the grammar made of the statement. Lines break at
+/// `\n` only: `str::lines` would drop a carriage return and the empty line
+/// after a final newline, which are the things a reader needs to see.
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn code_lines_visible(
     text: &str,
@@ -195,18 +252,48 @@ pub(crate) fn code_lines_visible(
 
 fn visible_lines(
     text: &str,
-    _syntax: Syntax,
-    _theme: &HighlightTheme,
-    _marker: HighlightStyle,
+    syntax: Syntax,
+    theme: &HighlightTheme,
+    marker: HighlightStyle,
 ) -> Vec<(String, Highlights)> {
-    text.lines()
-        .map(|line| (line.to_string(), Vec::new()))
+    let seen = visible(text);
+    let mut runs = seen.remap(&code_highlights(text, syntax, Code::Statement, theme));
+    runs.extend(seen.map.iter().map(|(_, shown)| (shown.clone(), marker)));
+    let mut start = 0;
+    seen.display
+        .split('\n')
+        .map(|line| {
+            let end = start + line.len();
+            let own = runs
+                .iter()
+                .filter_map(|(range, style)| {
+                    let clipped = range.start.max(start)..range.end.min(end);
+                    (!clipped.is_empty())
+                        .then(|| (clipped.start - start..clipped.end - start, *style))
+                })
+                .collect();
+            start = end + 1;
+            (line.to_string(), own)
+        })
         .collect()
 }
 
+/// How big a statement is as the reader sees it: the lines drawn, and its bytes
+/// as UTF-8, which is what the server is sent.
 #[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
-pub(crate) fn size_fact(_text: &str) -> String {
-    String::new()
+pub(crate) fn size_fact(text: &str) -> String {
+    let count = |n: usize, noun: &str| {
+        format!(
+            "{} {noun}{}",
+            group_digits(&n.to_string()),
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    format!(
+        "{}, {}",
+        count(text.split('\n').count(), "line"),
+        count(text.len(), "byte")
+    )
 }
 
 /// One column of icons down the sidebar, so every label starts at the same x
@@ -1489,43 +1576,42 @@ mod tests {
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         };
-        let text = "SELECT\u{202e} 1";
+        // A marker is drawn inside a literal; the keywords either side of it keep
+        // their colours on exactly their own characters.
+        let text = "SELECT 'a\u{202e}b' FROM t";
         let seen = visible(text);
-        assert_eq!(seen.display, "SELECT[U+202E] 1");
+        assert_eq!(seen.display, "SELECT 'a[U+202E]b' FROM t");
         let original = code_highlights(text, Syntax::Sql, Code::Statement, &theme);
-        let spans = |highlights: &Highlights, display: &str| {
+        let spans = |highlights: &Highlights, shown: &str| {
             highlights
                 .iter()
-                .map(|(range, _)| display[range.clone()].to_string())
+                .map(|(range, _)| shown[range.clone()].to_string())
                 .collect::<Vec<_>>()
         };
         let before = spans(&original, text);
-        assert!(before.contains(&"SELECT".to_string()), "{before:?}");
-        assert!(before.contains(&"1".to_string()), "{before:?}");
-        let moved = seen.remap(&original);
-        let after = spans(&moved, &seen.display);
+        assert!(before.contains(&"FROM".to_string()), "{before:?}");
+        let after = spans(&seen.remap(&original), &seen.display);
         assert!(after.contains(&"SELECT".to_string()), "{after:?}");
-        assert!(after.contains(&"1".to_string()), "{after:?}");
-
-        // A range ending inside the replaced character ends at the marker's end.
-        let style = HighlightStyle::default();
-        assert_eq!(seen.remap(&[(0..7, style)])[0].0, 0..14);
-        // One that starts inside it starts after the marker.
-        assert_eq!(seen.remap(&[(7..11, style)])[0].0, 14..16);
+        assert!(after.contains(&"FROM".to_string()), "{after:?}");
+        assert!(after.contains(&"'a[U+202E]b'".to_string()), "{after:?}");
 
         let lines = visible_lines(text, Syntax::Sql, &theme, marker);
         assert_eq!(lines.len(), 1);
         let (line, runs) = &lines[0];
-        assert_eq!(line, "SELECT[U+202E] 1");
+        assert_eq!(line, "SELECT 'a[U+202E]b' FROM t");
         assert!(
             runs.iter()
-                .any(|(range, style)| *range == (6..14) && *style == marker)
+                .any(|(range, style)| &line[range.clone()] == "[U+202E]" && *style == marker)
         );
-        assert!(
-            runs.iter()
-                .any(|(range, _)| &line[range.clone()] == "SELECT")
-        );
-        assert!(runs.iter().any(|(range, _)| &line[range.clone()] == "1"));
+        assert!(runs.iter().any(|(range, _)| &line[range.clone()] == "FROM"));
+
+        // A range ending inside the replaced character ends at the marker's end,
+        // and one starting inside it starts after the marker.
+        let style = HighlightStyle::default();
+        let seen = visible("SELECT\u{202e} 1");
+        assert_eq!(seen.remap(&[(0..7, style)])[0].0, 0..14);
+        assert_eq!(seen.remap(&[(7..11, style)])[0].0, 14..16);
+        assert_eq!(seen.remap(&[(9..11, style)])[0].0, 14..16);
     }
 
     #[test]
