@@ -158,6 +158,11 @@ pub(super) fn written_text(engine: Engine, sql: &str, result: &QueryResult) -> S
     }
 }
 
+/// What an approved write that ended `failed` answers and records.
+fn failed_text(_engine: Engine, _sql: &str, server_text: &str) -> String {
+    server_text.to_string()
+}
+
 impl Workspace {
     /// Start an approved write on a connection of its own. No deadline timer
     /// is made: see the module's header.
@@ -220,11 +225,11 @@ impl Workspace {
             Wrote::Done {
                 hidden,
                 result: Err(error),
-            } => (
-                Status::Failed,
-                scrubbed(&error.message, &hidden),
-                Some(error.message),
-            ),
+            } => {
+                let text =
+                    failed_text(write.engine, &write.sql, &scrubbed(&error.message, &hidden));
+                (Status::Failed, text.clone(), Some(text))
+            }
         };
         // From the socket's flag as well as from a `Hangup` the window heard,
         // and known before the outcome line is written: `Undelivered` arrives
@@ -281,6 +286,26 @@ mod tests {
                     "only the timeout differs"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_failed_concurrent_index_build_says_an_invalid_index_may_remain() {
+        let remains = format!("boom {}", super::super::agent::INVALID_INDEX);
+        assert_eq!(
+            failed_text(
+                Engine::Postgres,
+                "CREATE INDEX CONCURRENTLY i ON t (a)",
+                "boom"
+            ),
+            remains
+        );
+        for (engine, sql) in [
+            (Engine::Postgres, "CREATE INDEX i ON t (a)"),
+            (Engine::MySql, "CREATE INDEX CONCURRENTLY i ON t (a)"),
+            (Engine::Postgres, "UPDATE t SET a = 1"),
+        ] {
+            assert_eq!(failed_text(engine, sql, "boom"), "boom", "{engine:?} {sql}");
         }
     }
 

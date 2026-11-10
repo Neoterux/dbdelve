@@ -5309,6 +5309,28 @@ fn an_approved_ddl_says_it_ran_not_that_no_row_changed(cx: &mut TestAppContext) 
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn an_approved_write_that_fails_answers_and_records_the_same_words(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", "UPDATE missing SET a = 1");
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Failed, "{}", answer.text);
+        assert!(!answer.text.is_empty());
+
+        let lines = audit_of(id);
+        let outcome = lines.last().expect("the call was audited");
+        assert_eq!(outcome["phase"], "outcome");
+        assert_eq!(outcome["status"], "failed");
+        assert_eq!(outcome["error"], answer.text.as_str(), "{outcome}");
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
     use std::{sync::mpsc::TryRecvError, time::Duration};
