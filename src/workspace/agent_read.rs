@@ -341,6 +341,7 @@ fn facts_of(sql: Option<String>, arrived: Instant, ended: Ended) -> CallFacts {
         total: ended.rows.map(|(_, total)| total),
         elapsed_ms: elapsed_ms(arrived),
         error: ended.error,
+        ..CallFacts::default()
     }
 }
 
