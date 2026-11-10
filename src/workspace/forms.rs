@@ -1789,13 +1789,7 @@ impl Workspace {
             }
         };
         let code = fonts(cx).editor.clone();
-        // A marker is DBDelve's own, drawn in the accent so it cannot pass for
-        // the statement's text.
-        let marker = gpui::HighlightStyle {
-            color: Some(t.text.into()),
-            background_color: Some(t.accent.into()),
-            ..Default::default()
-        };
+        let marker = approval_marker(t);
         let lines = code_lines_visible(
             &approval.sql,
             engine.syntax(),
@@ -4073,6 +4067,17 @@ fn footer_status(
     }
 }
 
+/// How a `[U+XXXX]` marker in the approval's statement is drawn: DBDelve's own,
+/// on the accent so it cannot pass for the statement's text, in the ink every
+/// other label on the accent wears.
+fn approval_marker(t: Theme) -> gpui::HighlightStyle {
+    gpui::HighlightStyle {
+        color: Some(t.on_accent.into()),
+        background_color: Some(t.accent.into()),
+        ..Default::default()
+    }
+}
+
 /// The ink of Approve's label: the faint one until it arms, so the one redraw
 /// the arm causes is a change the person can see, and the quiet tone's once it
 /// has. A change of state, never a countdown (D-09).
@@ -4099,6 +4104,16 @@ fn approves(event: &gpui::ClickEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_marker_wears_the_ink_drawn_on_the_accent() {
+        for theme in theme::Theme::built_in() {
+            let t = theme.for_popup();
+            let marker = approval_marker(t);
+            assert_eq!(marker.color, Some(t.on_accent.into()));
+            assert_eq!(marker.background_color, Some(t.accent.into()));
+        }
+    }
 
     #[test]
     fn approve_is_drawn_dimmer_until_it_arms_on_every_theme() {
