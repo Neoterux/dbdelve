@@ -388,6 +388,10 @@ pub(crate) struct Workspace {
     pub(crate) dialog_choice: std::cell::Cell<usize>,
     /// What held the keyboard when the first dialog went up.
     pub(crate) focus_before_dialog: std::cell::RefCell<Option<FocusHandle>>,
+    /// The statement the approval dialog drew last, by call, so Approve can
+    /// refuse a statement that is not what the human read (GATE-10). Written
+    /// by the render through `&self`.
+    pub(crate) approval_shown: std::cell::RefCell<Option<(crate::agent::CallId, String)>>,
     /// See [`Workspace::welcome_project_focus`].
     pub(crate) welcome_project_focus: std::cell::RefCell<Vec<FocusHandle>>,
     pub(crate) newer_release: Option<update::Release>,
@@ -542,6 +546,7 @@ impl Workspace {
             dialog_in_front: std::cell::Cell::default(),
             dialog_choice: std::cell::Cell::default(),
             focus_before_dialog: std::cell::RefCell::default(),
+            approval_shown: std::cell::RefCell::default(),
             welcome_project_focus: std::cell::RefCell::default(),
             newer_release: None,
         };

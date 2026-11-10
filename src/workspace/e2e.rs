@@ -8080,6 +8080,119 @@ fn a_read_shown_at_read_write_and_lowered_to_read_only_is_not_run(cx: &mut TestA
     });
 }
 
+/// What Approve answers when the call in front is armed, its pending
+/// statement is made `pending` and the call is approved in the same update,
+/// so no frame is drawn between the two.
+fn approve_with_pending(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: crate::agent::CallId,
+    pending: &str,
+) {
+    settle(cx);
+    cx.executor().advance_clock(super::agent::ARM_DELAY);
+    settle(cx);
+    workspace.update(cx, |workspace, cx| {
+        let call = workspace
+            .agent
+            .calls
+            .iter_mut()
+            .find(|call| call.id == id)
+            .expect("the call is pending");
+        call.approval.sql = pending.to_string();
+        workspace.approve_call(id, cx);
+    });
+    settle(cx);
+}
+
+#[track_caller]
+fn assert_cancelled_as_changed(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: crate::agent::CallId,
+    answers: &std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    use crate::agent::{Reply, Status};
+
+    assert_eq!(
+        answer_of(cx, answers),
+        Reply {
+            status: Status::RefusedByGate,
+            text: super::agent::CHANGED_SINCE_SHOWN.to_string(),
+        }
+    );
+    workspace.read_with(cx, |workspace, _| {
+        assert!(workspace.agent.writes.is_empty(), "a write was started");
+        assert!(workspace.agent.lanes.is_empty(), "a lane was opened");
+    });
+    assert!(
+        !audit_lines()
+            .iter()
+            .any(|line| line["id"] == id.0 && line["phase"] == "started"),
+        "a call that did not run was recorded as started"
+    );
+}
+
+#[gpui::test]
+fn a_one_byte_difference_cancels_the_approval(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        approve_with_pending(
+            &workspace,
+            cx,
+            id,
+            "UPDATE t SET email = 'z@x' WHERE id = 2",
+        );
+        assert_cancelled_as_changed(&workspace, cx, id, &answers);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        assert_eq!(email_of(2), None);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_differently_encoded_statement_cancels_the_approval(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        // Equality is byte for byte: no normalisation, folding or trimming.
+        let precomposed = "UPDATE t SET email = '\u{e9}' WHERE id = 1";
+        let decomposed = "UPDATE t SET email = 'e\u{301}' WHERE id = 1";
+        let spaced = "UPDATE t SET email = 'z@x' WHERE id = 1 ";
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        for (drawn, pending) in [
+            (precomposed, decomposed),
+            (spaced, UPDATE_ONE),
+            (UPDATE_ONE, spaced),
+        ] {
+            let (id, answers) = inject_approval(&workspace, cx, "Orders", drawn);
+            approve_with_pending(&workspace, cx, id, pending);
+            assert_cancelled_as_changed(&workspace, cx, id, &answers);
+            assert_eq!(email_of(1).as_deref(), Some("a@x"), "{drawn:?}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_approval_never_drawn_never_runs(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            // As if the dialog had never drawn this call.
+            *workspace.approval_shown.borrow_mut() = None;
+            workspace.approve_call(id, cx);
+        });
+        settle(cx);
+        assert_cancelled_as_changed(&workspace, cx, id, &answers);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_agent_write_on_duckdb_is_refused_before_it_is_shown(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
