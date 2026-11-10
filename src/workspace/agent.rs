@@ -22,7 +22,8 @@ use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
     db::ConnectionConfig,
-    sql::{AgentVerdict, agent_gate},
+    sql::{AgentVerdict, ApprovalKind, agent_gate, approval_kind, creates_index_concurrently},
+    ui::size_fact,
 };
 
 /// What the agent bridge holds while it is running.
@@ -513,15 +514,53 @@ pub(crate) const OWN_CONNECTION: &str = "Runs on DBDelve's own connection, not y
 /// What the approval says of a concurrent index build.
 pub(crate) const INVALID_INDEX: &str =
     "A concurrent index build that stops can leave an invalid index of that name on the server.";
+const LOCKS_THE_FILE: &str =
+    "While it runs it locks the file, and your own reads and writes on it wait.";
 
+/// What DBDelve itself says of a statement it holds for approval, ahead of the
+/// statement: the access level the profile has and the one the statement needs,
+/// what kind of statement it is, any expiry it schedules or invalid index it
+/// can leave, whose connection it runs on, and its size. Pure, so opening the
+/// dialog asks no server anything, and every sentence is DBDelve's: the
+/// statement is never formatted into one, because the agent wrote it.
+/// `locks_the_file` is [`Approval::locks_the_file`].
 pub(crate) fn approval_facts(
-    _engine: Engine,
-    _mode: Mode,
-    _verdict: &AgentVerdict,
-    _sql: &str,
-    _locks_the_file: bool,
+    engine: Engine,
+    mode: Mode,
+    verdict: &AgentVerdict,
+    sql: &str,
+    locks_the_file: bool,
 ) -> Vec<String> {
-    Vec::new()
+    // Only a held statement has an approval; nothing else is described.
+    let AgentVerdict::Approve(held, expiry) = verdict else {
+        return Vec::new();
+    };
+    let kind = approval_kind(engine, sql, held);
+    let mut facts = vec![
+        format!(
+            "This connection's access level is {}; the statement needs {}.",
+            mode.label(),
+            held.mode.label()
+        ),
+        match kind {
+            ApprovalKind::Write => "It changes data.",
+            ApprovalKind::EgressRead => "It reads a file, a URL or another server.",
+            ApprovalKind::UnlistedCall => {
+                "It calls a function DBDelve does not list; it runs on a read-only connection."
+            }
+        }
+        .to_string(),
+    ];
+    facts.extend(expiry.map(|expiry| expiry.to_string()));
+    if creates_index_concurrently(engine, sql) {
+        facts.push(INVALID_INDEX.to_string());
+    }
+    if locks_the_file && kind == ApprovalKind::Write {
+        facts.push(LOCKS_THE_FILE.to_string());
+    }
+    facts.push(OWN_CONNECTION.to_string());
+    facts.push(size_fact(sql));
+    facts
 }
 
 impl Workspace {
