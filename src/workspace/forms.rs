@@ -1796,6 +1796,7 @@ impl Workspace {
             &approval.verdict,
             &approval.sql,
             approval.locks_the_file,
+            approval.config.agent_reads_are_held(),
         )
         .into_iter()
         .filter(|fact| *fact != size)
