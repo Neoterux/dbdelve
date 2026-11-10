@@ -9,7 +9,7 @@
 
 use std::{sync::mpsc::SyncSender, time::Instant};
 
-use super::agent::{AuditVerdict, CallFacts, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, elapsed_ms};
 use super::agent_read::{AGENT_ROWS, OPEN_FAILED, scrubbed, table_of};
 use super::*;
 use crate::{
@@ -49,6 +49,7 @@ pub(crate) fn agent_write_config(config: &ConnectionConfig) -> ConnectionConfig 
 pub(crate) struct Writing {
     pub(crate) id: CallId,
     profile_name: String,
+    engine: Engine,
     /// Kept after a hangup: the answer is still sent and nobody reads it.
     reply: SyncSender<Reply>,
     arrived: Instant,
@@ -167,6 +168,7 @@ impl Workspace {
         self.agent.writes.push(Writing {
             id,
             profile_name,
+            engine,
             reply,
             arrived,
             sql,
@@ -213,6 +215,8 @@ impl Workspace {
                 elapsed_ms: elapsed_ms(write.arrived),
                 error,
                 requester_gone: write.requester_gone,
+                decision: Some(Decision::Approved),
+                engine: Some(write.engine),
                 ..CallFacts::default()
             },
         );

@@ -68,6 +68,13 @@ pub(crate) struct AgentState {
     /// The one-shot timer that sets `armed`. Replaced, and so cancelled, each
     /// time the dialog in front is revealed.
     _arming: Option<gpui::Task<()>>,
+    /// Unix milliseconds when this window's bridge started, or 0 when none
+    /// has: with a call's id, what pairs the lines of the audit file. A call's
+    /// id is the counter of its connection, which starts again each run.
+    pub(crate) session: u64,
+    /// The file approved statements are recorded in.
+    #[cfg(unix)]
+    audit: store::AuditLog,
 }
 
 // ponytail: the wait between an approval being shown and its Approve working,
@@ -76,7 +83,10 @@ pub(crate) struct AgentState {
 // exist when it began. The upgrade is a setting.
 pub(crate) const ARM_DELAY: Duration = Duration::from_millis(1500);
 
-pub(super) const NOT_RECORDED: &str = "";
+/// What an approval that was approved is told when the line that says it is
+/// about to run could not be written. Nothing was opened.
+pub(super) const NOT_RECORDED: &str =
+    "DBDelve could not record the statement before running it, so it was not run.";
 
 /// What an approval that was approved is told when the statement, the
 /// connection or the profile's access level is not what it was when the person
@@ -152,6 +162,56 @@ pub(crate) struct CallFacts {
     pub(crate) error: Option<String>,
     /// The caller hung up before the call ended.
     pub(crate) requester_gone: bool,
+    /// What the person decided about a statement that waited for them. A call
+    /// with one is written to the audit file when it ends.
+    pub(crate) decision: Option<Decision>,
+    /// The engine of the profile the call was about, for the audit file.
+    pub(crate) engine: Option<Engine>,
+}
+
+/// What a person did with a statement that waited for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Decision {
+    Approved,
+    Rejected,
+    Expired,
+}
+
+/// One line of `agent-audit.jsonl`, the record of statements that waited for a
+/// person. It names the statement, who decided and how the call ended, and
+/// never a row value: what the database held does not belong in a file kept
+/// for longer than a session. `v` leads so a later shape can be told apart.
+/// JSON escapes every newline, so text an agent sent cannot start a line.
+#[derive(serde::Serialize)]
+pub(super) struct AuditLine<'a> {
+    v: u8,
+    session: u64,
+    id: u64,
+    at: u64,
+    /// `started` before a write is opened, `outcome` once the call ended.
+    phase: &'static str,
+    tool: Tool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<Decision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<Status>,
+    requester_gone: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shown: Option<usize>,
+    elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    /// The statement whole, never cut at [`AUDIT_SQL_CAP`]: clipping the record
+    /// of what a person approved would defeat it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql: Option<&'a str>,
 }
 
 /// One call that ended: its names, its code, its time and what the agent sent.
@@ -225,6 +285,34 @@ impl AgentState {
         status: Status,
         facts: CallFacts,
     ) {
+        if let Some(decision) = facts.decision {
+            // The one place an outcome line is written, so the file and the
+            // log say the same of every call that waited.
+            let line = AuditLine {
+                v: 1,
+                session: self.session,
+                id: id.0,
+                at: unix_millis(),
+                phase: "outcome",
+                tool,
+                profile: resolved.as_deref(),
+                engine: facts.engine.map(Engine::as_str),
+                verdict: facts.verdict.as_ref().map(AuditVerdict::line),
+                decision: Some(decision),
+                status: Some(status),
+                requester_gone: facts.requester_gone,
+                shown: facts.shown,
+                elapsed_ms: facts.elapsed_ms,
+                error: facts.error.as_deref(),
+                sql: facts.sql.as_deref(),
+            };
+            if let Err(error) = self.persist(&line) {
+                // The call has ended and nothing can un-run it, so the only
+                // thing left to do is say that its record is missing. The
+                // error names the file and never the statement.
+                eprintln!("{error}");
+            }
+        }
         self.log.push_front(LogEntry {
             at: unix_millis(),
             id,
@@ -246,6 +334,23 @@ impl AgentState {
             error: facts.error.map(clipped),
         });
         self.log.truncate(AUDIT_CAP);
+    }
+}
+
+impl AgentState {
+    /// Write one line to the audit file. The one door to it, so the writes of
+    /// the two phases cannot disagree about the file.
+    #[cfg(unix)]
+    pub(super) fn persist(&mut self, line: &AuditLine) -> Result<(), String> {
+        let json = serde_json::to_string(line)
+            .map_err(|error| format!("Could not encode the audit line: {error}"))?;
+        self.audit.append(&json)
+    }
+
+    /// No agent call reaches a window here: the bridge listens only on Unix.
+    #[cfg(not(unix))]
+    pub(super) fn persist(&mut self, _line: &AuditLine) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -610,36 +715,68 @@ impl Workspace {
         else {
             return;
         };
+        let engine = approval.config.engine();
         let profile = self
             .profiles
             .iter()
             .find(|profile| profile.id == profile_id && profile.agent_visible);
         let held = AuditVerdict::held_by(approval.verdict.clone());
-        let (status, text) = match profile {
-            None => (Status::Rejected, NO_LONGER_AVAILABLE),
+        let (status, text, error) = match profile {
+            None => (Status::Rejected, NO_LONGER_AVAILABLE, None),
             Some(profile)
                 if agent_gate(profile.config.engine(), &approval.sql, profile.mode)
                     != approval.verdict
                     || profile.config != approval.config =>
             {
-                (Status::RefusedByGate, CHANGED_SINCE_SHOWN)
+                (Status::RefusedByGate, CHANGED_SINCE_SHOWN, None)
             }
             Some(_) => {
-                self.start_write(
-                    id,
-                    profile_id,
-                    profile_name,
-                    approval.config,
-                    approval.sql,
-                    held,
-                    reply,
-                    arrived,
-                    cx,
-                );
-                self.finish_approval(was_in_front, cx);
-                return;
+                // Before anything is opened: a write that cannot be recorded
+                // is not run, so the file never lacks a statement the server
+                // may have received.
+                let started = AuditLine {
+                    v: 1,
+                    session: self.agent.session,
+                    id: id.0,
+                    at: unix_millis(),
+                    phase: "started",
+                    tool: Tool::ExecuteSql,
+                    profile: Some(&profile_name),
+                    engine: Some(engine.as_str()),
+                    verdict: held.as_ref().map(AuditVerdict::line),
+                    decision: Some(Decision::Approved),
+                    status: None,
+                    requester_gone: false,
+                    shown: None,
+                    elapsed_ms: elapsed_ms(arrived),
+                    error: None,
+                    sql: Some(&approval.sql),
+                };
+                match self.agent.persist(&started) {
+                    // No decision on the failure: its outcome line would meet
+                    // the same file.
+                    Err(error) => (Status::Failed, NOT_RECORDED, Some(error)),
+                    Ok(()) => {
+                        self.start_write(
+                            id,
+                            profile_id,
+                            profile_name,
+                            approval.config,
+                            approval.sql,
+                            held,
+                            reply,
+                            arrived,
+                            cx,
+                        );
+                        self.finish_approval(was_in_front, cx);
+                        return;
+                    }
+                }
             }
         };
+        // The person did click Approve; what the answer says is that it did not
+        // run. A failure to record has no decision (see above).
+        let decision = (status != Status::Failed).then_some(Decision::Approved);
         self.agent_answered(
             id,
             Tool::ExecuteSql,
@@ -654,6 +791,9 @@ impl Workspace {
                 verdict: held,
                 sql: Some(approval.sql),
                 elapsed_ms: elapsed_ms(arrived),
+                error,
+                decision,
+                engine: Some(engine),
                 ..CallFacts::default()
             },
         );
@@ -712,6 +852,7 @@ impl Workspace {
                 }
             }
         });
+        self.agent.session = unix_millis();
         self.agent.bridge = Some(Bridge {
             _listener: listener,
             _pump: pump,
@@ -1260,9 +1401,19 @@ impl Workspace {
         }
         // A held statement is audited with what it asked, so a denied, expired
         // or hung-up approval says which statement it was.
-        let (verdict, sql) = match call.approval {
-            Some(approval) => (AuditVerdict::held_by(approval.verdict), Some(approval.sql)),
-            None => (None, None),
+        let (verdict, sql, decision, engine) = match call.approval {
+            Some(approval) => (
+                AuditVerdict::held_by(approval.verdict),
+                Some(approval.sql),
+                // A hangup is no decision of the person's: its caller left.
+                match status {
+                    Status::Rejected => Some(Decision::Rejected),
+                    Status::Expired => Some(Decision::Expired),
+                    _ => None,
+                },
+                Some(approval.config.engine()),
+            ),
+            None => (None, None, None, None),
         };
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
@@ -1276,6 +1427,8 @@ impl Workspace {
                 verdict,
                 sql,
                 elapsed_ms: elapsed_ms(call.arrived),
+                decision,
+                engine,
                 ..CallFacts::default()
             },
         );

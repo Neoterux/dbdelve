@@ -1991,17 +1991,48 @@ fn secure(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Where what an agent's approved statements did is recorded, beside
+/// `profiles.toml`.
 #[cfg(unix)]
 pub(crate) const AGENT_AUDIT_FILE: &str = "agent-audit.jsonl";
 
+/// The record of agent calls that waited on a person: append-only, one JSON
+/// object per line, never a row value. Empty for now; it is a type so the
+/// file's handling has one owner when it gains a line counter and compaction.
+///
+/// Unix only, as the bridge that feeds it is: on Windows nothing reads it, and
+/// CI's Windows clippy denies dead code.
 #[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct AuditLog {}
 
 #[cfg(unix)]
 impl AuditLog {
-    pub(crate) fn append(&mut self, _line: &str) -> Result<(), String> {
-        Ok(())
+    /// Append `line`, which must hold no newline, as one line of the file.
+    ///
+    /// Created `0600` and kept there. The line and its newline go out in a
+    /// single `write_all`: two writes could leave a line without its end, and
+    /// the next append would then be glued onto it.
+    pub(crate) fn append(&mut self, line: &str) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = dbdelve_directory()?;
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+        let path = directory.join(AGENT_AUDIT_FILE);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+        // A file that existed before with looser bits keeps none of them.
+        secure(&path)?;
+        let mut text = String::with_capacity(line.len() + 1);
+        text.push_str(line);
+        text.push('\n');
+        file.write_all(text.as_bytes())
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))
     }
 }
 
