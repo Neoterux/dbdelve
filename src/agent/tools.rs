@@ -16,7 +16,8 @@ pub(crate) enum Tool {
     ListTables,
     /// Describes one relation the catalog holds: columns, keys and indexes.
     DescribeTable,
-    /// Runs one statement the gate lets an agent run without asking.
+    /// Runs one statement: a read at once, anything else once the user has
+    /// approved it in the window.
     ExecuteSql,
     /// Asks the database for the plan of one statement, without running it
     /// unless asked to measure it.
@@ -63,10 +64,10 @@ impl Tool {
                 "Describes one table or view of a named connection: its columns with type, nullability and default, its primary key, its foreign keys and its indexes."
             }
             Tool::ExecuteSql => {
-                "Runs one read statement on a named connection exactly as written and returns the first rows, header first. A statement that would change data is not run."
+                "Runs one statement on a named connection exactly as written; one statement per call. A read answers at once with the first rows, header first. A statement that changes data, reads a file or URL, or calls a function DBDelve does not list waits until the user approves or denies it in the DBDelve window, and the call returns when they answer. The status is one of executed, rejected, expired, refused_by_gate or failed. DELETE, DROP, TRUNCATE, most ALTER and more than one statement per call are refused."
             }
             Tool::ExplainQuery => {
-                "Returns the plan the database would use for one statement of a named connection, findings first and then the plan tree. With `analyze` true it runs the statement to measure it, which only a read may do; without it nothing is run."
+                "Returns the plan the database would use for one statement of a named connection, findings first and then the plan tree. With `analyze` true it runs the statement to measure it, which only a read may do; without it nothing is run. A statement that needs the user's approval is not run by this tool."
             }
         }
     }
