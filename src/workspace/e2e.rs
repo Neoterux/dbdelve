@@ -5617,6 +5617,77 @@ fn the_approval_surface_animates_nothing() {
 }
 
 #[gpui::test]
+fn the_approval_draws_every_line_of_a_long_statement(cx: &mut TestAppContext) {
+    use crate::sql::{AgentVerdict, agent_gate};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        // The carriage return after the last token, not inside a comment,
+        // which the gate may refuse as unreadable.
+        let comments = (0..299)
+            .map(|n| format!("-- line {n}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let sql = format!("{comments}\r\n{UPDATE_ONE}\r");
+        assert!(
+            matches!(
+                agent_gate(Engine::Sqlite, &sql, crate::sql::Mode::ReadWrite),
+                AgentVerdict::Approve(..)
+            ),
+            "the statement is one the gate holds for approval"
+        );
+        inject_approval(&workspace, cx, "Orders", &sql);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+
+        let block = cx
+            .debug_bounds("agent-approval-sql")
+            .expect("the statement block is drawn");
+        assert!(
+            f32::from(block.size.height) <= theme::layout::APPROVAL_TEXT_MAX_HEIGHT,
+            "the block is {:?} tall",
+            block.size.height
+        );
+        for line in [0, 299] {
+            assert!(
+                cx.debug_bounds(format!("agent-approval-line-{line}").leak())
+                    .is_some(),
+                "line {line} has no element"
+            );
+        }
+        assert!(cx.debug_bounds("agent-approval-label").is_some());
+        assert!(cx.debug_bounds("agent-approval-size").is_some());
+        let window = cx.update(|window, _| window.viewport_size());
+        let window =
+            gpui::Bounds::from_corners(gpui::point(gpui::px(0.), gpui::px(0.)), window.into());
+        for button in ["agent-approval-0", "agent-approval-approve"] {
+            let bounds = cx.debug_bounds(button).expect("the button is drawn");
+            assert!(
+                window.contains(&bounds.origin) && window.contains(&bounds.bottom_right()),
+                "{button} at {bounds:?} is outside the window {window:?}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[test]
+fn the_approval_draws_its_own_statement_not_the_audit_copy() {
+    let forms = include_str!("forms.rs");
+    let from = forms
+        .find("fn render_agent_approval")
+        .expect("the approval render exists");
+    let render = &forms[from..];
+    let render = &render[..render
+        .find("\n    pub(crate) fn ")
+        .expect("another method follows the render")];
+    assert!(render.contains("code_lines_visible(&"), "{render}");
+    assert!(render.contains("approval.sql"));
+    assert!(!render.contains("agent.log"));
+    assert!(!render.contains("code_lines(&"));
+}
+
+#[gpui::test]
 fn an_approval_for_a_profile_hidden_in_another_window_is_not_run(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
 
