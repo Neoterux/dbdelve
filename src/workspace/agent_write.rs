@@ -16,13 +16,13 @@ use std::{
     time::Instant,
 };
 
-use super::agent::{AuditVerdict, CallFacts, Decision, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, INVALID_INDEX, elapsed_ms};
 use super::agent_read::{AGENT_ROWS, OPEN_FAILED, scrubbed, table_of};
 use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, tools::Tool},
     db::{CancelToken, Connection, ConnectionConfig, DbError, Engine, Fetch, QueryResult},
-    sql::counts_rows,
+    sql::{counts_rows, creates_index_concurrently},
 };
 
 // ponytail: the longest an approved write is left to run where the engine has
@@ -158,9 +158,17 @@ pub(super) fn written_text(engine: Engine, sql: &str, result: &QueryResult) -> S
     }
 }
 
-/// What an approved write that ended `failed` answers and records.
-fn failed_text(_engine: Engine, _sql: &str, server_text: &str) -> String {
-    server_text.to_string()
+/// What an approved write that ended `failed` answers and records: the
+/// server's (scrubbed) text, and when `sql` is a Postgres `CREATE INDEX
+/// CONCURRENTLY`, that an invalid index of that name may remain. A stopped
+/// concurrent build leaves one; no other statement does, so no other failure
+/// says it.
+fn failed_text(engine: Engine, sql: &str, server_text: &str) -> String {
+    if creates_index_concurrently(engine, sql) {
+        format!("{server_text} {INVALID_INDEX}")
+    } else {
+        server_text.to_string()
+    }
 }
 
 impl Workspace {
@@ -291,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_failed_concurrent_index_build_says_an_invalid_index_may_remain() {
-        let remains = format!("boom {}", super::super::agent::INVALID_INDEX);
+        let remains = format!("boom {}", INVALID_INDEX);
         assert_eq!(
             failed_text(
                 Engine::Postgres,
