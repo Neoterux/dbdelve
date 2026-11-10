@@ -961,12 +961,25 @@ pub(crate) fn button(
     size: Control,
     t: Theme,
 ) -> Button {
+    button_inked(id, label, tone, size, tone.ink(t))
+}
+
+/// A [`button`] whose label wears `ink` rather than its tone's: the library's
+/// disabled style dims the fill, and a ghost has none, so a label pinned to
+/// its tone looks the same disabled as enabled.
+pub(crate) fn button_inked(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    tone: Tone,
+    size: Control,
+    ink: Srgb,
+) -> Button {
     control(id, tone, size)
         .px(px(size.padding()))
         .when(size == Control::Standard, |standard| {
             standard.min_w(px(layout::CONTROL_MIN_WIDTH))
         })
-        .child(button_label(label, tone, size, t))
+        .child(inked_label(label, size, ink))
 }
 
 /// A button that is only its icon, so it is square and reads as an
@@ -994,6 +1007,10 @@ pub(crate) fn button_label(
     size: Control,
     t: Theme,
 ) -> impl IntoElement {
+    inked_label(label, size, tone.ink(t))
+}
+
+fn inked_label(label: impl Into<gpui::SharedString>, size: Control, ink: Srgb) -> gpui::Div {
     div()
         .min_w_0()
         .overflow_hidden()
@@ -1003,7 +1020,7 @@ pub(crate) fn button_label(
         .line_height(gpui::relative(1.))
         .text_size(px(size.text_size()))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(tone.ink(t))
+        .text_color(ink)
         .child(label.into())
 }
 

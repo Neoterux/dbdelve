@@ -30,7 +30,8 @@ use crate::scroller::{SmoothScrollable, smooth_scoped};
 use crate::session::PendingDelete;
 use crate::sql::{Destructive, Stop};
 use crate::ui::{
-    Status, code_lines, code_lines_visible, dot, raised_card, row_icon_tinted, size_fact,
+    Status, button_inked, code_lines, code_lines_visible, dot, raised_card, row_icon_tinted,
+    size_fact,
 };
 
 impl Workspace {
@@ -1962,12 +1963,12 @@ impl Workspace {
                                     div()
                                         .debug_selector(|| "agent-approval-approve".into())
                                         .child(
-                                            button(
+                                            button_inked(
                                                 format!("approve-write-{}", id.0),
                                                 "Approve",
                                                 Tone::Quiet,
                                                 Control::Standard,
-                                                t,
+                                                approve_ink(t, armed),
                                             )
                                             // A key cannot move onto it, so a key
                                             // cannot press it.
@@ -4064,6 +4065,17 @@ fn footer_status(
     }
 }
 
+/// The ink of Approve's label: the faint one until it arms, so the one redraw
+/// the arm causes is a change the person can see, and the quiet tone's once it
+/// has. A change of state, never a countdown (D-09).
+fn approve_ink(t: Theme, armed: bool) -> theme::color::Srgb {
+    if armed {
+        Tone::Quiet.ink(t)
+    } else {
+        t.text_faint
+    }
+}
+
 /// Whether a click is one Approve answers: a single mouse click that is not the
 /// one that brought the window forward. Refused, each for its own reason:
 /// - a double click, whose second press may land on a button that appeared
@@ -4079,6 +4091,15 @@ fn approves(event: &gpui::ClickEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approve_is_drawn_dimmer_until_it_arms_on_every_theme() {
+        for theme in theme::Theme::built_in() {
+            let t = theme.for_popup();
+            assert_eq!(approve_ink(t, true), Tone::Quiet.ink(t));
+            assert_ne!(approve_ink(t, false), approve_ink(t, true));
+        }
+    }
 
     #[test]
     fn approve_takes_only_a_single_ordinary_mouse_click() {

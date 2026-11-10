@@ -173,7 +173,8 @@ curves, and hover states are instant. These things move:
   window too short for the whole card the block gives up its height first so
   Deny and Approve stay on screen.
   Approve's arm is a one-shot timer (`ARM_DELAY`), not an animation, and ends
-  in one redraw. The dialog asks the OS for attention once per call, when it is
+  in one redraw, which takes Approve's label from the faint ink to the quiet
+  one: the library's disabled style dims only a fill, and a ghost has none. The dialog asks the OS for attention once per call, when it is
   first drawn (`Window::request_attention`): a single dock bounce or taskbar
   flash that never takes focus from another application and never raises the
   window, and nothing at all on Wayland, where the mark's waiting count is the
