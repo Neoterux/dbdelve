@@ -7505,7 +7505,7 @@ fn an_empty_statement_is_refused_without_opening_a_connection(cx: &mut TestAppCo
     use crate::agent::Status;
 
     store::tests::with_home(|| {
-        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
         for sql in ["", "   "] {
             let answers = inject_sql(&workspace, cx, "Orders", sql);
             cx.run_until_parked();
@@ -7513,7 +7513,9 @@ fn an_empty_statement_is_refused_without_opening_a_connection(cx: &mut TestAppCo
             assert_eq!(reply.status, Status::RefusedByGate, "{sql:?}");
             assert_eq!(reply.text, "there is no statement to run", "{sql:?}");
         }
+        assert!(pending_calls(&workspace, cx).is_empty());
         workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.calls.is_empty(), "a call was held");
             assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
         });
         quit(workspace, cx);
@@ -8188,6 +8190,89 @@ fn an_approval_never_drawn_never_runs(cx: &mut TestAppContext) {
         });
         settle(cx);
         assert_cancelled_as_changed(&workspace, cx, id, &answers);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_lowered_mode_cancels_the_approval(cx: &mut TestAppContext) {
+    use crate::sql::Mode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.active = Some(
+                workspace
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.id == "orders")
+                    .expect("Orders is in the list"),
+            );
+            workspace.set_mode(Mode::ReadOnly, cx);
+        });
+        approve_front(cx);
+        assert_cancelled_as_changed(&workspace, cx, id, &answers);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_changed_connection_cancels_the_approval(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        workspace.update(cx, |workspace, _| {
+            let profile = workspace
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == "orders")
+                .expect("Orders is in the list");
+            profile.config = profile.config.clone().with_statement_timeout(7);
+        });
+        approve_front(cx);
+        assert_cancelled_as_changed(&workspace, cx, id, &answers);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_approval_for_a_profile_hidden_at_approve_is_rejected(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        // Hidden on the field, without the sweep that would end the call.
+        workspace.update(cx, |workspace, cx| {
+            let profile = workspace
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == "orders")
+                .expect("Orders is in the list");
+            profile.agent_visible = false;
+            workspace.approve_call(id, cx);
+        });
+        settle(cx);
+        assert_eq!(
+            answer_of(cx, &answers),
+            Reply {
+                status: Status::Rejected,
+                text: super::agent::NO_LONGER_AVAILABLE.to_string(),
+            }
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+            assert!(workspace.agent.lanes.is_empty(), "a lane was opened");
+        });
         assert_eq!(email_of(1).as_deref(), Some("a@x"));
         quit(workspace, cx);
     });
