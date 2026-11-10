@@ -7371,6 +7371,95 @@ fn an_approved_read_of_a_file_runs_read_only_and_answers_rows(cx: &mut TestAppCo
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn an_approved_read_that_cannot_be_recorded_does_not_run(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx, user, csv) = agent_duckdb_with_csv(cx);
+        // A directory where the file belongs: nothing can be appended to it.
+        let log = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join(store::AGENT_AUDIT_FILE);
+        std::fs::create_dir_all(&log).expect("the obstacle is creatable");
+
+        let (_, answers) = inject_approval(
+            &workspace,
+            cx,
+            "Ducks",
+            &format!("SELECT count(*) AS n FROM '{csv}'"),
+        );
+        approve_front(cx);
+        assert_eq!(
+            answer_of(cx, &answers),
+            Reply {
+                status: Status::Failed,
+                text: super::agent::NOT_RECORDED.to_string(),
+            }
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .agent
+                    .lanes
+                    .get("ducks")
+                    .is_none_or(|lane| lane.running.is_none() && lane.waiting.is_empty()),
+                "a read was handed to the lane"
+            );
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+            let entry = workspace.agent.log.front().expect("the call is logged");
+            assert_eq!(entry.status, Status::Failed);
+        });
+        drop(user);
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_read_shown_at_read_write_and_lowered_to_read_only_is_not_run(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Reply, Status},
+        sql::Mode,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        // An unlisted function asks at Read-write and runs at Read-only, so
+        // the lowered profile would give this statement another verdict.
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", "SELECT my_udf(1)");
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.active = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "orders")
+                .expect("Orders is in the list");
+            workspace.set_mode(Mode::ReadOnly, cx);
+        });
+        approve_front(cx);
+        assert_eq!(
+            answer_of(cx, &answers),
+            Reply {
+                status: Status::RefusedByGate,
+                text: super::agent::CHANGED_SINCE_SHOWN.to_string(),
+            }
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a lane was opened");
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+        assert!(
+            !audit_lines()
+                .iter()
+                .any(|line| line["id"] == id.0 && line["phase"] == "started"),
+            "a call that did not run was recorded as started"
+        );
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_agent_write_on_duckdb_is_refused_before_it_is_shown(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
