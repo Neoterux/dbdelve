@@ -5515,6 +5515,108 @@ fn approving_nothing_changes_nothing(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn attention_is_asked_once_per_approval(cx: &mut TestAppContext) {
+    use crate::actions::ShowAgentActivity;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let attended =
+            |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.agent.attended);
+        settle(cx);
+        assert_eq!(attended(cx), None, "asked with nothing to approve");
+
+        let (first, _first_answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        assert_eq!(attended(cx), Some(first));
+
+        // Covered and revealed again: the same call, so no second request.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.close_agent_audit(cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.agent.revealed),
+            Some(first)
+        );
+        assert_eq!(attended(cx), Some(first));
+
+        let (second, _second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some(UPDATE_ONE.to_string()),
+                ..Default::default()
+            },
+        );
+        settle(cx);
+        assert_eq!(
+            attended(cx),
+            Some(first),
+            "asked for a call behind the front"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.deny_call(first, cx));
+        settle(cx);
+        assert_eq!(attended(cx), Some(second));
+
+        workspace.update(cx, |workspace, cx| workspace.deny_call(second, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(attended(cx), Some(second), "asked with nothing to approve");
+        quit(workspace, cx);
+    });
+}
+
+#[test]
+fn the_approval_surface_animates_nothing() {
+    let forms = include_str!("forms.rs");
+    let from = forms
+        .find("fn render_agent_approval")
+        .expect("the approval render exists");
+    let render = &forms[from..];
+    let render = &render[..render
+        .find("\n    pub(crate) fn ")
+        .expect("another method follows the render")];
+    for moving in [
+        "with_animation",
+        "Animation::",
+        "smooth_scroll",
+        "Spinner",
+        "request_animation_frame",
+    ] {
+        assert!(
+            !render.contains(moving),
+            "the approval surface holds {moving}"
+        );
+    }
+
+    let agent = include_str!("agent.rs");
+    let from = agent.find("fn reveal_approval").expect("the reveal exists");
+    let reveal = &agent[from..];
+    let reveal = &reveal[..reveal
+        .find("\n    pub(crate) fn ")
+        .expect("another method follows the reveal")];
+    assert_eq!(reveal.matches("request_attention").count(), 1);
+    assert!(
+        !reveal.contains("activate"),
+        "the reveal takes the window forward"
+    );
+    for (file, text) in [
+        ("forms.rs", forms),
+        ("mod.rs", include_str!("mod.rs")),
+        ("tabs.rs", include_str!("tabs.rs")),
+    ] {
+        assert!(
+            !text.contains("request_attention"),
+            "{file} asks for attention"
+        );
+    }
+}
+
+#[gpui::test]
 fn an_approval_for_a_profile_hidden_in_another_window_is_not_run(cx: &mut TestAppContext) {
     use crate::agent::{Reply, Status};
 

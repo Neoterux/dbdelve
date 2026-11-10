@@ -925,7 +925,9 @@ impl Workspace {
             && let Some(id) = self.front_approval_id()
             && (raised || self.agent.revealed != Some(id))
         {
-            cx.on_next_frame(window, |workspace, _, cx| workspace.reveal_approval(cx));
+            cx.on_next_frame(window, |workspace, window, cx| {
+                workspace.reveal_approval(window, cx)
+            });
         }
         // An Approve is live only while its own dialog is the one in front: a
         // dialog raised over it, or another call in front of it, ends the arm,
