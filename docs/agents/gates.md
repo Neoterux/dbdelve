@@ -244,13 +244,15 @@ session state, calls nothing on the engine's `denied_functions` or
 `egress_functions` and, at Read-write and Full, calls only functions on its
 engine's built-in list.
 
-**An `Approve` waits for the human, and runs only what the dialog drew.** The
-call is held until the person approves, denies or lets it expire, and nothing
-stands in for that act. At Approve the gate runs again, on the exact string the
-dialog drew, against the profile's current mode: a different verdict, a
-profile whose connection has changed since or a byte of difference between the
-statement and what was drawn cancels the call as `refused_by_gate` and sends
-nothing. An approved statement whose verdict is Read-only runs on the profile's
+**An `Approve` waits for the human, and runs the statement the dialog was
+drawn from.** The call is held until the person approves, denies or lets it
+expire, and nothing stands in for that act. At Approve the gate runs again, on
+the exact string the dialog was drawn from, against the profile's current mode:
+a different verdict, a profile whose connection has changed since, a dialog
+never drawn for this call, or a byte of difference between the statement and
+the source the dialog was last drawn from cancels the call as `refused_by_gate`
+and sends nothing. The check compares source strings: what the dialog draws is
+the marked text `ui::visible` makes of that source, which is display only. An approved statement whose verdict is Read-only runs on the profile's
 agent read lane, which the database holds to reads only where the engine has a
 hold (`ConnectionConfig::agent_reads_are_held`: a file opened read-only, or a
 session setting); on SQL Server, Snowflake, MongoDB and Redis nothing on the
