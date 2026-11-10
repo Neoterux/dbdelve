@@ -17,12 +17,14 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::Icon;
 use icondata_core::IconData;
 
+use crate::db::Syntax;
+
 /// The icons dbdelve can draw, by the path GPUI asks for.
 ///
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 76] = [
+const ICONS: [(&str, &IconData); 83] = [
     ("icons/git-fork.svg", icondata_lu::LuGitFork),
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
@@ -81,6 +83,12 @@ const ICONS: [(&str, &IconData); 76] = [
     ("icons/folder-minus.svg", icondata_lu::LuFolderMinus),
     ("icons/folder-plus.svg", icondata_lu::LuFolderPlus),
     ("icons/pin.svg", icondata_lu::LuPin),
+    ("icons/package.svg", icondata_lu::LuPackage),
+    ("icons/code.svg", icondata_lu::LuCode),
+    ("icons/braces.svg", icondata_lu::LuBraces),
+    ("icons/terminal.svg", icondata_lu::LuTerminal),
+    ("icons/file-json.svg", icondata_lu::LuFileJson),
+    ("icons/file-terminal.svg", icondata_lu::LuFileTerminal),
     (
         "icons/sliders-horizontal.svg",
         icondata_lu::LuSlidersHorizontal,
@@ -105,6 +113,7 @@ const ICONS: [(&str, &IconData); 76] = [
     ("icons/engine-generic.svg", icondata_lu::LuDatabase),
     ("icons/plugin.svg", icondata_lu::LuPlug),
     ("icons/mcp.svg", &MCP),
+    ("icons/unplug.svg", icondata_lu::LuUnplug),
 ];
 
 /// The Model Context Protocol's mark, the three strokes of the protocol's own
@@ -124,6 +133,24 @@ const MCP: IconData = IconData {
     fill: Some("none"),
     data: r#"<path d="M25 97.8528L92.8823 29.9706C102.255 20.598 117.451 20.598 126.823 29.9706V29.9706C136.196 39.3431 136.196 54.5391 126.823 63.9117L75.5581 115.177"/><path d="M76.2653 114.47L126.823 63.9117C136.196 54.5391 151.392 54.5391 160.765 63.9117L161.118 64.2652C170.491 73.6378 170.491 88.8338 161.118 98.2063L99.7248 159.6C96.6006 162.724 96.6006 167.789 99.7248 170.913L112.331 183.52"/><path d="M109.853 46.9411L59.6482 97.1457C50.2757 106.518 50.2757 121.714 59.6482 131.087V131.087C69.0208 140.459 84.2168 140.459 93.5894 131.087L143.794 80.8822"/>"#,
 };
+
+/// The Queries group's icon for a connection's query language.
+pub fn queries_group_icon(syntax: Syntax) -> &'static str {
+    match syntax {
+        Syntax::Sql => icon::QUERIES_SQL,
+        Syntax::Mongo => icon::QUERIES_MONGO,
+        Syntax::Redis => icon::QUERIES_REDIS,
+    }
+}
+
+/// A saved query's icon for a connection's query language.
+pub fn saved_query_icon(syntax: Syntax) -> &'static str {
+    match syntax {
+        Syntax::Sql => icon::SAVED_QUERY,
+        Syntax::Mongo => icon::SAVED_QUERY_MONGO,
+        Syntax::Redis => icon::SAVED_QUERY_REDIS,
+    }
+}
 
 /// dbdelve's own names for the icons it draws, so a call site names a thing
 /// rather than a file.
@@ -159,15 +186,24 @@ pub mod icon {
     /// No connection colour.
     pub const NO_COLOR: &str = "icons/ban.svg";
     pub const SAVED_QUERY: &str = "icons/file-code.svg";
+    pub const SAVED_QUERY_MONGO: &str = "icons/file-json.svg";
+    pub const SAVED_QUERY_REDIS: &str = "icons/file-terminal.svg";
+    /// The Queries group, in the glyph of the language its queries are in.
+    pub const QUERIES_SQL: &str = "icons/code.svg";
+    pub const QUERIES_MONGO: &str = "icons/braces.svg";
+    pub const QUERIES_REDIS: &str = "icons/terminal.svg";
     pub const DELETE: &str = "icons/trash.svg";
     pub const SEARCH: &str = "icons/search.svg";
     pub const DATABASE: &str = "icons/database.svg";
+    pub const DISCONNECT: &str = "icons/unplug.svg";
     pub const PROJECT: &str = "icons/folder.svg";
     /// A folder of shortcuts in the explorer, closed and open.
     pub const FOLDER: &str = "icons/folder.svg";
-    pub const FOLDER_OPEN: &str = "icons/folder-open.svg";
     /// The Pinned group's header, which is the icon alone.
     pub const PIN: &str = "icons/pin.svg";
+    /// A schema: a box rather than a folder, since the folders beside it are
+    /// the user's own.
+    pub const SCHEMA: &str = "icons/package.svg";
     pub const BROWSE: &str = "icons/folder-open.svg";
     pub const LEAVE_PROJECT: &str = "icons/folder-minus.svg";
     pub const ADD_TO_PROJECT: &str = "icons/folder-plus.svg";
@@ -301,6 +337,20 @@ fn document(icon: &IconData) -> String {
 mod tests {
     use super::*;
     use crate::db::Engine;
+
+    #[test]
+    fn query_icons_follow_the_query_language() {
+        assert_eq!(queries_group_icon(Syntax::Sql), icon::QUERIES_SQL);
+        assert_eq!(queries_group_icon(Syntax::Mongo), icon::QUERIES_MONGO);
+        assert_eq!(queries_group_icon(Syntax::Redis), icon::QUERIES_REDIS);
+        assert_eq!(saved_query_icon(Syntax::Sql), icon::SAVED_QUERY);
+        assert_eq!(saved_query_icon(Syntax::Mongo), icon::SAVED_QUERY_MONGO);
+        assert_eq!(saved_query_icon(Syntax::Redis), icon::SAVED_QUERY_REDIS);
+        for syntax in [Syntax::Sql, Syntax::Mongo, Syntax::Redis] {
+            assert_draws(queries_group_icon(syntax));
+            assert_draws(saved_query_icon(syntax));
+        }
+    }
 
     #[test]
     fn the_brand_mark_is_declared_near_the_size_it_is_drawn() {

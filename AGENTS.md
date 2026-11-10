@@ -32,8 +32,9 @@ require it, stop and raise it instead.
    splices its `ORDER BY` into the buffer (one sorted in memory reorders its
    rows and writes nothing); grid edits are appended to the buffer (`sql::appended_statement`),
    or shown in a review dialog on an object tab, which has no buffer, and on
-   a query tab of an engine whose rows are named by every value, whose writes
-   must run behind their guard (`Engine::reviews_query_edits`); Import
+   a query tab of an engine whose rows are named by every value, or of a
+   plugin, whose writes must run behind their guard
+   (`Target::reviews_query_edits`); Import
    Rows shows every statement before any runs; Explain prefixes a copy, never
    the buffer; transaction control (Toggle Auto-commit, Commit, Roll Back)
    appends its `BEGIN`, `COMMIT` and `ROLLBACK` to the buffer and runs them
@@ -101,7 +102,8 @@ require it, stop and raise it instead.
    them, through their methods, and never match on them: spelling is asked of
    `Engine`, and abilities (editing, inserting, importing, switching database,
    picking a schema, Copy DDL) of `Target`, never of `Engine`, because a plugin
-   target is the read-only tier whatever its dialect could do. Where a question
+   target has only the abilities proven through a real driver, whatever its
+   dialect could do. Where a question
    is missing, add a method rather than a `match` at the caller. `sql.rs`,
    `filter.rs` and `explorer.rs` branch on `Engine::syntax()` and read the
    engine's `EngineSpec`; they never name an engine. The only places above
@@ -307,6 +309,10 @@ Hard-won and easy to rediscover. The ones only animation work reaches are in
 - Non-trivial logic leaves one runnable check behind: the smallest test that
   fails if the logic breaks. No fixture scaffolding.
 - Match surrounding code's naming, density and idiom.
+- **Log through `tracing`, never `eprintln!`**, and only what the module doc of
+  `src/logging.rs` allows: no query text, rows, secrets or connection strings
+  at any level, and no host, user or database names or server error text
+  below debug. A user attaches this log to a public issue.
 - Commit messages and PR titles are `type(scope): summary`; the types and
   scopes are listed in `CONTRIBUTING.md`.
 - **This file holds what every task needs; `docs/agents/` holds the rest.** A
