@@ -612,6 +612,10 @@ pub(crate) const INVALID_INDEX: &str =
     "A concurrent index build that stops can leave an invalid index of that name on the server.";
 const LOCKS_THE_FILE: &str =
     "While it runs it locks the file, and your own reads and writes on it wait.";
+/// What the approval says of a read that runs where the database holds the
+/// agent's connection to reads, and of one where nothing does.
+pub(crate) const HELD_TO_READS: &str = "It runs on a read-only connection.";
+pub(crate) const NOT_HELD_TO_READS: &str = "Nothing on the server holds it to reads.";
 
 /// What DBDelve itself says of a statement it holds for approval, ahead of the
 /// statement: the access level the profile has and the one the statement needs,
@@ -619,13 +623,17 @@ const LOCKS_THE_FILE: &str =
 /// can leave, whose connection it runs on, and its size. Pure, so opening the
 /// dialog asks no server anything, and every sentence is DBDelve's: the
 /// statement is never formatted into one, because the agent wrote it.
-/// `locks_the_file` is [`Approval::locks_the_file`].
+/// `locks_the_file` is [`Approval::locks_the_file`], and `reads_held`
+/// [`ConnectionConfig::agent_reads_are_held`] of the profile: a read the gate
+/// holds runs on the agent's read connection, and what holds that connection
+/// to reads is the engine's.
 pub(crate) fn approval_facts(
     engine: Engine,
     mode: Mode,
     verdict: &AgentVerdict,
     sql: &str,
     locks_the_file: bool,
+    reads_held: bool,
 ) -> Vec<String> {
     // Only a held statement has an approval; nothing else is described.
     let AgentVerdict::Approve(held, expiry) = verdict else {
@@ -641,12 +649,20 @@ pub(crate) fn approval_facts(
         match kind {
             ApprovalKind::Write => "It changes data.",
             ApprovalKind::EgressRead => "It reads a file, a URL or another server.",
-            ApprovalKind::UnlistedCall => {
-                "It calls a function DBDelve does not list; it runs on a read-only connection."
-            }
+            ApprovalKind::UnlistedCall => "It calls a function DBDelve does not list.",
         }
         .to_string(),
     ];
+    if kind != ApprovalKind::Write {
+        facts.push(
+            if reads_held {
+                HELD_TO_READS
+            } else {
+                NOT_HELD_TO_READS
+            }
+            .to_string(),
+        );
+    }
     facts.extend(expiry.map(|expiry| expiry.to_string()));
     if creates_index_concurrently(engine, sql) {
         facts.push(INVALID_INDEX.to_string());
@@ -1680,7 +1696,7 @@ mod tests {
                         continue;
                     };
                     seen += 1;
-                    let facts = approval_facts(engine, mode, &verdict, sql, true);
+                    let facts = approval_facts(engine, mode, &verdict, sql, true, true);
                     let at = format!("{engine:?} {mode:?} {sql}");
                     let count = |fact: &str| facts.iter().filter(|each| *each == fact).count();
                     assert_eq!(count(OWN_CONNECTION), 1, "{at}: {facts:?}");
@@ -1702,7 +1718,7 @@ mod tests {
                         ),
                         (
                             ApprovalKind::UnlistedCall,
-                            "It calls a function DBDelve does not list; it runs on a read-only connection.",
+                            "It calls a function DBDelve does not list.",
                         ),
                     ];
                     let kind = approval_kind(engine, sql, held);
@@ -1735,7 +1751,7 @@ mod tests {
         let facts = |engine, sql: &str, locks| {
             let verdict = agent_gate(engine, sql, Mode::ReadWrite);
             assert!(matches!(verdict, AgentVerdict::Approve(..)), "{sql}");
-            approval_facts(engine, Mode::ReadWrite, &verdict, sql, locks)
+            approval_facts(engine, Mode::ReadWrite, &verdict, sql, locks, true)
         };
         let count =
             |facts: &[String], fact: &str| facts.iter().filter(|each| *each == fact).count();
@@ -1814,6 +1830,46 @@ mod tests {
         ] {
             assert_eq!(audited_error(server), kept, "{server}");
         }
+    }
+
+    #[test]
+    fn an_approved_read_says_whether_the_database_holds_it_to_reads() {
+        for (engine, sql) in [
+            (Engine::SqlServer, "SELECT dbo.my_udf(1)"),
+            (Engine::Postgres, "SELECT my_udf(1)"),
+            (Engine::DuckDb, "SELECT * FROM 'a.csv'"),
+        ] {
+            let verdict = agent_gate(engine, sql, Mode::ReadWrite);
+            assert!(
+                matches!(verdict, AgentVerdict::Approve(..)),
+                "{engine:?} {sql}"
+            );
+            for held in [true, false] {
+                let facts = approval_facts(engine, Mode::ReadWrite, &verdict, sql, false, held);
+                let says = |fact: &str| facts.iter().any(|each| each == fact);
+                assert_eq!(says(HELD_TO_READS), held, "{engine:?} {held}: {facts:?}");
+                assert_eq!(
+                    says(NOT_HELD_TO_READS),
+                    !held,
+                    "{engine:?} {held}: {facts:?}"
+                );
+            }
+        }
+        let verdict = agent_gate(Engine::SqlServer, "UPDATE t SET a = 1", Mode::ReadWrite);
+        let write = approval_facts(
+            Engine::SqlServer,
+            Mode::ReadWrite,
+            &verdict,
+            "UPDATE t SET a = 1",
+            false,
+            false,
+        );
+        assert!(
+            !write
+                .iter()
+                .any(|fact| fact == HELD_TO_READS || fact == NOT_HELD_TO_READS),
+            "a write is not said to be held to reads: {write:?}"
+        );
     }
 
     #[test]

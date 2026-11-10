@@ -1244,6 +1244,18 @@ impl ConnectionConfig {
         )
     }
 
+    /// Whether the agent's read connection to this profile is held to reads by
+    /// the database itself: a file engine's is opened read-only, and a server
+    /// session is held where [`Engine::holds_read_only`]. On SQL Server,
+    /// Snowflake, MongoDB and Redis nothing on the server does, and
+    /// `sql::agent_gate` is all that holds what an agent sends there.
+    pub fn agent_reads_are_held(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite { .. } | Self::Turso { .. } | Self::DuckDb { .. }
+        ) || self.engine().holds_read_only()
+    }
+
     /// Why an agent's approved write may not run on this profile, when it may
     /// not: DuckDB, file or in-memory. A write from a second connection to the
     /// file succeeds and is then lost -- the probe found a second writable
@@ -5874,6 +5886,22 @@ mod tests {
             )
         );
         assert!(!in_memory("").agent_opens_per_call());
+    }
+
+    #[test]
+    fn an_agent_read_is_held_by_the_database_where_a_file_opens_read_only_or_a_session_holds() {
+        for config in every_shape() {
+            let engine = config.engine();
+            let expected = !matches!(
+                engine,
+                Engine::SqlServer
+                    | Engine::Snowflake
+                    | Engine::MongoDb
+                    | Engine::Redis
+                    | Engine::Generic
+            );
+            assert_eq!(config.agent_reads_are_held(), expected, "{engine:?}");
+        }
     }
 
     #[test]

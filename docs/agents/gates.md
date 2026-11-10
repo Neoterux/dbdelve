@@ -251,10 +251,12 @@ dialog drew, against the profile's current mode: a different verdict, a
 profile whose connection has changed since or a byte of difference between the
 statement and what was drawn cancels the call as `refused_by_gate` and sends
 nothing. An approved statement whose verdict is Read-only runs on the profile's
-read-only lane; a Read-write one runs on a connection opened for that call and
-closed with it, so a session change the statement makes dies with the
-connection. A write
-aimed at a DuckDB database is refused (`DUCKDB_WRITE_REFUSED`), because a write
+agent read lane, which the database holds to reads only where the engine has a
+hold (`ConnectionConfig::agent_reads_are_held`: a file opened read-only, or a
+session setting); on SQL Server, Snowflake, MongoDB and Redis nothing on the
+server does, and the approval says so. A Read-write one runs on a connection
+opened for that call and closed with it, so a session change the statement
+makes dies with the connection. A write aimed at a DuckDB database is refused (`DUCKDB_WRITE_REFUSED`), because a write
 from a second connection to the file is lost. `explain_query` still refuses a
 statement that needs approval and never waits for one.
 
