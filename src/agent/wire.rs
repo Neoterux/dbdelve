@@ -10,7 +10,7 @@ use super::tools::Tool;
 
 /// The version the first frame must carry. A frame from another one is
 /// refused rather than read as if it meant what this build's frames mean.
-pub(super) const PROTOCOL_VERSION: u32 = 2;
+pub(super) const PROTOCOL_VERSION: u32 = 3;
 
 // ponytail: a first frame is a tool name, a profile name and now an agent's
 // statement, so 64 KiB is beyond any statement worth reading back as rows; the

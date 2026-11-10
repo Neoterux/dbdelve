@@ -12,7 +12,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable};
 
-use super::agent::{ping_prompt, visibility_facts};
+use super::agent::visibility_facts;
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -1605,7 +1605,7 @@ impl Workspace {
     /// What agents did this session, newest first: one block per call with its
     /// tool, connection, verdict, row counts, time and statement, and the full
     /// error of a call that failed. Never a row. Drawn below the titlebar, as
-    /// the ping is, so the mark stays reachable.
+    /// an approval is, so the mark stays reachable.
     ///
     /// ponytail: every entry is laid out while the dialog is open. The upgrade
     /// is a virtual list, if five hundred entries ever prove slow.
@@ -1729,30 +1729,48 @@ impl Workspace {
         )
     }
 
-    /// What an agent asks the human to approve: a statement to run, or a test
-    /// for one connection, named by the profile's own current name read by id,
-    /// never by anything the agent sent. Deny is the ring's only stop; Approve is a click and nothing else.
-    /// Nothing is drawn unless the oldest waiting call still has its profile.
+    /// What an agent asks to run: the connection by the profile's own name, the
+    /// facts the gate and the profile give, and the statement exactly as the
+    /// agent sent it, in a block that scrolls. Deny is the ring's only stop;
+    /// Approve is a click, off until [`agent::ARM_DELAY`] has passed since this
+    /// was drawn, and never a stop for a key. The profile is read by id, never
+    /// by anything the agent sent. Nothing is drawn unless the oldest waiting
+    /// call still has its profile.
     pub(crate) fn render_agent_approval(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
         let call = self.front_approval()?;
         let id = call.id;
+        let approval = &call.approval;
         let profile = self
             .profiles
             .iter()
             .find(|profile| profile.id == call.profile_id)?;
+        let engine = profile.config.engine();
+        let code = fonts(cx).editor.clone();
+        let lines = code_lines(&approval.sql, engine.syntax(), &cx.theme().highlight_theme);
+        let held = match &approval.verdict {
+            crate::sql::AgentVerdict::Approve(verdict, _) => Some(verdict.mode),
+            _ => None,
+        };
+        let facts = [
+            Some(engine.label().to_string()),
+            Some(format!("access {}", profile.mode.label())),
+            held.map(|mode| format!("needs {}", mode.label())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
         let deny_workspace = cx.entity().downgrade();
         let approve_workspace = deny_workspace.clone();
-        if let Some(approval) = &call.approval {
-            return Some(self.approval_dialog(id, approval, profile, t, cx));
-        }
+        let armed = self.agent.armed == Some(id);
 
         Some(
             div()
-                // Starts below the titlebar rather than over it: the agent
-                // mark's waiting count and its turn-off item must stay
-                // clickable while an approval waits, and the window controls live
-                // in that strip too.
+                // Below the titlebar rather than over it: the agent mark's
+                // waiting count and its turn-off item must stay clickable
+                // while an approval waits, and the window controls live in
+                // that strip too.
                 .absolute()
                 .top(px(layout::TITLEBAR_HEIGHT))
                 .left_0()
@@ -1769,13 +1787,24 @@ impl Workspace {
                             div()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text)
-                                .child("Ping from an agent"),
+                                .child(format!("Statement from the agent for {}", profile.name)),
                         )
                         .child(
                             div()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
-                                .child(ping_prompt(&profile.name)),
+                                .child(facts),
+                        )
+                        // Nothing on this surface moves on its own, so the block
+                        // has no smooth-scroll modifier.
+                        .child(
+                            div()
+                                .id("agent-approval-sql")
+                                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .font_family(code)
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .children(lines.into_iter().map(|line| div().child(line))),
                         )
                         .child(
                             div()
@@ -1811,7 +1840,7 @@ impl Workspace {
                                         .debug_selector(|| "agent-approval-approve".into())
                                         .child(
                                             button(
-                                                format!("approve-ping-{}", id.0),
+                                                format!("approve-write-{}", id.0),
                                                 "Approve",
                                                 Tone::Quiet,
                                                 Control::Standard,
@@ -1820,12 +1849,13 @@ impl Workspace {
                                             // A key cannot move onto it, so a key
                                             // cannot press it.
                                             .tab_stop(false)
+                                            .disabled(!armed)
                                             .on_click(
                                                 move |_, _, cx| {
                                                     _ = approve_workspace.update(
                                                         cx,
                                                         |workspace, cx| {
-                                                            workspace.approve_ping(id, cx);
+                                                            workspace.approve_call(id, cx);
                                                         },
                                                     );
                                                 },
@@ -1836,136 +1866,6 @@ impl Workspace {
                 )
                 .into_any_element(),
         )
-    }
-
-    /// What an agent asks to run: the connection by the profile's own name, the
-    /// facts the gate and the profile give, and the statement exactly as the
-    /// agent sent it, in a block that scrolls. Deny is the ring's only stop;
-    /// Approve is a click, off until [`agent::ARM_DELAY`] has passed since this
-    /// was drawn, and never a stop for a key.
-    fn approval_dialog(
-        &self,
-        id: crate::agent::CallId,
-        approval: &agent::Approval,
-        profile: &Profile,
-        t: Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let engine = profile.config.engine();
-        let code = fonts(cx).editor.clone();
-        let lines = code_lines(&approval.sql, engine.syntax(), &cx.theme().highlight_theme);
-        let held = match &approval.verdict {
-            crate::sql::AgentVerdict::Approve(verdict, _) => Some(verdict.mode),
-            _ => None,
-        };
-        let facts = [
-            Some(engine.label().to_string()),
-            Some(format!("access {}", profile.mode.label())),
-            held.map(|mode| format!("needs {}", mode.label())),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
-        let deny_workspace = cx.entity().downgrade();
-        let approve_workspace = deny_workspace.clone();
-        let armed = self.agent.armed == Some(id);
-
-        div()
-            // Below the titlebar, as the ping's is.
-            .absolute()
-            .top(px(layout::TITLEBAR_HEIGHT))
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                dialog(t)
-                    .child(section_label(t, "Agent"))
-                    .child(
-                        div()
-                            .text_size(px(layout::chrome(layout::TEXT_SM)))
-                            .text_color(t.text)
-                            .child(format!("Statement from the agent for {}", profile.name)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(layout::chrome(layout::TEXT_SM)))
-                            .text_color(t.text_muted)
-                            .child(facts),
-                    )
-                    // Nothing on this surface moves on its own, so the block
-                    // has no smooth-scroll modifier.
-                    .child(
-                        div()
-                            .id("agent-approval-sql")
-                            .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
-                            .overflow_y_scroll()
-                            .font_family(code)
-                            .text_size(px(layout::chrome(layout::TEXT_SM)))
-                            .children(lines.into_iter().map(|line| div().child(line))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(layout::SPACE_SM))
-                            .child(
-                                self.choice(
-                                    "agent-approval",
-                                    0,
-                                    button(
-                                        "deny-agent-approval",
-                                        "Deny",
-                                        Tone::Quiet,
-                                        Control::Standard,
-                                        t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = deny_workspace.update(cx, |workspace, cx| {
-                                                workspace.deny_call(id, cx);
-                                            });
-                                        },
-                                    ),
-                                    t,
-                                ),
-                            )
-                            // Outside the ring, with an id of this call alone,
-                            // as the ping's is.
-                            .child(
-                                div()
-                                    .debug_selector(|| "agent-approval-approve".into())
-                                    .child(
-                                        button(
-                                            format!("approve-write-{}", id.0),
-                                            "Approve",
-                                            Tone::Quiet,
-                                            Control::Standard,
-                                            t,
-                                        )
-                                        // A key cannot move onto it, so a key
-                                        // cannot press it.
-                                        .tab_stop(false)
-                                        .disabled(!armed)
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                _ = approve_workspace.update(
-                                                    cx,
-                                                    |workspace, cx| {
-                                                        workspace.approve_call(id, cx);
-                                                    },
-                                                );
-                                            },
-                                        ),
-                                    ),
-                            ),
-                    ),
-            )
-            .into_any_element()
     }
 
     /// What Delete asks before a saved query's file goes, since nothing

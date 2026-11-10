@@ -148,7 +148,8 @@ impl AuditVerdict {
 }
 
 /// What a call knew about itself at its end, beyond who made it and how it
-/// ended. A call that has none of these, such as a ping, takes the default.
+/// ended. A call that has none of these, such as a catalog listing, takes the
+/// default.
 #[derive(Default)]
 pub(crate) struct CallFacts {
     pub(crate) verdict: Option<AuditVerdict>,
@@ -373,16 +374,14 @@ pub(crate) struct PendingCall {
     /// dialog and the sweeps read the profile by this id, so a rename or a
     /// second profile of the same name cannot change which one a call is about.
     pub(crate) profile_id: String,
-    pub(crate) tool: Tool,
     /// The profile's own name when the call resolved, kept so the log can name
     /// it after the profile is gone.
     profile_name: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
     /// When the call reached [`Workspace::on_agent_message`].
     arrived: Instant,
-    /// What the person is asked to approve, for a statement the gate held. A
-    /// ping asks for nothing and has none.
-    pub(crate) approval: Option<Approval>,
+    /// What the person is asked to approve: the statement the gate held.
+    pub(crate) approval: Approval,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
     _expiry: gpui::Task<()>,
@@ -459,16 +458,6 @@ impl std::fmt::Display for AgentLookup {
             Self::Ambiguous => "more than one agent-visible connection has that name",
         })
     }
-}
-
-/// What the ping dialog says: the connection by its own name, that this is a
-/// test, and that approving touches nothing. The name is the profile's, as its
-/// owner spelt it, never text the agent sent.
-pub(crate) fn ping_prompt(name: &str) -> String {
-    format!(
-        "An agent asks you to answer a test for {name}. Approving answers the agent; it runs \
-         nothing on the database."
-    )
 }
 
 /// What the visibility dialog tells the owner about this engine and mode, one
@@ -625,28 +614,14 @@ impl Workspace {
         })
     }
 
-    /// The dialog's Approve. Answers the agent and nothing else: no connection
-    /// is opened and nothing runs.
-    pub(crate) fn approve_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
-        self.finish_call(
-            id,
-            Status::Executed,
-            "The ping was approved in DBDelve.".to_string(),
-            cx,
-        );
-    }
-
     /// The dialog's Deny, for a call named by id.
     pub(crate) fn deny_call(&mut self, id: CallId, cx: &mut Context<Self>) {
         self.finish_call(id, Status::Rejected, DENIED.to_string(), cx);
     }
 
-    /// The call the dialog in front is about, when it asks for a statement to
-    /// be run and not for a ping to be answered.
+    /// The call the dialog in front is about.
     pub(crate) fn front_approval_id(&self) -> Option<CallId> {
-        self.front_approval()
-            .filter(|call| call.approval.is_some())
-            .map(|call| call.id)
+        self.front_approval().map(|call| call.id)
     }
 
     /// The timer that ends a call nobody answered as `expired`. Dropping it
@@ -700,12 +675,7 @@ impl Workspace {
         // A hide saved by another window since this call arrived: the answer
         // is this call's own rejection, found below as no call at all.
         self.adopt_saved_visibility_for_read(cx);
-        let Some(index) = self
-            .agent
-            .calls
-            .iter()
-            .position(|call| call.id == id && call.approval.is_some())
-        else {
+        let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
             return;
         };
         let was_in_front = self.front_approval().is_some_and(|front| front.id == id);
@@ -716,12 +686,9 @@ impl Workspace {
             profile_name,
             reply,
             arrived,
-            approval: Some(approval),
+            approval,
             ..
-        } = call
-        else {
-            return;
-        };
+        } = call;
         let engine = approval.config.engine();
         let profile = self
             .profiles
@@ -1166,15 +1133,14 @@ impl Workspace {
                                 self.agent.calls.push(PendingCall {
                                     id,
                                     profile_id: resolved.id,
-                                    tool: Tool::ExecuteSql,
                                     profile_name: resolved.name,
                                     reply,
                                     arrived,
-                                    approval: Some(Approval {
+                                    approval: Approval {
                                         sql,
                                         verdict,
                                         config: resolved.config,
-                                    }),
+                                    },
                                     _expiry: expiry,
                                 });
                                 cx.notify();
@@ -1318,52 +1284,6 @@ impl Workspace {
                 };
                 self.run_agent_work(id, resolved, work, reply, arrived, cx);
             }
-            Inbound::Call {
-                tool: Tool::Ping,
-                id,
-                connection,
-                reply,
-                ..
-            } => {
-                self.adopt_saved_visibility(cx);
-                let found = match connection.as_deref() {
-                    Some(name) => self
-                        .agent_profile(name)
-                        .map(|profile| (profile.id.clone(), profile.name.clone())),
-                    None => Err(AgentLookup::NotAvailable),
-                };
-                let (profile_id, profile_name) = match found {
-                    Ok(found) => found,
-                    Err(lookup) => {
-                        // The caller may have hung up, and then nobody reads this.
-                        let _ = reply.send(Reply {
-                            status: Status::RefusedByGate,
-                            text: lookup.to_string(),
-                        });
-                        self.agent.record(
-                            id,
-                            Tool::Ping,
-                            None,
-                            connection.as_deref(),
-                            Status::RefusedByGate,
-                            CallFacts::default(),
-                        );
-                        return;
-                    }
-                };
-                let expiry = self.expiry_of(id, cx);
-                self.agent.calls.push(PendingCall {
-                    id,
-                    profile_id,
-                    tool: Tool::Ping,
-                    profile_name,
-                    reply,
-                    arrived,
-                    approval: None,
-                    _expiry: expiry,
-                });
-                cx.notify();
-            }
             Inbound::Hangup { id } => {
                 self.finish_call(id, Status::Cancelled, String::new(), cx);
             }
@@ -1402,7 +1322,7 @@ impl Workspace {
     /// The one door every call ends through: answered, expired or hung up.
     /// It removes the call by id before it replies, so two things ending the
     /// same call at once produce one outcome and at most one reply. It looks
-    /// among the calls waiting on a person first (pings and held statements),
+    /// among the calls waiting on a person first (held statements),
     /// then among the approved writes running, which a hangup is noted on and
     /// nothing else ends, and last among the reads of every lane
     /// ([`Workspace::finish_read`]), where a running read is cancelled on the
@@ -1434,34 +1354,28 @@ impl Workspace {
         }
         // A held statement is audited with what it asked, so a denied, expired
         // or hung-up approval says which statement it was.
-        let (verdict, sql, decision, engine) = match call.approval {
-            Some(approval) => (
-                AuditVerdict::held_by(approval.verdict),
-                Some(approval.sql),
-                // A hangup is no decision of the person's: its caller left.
-                match status {
-                    Status::Rejected => Some(Decision::Rejected),
-                    Status::Expired => Some(Decision::Expired),
-                    _ => None,
-                },
-                Some(approval.config.engine()),
-            ),
-            None => (None, None, None, None),
+        let approval = call.approval;
+        // A hangup is no decision of the person's: its caller left.
+        let decision = match status {
+            Status::Rejected => Some(Decision::Rejected),
+            Status::Expired => Some(Decision::Expired),
+            _ => None,
         };
+        let engine = approval.config.engine();
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
         self.agent.record(
             id,
-            call.tool,
+            Tool::ExecuteSql,
             Some(call.profile_name),
             None,
             status,
             CallFacts {
-                verdict,
-                sql,
+                verdict: AuditVerdict::held_by(approval.verdict),
+                sql: Some(approval.sql),
                 elapsed_ms: elapsed_ms(call.arrived),
                 decision,
-                engine,
+                engine: Some(engine),
                 ..CallFacts::default()
             },
         );
@@ -1625,20 +1539,6 @@ mod tests {
             })
         );
         assert_eq!(AuditVerdict::held_by(AgentVerdict::Run), None);
-    }
-
-    #[test]
-    fn the_ping_prompt_names_the_connection_and_runs_nothing() {
-        let prompt = ping_prompt("Reports");
-        assert!(prompt.contains("Reports"), "{prompt}");
-        assert!(prompt.contains("runs nothing"), "{prompt}");
-        for name in ["Orders", "a b", "x'y"] {
-            let prompt = ping_prompt(name);
-            assert!(prompt.contains(name), "{prompt}");
-            for word in ["SQL", "try", "should", "Phase", "MCP"] {
-                assert!(!prompt.contains(word), "{name}: {prompt}");
-            }
-        }
     }
 
     #[test]

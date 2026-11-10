@@ -21,21 +21,17 @@ pub(crate) enum Tool {
     /// Asks the database for the plan of one statement, without running it
     /// unless asked to measure it.
     ExplainQuery,
-    /// Asks the person at the window to answer: nothing runs for it, so it
-    /// only ever waits to be answered, to expire, or to be hung up.
-    Ping,
 }
 
 impl Tool {
     /// Every tool, in the order the agent is shown them.
-    pub(crate) const ALL: [Tool; 7] = [
+    pub(crate) const ALL: [Tool; 6] = [
         Tool::ListConnections,
         Tool::ListSchemas,
         Tool::ListTables,
         Tool::DescribeTable,
         Tool::ExecuteSql,
         Tool::ExplainQuery,
-        Tool::Ping,
     ];
 
     /// The name the agent calls it by: the spelling serde writes for it.
@@ -47,7 +43,6 @@ impl Tool {
             Tool::DescribeTable => "describe_table",
             Tool::ExecuteSql => "execute_sql",
             Tool::ExplainQuery => "explain_query",
-            Tool::Ping => "ping",
         }
     }
 
@@ -72,9 +67,6 @@ impl Tool {
             }
             Tool::ExplainQuery => {
                 "Returns the plan the database would use for one statement of a named connection, findings first and then the plan tree. With `analyze` true it runs the statement to measure it, which only a read may do; without it nothing is run."
-            }
-            Tool::Ping => {
-                "Asks the user, in the DBDelve window, to answer a test from the agent for one connection. Waits until the user answers. Opens no database connection and runs nothing."
             }
         }
     }
@@ -117,10 +109,6 @@ impl Tool {
                     "sql": { "type": "string" },
                     "analyze": { "type": "boolean" },
                 })
-            }
-            Tool::Ping => {
-                schema.insert("required".to_string(), json!(["connection"]));
-                json!({ "connection": { "type": "string" } })
             }
         };
         schema.insert("properties".to_string(), properties);
