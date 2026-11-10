@@ -154,6 +154,61 @@ fn split_highlights<'a>(
         .collect()
 }
 
+/// A statement's text as it is drawn for a human who must read what the
+/// server will read: every character that is invisible or reorders what is
+/// around it is shown as an ASCII `[U+XXXX]` marker. For display only; what
+/// runs, and what is compared against it, is always the source text (D-29).
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) struct Visible {
+    pub(crate) display: String,
+    map: Vec<(Range<usize>, Range<usize>)>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+impl Visible {
+    /// `highlights` over the source text, moved onto the display.
+    pub(crate) fn remap(&self, highlights: &[(Range<usize>, HighlightStyle)]) -> Highlights {
+        highlights.to_vec()
+    }
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) fn visible(text: &str) -> Visible {
+    Visible {
+        display: text.to_string(),
+        map: Vec::new(),
+    }
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) fn code_lines_visible(
+    text: &str,
+    syntax: Syntax,
+    theme: &HighlightTheme,
+    marker: HighlightStyle,
+) -> Vec<StyledText> {
+    visible_lines(text, syntax, theme, marker)
+        .into_iter()
+        .map(|(line, runs)| StyledText::new(line).with_highlights(runs))
+        .collect()
+}
+
+fn visible_lines(
+    text: &str,
+    _syntax: Syntax,
+    _theme: &HighlightTheme,
+    _marker: HighlightStyle,
+) -> Vec<(String, Highlights)> {
+    text.lines()
+        .map(|line| (line.to_string(), Vec::new()))
+        .collect()
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
+pub(crate) fn size_fact(_text: &str) -> String {
+    String::new()
+}
+
 /// One column of icons down the sidebar, so every label starts at the same x
 /// whether its row is a folder or an object.
 pub(crate) fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
@@ -1390,6 +1445,110 @@ mod tests {
             ),
             color("boolean")
         );
+    }
+
+    #[test]
+    fn visible_characters_mark_every_control_bidi_and_zero_width_character() {
+        for c in [
+            '\u{0}', '\u{1b}', '\r', '\u{7f}', '\u{85}', '\u{9f}', '\u{61c}', '\u{200b}',
+            '\u{200e}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{2028}', '\u{2029}', '\u{ad}',
+            '\u{feff}',
+        ] {
+            assert_eq!(
+                visible(&format!("a{c}b")).display,
+                format!("a[U+{:04X}]b", c as u32),
+                "{c:?}"
+            );
+        }
+        assert_eq!(visible("a\tb\nc").display, "a\tb\nc");
+    }
+
+    #[test]
+    fn visible_characters_keep_crlf_and_a_trailing_carriage_return() {
+        let theme = HighlightTheme::default_dark();
+        let lines = |text| {
+            visible_lines(text, Syntax::Sql, &theme, HighlightStyle::default())
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines("a\r\nb"), ["a[U+000D]", "b"]);
+        assert_eq!(lines("a\r"), ["a[U+000D]"]);
+        assert_eq!(lines("a\n"), ["a", ""]);
+        assert_eq!(lines(""), [""]);
+        assert_eq!(
+            code_lines_visible("a\r\nb", Syntax::Sql, &theme, HighlightStyle::default()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn visible_characters_keep_highlights_on_the_text_they_coloured() {
+        let theme = HighlightTheme::default_dark();
+        let marker = HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        };
+        let text = "SELECT\u{202e} 1";
+        let seen = visible(text);
+        assert_eq!(seen.display, "SELECT[U+202E] 1");
+        let original = code_highlights(text, Syntax::Sql, Code::Statement, &theme);
+        let spans = |highlights: &Highlights, display: &str| {
+            highlights
+                .iter()
+                .map(|(range, _)| display[range.clone()].to_string())
+                .collect::<Vec<_>>()
+        };
+        let before = spans(&original, text);
+        assert!(before.contains(&"SELECT".to_string()), "{before:?}");
+        assert!(before.contains(&"1".to_string()), "{before:?}");
+        let moved = seen.remap(&original);
+        let after = spans(&moved, &seen.display);
+        assert!(after.contains(&"SELECT".to_string()), "{after:?}");
+        assert!(after.contains(&"1".to_string()), "{after:?}");
+
+        // A range ending inside the replaced character ends at the marker's end.
+        let style = HighlightStyle::default();
+        assert_eq!(seen.remap(&[(0..7, style)])[0].0, 0..14);
+        // One that starts inside it starts after the marker.
+        assert_eq!(seen.remap(&[(7..11, style)])[0].0, 14..16);
+
+        let lines = visible_lines(text, Syntax::Sql, &theme, marker);
+        assert_eq!(lines.len(), 1);
+        let (line, runs) = &lines[0];
+        assert_eq!(line, "SELECT[U+202E] 1");
+        assert!(
+            runs.iter()
+                .any(|(range, style)| *range == (6..14) && *style == marker)
+        );
+        assert!(
+            runs.iter()
+                .any(|(range, _)| &line[range.clone()] == "SELECT")
+        );
+        assert!(runs.iter().any(|(range, _)| &line[range.clone()] == "1"));
+    }
+
+    #[test]
+    fn visible_characters_leave_plain_text_as_it_is() {
+        let theme = HighlightTheme::default_dark();
+        for text in [
+            "UPDATE t SET a = 'é' WHERE id = 1",
+            "SELECT '\u{1F600}' FROM t",
+        ] {
+            let seen = visible(text);
+            assert_eq!(seen.display, text);
+            let original = code_highlights(text, Syntax::Sql, Code::Statement, &theme);
+            assert!(!original.is_empty());
+            assert_eq!(seen.remap(&original), original);
+        }
+    }
+
+    #[test]
+    fn the_size_fact_counts_drawn_lines_and_bytes() {
+        assert_eq!(size_fact("a"), "1 line, 1 byte");
+        assert_eq!(size_fact("é"), "1 line, 2 bytes");
+        assert_eq!(size_fact("a\nb\n"), "3 lines, 4 bytes");
+        assert_eq!(size_fact(&"a".repeat(1204)), "1 line, 1,204 bytes");
     }
 
     #[test]
