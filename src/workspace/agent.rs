@@ -13,6 +13,7 @@
 use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
 use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
+use super::agent_write;
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
@@ -51,7 +52,12 @@ pub(crate) struct AgentState {
     /// What opens an agent's connection; `None` is the real open. Tests put
     /// one here to stand in for an open that never returns.
     pub(crate) opener: Option<agent_read::Opener>,
+    pub(crate) writes: Vec<agent_write::Writing>,
+    pub(crate) armed: Option<CallId>,
+    pub(crate) revealed: Option<CallId>,
 }
+
+pub(crate) const ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 
 // ponytail: the audit is this session's own and keeps the last five hundred
 // calls, in memory only, because it is read in a dialog and a longer list is
@@ -488,6 +494,8 @@ impl Workspace {
             cx,
         );
     }
+
+    pub(crate) fn approve_call(&mut self, _id: CallId, _cx: &mut Context<Self>) {}
 
     /// Deny whichever ping the dialog in front is about. Answers whether there
     /// was one, so `escape` is only spent on a dialog that was drawn.

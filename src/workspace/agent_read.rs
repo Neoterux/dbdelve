@@ -403,7 +403,7 @@ struct Listing {
 
 /// One result set as the agent reads it. A Postgres spatial cell is rendered
 /// first, as an export renders it, so hex EWKB never spends the agent's tokens.
-fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
+pub(super) fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
     // Only the cells that wait on their type are copied out and replaced; the
     // rest are read where they stand.
     let rendered: HashMap<(usize, usize), String> = db::render(db::unrendered(engine, result))

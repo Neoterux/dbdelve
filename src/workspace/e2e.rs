@@ -3818,6 +3818,58 @@ fn pending_calls(
     })
 }
 
+/// An `execute_sql` call the gate holds for approval, injected. The call is
+/// pending when this returns.
+fn inject_approval(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: &str,
+    sql: &str,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    let (id, answers) = inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some(connection),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(pending_calls(workspace, cx), [id], "the call is held");
+    (id, answers)
+}
+
+/// What a person does to approve the call in front: let the dialog be drawn,
+/// wait out the arm, and click Approve.
+fn approve_front(cx: &mut VisualTestContext) {
+    settle(cx);
+    cx.executor().advance_clock(super::agent::ARM_DELAY);
+    settle(cx);
+    let approve = cx
+        .debug_bounds("agent-ping-approve")
+        .expect("the dialog draws Approve");
+    cx.simulate_click(approve.center(), gpui::Modifiers::default());
+    settle(cx);
+}
+
+/// What `Orders`' file holds as the email of row `id`.
+fn email_of(id: i64) -> Option<String> {
+    let database = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(database)
+        .and_then(|connection| {
+            connection.query_row("SELECT email FROM t WHERE id = ?1", [id], |row| row.get(0))
+        })
+        .expect("the row is readable")
+}
+
+const UPDATE_ONE: &str = "UPDATE t SET email = 'z@x' WHERE id = 1";
+
 #[gpui::test]
 fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
     cx: &mut TestAppContext,
@@ -4906,6 +4958,172 @@ fn a_ping_through_the_shim_waits_for_the_human_and_answers_executed(cx: &mut Tes
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn an_approved_statement_waits_for_the_human_and_runs_only_after_approve(cx: &mut TestAppContext) {
+    use crate::{agent::Status, session::ProfileState, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "execute_sql",
+            serde_json::json!({ "connection": "Orders", "sql": UPDATE_ONE }),
+        );
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert!(!shim.is_finished(), "the agent waits for the human");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+
+        approve_front(cx);
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "status: executed\nThe server reported 1 row affected."
+        );
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty());
+            assert!(workspace.agent.lanes.is_empty());
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            assert!(
+                matches!(orders.state, ProfileState::Idle),
+                "approving a write connected the user's profile"
+            );
+            let entry = workspace.agent.log.front().expect("the call is logged");
+            assert_eq!(entry.status, Status::Executed);
+            assert_eq!(
+                entry.verdict,
+                Some(super::agent::AuditVerdict::Approve {
+                    mode: Mode::ReadWrite,
+                    expiry: None
+                })
+            );
+        });
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent::ARM_DELAY;
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        let state = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (workspace.agent.revealed, workspace.agent.armed)
+            })
+        };
+        assert_eq!(state(cx), (Some(id), None), "the dialog was revealed");
+
+        let approve = cx
+            .debug_bounds("agent-ping-approve")
+            .expect("the dialog draws Approve");
+        cx.simulate_click(approve.center(), gpui::Modifiers::default());
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.approve_call(id, cx));
+        assert_eq!(pending_calls(&workspace, cx), [id]);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+
+        cx.executor()
+            .advance_clock(ARM_DELAY - Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(state(cx).1, None, "armed a millisecond early");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(state(cx).1, Some(id));
+
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+        assert_eq!(email_of(1).as_deref(), Some("z@x"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_approved_write_touches_no_tab_grid_buffer_or_history(cx: &mut TestAppContext) {
+    use crate::{agent::Status, session::ProfileState};
+
+    store::tests::with_home(|| {
+        // `Secret`, the first profile, is connected at launch: the user's own
+        // session on the file the agent writes.
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        cx.update(|window, cx| {
+            let editor = workspace
+                .read(cx)
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("a connected profile opens on a query tab")
+                .editor
+                .clone();
+            editor.update(cx, |input, cx| input.set_value("SELECT 1", window, cx));
+        });
+        let record = |cx: &mut VisualTestContext| {
+            let shape = workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("a profile is in front");
+                (
+                    profile.id.clone(),
+                    profile.session.queries.len(),
+                    profile.session.objects.len(),
+                    profile.session.active,
+                )
+            });
+            (
+                shape,
+                buffer(&workspace, cx),
+                store::history("secret").len(),
+                store::history("orders").len(),
+            )
+        };
+        let before = record(cx);
+        assert_eq!(before.0.0, "secret");
+        assert_eq!(before.1, "SELECT 1");
+
+        let (_, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+        settle(cx);
+
+        assert_eq!(record(cx), before);
+        workspace.read_with(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            assert!(matches!(orders.state, ProfileState::Idle));
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn enter_never_approves_a_ping(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
@@ -5608,14 +5826,14 @@ fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAp
         let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
         let insert = "INSERT INTO t VALUES (9, 'z')";
         let drop = "DROP TABLE t";
-        inject_sql(&workspace, cx, "Orders", insert);
+        let (held, _held_answers) = inject_approval(&workspace, cx, "Orders", insert);
         inject_sql(&workspace, cx, "Orders", drop);
         cx.run_until_parked();
 
+        // The refusal is logged at once; the held statement waits for a person.
         let log = agent_log(&workspace, cx);
         let refusal = "DROP is refused for agent statements";
-        // Newest first: the DROP, then the INSERT.
-        assert_eq!(log.len(), 2);
+        assert_eq!(log.len(), 1);
         assert_eq!(
             (log[0].status, log[0].verdict.clone(), log[0].sql.as_deref()),
             (
@@ -5624,10 +5842,15 @@ fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAp
                 Some(drop)
             )
         );
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(held, cx));
+
+        let log = agent_log(&workspace, cx);
+        // Newest first: the denied INSERT, then the DROP.
+        assert_eq!(log.len(), 2);
         assert_eq!(
-            (log[1].status, log[1].verdict.clone(), log[1].sql.as_deref()),
+            (log[0].status, log[0].verdict.clone(), log[0].sql.as_deref()),
             (
-                Status::RefusedByGate,
+                Status::Rejected,
                 Some(AuditVerdict::Approve {
                     mode: Mode::ReadWrite,
                     expiry: None
@@ -5640,11 +5863,11 @@ fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAp
         }
 
         assert_eq!(
-            log[0].verdict.as_ref().map(|v| v.line()),
+            log[1].verdict.as_ref().map(|v| v.line()),
             Some(format!("Refused: {refusal}"))
         );
         assert_eq!(
-            log[1].verdict.as_ref().map(|v| v.line()).as_deref(),
+            log[0].verdict.as_ref().map(|v| v.line()).as_deref(),
             Some("Needs approval at Read-write")
         );
         // The dialog draws both entries with their statements.
@@ -6419,22 +6642,20 @@ fn a_read_keeps_the_first_rows_and_runs_as_written(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_statement_that_needs_approval_is_refused_and_never_reaches_the_server(
-    cx: &mut TestAppContext,
-) {
-    use crate::agent::Status;
+fn a_statement_that_needs_approval_waits_and_opens_nothing(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
 
     store::tests::with_home(|| {
         let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
-        let answers = inject_sql(&workspace, cx, "Orders", "INSERT INTO t VALUES (9, 'z')");
+        let (id, answers) =
+            inject_approval(&workspace, cx, "Orders", "INSERT INTO t VALUES (9, 'z')");
         cx.run_until_parked();
-        let reply = answers.try_recv().expect("the gate answers at once");
-        assert_eq!(reply.status, Status::RefusedByGate);
-        assert_eq!(reply.text, super::agent_read::NEEDS_APPROVAL);
+        assert_eq!(answers.try_recv().err(), Some(TryRecvError::Empty));
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
-            assert!(workspace.agent.calls.is_empty());
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
         });
+        assert_eq!(pending_calls(&workspace, cx), [id]);
         assert_eq!(rows_in_orders(), 3);
         quit(workspace, cx);
     });
@@ -6812,13 +7033,22 @@ fn agent_duckdb<'a>(
     cx: &'a mut TestAppContext,
     path: &str,
 ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    agent_duckdb_with(cx, path, "")
+}
+
+/// [`agent_duckdb`] with more scalar keys for `Ducks`, such as its mode.
+fn agent_duckdb_with<'a>(
+    cx: &'a mut TestAppContext,
+    path: &str,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
     launch_with_profiles(
         cx,
         &[
             sqlite_profile("secret", "Secret", ""),
             format!(
                 "[[profiles]]\nid = \"ducks\"\nname = \"Ducks\"\nhost = \"\"\ndatabase = \"\"\n\
-                 user = \"\"\nengine = \"duckdb\"\npath = {path:?}\nagent_visible = true\n"
+                 user = \"\"\nengine = \"duckdb\"\npath = {path:?}\nagent_visible = true\n{extra}\n"
             ),
         ]
         .concat(),
@@ -6859,6 +7089,50 @@ fn an_agent_read_on_a_duckdb_file_sees_the_latest_commit(cx: &mut TestAppContext
             .expect("the user commits a row");
         let second = count(cx);
         assert!(second.contains("[\"2\"]"), "{second}");
+        drop(user);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_write_on_duckdb_is_refused_before_it_is_shown(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("ducks.duckdb").display().to_string();
+        // The user's own instance, held open for the whole test.
+        let user = ::duckdb::Connection::open(&path).expect("the file opens");
+        user.execute_batch("CREATE TABLE t (id INTEGER)")
+            .expect("the schema applies");
+        let (workspace, cx) = agent_duckdb_with(cx, &path, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+
+        let answers = inject_sql(&workspace, cx, "Ducks", "CREATE INDEX i ON t (id)");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(
+            answer,
+            Reply {
+                status: Status::RefusedByGate,
+                text: crate::db::DUCKDB_WRITE_REFUSED.to_string(),
+            }
+        );
+        settle(cx);
+        assert_ne!(front_dialog(&workspace, cx), Some("agent-ping"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.calls.is_empty(), "the write was held");
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+        let indexes: i64 = user
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'i'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the catalog reads");
+        assert_eq!(indexes, 0);
         drop(user);
         quit(workspace, cx);
     });
