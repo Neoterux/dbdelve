@@ -65,6 +65,10 @@ pub(crate) struct AgentState {
     pub(crate) armed: Option<CallId>,
     /// The approval [`Workspace::reveal_approval`] last started the arm for.
     pub(crate) revealed: Option<CallId>,
+    /// The last call whose reveal asked the OS for the person's attention. Calls
+    /// are shown oldest first and ids rise, so a call that never asked is one
+    /// other than this.
+    pub(crate) attended: Option<CallId>,
     /// The one-shot timer that sets `armed`. Replaced, and so cancelled, each
     /// time the dialog in front is revealed.
     _arming: Option<gpui::Task<()>>,
@@ -639,7 +643,7 @@ impl Workspace {
     /// Approve is dead until [`ARM_DELAY`] has passed from now. Called one frame
     /// after the dialog is raised or the front call changes, so it counts from
     /// what the person can see and never from the call's arrival.
-    pub(crate) fn reveal_approval(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reveal_approval(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.front_approval_id() else {
             return;
         };
