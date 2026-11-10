@@ -50,7 +50,7 @@ use super::{CallArgs, Reply, Status, tools::Tool, wire};
 const NOT_RUNNING: &str = "DBDelve is not running, or its agent access is off.";
 
 // ponytail: Claude Code gives up on a call that stays silent for 30 seconds,
-// and a person answering a ping takes longer, so a waiting call says it is
+// and a person answering an approval takes longer, so a waiting call says it is
 // still alive every 10: margin for a late tick, no setting.
 #[cfg(unix)]
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
@@ -291,15 +291,6 @@ fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>, Cal
             "`list_connections` takes no arguments.",
             None,
         )),
-        Tool::Ping => match (arguments.len(), arguments.get("connection")) {
-            (1, Some(serde_json::Value::String(name))) => {
-                Ok((tool, Some(name.clone()), CallArgs::default()))
-            }
-            _ => Err(ErrorData::invalid_params(
-                "`ping` takes one string argument, `connection`.",
-                None,
-            )),
-        },
         Tool::ListSchemas => match (arguments.len(), arguments.get("connection")) {
             (1, Some(serde_json::Value::String(name))) => {
                 Ok((tool, Some(name.clone()), CallArgs::default()))
@@ -1298,15 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn a_ping_without_a_connection_name_is_an_invalid_params_error() {
+    fn an_unknown_tool_or_an_argument_a_tool_does_not_take_is_an_invalid_params_error() {
         let app = App::answering(executed("[]"));
         block_on(async {
             let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
             client.initialize().await;
             for (tool, arguments) in [
-                ("ping", json!({})),
-                ("ping", json!({"connection": "a", "x": 1})),
-                ("ping", json!({"connection": 3})),
                 ("list_connections", json!({"connection": "a"})),
                 ("not_a_tool", json!({})),
             ] {
