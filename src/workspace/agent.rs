@@ -10,13 +10,18 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::SyncSender,
+    time::{Duration, Instant},
+};
 
 use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
 use super::agent_write;
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
+    db::ConnectionConfig,
     sql::{AgentVerdict, agent_gate},
 };
 
@@ -52,12 +57,29 @@ pub(crate) struct AgentState {
     /// What opens an agent's connection; `None` is the real open. Tests put
     /// one here to stand in for an open that never returns.
     pub(crate) opener: Option<agent_read::Opener>,
+    /// The approved writes running now, found by their id. Each holds no
+    /// connection and no way to cancel it: see [`agent_write`].
     pub(crate) writes: Vec<agent_write::Writing>,
+    /// The call whose Approve is live: the approval in front, once
+    /// [`ARM_DELAY`] has passed since it was shown. At most one.
     pub(crate) armed: Option<CallId>,
+    /// The approval [`Workspace::reveal_approval`] last started the arm for.
     pub(crate) revealed: Option<CallId>,
+    /// The one-shot timer that sets `armed`. Replaced, and so cancelled, each
+    /// time the dialog in front is revealed.
+    _arming: Option<gpui::Task<()>>,
 }
 
-pub(crate) const ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+// ponytail: the wait between an approval being shown and its Approve working,
+// a decision and not a setting: long enough that a click or keystroke already
+// in flight when the dialog appeared cannot land on an Approve that did not
+// exist when it began. The upgrade is a setting.
+pub(crate) const ARM_DELAY: Duration = Duration::from_millis(1500);
+
+/// What an approval that was approved is told when the statement, the
+/// connection or the profile's access level is not what it was when the person
+/// was shown it. Nothing was opened.
+pub(super) const CHANGED_SINCE_SHOWN: &str = "The statement, the connection or its access level changed after it was shown, so it was not run.";
 
 // ponytail: the audit is this session's own and keeps the last five hundred
 // calls, in memory only, because it is read in a dialog and a longer list is
@@ -126,6 +148,8 @@ pub(crate) struct CallFacts {
     /// Whole milliseconds from the call's arrival to its end.
     pub(crate) elapsed_ms: u64,
     pub(crate) error: Option<String>,
+    /// The caller hung up before the call ended.
+    pub(crate) requester_gone: bool,
 }
 
 /// One call that ended: its names, its code, its time and what the agent sent.
@@ -211,7 +235,7 @@ impl AgentState {
                     .collect()
             }),
             status,
-            requester_gone: false,
+            requester_gone: facts.requester_gone,
             verdict: facts.verdict,
             sql: facts.sql.map(clipped),
             shown: facts.shown,
@@ -249,9 +273,25 @@ pub(crate) struct PendingCall {
     reply: std::sync::mpsc::SyncSender<Reply>,
     /// When the call reached [`Workspace::on_agent_message`].
     arrived: Instant,
+    /// What the person is asked to approve, for a statement the gate held. A
+    /// ping asks for nothing and has none.
+    pub(crate) approval: Option<Approval>,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
     _expiry: gpui::Task<()>,
+}
+
+/// The statement a held call asks to run, with what the gate and the profile
+/// said of it when it arrived. `sql` is exactly what the agent sent: what the
+/// dialog draws and what runs, never a copy that was cleaned for the screen.
+pub(crate) struct Approval {
+    pub(crate) sql: String,
+    /// The gate's answer at arrival, which the re-gate at Approve must
+    /// reproduce.
+    pub(crate) verdict: AgentVerdict,
+    /// The profile's config at arrival, compared with the current one at
+    /// Approve.
+    pub(crate) config: ConnectionConfig,
 }
 
 /// What a pending call is told when the kill switch ends it.
@@ -495,7 +535,138 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn approve_call(&mut self, _id: CallId, _cx: &mut Context<Self>) {}
+    /// The call the dialog in front is about, when it asks for a statement to
+    /// be run and not for a ping to be answered.
+    pub(crate) fn front_approval_id(&self) -> Option<CallId> {
+        self.front_ping()
+            .filter(|call| call.approval.is_some())
+            .map(|call| call.id)
+    }
+
+    /// The timer that ends a call nobody answered as `expired`. Dropping it
+    /// with the call is what cancels it.
+    fn expiry_of(&self, id: CallId, cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(EXPIRY).await;
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.finish_call(id, Status::Expired, expired_text(), cx)
+            });
+        })
+    }
+
+    /// The approval in front has just been drawn, as the dialog in front: its
+    /// Approve is dead until [`ARM_DELAY`] has passed from now. Called one frame
+    /// after the dialog is raised or the front call changes, so it counts from
+    /// what the person can see and never from the call's arrival.
+    pub(crate) fn reveal_approval(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.front_approval_id() else {
+            return;
+        };
+        self.agent.revealed = Some(id);
+        self.agent.armed = None;
+        // Replacing the old timer cancels it.
+        self.agent._arming = Some(cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(ARM_DELAY).await;
+            _ = workspace.update(cx, |workspace, cx| {
+                if workspace.front_approval_id() == Some(id) {
+                    workspace.agent.armed = Some(id);
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The dialog's Approve for a held statement. Does nothing until the call is
+    /// armed. Then the call is taken out of the waiting list, and the statement
+    /// is judged again as the gate sees it now: it must come out as it did when
+    /// it arrived, on the config it arrived with. Only then does the write
+    /// start, on a connection of its own, with the very `String` the dialog drew.
+    pub(crate) fn approve_call(&mut self, id: CallId, cx: &mut Context<Self>) {
+        if self.agent.armed != Some(id) {
+            return;
+        }
+        let Some(index) = self
+            .agent
+            .calls
+            .iter()
+            .position(|call| call.id == id && call.approval.is_some())
+        else {
+            return;
+        };
+        let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
+        // Dropping the call's expiry with the rest of it.
+        let call = self.agent.calls.remove(index);
+        let PendingCall {
+            profile_id,
+            profile_name,
+            reply,
+            arrived,
+            approval: Some(approval),
+            ..
+        } = call
+        else {
+            return;
+        };
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id && profile.agent_visible);
+        let held = AuditVerdict::held_by(approval.verdict.clone());
+        let (status, text) = match profile {
+            None => (Status::Rejected, NO_LONGER_AVAILABLE),
+            Some(profile)
+                if agent_gate(profile.config.engine(), &approval.sql, profile.mode)
+                    != approval.verdict
+                    || profile.config != approval.config =>
+            {
+                (Status::RefusedByGate, CHANGED_SINCE_SHOWN)
+            }
+            Some(_) => {
+                self.start_write(
+                    id,
+                    profile_id,
+                    profile_name,
+                    approval.config,
+                    approval.sql,
+                    held,
+                    reply,
+                    arrived,
+                    cx,
+                );
+                self.finish_approval(was_in_front, cx);
+                return;
+            }
+        };
+        self.agent_answered(
+            id,
+            Tool::ExecuteSql,
+            Some(profile_name),
+            None,
+            &reply,
+            Reply {
+                status,
+                text: text.to_string(),
+            },
+            CallFacts {
+                verdict: held,
+                sql: Some(approval.sql),
+                elapsed_ms: elapsed_ms(arrived),
+                ..CallFacts::default()
+            },
+        );
+        self.finish_approval(was_in_front, cx);
+    }
+
+    /// What every end of an approval does after the call left the list: the
+    /// arm is spent, and the keyboard goes back if the dialog that took it went.
+    fn finish_approval(&mut self, was_in_front: bool, cx: &mut Context<Self>) {
+        self.agent.armed = None;
+        if was_in_front {
+            self.refocus_front();
+        }
+        cx.notify();
+    }
 
     /// Deny whichever ping the dialog in front is about. Answers whether there
     /// was one, so `escape` is only spent on a dialog that was drawn.
@@ -799,13 +970,47 @@ impl Workspace {
                 let verdict = agent_gate(engine, &sql, mode);
                 // The verdict's contents are what an approval will show,
                 // which agents do not get.
-                let refused = match &verdict {
+                let (refused, audited) = match &verdict {
                     AgentVerdict::Run => {
                         self.run_agent_sql(id, resolved, sql, reply, arrived, cx);
                         return;
                     }
-                    AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
-                    AgentVerdict::Refuse(reason) => reason.to_string(),
+                    // A write is held for a person, unless nothing can run it
+                    // for an agent on this engine: then it is refused here,
+                    // before there is a pending call or a dialog to be shown.
+                    AgentVerdict::Approve(held, _) if held.mode == Mode::ReadWrite => {
+                        match resolved.config.agent_write_refusal() {
+                            Some(refusal) => (
+                                refusal.to_string(),
+                                Some(AuditVerdict::Refuse(refusal.to_string())),
+                            ),
+                            None => {
+                                let expiry = self.expiry_of(id, cx);
+                                self.agent.calls.push(PendingCall {
+                                    id,
+                                    profile_id: resolved.id,
+                                    tool: Tool::ExecuteSql,
+                                    profile_name: resolved.name,
+                                    reply,
+                                    arrived,
+                                    approval: Some(Approval {
+                                        sql,
+                                        verdict,
+                                        config: resolved.config,
+                                    }),
+                                    _expiry: expiry,
+                                });
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    }
+                    AgentVerdict::Approve(..) => {
+                        (NEEDS_APPROVAL.to_string(), AuditVerdict::held_by(verdict))
+                    }
+                    AgentVerdict::Refuse(reason) => {
+                        (reason.to_string(), AuditVerdict::held_by(verdict))
+                    }
                 };
                 self.agent_answered(
                     id,
@@ -818,7 +1023,7 @@ impl Workspace {
                         text: refused,
                     },
                     CallFacts {
-                        verdict: AuditVerdict::held_by(verdict),
+                        verdict: audited,
                         sql: Some(sql),
                         elapsed_ms: elapsed_ms(arrived),
                         ..CallFacts::default()
@@ -972,12 +1177,7 @@ impl Workspace {
                         return;
                     }
                 };
-                let expiry = cx.spawn(async move |workspace, cx| {
-                    cx.background_executor().timer(EXPIRY).await;
-                    _ = workspace.update(cx, |workspace, cx| {
-                        workspace.finish_call(id, Status::Expired, expired_text(), cx)
-                    });
-                });
+                let expiry = self.expiry_of(id, cx);
                 self.agent.calls.push(PendingCall {
                     id,
                     profile_id,
@@ -985,6 +1185,7 @@ impl Workspace {
                     profile_name,
                     reply,
                     arrived,
+                    approval: None,
                     _expiry: expiry,
                 });
                 cx.notify();
@@ -1041,6 +1242,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
+            // A running write ends by its own result alone: a hangup is noted
+            // for the audit and nothing else reaches it.
+            if let Some(write) = self.agent.writes.iter_mut().find(|write| write.id == id) {
+                write.requester_gone |= status == Status::Cancelled;
+                return true;
+            }
             return self.finish_read(id, status, text, true, Default::default(), cx);
         };
         let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
@@ -1049,6 +1256,12 @@ impl Workspace {
             // The caller may have hung up, and then nobody reads this.
             let _ = call.reply.send(Reply { status, text });
         }
+        // A held statement is audited with what it asked, so a denied, expired
+        // or hung-up approval says which statement it was.
+        let (verdict, sql) = match call.approval {
+            Some(approval) => (AuditVerdict::held_by(approval.verdict), Some(approval.sql)),
+            None => (None, None),
+        };
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
         self.agent.record(
@@ -1058,10 +1271,15 @@ impl Workspace {
             None,
             status,
             CallFacts {
+                verdict,
+                sql,
                 elapsed_ms: elapsed_ms(call.arrived),
                 ..CallFacts::default()
             },
         );
+        if self.agent.armed == Some(id) {
+            self.agent.armed = None;
+        }
         if was_in_front {
             // The dialog took the keyboard when it went up and goes away with
             // the call, by whichever route the call ended.

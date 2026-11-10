@@ -1220,8 +1220,15 @@ impl ConnectionConfig {
         )
     }
 
+    /// Why an agent's approved write may not run on this profile, when it may
+    /// not: DuckDB, file or in-memory. A write from a second connection to the
+    /// file succeeds and is then lost -- the probe found a second writable
+    /// instance in one process silently dropping the agent's write -- and a
+    /// second process is refused by the file lock. The user's own instance is
+    /// never shared with the agent (Phase 5 D-23), so there is no connection a
+    /// write could ride on instead. Asked before anything is shown or opened.
     pub fn agent_write_refusal(&self) -> Option<&'static str> {
-        None
+        matches!(self, Self::DuckDb { .. }).then_some(DUCKDB_WRITE_REFUSED)
     }
 
     /// Whether an agent's read of this connection can make the user's commit
@@ -1857,7 +1864,19 @@ impl Connection {
         Ok(connection)
     }
 
+    /// Open the connection an approved agent write runs on. A named seam so
+    /// every agent open stays greppable: it adds no read-only hold, so a file
+    /// engine opens writable and a server session starts as the profile's own.
+    /// A DuckDB config is refused before anything is opened or created, the
+    /// second line of defence behind [`ConnectionConfig::agent_write_refusal`]
+    /// being asked at arrival.
+    ///
+    /// The connection is for one call and is dropped with it, never kept: a
+    /// session change the statement makes must die with it.
     pub fn open_for_approved_write(config: ConnectionConfig) -> Result<Self, DbError> {
+        if let Some(refusal) = config.agent_write_refusal() {
+            return Err(plain_error(refusal.to_string()));
+        }
         Self::open(config)
     }
 
