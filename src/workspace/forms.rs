@@ -9,6 +9,7 @@ use gpui::{Animation, AnimationExt, Div, PathPromptOptions, StyledText, ease_out
 use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable};
@@ -1774,6 +1775,18 @@ impl Workspace {
                 *shown = Some((id, approval.sql.clone()));
             }
         }
+        // The block's scroll offset, fresh for each call.
+        let scroll = {
+            let mut kept = self.approval_scroll.borrow_mut();
+            match kept.as_ref() {
+                Some((kept_id, handle)) if *kept_id == id => handle.clone(),
+                _ => {
+                    let handle = gpui::ScrollHandle::new();
+                    *kept = Some((id, handle.clone()));
+                    handle
+                }
+            }
+        };
         let code = fonts(cx).editor.clone();
         // A marker is DBDelve's own, drawn in the accent so it cannot pass for
         // the statement's text.
@@ -1801,6 +1814,10 @@ impl Workspace {
         .into_iter()
         .filter(|fact| *fact != size)
         .map(|fact| div().child(fact));
+        // Everything on the card keeps its height but the statement block,
+        // which gives up its own down to nothing before the buttons leave a
+        // short window: they are the only way to answer.
+        let fixed = || div().flex_shrink_0();
         let waiting = self.agent.calls.len().saturating_sub(1);
         let deny_workspace = cx.entity().downgrade();
         let approve_workspace = deny_workspace.clone();
@@ -1821,13 +1838,15 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
+                .py(px(layout::SPACE_LG))
                 .child(
                     dialog(t)
                         .w(px(layout::APPROVAL_DIALOG_WIDTH))
                         .max_w(gpui::relative(0.9))
-                        .child(section_label(t, "Agent"))
+                        .max_h_full()
+                        .child(fixed().child(section_label(t, "Agent")))
                         .child(
-                            div()
+                            fixed()
                                 .flex()
                                 .gap(px(layout::SPACE_SM))
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
@@ -1835,7 +1854,7 @@ impl Workspace {
                                 .child(div().text_color(t.text_muted).child(engine.label())),
                         )
                         .child(
-                            div()
+                            fixed()
                                 .debug_selector(|| "agent-approval-facts".into())
                                 .flex()
                                 .flex_col()
@@ -1844,33 +1863,58 @@ impl Workspace {
                                 .children(facts),
                         )
                         .child(
-                            div()
+                            fixed()
                                 .debug_selector(|| "agent-approval-label".into())
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
                                 .child("Statement from the agent, exactly as sent"),
                         )
                         // Nothing on this surface moves on its own, so the block
-                        // has no smooth-scroll modifier. One element per line,
-                        // so none is left out of a long statement.
+                        // has no smooth-scroll modifier and its scrollbar is
+                        // always drawn rather than faded in: a statement that
+                        // goes on below the fold shows that it does. One
+                        // element per line, so none is left out of a long
+                        // statement.
                         .child(
                             div()
-                                .id("agent-approval-sql")
-                                .debug_selector(|| "agent-approval-sql".into())
+                                .relative()
+                                .flex()
+                                .flex_col()
+                                .min_h(px(0.))
                                 .max_h(px(layout::APPROVAL_TEXT_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .font_family(code)
-                                .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                .children(lines.into_iter().enumerate().map(|(index, line)| {
+                                .child(
                                     div()
-                                        .debug_selector(move || {
-                                            format!("agent-approval-line-{index}")
-                                        })
-                                        .child(line)
-                                })),
+                                        .id("agent-approval-sql")
+                                        .debug_selector(|| "agent-approval-sql".into())
+                                        .track_scroll(&scroll)
+                                        .overflow_y_scroll()
+                                        .min_h(px(0.))
+                                        .font_family(code)
+                                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                        .children(lines.into_iter().enumerate().map(
+                                            |(index, line)| {
+                                                div()
+                                                    .debug_selector(move || {
+                                                        format!("agent-approval-line-{index}")
+                                                    })
+                                                    .child(line)
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .debug_selector(|| "agent-approval-scrollbar".into())
+                                        .child(
+                                            Scrollbar::vertical(&scroll)
+                                                .id(("agent-approval-scrollbar", id.0))
+                                                .mode(ScrollbarMode::Always),
+                                        ),
+                                ),
                         )
                         .child(
-                            div()
+                            fixed()
                                 .debug_selector(|| "agent-approval-size".into())
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
@@ -1878,7 +1922,7 @@ impl Workspace {
                         )
                         .when(waiting > 0, |card| {
                             card.child(
-                                div()
+                                fixed()
                                     .debug_selector(|| "agent-approval-waiting".into())
                                     .text_size(px(layout::chrome(layout::TEXT_SM)))
                                     .text_color(t.text_muted)
@@ -1886,7 +1930,7 @@ impl Workspace {
                             )
                         })
                         .child(
-                            div()
+                            fixed()
                                 .flex()
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
