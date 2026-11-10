@@ -1163,6 +1163,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let found = match connection.as_deref() {
@@ -1267,6 +1268,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let found = match connection.as_deref() {
@@ -1334,6 +1336,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let resolved = match connection.as_deref() {

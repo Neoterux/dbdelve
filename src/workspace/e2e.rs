@@ -3943,6 +3943,7 @@ fn inject_call_with(
         connection: connection.map(str::to_string),
         args,
         reply,
+        gone: Default::default(),
     };
     workspace.update(cx, |workspace, cx| workspace.on_agent_message(call, cx));
     (id, answers)
@@ -4187,6 +4188,72 @@ fn an_unanswered_approval_expires_after_the_fixed_wait(cx: &mut TestAppContext) 
         assert!(answers.try_recv().is_err(), "nothing else is ever sent");
         assert_eq!(email_of(1).as_deref(), Some("a@x"), "the statement ran");
         quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_approval_after_its_caller_hung_up_starts_nothing(cx: &mut TestAppContext) {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
+        client
+            .write_all(format!("{}\n", update_orders()).as_bytes())
+            .expect("the frame is written");
+        drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
+        let id = pending_calls(&workspace, cx)[0];
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.agent.armed),
+            Some(id),
+            "the approval is drawn and armed"
+        );
+
+        // The caller leaves and the window, not being run, does not hear it:
+        // the person's click lands in the moment between the two.
+        drop(client);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            pending_calls(&workspace, cx),
+            [id],
+            "the window has not heard"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.approve_call(id, cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+        });
+        let entries: Vec<_> = agent_log(&workspace, cx)
+            .into_iter()
+            .filter(|entry| entry.id == id)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, Status::Cancelled);
+        assert!(entries[0].requester_gone);
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        assert!(
+            audit_lines()
+                .iter()
+                .all(|line| !(line["id"] == id.0 && line["phase"] == "started")),
+            "nothing was recorded as started"
+        );
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
     });
 }
 
