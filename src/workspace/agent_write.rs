@@ -224,7 +224,7 @@ impl Workspace {
         // From the socket's flag as well as from a `Hangup` the window heard,
         // and known before the outcome line is written: `Undelivered` arrives
         // after it and could only change the in-memory entry.
-        let requester_gone = write.requester_gone;
+        let requester_gone = write.requester_gone || write.gone.load(Ordering::Acquire);
         // The caller may have hung up, and then nobody reads this; the reply is
         // still sent, because a dropped sender would close the socket with no
         // answer for a caller that is still there.

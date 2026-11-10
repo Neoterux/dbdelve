@@ -10329,6 +10329,9 @@ fn a_running_write_keeps_the_agent_mark_lit(cx: &mut TestAppContext) {
 
     store::tests::with_home(|| {
         let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        // The socket's own threads touch the scheduler's wakers when the
+        // bridge ends.
+        cx.executor().allow_parking();
         let path = crate::agent::tests::short_socket_path();
         workspace
             .update(cx, |workspace, cx| {
