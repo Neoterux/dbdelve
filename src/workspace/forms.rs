@@ -1890,8 +1890,16 @@ impl Workspace {
                                         .track_scroll(&scroll)
                                         .overflow_y_scroll()
                                         .min_h(px(0.))
+                                        // Framed as every other statement on
+                                        // a modal is, so the agent's text is
+                                        // set apart from DBDelve's facts by
+                                        // more than its font.
+                                        .p(px(layout::SPACE_SM))
+                                        .rounded(px(layout::RADIUS_CONTROL))
+                                        .bg(t.surface)
                                         .font_family(code)
                                         .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                        .text_color(t.text)
                                         .children(lines.into_iter().enumerate().map(
                                             |(index, line)| {
                                                 div()
