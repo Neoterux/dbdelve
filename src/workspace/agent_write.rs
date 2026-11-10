@@ -651,6 +651,49 @@ mod tests {
         assert!(audited.starts_with("duplicate key value"), "{audited}");
     }
 
+    /// Redis's read timeout starts once the command is written, after the
+    /// instant `ran_for` counts from, so a write its timer stopped always
+    /// reads as having run its whole bound.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_redis_write_its_timer_stopped_says_its_outcome_is_not_known() {
+        let config = ConnectionConfig::Redis(crate::db::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: Some(
+                std::env::var("DBDELVE_REDIS_PORT")
+                    .ok()
+                    .map_or(56379, |port| port.parse().expect("a port number")),
+            ),
+            database: "0".to_string(),
+            user: "dbdelve".to_string(),
+            password: "dbdelve".to_string(),
+            sslmode: crate::db::SslMode::Disable,
+            root_certificate: None,
+            statement_timeout: 1,
+            ssh: None,
+            schema: None,
+            read_only: false,
+        });
+        let bound = Duration::from_secs(u64::from(write_timeout(1)));
+        const SQL: &str = "BLPOP dbdelve:never 0";
+        let Wrote::Done {
+            hidden,
+            ran_for,
+            result: Err(error),
+        } = approved(&config, SQL)
+        else {
+            panic!("the blocked command did not time out");
+        };
+        assert!(ran_for >= bound, "{ran_for:?} < {bound:?}");
+        let text = failed_text(
+            Engine::Redis,
+            SQL,
+            &scrubbed(&error.message, &hidden),
+            ran_for >= bound,
+        );
+        assert!(text.ends_with(UNKNOWN_OUTCOME), "{text}");
+    }
+
     #[test]
     #[ignore = "requires the compose databases"]
     fn live_the_write_session_carries_its_bounds() {
