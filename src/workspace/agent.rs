@@ -58,6 +58,9 @@ pub(crate) struct AgentState {
     /// What opens an agent's connection; `None` is the real open. Tests put
     /// one here to stand in for an open that never returns.
     pub(crate) opener: Option<agent_read::Opener>,
+    /// What runs an approved write; `None` is [`agent_write::open_for_write`].
+    /// Tests put one here to hold a write running.
+    pub(crate) write_runner: Option<agent_write::WriteRunner>,
     /// The approved writes running now, found by their id. Each holds no
     /// connection and no way to cancel it: see [`agent_write`].
     pub(crate) writes: Vec<agent_write::Writing>,
@@ -655,7 +658,9 @@ impl Workspace {
 
     /// Answer every call waiting on this profile `rejected`, oldest first, each
     /// once, and end its reads, running and waiting, and drop its agent
-    /// connection. Calls on any other profile are left as they are.
+    /// connection. Calls on any other profile are left as they are, and so is
+    /// an approved write already running on this one: it finishes and is
+    /// audited (D-16).
     pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let waiting: Vec<CallId> = self
             .agent
@@ -886,6 +891,7 @@ impl Workspace {
                                 held,
                                 reply,
                                 arrived,
+                                approval.gone,
                                 cx,
                             ),
                         }
@@ -1080,6 +1086,12 @@ impl Workspace {
     /// Stop listening and forget who was attached. Dropping the bridge stops
     /// the listener, removes the socket file and shuts every presence
     /// connection; it leaves the saved choice alone, so quitting keeps it.
+    ///
+    // ponytail: quitting while an approved write runs does not wait for it and
+    // asks nothing, so the write may be cut off with the process. Its `started`
+    // line is already in the audit file with no `outcome` line, which is the
+    // trace an interrupted call leaves. The upgrade is a confirmation on quit,
+    // which the owner declined (D-31).
     pub(crate) fn drop_bridge(&mut self) {
         self.agent.bridge = None;
         self.agent.presence.clear();
@@ -1089,7 +1101,9 @@ impl Workspace {
     /// listens until the user turns access on again. In order:
     ///
     /// 1. Every pending call and every read, running or waiting, is answered
-    ///    `rejected` and every agent connection is dropped. This comes first and runs
+    ///    `rejected` and every agent connection is dropped. An approved write
+    ///    already running is not among them: it finishes and is audited, as
+    ///    nothing but its own result ends it (D-16). This comes first and runs
     ///    with or without a bridge, because dropping the bridge never closes a
     ///    call's connection: each call's writer thread sends its frame and then
     ///    closes its own socket, so a waiting client reads a whole answer and
@@ -1418,6 +1432,10 @@ impl Workspace {
                 self.finish_call(id, Status::Cancelled, String::new(), cx);
             }
             Inbound::Undelivered { id } => {
+                // Only the in-memory entry: the audit file is append-only and an
+                // outcome line already written is not rewritten. A write's own
+                // line says the caller was gone from the socket's flag, known
+                // before it was written.
                 if let Some(entry) = self.agent.log.iter_mut().find(|entry| entry.id == id) {
                     entry.requester_gone = true;
                     cx.notify();
