@@ -5082,6 +5082,75 @@ fn approve_is_inert_until_armed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn an_approval_covered_by_another_dialog_is_not_armed_until_it_is_shown_again(
+    cx: &mut TestAppContext,
+) {
+    use std::time::Duration;
+
+    use super::agent::ARM_DELAY;
+    use crate::actions::ShowAgentActivity;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, _answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        let armed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.agent.armed);
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        cx.executor()
+            .advance_clock(ARM_DELAY + Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(
+            armed(cx),
+            None,
+            "armed under a dialog the person is reading"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.close_agent_audit(cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-ping"));
+        assert_eq!(armed(cx), None, "armed the moment it was uncovered");
+        cx.executor()
+            .advance_clock(ARM_DELAY - Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), None);
+        cx.executor().advance_clock(Duration::from_millis(1));
+        settle(cx);
+        assert_eq!(armed(cx), Some(id));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_approval_for_a_profile_hidden_in_another_window_is_not_run(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (_, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        settle(cx);
+        cx.executor().advance_clock(super::agent::ARM_DELAY);
+        settle(cx);
+        save_visibility_as_another_window("orders", false);
+        approve_front(cx);
+        assert_eq!(
+            answer_of(cx, &answers),
+            Reply {
+                status: Status::Rejected,
+                text: super::agent::NO_LONGER_AVAILABLE.to_string(),
+            }
+        );
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_approved_write_touches_no_tab_grid_buffer_or_history(cx: &mut TestAppContext) {
     use crate::{agent::Status, session::ProfileState};
 
