@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::SyncSender,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::agent::{AuditVerdict, CallFacts, Decision, INVALID_INDEX, elapsed_ms};
@@ -67,6 +67,13 @@ pub(crate) struct Writing {
     /// Kept after a hangup: the answer is still sent and nobody reads it.
     reply: SyncSender<Reply>,
     arrived: Instant,
+    /// When the write was handed to its connection, after any wait for the
+    /// human: `arrived` would count the approval as time the write ran.
+    started: Instant,
+    /// The statement timeout its connection carries, which is how long the
+    /// write may run before an engine that times out on the client stops
+    /// waiting.
+    bound: Duration,
     /// The statement exactly as it was approved, for the audit.
     sql: String,
     verdict: Option<AuditVerdict>,
@@ -175,13 +182,23 @@ pub(super) fn written_text(engine: Engine, sql: &str, result: &QueryResult) -> S
     }
 }
 
+/// Said after the text of a write DBDelve's own timer stopped waiting for.
+const UNKNOWN_OUTCOME: &str =
+    "DBDelve stopped waiting at its timeout; whether the server applied the write is not known.";
+
 /// What an approved write that ended `failed` answers and records: the
-/// server's (scrubbed) text, and when `sql` is a Postgres `CREATE INDEX
-/// CONCURRENTLY`, that an invalid index of that name may remain. A stopped
-/// concurrent build leaves one; no other statement does, so no other failure
-/// says it.
-fn failed_text(engine: Engine, sql: &str, server_text: &str) -> String {
-    if creates_index_concurrently(engine, sql) {
+/// server's (scrubbed) text, then
+///
+/// - that the outcome is not known, when the engine's timeout is DBDelve's own
+///   timer and the write had run for the whole bound -- the server may still
+///   apply it, and no other failure says so; or
+/// - that an invalid index of that name may remain, when `sql` is a Postgres
+///   `CREATE INDEX CONCURRENTLY`: a stopped concurrent build leaves one, no
+///   other statement does, so no other failure says it.
+fn failed_text(engine: Engine, sql: &str, server_text: &str, reached_bound: bool) -> String {
+    if reached_bound && engine.times_out_on_the_client() {
+        format!("{server_text} {UNKNOWN_OUTCOME}")
+    } else if creates_index_concurrently(engine, sql) {
         format!("{server_text} {INVALID_INDEX}")
     } else {
         server_text.to_string()
@@ -209,6 +226,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let engine = config.engine();
+        let bound = Duration::from_secs(u64::from(write_timeout(config.statement_timeout())));
         let run = self.agent.write_runner.unwrap_or(open_for_write);
         let work = cx.spawn({
             let sql = sql.clone();
@@ -225,6 +243,8 @@ impl Workspace {
             engine,
             reply,
             arrived,
+            started: Instant::now(),
+            bound,
             sql,
             verdict,
             requester_gone: false,
@@ -251,8 +271,12 @@ impl Workspace {
                 hidden,
                 result: Err(error),
             } => {
-                let text =
-                    failed_text(write.engine, &write.sql, &scrubbed(&error.message, &hidden));
+                let text = failed_text(
+                    write.engine,
+                    &write.sql,
+                    &scrubbed(&error.message, &hidden),
+                    write.started.elapsed() >= write.bound,
+                );
                 (Status::Failed, text.clone(), Some(text))
             }
         };
@@ -324,7 +348,8 @@ mod tests {
             failed_text(
                 Engine::Postgres,
                 "CREATE INDEX CONCURRENTLY i ON t (a)",
-                "boom"
+                "boom",
+                false
             ),
             remains
         );
@@ -333,8 +358,36 @@ mod tests {
             (Engine::MySql, "CREATE INDEX CONCURRENTLY i ON t (a)"),
             (Engine::Postgres, "UPDATE t SET a = 1"),
         ] {
-            assert_eq!(failed_text(engine, sql, "boom"), "boom", "{engine:?} {sql}");
+            assert_eq!(
+                failed_text(engine, sql, "boom", false),
+                "boom",
+                "{engine:?} {sql}"
+            );
         }
+    }
+
+    #[test]
+    fn a_write_stopped_by_dbdelves_own_timer_says_its_outcome_is_not_known() {
+        let unknown = format!("boom {UNKNOWN_OUTCOME}");
+        assert_eq!(failed_text(Engine::Redis, "SET k v", "boom", true), unknown);
+        assert_eq!(
+            failed_text(Engine::MongoDb, "db.t.drop()", "boom", true),
+            unknown
+        );
+        assert_eq!(failed_text(Engine::Redis, "SET k v", "boom", false), "boom");
+        assert_eq!(
+            failed_text(Engine::Postgres, "UPDATE t SET a = 1", "boom", true),
+            "boom"
+        );
+        assert_eq!(
+            failed_text(
+                Engine::Postgres,
+                "CREATE INDEX CONCURRENTLY i ON t (a)",
+                "boom",
+                true
+            ),
+            format!("boom {INVALID_INDEX}")
+        );
     }
 
     #[test]
@@ -525,7 +578,12 @@ mod tests {
         else {
             panic!("the duplicate build did not fail on the server");
         };
-        let text = failed_text(Engine::Postgres, &sql, &scrubbed(&error.message, &hidden));
+        let text = failed_text(
+            Engine::Postgres,
+            &sql,
+            &scrubbed(&error.message, &hidden),
+            false,
+        );
         assert!(text.ends_with(INVALID_INDEX), "{text}");
         assert!(
             text.starts_with(&scrubbed(&error.message, &hidden)),
