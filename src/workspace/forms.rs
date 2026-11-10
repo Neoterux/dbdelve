@@ -909,7 +909,7 @@ impl Workspace {
         }
         // An approval's Approve counts its wait from when the person can see the
         // dialog: raised to the front, or a different call come to the front.
-        if front == Some("agent-ping")
+        if front == Some("agent-approval")
             && let Some(id) = self.front_approval_id()
             && (raised || self.agent.revealed != Some(id))
         {
@@ -919,10 +919,10 @@ impl Workspace {
         // dialog raised over it, or another call in front of it, ends the arm,
         // so what comes back to the front is armed afresh.
         if self.agent.armed.is_some()
-            && (front != Some("agent-ping") || self.front_approval_id() != self.agent.armed)
+            && (front != Some("agent-approval") || self.front_approval_id() != self.agent.armed)
         {
             cx.on_next_frame(window, |workspace, _, cx| {
-                if workspace.dialog_in_front.get() != Some("agent-ping")
+                if workspace.dialog_in_front.get() != Some("agent-approval")
                     || workspace.front_approval_id() != workspace.agent.armed
                 {
                     workspace.agent.armed = None;
@@ -1023,7 +1023,7 @@ impl Workspace {
             }
             Some("import-rows") | None => 0,
             // Deny alone: Approve is click-only and never a stop.
-            Some("agent-ping") => 1,
+            Some("agent-approval") => 1,
             Some("agent-audit") => 1,
             Some(_) => 2 + checkbox,
         }
@@ -1156,8 +1156,8 @@ impl Workspace {
             ("pending-run", _) => self.cancel_pending_run(cx),
             ("agent-visibility", 0) => self.confirm_agent_visibility(cx),
             ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
-            // Every index denies: no key approves a ping.
-            ("agent-ping", _) => _ = self.deny_front_ping(cx),
+            // Every index denies: no key approves an agent's call.
+            ("agent-approval", _) => _ = self.deny_front_approval(cx),
             ("agent-audit", _) => _ = self.close_agent_audit(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
@@ -1729,13 +1729,13 @@ impl Workspace {
         )
     }
 
-    /// What an agent's ping asks the human: a test for one connection, named by
-    /// the profile's own current name read by id, never by anything the agent
-    /// sent. Deny is the ring's only stop; Approve is a click and nothing else.
+    /// What an agent asks the human to approve: a statement to run, or a test
+    /// for one connection, named by the profile's own current name read by id,
+    /// never by anything the agent sent. Deny is the ring's only stop; Approve is a click and nothing else.
     /// Nothing is drawn unless the oldest waiting call still has its profile.
-    pub(crate) fn render_agent_ping(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_agent_approval(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
-        let call = self.front_ping()?;
+        let call = self.front_approval()?;
         let id = call.id;
         let profile = self
             .profiles
@@ -1744,14 +1744,14 @@ impl Workspace {
         let deny_workspace = cx.entity().downgrade();
         let approve_workspace = deny_workspace.clone();
         if let Some(approval) = &call.approval {
-            return Some(self.render_agent_approval(id, approval, profile, t, cx));
+            return Some(self.approval_dialog(id, approval, profile, t, cx));
         }
 
         Some(
             div()
                 // Starts below the titlebar rather than over it: the agent
                 // mark's waiting count and its turn-off item must stay
-                // clickable while a ping waits, and the window controls live
+                // clickable while an approval waits, and the window controls live
                 // in that strip too.
                 .absolute()
                 .top(px(layout::TITLEBAR_HEIGHT))
@@ -1784,10 +1784,10 @@ impl Workspace {
                                 .gap(px(layout::SPACE_SM))
                                 .child(
                                     self.choice(
-                                        "agent-ping",
+                                        "agent-approval",
                                         0,
                                         button(
-                                            "deny-agent-ping",
+                                            "deny-agent-approval",
                                             "Deny",
                                             Tone::Quiet,
                                             Control::Standard,
@@ -1796,7 +1796,7 @@ impl Workspace {
                                         .on_click(
                                             move |_, _, cx| {
                                                 _ = deny_workspace.update(cx, |workspace, cx| {
-                                                    workspace.deny_ping(id, cx);
+                                                    workspace.deny_call(id, cx);
                                                 });
                                             },
                                         ),
@@ -1807,28 +1807,30 @@ impl Workspace {
                                 // alone: a press that began on one call's button
                                 // cannot finish on the next call's.
                                 .child(
-                                    div().debug_selector(|| "agent-ping-approve".into()).child(
-                                        button(
-                                            format!("approve-ping-{}", id.0),
-                                            "Approve",
-                                            Tone::Quiet,
-                                            Control::Standard,
-                                            t,
-                                        )
-                                        // A key cannot move onto it, so a key
-                                        // cannot press it.
-                                        .tab_stop(false)
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                _ = approve_workspace.update(
-                                                    cx,
-                                                    |workspace, cx| {
-                                                        workspace.approve_ping(id, cx);
-                                                    },
-                                                );
-                                            },
+                                    div()
+                                        .debug_selector(|| "agent-approval-approve".into())
+                                        .child(
+                                            button(
+                                                format!("approve-ping-{}", id.0),
+                                                "Approve",
+                                                Tone::Quiet,
+                                                Control::Standard,
+                                                t,
+                                            )
+                                            // A key cannot move onto it, so a key
+                                            // cannot press it.
+                                            .tab_stop(false)
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    _ = approve_workspace.update(
+                                                        cx,
+                                                        |workspace, cx| {
+                                                            workspace.approve_ping(id, cx);
+                                                        },
+                                                    );
+                                                },
+                                            ),
                                         ),
-                                    ),
                                 ),
                         ),
                 )
@@ -1841,7 +1843,7 @@ impl Workspace {
     /// agent sent it, in a block that scrolls. Deny is the ring's only stop;
     /// Approve is a click, off until [`agent::ARM_DELAY`] has passed since this
     /// was drawn, and never a stop for a key.
-    fn render_agent_approval(
+    fn approval_dialog(
         &self,
         id: crate::agent::CallId,
         approval: &agent::Approval,
@@ -1870,7 +1872,7 @@ impl Workspace {
         let armed = self.agent.armed == Some(id);
 
         div()
-            // Below the titlebar, as the ping is.
+            // Below the titlebar, as the ping's is.
             .absolute()
             .top(px(layout::TITLEBAR_HEIGHT))
             .left_0()
@@ -1913,10 +1915,10 @@ impl Workspace {
                             .gap(px(layout::SPACE_SM))
                             .child(
                                 self.choice(
-                                    "agent-ping",
+                                    "agent-approval",
                                     0,
                                     button(
-                                        "deny-agent-ping",
+                                        "deny-agent-approval",
                                         "Deny",
                                         Tone::Quiet,
                                         Control::Standard,
@@ -1925,7 +1927,7 @@ impl Workspace {
                                     .on_click(
                                         move |_, _, cx| {
                                             _ = deny_workspace.update(cx, |workspace, cx| {
-                                                workspace.deny_ping(id, cx);
+                                                workspace.deny_call(id, cx);
                                             });
                                         },
                                     ),
@@ -1935,26 +1937,31 @@ impl Workspace {
                             // Outside the ring, with an id of this call alone,
                             // as the ping's is.
                             .child(
-                                div().debug_selector(|| "agent-ping-approve".into()).child(
-                                    button(
-                                        format!("approve-write-{}", id.0),
-                                        "Approve",
-                                        Tone::Quiet,
-                                        Control::Standard,
-                                        t,
-                                    )
-                                    // A key cannot move onto it, so a key
-                                    // cannot press it.
-                                    .tab_stop(false)
-                                    .disabled(!armed)
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = approve_workspace.update(cx, |workspace, cx| {
-                                                workspace.approve_call(id, cx);
-                                            });
-                                        },
+                                div()
+                                    .debug_selector(|| "agent-approval-approve".into())
+                                    .child(
+                                        button(
+                                            format!("approve-write-{}", id.0),
+                                            "Approve",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        // A key cannot move onto it, so a key
+                                        // cannot press it.
+                                        .tab_stop(false)
+                                        .disabled(!armed)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = approve_workspace.update(
+                                                    cx,
+                                                    |workspace, cx| {
+                                                        workspace.approve_call(id, cx);
+                                                    },
+                                                );
+                                            },
+                                        ),
                                     ),
-                                ),
                             ),
                     ),
             )
