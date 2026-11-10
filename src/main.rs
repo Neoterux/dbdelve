@@ -68,7 +68,8 @@ use actions::{
     SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor,
     ShowMessages, ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
     ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn,
-    ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn, ZoomEditorOut,
+    ToggleResults, ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn,
+    ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
@@ -455,6 +456,7 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Results", ToggleResults),
                 MenuItem::action("Toggle Row Panel", ToggleRowPanel),
                 MenuItem::action("Toggle Row Panel Edit Mode", ToggleRowEdit),
                 MenuItem::action("Toggle Data / Structure", ToggleStructure),

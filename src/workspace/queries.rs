@@ -13,7 +13,7 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 use super::*;
 use crate::session::{
     Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume, Step,
-    TabKey, next_step, query_name_refusal,
+    TabKey, next_step, query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -2649,6 +2649,19 @@ impl Workspace {
                         unrecorded = None;
                         let _ = store::append_history(&id, &landed);
                         workspace.remember_run(&id, landed);
+                    }
+                    // Hidden for statements that answer with nothing to read,
+                    // the pane comes back for one that does, queued lanes
+                    // included: what lands must never be on screen unseen.
+                    if let Tab::Query(query) = tab
+                        && let Some(profile) = workspace.issued_to(&id, generation)
+                        && profile
+                            .session
+                            .slot_at(tab, lane.as_ref())
+                            .is_some_and(|(state, _)| reveals_results(state, produced_grid))
+                        && let Some(query) = profile.session.query_tab_mut(query)
+                    {
+                        query.results_hidden = false;
                     }
                     if keep_rows
                         && let Some(profile) = workspace.issued_to(&id, generation)
