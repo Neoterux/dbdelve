@@ -6102,6 +6102,176 @@ fn agent_audit_failure_runs_nothing(cx: &mut TestAppContext) {
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_records_every_call_reads_included(cx: &mut TestAppContext) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        let (_, _unknown) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Nope"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 1".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_, listing) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        assert_eq!(answer_of(cx, &listing).status, Status::Executed);
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT id FROM t ORDER BY id");
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        let answers = inject_sql(&workspace, cx, "Orders", "DROP TABLE t");
+        assert_eq!(answer_of(cx, &answers).status, Status::RefusedByGate);
+        let (held, _answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        workspace.update(cx, |workspace, cx| workspace.deny_call(held, cx));
+
+        let lines = audit_lines();
+        let shape: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["phase"].as_str().unwrap_or_default().to_string(),
+                    line["status"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        let line =
+            |phase: &str, status: Option<&str>| (phase.to_string(), status.map(str::to_string));
+        assert_eq!(
+            shape,
+            [
+                line("outcome", Some("refused_by_gate")),
+                line("outcome", Some("executed")),
+                line("started", None),
+                line("outcome", Some("executed")),
+                line("outcome", Some("refused_by_gate")),
+                line("outcome", Some("rejected")),
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[3]["shown"], 3);
+        assert_eq!(lines[5]["decision"], "rejected");
+        for line in lines.iter().filter(|line| line["phase"] == "started") {
+            assert!(line.get("status").is_none(), "{line}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_never_records_a_row_value(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT email FROM t WHERE id = 1");
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        let path = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join(store::AGENT_AUDIT_FILE);
+        let text = std::fs::read_to_string(path).expect("the read was written");
+        assert!(text.contains("SELECT email"), "{text}");
+        assert!(
+            !text.contains("a@x"),
+            "a row value reached the file: {text}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_cuts_a_read_and_keeps_an_approval_whole(cx: &mut TestAppContext) {
+    use super::agent::{AUDIT_SQL_CAP, SQL_CLIPPED};
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        let comment = format!("/* {} */", "x".repeat(5000));
+        let read = format!("SELECT id FROM t {comment}");
+        let answers = inject_sql(&workspace, cx, "Orders", &read);
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        let cut = format!(
+            "{}{SQL_CLIPPED}",
+            read.chars().take(AUDIT_SQL_CAP).collect::<String>()
+        );
+        let lines = audit_lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert_eq!(line["sql"], cut.as_str(), "{}", line["phase"]);
+        }
+
+        let write = format!("{UPDATE_ONE} {comment}");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", &write);
+        approve_front(cx);
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        let lines = audit_of(id);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert_eq!(line["sql"], write.as_str(), "{}", line["phase"]);
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_pairs_lines_by_call_in_the_order_they_happened(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        cx.executor().allow_parking();
+        let (a, write) = running_write(&workspace, cx);
+        let read = inject_sql(&workspace, cx, "Orders", "SELECT id FROM t");
+        let b = {
+            let answered = answer_of(cx, &read);
+            assert_eq!(answered.status, Status::Executed);
+            audit_lines()
+                .iter()
+                .find(|line| line["id"] != a.0)
+                .expect("the read left a line")["id"]
+                .clone()
+        };
+        land_write(cx);
+        assert_eq!(answer_of(cx, &write).status, Status::Executed);
+
+        let lines = audit_lines();
+        let order: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["id"] == a.0,
+                    line["phase"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let step = |is_a: bool, phase: &str| (is_a, phase.to_string());
+        assert_eq!(
+            order,
+            [
+                step(true, "started"),
+                step(false, "started"),
+                step(false, "outcome"),
+                step(true, "outcome"),
+            ],
+            "{lines:?}"
+        );
+        assert_ne!(b, serde_json::json!(a.0));
+        for line in &lines {
+            assert_eq!(line["session"], lines[0]["session"]);
+        }
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn enter_never_approves_an_approval(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
@@ -6667,6 +6837,7 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         total: None,
         elapsed_ms: 0,
         error: None,
+        decision: None,
     };
     assert_eq!(
         agent_log_label(&entry, 1_000_000 + 125_000),
@@ -6692,6 +6863,16 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
     assert_eq!(
         agent_log_label(&entry, 1_000_000),
         "moments ago \u{b7} list_connections \u{b7} executed"
+    );
+    let entry = LogEntry {
+        resolved: Some("Orders".to_string()),
+        tool: Tool::ExecuteSql,
+        decision: Some(super::agent::Decision::Approved),
+        ..entry
+    };
+    assert_eq!(
+        agent_log_label(&entry, 1_000_000),
+        "moments ago \u{b7} execute_sql \u{b7} Orders \u{b7} executed \u{b7} approved"
     );
 }
 
@@ -6826,6 +7007,7 @@ fn an_entry_is_capped_when_the_agent_was_given_fewer_rows_than_there_were() {
         total: Some(Total::Exact(100)),
         elapsed_ms: 0,
         error: None,
+        decision: None,
     };
     assert!(!entry.capped());
     let more = LogEntry {

@@ -252,6 +252,8 @@ pub(crate) struct LogEntry {
     /// The error of a call that failed, which the agent was not given, cut at
     /// [`AUDIT_SQL_CAP`] characters.
     pub(crate) error: Option<String>,
+    /// What the person decided, for a call that waited for one.
+    pub(crate) decision: Option<Decision>,
 }
 
 impl LogEntry {
@@ -341,6 +343,7 @@ impl AgentState {
             total: facts.total,
             elapsed_ms: facts.elapsed_ms,
             error: facts.error.map(clipped),
+            decision: facts.decision,
         });
         self.log.truncate(AUDIT_CAP);
     }
