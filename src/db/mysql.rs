@@ -2332,7 +2332,9 @@ mod tests {
     }
 
     /// The write lane's session waits at most the lock wait it was opened
-    /// with, and the read lane's does not.
+    /// with, for a metadata lock and for a row lock, and the read lane's does
+    /// not. The row lock is held by a transaction left open on another
+    /// session, as a user's would be.
     fn live_an_approved_write_session_carries_the_lock_wait(engine: Engine) {
         use crate::db::{Connection as Open, ConnectionConfig};
         let server = ServerConfig {
@@ -2343,22 +2345,53 @@ mod tests {
             Engine::MariaDb => ConnectionConfig::MariaDb(server),
             _ => ConnectionConfig::MySql(server),
         };
-        let wait = |connection: &Open| {
-            let result = connection
-                .query(
-                    "SELECT @@SESSION.lock_wait_timeout",
-                    &crate::db::CancelToken::default(),
-                    Fetch::default(),
-                )
-                .expect("the server answers the read");
-            result.rows[0].get(0).unwrap_or_default().to_string()
+        let run = |connection: &Open, sql: &str| {
+            connection.query(sql, &crate::db::CancelToken::default(), Fetch::default())
+        };
+        let waits = |connection: &Open| {
+            let result = run(
+                connection,
+                "SELECT @@SESSION.lock_wait_timeout, @@SESSION.innodb_lock_wait_timeout",
+            )
+            .expect("the server answers the read");
+            let row = &result.rows[0];
+            [0, 1].map(|at| row.get(at).unwrap_or_default().to_string())
         };
 
         let writer =
             Open::open_for_approved_write(config.clone(), 30).expect("the write connection opens");
-        assert_eq!(wait(&writer), "30");
-        let reader = Open::open_for_agent(config).expect("the read connection opens");
-        assert_ne!(wait(&reader), "30");
+        assert_eq!(waits(&writer), ["30", "30"]);
+        let reader = Open::open_for_agent(config.clone()).expect("the read connection opens");
+        assert_ne!(waits(&reader)[0], "30");
+
+        let table = format!("dbdelve_lock_{}", std::process::id());
+        let holder = Open::open(config.clone()).expect("the holding connection opens");
+        let drop = format!("DROP TABLE IF EXISTS {table}");
+        run(&holder, &drop).expect("a stale table is dropped");
+        run(
+            &holder,
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, n INT) ENGINE = InnoDB"),
+        )
+        .expect("the table is made");
+        run(&holder, &format!("INSERT INTO {table} VALUES (1, 0)")).expect("the row is made");
+        let outcome = (|| {
+            run(&holder, "BEGIN")?;
+            run(&holder, &format!("UPDATE {table} SET n = 1 WHERE id = 1"))?;
+            let writer = Open::open_for_approved_write(config.clone(), 2)?;
+            let began = Instant::now();
+            let blocked = run(&writer, &format!("UPDATE {table} SET n = 2 WHERE id = 1"));
+            Ok::<_, crate::db::DbError>((blocked, began.elapsed()))
+        })();
+        let _ = run(&holder, "ROLLBACK");
+        run(&holder, &drop).expect("the table is dropped");
+        let (blocked, waited) = outcome.expect("the lock is held and the writer opens");
+        let error = blocked.expect_err("the approved update waits for the row lock and gives up");
+        assert!(
+            error.message.contains("Lock wait timeout"),
+            "{}",
+            error.message
+        );
+        assert!(waited < Duration::from_secs(20), "it waited {waited:?}");
     }
 
     fn live_a_statements_warnings_arrive_as_messages(engine: Engine) {

@@ -3795,7 +3795,9 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
 }
 
 /// The statement that bounds how long this session waits for a lock, or
-/// `None` where the engine has no session setting for it.
+/// `None` where the engine has no session setting for it. On MySQL and
+/// MariaDB that is two settings: `lock_wait_timeout` bounds a metadata lock
+/// (DDL, `LOCK TABLES`) and `innodb_lock_wait_timeout` a row lock.
 ///
 /// A statement DBDelve sends on its own connection, as
 /// [`read_only_statement`] is, and not a [`ServerConfig`] field: a field would
@@ -3804,9 +3806,9 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
 fn lock_wait_statement(engine: Engine, seconds: u32) -> Option<String> {
     match engine {
         Engine::Postgres => Some(format!("SET lock_timeout = '{seconds}s'")),
-        Engine::MySql | Engine::MariaDb => {
-            Some(format!("SET SESSION lock_wait_timeout = {seconds}"))
-        }
+        Engine::MySql | Engine::MariaDb => Some(format!(
+            "SET SESSION lock_wait_timeout = {seconds}, innodb_lock_wait_timeout = {seconds}"
+        )),
         _ => None,
     }
 }
@@ -5925,7 +5927,9 @@ mod tests {
         for engine in Engine::ALL {
             let expected = match engine {
                 Engine::Postgres => Some("SET lock_timeout = '30s'"),
-                Engine::MySql | Engine::MariaDb => Some("SET SESSION lock_wait_timeout = 30"),
+                Engine::MySql | Engine::MariaDb => {
+                    Some("SET SESSION lock_wait_timeout = 30, innodb_lock_wait_timeout = 30")
+                }
                 _ => None,
             };
             assert_eq!(

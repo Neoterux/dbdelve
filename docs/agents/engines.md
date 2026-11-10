@@ -903,8 +903,9 @@ carries, engine by engine:
   profile's own, and a session change the statement makes ends with the
   connection. Its statement timeout is `WRITE_TIMEOUT` (600 seconds), or the
   profile's when that is shorter. It waits at most `LOCK_WAIT` (30 seconds) for
-  a lock on Postgres (`lock_timeout`), MySQL and MariaDB (`lock_wait_timeout`),
-  and the read lane's sessions do not carry that wait. On MySQL nothing bounds a
+  a lock on Postgres (`lock_timeout`), and on MySQL and MariaDB for a row lock
+  (`innodb_lock_wait_timeout`) and a metadata lock (`lock_wait_timeout`); the
+  read lane's sessions do not carry that wait. On MySQL nothing bounds a
   running DDL: `max_execution_time` bounds only a `SELECT`. Nothing cancels a
   running approved write. A write stopped by a client-side timer, on MongoDB or
   Redis after its whole bound, answers that the outcome is not known; a failed
