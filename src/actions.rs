@@ -229,6 +229,7 @@ actions!(
         ToggleSidebar,
         DisconnectAgents,
         ShowAgentActivity,
+        ToggleResults,
         ToggleRowPanel,
         ToggleRowEdit,
         ToggleStructure,
