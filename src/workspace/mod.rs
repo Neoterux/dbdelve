@@ -1524,9 +1524,9 @@ impl Render for Workspace {
                 .children(self.dialog_layer(
                     [
                         // First, so it is drawn behind every other dialog: an
-                        // agent's unsolicited ping never covers one the user
+                        // agent's unsolicited approval never covers one the user
                         // is already answering.
-                        ("agent-ping", self.render_agent_ping(cx)),
+                        ("agent-approval", self.render_agent_approval(cx)),
                         ("agent-audit", self.render_agent_audit(cx)),
                         ("import-choice", self.render_import_choice(cx)),
                     ],
@@ -2503,9 +2503,9 @@ impl Render for Workspace {
             .children(self.dialog_layer(
                 [
                     // First, so it is drawn behind every other dialog: an
-                    // agent's unsolicited ping never covers one the user is
+                    // agent's unsolicited approval never covers one the user is
                     // already answering, and `escape` reaches it last.
-                    ("agent-ping", self.render_agent_ping(cx)),
+                    ("agent-approval", self.render_agent_approval(cx)),
                     ("agent-audit", self.render_agent_audit(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),

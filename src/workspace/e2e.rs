@@ -4934,13 +4934,13 @@ fn refused_table_copies_preserve_the_clipboard(cx: &mut TestAppContext) {
     });
 }
 
-/// The call the ping dialog is about.
-fn front_ping_id(
+/// The call the approval dialog is about.
+fn front_approval_id(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
 ) -> Option<crate::agent::CallId> {
     workspace.read_with(cx, |workspace, _| {
-        workspace.front_ping().map(|call| call.id)
+        workspace.front_approval().map(|call| call.id)
     })
 }
 
@@ -5350,7 +5350,7 @@ fn a_closed_approval_hands_the_keyboard_back(cx: &mut TestAppContext) {
         let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(id, cx));
         settle(cx);
         assert_eq!(answers.try_recv().ok(), Some(denied()));
         assert_eq!(front_dialog(&workspace, cx), None);
@@ -5427,13 +5427,13 @@ fn approvals_are_shown_oldest_first(cx: &mut TestAppContext) {
         let (third, third_answers) = inject_update(&workspace, cx, Some("Orders"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
-        assert_eq!(front_ping_id(&workspace, cx), Some(first));
+        assert_eq!(front_approval_id(&workspace, cx), Some(first));
 
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(first, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(first, cx));
         settle(cx);
         assert_eq!(first_answers.try_recv().ok(), Some(denied()));
         assert_eq!(pending_calls(&workspace, cx), [second, third]);
-        assert_eq!(front_ping_id(&workspace, cx), Some(second));
+        assert_eq!(front_approval_id(&workspace, cx), Some(second));
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         assert_eq!(
             second_answers.try_recv().err(),
@@ -5441,10 +5441,10 @@ fn approvals_are_shown_oldest_first(cx: &mut TestAppContext) {
             "the second approval was answered by the first's denial"
         );
 
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(second, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(second, cx));
         settle(cx);
         assert_eq!(second_answers.try_recv().ok(), Some(denied()));
-        assert_eq!(front_ping_id(&workspace, cx), Some(third));
+        assert_eq!(front_approval_id(&workspace, cx), Some(third));
         assert_eq!(third_answers.try_recv().err(), Some(TryRecvError::Empty));
         quit(workspace, cx);
     });
@@ -5479,7 +5479,7 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
         let (reports, reports_answers) = inject_update(&workspace, cx, Some("Reports"));
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
-        assert_eq!(front_ping_id(&workspace, cx), Some(first_shop));
+        assert_eq!(front_approval_id(&workspace, cx), Some(first_shop));
 
         // Hiding the profile that is already hidden answers nothing.
         workspace.update(cx, |workspace, cx| {
@@ -5498,13 +5498,13 @@ fn hiding_a_profile_rejects_its_pending_calls_and_no_others(cx: &mut TestAppCont
         assert_eq!(pending_calls(&workspace, cx), [orders, reports]);
         assert_eq!(orders_answers.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
-        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+        assert_eq!(front_approval_id(&workspace, cx), Some(orders));
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
 
         // Nothing waits on Reports once its approval is denied, so hiding it sends
         // nothing and says nothing.
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(orders, cx));
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(reports, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(orders, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(reports, cx));
         assert_eq!(orders_answers.try_recv().ok(), Some(denied()));
         assert_eq!(reports_answers.try_recv().ok(), Some(denied()));
         workspace.update(cx, |workspace, _| workspace.clear_notice());
@@ -5533,14 +5533,14 @@ fn removing_a_profile_rejects_its_pending_calls(cx: &mut TestAppContext) {
         let (orders, orders_answers) = inject_update(&workspace, cx, Some("Orders"));
         let (reports, reports_answers) = inject_update(&workspace, cx, Some("Reports"));
         settle(cx);
-        assert_eq!(front_ping_id(&workspace, cx), Some(orders));
+        assert_eq!(front_approval_id(&workspace, cx), Some(orders));
 
         workspace.update(cx, |workspace, cx| workspace.remove_profile(0, cx));
         settle(cx);
         assert_eq!(orders_answers.try_recv().ok(), Some(swept()));
         assert_eq!(pending_calls(&workspace, cx), [reports]);
         assert_eq!(reports_answers.try_recv().err(), Some(TryRecvError::Empty));
-        assert_eq!(front_ping_id(&workspace, cx), Some(reports));
+        assert_eq!(front_approval_id(&workspace, cx), Some(reports));
         assert_eq!(front_dialog(&workspace, cx), Some("agent-approval"));
         quit(workspace, cx);
     });
@@ -5603,7 +5603,7 @@ fn the_agent_mark_is_absent_off_dim_listening_and_lit_when_connected(cx: &mut Te
             Some(AgentMark::Connected { waiting: 1 })
         );
 
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(id, cx));
         workspace.update(cx, |workspace, cx| {
             workspace.on_agent_message(Inbound::PresenceClosed { conn: ConnId(1) }, cx)
         });
@@ -5731,7 +5731,7 @@ fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppCont
             workspace.on_agent_message(Inbound::Hangup { id: hung_up }, cx)
         });
         let (denied, _denied_answers) = inject_update(&workspace, cx, Some("Orders"));
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(denied, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(denied, cx));
 
         let log = agent_log(&workspace, cx);
         assert_eq!(
@@ -5804,7 +5804,7 @@ fn an_answer_nobody_was_waiting_for_is_logged_as_having_no_requester(cx: &mut Te
         let (workspace, cx) =
             launch_with_profiles(cx, &sqlite_profile("orders", "Orders", VISIBLE_RW));
         let (id, _answers) = inject_update(&workspace, cx, Some("Orders"));
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(id, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(id, cx));
         let log = agent_log(&workspace, cx);
         assert_eq!(
             (log.len(), log[0].status, log[0].requester_gone),
@@ -5957,7 +5957,7 @@ fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAp
                 Some(drop)
             )
         );
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(held, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(held, cx));
 
         let log = agent_log(&workspace, cx);
         // Newest first: the denied INSERT, then the DROP.
@@ -6100,7 +6100,7 @@ fn the_audit_lists_calls_newest_first_by_when_they_ended(cx: &mut TestAppContext
         let (first, _first_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
         let (second, _second_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
         let (third, _third_answers) = inject_update(&workspace, cx, Some("Orders"));
-        workspace.update(cx, |workspace, cx| workspace.deny_ping(third, cx));
+        workspace.update(cx, |workspace, cx| workspace.deny_call(third, cx));
         let ended: Vec<_> = agent_log(&workspace, cx)
             .iter()
             .map(|entry| entry.id)
@@ -7823,7 +7823,7 @@ fn a_running_read_is_not_a_waiting_approval(cx: &mut TestAppContext) {
         workspace.read_with(cx, |workspace, _| {
             let lane = workspace.agent.lanes.get("orders").expect("a lane");
             assert!(lane.running.is_some(), "the read is running");
-            assert!(workspace.front_ping().is_none());
+            assert!(workspace.front_approval().is_none());
             assert!(workspace.agent.calls.is_empty());
         });
         assert_eq!(

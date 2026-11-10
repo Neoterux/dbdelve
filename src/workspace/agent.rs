@@ -413,17 +413,17 @@ const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDel
 /// One sentence for both, so the agent cannot tell which happened.
 pub(super) const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
-/// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
+/// What an unanswered approval is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
     format!(
-        "Nobody answered the ping in DBDelve within {} minutes.",
+        "Nobody answered the approval in DBDelve within {} minutes; the statement was not run.",
         EXPIRY.as_secs() / 60
     )
 }
 
 /// What a denied call is told: the person read the statement and said no, and
 /// nothing ran.
-const DENIED: &str = "The ping was denied in DBDelve.";
+const DENIED: &str = "The statement was denied in DBDelve and was not run.";
 
 /// A running bridge. Neither field is read: holding them is the point.
 pub(crate) struct Bridge {
@@ -614,10 +614,10 @@ impl Workspace {
         self.end_lane(profile_id, Status::Rejected, NO_LONGER_AVAILABLE, cx);
     }
 
-    /// The call the ping dialog is about: the oldest one whose profile is still
+    /// The call the approval dialog is about: the oldest one whose profile is still
     /// in the list. A call whose profile has gone is swept with it, so the
     /// filter only guards the moment between the two.
-    pub(crate) fn front_ping(&self) -> Option<&PendingCall> {
+    pub(crate) fn front_approval(&self) -> Option<&PendingCall> {
         self.agent.calls.iter().find(|call| {
             self.profiles
                 .iter()
@@ -637,14 +637,14 @@ impl Workspace {
     }
 
     /// The dialog's Deny, for a call named by id.
-    pub(crate) fn deny_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
+    pub(crate) fn deny_call(&mut self, id: CallId, cx: &mut Context<Self>) {
         self.finish_call(id, Status::Rejected, DENIED.to_string(), cx);
     }
 
     /// The call the dialog in front is about, when it asks for a statement to
     /// be run and not for a ping to be answered.
     pub(crate) fn front_approval_id(&self) -> Option<CallId> {
-        self.front_ping()
+        self.front_approval()
             .filter(|call| call.approval.is_some())
             .map(|call| call.id)
     }
@@ -678,7 +678,7 @@ impl Workspace {
                 // dialog over it that they are reading is not the approval
                 // being shown, and it is revealed again when that closes.
                 if workspace.front_approval_id() == Some(id)
-                    && workspace.dialog_in_front.get() == Some("agent-ping")
+                    && workspace.dialog_in_front.get() == Some("agent-approval")
                 {
                     workspace.agent.armed = Some(id);
                     cx.notify();
@@ -708,7 +708,7 @@ impl Workspace {
         else {
             return;
         };
-        let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
+        let was_in_front = self.front_approval().is_some_and(|front| front.id == id);
         // Dropping the call's expiry with the rest of it.
         let call = self.agent.calls.remove(index);
         let PendingCall {
@@ -841,13 +841,13 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Deny whichever ping the dialog in front is about. Answers whether there
+    /// Deny whichever call the dialog in front is about. Answers whether there
     /// was one, so `escape` is only spent on a dialog that was drawn.
-    pub(crate) fn deny_front_ping(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.front_ping().map(|call| call.id) else {
+    pub(crate) fn deny_front_approval(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.front_approval().map(|call| call.id) else {
             return false;
         };
-        self.deny_ping(id, cx);
+        self.deny_call(id, cx);
         true
     }
 
@@ -1426,7 +1426,7 @@ impl Workspace {
             }
             return self.finish_read(id, status, text, true, Default::default(), cx);
         };
-        let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
+        let was_in_front = self.front_approval().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
         if status != Status::Cancelled {
             // The caller may have hung up, and then nobody reads this.
