@@ -31,6 +31,12 @@ use crate::{
 // upgrade is a setting, if a user ever needs one.
 pub(crate) const WRITE_TIMEOUT: u32 = 600;
 
+// ponytail: how long an approved write's session waits for a lock. Long enough
+// for an ordinary row lock to clear, short enough that a queued `ALTER` does
+// not hold up every later query on its table for the whole write bound (on
+// MySQL, for a year). The upgrade is a setting.
+pub(crate) const LOCK_WAIT: u32 = 30;
+
 /// The statement timeout in seconds an approved write's connection carries,
 /// given the profile's own: the smaller of the two, with 0 (none) meaning
 /// [`WRITE_TIMEOUT`].
@@ -90,9 +96,8 @@ pub(crate) enum Wrote {
     },
 }
 
-/// Open a connection for this one call, run `sql` on it as written, build the
-/// answer and drop the connection before returning, so a runtime shutdown
-/// never happens on the window's thread.
+/// [`run_write`] on a blocking thread, so the window's thread never waits on a
+/// server or shuts a runtime down.
 pub(super) fn open_for_write(
     executor: &gpui::BackgroundExecutor,
     config: ConnectionConfig,
@@ -101,44 +106,56 @@ pub(super) fn open_for_write(
     engine: Engine,
 ) -> gpui::Task<Wrote> {
     spawn_blocking(executor, move || {
-        let mut config = agent_write_config(&config);
-        // A file engine has nothing to authenticate to, so it never reaches
-        // the keychain.
-        if let Some(slot) = config.password_mut()
-            && slot.is_empty()
-        {
-            match store::password(&profile_id) {
-                Ok(Some(password)) => *slot = password,
-                Ok(None) => {}
-                Err(error) => {
-                    return Wrote::NotOpened(DbError {
-                        message: error,
-                        position: None,
-                    });
-                }
+        run_write(config, &profile_id, &sql, engine)
+    })
+}
+
+/// Open a connection for this one call, run `sql` on it as written, build the
+/// answer and drop the connection before returning. Blocking, and a plain
+/// function so a live test runs exactly what the window runs.
+pub(super) fn run_write(
+    config: ConnectionConfig,
+    profile_id: &str,
+    sql: &str,
+    engine: Engine,
+) -> Wrote {
+    let mut config = agent_write_config(&config);
+    // A file engine has nothing to authenticate to, so it never reaches the
+    // keychain.
+    if let Some(slot) = config.password_mut()
+        && slot.is_empty()
+    {
+        match store::password(profile_id) {
+            Ok(Some(password)) => *slot = password,
+            Ok(None) => {}
+            Err(error) => {
+                return Wrote::NotOpened(DbError {
+                    message: error,
+                    position: None,
+                });
             }
         }
-        // Taken after the password is in: it is one of the strings a server's
-        // error may echo.
-        let hidden = config.identifying_text();
-        let connection = match Connection::open_for_approved_write(config) {
-            Ok(connection) => connection,
-            Err(error) => return Wrote::NotOpened(error),
-        };
-        // Not `reads_only`: a write's rows are drained, never stopped early.
-        let result = connection
-            .query(
-                &sql,
-                &CancelToken::default(),
-                Fetch {
-                    limit: Some(AGENT_ROWS),
-                    ..Fetch::default()
-                },
-            )
-            .map(|result| written_text(engine, &sql, &result));
-        drop(connection);
-        Wrote::Done { hidden, result }
-    })
+    }
+    // Taken after the password is in: it is one of the strings a server's
+    // error may echo.
+    let hidden = config.identifying_text();
+    let connection = match Connection::open_for_approved_write(config, LOCK_WAIT) {
+        Ok(connection) => connection,
+        Err(error) => return Wrote::NotOpened(error),
+    };
+    // Not `reads_only`: a write's rows are drained, never stopped early.
+    let result = connection
+        .query(
+            sql,
+            &CancelToken::default(),
+            Fetch {
+                limit: Some(AGENT_ROWS),
+                ..Fetch::default()
+            },
+        )
+        .map(|result| written_text(engine, sql, &result));
+    drop(connection);
+    Wrote::Done { hidden, result }
 }
 
 /// What an approved write answers: its rows when it returned any, the server's
@@ -271,7 +288,10 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Column, every_shape};
+    use crate::{
+        db::{Column, every_shape},
+        workspace::agent_read::agent_config,
+    };
 
     #[test]
     fn the_write_config_carries_the_write_bound() {
@@ -349,5 +369,197 @@ mod tests {
         let text = written_text(Engine::Sqlite, "UPDATE t SET a = 1 RETURNING id", &returned);
         assert!(text.contains("id"), "{text}");
         assert!(!text.contains("affected"), "{text}");
+    }
+
+    /// The compose Postgres from the standard `PG*` variables, as
+    /// `agent_read`'s live tests open it.
+    fn live_postgres() -> ConnectionConfig {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+        ConnectionConfig::postgres(crate::db::ServerConfig {
+            host: var("PGHOST"),
+            port: std::env::var("PGPORT")
+                .ok()
+                .map(|port| port.parse().expect("PGPORT must be a number")),
+            database: var("PGDATABASE"),
+            user: var("PGUSER"),
+            password: std::env::var("PGPASSWORD").unwrap_or_default(),
+            // The compose database speaks no TLS, and this test is the one
+            // place a plaintext connection is the point.
+            sslmode: crate::db::SslMode::Disable,
+            root_certificate: None,
+            statement_timeout: 0,
+            ssh: None,
+            schema: None,
+            read_only: false,
+        })
+    }
+
+    /// Runs `teardown` and then `setup` on a direct connection -- the user's
+    /// kind, because an agent `DROP` is refused (GATE-06) -- and `teardown`
+    /// again when it goes out of scope, so a failed assertion leaves nothing
+    /// on the shared database.
+    struct Cleanup {
+        config: ConnectionConfig,
+        teardown: String,
+    }
+
+    impl Cleanup {
+        fn new(config: &ConnectionConfig, setup: &str, teardown: &str) -> Self {
+            let cleanup = Self {
+                config: config.clone(),
+                teardown: teardown.to_string(),
+            };
+            cleanup.run(&[teardown, setup]);
+            cleanup
+        }
+
+        fn run(&self, statements: &[&str]) {
+            let connection =
+                Connection::open(self.config.clone()).expect("the compose Postgres opens");
+            for sql in statements.iter().filter(|sql| !sql.is_empty()) {
+                connection
+                    .query(sql, &CancelToken::default(), Fetch::default())
+                    .unwrap_or_else(|error| panic!("{sql}: {}", error.message));
+            }
+        }
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.run(&[&self.teardown]);
+        }
+    }
+
+    /// The first cell of every row `sql` returns on the agent's read-only
+    /// open, one per line.
+    fn read_lines(config: &ConnectionConfig, sql: &str) -> String {
+        let connection = Connection::open_for_agent(agent_config(config))
+            .expect("the compose Postgres opens for the agent");
+        let result = connection
+            .query(sql, &CancelToken::default(), Fetch::default())
+            .unwrap_or_else(|error| panic!("{sql}: {}", error.message));
+        result
+            .rows
+            .iter()
+            .map(|row| row.get(0).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn approved(config: &ConnectionConfig, sql: &str) -> Wrote {
+        run_write(agent_write_config(config), "", sql, config.engine())
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_an_approved_create_index_moves_the_plan() {
+        let config = live_postgres();
+        let index = format!("dbdelve_sc5_{}", std::process::id());
+        let _cleanup = Cleanup::new(&config, "", &format!("DROP INDEX IF EXISTS {index}"));
+        const READ: &str = "SELECT * FROM events WHERE occurred_at = '2024-01-05 00:00:00+00'";
+
+        let before = read_lines(&config, &format!("EXPLAIN {READ}"));
+        assert!(
+            before.contains("Seq Scan on events"),
+            "no Seq Scan before the index; an index on events (occurred_at) left by an earlier run?\n{before}"
+        );
+
+        let Wrote::Done { result, .. } = approved(
+            &config,
+            &format!("CREATE INDEX {index} ON events (occurred_at)"),
+        ) else {
+            panic!("the approved write did not open");
+        };
+        assert_eq!(result.expect("the server builds it"), "The statement ran.");
+
+        let after = read_lines(&config, &format!("EXPLAIN {READ}"));
+        assert!(
+            after.contains(&format!("Index Scan using {index}"))
+                || after.contains(&format!("Bitmap Index Scan on {index}")),
+            "{after}"
+        );
+        assert!(!after.contains("Seq Scan"), "{after}");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_concurrent_index_build_runs_in_autocommit() {
+        let config = live_postgres();
+        let table = format!("dbdelve_cic_{}", std::process::id());
+        let _cleanup = Cleanup::new(
+            &config,
+            &format!("CREATE TABLE {table} AS SELECT n AS a FROM generate_series(1, 100) n"),
+            &format!("DROP TABLE IF EXISTS {table}"),
+        );
+
+        let Wrote::Done { result, .. } = approved(
+            &config,
+            &format!("CREATE INDEX CONCURRENTLY {table}_a ON {table} (a)"),
+        ) else {
+            panic!("the approved write did not open");
+        };
+        result.expect("a concurrent build runs outside a transaction block");
+        let valid = read_lines(
+            &config,
+            &format!("SELECT indisvalid FROM pg_index WHERE indexrelid = '{table}_a'::regclass"),
+        );
+        assert_eq!(valid, "t");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_failed_concurrent_index_build_says_an_invalid_index_may_remain() {
+        let config = live_postgres();
+        let table = format!("dbdelve_cicu_{}", std::process::id());
+        let _cleanup = Cleanup::new(
+            &config,
+            &format!("CREATE TABLE {table} AS SELECT 1 AS a UNION ALL SELECT 1"),
+            &format!("DROP TABLE IF EXISTS {table}"),
+        );
+        let sql = format!("CREATE UNIQUE INDEX CONCURRENTLY {table}_u ON {table} (a)");
+
+        let Wrote::Done {
+            hidden,
+            result: Err(error),
+        } = approved(&config, &sql)
+        else {
+            panic!("the duplicate build did not fail on the server");
+        };
+        let text = failed_text(Engine::Postgres, &sql, &scrubbed(&error.message, &hidden));
+        assert!(text.ends_with(INVALID_INDEX), "{text}");
+        assert!(
+            text.starts_with(&scrubbed(&error.message, &hidden)),
+            "{text}"
+        );
+        let valid = read_lines(
+            &config,
+            &format!("SELECT indisvalid FROM pg_index WHERE indexrelid = '{table}_u'::regclass"),
+        );
+        assert_eq!(valid, "f");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_write_session_carries_its_bounds() {
+        let config = live_postgres();
+        let setting = |connection: &Connection, name: &str| {
+            let result = connection
+                .query(
+                    &format!("SHOW {name}"),
+                    &CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the server answers SHOW");
+            result.rows[0].get(0).unwrap_or_default().to_string()
+        };
+
+        let writer = Connection::open_for_approved_write(agent_write_config(&config), LOCK_WAIT)
+            .expect("the write connection opens");
+        assert_eq!(setting(&writer, "lock_timeout"), "30s");
+        assert_eq!(setting(&writer, "statement_timeout"), "10min");
+
+        let reader =
+            Connection::open_for_agent(agent_config(&config)).expect("the read connection opens");
+        assert_ne!(setting(&reader, "lock_timeout"), "30s");
     }
 }

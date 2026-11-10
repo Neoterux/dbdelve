@@ -1888,12 +1888,20 @@ impl Connection {
     /// being asked at arrival.
     ///
     /// The connection is for one call and is dropped with it, never kept: a
-    /// session change the statement makes must die with it.
-    pub fn open_for_approved_write(config: ConnectionConfig) -> Result<Self, DbError> {
+    /// session change the statement makes must die with it. It waits at most
+    /// `lock_wait` seconds for a lock where the engine says so
+    /// ([`Connection::set_lock_wait`]); a session that will not take that is
+    /// not one an approved write runs on, so the open fails.
+    pub fn open_for_approved_write(
+        config: ConnectionConfig,
+        lock_wait: u32,
+    ) -> Result<Self, DbError> {
         if let Some(refusal) = config.agent_write_refusal() {
             return Err(plain_error(refusal.to_string()));
         }
-        Self::open(config)
+        let connection = Self::open(config)?;
+        connection.set_lock_wait(lock_wait)?;
+        Ok(connection)
     }
 
     /// Run one statement verbatim.
@@ -2448,6 +2456,22 @@ impl Connection {
             return Ok(());
         };
         self.query(statement, &CancelToken::default(), Fetch::default())
+            .map(|_| ())
+    }
+
+    /// Bound how long this session waits for a lock, where the engine has a
+    /// session setting for it ([`lock_wait_statement`]). A plugin connection
+    /// and every other engine are left as they are.
+    pub fn set_lock_wait(&self, seconds: u32) -> Result<(), DbError> {
+        let engine = match self {
+            Self::Postgres(_) => Engine::Postgres,
+            Self::MySql(connection) => connection.engine(),
+            _ => return Ok(()),
+        };
+        let Some(statement) = lock_wait_statement(engine, seconds) else {
+            return Ok(());
+        };
+        self.query(&statement, &CancelToken::default(), Fetch::default())
             .map(|_| ())
     }
 
@@ -3757,6 +3781,17 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
         // Carried by each request's settings, not set on the session.
         (ReadOnlySession::PerRequest, _) => None,
     }
+}
+
+/// The statement that bounds how long this session waits for a lock, or
+/// `None` where the engine has no session setting for it.
+///
+/// A statement DBDelve sends on its own connection, as
+/// [`read_only_statement`] is, and not a [`ServerConfig`] field: a field would
+/// reach every struct literal and every stored profile for a setting only the
+/// agent's writable session carries.
+fn lock_wait_statement(_engine: Engine, _seconds: u32) -> Option<String> {
+    None
 }
 
 /// Shared with `postgres::tests`, which exercises `assemble`'s type-matching
@@ -5842,10 +5877,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("the directory is creatable");
         let path = directory.join("never.duckdb");
-        let refused = Connection::open_for_approved_write(ConnectionConfig::duckdb(
-            path.display().to_string(),
-            0,
-        ));
+        let refused = Connection::open_for_approved_write(
+            ConnectionConfig::duckdb(path.display().to_string(), 0),
+            30,
+        );
         match refused {
             Ok(_) => panic!("a DuckDB write connection was opened"),
             Err(error) => assert_eq!(error.message, DUCKDB_WRITE_REFUSED),
@@ -5855,6 +5890,22 @@ mod tests {
             "the refusal came after the file was created"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_lock_wait_is_spelt_per_engine() {
+        for engine in Engine::ALL {
+            let expected = match engine {
+                Engine::Postgres => Some("SET lock_timeout = '30s'"),
+                Engine::MySql | Engine::MariaDb => Some("SET SESSION lock_wait_timeout = 30"),
+                _ => None,
+            };
+            assert_eq!(
+                lock_wait_statement(engine, 30).as_deref(),
+                expected,
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]
