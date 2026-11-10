@@ -8153,7 +8153,7 @@ fn a_connection_that_will_not_open_answers_a_fixed_sentence(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn a_failed_call_keeps_its_full_error_in_the_audit_only(cx: &mut TestAppContext) {
+fn a_failed_call_audits_the_servers_words_without_the_path(cx: &mut TestAppContext) {
     use crate::agent::Status;
 
     store::tests::with_home(|| {
@@ -8190,7 +8190,7 @@ fn a_failed_call_keeps_its_full_error_in_the_audit_only(cx: &mut TestAppContext)
         let error = log[1].error.as_deref().expect("the failure is audited");
         assert!(error.contains("no such table"), "{error}");
         assert!(
-            error.contains(&database.display().to_string()),
+            !names_whole(error, &database.display().to_string()),
             "the audit keeps the path: {error}"
         );
 
@@ -8205,16 +8205,17 @@ fn a_failed_call_keeps_its_full_error_in_the_audit_only(cx: &mut TestAppContext)
             .error
             .as_deref()
             .expect("the open failure is audited");
+        assert!(!opened.is_empty());
         assert!(
-            opened.contains(&database.display().to_string()),
-            "the audit keeps the full open error: {opened}"
+            !names_whole(opened, &database.display().to_string()),
+            "the audit keeps the path: {opened}"
         );
         for entry in &log {
             assert_eq!(entry.status, Status::Failed);
         }
         assert!(
             !reply.text.contains(opened),
-            "the full error reached the agent: {}",
+            "the open error reached the agent: {}",
             reply.text
         );
         quit(workspace, cx);
