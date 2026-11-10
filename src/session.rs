@@ -1618,6 +1618,10 @@ pub(crate) struct QueryTab {
     /// all of them. Starts at the Settings row limit and is not persisted, so
     /// a limit picked for one tab lasts only as long as the tab does.
     pub(crate) row_limit: Option<usize>,
+    /// Whether this tab's results pane is hidden, giving the editor the whole
+    /// height. Per tab, like the row panel's fold, and not persisted. A run
+    /// that has something to read clears it ([`reveals_results`]).
+    pub(crate) results_hidden: bool,
     /// Whether this tab's row-inspector panel is folded away. Per tab, like
     /// the panel itself (see `RowPanel`), and not persisted.
     pub(crate) row_panel_folded: bool,
@@ -2261,6 +2265,7 @@ impl QueryTab {
             row_limit,
             showing_plan: false,
             showing_messages: false,
+            results_hidden: false,
             row_panel_folded: false,
             row_panel_editing: false,
             row_panel_filter: Default::default(),
@@ -2936,10 +2941,57 @@ pub(crate) fn result_pane_is_expanded(query: &QueryState) -> bool {
     !matches!(query, QueryState::Idle)
 }
 
+/// Whether a run that just landed brings a hidden results pane back: rows
+/// (or the columns of an empty set), a plan, and an error are answers the
+/// user would otherwise not know were there. A statement that returned
+/// nothing to read, a `CREATE TABLE` say, leaves the pane as it was.
+pub(crate) fn reveals_results(landed: &QueryState, produced_grid: bool) -> bool {
+    produced_grid || matches!(landed, QueryState::Failed(_) | QueryState::Explained { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql;
+
+    fn complete() -> QueryState {
+        QueryState::Complete {
+            rows: 0,
+            bytes: 0,
+            elapsed: std::time::Duration::ZERO,
+            rows_affected: None,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_statement_that_returns_rows_shows_hidden_results_again() {
+        assert!(reveals_results(&complete(), true));
+    }
+
+    #[test]
+    fn a_statement_with_nothing_to_read_leaves_hidden_results_hidden() {
+        assert!(!reveals_results(&complete(), false));
+    }
+
+    #[test]
+    fn a_failed_statement_shows_hidden_results_so_its_error_is_seen() {
+        let failed = QueryState::Failed(DbError {
+            message: "relation already exists".into(),
+            position: None,
+        });
+        assert!(reveals_results(&failed, false));
+    }
+
+    #[test]
+    fn a_plan_shows_hidden_results_again() {
+        let explained = QueryState::Explained {
+            elapsed: std::time::Duration::ZERO,
+            mode: ExplainMode::Plan,
+            messages: Vec::new(),
+        };
+        assert!(reveals_results(&explained, false));
+    }
 
     #[test]
     fn a_failed_queue_statement_says_what_before_it_was_committed() {
