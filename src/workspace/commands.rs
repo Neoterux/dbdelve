@@ -4,7 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
-use crate::actions::{FocusSidebar, ToggleResultsFocus};
+use crate::actions::{FocusSidebar, ToggleResults, ToggleResultsFocus};
 use crate::keybindings;
 
 impl Workspace {
@@ -738,6 +738,7 @@ impl Workspace {
             Command::ToggleResultsFocus => {
                 self.toggle_results_focus(&ToggleResultsFocus, window, cx)
             }
+            Command::ToggleResults => self.toggle_results(&ToggleResults, window, cx),
             Command::ToggleRowPanel => self.toggle_row_panel(&ToggleRowPanel, window, cx),
             Command::ToggleRowEdit => self.toggle_row_edit(&ToggleRowEdit, window, cx),
             // Explicit, because the palette still holds focus here and would
