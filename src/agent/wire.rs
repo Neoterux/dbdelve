@@ -163,7 +163,8 @@ mod tests {
         for text in [
             call(r#""tool":"list_connections","extra":1"#),
             r#"{"v":1,"kind":"call","tool":"list_connections"}"#.to_string(),
-            r#"{"v":3,"kind":"call","tool":"list_connections"}"#.to_string(),
+            r#"{"v":2,"kind":"call","tool":"list_connections"}"#.to_string(),
+            r#"{"v":4,"kind":"call","tool":"list_connections"}"#.to_string(),
             frame(r#""kind":"shout","tool":"list_connections""#),
             call(r#""tool":"drop_everything""#),
             String::new(),
@@ -173,7 +174,8 @@ mod tests {
         }
         assert!(decode_hello(&call(r#""tool":"list_connections""#)).is_ok());
         assert!(decode_hello(&frame(r#""kind":"presence""#)).is_ok());
-        assert!(decode_hello(r#"{"v":3,"kind":"presence"}"#).is_err());
+        assert!(decode_hello(r#"{"v":2,"kind":"presence"}"#).is_err());
+        assert!(decode_hello(r#"{"v":4,"kind":"presence"}"#).is_err());
         assert_eq!(
             decode_hello(&call(
                 r#""tool":"execute_sql","connection":"Orders","sql":"SELECT 1""#

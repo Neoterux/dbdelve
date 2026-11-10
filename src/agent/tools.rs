@@ -149,8 +149,7 @@ mod tests {
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], false);
         }
-        assert_eq!(Tool::Ping.input_schema()["required"], json!(["connection"]));
-        assert_eq!(Tool::ALL.len(), 7);
+        assert_eq!(Tool::ALL.len(), 6);
         assert_eq!(
             Tool::ListSchemas.input_schema()["required"],
             json!(["connection"])
@@ -168,6 +167,15 @@ mod tests {
             json!({"type": "string"})
         );
         assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));
+        // The statement is the only text an agent supplies to an approval.
+        let mut named: Vec<_> = schema["properties"]
+            .as_object()
+            .expect("the properties are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["connection", "sql"]);
         let schema = Tool::ExplainQuery.input_schema();
         assert_eq!(schema["required"], json!(["connection", "sql"]));
         assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));
