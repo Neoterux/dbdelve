@@ -675,7 +675,12 @@ impl Workspace {
         self.agent._arming = Some(cx.spawn(async move |workspace, cx| {
             cx.background_executor().timer(ARM_DELAY).await;
             _ = workspace.update(cx, |workspace, cx| {
-                if workspace.front_approval_id() == Some(id) {
+                // Only while the approval is what the person is looking at: a
+                // dialog over it that they are reading is not the approval
+                // being shown, and it is revealed again when that closes.
+                if workspace.front_approval_id() == Some(id)
+                    && workspace.dialog_in_front.get() == Some("agent-ping")
+                {
                     workspace.agent.armed = Some(id);
                     cx.notify();
                 }
@@ -693,6 +698,9 @@ impl Workspace {
         if self.agent.armed != Some(id) {
             return;
         }
+        // A hide saved by another window since this call arrived: the answer
+        // is this call's own rejection, found below as no call at all.
+        self.adopt_saved_visibility_for_read(cx);
         let Some(index) = self
             .agent
             .calls
@@ -1371,7 +1379,9 @@ impl Workspace {
     /// The one door every call ends through: answered, expired or hung up.
     /// It removes the call by id before it replies, so two things ending the
     /// same call at once produce one outcome and at most one reply. It looks
-    /// among the pings first and then among the reads of every lane
+    /// among the calls waiting on a person first (pings and held statements),
+    /// then among the approved writes running, which a hangup is noted on and
+    /// nothing else ends, and last among the reads of every lane
     /// ([`Workspace::finish_read`]), where a running read is cancelled on the
     /// server. Answers whether there was such a call.
     ///

@@ -915,6 +915,21 @@ impl Workspace {
         {
             cx.on_next_frame(window, |workspace, _, cx| workspace.reveal_approval(cx));
         }
+        // An Approve is live only while its own dialog is the one in front: a
+        // dialog raised over it, or another call in front of it, ends the arm,
+        // so what comes back to the front is armed afresh.
+        if self.agent.armed.is_some()
+            && (front != Some("agent-ping") || self.front_approval_id() != self.agent.armed)
+        {
+            cx.on_next_frame(window, |workspace, _, cx| {
+                if workspace.dialog_in_front.get() != Some("agent-ping")
+                    || workspace.front_approval_id() != workspace.agent.armed
+                {
+                    workspace.agent.armed = None;
+                    cx.notify();
+                }
+            });
+        }
         if raised {
             // Every dialog opens on its primary button, as a native one does,
             // except the one that widens what an agent may reach: it opens on
