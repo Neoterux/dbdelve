@@ -3870,6 +3870,22 @@ fn email_of(id: i64) -> Option<String> {
 
 const UPDATE_ONE: &str = "UPDATE t SET email = 'z@x' WHERE id = 1";
 
+/// The lines of the agent audit file as they were written. A file that does
+/// not exist reads as no lines.
+#[cfg(unix)]
+fn audit_lines() -> Vec<serde_json::Value> {
+    let path = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join(store::AGENT_AUDIT_FILE);
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a line of the audit is JSON"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[gpui::test]
 fn a_ping_for_an_unknown_or_hidden_connection_is_refused_with_the_lookup_text(
     cx: &mut TestAppContext,
@@ -5119,6 +5135,109 @@ fn an_approved_write_touches_no_tab_grid_buffer_or_history(cx: &mut TestAppConte
                 .find(|profile| profile.id == "orders")
                 .expect("the profile was restored");
             assert!(matches!(orders.state, ProfileState::Idle));
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_writes_started_before_the_write_and_the_outcome_after(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let (id, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        assert!(
+            audit_lines().is_empty(),
+            "a statement not yet approved is not written"
+        );
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+
+        let lines = audit_lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let (started, outcome) = (&lines[0], &lines[1]);
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["decision"], "approved");
+        assert_eq!(started["sql"], UPDATE_ONE);
+        assert!(started.get("status").is_none(), "{started}");
+        assert_eq!(outcome["phase"], "outcome");
+        assert_eq!(outcome["status"], "executed");
+        assert_eq!(outcome["sql"], UPDATE_ONE);
+        for line in &lines {
+            assert_eq!(line["v"], 1);
+            assert_eq!(line["id"], id.0);
+            assert_eq!(line["session"], started["session"]);
+            assert_eq!(line["tool"], "execute_sql");
+            assert_eq!(line["profile"], "Orders");
+            assert_eq!(line["engine"], Engine::Sqlite.as_str());
+            let mut without_sql = line.clone();
+            without_sql
+                .as_object_mut()
+                .expect("a line is an object")
+                .remove("sql");
+            assert!(
+                !without_sql.to_string().contains("z@x"),
+                "the statement's text is outside its field: {line}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_keeps_an_approved_statement_whole(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let statement = format!("UPDATE t SET email = '{}' WHERE id = 1", "x".repeat(5000));
+        assert!(statement.chars().count() > super::agent::AUDIT_SQL_CAP);
+        let (_, answers) = inject_approval(&workspace, cx, "Orders", &statement);
+        approve_front(cx);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+
+        let lines = audit_lines();
+        assert_eq!(lines.len(), 2, "{} lines", lines.len());
+        for line in &lines {
+            assert_eq!(line["sql"], statement.as_str(), "{}", line["phase"]);
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn agent_audit_failure_runs_nothing(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        // A directory where the file belongs: nothing can be appended to it.
+        let log = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join(store::AGENT_AUDIT_FILE);
+        std::fs::create_dir_all(&log).expect("the obstacle is creatable");
+
+        let (_, answers) = inject_approval(&workspace, cx, "Orders", UPDATE_ONE);
+        approve_front(cx);
+        assert_eq!(
+            answer_of(cx, &answers),
+            Reply {
+                status: Status::Failed,
+                text: super::agent::NOT_RECORDED.to_string(),
+            }
+        );
+        assert_eq!(email_of(1).as_deref(), Some("a@x"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.writes.is_empty(), "a write was started");
+            assert!(workspace.agent.lanes.is_empty());
+            let entry = workspace.agent.log.front().expect("the call is logged");
+            assert_eq!(entry.status, Status::Failed);
         });
         quit(workspace, cx);
     });

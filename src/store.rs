@@ -1991,6 +1991,20 @@ fn secure(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) const AGENT_AUDIT_FILE: &str = "agent-audit.jsonl";
+
+#[cfg(unix)]
+#[derive(Default)]
+pub(crate) struct AuditLog {}
+
+#[cfg(unix)]
+impl AuditLog {
+    pub(crate) fn append(&mut self, _line: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2690,6 +2704,48 @@ user = ""
         // With no home directory to put in its place, the path is left as
         // typed and fails as missing, rather than resolving somewhere else.
         assert_eq!(expanded_against("~/app.db", None), Path::new("~/app.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_is_created_private_and_one_line_per_append() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            let path = dbdelve_directory()
+                .expect("the test home has a data directory")
+                .join(AGENT_AUDIT_FILE);
+            let mode = |path: &Path| {
+                fs::metadata(path)
+                    .expect("the file exists")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+
+            let mut log = AuditLog::default();
+            log.append(r#"{"a":1}"#).expect("the first line is written");
+            log.append(r#"{"b":"x\ny"}"#)
+                .expect("the second line is written");
+            let text = fs::read_to_string(&path).expect("the file is readable");
+            assert_eq!(text.lines().count(), 2, "{text:?}");
+            for line in text.lines() {
+                serde_json::from_str::<serde_json::Value>(line).expect("a line is JSON");
+            }
+            assert_eq!(mode(&path), 0o600);
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                .expect("the mode is settable");
+            log.append(r#"{"c":3}"#).expect("the third line is written");
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(
+                fs::read_to_string(&path)
+                    .expect("the file is readable")
+                    .lines()
+                    .count(),
+                3
+            );
+        });
     }
 
     #[cfg(target_os = "windows")]
