@@ -5886,6 +5886,29 @@ fn on_a_short_window_the_approval_keeps_deny_and_approve_on_screen(cx: &mut Test
             .debug_bounds("agent-approval-scrollbar")
             .expect("the statement block draws a scrollbar");
         assert_eq!(bar, block, "the scrollbar lies over the statement block");
+
+        // The scrollbar over it does not take the wheel from the statement.
+        let offset = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, _| {
+                w.approval_scroll
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, handle)| handle.offset().y)
+            })
+        };
+        assert_eq!(offset(cx), Some(gpui::px(0.)));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: block.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        settle(cx);
+        assert!(
+            offset(cx).is_some_and(|y| y < gpui::px(0.)),
+            "the wheel did not scroll the statement: {:?}",
+            offset(cx)
+        );
         quit(workspace, cx);
     });
 }
