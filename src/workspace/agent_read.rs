@@ -196,7 +196,7 @@ impl Resolved {
 /// Said for an `explain_query` of a statement that needs the user's approval:
 /// it is not run for an agent, and no connection is opened for it.
 /// `execute_sql` holds such a statement for the person instead.
-pub(crate) const NEEDS_APPROVAL: &str =
+pub(crate) const NOT_EXPLAINED: &str =
     "statements that need the user's approval are not run for agents";
 
 /// The agent's calls on one profile, and the connection of its own they share.
@@ -1278,7 +1278,7 @@ pub(crate) fn explain_statement(
     // What an approval would show is not for the agent.
     let text = match &verdict {
         AgentVerdict::Run => return Ok(composed),
-        AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
+        AgentVerdict::Approve(..) => NOT_EXPLAINED.to_string(),
         AgentVerdict::Refuse(reason) => reason.to_string(),
     };
     Err(Declined {
@@ -1539,7 +1539,11 @@ mod tests {
         }
         let held = explain_statement(Engine::Postgres, "UPDATE t SET a = 1", true, Mode::Full)
             .expect_err("a person approves it first");
-        assert_eq!(held.text, NEEDS_APPROVAL);
+        assert_eq!(held.text, NOT_EXPLAINED);
+        assert_eq!(
+            NOT_EXPLAINED,
+            "a statement that needs the user's approval is not run by explain_query"
+        );
     }
 
     #[test]
@@ -1557,7 +1561,7 @@ mod tests {
         )
         .expect_err("an analyzed update waits for a person");
         assert_eq!(held.status, Status::RefusedByGate);
-        assert_eq!(held.text, NEEDS_APPROVAL);
+        assert_eq!(held.text, NOT_EXPLAINED);
 
         let removed = explain_statement(Engine::Postgres, "DELETE FROM t WHERE id = 1", true, mode)
             .expect_err("an analyzed delete is refused");

@@ -131,6 +131,22 @@ mod tests {
     }
 
     #[test]
+    fn execute_sql_says_a_change_waits_for_the_user() {
+        let text = Tool::ExecuteSql.description();
+        for word in [
+            "approve",
+            "DBDelve window",
+            "executed",
+            "rejected",
+            "expired",
+            "refused_by_gate",
+        ] {
+            assert!(text.contains(word), "{word}: {text}");
+        }
+        assert!(!text.contains("is not run"), "{text}");
+    }
+
+    #[test]
     fn no_tool_takes_an_argument_it_does_not_name() {
         for tool in Tool::ALL {
             let schema = tool.input_schema();
