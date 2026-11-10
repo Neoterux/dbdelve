@@ -706,7 +706,7 @@ impl Engine {
     /// closes the connection, which rolls the statement back; the file engines
     /// interrupt the statement in the driver; a plugin's driver owns its own.
     pub fn times_out_on_the_client(self) -> bool {
-        false
+        matches!(self, Self::MongoDb | Self::Redis)
     }
 
     /// Whether the server holds a Read-only session to reads -- the backstop
