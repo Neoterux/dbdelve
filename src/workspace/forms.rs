@@ -13,7 +13,7 @@ use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable};
 
-use super::agent::visibility_facts;
+use super::agent::{approval_facts, visibility_facts};
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -1777,19 +1777,18 @@ impl Workspace {
             marker,
         );
         let size = size_fact(&approval.sql);
-        let held = match &approval.verdict {
-            crate::sql::AgentVerdict::Approve(verdict, _) => Some(verdict.mode),
-            _ => None,
-        };
-        let facts = [
-            Some(engine.label().to_string()),
-            Some(format!("access {}", profile.mode.label())),
-            held.map(|mode| format!("needs {}", mode.label())),
-        ]
+        // The size sits under the statement it counts, so it is not said twice.
+        let facts = approval_facts(
+            engine,
+            profile.mode,
+            &approval.verdict,
+            &approval.sql,
+            approval.locks_the_file,
+        )
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+        .filter(|fact| *fact != size)
+        .map(|fact| div().child(fact));
+        let waiting = self.agent.calls.len().saturating_sub(1);
         let deny_workspace = cx.entity().downgrade();
         let approve_workspace = deny_workspace.clone();
         let armed = self.agent.armed == Some(id);
@@ -1816,15 +1815,20 @@ impl Workspace {
                         .child(section_label(t, "Agent"))
                         .child(
                             div()
+                                .flex()
+                                .gap(px(layout::SPACE_SM))
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                .text_color(t.text)
-                                .child(format!("Statement from the agent for {}", profile.name)),
+                                .child(div().text_color(t.text).child(profile.name.clone()))
+                                .child(div().text_color(t.text_muted).child(engine.label())),
                         )
                         .child(
                             div()
+                                .debug_selector(|| "agent-approval-facts".into())
+                                .flex()
+                                .flex_col()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
-                                .child(facts),
+                                .children(facts),
                         )
                         .child(
                             div()
@@ -1859,6 +1863,15 @@ impl Workspace {
                                 .text_color(t.text_muted)
                                 .child(size),
                         )
+                        .when(waiting > 0, |card| {
+                            card.child(
+                                div()
+                                    .debug_selector(|| "agent-approval-waiting".into())
+                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                    .text_color(t.text_muted)
+                                    .child(format!("{waiting} more waiting")),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()

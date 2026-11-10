@@ -315,7 +315,6 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
 /// What an approvable statement does, which is what the approval says first.
 /// The three kinds are gate steps 9, 10 and 11, one to one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) enum ApprovalKind {
     /// It writes (step 9).
     Write,
@@ -330,7 +329,6 @@ pub(crate) enum ApprovalKind {
 /// cannot contradict the gate: a write is the step-9 verdict at Read-write, and
 /// of the reads the gate approves the ones that are not egress are the ones
 /// that call an unlisted function.
-#[cfg_attr(not(test), expect(dead_code, reason = "the approval dialog reads it"))]
 pub(crate) fn approval_kind(engine: Engine, sql: &str, verdict: &Verdict) -> ApprovalKind {
     if verdict.mode == Mode::ReadWrite {
         ApprovalKind::Write
@@ -355,10 +353,6 @@ fn typed_statements(engine: Engine, sql: &str) -> Vec<Statement> {
 /// Whether `sql` is a Postgres `CREATE INDEX CONCURRENTLY`. Only Postgres
 /// leaves an invalid index behind when a concurrent build stops, which is what
 /// the answer to a stopped write tells the agent about.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the approved write's answer reads it")
-)]
 pub(crate) fn creates_index_concurrently(engine: Engine, sql: &str) -> bool {
     engine == Engine::Postgres
         && typed_statements(engine, sql).iter().any(
