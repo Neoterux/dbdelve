@@ -6185,6 +6185,87 @@ fn agent_audit_never_records_a_row_value(cx: &mut TestAppContext) {
     });
 }
 
+/// A write that opens for `opening` of the test clock and then fails at once,
+/// or after `running`, as Redis answers.
+fn slow_open_then(
+    opening: std::time::Duration,
+    running: std::time::Duration,
+    executor: &gpui::BackgroundExecutor,
+) -> gpui::Task<super::agent_write::Wrote> {
+    let executor = executor.clone();
+    executor.clone().spawn(async move {
+        executor.timer(opening).await;
+        super::agent_write::Wrote::Done {
+            hidden: Vec::new(),
+            ran_for: running,
+            result: Err(crate::db::DbError {
+                message: "WRONGTYPE Operation against a key holding the wrong kind of value"
+                    .to_string(),
+                position: None,
+            }),
+        }
+    })
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn only_a_write_that_ran_its_whole_bound_after_it_was_sent_says_its_outcome_is_not_known(
+    cx: &mut TestAppContext,
+) {
+    use std::time::Duration;
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &[
+                sqlite_profile("secret", "Secret", ""),
+                "[[profiles]]\nid = \"keys\"\nname = \"Keys\"\nhost = \"127.0.0.1\"\n\
+                 database = \"0\"\nuser = \"\"\nengine = \"redis\"\nagent_visible = true\n\
+                 mode = \"read-write\"\nstatement_timeout = 1\n"
+                    .to_string(),
+            ]
+            .concat(),
+        );
+        let answer_after = |workspace: &Entity<Workspace>,
+                            cx: &mut VisualTestContext,
+                            runner: super::agent_write::WriteRunner| {
+            workspace.update(cx, |workspace, _| {
+                workspace.agent.write_runner = Some(runner)
+            });
+            let (_, answers) = inject_call_with(
+                workspace,
+                cx,
+                crate::agent::tools::Tool::ExecuteSql,
+                Some("Keys"),
+                crate::agent::CallArgs {
+                    sql: Some("SET k v".to_string()),
+                    ..Default::default()
+                },
+            );
+            approve_front(cx);
+            cx.executor().advance_clock(Duration::from_secs(5));
+            settle(cx);
+            let answer = answers.try_recv().expect("the write answered");
+            assert_eq!(answer.status, Status::Failed);
+            answer.text
+        };
+
+        // Most of the bound went on opening; the server then refused it.
+        let refused = answer_after(&workspace, cx, |executor, _, _, _, _| {
+            slow_open_then(Duration::from_secs(3), Duration::from_millis(5), executor)
+        });
+        assert!(!refused.contains("is not known"), "{refused}");
+
+        let stopped = answer_after(&workspace, cx, |executor, _, _, _, _| {
+            slow_open_then(Duration::ZERO, Duration::from_secs(1), executor)
+        });
+        assert!(stopped.contains("is not known"), "{stopped}");
+        quit(workspace, cx);
+    });
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn agent_audit_keeps_no_row_value_or_host_from_a_failed_write(cx: &mut TestAppContext) {
@@ -6217,6 +6298,7 @@ fn agent_audit_keeps_no_row_value_or_host_from_a_failed_write(cx: &mut TestAppCo
         let (id, answer, logged) = fail_with(&workspace, cx, |_, _, _, _, _| {
             gpui::Task::ready(Wrote::Done {
                 hidden: Vec::new(),
+                ran_for: std::time::Duration::ZERO,
                 result: Err(DbError {
                     message: "duplicate key value violates unique constraint \"t_email_key\"\n\
                               Key (email)=(a@x) already exists."

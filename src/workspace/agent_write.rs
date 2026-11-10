@@ -68,12 +68,9 @@ pub(crate) struct Writing {
     /// Kept after a hangup: the answer is still sent and nobody reads it.
     reply: SyncSender<Reply>,
     arrived: Instant,
-    /// When the write was handed to its connection, after any wait for the
-    /// human: `arrived` would count the approval as time the write ran.
-    started: Instant,
     /// The statement timeout its connection carries, which is how long the
-    /// write may run before an engine that times out on the client stops
-    /// waiting.
+    /// write may run, once sent, before an engine that times out on the
+    /// client stops waiting.
     bound: Duration,
     /// The statement exactly as it was approved, for the audit.
     sql: String,
@@ -101,8 +98,11 @@ pub(crate) enum Wrote {
         hidden: Vec<String>,
         error: DbError,
     },
+    /// `ran_for` is from the statement being sent to its answer: the
+    /// keychain, a tunnel and the open before it are not the write running.
     Done {
         hidden: Vec<String>,
+        ran_for: Duration,
         result: Result<String, DbError>,
     },
 }
@@ -157,6 +157,7 @@ pub(super) fn run_write(
         Ok(connection) => connection,
         Err(error) => return Wrote::NotOpened { hidden, error },
     };
+    let sent = Instant::now();
     // Not `reads_only`: a write's rows are drained, never stopped early.
     let result = connection
         .query(
@@ -168,8 +169,13 @@ pub(super) fn run_write(
             },
         )
         .map(|result| written_text(engine, sql, &result));
+    let ran_for = sent.elapsed();
     drop(connection);
-    Wrote::Done { hidden, result }
+    Wrote::Done {
+        hidden,
+        ran_for,
+        result,
+    }
 }
 
 /// What an approved write answers: its rows when it returned any, the server's
@@ -197,8 +203,9 @@ const UNKNOWN_OUTCOME: &str =
 /// server's (scrubbed) text, then
 ///
 /// - that the outcome is not known, when the engine's timeout is DBDelve's own
-///   timer and the write had run for the whole bound -- the server may still
-///   apply it, and no other failure says so; or
+///   timer and the write had run for the whole bound since it was sent -- the
+///   server may still apply it, and no other failure says so: one that failed
+///   to open was never sent; or
 /// - that an invalid index of that name may remain, when `sql` is a Postgres
 ///   `CREATE INDEX CONCURRENTLY`: a stopped concurrent build leaves one, no
 ///   other statement does, so no other failure says it.
@@ -250,7 +257,6 @@ impl Workspace {
             engine,
             reply,
             arrived,
-            started: Instant::now(),
             bound,
             sql,
             verdict,
@@ -280,10 +286,11 @@ impl Workspace {
             } => (Status::Executed, text, None),
             Wrote::Done {
                 hidden,
+                ran_for,
                 result: Err(error),
             } => {
                 let server = scrubbed(&error.message, &hidden);
-                let unknown = write.started.elapsed() >= write.bound;
+                let unknown = ran_for >= write.bound;
                 (
                     Status::Failed,
                     failed_text(write.engine, &write.sql, &server, unknown),
@@ -590,6 +597,7 @@ mod tests {
         let Wrote::Done {
             hidden,
             result: Err(error),
+            ..
         } = approved(&config, &sql)
         else {
             panic!("the duplicate build did not fail on the server");
@@ -628,6 +636,7 @@ mod tests {
         let Wrote::Done {
             hidden,
             result: Err(error),
+            ..
         } = approved(
             &config,
             &format!("INSERT INTO {table} SELECT email FROM {table}"),
