@@ -130,7 +130,12 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   them, never sorted by time. A statement a person approved is kept whole and
   its `started` line is written before anything is opened, and a write that
   cannot be recorded is not run; a plain read's statement is cut as it is in
-  memory and its `started` line is best effort. No line holds a row value.
+  memory and its `started` line is best effort. No line holds a row value: a
+  failed call keeps only the first line of the server's error, scrubbed and cut
+  where it starts to quote or bracket something (`agent::audited_error`), since
+  that is where a server puts the value it names, Postgres's `DETAIL` a line
+  later. The agent's answer keeps the whole scrubbed error. A value a server
+  writes unquoted in its own words is the one thing the cut cannot tell apart.
   `store::AuditLog` counts the lines once and keeps the count, and past
   `AUDIT_SLACK` lines rewrites the file to its newest `AUDIT_KEEP`, verbatim.
   A line a crash left without its end is ended before the next is written. A

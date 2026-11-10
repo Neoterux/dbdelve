@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::agent::{AuditVerdict, CallFacts, Decision, INVALID_INDEX, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, INVALID_INDEX, audited_error, elapsed_ms};
 use super::agent_read::{AGENT_ROWS, OPEN_FAILED, scrubbed, table_of};
 use super::*;
 use crate::{
@@ -94,9 +94,12 @@ pub(crate) type WriteRunner =
     fn(&gpui::BackgroundExecutor, ConnectionConfig, String, String, Engine) -> gpui::Task<Wrote>;
 
 /// What the blocking half of an approved write came back with.
+/// `hidden` is what an error from the server or the open must not name.
 pub(crate) enum Wrote {
-    NotOpened(DbError),
-    /// `hidden` is what an error from the server must not name.
+    NotOpened {
+        hidden: Vec<String>,
+        error: DbError,
+    },
     Done {
         hidden: Vec<String>,
         result: Result<String, DbError>,
@@ -136,10 +139,13 @@ pub(super) fn run_write(
             Ok(Some(password)) => *slot = password,
             Ok(None) => {}
             Err(error) => {
-                return Wrote::NotOpened(DbError {
-                    message: error,
-                    position: None,
-                });
+                return Wrote::NotOpened {
+                    hidden: config.identifying_text(),
+                    error: DbError {
+                        message: error,
+                        position: None,
+                    },
+                };
             }
         }
     }
@@ -148,7 +154,7 @@ pub(super) fn run_write(
     let hidden = config.identifying_text();
     let connection = match Connection::open_for_approved_write(config, LOCK_WAIT) {
         Ok(connection) => connection,
-        Err(error) => return Wrote::NotOpened(error),
+        Err(error) => return Wrote::NotOpened { hidden, error },
     };
     // Not `reads_only`: a write's rows are drained, never stopped early.
     let result = connection
@@ -260,10 +266,14 @@ impl Workspace {
             return;
         };
         let write = self.agent.writes.remove(index);
+        // The answer has the server's (scrubbed) text whole; the audit keeps
+        // what `audited_error` does of it, with DBDelve's own sentence after.
         let (status, text, error) = match wrote {
-            Wrote::NotOpened(error) => {
-                (Status::Failed, OPEN_FAILED.to_string(), Some(error.message))
-            }
+            Wrote::NotOpened { hidden, error } => (
+                Status::Failed,
+                OPEN_FAILED.to_string(),
+                Some(audited_error(&scrubbed(&error.message, &hidden))),
+            ),
             Wrote::Done {
                 result: Ok(text), ..
             } => (Status::Executed, text, None),
@@ -271,13 +281,18 @@ impl Workspace {
                 hidden,
                 result: Err(error),
             } => {
-                let text = failed_text(
-                    write.engine,
-                    &write.sql,
-                    &scrubbed(&error.message, &hidden),
-                    write.started.elapsed() >= write.bound,
-                );
-                (Status::Failed, text.clone(), Some(text))
+                let server = scrubbed(&error.message, &hidden);
+                let unknown = write.started.elapsed() >= write.bound;
+                (
+                    Status::Failed,
+                    failed_text(write.engine, &write.sql, &server, unknown),
+                    Some(failed_text(
+                        write.engine,
+                        &write.sql,
+                        &audited_error(&server),
+                        unknown,
+                    )),
+                )
             }
         };
         // From the socket's flag as well as from a `Hangup` the window heard,
@@ -594,6 +609,36 @@ mod tests {
             &format!("SELECT indisvalid FROM pg_index WHERE indexrelid = '{table}_u'::regclass"),
         );
         assert_eq!(valid, "f");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_failed_write_audits_the_servers_words_and_not_the_row_value() {
+        let config = live_postgres();
+        let table = format!("dbdelve_dup_{}", std::process::id());
+        let _cleanup = Cleanup::new(
+            &config,
+            &format!(
+                "CREATE TABLE {table} (email text UNIQUE); INSERT INTO {table} VALUES ('alice@example.com')"
+            ),
+            &format!("DROP TABLE IF EXISTS {table}"),
+        );
+
+        let Wrote::Done {
+            hidden,
+            result: Err(error),
+        } = approved(
+            &config,
+            &format!("INSERT INTO {table} SELECT email FROM {table}"),
+        )
+        else {
+            panic!("the duplicate insert did not fail on the server");
+        };
+        let answered = scrubbed(&error.message, &hidden);
+        assert!(answered.contains("alice@example.com"), "{answered}");
+        let audited = audited_error(&answered);
+        assert!(!audited.contains("alice"), "{audited}");
+        assert!(audited.starts_with("duplicate key value"), "{audited}");
     }
 
     #[test]

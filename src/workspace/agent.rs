@@ -167,6 +167,8 @@ pub(crate) struct CallFacts {
     pub(crate) total: Option<Total>,
     /// Whole milliseconds from the call's arrival to its end.
     pub(crate) elapsed_ms: u64,
+    /// What the server said of a call that failed, as [`audited_error`] keeps
+    /// it, with any sentence of DBDelve's own after it.
     pub(crate) error: Option<String>,
     /// The caller hung up before the call ended.
     pub(crate) requester_gone: bool,
@@ -189,7 +191,10 @@ pub(crate) enum Decision {
 /// One line of `agent-audit.jsonl`, the record of every call an agent made. It
 /// names the statement, who decided when a person did, and how the call ended, and
 /// never a row value: what the database held does not belong in a file kept
-/// for longer than a session. `v` leads so a later shape can be told apart.
+/// for longer than a session. An error is kept as [`audited_error`] has it,
+/// for that reason; a value a server writes unquoted in its own words is the
+/// one kind the cut cannot tell apart. `v` leads so a later shape can be told
+/// apart.
 /// JSON escapes every newline, so text an agent sent cannot start a line.
 #[derive(serde::Serialize)]
 pub(super) struct AuditLine<'a> {
@@ -249,7 +254,7 @@ pub(crate) struct LogEntry {
     pub(crate) shown: Option<usize>,
     pub(crate) total: Option<Total>,
     pub(crate) elapsed_ms: u64,
-    /// The error of a call that failed, which the agent was not given, cut at
+    /// The error of a call that failed, as [`CallFacts::error`] has it, cut at
     /// [`AUDIT_SQL_CAP`] characters.
     pub(crate) error: Option<String>,
     /// What the person decided, for a call that waited for one.
@@ -426,6 +431,36 @@ fn clipped(mut text: String) -> String {
         text.push_str(SQL_CLIPPED);
     }
     text
+}
+
+/// What the audit keeps of what a server said about a call that failed: its
+/// first line, up to where it starts to quote or bracket something, with `…`
+/// in place of the rest. That is where a server puts a value it names, and the
+/// value may be a row's: Postgres's `DETAIL` (`Failing row contains (…)`) is a
+/// later line, MySQL writes `Duplicate entry '…'`, SQL Server `(…)`, MongoDB
+/// `{ … }`, and a read that casts a column quotes the column's value. A quote
+/// between two letters is an apostrophe. `server_text` is already
+/// [`agent_read::scrubbed`], so a host or a user written unquoted is gone too.
+pub(crate) fn audited_error(server_text: &str) -> String {
+    let line = server_text.lines().next().unwrap_or_default();
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let letter = |at: Option<&(usize, char)>| at.is_some_and(|(_, c)| c.is_alphabetic());
+    let cut = chars.iter().enumerate().find_map(|(index, &(at, c))| {
+        let opens = match c {
+            // Not `[`: the scrubber's own `[hidden]` is written with it.
+            '"' | '`' | '(' | '{' => true,
+            '\'' => {
+                !(letter(index.checked_sub(1).and_then(|before| chars.get(before)))
+                    && letter(chars.get(index + 1)))
+            }
+            _ => false,
+        };
+        opens.then_some(at)
+    });
+    match cut {
+        Some(at) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -1732,6 +1767,53 @@ mod tests {
         assert_eq!(count(&unlocked, lock), 0, "{unlocked:?}");
         let read = facts(Engine::DuckDb, "SELECT * FROM 'a.csv'", true);
         assert_eq!(count(&read, lock), 0, "a read is no write: {read:?}");
+    }
+
+    #[test]
+    fn an_audited_error_keeps_the_servers_words_and_never_the_value_they_name() {
+        for (server, kept) in [
+            (
+                "duplicate key value violates unique constraint \"users_email_key\"\nKey (email)=(alice@example.com) already exists.",
+                "duplicate key value violates unique constraint …",
+            ),
+            (
+                "new row for relation \"t\" violates check constraint \"c\"\nFailing row contains (7, alice, s3cret).",
+                "new row for relation …",
+            ),
+            // A read that casts a column: the value is the row's.
+            (
+                "invalid input syntax for type integer: \"s3cret\"",
+                "invalid input syntax for type integer: …",
+            ),
+            (
+                "Duplicate entry 'alice@example.com' for key 'users.email'",
+                "Duplicate entry …",
+            ),
+            (
+                "Truncated incorrect DOUBLE value: 's3cret'",
+                "Truncated incorrect DOUBLE value: …",
+            ),
+            (
+                "Violation of UNIQUE KEY constraint 'UQ_email'. The duplicate key value is (alice@example.com).",
+                "Violation of UNIQUE KEY constraint …",
+            ),
+            (
+                "E11000 duplicate key error collection: app.users index: email_1 dup key: { email: \"alice@example.com\" }",
+                "E11000 duplicate key error collection: app.users index: email_1 dup key: …",
+            ),
+            (
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ),
+            // An apostrophe is not a quote.
+            (
+                "Can't connect to server on 'db.internal'",
+                "Can't connect to server on …",
+            ),
+            ("", ""),
+        ] {
+            assert_eq!(audited_error(server), kept, "{server}");
+        }
     }
 
     #[test]
