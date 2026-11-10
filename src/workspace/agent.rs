@@ -643,12 +643,22 @@ impl Workspace {
     /// Approve is dead until [`ARM_DELAY`] has passed from now. Called one frame
     /// after the dialog is raised or the front call changes, so it counts from
     /// what the person can see and never from the call's arrival.
-    pub(crate) fn reveal_approval(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// The first time a call is revealed it also asks the OS to draw the
+    /// person's attention to the window, once. That is a request and nothing
+    /// more: it never takes focus from another application and never raises
+    /// the window (PITFALLS P-09). On Wayland it does nothing, and the agent
+    /// mark's waiting count is the signal.
+    pub(crate) fn reveal_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.front_approval_id() else {
             return;
         };
         self.agent.revealed = Some(id);
         self.agent.armed = None;
+        if self.agent.attended != Some(id) {
+            self.agent.attended = Some(id);
+            window.request_attention();
+        }
         // Replacing the old timer cancels it.
         self.agent._arming = Some(cx.spawn(async move |workspace, cx| {
             cx.background_executor().timer(ARM_DELAY).await;
