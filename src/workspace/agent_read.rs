@@ -649,6 +649,10 @@ impl Workspace {
         let cancel = CancelToken::default();
         let sent = work.sql();
         let approved = work.approved();
+        if approved.is_none() {
+            self.agent
+                .note_started(id, tool, &profile_name, engine, sent.as_deref(), arrived);
+        }
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
