@@ -388,9 +388,9 @@ pub(crate) struct Workspace {
     pub(crate) dialog_choice: std::cell::Cell<usize>,
     /// What held the keyboard when the first dialog went up.
     pub(crate) focus_before_dialog: std::cell::RefCell<Option<FocusHandle>>,
-    /// The statement the approval dialog drew last, by call, so Approve can
-    /// refuse a statement that is not what the human read (GATE-10). Written
-    /// by the render through `&self`.
+    /// The source statement the approval dialog was last drawn from, by call,
+    /// so Approve can refuse a call that was never drawn or whose statement is
+    /// not the one drawn (GATE-10). Written by the render through `&self`.
     pub(crate) approval_shown: std::cell::RefCell<Option<(crate::agent::CallId, String)>>,
     /// Where the approval's statement block is scrolled, by call, so the next
     /// call opens at its first line and the scrollbar reads the same offset.

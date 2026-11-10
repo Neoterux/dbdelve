@@ -857,12 +857,13 @@ impl Workspace {
     /// `cancelled`, unrun and unrecorded as started, when its caller has already
     /// left, even if the window has not heard so. Otherwise it is checked in
     /// this order: its profile, found by id and still visible to agents
-    /// (`rejected` otherwise); the statement, which must be byte for byte what
-    /// the dialog last drew for this call; and the gate's judgment of it now,
+    /// (`rejected` otherwise); the statement, which must be byte for byte the
+    /// source the dialog was last drawn from for this call, so a call never
+    /// drawn is refused; and the gate's judgment of it now,
     /// which must come out as it did when it arrived, on the config it arrived
     /// with. A difference in the last two answers `refused_by_gate`. Only then
     /// is the `started` line written and the write started, on a connection of
-    /// its own, with the very `String` the dialog drew.
+    /// its own, with the very `String` the dialog was drawn from.
     pub(crate) fn approve_call(&mut self, id: CallId, cx: &mut Context<Self>) {
         if self.agent.armed != Some(id) {
             return;
@@ -921,8 +922,8 @@ impl Workspace {
         let held = AuditVerdict::held_by(approval.verdict.clone());
         let (status, text, error) = match profile {
             None => (Status::Rejected, NO_LONGER_AVAILABLE, None),
-            // Byte for byte what the dialog drew for this call: no
-            // normalising, folding or trimming (GATE-10).
+            // Byte for byte the source the dialog was drawn from for this
+            // call: no normalising, folding or trimming (GATE-10).
             Some(_)
                 if !self
                     .approval_shown
