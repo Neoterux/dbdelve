@@ -2011,9 +2011,19 @@ fn secure(path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 pub(crate) const AGENT_AUDIT_FILE: &str = "agent-audit.jsonl";
 
-/// The record of agent calls that waited on a person: append-only, one JSON
-/// object per line, never a row value. Empty for now; it is a type so the
-/// file's handling has one owner when it gains a line counter and compaction.
+// ponytail: the audit is rewritten to its newest `AUDIT_KEEP` lines once it
+// passes `AUDIT_SLACK`, so a rewrite comes once per two thousand appends, and
+// the line count is read from the file once and then kept, so an append never
+// reads it. The upgrade is a size bound or rotation, if a user's audit ever
+// needs to reach further back. Two windows appending to one file would each
+// count their own appends and one's rewrite could drop the other's newest lines.
+#[cfg(unix)]
+pub(crate) const AUDIT_KEEP: usize = 2_000;
+#[cfg(unix)]
+pub(crate) const AUDIT_SLACK: usize = 4_000;
+
+/// The record of agent calls: append-only, one JSON object per line, never a
+/// row value.
 ///
 /// Unix only, as the bridge that feeds it is: on Windows nothing reads it, and
 /// CI's Windows clippy denies dead code.
@@ -2791,6 +2801,108 @@ user = ""
                     .count(),
                 3
             );
+        });
+    }
+
+    #[cfg(unix)]
+    fn audit_path() -> PathBuf {
+        dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join(AGENT_AUDIT_FILE)
+    }
+
+    #[cfg(unix)]
+    fn audit_text() -> String {
+        fs::read_to_string(audit_path()).expect("the audit is readable")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_keeps_its_newest_lines_once_past_its_slack() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            let mut log = AuditLog::default();
+            for n in 0..=AUDIT_SLACK {
+                log.append(&format!(r#"{{"n":{n}}}"#))
+                    .expect("a line is written");
+            }
+            let kept: Vec<String> = (AUDIT_SLACK + 1 - AUDIT_KEEP..=AUDIT_SLACK)
+                .map(|n| format!(r#"{{"n":{n}}}"#))
+                .collect();
+            let text = audit_text();
+            let lines: Vec<_> = text.lines().collect();
+            assert_eq!(lines.len(), AUDIT_KEEP);
+            // Not `assert_eq!`: its failure would print two thousand lines.
+            assert!(lines == kept, "the newest lines, in order and verbatim");
+            assert_eq!(
+                fs::metadata(audit_path())
+                    .expect("the file exists")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let beside = fs::read_dir(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is readable")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("agent-audit"))
+                .collect::<Vec<_>>();
+            assert_eq!(beside, [AGENT_AUDIT_FILE]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_counts_an_existing_file_once() {
+        with_home(|| {
+            let full: String = (0..AUDIT_SLACK)
+                .map(|n| format!("{{\"n\":{n}}}\n"))
+                .collect();
+            fs::create_dir_all(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is creatable");
+            fs::write(audit_path(), full).expect("the file is writable");
+
+            let mut log = AuditLog::default();
+            log.append(r#"{"last":1}"#).expect("a line is written");
+            let text = audit_text();
+            assert_eq!(text.lines().count(), AUDIT_KEEP, "compacted on that append");
+            assert_eq!(text.lines().last(), Some(r#"{"last":1}"#));
+
+            log.append(r#"{"last":2}"#).expect("a line is written");
+            assert_eq!(
+                audit_text().lines().count(),
+                AUDIT_KEEP + 1,
+                "the count was kept and the file not read again"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_ends_a_cut_line_before_the_next() {
+        with_home(|| {
+            fs::create_dir_all(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is creatable");
+            fs::write(audit_path(), "{\"v\":1,\"id\":").expect("the file is writable");
+
+            AuditLog::default()
+                .append(r#"{"v":1,"id":2}"#)
+                .expect("a line is written");
+            assert_eq!(audit_text(), "{\"v\":1,\"id\":\n{\"v\":1,\"id\":2}\n");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_starts_a_missing_file() {
+        with_home(|| {
+            assert!(!audit_path().exists());
+            AuditLog::default()
+                .append(r#"{"v":1}"#)
+                .expect("a line is written");
+            assert_eq!(audit_text(), "{\"v\":1}\n");
         });
     }
 
