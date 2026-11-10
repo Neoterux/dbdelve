@@ -193,8 +193,9 @@ impl Resolved {
     }
 }
 
-/// Said for a statement that needs the user's approval: it is not run for an
-/// agent, and no connection is opened for it.
+/// Said for a statement that needs the user's approval at Read-only access:
+/// it is not run for an agent, and no connection is opened for it. A write at
+/// Read-write waits for the person instead.
 pub(crate) const NEEDS_APPROVAL: &str =
     "statements that need the user's approval are not run for agents";
 
