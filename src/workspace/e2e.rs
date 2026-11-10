@@ -8705,6 +8705,54 @@ fn an_agent_read_on_an_in_memory_duckdb_profile_is_refused_by_name(cx: &mut Test
     });
 }
 
+#[cfg(unix)]
+#[gpui::test]
+fn an_in_memory_duckdb_profile_refuses_a_read_it_would_hold_before_asking_anyone(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        agent::Status,
+        sql::{AgentVerdict, Mode, agent_gate},
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_duckdb(cx, "");
+        cx.executor().allow_parking();
+        let sql = "SELECT * FROM 'data.csv'";
+        assert!(
+            matches!(
+                agent_gate(Engine::DuckDb, sql, Mode::ReadOnly),
+                AgentVerdict::Approve(..)
+            ),
+            "the gate holds a read of a file for a person"
+        );
+        let (id, answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Ducks"),
+            crate::agent::CallArgs {
+                sql: Some(sql.to_string()),
+                ..Default::default()
+            },
+        );
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::RefusedByGate, "{}", answer.text);
+        assert!(answer.text.contains("in-memory DuckDB"), "{}", answer.text);
+        settle(cx);
+        assert_ne!(front_dialog(&workspace, cx), Some("agent-approval"));
+        assert!(
+            pending_calls(&workspace, cx).is_empty(),
+            "the read was held"
+        );
+        let lines = audit_of(id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["phase"], "outcome");
+        assert!(lines[0].get("decision").is_none(), "{lines:?}");
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
     use std::sync::mpsc::TryRecvError;
