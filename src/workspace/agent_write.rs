@@ -31,10 +31,11 @@ use crate::{
 // upgrade is a setting, if a user ever needs one.
 pub(crate) const WRITE_TIMEOUT: u32 = 600;
 
-// ponytail: how long an approved write's session waits for a lock. Long enough
-// for an ordinary row lock to clear, short enough that a queued `ALTER` does
-// not hold up every later query on its table for the whole write bound (on
-// MySQL, for a year). The upgrade is a setting.
+// ponytail: how long an approved write's session waits for a lock, a row lock
+// or a metadata one (on MySQL and MariaDB, `innodb_lock_wait_timeout` and
+// `lock_wait_timeout`). Long enough for an ordinary row lock to clear, short
+// enough that a queued `ALTER` does not hold up every later query on its table
+// for the whole write bound (on MySQL, for a year). The upgrade is a setting.
 pub(crate) const LOCK_WAIT: u32 = 30;
 
 /// The statement timeout in seconds an approved write's connection carries,
