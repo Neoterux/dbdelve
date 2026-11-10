@@ -974,8 +974,7 @@ mod tests {
                     "list_tables",
                     "describe_table",
                     "execute_sql",
-                    "explain_query",
-                    "ping"
+                    "explain_query"
                 ]
             );
         });
@@ -1010,8 +1009,7 @@ mod tests {
                     "list_tables",
                     "describe_table",
                     "execute_sql",
-                    "explain_query",
-                    "ping"
+                    "explain_query"
                 ]
             );
         });
@@ -1053,7 +1051,10 @@ mod tests {
                         "explain_query",
                         json!({"connection": "Orders", "sql": "SELECT 1"}),
                     ),
-                    ("ping", json!({"connection": "Orders"})),
+                    (
+                        "execute_sql",
+                        json!({"connection": "Orders", "sql": "UPDATE t SET a = 1"}),
+                    ),
                 ] {
                     let answered = client.call(tool, arguments).await;
                     assert_eq!(
@@ -1159,7 +1160,10 @@ mod tests {
             let waiting = client
                 .start(
                     "tools/call",
-                    json!({"name": "ping", "arguments": {"connection": "Orders"}}),
+                    json!({
+                        "name": "execute_sql",
+                        "arguments": {"connection": "Orders", "sql": "UPDATE t SET a = 1"},
+                    }),
                 )
                 .await;
             let heard = app.collect(PATIENCE, |heard| called(heard) > 0).await;
