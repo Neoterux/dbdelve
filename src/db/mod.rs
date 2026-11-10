@@ -3790,8 +3790,14 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
 /// [`read_only_statement`] is, and not a [`ServerConfig`] field: a field would
 /// reach every struct literal and every stored profile for a setting only the
 /// agent's writable session carries.
-fn lock_wait_statement(_engine: Engine, _seconds: u32) -> Option<String> {
-    None
+fn lock_wait_statement(engine: Engine, seconds: u32) -> Option<String> {
+    match engine {
+        Engine::Postgres => Some(format!("SET lock_timeout = '{seconds}s'")),
+        Engine::MySql | Engine::MariaDb => {
+            Some(format!("SET SESSION lock_wait_timeout = {seconds}"))
+        }
+        _ => None,
+    }
 }
 
 /// Shared with `postgres::tests`, which exercises `assemble`'s type-matching
