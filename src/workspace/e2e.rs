@@ -3963,7 +3963,7 @@ fn a_refused_bar_edit_leaves_the_bars_as_they_ran(cx: &mut TestAppContext) {
                     filter: crate::filter::derived_filter(Engine::Generic, &ran, &[]),
                     filters: ran.clone(),
                 };
-                let id = workspace.open_object(opened, window, cx).unwrap();
+                let id = workspace.open_object(opened, None, window, cx).unwrap();
                 workspace.activate_tab(crate::session::Tab::Object(id), window, cx);
                 id
             })

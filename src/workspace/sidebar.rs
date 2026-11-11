@@ -31,6 +31,14 @@ use crate::ui::{Status, row_icon_tinted, status_dot};
 /// The id of the row of `profile`'s front tab in the connections tree, if
 /// the tab has one.
 pub(crate) fn front_row_id(profile: &Profile) -> Option<String> {
+    if let Some((database, row)) = profile.front_row_elsewhere() {
+        return Some(model::listed_row(
+            &profile.id,
+            profile.config.target().levels(),
+            Some(database),
+            &row,
+        ));
+    }
     let row = profile.front_row()?;
     Some(model::listed_row(
         &profile.id,
@@ -366,29 +374,33 @@ impl Workspace {
         let Some(index) = self.profiles.iter().position(|p| p.id == profile) else {
             return false;
         };
-        // Only the connection's own database opens through its own catalog.
-        if database.is_some_and(|database| {
-            self.profiles[index].active_database().as_deref() != Some(database)
-        }) {
-            return false;
-        }
+        // A row under another database opens through the catalog read for it,
+        // and only an object does: the connection's saved queries and
+        // shortcuts are not listed there.
+        let elsewhere = database
+            .filter(|database| self.profiles[index].active_database().as_deref() != Some(database))
+            .map(str::to_string);
         let leaf = match self.connections.nodes.get(id) {
             Some(Node::Row { leaf }) => *leaf,
             _ => None,
         };
         let query = saved_query(row)
             .or_else(|| self.connections.shortcuts.get(id).and_then(Shortcut::query))
-            .map(str::to_string);
+            .map(str::to_string)
+            .filter(|_| elsewhere.is_none());
         if leaf.is_none() && query.is_none() {
             return false;
         }
         if self.active != Some(index) {
             self.activate(index, cx);
         }
-        match (query, leaf) {
-            (Some(name), _) => self.open_saved_query(name, window, cx),
-            (None, Some(leaf)) => self.open_explorer_target(leaf.target, window, cx),
-            (None, None) => {}
+        match (query, leaf, elsewhere) {
+            (Some(name), ..) => self.open_saved_query(name, window, cx),
+            (None, Some(leaf), Some(database)) => {
+                self.open_object_on(profile, database, leaf.target, window, cx)
+            }
+            (None, Some(leaf), None) => self.open_explorer_target(leaf.target, window, cx),
+            (None, None, _) => {}
         }
         true
     }

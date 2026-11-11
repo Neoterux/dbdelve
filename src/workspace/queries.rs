@@ -12,8 +12,8 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
-    Binding, BoundSession, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename,
-    Queue, Resume, Step, TabKey, next_step, query_name_refusal, reveals_results,
+    Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume,
+    Routed, Step, TabKey, next_step, query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -103,10 +103,12 @@ impl Workspace {
         // The session a bound tab runs on, which is where the statements that
         // are stopped by what the connection holds of them (MongoDB's, and
         // ClickHouse's fallback) are kept.
-        let Some(connection) = self
-            .profile()
-            .and_then(|profile| profile.connection_for(profile.session.active))
-        else {
+        let Some(connection) = self.profile().and_then(|profile| {
+            profile
+                .connection_for(profile.session.active)
+                .existing()
+                .cloned()
+        }) else {
             return;
         };
         let Some(profile) = self.profile_mut() else {
@@ -2092,34 +2094,19 @@ impl Workspace {
         // Read before the task, which outlives the borrow of `self`.
         let target = profile.config.target();
         let engine = target.engine;
-        let connection = profile.connection();
         let id = profile.id.clone();
         let generation = profile.generation;
         let read_only = profile.mode == Mode::ReadOnly;
         let alongside = lane.is_some();
-        // A tab opened with New Query Here runs on the session of the database
-        // it is bound to: the one open for it, else one this run opens first.
-        // A lane belongs to the profile's own tabs, which are never bound.
-        let binding = match (tab, &lane) {
-            (Tab::Query(query), None) => profile
-                .session
-                .query_tab(query)
-                .and_then(|query| query.binding.clone()),
-            _ => None,
+        // A tab bound to a database -- a query tab opened with New Query Here,
+        // an object tab of another database -- runs on the session of that
+        // database: the one open for it, else one this run opens first. A lane
+        // belongs to the profile's own tabs, which are never bound.
+        let binding = match &lane {
+            None => profile.binding_of(tab),
+            Some(_) => None,
         };
-        let session =
-            binding
-                .as_ref()
-                .and_then(|binding| match profile.bound.get(&binding.database) {
-                    Some(BoundSession::Open(session)) => Some((**session).clone()),
-                    _ => None,
-                });
-        // The connection to open the session from, when there is no session.
-        let opens = binding
-            .as_ref()
-            .filter(|_| session.is_none())
-            .map(|binding| binding.database.clone());
-        let connection = session.or(connection);
+        let routed = profile.route(binding.clone());
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
         // command's does. Not in a queue, where every result holds a grid.
@@ -2142,7 +2129,7 @@ impl Workspace {
             return;
         }
 
-        let Some(connection) = connection else {
+        if !routed.is_available() {
             *state = QueryState::Failed(DbError {
                 message: "The connection is not open.".into(),
                 position: None,
@@ -2152,7 +2139,7 @@ impl Workspace {
                 self.land_lane(tab, lane, Vec::new(), cx);
             }
             return;
-        };
+        }
         // Lent only now the run is certain to start, so nothing refused above
         // leaves it lent.
         if let (Tab::Query(query), None, Some(Refresh::Earlier { index, .. })) =
@@ -2471,30 +2458,23 @@ impl Workspace {
             (result, lost)
         };
         let number = crate::logging::connection_number(&id);
+        // The database to open a session for, when none is open for it.
+        let opens = match &routed {
+            Routed::Open { database, .. } => Some(database.clone()),
+            _ => None,
+        };
 
         cx.spawn(async move |workspace, cx| {
             // A bound tab with no session open for its database opens one
             // first, and keeps it where the tree and a Cancel find it before
             // anything is sent on it (`Workspace::keep_session`).
             let ready = match opens {
-                None => Ok(connection),
+                None => routed.resolve().map(|(connection, _)| connection),
                 Some(database) => {
-                    let opening = spawn_blocking(cx.background_executor(), {
-                        let database = database.clone();
-                        move || {
-                            let session = connection.on_database(&database)?;
-                            // Only Read-only asks the server for anything, as
-                            // at connect: a session that fails to take the
-                            // hold is dropped, not run on looking held.
-                            if read_only {
-                                session.set_read_only(true)?;
-                            }
-                            Ok::<_, DbError>(session)
-                        }
-                    })
-                    .await;
+                    let opening =
+                        spawn_blocking(cx.background_executor(), move || routed.resolve()).await;
                     match opening {
-                        Ok(session) => match workspace.update(cx, |workspace, cx| {
+                        Ok((session, _)) => match workspace.update(cx, |workspace, cx| {
                             workspace
                                 .keep_session(&id, generation, database, read_only, session, cx)
                         }) {

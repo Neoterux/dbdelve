@@ -183,6 +183,8 @@ impl Profile {
     /// does not list.
     pub(crate) fn front_row(&self) -> Option<String> {
         match self.session.active_object() {
+            // Listed under its own database, not under the connection's.
+            Some(tab) if tab.database.is_some() => None,
             Some(tab) => match &self.catalog {
                 CatalogState::Loaded(catalog, _) => {
                     crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)
@@ -195,6 +197,39 @@ impl Profile {
                 .open_query
                 .as_deref()
                 .map(crate::explorer::query_row),
+        }
+    }
+
+    /// How far the catalog an object of `database` is looked up in has got:
+    /// the one read for that database, or the profile's own when there is
+    /// none. A database nothing has asked for is still loading.
+    pub(crate) fn catalog_state_of(&self, database: Option<&str>) -> &CatalogState {
+        static NOT_READ: CatalogState = CatalogState::Loading;
+        match database {
+            Some(database) => self.database_catalogs.get(database).unwrap_or(&NOT_READ),
+            None => &self.catalog,
+        }
+    }
+
+    /// The loaded catalog behind [`Profile::catalog_state_of`], if it is.
+    pub(crate) fn catalog_of(&self, database: Option<&str>) -> Option<&Catalog> {
+        match self.catalog_state_of(database) {
+            CatalogState::Loaded(catalog, _) => Some(catalog),
+            _ => None,
+        }
+    }
+
+    /// The row of the object tab in front when it is of another database,
+    /// with that database, found in the catalog read for it.
+    pub(crate) fn front_row_elsewhere(&self) -> Option<(&str, String)> {
+        let tab = self.session.active_object()?;
+        let database = tab.database.as_deref()?;
+        match self.database_catalogs.get(database)? {
+            CatalogState::Loaded(catalog, _) => {
+                let row = crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)?;
+                Some((database, row))
+            }
+            _ => None,
         }
     }
 
@@ -228,19 +263,53 @@ impl Profile {
         self.database_catalogs.clear();
     }
 
-    /// The connection `tab`'s statements run on: the session open for the
-    /// database a bound query tab is bound to, else the profile's own.
-    pub(crate) fn connection_for(&self, tab: Tab) -> Option<Connection> {
-        if let Tab::Query(query) = tab
-            && let Some(binding) = self
+    /// Where a run of `tab` goes. See [`Profile::route`].
+    pub(crate) fn connection_for(&self, tab: Tab) -> Routed {
+        self.route(self.binding_of(tab))
+    }
+
+    /// The binding `tab` runs under: a bound query tab's own, or, for an
+    /// object tab of another database, that database alone -- its statements
+    /// name their schema, so there is none to pick.
+    pub(crate) fn binding_of(&self, tab: Tab) -> Option<Binding> {
+        match tab {
+            Tab::Query(query) => self.session.query_tab(query)?.binding.clone(),
+            Tab::Object(object) => self
                 .session
-                .query_tab(query)
-                .and_then(|query| query.binding.as_ref())
-            && let Some(BoundSession::Open(session)) = self.bound.get(&binding.database)
-        {
-            return Some((**session).clone());
+                .objects
+                .iter()
+                .find(|tab| tab.id == object)?
+                .database
+                .clone()
+                .map(|database| Binding {
+                    database,
+                    schema: None,
+                }),
         }
-        self.connection()
+    }
+
+    /// The connection a run under `binding` goes to: the profile's own when
+    /// there is none, else the session open for its database, else what is
+    /// needed to open one. The one place a tab's database picks a session.
+    pub(crate) fn route(&self, binding: Option<Binding>) -> Routed {
+        let Some(own) = self.connection() else {
+            return Routed::Unavailable;
+        };
+        let Some(binding) = binding else {
+            return Routed::Own(own);
+        };
+        match self.bound.get(&binding.database) {
+            Some(BoundSession::Open(session)) => Routed::Bound {
+                session: (**session).clone(),
+                schema: binding.schema,
+            },
+            _ => Routed::Open {
+                from: own,
+                database: binding.database,
+                schema: binding.schema,
+                read_only: self.mode == Mode::ReadOnly,
+            },
+        }
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -1444,6 +1513,78 @@ pub(crate) enum CatalogState {
     Failed(String),
 }
 
+/// Where a tab's reads and writes go, as [`Profile::connection_for`] finds
+/// it. Resolved on the blocking pool, because opening a session is not
+/// something to wait on from the frame.
+pub(crate) enum Routed {
+    /// The profile's own connection: the tab is not bound.
+    Own(Connection),
+    /// The session already open for the tab's database.
+    Bound {
+        session: Connection,
+        schema: Option<String>,
+    },
+    /// No session is open for the tab's database: one is opened from `from`
+    /// ([`Connection::on_database`]), held to reads when `read_only`.
+    Open {
+        from: Connection,
+        database: String,
+        schema: Option<String>,
+        read_only: bool,
+    },
+    /// The profile has no live connection to run on.
+    Unavailable,
+}
+
+impl Routed {
+    /// The connection to run on, with the schema a bound tab runs in. Opens
+    /// the session when there is none, and so may take as long as a connect.
+    pub(crate) fn resolve(self) -> Result<(Connection, Option<String>), DbError> {
+        match self {
+            Self::Own(connection) => Ok((connection, None)),
+            Self::Bound { session, schema } => Ok((session, schema)),
+            Self::Open {
+                from,
+                database,
+                schema,
+                read_only,
+            } => {
+                let session = from.on_database(&database)?;
+                // Only Read-only asks the server for anything, as at connect:
+                // a session that fails to take the hold is dropped, not run
+                // on looking held.
+                if read_only {
+                    session.set_read_only(true)?;
+                }
+                Ok((session, schema))
+            }
+            Self::Unavailable => Err(DbError {
+                message: "The connection is not open.".into(),
+                position: None,
+            }),
+        }
+    }
+
+    /// Whether there is a connection to run on, now or once a session opens.
+    pub(crate) fn is_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+
+    /// A connection that exists now to ask something of, such as a statement
+    /// to stop: the session of a bound tab, else the profile's own.
+    pub(crate) fn existing(&self) -> Option<&Connection> {
+        match self {
+            Self::Own(connection)
+            | Self::Bound {
+                session: connection,
+                ..
+            } => Some(connection),
+            Self::Open { from, .. } => Some(from),
+            Self::Unavailable => None,
+        }
+    }
+}
+
 /// A session for one (profile, database) pair other than the profile's own.
 pub(crate) enum BoundSession {
     /// Being opened on the blocking pool. Holds the database's place, so a
@@ -2645,19 +2786,23 @@ impl OpenedObject {
 }
 
 /// The tab an object would reuse, if it has one. Dedup is on
-/// `(schema, name, filter)` rather than `(schema, name)` (spec §6.3), so
-/// `customers` and `customers WHERE id = 42` are two tabs. Fed an iterator
+/// `(database, schema, name, filter)` rather than `(schema, name)` (spec
+/// §6.3), so `customers` and `customers WHERE id = 42` are two tabs, and
+/// `main.t` under two databases of one server is two. Fed an iterator
 /// rather than a session, so the invariant has a test that needs no window.
 pub(crate) fn matching_tab<'a>(
     open: impl Iterator<Item = (u64, Option<&'a str>, &'a str, &'a str, &'a str)>,
-    _database: Option<&str>,
+    database: Option<&str>,
     schema: &str,
     name: &str,
     filter: &str,
 ) -> Option<u64> {
     open.filter(
-        |(_, _candidate_database, candidate_schema, candidate_name, candidate_filter)| {
-            *candidate_schema == schema && *candidate_name == name && *candidate_filter == filter
+        |(_, candidate_database, candidate_schema, candidate_name, candidate_filter)| {
+            *candidate_database == database
+                && *candidate_schema == schema
+                && *candidate_name == name
+                && *candidate_filter == filter
         },
     )
     .map(|(id, ..)| id)
