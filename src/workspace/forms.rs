@@ -1782,8 +1782,63 @@ impl Workspace {
         let code = fonts(cx).editor.clone();
         let syntax = self.engine().syntax();
         let text_size = px(layout::chrome(layout::TEXT_SM));
-        let copyable = matches!(&view.text, DdlText::Ready(text) if !text.is_empty());
-        let body = match (&view.diagram, view.showing_diagram, &view.text) {
+        let copyable = view
+            .sections
+            .iter()
+            .any(|section| matches!(&section.text, DdlText::Ready(text) if !text.is_empty()));
+        let highlight = cx.theme().highlight_theme.clone();
+        // One definition as the dialog draws it. `suffix` tells the sections
+        // of several apart; `scrolls` is whether this block scrolls itself,
+        // which several leave to the list that holds them.
+        let block = |text: &DdlText, name: &str, suffix: String, scrolls: bool| -> AnyElement {
+            match text {
+                DdlText::Loading => div()
+                    .debug_selector({
+                        let suffix = suffix.clone();
+                        move || format!("show-ddl-loading{suffix}")
+                    })
+                    .text_color(t.text_muted)
+                    .child("Reading the definition…")
+                    .into_any_element(),
+                DdlText::Failed(message) => div()
+                    .debug_selector({
+                        let suffix = suffix.clone();
+                        move || format!("show-ddl-failed{suffix}")
+                    })
+                    .text_color(t.danger)
+                    .child(message.clone())
+                    .into_any_element(),
+                DdlText::Ready(text) if text.is_empty() => div()
+                    .debug_selector({
+                        let suffix = suffix.clone();
+                        move || format!("show-ddl-empty{suffix}")
+                    })
+                    .text_color(t.text_muted)
+                    .child(format!("The server returned no definition for {name}."))
+                    .into_any_element(),
+                // Nothing moves in it, so it takes no smooth-scroll modifier.
+                DdlText::Ready(text) => div()
+                    .id(format!("show-ddl-text{suffix}"))
+                    .debug_selector(move || format!("show-ddl-text{suffix}"))
+                    .when(scrolls, |block| {
+                        block
+                            .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                    })
+                    .font_family(code.clone())
+                    .children(
+                        code_lines(text, syntax, &highlight)
+                            .into_iter()
+                            .map(|line| div().child(line)),
+                    )
+                    .into_any_element(),
+            }
+        };
+        let body = match (
+            &view.diagram,
+            view.showing_diagram,
+            view.sections.as_slice(),
+        ) {
             (Some(DiagramState::Ready(diagram)), true, _) => {
                 render_diagram(diagram, t, code.clone())
             }
@@ -1797,39 +1852,62 @@ impl Workspace {
                 .text_color(t.text_muted)
                 .child("Reading the structure…")
                 .into_any_element(),
-            (_, false, text) => match text {
-                DdlText::Loading => div()
-                    .debug_selector(|| "show-ddl-loading".into())
-                    .text_color(t.text_muted)
-                    .child("Reading the definition…")
-                    .into_any_element(),
-                DdlText::Failed(message) => div()
-                    .debug_selector(|| "show-ddl-failed".into())
-                    .text_color(t.danger)
-                    .child(message.clone())
-                    .into_any_element(),
-                DdlText::Ready(text) if text.is_empty() => div()
-                    .debug_selector(|| "show-ddl-empty".into())
-                    .text_color(t.text_muted)
-                    .child(format!(
-                        "The server returned no definition for {}.",
-                        view.name
-                    ))
-                    .into_any_element(),
-                // Nothing moves in it, so it takes no smooth-scroll modifier.
-                DdlText::Ready(text) => div()
-                    .id("show-ddl-text")
-                    .debug_selector(|| "show-ddl-text".into())
-                    .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
-                    .overflow_y_scroll()
-                    .font_family(code)
-                    .children(
-                        code_lines(text, syntax, &cx.theme().highlight_theme)
-                            .into_iter()
-                            .map(|line| div().child(line)),
-                    )
-                    .into_any_element(),
-            },
+            (_, false, [only]) => block(&only.text, &view.name, String::new(), true),
+            (_, false, sections) => div()
+                .id("show-ddl-sections")
+                .debug_selector(|| "show-ddl-sections".into())
+                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_MD))
+                .children(sections.iter().enumerate().map(|(at, section)| {
+                    let copy_workspace = cx.entity().downgrade();
+                    let ready = matches!(&section.text, DdlText::Ready(text) if !text.is_empty());
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout::SPACE_XS))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(layout::SPACE_MD))
+                                .child(section_label(t, &section.title))
+                                .child(
+                                    div()
+                                        .debug_selector(move || format!("show-ddl-copy-{at}"))
+                                        .child(
+                                            button(
+                                                format!("show-ddl-copy-{at}"),
+                                                "Copy",
+                                                Tone::Quiet,
+                                                Control::Compact,
+                                                t,
+                                            )
+                                            .disabled(!ready)
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    _ = copy_workspace.update(
+                                                        cx,
+                                                        |workspace, cx| {
+                                                            workspace.copy_ddl_section(at, cx);
+                                                        },
+                                                    );
+                                                },
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(block(
+                            &section.text,
+                            &section.title,
+                            format!("-{at}"),
+                            false,
+                        ))
+                }))
+                .into_any_element(),
         };
         let close_workspace = cx.entity().downgrade();
         let copy_workspace = close_workspace.clone();
@@ -1881,7 +1959,7 @@ impl Workspace {
                                 .items_center()
                                 .justify_between()
                                 .gap(px(layout::SPACE_MD))
-                                .child(section_label(t, &view.title))
+                                .child(section_label(t, &view.heading()))
                                 .children(choices),
                         )
                         .child(div().text_size(text_size).child(body))

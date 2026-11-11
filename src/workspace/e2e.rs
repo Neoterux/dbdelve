@@ -2970,11 +2970,14 @@ fn the_palette_copies_what_the_explorer_menu_copies(cx: &mut TestAppContext) {
 /// What the `Show DDL` dialog holds, if it is up.
 fn ddl_text(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
     workspace.read_with(cx, |workspace, _| {
-        workspace.ddl_view.as_ref().map(|view| match &view.text {
-            super::DdlText::Loading => "loading".to_string(),
-            super::DdlText::Ready(text) => text.clone(),
-            super::DdlText::Failed(error) => format!("failed: {error}"),
-        })
+        workspace
+            .ddl_view
+            .as_ref()
+            .map(|view| match &view.sections[0].text {
+                super::DdlText::Loading => "loading".to_string(),
+                super::DdlText::Ready(text) => text.clone(),
+                super::DdlText::Failed(error) => format!("failed: {error}"),
+            })
     })
 }
 
@@ -3091,8 +3094,10 @@ fn an_empty_definition_says_so_and_offers_nothing_to_copy(cx: &mut TestAppContex
                     schema: "main".into(),
                     name: "birds".into(),
                     kind: Some(RelationKind::Table),
-                    title: "Table main.birds".into(),
-                    text,
+                    sections: vec![super::DdlSection {
+                        title: "Table main.birds".into(),
+                        text,
+                    }],
                     diagram: None,
                     showing_diagram: false,
                     request: 1,
