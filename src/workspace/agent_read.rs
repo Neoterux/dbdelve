@@ -2026,6 +2026,58 @@ mod tests {
     }
 
     #[test]
+    fn the_list_schemas_note_says_how_many_and_that_execute_sql_still_reads_the_rest() {
+        assert_eq!(
+            filter_note(Levels::DatabaseThenSchema, 3, 9).as_deref(),
+            Some(
+                "Showing 3 of 12 schemas. The profile's filter hides the rest from this \
+                 listing; execute_sql can still read them."
+            )
+        );
+        assert_eq!(
+            filter_note(Levels::DatabaseIsSchema, 4, 34).as_deref(),
+            Some(
+                "Showing 4 of 38 databases. The profile's filter hides the rest from this \
+                 listing; execute_sql can still read them."
+            )
+        );
+        for levels in [
+            Levels::Flat,
+            Levels::DatabaseIsSchema,
+            Levels::DatabaseThenSchema,
+            Levels::DatabaseHoldsObjects,
+        ] {
+            assert_eq!(filter_note(levels, 5, 0), None, "{levels:?}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_pair_and_a_missing_pair_take_the_same_path() {
+        let catalog = Catalog {
+            schemas: vec![
+                schema("main", vec![relation("t", RelationKind::Table, None, None)]),
+                schema(
+                    "extra",
+                    vec![relation("x", RelationKind::Table, None, None)],
+                ),
+            ],
+            ..Default::default()
+        };
+        let shown = Include::from_stored(Vec::new(), vec!["main".to_string()]).resolve(
+            Levels::DatabaseThenSchema,
+            None,
+            None,
+        );
+        let narrowed = shown.narrow_catalog(catalog);
+        for (schema, table) in [("extra", "x"), ("nope", "x")] {
+            let reply = describe(&narrowed, schema, table, None, |_, _| {
+                panic!("the loader was called for {schema}.{table}")
+            });
+            assert!(matches!(reply, Ok(None)), "{schema}.{table}");
+        }
+    }
+
+    #[test]
     fn a_redis_catalog_reply_carries_the_preview_note() {
         let catalog = Catalog {
             schemas: vec![schema(
