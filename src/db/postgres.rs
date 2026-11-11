@@ -1097,6 +1097,11 @@ impl Connection {
         })
     }
 
+    /// RED stub: shares state like `alongside`.
+    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
+        self.alongside()
+    }
+
     /// A poisoned mutex counts: every later statement would fail on it too.
     pub fn is_lost(&self) -> bool {
         self.client
@@ -3254,6 +3259,82 @@ mod tests {
             error.message
         );
         assert!(connection.query("SELECT 1", Fetch::default()).is_ok());
+    }
+
+    /// The hold is applied by the caller, through the same call every engine's
+    /// session gets; a session that was not asked for it is not held, and one
+    /// that was refuses a write in the server's own words.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_session_on_another_database_is_held_to_reads_when_asked() {
+        let original = Connection::open(&live_config()).expect("connection should open");
+        let session =
+            |connection: &Connection| super::super::Connection::Postgres(connection.clone());
+        let database = |connection: &super::super::Connection| {
+            connection
+                .query(
+                    "SELECT current_database()",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the database should read")
+                .rows[0]
+                .iter()
+                .next()
+                .flatten()
+                .map(str::to_string)
+        };
+        let other = original
+            .on_database("postgres")
+            .expect("a session on another database should open");
+        let other = session(&other);
+        assert_eq!(database(&other).as_deref(), Some("postgres"));
+
+        other.set_read_only(true).expect("the hold should take");
+        let refusal = other
+            .query(
+                "CREATE TABLE dbdelve_held_probe (id int)",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect_err("a held session must refuse a write");
+        assert!(
+            refusal.message.contains("read-only"),
+            "the server's own words: {}",
+            refusal.message
+        );
+        assert_eq!(
+            database(&session(&original)).as_deref(),
+            Some("dbdelve_dev"),
+            "the profile's own connection is where it was"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_session_on_another_database_shares_no_schema_with_the_first() {
+        let original = Connection::open(&ServerConfig {
+            schema: Some("dbdelve_missing_schema".into()),
+            ..live_config()
+        })
+        .expect("connection should open");
+        let other = original
+            .on_database("postgres")
+            .expect("a schema the other database lacks must not stop it opening");
+        assert_eq!(
+            other.server().schema,
+            None,
+            "the first's picked schema is not applied to the other database"
+        );
+
+        other.set_schema(Some("public"));
+        other.apply_schema().expect("the pick should apply");
+        assert_eq!(other.server().schema.as_deref(), Some("public"));
+        assert_eq!(
+            original.server().schema.as_deref(),
+            Some("dbdelve_missing_schema"),
+            "picking a schema on the new session leaves the first's pick as it was"
+        );
     }
 
     #[test]
