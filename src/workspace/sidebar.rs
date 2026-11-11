@@ -294,6 +294,11 @@ impl Workspace {
         })
     }
 
+    /// The node the sidebar has selected, in whichever tree is drawn.
+    pub(crate) fn selected_node(&self, _cx: &App) -> Option<SelectedNode> {
+        None
+    }
+
     /// What the connections tree's row `id` is, if it is a node an action
     /// applies to: a connection, a database, a schema or an object.
     pub(crate) fn connections_node(&self, id: &str) -> Option<SelectedNode> {
