@@ -255,6 +255,14 @@ pub struct StoredQueryTab {
     /// rest.
     #[serde(default)]
     pub queued_results: usize,
+    /// The database this tab runs on, as the server listed it, or absent for
+    /// a tab on the connection's own session. A name the server no longer
+    /// has fails the tab's run; it never retargets the tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// The schema in that database the tab runs in, where the engine picks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 }
 
 /// An opened table, view or routine, stored by name rather than by content: the
@@ -2174,6 +2182,48 @@ pub(crate) mod tests {
         assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
         // Saving what was saved changes nothing.
         assert_eq!(resaved(golden), golden);
+    }
+
+    #[test]
+    fn a_query_tabs_binding_round_trips_and_an_old_tab_reads_unbound() {
+        let text = supported_stub(
+            None,
+            "[[profiles.open_queries]]\nid = 0\n\n\
+             [[profiles.open_queries]]\nid = 1\ndatabase = \"other\"\nschema = \"s\"\n\n\
+             [[profiles.open_queries]]\nid = 2\ndatabase = \"main\"\n",
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        let tabs = &decoded.profiles[0].open_queries;
+        assert_eq!(
+            (tabs[0].database.clone(), tabs[0].schema.clone()),
+            (None, None)
+        );
+        assert_eq!(
+            (tabs[1].database.as_deref(), tabs[1].schema.as_deref()),
+            (Some("other"), Some("s"))
+        );
+        assert_eq!(
+            (tabs[2].database.as_deref(), tabs[2].schema.as_deref()),
+            (Some("main"), None)
+        );
+
+        let saved = resaved(&text);
+        assert_eq!(saved.matches("database = \"other\"").count(), 1, "{saved}");
+        assert_eq!(saved.matches("schema = ").count(), 1, "{saved}");
+        let again = decode_profiles(&saved, &[]).expect("what was written loads");
+        assert_eq!(again.profiles[0].open_queries, *tabs);
+        assert_eq!(
+            resaved(&saved),
+            saved,
+            "saving what was saved changes nothing"
+        );
+
+        // A file from before the keys held tabs with neither, and writes
+        // them back with neither.
+        let old = supported_stub(None, "[[profiles.open_queries]]\nid = 0\n");
+        let old_saved = resaved(&old);
+        assert_eq!(old_saved.matches("database = ").count(), 1, "{old_saved}");
+        assert!(!old_saved.contains("schema = "), "{old_saved}");
     }
 
     /// `decode_profiles` as it was before any profile could be unavailable:
@@ -4958,12 +5008,16 @@ open_objects = []
                     name: None,
                     active: false,
                     queued_results: 0,
+                    database: None,
+                    schema: None,
                 },
                 StoredQueryTab {
                     id: 4,
                     name: Some("daily".into()),
                     active: true,
                     queued_results: 2,
+                    database: None,
+                    schema: None,
                 },
             ],
             open_objects: vec![StoredObject {

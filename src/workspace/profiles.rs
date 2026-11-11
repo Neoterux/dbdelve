@@ -3086,6 +3086,8 @@ fn first_buffer(name: Option<String>) -> Vec<store::StoredQueryTab> {
         name,
         active: true,
         queued_results: 0,
+        database: None,
+        schema: None,
     }]
 }
 
@@ -3353,6 +3355,8 @@ mod tests {
             name: None,
             active: true,
             queued_results: 0,
+            database: None,
+            schema: None,
         };
         // A connection just made.
         assert_eq!(first_buffer(None), std::slice::from_ref(&blank));
@@ -3375,6 +3379,8 @@ mod tests {
             name: None,
             active: false,
             queued_results: 0,
+            database: None,
+            schema: None,
         }];
         assert_eq!(stored_buffers(open.clone(), Some(3), None), open);
     }

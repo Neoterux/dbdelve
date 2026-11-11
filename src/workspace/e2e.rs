@@ -12901,3 +12901,104 @@ fn every_row_of_a_bound_tabs_result_is_not_fetched_on_the_profiles_own_session(
         quit(workspace, cx);
     });
 }
+
+/// A second window over the same home, as `launch` builds it, once the first
+/// has gone: what a relaunch reads is what the first left in `profiles.toml`.
+fn relaunch(
+    workspace: Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    cx.update(|window, _| window.remove_window());
+    drop(workspace);
+    cx.cx.run_until_parked();
+    let mut relaunched = None;
+    let (_, cx) = cx.cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| Workspace::new(Vec::new(), window, cx));
+        relaunched = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    settle(cx);
+    (relaunched.expect("the window builds the workspace"), cx)
+}
+
+/// Brings the query tab `bound` says is bound, or is not, to the front.
+fn front_the_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, bound: bool) {
+    let tab = workspace.read_with(cx, |workspace, _| {
+        let id = workspace
+            .profile()
+            .and_then(|profile| {
+                profile
+                    .session
+                    .queries
+                    .iter()
+                    .find(|tab| tab.binding.is_some() == bound)
+            })
+            .expect("the tab is open")
+            .id;
+        Tab::Query(id)
+    });
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.activate_tab(tab, window, cx));
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_bound_tab_keeps_its_binding_across_a_relaunch(cx: &mut TestAppContext) {
+    use crate::session::Binding;
+    let other = Binding {
+        database: "other".into(),
+        schema: None,
+    };
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        let saved = store::peek_profiles(&[]).expect("the file reads");
+        let tabs = &saved.profiles[0].open_queries;
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| tab.database.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("other")],
+            "the binding is written with its tab"
+        );
+
+        let (workspace, cx) = relaunch(workspace, cx);
+        assert_eq!(front_binding(&workspace, cx), Some(other.clone()));
+
+        // `other` was attached to the first window's instance and is not on
+        // the new one: the run says what the open said, and the tab is
+        // still bound to `other`.
+        cx.update(|window, cx| {
+            let editor = workspace
+                .read(cx)
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("the bound tab is in front")
+                .editor
+                .clone();
+            editor.update(cx, |input, cx| {
+                input.set_value("SELECT current_database()", window, cx)
+            });
+        });
+        cx.dispatch_action(crate::actions::RunQuery);
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert!(
+                error.message.contains("other"),
+                "the open's own words name the database: {}",
+                error.message
+            ),
+            _ => panic!("a run on a database the server lacks must fail"),
+        });
+        assert_eq!(front_binding(&workspace, cx), Some(other.clone()));
+
+        front_the_tab(&workspace, cx, false);
+        attach_other(&workspace, cx);
+        front_the_tab(&workspace, cx, true);
+        assert_eq!(front_binding(&workspace, cx), Some(other));
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+        quit(workspace, cx);
+    });
+}
