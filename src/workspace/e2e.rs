@@ -14821,7 +14821,8 @@ fn selection_fixture(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visual
         let at = connections_row(&workspace, cx, &connection_row(id)).unwrap();
         click_connections_row(cx, at);
     }
-    for id in ["a", "b"] {
+    // `a`'s `birds` is revealed last, so it is the row the tree has selected.
+    for id in ["b", "a"] {
         for name in ["flocks", "birds"] {
             let row = table_row(id, name);
             workspace.update(cx, |workspace, cx| {
@@ -15013,6 +15014,231 @@ fn simple_mode_keeps_one_selected_row(cx: &mut TestAppContext) {
                 "no selection set exists in simple mode"
             );
         });
+        quit(workspace, cx);
+    });
+}
+
+/// `birds` and `flocks` of `a` selected, with nothing opened: the tree's own
+/// row is `birds` already, and a modifier click adds `flocks` to it.
+fn two_tables_selected(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    click_connections_row_with(
+        workspace,
+        cx,
+        &table_row("a", "flocks"),
+        gpui::Modifiers::secondary_key(),
+    );
+    assert_eq!(
+        selected_rows(workspace, cx).0,
+        [table_row("a", "birds"), table_row("a", "flocks")]
+    );
+}
+
+/// The clipboard's text.
+fn clipboard_text(cx: &mut VisualTestContext) -> String {
+    cx.read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default()
+}
+
+#[gpui::test]
+fn copy_names_and_copy_ddl_cover_every_selected_table(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        let at = connections_row(&workspace, cx, &table_row("a", "birds")).unwrap();
+
+        // Open All, Copy Names, Copy DDL, Show DDL, Pin, Refresh.
+        pick_from_connections_menu(cx, at, 2);
+        assert_eq!(clipboard_text(cx), "birds\nflocks");
+
+        pick_from_connections_menu(cx, at, 3);
+        settle(cx);
+        assert_eq!(
+            clipboard_text(cx),
+            "CREATE TABLE birds (name text);\n\nCREATE TABLE flocks (name text);"
+        );
+        assert_eq!(
+            object_tab_names(&workspace, cx, "a"),
+            Vec::<String>::new(),
+            "copying opens nothing"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn show_ddl_on_a_selection_lists_each_definition_in_one_dialog(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        let at = connections_row(&workspace, cx, &table_row("a", "birds")).unwrap();
+
+        pick_from_connections_menu(cx, at, 4);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        workspace.read_with(cx, |workspace, _| {
+            let view = workspace.ddl_view.as_ref().expect("the dialog is up");
+            let sections: Vec<_> = view
+                .sections
+                .iter()
+                .map(|section| match &section.text {
+                    super::DdlText::Ready(text) => (section.title.clone(), text.clone()),
+                    _ => (section.title.clone(), "not read".to_string()),
+                })
+                .collect();
+            assert_eq!(
+                sections,
+                [
+                    (
+                        "Table main.birds".to_string(),
+                        "CREATE TABLE birds (name text);".to_string()
+                    ),
+                    (
+                        "Table main.flocks".to_string(),
+                        "CREATE TABLE flocks (name text);".to_string()
+                    ),
+                ]
+            );
+        });
+        assert!(cx.debug_bounds("show-ddl-text-0").is_some());
+        assert!(cx.debug_bounds("show-ddl-text-1").is_some());
+        assert!(
+            cx.debug_bounds("show-ddl-diagram-choice").is_none(),
+            "a diagram is of one relation"
+        );
+
+        // Each definition has a Copy of its own.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        let copy = cx.debug_bounds("show-ddl-copy-1").expect("drawn").center();
+        cx.simulate_click(copy, gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(clipboard_text(cx), "CREATE TABLE flocks (name text);");
+
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.ddl_view.is_none()),
+            "escape closes it"
+        );
+        assert!(editor_has_keyboard(&workspace, cx), "the keyboard is back");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn pin_and_refresh_act_on_every_selected_row(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_selection_action(crate::sidebar::SelectionAction::Pin, window, cx);
+            // Again: Pin pins what is not pinned and unpins nothing.
+            workspace.run_selection_action(crate::sidebar::SelectionAction::Pin, window, cx)
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.profile().unwrap().shortcuts.pins.len(), 2);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn refresh_reads_each_database_of_the_selection_again(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
+        let other = database_row("e2e", "other");
+        let at = connections_row(&workspace, cx, &other).expect("other is listed");
+        click_connections_row(cx, at);
+        run_in_front(&workspace, cx, "CREATE TABLE other.main.fresh (id INTEGER)");
+        run_in_front(&workspace, cx, "CREATE TABLE fresh_own (id INTEGER)");
+
+        let t_rows: Vec<String> = workspace.read_with(cx, |workspace, _| {
+            let mut rows: Vec<_> = workspace
+                .connections
+                .nodes
+                .keys()
+                .filter(|id| id.ends_with("relation-main\0t"))
+                .cloned()
+                .collect();
+            rows.sort();
+            rows
+        });
+        assert_eq!(
+            t_rows.len(),
+            2,
+            "`t` of each database is listed: {t_rows:?}"
+        );
+        for row in t_rows.iter().rev() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.connections.tree.update(cx, |tree, cx| {
+                    let row = row.clone().into();
+                    tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
+                    tree.set_selected_index(tree.index_of(&row), cx);
+                });
+            });
+            settle(cx);
+        }
+        // The first is the tree's row, the second joins it.
+        click_connections_row_with(&workspace, cx, &t_rows[1], gpui::Modifiers::secondary_key());
+        assert_eq!(selected_rows(&workspace, cx).0.len(), 2);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_selection_action(crate::sidebar::SelectionAction::Refresh, window, cx)
+        });
+        settle(cx);
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let names = |catalog: &crate::db::Catalog| {
+                let mut names: Vec<_> = catalog
+                    .schemas
+                    .iter()
+                    .flat_map(|schema| schema.relations.iter().map(|r| r.name.clone()))
+                    .collect();
+                names.sort();
+                names
+            };
+            let profile = workspace.profile().unwrap();
+            assert_eq!(
+                names(workspace.catalog().expect("the own catalog")),
+                ["fresh_own", "t"]
+            );
+            match profile.database_catalogs.get("other") {
+                Some(CatalogState::Loaded(catalog, _)) => {
+                    assert_eq!(names(catalog), ["fresh", "t"])
+                }
+                _ => panic!("the catalog of `other` has not loaded"),
+            }
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_selection_survives_a_rebuild_and_drops_rows_that_are_gone(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        let (birds, flocks) = (table_row("a", "birds"), table_row("a", "flocks"));
+
+        workspace.update(cx, |workspace, cx| workspace.rebuild_connections(cx));
+        settle(cx);
+        assert_eq!(selected_rows(&workspace, cx).0, [birds.clone(), flocks]);
+
+        rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
+            .and_then(|db| db.execute_batch("drop table flocks"))
+            .unwrap();
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        settle(cx);
+        let (rows, tree_row) = selected_rows(&workspace, cx);
+        assert_eq!(rows, [birds.clone()], "a row that is gone drops out");
+        assert_eq!(
+            tree_row.as_deref(),
+            Some(birds.as_str()),
+            "and the tree's own row is one that is left"
+        );
         quit(workspace, cx);
     });
 }
