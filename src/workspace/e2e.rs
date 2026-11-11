@@ -15360,3 +15360,179 @@ fn no_selection_action_sends_a_generated_statement(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// Connections `a` and `b` over one file holding `birds` and `flocks`, in
+/// complex mode, `a` in front. The window is tall enough to draw every row.
+fn remembering_fixture(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    crate::IGNORE_ENVIRONMENT.set(true);
+    let (workspace, cx) = launch_connections(
+        cx,
+        "create table birds (name text); create table flocks (name text);",
+        "view_mode = \"complex\"",
+        &format!(
+            "{}{}",
+            sqlite_profile("a", "Birds", ""),
+            sqlite_profile("b", "Flocks", ""),
+        ),
+    );
+    cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+    settle(cx);
+    (workspace, cx)
+}
+
+/// A click on each of `ids` in turn, each as showing when its turn comes.
+fn open_connections_rows(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    ids: &[String],
+) {
+    for id in ids {
+        let at = connections_row(workspace, cx, id)
+            .unwrap_or_else(|| panic!("{id} is not showing to be clicked"));
+        click_connections_row(cx, at);
+    }
+}
+
+/// Whether the connections tree's row `id` is showing and open.
+fn connections_row_open(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: &str,
+) -> bool {
+    connections_item(workspace, cx, id).is_some_and(|(open, _)| open)
+}
+
+#[gpui::test]
+fn folds_and_the_selection_in_the_connections_tree_come_back_after_a_relaunch(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = remembering_fixture(cx);
+        let (a_main, a_tables) = (
+            scoped_row("a", None, "schema-main"),
+            scoped_row("a", None, "category-Tables-main"),
+        );
+        let (b_main, b_tables) = (
+            scoped_row("b", None, "schema-main"),
+            scoped_row("b", None, "category-Tables-main"),
+        );
+        let (birds, flocks) = (table_row("a", "birds"), table_row("a", "flocks"));
+        open_connections_rows(
+            &workspace,
+            cx,
+            &[connection_row("a"), a_main.clone(), a_tables.clone()],
+        );
+        // Opening `b` connects it, and its rows are there once it has.
+        open_connections_rows(&workspace, cx, &[connection_row("b"), b_main.clone()]);
+        assert_eq!(profile_state(&workspace, cx, "b"), "connected");
+        click_connections_row_with(&workspace, cx, &birds, gpui::Modifiers::default());
+        click_connections_row_with(&workspace, cx, &flocks, gpui::Modifiers::secondary_key());
+        assert_eq!(
+            selected_rows(&workspace, cx).0,
+            [birds.clone(), flocks.clone()]
+        );
+
+        let (workspace, cx) = relaunch(workspace, cx);
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
+        assert_eq!(
+            profile_state(&workspace, cx, "b"),
+            "idle",
+            "nothing is connected on the strength of what was stored"
+        );
+        for row in [connection_row("a"), a_main, a_tables] {
+            assert!(
+                connections_row_open(&workspace, cx, &row),
+                "{row} is open as it was left"
+            );
+        }
+        assert_eq!(
+            selected_rows(&workspace, cx),
+            (vec![birds, flocks.clone()], Some(flocks)),
+            "the rows that were selected are, and the last is the tree's own"
+        );
+        assert!(
+            !connections_row_open(&workspace, cx, &connection_row("b")),
+            "an idle connection stays folded whatever was stored"
+        );
+        assert_eq!(
+            connections_item(&workspace, cx, &connection_row("b"))
+                .map(|(_, children)| children.len()),
+            Some(1),
+            "and holds only its notice"
+        );
+
+        open_connections_rows(&workspace, cx, &[connection_row("b")]);
+        assert_eq!(profile_state(&workspace, cx, "b"), "connected");
+        assert!(
+            connections_row_open(&workspace, cx, &b_main),
+            "once it has loaded its rows open as they were left"
+        );
+        assert!(
+            !connections_row_open(&workspace, cx, &b_tables),
+            "and only those"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn removing_a_connection_takes_its_stored_rows_and_leaves_the_others(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = remembering_fixture(cx);
+        open_connections_rows(
+            &workspace,
+            cx,
+            &[
+                connection_row("a"),
+                scoped_row("a", None, "schema-main"),
+                connection_row("b"),
+                scoped_row("b", None, "schema-main"),
+                scoped_row("b", None, "category-Tables-main"),
+            ],
+        );
+        click_connections_row_with(
+            &workspace,
+            cx,
+            &table_row("b", "birds"),
+            gpui::Modifiers::default(),
+        );
+        let stored = |id: &str| {
+            let profile = store::peek_profiles(&[])
+                .expect("profiles.toml reads back")
+                .profiles
+                .into_iter()
+                .find(|profile| profile.id == id)
+                .unwrap_or_else(|| panic!("{id} was saved"));
+            (profile.open_rows, profile.selected_rows)
+        };
+        let (a_before, b_before) = (stored("a"), stored("b"));
+        assert!(
+            a_before.0.contains(&connection_row("a")) && b_before.0.contains(&connection_row("b")),
+            "each connection saved its open rows: {a_before:?} {b_before:?}"
+        );
+        assert_eq!(b_before.1, [table_row("b", "birds")]);
+
+        workspace.update(cx, |workspace, cx| {
+            let at = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "b")
+                .expect("b is listed");
+            workspace.remove_profile(at, cx);
+        });
+        settle(cx);
+        let file = std::fs::read_to_string(
+            store::dbdelve_directory()
+                .expect("the test home has a data directory")
+                .join("profiles.toml"),
+        )
+        .expect("profiles.toml reads");
+        assert!(
+            !file.contains("connection:1:b"),
+            "no stored row names the removed connection:\n{file}"
+        );
+        assert_eq!(stored("a"), a_before, "another's rows do not change");
+        quit(workspace, cx);
+    });
+}

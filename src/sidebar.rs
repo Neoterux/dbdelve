@@ -584,6 +584,24 @@ pub(crate) fn selection_header(kinds: &[NodeKind]) -> String {
     }
 }
 
+/// How many open rows, and how many selected rows, one profile keeps for the
+/// next run. `profiles.toml` is a file a person edits: a list is read no
+/// further than this.
+///
+/// ponytail: the first rows in tree order are kept, so what is dropped past it
+/// is the deepest and latest opened; a profile with more open than this comes
+/// back with its outer folders open and its inner ones folded. The upgrade is
+/// a cap that counts folds at each depth.
+pub(crate) const OPEN_ROWS_CAP: usize = 500;
+
+/// The ids of the open folders under `profile`'s connection row, the row
+/// itself included, in tree order, at most [`OPEN_ROWS_CAP`]. A folder inside a
+/// folded one is as open as it was left: an item keeps its rows until the
+/// next build.
+pub(crate) fn open_rows_of(items: &[TreeItem], profile: &str) -> Vec<String> {
+    Vec::new()
+}
+
 /// The rows, and what each stands for, by row id.
 #[derive(Default)]
 pub(crate) struct SidebarTree {
@@ -2483,5 +2501,97 @@ mod tests {
             selection_header(&[NodeKind::Schema, NodeKind::Schema]),
             "2 schemas selected"
         );
+    }
+
+    #[test]
+    fn a_stored_open_row_applies_only_once_its_row_exists() {
+        let schema = scoped_row("a", None, "schema-main");
+        let stored = HashMap::from([
+            (schema.clone(), true),
+            (scoped_row("a", Some("gone"), "schema-main"), true),
+        ]);
+        let before = build(&[], vec![unloaded("a")], &stored);
+        assert_eq!(
+            all_ids(&before.items),
+            [connection_row("a"), scoped_row("a", None, "loading")],
+            "an idle connection stays folded and gains no row from what was stored"
+        );
+        assert!(!find(&before.items, &connection_row("a")).is_expanded());
+
+        let loaded = build(
+            &[],
+            vec![listed("a", "a", Content::Loaded(birds()))],
+            &stored,
+        );
+        assert!(
+            find(&loaded.items, &schema).is_expanded(),
+            "once its subtree has loaded the row opens as it was left"
+        );
+        assert_eq!(
+            all_ids(&loaded.items),
+            all_ids(
+                &build(
+                    &[],
+                    vec![listed("a", "a", Content::Loaded(birds()))],
+                    &HashMap::from([(schema, true)])
+                )
+                .items
+            ),
+            "a stored id naming a database that is not listed changes nothing"
+        );
+    }
+
+    #[test]
+    fn open_rows_of_lists_a_profiles_open_folders_capped() {
+        let (schema, category) = (
+            scoped_row("a", None, "schema-main"),
+            scoped_row("a", None, "category-Tables-main"),
+        );
+        let folds = HashMap::from([
+            (connection_row("a"), true),
+            (schema.clone(), true),
+            (category.clone(), true),
+            (connection_row("b"), true),
+            (scoped_row("b", None, "schema-main"), true),
+        ]);
+        let tree = build(
+            &[],
+            vec![
+                listed("a", "a", Content::Loaded(birds())),
+                listed("b", "b", Content::Loaded(birds())),
+            ],
+            &folds,
+        );
+        assert_eq!(
+            open_rows_of(&tree.items, "a"),
+            [connection_row("a"), schema, category],
+            "open folders under that connection, its own row first, in tree order"
+        );
+        assert_eq!(
+            open_rows_of(&tree.items, "b"),
+            [connection_row("b"), scoped_row("b", None, "schema-main")],
+            "and none of another's"
+        );
+        assert!(
+            open_rows_of(&tree.items, "missing").is_empty(),
+            "a profile the tree does not list has no rows"
+        );
+
+        let many: Vec<TreeItem> = (0..OPEN_ROWS_CAP + 20)
+            .map(|at| {
+                TreeItem::new(format!("folder-{at}"), "f")
+                    .expanded(true)
+                    .child(TreeItem::new(format!("leaf-{at}"), "l"))
+            })
+            .collect();
+        let items = vec![
+            TreeItem::new(connection_row("c"), "c")
+                .expanded(true)
+                .children(many),
+        ];
+        let rows = open_rows_of(&items, "c");
+        assert_eq!(rows.len(), OPEN_ROWS_CAP);
+        assert_eq!(rows[0], connection_row("c"));
+        assert_eq!(rows[1], "folder-0", "what is dropped is the latest");
     }
 }
