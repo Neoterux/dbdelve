@@ -1454,6 +1454,13 @@ pub(crate) enum BoundSession {
     Open(Box<Connection>),
 }
 
+/// What Toggle Auto-commit, Commit and Roll Back answer on a bound tab, and
+/// send nothing: they act on the connection's own session, which is not the
+/// one the tab runs on.
+// ponytail: a bound session is auto-commit, so there is no transaction of the
+// tab's for these to act on; the upgrade is a session of the tab's own.
+pub(crate) const BOUND_TRANSACTION: &str = "Transaction controls act on the connection's own session, and this tab runs on its database's own session.";
+
 /// Where a query tab opened with New Query Here runs: a database of its
 /// connection's server, and where the engine picks one, a schema in it. Both
 /// as the server listed them, handed to the driver unchanged.
