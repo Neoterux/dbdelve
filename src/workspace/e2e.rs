@@ -13002,3 +13002,106 @@ fn a_bound_tab_keeps_its_binding_across_a_relaunch(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// The transaction state of the profile in front: its auto-commit switch, an
+/// open transaction, and how many statements its history holds.
+fn transaction_state(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (bool, bool, usize) {
+    workspace.read_with(cx, |workspace, _| {
+        let profile = workspace.profile().expect("a profile is in front");
+        (
+            profile.auto_commit,
+            profile.in_transaction,
+            profile.session.history.len(),
+        )
+    })
+}
+
+#[gpui::test]
+fn transaction_controls_are_refused_on_a_bound_tab(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        let before = transaction_state(&workspace, cx);
+        assert_eq!((before.0, before.1), (true, false));
+
+        let controls: [(&str, Box<dyn gpui::Action>); 3] = [
+            (
+                "Toggle Auto-commit",
+                Box::new(crate::actions::ToggleAutoCommit),
+            ),
+            ("Commit", Box::new(crate::actions::CommitTransaction)),
+            ("Roll Back", Box::new(crate::actions::RollbackTransaction)),
+        ];
+        for (name, action) in controls {
+            workspace.update(cx, |workspace, _| workspace.clear_notice());
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.profile().unwrap().session.notice.as_deref(),
+                    Some(crate::session::BOUND_TRANSACTION),
+                    "{name}"
+                );
+            });
+            assert_eq!(
+                buffer(&workspace, cx),
+                "SELECT current_database()",
+                "{name}"
+            );
+            assert_eq!(transaction_state(&workspace, cx), before, "{name}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_unbound_tab_in_complex_mode_keeps_its_transaction_controls(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.new_query(&crate::actions::NewQuery, window, cx)
+            });
+        });
+        settle(cx);
+        assert_eq!(front_binding(&workspace, cx), None);
+
+        cx.dispatch_action(crate::actions::ToggleAutoCommit);
+        settle(cx);
+        assert_eq!(buffer(&workspace, cx), "BEGIN");
+        let (auto_commit, in_transaction, _) = transaction_state(&workspace, cx);
+        assert!(!auto_commit, "the switch turned off");
+        assert!(in_transaction, "the BEGIN ran on the profile's own session");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_use_in_a_bound_tab_is_undone_before_its_next_run(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "USE e2e");
+        workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            assert_eq!(
+                session
+                    .tab_notice
+                    .as_ref()
+                    .map(|(_, notice)| notice.as_str()),
+                Some("The next run in this tab starts again on other.")
+            );
+        });
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+        assert!(
+            !profile_flags(&workspace, cx).1,
+            "the profile's own session is unmarked"
+        );
+        quit(workspace, cx);
+    });
+}
