@@ -1916,6 +1916,47 @@ fn the_active_schema_is_kept_only_in_the_connections_own_database(cx: &mut TestA
 }
 
 #[gpui::test]
+fn a_tab_bound_to_a_hidden_database_runs_and_its_catalog_is_never_read(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+
+        let unread = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("a profile is in front");
+                assert!(matches!(
+                    profile.bound.get("other"),
+                    Some(crate::session::BoundSession::Open(_))
+                ));
+                assert!(
+                    !profile.database_catalogs.contains_key("other"),
+                    "the hidden database's catalog was read"
+                );
+            });
+            assert!(
+                connections_row(workspace, cx, &database_row("e2e", "other")).is_none(),
+                "the hidden database is not drawn"
+            );
+        };
+        unread(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        settle(cx);
+        unread(&workspace, cx);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
