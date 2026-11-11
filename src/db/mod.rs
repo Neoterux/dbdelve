@@ -1962,6 +1962,21 @@ impl Connection {
         }
     }
 
+    /// [`Connection::query`] on a session opened for a database
+    /// ([`Connection::on_database`]).
+    pub fn query_bound(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        cancel: &CancelToken,
+        fetch: Fetch,
+    ) -> Result<QueryResult, DbError> {
+        match self {
+            Self::DuckDb(connection) => connection.query_bound(schema, sql, fetch),
+            _ => self.query(sql, cancel, fetch),
+        }
+    }
+
     /// [`Connection::query`] on a connection of its own, opened the way this
     /// one was (its tunnel and side session shared), so the statement runs
     /// beside whatever this one is running rather than queued behind it, and

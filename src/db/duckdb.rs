@@ -393,6 +393,15 @@ impl Connection {
         Ok(result)
     }
 
+    pub fn query_bound(
+        &self,
+        _schema: Option<&str>,
+        sql: &str,
+        fetch: Fetch,
+    ) -> Result<QueryResult, DbError> {
+        self.query(sql, fetch)
+    }
+
     /// dbdelve's own SQL, whose rows are never edited.
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
         let _deadline = self.deadline();
@@ -2520,6 +2529,50 @@ mod tests {
         assert_eq!(at(&connection), on("memory", "main"));
         // The database it names has to be there.
         assert!(connection.on_database("gone").is_err());
+    }
+
+    /// The one cell a statement answers, as text.
+    fn cell(result: Result<QueryResult, DbError>) -> Option<String> {
+        let result = result.unwrap();
+        result.rows[0].get(0).map(str::to_string)
+    }
+
+    #[test]
+    fn a_bound_run_puts_its_database_and_schema_back_first() {
+        let connection =
+            memory("ATTACH ':memory:' AS other; CREATE SCHEMA other.s1; CREATE SCHEMA other.s2;");
+        let session = connection.on_database("other").unwrap();
+        assert_eq!(
+            cell(session.query_bound(Some("s1"), "SELECT current_schema()", Fetch::default())),
+            Some("s1".into())
+        );
+        // A statement of the user's moved it away, as a `USE` in a tab would.
+        session.query("USE memory", Fetch::default()).unwrap();
+        assert_eq!(
+            cell(session.query_bound(
+                Some("s1"),
+                "SELECT current_database() || '.' || current_schema()",
+                Fetch::default()
+            )),
+            Some("other.s1".into())
+        );
+        assert_eq!(
+            cell(session.query_bound(None, "SELECT current_schema()", Fetch::default())),
+            Some("main".into()),
+            "no schema is where the database starts"
+        );
+        // Neither run moved the connection it was opened from.
+        assert_eq!(at(&connection), on("memory", "main"));
+    }
+
+    #[test]
+    fn a_bound_run_reaches_a_database_whatever_its_name_holds() {
+        let connection = memory(r#"ATTACH ':memory:' AS "odd ""name""""#);
+        let session = connection.on_database(r#"odd "name""#).unwrap();
+        assert_eq!(
+            cell(session.query_bound(None, "SELECT current_database()", Fetch::default())),
+            Some(r#"odd "name""#.into())
+        );
     }
 
     #[test]
