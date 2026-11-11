@@ -1533,17 +1533,23 @@ fn duckdb_with_other_attached(
     let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
     let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
     click_connections_row(cx, at);
+    attach_other(&workspace, cx);
+    (workspace, cx)
+}
+
+/// Attaches `other.duckdb` to the instance the profile in front is on, and
+/// lists the connection's databases again to say so.
+fn attach_other(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
     let other = store::dbdelve_directory()
         .expect("the test home has a data directory")
         .join("other.duckdb");
     run_in_front(
-        &workspace,
+        workspace,
         cx,
         &format!("ATTACH '{}' AS other", other.display()),
     );
     workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
     settle(cx);
-    (workspace, cx)
 }
 
 #[gpui::test]
@@ -1693,6 +1699,127 @@ fn expanding_a_database_twice_while_it_opens_opens_one_session(cx: &mut TestAppC
                 profile.database_catalogs.get("other"),
                 Some(CatalogState::Loaded(..))
             ));
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+/// What the profile in front holds of the databases it opened sessions for:
+/// how many sessions and how many catalogs.
+fn held_of_other_databases(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (usize, usize) {
+    workspace.read_with(cx, |workspace, _| {
+        let profile = workspace.profile().expect("a profile is in front");
+        (profile.bound.len(), profile.database_catalogs.len())
+    })
+}
+
+#[gpui::test]
+fn disconnecting_or_reconnecting_drops_every_session_and_database_catalog(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(
+            cx,
+            "mode = \"full\"\n\
+             [[profiles]]\n\
+             id = \"z\"\n\
+             name = \"Z\"\n\
+             host = \"\"\n\
+             database = \"\"\n\
+             user = \"\"\n\
+             engine = \"sqlite\"\n\
+             path = \"z.db\"\n",
+        );
+        let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("it shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let other = database_row("e2e", "other");
+        let expand = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.expand_node(&other.clone().into(), cx)
+            });
+            settle(cx);
+        };
+        expand(cx);
+        assert_eq!(held_of_other_databases(&workspace, cx), (1, 1));
+
+        // Another profile's removal leaves this one's alone.
+        workspace.update(cx, |workspace, cx| {
+            let z = workspace.profiles.iter().position(|p| p.id == "z");
+            workspace.remove_profile(z.expect("z is listed"), cx);
+        });
+        settle(cx);
+        assert_eq!(held_of_other_databases(&workspace, cx), (1, 1));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.disconnect(&Disconnect, window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = &workspace.profiles[0];
+            assert!(profile.bound.is_empty() && profile.database_catalogs.is_empty());
+        });
+
+        // Connected again, with the database attached again (an attachment
+        // went with the instance), and expanded again.
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        attach_other(&workspace, cx);
+        expand(cx);
+        assert_eq!(held_of_other_databases(&workspace, cx), (1, 1));
+        workspace.update(cx, |workspace, cx| workspace.begin_connect(0, cx));
+        assert_eq!(
+            held_of_other_databases(&workspace, cx),
+            (0, 0),
+            "a connect leaves nothing of the connection it replaces"
+        );
+        settle(cx);
+        assert_eq!(held_of_other_databases(&workspace, cx), (0, 0));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_database_that_cannot_be_opened_says_so_on_its_own_row(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let (own, other) = (database_row("e2e", "e2e"), database_row("e2e", "other"));
+        let before = connections_item(&workspace, cx, &own);
+        run_in_front(&workspace, cx, "DETACH other");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.expand_node(&other.clone().into(), cx)
+        });
+        settle(cx);
+        let said = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("a profile is in front");
+            assert!(profile.bound.is_empty(), "nothing is left half open");
+            match profile.database_catalogs.get("other") {
+                Some(CatalogState::Failed(message)) => message.clone(),
+                _ => panic!("the failure is not on its catalog"),
+            }
+        });
+        assert!(!said.is_empty());
+        assert_eq!(
+            connections_item(&workspace, cx, &other).map(|(_, rows)| rows),
+            Some(vec![(
+                scoped_row("e2e", Some("other"), "notice"),
+                said,
+                true
+            )])
+        );
+        assert_eq!(connections_item(&workspace, cx, &own), before);
+
+        // Another expand asks again: a failure is not a verdict.
+        workspace.update(cx, |workspace, cx| {
+            workspace.expand_node(&other.clone().into(), cx)
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.opened, ["other", "other"]);
         });
 
         quit(workspace, cx);

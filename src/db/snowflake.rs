@@ -2603,6 +2603,41 @@ mod tests {
     }
 
     #[test]
+    fn a_session_on_another_database_names_it_and_shares_no_schema_with_the_first() {
+        let mock = Mock::start();
+        let sql = "SELECT 1 AS one, NULL AS nothing, '' AS blank, DATE '2024-02-29' AS leap";
+        mock.answer(sql, "query");
+        let connection = connected(&mock);
+        connection.set_schema(Some("Sales EU"));
+        let session = connection.on_database("OTHER_DB");
+        session.set_schema(Some("Archive"));
+        for connection in [&connection, &session] {
+            connection
+                .query_with(sql, &CancelToken::default(), Fetch::default())
+                .expect("runs");
+        }
+
+        let requests = mock.requests();
+        let sent = requests
+            .iter()
+            .filter(|request| request.body["statement"] == sql)
+            .map(|request| {
+                (
+                    request.body["database"].clone(),
+                    request.body["schema"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent,
+            [
+                (json!("DBDELVE_TEST"), json!(r#""Sales EU""#)),
+                (json!("OTHER_DB"), json!(r#""Archive""#)),
+            ]
+        );
+    }
+
+    #[test]
     fn a_statement_still_running_is_polled_until_it_finishes() {
         let mock = Mock::start();
         let sql = "SELECT 1 AS one, NULL AS nothing, '' AS blank, DATE '2024-02-29' AS leap";
