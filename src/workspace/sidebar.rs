@@ -17,7 +17,7 @@ use std::{
 use gpui::{Entity, SharedString, StyledText};
 use gpui_component::{
     ActiveTheme as _,
-    tree::{TreeEvent, TreeState},
+    tree::{TreeEvent, TreeItem, TreeState},
 };
 
 use super::forms::{MenuRow, explorer_menu, node_items, selection_menu};
@@ -25,14 +25,14 @@ use super::profiles::{database_content, explorer_content};
 use super::*;
 use crate::db::{Levels, Syntax};
 use crate::explorer::{
-    ExplorerLeaf, Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, folds, is_schema_row, saved_query,
+    ExplorerLeaf, Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, is_schema_row, saved_query,
     schema_row_name,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::session::Binding;
 use crate::sidebar::{
-    self as model, Content, Listed, Node, NodeKind, SelectedNode, Selection, SelectionAction,
-    node_actions, schema_row_is_a_database, shown_size,
+    self as model, Content, Listed, Node, NodeKind, OPEN_ROWS_CAP, SelectedNode, Selection,
+    SelectionAction, node_actions, schema_row_is_a_database, shown_size,
 };
 use crate::ui::{Status, row_icon_tinted, status_dot};
 
@@ -112,6 +112,8 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) folds_before_filter: Option<HashMap<String, bool>>,
     /// The rows a modifier click gathered; complex mode only.
     pub(crate) selection: Selection,
+    /// The rows the last build closed because nothing had loaded under them.
+    unloaded: HashSet<String>,
     /// The group the last build was made for, which `None` outer says is no
     /// build yet. A build for another group opens that one.
     group: Option<Option<String>>,
@@ -135,6 +137,7 @@ impl ConnectionsSidebar {
             if let TreeEvent::Expanded(id) = event {
                 workspace.expand_node(id, cx);
             }
+            workspace.tree_folded(cx);
         })
         .detach();
         Self {
@@ -146,6 +149,7 @@ impl ConnectionsSidebar {
             filter,
             folds_before_filter: None,
             selection: Selection::default(),
+            unloaded: HashSet::new(),
             group: None,
         }
     }
@@ -166,7 +170,13 @@ impl Workspace {
             .filter(|entry| entry.depth() == 0)
             .map(|entry| entry.item().clone())
             .collect();
-        let mut folds = folds(&roots);
+        let mut folds = model::held_folds(&roots, &self.connections.unloaded);
+        // The tree is the user's unless a filter has opened it: the folds it
+        // had are kept aside from the first key, and what it holds in between
+        // is not theirs to be remembered.
+        if self.connections.folds_before_filter.is_none() {
+            self.capture_rows(&roots.iter().collect::<Vec<_>>(), &folds);
+        }
         // While text is in the filter every kept row is open, so the folds
         // the user had are kept aside from its first key and come back when
         // the field is empty. Read on every rebuild: a landing in the
@@ -182,6 +192,12 @@ impl Workspace {
             (false, None) => self.connections.folds_before_filter = Some(folds.clone()),
             (false, kept) => self.connections.folds_before_filter = kept,
             (true, None) => {}
+        }
+        // What was stored opens a row once the tree has one to open: the rows
+        // the tree holds are as it has them, so a fold made since is kept, and
+        // the rest wait for their subtree to load.
+        for row in self.profiles.iter().flat_map(|profile| &profile.open_rows) {
+            folds.entry(row.clone()).or_insert(true);
         }
         // The group in front starts open. What the last build left of its
         // fold is only how it started, so it is let go when the front
@@ -258,6 +274,7 @@ impl Workspace {
             filter,
         );
         self.connections.group = Some(current);
+        self.connections.unloaded = built.unloaded;
         let front = self
             .profile()
             .map(|profile| SharedString::from(front_row_id(profile).unwrap_or_default()));
@@ -268,6 +285,29 @@ impl Workspace {
             let present: HashSet<String> = built.nodes.keys().cloned().collect();
             self.connections.selection.retain(&present);
         }
+        // No selection of the user's yet, and the tree's row only the one it
+        // falls to: what was stored comes back as its rows appear.
+        let restored = filter.is_empty()
+            && self.connections.selection.rows.is_empty()
+            && selected
+                .as_ref()
+                .is_none_or(|row| front.as_ref().is_some_and(|front| front == row));
+        if restored {
+            let rows: Vec<String> = self
+                .profiles
+                .iter()
+                .flat_map(|profile| &profile.selected_rows)
+                .filter(|row| built.nodes.contains_key(row.as_str()))
+                .cloned()
+                .collect();
+            if !rows.is_empty() {
+                self.connections.selection = Selection {
+                    anchor: rows.last().cloned(),
+                    rows,
+                };
+            }
+        }
+        self.remember_selection();
         self.connections.nodes = Arc::new(built.nodes);
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
@@ -283,13 +323,95 @@ impl Workspace {
         tree.update(cx, |tree, cx| {
             tree.set_items(built.items, cx);
             // A row the user moved to stays selected: a landing in the
-            // background must not send Enter elsewhere.
-            let row = selected
-                .and_then(|selected| tree.index_of(&selected))
-                .or_else(|| kept.and_then(|kept| tree.index_of(&kept)))
-                .or_else(|| front.and_then(|front| tree.index_of(&front)));
+            // background must not send Enter elsewhere. A selection that has
+            // just come back from the file is where the tree goes, not the
+            // row it fell to.
+            let at = |id: Option<SharedString>| id.and_then(|id| tree.index_of(&id));
+            let row = match restored {
+                true => at(kept.clone()).or_else(|| at(selected.clone())),
+                false => at(selected.clone()).or_else(|| at(kept)),
+            }
+            .or_else(|| at(front));
             tree.set_selected_index(row, cx);
         });
+    }
+
+    /// What the tree holds of every profile's open rows, put on the profile:
+    /// the rows open in the tree, then the ones it has no say over yet, which
+    /// wait for their subtree to load. `held` is what the tree has a say over.
+    /// The rows are written out with the profile at its next save.
+    fn capture_rows(&mut self, roots: &[&TreeItem], held: &HashMap<String, bool>) {
+        let open: Vec<Vec<String>> = self
+            .profiles
+            .iter()
+            .map(|profile| {
+                roots
+                    .iter()
+                    .map(|root| model::open_rows_of(std::slice::from_ref(*root), &profile.id))
+                    .find(|rows| !rows.is_empty())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (profile, open) in self.profiles.iter_mut().zip(open) {
+            profile.open_rows = model::remembered_rows(open, &profile.open_rows, held);
+        }
+    }
+
+    /// The selection, split between the profiles whose rows it holds. Nothing
+    /// is selected until a click has, and nothing is written then, so a
+    /// selection that is still on its way back from the file is not lost to
+    /// one that was never made.
+    fn remember_selection(&mut self) {
+        let rows = &self.connections.selection.rows;
+        if rows.is_empty() {
+            return;
+        }
+        for profile in &mut self.profiles {
+            profile.selected_rows = rows
+                .iter()
+                .filter(|row| model::profile_of_row(row) == Some(profile.id.as_str()))
+                .take(OPEN_ROWS_CAP)
+                .cloned()
+                .collect();
+        }
+    }
+
+    /// The connections tree as it stands now, put on the profiles that save
+    /// it. Not while a filter has opened the tree: its folds are not the
+    /// user's.
+    pub(crate) fn capture_tree(&mut self, cx: &mut Context<Self>) {
+        if self.view_mode() != model::ViewMode::Complex
+            || self.connections.folds_before_filter.is_some()
+        {
+            return;
+        }
+        let state = self.connections.tree.clone();
+        let state = state.read(cx);
+        let roots: Vec<&TreeItem> = (0..)
+            .map_while(|ix| state.entry(ix))
+            .filter(|entry| entry.depth() == 0)
+            .map(|entry| entry.item())
+            .collect();
+        let mut held = HashMap::new();
+        for root in &roots {
+            held.extend(model::held_folds(
+                std::slice::from_ref(*root),
+                &self.connections.unloaded,
+            ));
+        }
+        self.capture_rows(&roots, &held);
+        self.remember_selection();
+    }
+
+    /// A row of the connections tree was opened or folded: the tree as the
+    /// user has it now is what the next start comes back to, and nothing else
+    /// saves it.
+    fn tree_folded(&mut self, cx: &mut Context<Self>) {
+        if self.view_mode() != model::ViewMode::Complex {
+            return;
+        }
+        self.capture_tree(cx);
+        self.remember_profiles(cx);
     }
 
     /// What a row of one connection's own rows is: the object its leaf opens,
@@ -440,10 +562,16 @@ impl Workspace {
             self.connections.tree.update(cx, |tree, cx| {
                 tree.set_selected_index(tree.index_of(&shown.into()), cx);
             });
+            // Nothing folds or opens, so nothing else would save it.
+            self.capture_tree(cx);
+            self.remember_profiles(cx);
             cx.notify();
             return true;
         }
         self.connections.selection.click(id);
+        // Saved by what the click does next, if it does anything: a fold, a
+        // tab opened.
+        self.capture_tree(cx);
         if opens {
             self.open_connection_row(id, window, cx);
         }
