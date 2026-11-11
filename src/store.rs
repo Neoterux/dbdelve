@@ -4204,6 +4204,25 @@ open_objects = []
     }
 
     #[test]
+    fn the_view_mode_round_trips_and_an_old_file_reads_as_simple() {
+        let complex =
+            decode_profiles("[settings]\nview_mode = \"complex\"\n", &[]).expect("the file loads");
+        assert_eq!(
+            complex
+                .settings
+                .as_ref()
+                .and_then(|s| s.view_mode.as_deref()),
+            Some("complex")
+        );
+        let text = encode_profiles(&complex).expect("the file encodes");
+        assert!(text.contains("view_mode = \"complex\""), "{text}");
+
+        let old = decode_profiles("[settings]\ncheck_for_updates = false\n", &[])
+            .expect("the file loads");
+        assert_eq!(old.settings.expect("settings").view_mode, None);
+    }
+
+    #[test]
     fn an_unparsable_profile_file_is_an_error_rather_than_an_empty_list() {
         // The empty list is what the next save writes back, so a parse error
         // that reads as "no profiles" is a parse error that deletes them.
