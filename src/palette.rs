@@ -467,6 +467,10 @@ pub enum Command {
     /// The explorer menu's other copies: put this on the clipboard, and
     /// nothing else.
     CopyText(String),
+    /// What the sidebar's menu offers on the node the row was built for: one
+    /// of [`crate::sidebar::node_actions`], acting on that node and not on
+    /// whatever is selected when it is confirmed.
+    NodeAction(crate::sidebar::SelectedNode, crate::sidebar::NodeAction),
     CopyRows(RowsAs),
     FollowForeignKey,
     /// Add a filter bar and put the cursor in it.

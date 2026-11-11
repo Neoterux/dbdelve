@@ -2846,6 +2846,7 @@ fn the_palette_copies_what_the_explorer_menu_copies(cx: &mut TestAppContext) {
         settle(cx);
 
         for (row, copied) in [
+            ("Copy Name", "birds"),
             ("Copy SELECT (Top 100)", "SELECT"),
             ("Copy DROP", "DROP TABLE"),
         ] {
@@ -2863,6 +2864,14 @@ fn the_palette_copies_what_the_explorer_menu_copies(cx: &mut TestAppContext) {
                 "{row}: {text}"
             );
         }
+        // The menu's Copy Name, the fifth item, copies what the palette's does.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before menu".into()));
+        pick_from_explorer_menu(&workspace, cx, &explorer::relation_row("main", "birds"), 5);
+        let named = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert_eq!(named, "birds");
         // Copied, never run.
         let tables = rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
             .and_then(|db| {
@@ -14515,6 +14524,112 @@ fn refresh_on_another_database_rereads_it_over_its_session(cx: &mut TestAppConte
                 .collect();
             assert_eq!(names, ["t"]);
         });
+        quit(workspace, cx);
+    });
+}
+
+/// Makes the simple tree's row `row` the selected one, as arrowing to it does,
+/// without opening it.
+fn select_explorer_row(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, row: &str) {
+    workspace.update(cx, |workspace, cx| {
+        let tree = workspace.profile().unwrap().session.explorer_tree.clone();
+        tree.update(cx, |tree, cx| {
+            let at = tree.index_of(&row.to_string().into());
+            assert!(at.is_some(), "{row} is listed");
+            tree.set_selected_index(at, cx);
+        });
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn the_palette_offers_the_selected_nodes_actions_as_its_menu_does(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let offered = |cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes("secondary-shift-p");
+            settle(cx);
+            let labels = palette_labels(&workspace, cx);
+            cx.simulate_keystrokes("escape");
+            settle(cx);
+            ["New Query Here", "Copy Name", "Show DDL", "Refresh"]
+                .map(|label| labels.iter().any(|shown| shown == label))
+        };
+
+        assert_eq!(offered(cx), [false; 4], "nothing is selected");
+        select_explorer_row(&workspace, cx, &explorer::relation_row("main", "birds"));
+        assert_eq!(
+            offered(cx),
+            [false, true, true, false],
+            "a table offers what its menu does: its name and its definition"
+        );
+        select_explorer_row(&workspace, cx, "schema-main");
+        assert_eq!(
+            offered(cx),
+            [true, true, false, true],
+            "a schema offers a query here, its name and a refresh"
+        );
+
+        select_explorer_row(&workspace, cx, &explorer::relation_row("main", "birds"));
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Show DDL");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        let text = ddl_text(&workspace, cx).expect("the dialog holds a definition");
+        assert!(text.contains("CREATE TABLE birds"), "{text}");
+        press(cx, "escape");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn no_node_action_sends_a_generated_statement(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let counts = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().unwrap().session;
+                (store::history("e2e").len(), session.history.len())
+            })
+        };
+        let before = counts(&workspace, cx);
+        let nodes = workspace.read_with(cx, |workspace, _| {
+            let id = front_id(workspace);
+            let leaf = workspace.profile().unwrap().session.explorer_leaves
+                [explorer::relation_row("main", "birds").as_str()];
+            [
+                workspace.row_node(
+                    &id,
+                    None,
+                    &explorer::relation_row("main", "birds"),
+                    Some(leaf),
+                ),
+                workspace.row_node(&id, None, "schema-main", None),
+            ]
+        });
+        for node in nodes
+            .into_iter()
+            .map(|node| node.expect("the row is a node"))
+        {
+            for action in crate::sidebar::node_actions(
+                node.kind,
+                &node.name,
+                crate::db::Target::built_in(Engine::Sqlite),
+            ) {
+                cx.update(|window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.run_node_action(&node, action, window, cx)
+                    })
+                });
+                settle(cx);
+                if front_dialog(&workspace, cx).is_some() {
+                    press(cx, "escape");
+                }
+            }
+        }
+        assert_eq!(counts(&workspace, cx), before, "no statement was recorded");
         quit(workspace, cx);
     });
 }
