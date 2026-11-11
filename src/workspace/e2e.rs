@@ -11496,3 +11496,196 @@ fn a_project_can_list_only_its_own_connections_while_the_setting_lists_all(
         quit(workspace, cx);
     });
 }
+
+fn connections_label(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: &str,
+) -> Option<String> {
+    let index = connections_row(workspace, cx, id)?;
+    workspace.read_with(cx, |workspace, cx| {
+        let tree = workspace.connections.tree.read(cx);
+        Some(tree.entry(index)?.item().label.to_string())
+    })
+}
+
+fn selected_connections_row(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<String> {
+    workspace.read_with(cx, |workspace, cx| {
+        let tree = workspace.connections.tree.read(cx);
+        tree.selected_item().map(|item| item.id.to_string())
+    })
+}
+
+#[gpui::test]
+fn adding_renaming_and_removing_a_connection_redraws_the_connections_tree(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_connections(cx);
+        let config = workspace.read_with(cx, |workspace, _| workspace.profiles[0].config.clone());
+        let id_named = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, name: &str| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == name)
+                    .map(|profile| profile.id.clone())
+            })
+        };
+        let listed = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            connections_rows(workspace, cx)
+                .into_iter()
+                .filter(|(depth, _)| *depth == 1)
+                .count()
+        };
+        assert_eq!(listed(&workspace, cx), 2);
+
+        // The form's save of a new connection.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.create_profile(
+                "Extra".into(),
+                config.clone(),
+                None,
+                crate::sql::Mode::ReadOnly,
+                crate::connection_form::Origin::Form,
+                window,
+                cx,
+            );
+        });
+        settle(cx);
+        let id = id_named(&workspace, cx, "Extra").expect("the connection was added");
+        let row = connection_row(&id);
+        assert_eq!(listed(&workspace, cx), 3);
+        assert_eq!(
+            connections_label(&workspace, cx, &row).as_deref(),
+            Some("Extra")
+        );
+
+        // An edit, its name included, keeps the row.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_profile(&id, "Renamed".into(), config.clone(), None, window, cx);
+        });
+        settle(cx);
+        assert_eq!(
+            connections_label(&workspace, cx, &row).as_deref(),
+            Some("Renamed")
+        );
+        assert_eq!(listed(&workspace, cx), 3);
+
+        // A duplicate is a form until it is saved, and the save adds the row.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.duplicate_profile(0, window, cx);
+        });
+        settle(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.submit_connection(&SubmitConnection, window, cx);
+        });
+        settle(cx);
+        assert_eq!(listed(&workspace, cx), 4);
+
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == id)
+                .expect("the connection is still there");
+            workspace.remove_profile(index, cx);
+        });
+        settle(cx);
+        assert_eq!(connections_row(&workspace, cx, &row), None);
+        assert_eq!(listed(&workspace, cx), 3);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn disconnecting_redraws_the_connection_in_front_as_not_open(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_connections(cx);
+        let a = connection_row("a");
+        let schema = scoped_row("a", "schema-main");
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        assert_eq!(profile_state(&workspace, cx, "a"), "connected");
+        let (_, rows) = connections_item(&workspace, cx, &a).expect("a is listed");
+        assert!(rows.iter().any(|(id, ..)| id == &schema), "{rows:?}");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.disconnect(&Disconnect, window, cx);
+        });
+        settle(cx);
+        assert_eq!(profile_state(&workspace, cx, "a"), "idle");
+        assert_eq!(
+            connections_item(&workspace, cx, &a),
+            Some((
+                false,
+                vec![(scoped_row("a", "loading"), LOADING.to_string(), true)]
+            ))
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_connections(cx);
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.create_project("Other".into(), cx)
+        });
+        // `b` in front and connected, its schema open and a relation selected.
+        activate_by_id(&workspace, cx, "b");
+        assert_eq!(profile_state(&workspace, cx, "b"), "connected");
+        let b = connection_row("b");
+        let schema = scoped_row("b", "schema-main");
+        let birds = scoped_row("b", &explorer::relation_row("main", "birds"));
+        for row in [&b, &schema] {
+            let at = connections_row(&workspace, cx, row).expect("the row is listed");
+            click_connections_row(cx, at);
+        }
+        workspace.update(cx, |workspace, cx| {
+            workspace.connections.tree.update(cx, |tree, cx| {
+                // A relation is under its category, which a reveal opens.
+                let id = birds.clone().into();
+                tree.reveal_item(&id, gpui::ScrollStrategy::Top, cx);
+                let row = tree.index_of(&id);
+                assert!(row.is_some(), "the schema's relations are listed");
+                tree.set_selected_index(row, cx);
+            });
+        });
+        settle(cx);
+
+        let kept = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            (
+                connections_row(workspace, cx, &b).is_some(),
+                connections_item(workspace, cx, &schema).map(|(open, _)| open),
+                selected_connections_row(workspace, cx),
+            )
+        };
+        let before = kept(&workspace, cx);
+        assert_eq!(before, (true, Some(true), Some(birds.clone())));
+
+        let index = workspace.read_with(cx, |workspace, _| {
+            workspace.profiles.iter().position(|p| p.id == "b").unwrap()
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.move_to_project(index, Some("Other"), cx)
+        });
+        settle(cx);
+        assert_eq!(kept(&workspace, cx), before, "moved");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.rename_project("Other", "Renamed".into(), cx)
+        });
+        settle(cx);
+        assert_eq!(kept(&workspace, cx), before, "its project renamed");
+
+        workspace.update(cx, |workspace, cx| workspace.remove_project("Renamed", cx));
+        settle(cx);
+        assert_eq!(kept(&workspace, cx), before, "its project deleted");
+        quit(workspace, cx);
+    });
+}
