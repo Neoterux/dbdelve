@@ -3232,6 +3232,66 @@ fn show_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn the_dialogs_of_another_databases_table_name_the_database(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        let heading = |database: Option<&str>, cx: &mut VisualTestContext| {
+            let database = database.map(str::to_string);
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_ddl(
+                    database,
+                    "main".into(),
+                    "t".into(),
+                    ObjectKind::Relation(RelationKind::Table),
+                    cx,
+                )
+            });
+            settle(cx);
+            let heading = workspace.read_with(cx, |workspace, _| {
+                workspace.ddl_view.as_ref().map(|view| view.heading())
+            });
+            press(cx, "escape");
+            heading
+        };
+        assert_eq!(
+            heading(Some("other"), cx).as_deref(),
+            Some("Table other.main.t")
+        );
+        assert_eq!(
+            heading(None, cx).as_deref(),
+            Some("Table main.t"),
+            "a table of the connection's own database is named as it was"
+        );
+
+        let file = store::dbdelve_directory().unwrap().join("t.csv");
+        std::fs::write(&file, "name,id\nwren,2\n").unwrap();
+        let named = |database: Option<&str>, cx: &mut VisualTestContext| {
+            let (database, file) = (database.map(str::to_string), file.clone());
+            workspace.update_in(cx, |workspace, window, cx| {
+                let profile = workspace.profile().unwrap().id.clone();
+                workspace.open_import_file(
+                    profile,
+                    database,
+                    "main".into(),
+                    "t".into(),
+                    file,
+                    window,
+                    cx,
+                );
+            });
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                let dialog = workspace.profile().unwrap().session.import_rows.as_ref();
+                dialog.map(|dialog| dialog.target_name())
+            })
+        };
+        assert_eq!(named(Some("other"), cx).as_deref(), Some("other.main.t"));
+        assert_eq!(named(None, cx).as_deref(), Some("main.t"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn copy_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = two_databases_each_holding_t(cx);
