@@ -2019,7 +2019,15 @@ fn tab_walks_the_import_dialog_and_its_buttons_answer_the_keyboard(cx: &mut Test
         std::fs::write(&file, "name\nwren\n").unwrap();
         workspace.update_in(cx, |workspace, window, cx| {
             let profile = workspace.profile().unwrap().id.clone();
-            workspace.open_import_file(profile, "main".into(), "birds".into(), file, window, cx);
+            workspace.open_import_file(
+                profile,
+                None,
+                "main".into(),
+                "birds".into(),
+                file,
+                window,
+                cx,
+            );
         });
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("import-rows"));
@@ -2253,7 +2261,7 @@ fn copy_and_paste_in_a_table_carry_rows_into_the_import_dialog(cx: &mut TestAppC
         take(cx);
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.import_rows_from_clipboard(&ImportRowsFromClipboard, window, cx);
-            workspace.import_rows_into("main".into(), "birds".into(), window, cx);
+            workspace.import_rows_into(None, "main".into(), "birds".into(), window, cx);
         });
         settle(cx);
         assert_eq!(shown(cx), None);
@@ -2276,6 +2284,7 @@ fn copy_and_paste_in_a_table_carry_rows_into_the_import_dialog(cx: &mut TestAppC
                 let profile = workspace.profile().unwrap().id.clone();
                 workspace.open_import_file(
                     profile,
+                    None,
                     "main".into(),
                     "birds".into(),
                     file.clone(),
@@ -11414,6 +11423,7 @@ fn disconnect_closes_an_import_dialog_that_is_not_running(cx: &mut TestAppContex
             let profile = workspace.profile().unwrap().id.clone();
             workspace.open_import_file(
                 profile.clone(),
+                None,
                 "main".into(),
                 "birds".into(),
                 file,
@@ -13440,11 +13450,17 @@ fn a_tab_of_another_database_comes_back_after_a_relaunch(cx: &mut TestAppContext
 
         // `other` was attached to the first window's instance and is not on
         // the new one. Attached again, the tab reads it.
+        front_the_tab(&workspace, cx, false);
         attach_other(&workspace, cx);
         let id = workspace.read_with(cx, |workspace, _| {
             workspace.profile().unwrap().session.objects[0].id
         });
-        workspace.update(cx, |workspace, cx| workspace.load_relation(id, cx));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_tab(Tab::Object(id), window, cx);
+                workspace.load_relation(id, cx);
+            });
+        });
         settle(cx);
         assert_eq!(
             front_object_database_and_cell(&workspace, cx),

@@ -103,6 +103,27 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   (profile, database) catalog). Exporting every row of a bound tab's result is
   refused with a sentence (`Workspace::refetch`): that re-read runs on the
   profile's own session, which is another database's.
+- **An object tab carries its database** (`ObjectTab::database`, stored as
+  `StoredObject.database`, absent for the connection's own). Clicking a table
+  under another database in the connections tree opens it through the catalog
+  read for that database (`Workspace::open_object_on`), never the profile's
+  own, so `main.t` under two databases is two tabs: the tab's identity and its
+  grid snapshot key include the database (`matching_tab`,
+  `store::object_grid_key_in`). **One accessor routes every tab-scoped read and
+  write** (`Profile::connection_for(tab)` -> `Routed`, resolved on the blocking
+  pool; `Workspace::run_routed` for the reads that are not a run): the
+  preview, page and count, the structure and references, the check behind a
+  reference arrow, Export, Import Rows (the dialog carries its table's
+  database), a grid edit and the re-read after it, and the filter bars'
+  completion columns. A query tab's bound run goes through the same accessor
+  (`Profile::route`). The profile's own session keeps what is the connection's:
+  refresh, Select Database, disconnect, `set_schema`, its catalog chain, Copy
+  DDL (until it is routed by database), the transaction readout, a data file
+  opened into a new tab, and the database opens themselves. Select Database
+  closes the object tabs of the database it leaves; a tab of another database
+  stays, and its session opens again on its next read. A restored tab of
+  another database comes back by name before any connection, and a routine of
+  one waits for that database's catalog.
 - **A bound tab makes its connection the one in front.** Running or opening
   one is acting on a row of that connection (`Workspace::new_query_here`
   activates it), because the gate, the mode and the engine a statement meets

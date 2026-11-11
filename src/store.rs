@@ -1678,6 +1678,23 @@ pub fn object_grid_key(schema: &str, name: &str, filter: &str) -> String {
     }
 }
 
+/// [`object_grid_key`] for a tab of `database`, another database of the
+/// connection's server, where the same schema and name name another table.
+/// Under a prefix of its own, so it collides with no key of the connection's
+/// own tabs; a tab with none has the key it always had.
+pub fn object_grid_key_in(
+    database: Option<&str>,
+    schema: &str,
+    name: &str,
+    filter: &str,
+) -> String {
+    let key = object_grid_key(schema, name, filter);
+    match database {
+        Some(database) => format!("d-{}.{key}", escape_grid_key(database)),
+        None => key,
+    }
+}
+
 fn escape_grid_key(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -2229,6 +2246,24 @@ pub(crate) mod tests {
         let old_saved = resaved(&old);
         assert_eq!(old_saved.matches("database = ").count(), 1, "{old_saved}");
         assert!(!old_saved.contains("schema = "), "{old_saved}");
+    }
+
+    #[test]
+    fn a_database_is_part_of_an_object_tabs_grid_key() {
+        assert_eq!(
+            object_grid_key_in(None, "main", "t", ""),
+            object_grid_key("main", "t", ""),
+            "a tab of the connection's own database keeps the key it always had"
+        );
+        let keys = [
+            object_grid_key_in(None, "main", "t", ""),
+            object_grid_key_in(Some("other"), "main", "t", ""),
+            object_grid_key_in(Some("third"), "main", "t", ""),
+            object_grid_key_in(Some("other"), "main", "t", "id = 1"),
+        ];
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(keys.iter().filter(|other| *other == key).count(), 1, "{at}");
+        }
     }
 
     #[test]

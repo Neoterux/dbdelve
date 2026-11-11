@@ -180,18 +180,22 @@ impl Workspace {
         // A buffer's queued results are live too, and the count is what says
         // how many: a tab that ran fewer statements the second time leaves the
         // rest behind, and they are orphans the moment it does.
-        let live_grids =
-            stored_queries
-                .iter()
-                .flat_map(|tab| {
-                    std::iter::once(store::query_grid_key(tab.id)).chain(
-                        (0..tab.queued_results).map(|index| store::queued_grid_key(tab.id, index)),
-                    )
-                })
-                .chain(stored.open_objects.iter().map(|object| {
-                    store::object_grid_key(&object.schema, &object.name, &object.filter)
-                }))
-                .collect();
+        let live_grids = stored_queries
+            .iter()
+            .flat_map(|tab| {
+                std::iter::once(store::query_grid_key(tab.id)).chain(
+                    (0..tab.queued_results).map(|index| store::queued_grid_key(tab.id, index)),
+                )
+            })
+            .chain(stored.open_objects.iter().map(|object| {
+                store::object_grid_key_in(
+                    object.database.as_deref(),
+                    &object.schema,
+                    &object.name,
+                    &object.filter,
+                )
+            }))
+            .collect();
         // The grid directory is the id's, so when an unavailable profile holds
         // the id too, its tabs' snapshots are in there as well, and none of
         // them can be told apart as stale.
@@ -1343,10 +1347,12 @@ impl Workspace {
 
     /// Close what the profile in front holds of the database it is leaving.
     ///
-    /// Object tabs go, and their grid snapshots with them: both are keyed by
-    /// schema and name within the profile, with no database in the key, so
-    /// one left open would name a relation that may not exist here and a
-    /// relation of the same name would read the old one's rows back. Query
+    /// Object tabs of the database left go, and their grid snapshots with
+    /// them: both are keyed by schema and name within the database, so one
+    /// left open would name a relation that may not exist here and a
+    /// relation of the same name would read the old one's rows back. A tab of
+    /// another database stays: it names a relation there, and its session
+    /// opens again on its next read. Query
     /// tabs keep their SQL, which is the user's to run wherever they like, but
     /// drop their results and a New row form open on one: those rows belong
     /// to the database left behind, and an edit staged on them, or a row
@@ -1357,7 +1363,14 @@ impl Workspace {
         };
         let session = &profile.session;
         let active = session.active;
-        let mut closing = session.objects.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        // Only the tabs of the database being left: one of another database
+        // names a relation of that database, which this switch does not touch.
+        let mut closing = session
+            .objects
+            .iter()
+            .filter(|tab| tab.database.is_none())
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
         // The tab in front closes last, so the one it hands the front to is a
         // query tab that stays rather than a sibling about to close too.
         closing.sort_by_key(|id| Tab::Object(*id) == active);
@@ -1378,7 +1391,11 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        for object in profile.session.pending_objects.drain(..) {
+        let (left, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut profile.session.pending_objects)
+            .into_iter()
+            .partition(|object| object.database.is_none());
+        profile.session.pending_objects = kept;
+        for object in left {
             let key = store::object_grid_key(&object.schema, &object.name, &object.filter);
             let _ = store::remove_grid(&profile.id, &key);
         }
@@ -1946,7 +1963,11 @@ impl Workspace {
     /// of a database the connection is not on, and is about to close.
     fn reload_front_object(&mut self, id: &str, cx: &mut Context<Self>) {
         let active = self.profile().filter(|profile| {
-            profile.id == id && profile.connection().is_some() && !profile.left_database
+            profile.id == id
+                && profile
+                    .connection_for(profile.session.active)
+                    .is_available()
+                && !profile.left_database
         });
         if let Some(Tab::Object(object)) = active.map(|profile| profile.session.active) {
             self.load_relation(object, cx);
@@ -2206,6 +2227,17 @@ impl Workspace {
                 };
                 match result {
                     Ok(catalog) => {
+                        // Tabs restored before this catalog was read wear
+                        // whatever kind was stored.
+                        for tab in &mut profile.session.objects {
+                            if tab.database.as_deref() == Some(database.as_str())
+                                && let ObjectKind::Relation(kind) = &mut tab.kind
+                                && let Some(actual) =
+                                    relation_kind(&catalog, &tab.schema, &tab.name)
+                            {
+                                *kind = actual;
+                            }
+                        }
                         profile.database_catalogs.insert(
                             database.clone(),
                             CatalogState::Loaded(catalog, Routines::Loading),
@@ -2364,9 +2396,12 @@ impl Workspace {
         // Relations restore before the catalog arrives, wearing whatever kind
         // was on disk -- a default, for a profile an older build wrote. This is
         // the first moment there is anything to correct it from.
+        // Only the tabs of this catalog's own database: another database's
+        // are corrected when its catalog lands.
         if let CatalogState::Loaded(catalog, _) = &profile.catalog {
             for tab in &mut profile.session.objects {
-                if let ObjectKind::Relation(kind) = &mut tab.kind
+                if tab.database.is_none()
+                    && let ObjectKind::Relation(kind) = &mut tab.kind
                     && let Some(actual) = relation_kind(catalog, &tab.schema, &tab.name)
                 {
                     *kind = actual;
@@ -2516,17 +2551,35 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return false;
         };
-        let Some(connection) = profile.connection() else {
-            return false;
+        // An object tab's filter bars complete from its own relation, which is
+        // on the session of its database. A query tab's buffer completes from
+        // the profile's own catalog, whichever session it runs on, so the
+        // columns come from the same place the names do.
+        let routed = match profile.session.active {
+            active @ Tab::Object(_) => profile.connection_for(active),
+            Tab::Query(_) => profile.route(None),
         };
+        if !routed.is_available() {
+            return false;
+        }
         let id = profile.id.clone();
         let generation = profile.generation;
         let columns = profile.session.completion_columns.clone();
 
-        let task = spawn_blocking(cx.background_executor(), {
-            let (schema, relation) = (schema.clone(), relation.clone());
-            move || connection.structure(&schema, &relation)
-        });
+        // ponytail: the cache is keyed by schema and name alone, so a relation
+        // of that name in two databases shares one entry, and a tab of
+        // another database completes from whichever was read first. The
+        // upgrade is the database in the key.
+        let task = self.run_routed(
+            &id,
+            generation,
+            routed,
+            {
+                let (schema, relation) = (schema.clone(), relation.clone());
+                move |connection| connection.structure(&schema, &relation)
+            },
+            cx,
+        );
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             workspace

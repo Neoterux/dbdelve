@@ -3458,7 +3458,7 @@ impl Workspace {
                         move |_, window, cx| {
                             let (schema, relation) = import_names.clone();
                             _ = import_workspace.update(cx, |workspace, cx| {
-                                workspace.import_rows_into(schema, relation, window, cx);
+                                workspace.import_rows_into(None, schema, relation, window, cx);
                             });
                         },
                     ));
