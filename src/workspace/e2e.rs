@@ -14439,13 +14439,10 @@ fn the_auto_prompt_leaves_auto_off_when_its_commit_is_not_sent(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn the_auto_prompt_leaves_auto_off_and_the_transaction_listed_when_its_commit_fails(
-    cx: &mut TestAppContext,
-) {
+fn a_failed_commit_from_the_auto_prompt_does_not_keep_a_stale_open_flag(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
         manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
-        let listed = open_transaction_statements(&workspace, cx);
 
         // Ended straight on the session, so the profile still reads the
         // transaction as open and the COMMIT the dialog sends has none to end
@@ -14470,21 +14467,24 @@ fn the_auto_prompt_leaves_auto_off_and_the_transaction_listed_when_its_commit_fa
         });
         let (auto_commit, open, _) = transaction_state(&workspace, cx);
         assert!(
-            !auto_commit && open,
-            "a COMMIT that failed leaves auto-commit off and the transaction read as open"
+            !auto_commit && !open,
+            "DuckDB does not keep a transaction whose COMMIT failed, so it is not read as open"
         );
-        assert_eq!(
-            open_transaction_statements(&workspace, cx),
-            listed,
-            "the list the failed COMMIT cleared is put back"
+        assert!(
+            open_transaction_statements(&workspace, cx).is_empty(),
+            "the list of a transaction no longer read as open is not put back"
         );
 
+        // A second attempt settles: it was the restored flag that made every
+        // COMMIT fail and the dialog ask again.
         click_selector(cx, "auto-commit-auto");
         assert_eq!(
             front_dialog(&workspace, cx),
-            Some("end-transaction"),
-            "the dialog can be asked again"
+            None,
+            "nothing is open to ask about"
         );
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(auto_commit && !open, "Auto is reached");
         quit(workspace, cx);
     });
 }
