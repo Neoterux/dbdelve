@@ -43,6 +43,11 @@ impl ViewMode {
     }
 }
 
+/// The mode in effect.
+pub(crate) fn effective_view_mode(global: ViewMode, _project: Option<&StoredProject>) -> ViewMode {
+    global
+}
+
 /// The row of connections that belong to no project, listed first while any
 /// project exists.
 pub(crate) const NO_PROJECT_ROW: &str = "no-project";
@@ -278,6 +283,7 @@ mod tests {
         StoredProject {
             name: name.into(),
             connections: members.iter().map(|member| member.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -517,6 +523,32 @@ mod tests {
         let opened = build_with(&HashMap::from([(schema.clone(), true)]));
         assert!(find(&opened.items, &schema).is_expanded());
         assert!(!find(&opened.items, &category).is_expanded());
+    }
+
+    #[test]
+    fn the_project_in_front_decides_and_no_project_follows_the_setting() {
+        let with = |slug: &str| StoredProject {
+            view_mode: Some(slug.into()),
+            ..project("Zoo", &[])
+        };
+        assert_eq!(
+            effective_view_mode(ViewMode::Simple, Some(&with("complex"))),
+            ViewMode::Complex
+        );
+        assert_eq!(
+            effective_view_mode(ViewMode::Complex, Some(&with("simple"))),
+            ViewMode::Simple
+        );
+        for global in [ViewMode::Simple, ViewMode::Complex] {
+            // No choice of its own, one this build cannot read, and no project
+            // at all, each follow the setting.
+            assert_eq!(
+                effective_view_mode(global, Some(&project("Zoo", &[]))),
+                global
+            );
+            assert_eq!(effective_view_mode(global, Some(&with("tree"))), global);
+            assert_eq!(effective_view_mode(global, None), global);
+        }
     }
 
     #[test]

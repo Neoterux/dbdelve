@@ -20,7 +20,7 @@ use crate::{
     explorer, keybindings,
     palette::{Command, Mode as PaletteMode, Scope},
     session::{CatalogState, ObjectBody, ProfileState, QueryState, QueryTab, Tab},
-    sidebar::{LOADING, NO_PROJECT_ROW, connection_row, project_row, scoped_row},
+    sidebar::{LOADING, NO_PROJECT_ROW, ViewMode, connection_row, project_row, scoped_row},
     store,
     theme::{self, Fonts},
 };
@@ -1097,25 +1097,27 @@ fn click_connections_row(cx: &mut VisualTestContext, index: usize) {
     settle(cx);
 }
 
+fn profile_state_of(workspace: &Workspace, id: &str) -> &'static str {
+    match workspace
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .expect("the profile was restored")
+        .state
+    {
+        ProfileState::Idle => "idle",
+        ProfileState::Connecting => "connecting",
+        ProfileState::Connected(_) => "connected",
+        ProfileState::Failed(_) => "failed",
+    }
+}
+
 fn profile_state(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
     id: &str,
 ) -> &'static str {
-    workspace.read_with(cx, |workspace, _| {
-        match workspace
-            .profiles
-            .iter()
-            .find(|profile| profile.id == id)
-            .expect("the profile was restored")
-            .state
-        {
-            ProfileState::Idle => "idle",
-            ProfileState::Connecting => "connecting",
-            ProfileState::Connected(_) => "connected",
-            ProfileState::Failed(_) => "failed",
-        }
-    })
+    workspace.read_with(cx, |workspace, _| profile_state_of(workspace, id))
 }
 
 fn front_profile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
@@ -11245,5 +11247,149 @@ fn a_running_write_keeps_the_agent_mark_lit(cx: &mut TestAppContext) {
         assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
         quit(workspace, cx);
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// Whether the sidebar draws the connections tree: only it draws rows named
+/// `connections-row-{n}`.
+fn connections_tree_drawn(cx: &mut VisualTestContext) -> bool {
+    cx.debug_bounds("connections-row-0").is_some()
+}
+
+fn view_mode_in_effect(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> ViewMode {
+    workspace.read_with(cx, |workspace, _| workspace.view_mode())
+}
+
+/// `b`, in the Zoo project, and `a`, in none, with `settings` as `[settings]`
+/// keys; `b` in front and connected.
+fn zoo_and_a<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    // Left alone, CI's live job puts a connection from `PG*` among these.
+    crate::IGNORE_ENVIRONMENT.set(true);
+    let (workspace, cx) = launch_connections(
+        cx,
+        "create table birds (name text);",
+        settings,
+        &format!(
+            "[[projects]]\nname = \"Zoo\"\nconnections = [\"b\"]\n{}{}",
+            sqlite_profile("b", "Flocks", ""),
+            sqlite_profile("a", "Birds", ""),
+        ),
+    );
+    workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+    settle(cx);
+    (workspace, cx)
+}
+
+fn activate_by_id(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) {
+    workspace.update(cx, |workspace, cx| {
+        let index = workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .expect("the profile was restored");
+        workspace.activate(index, cx);
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_project_can_show_every_connection_while_the_global_setting_stays_simple(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = zoo_and_a(cx, "");
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+        assert_eq!(front_profile(&workspace, cx), "b");
+        assert!(
+            !connections_tree_drawn(cx),
+            "the profile's own tree is drawn"
+        );
+
+        run_command(
+            &workspace,
+            cx,
+            Command::SetProjectViewMode(0, Some(ViewMode::Complex)),
+        );
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Complex);
+        assert!(connections_tree_drawn(cx), "the connections tree is drawn");
+
+        let saved = store::peek_profiles(&[]).expect("the file reads");
+        assert_eq!(saved.projects[0].view_mode.as_deref(), Some("complex"));
+        let global = saved.settings.and_then(|settings| settings.view_mode);
+        assert!(
+            matches!(global.as_deref(), None | Some("simple")),
+            "{global:?}"
+        );
+
+        // The project in front decides: a connection in no project follows
+        // the global setting, and Zoo's own again follows Zoo's.
+        activate_by_id(&workspace, cx, "a");
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+        assert!(!connections_tree_drawn(cx), "the simple tree is back");
+        activate_by_id(&workspace, cx, "b");
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Complex);
+        assert!(connections_tree_drawn(cx));
+
+        run_command(&workspace, cx, Command::SetProjectViewMode(0, None));
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+        let file = std::fs::read_to_string(
+            store::dbdelve_directory()
+                .expect("the home has a data directory")
+                .join("profiles.toml"),
+        )
+        .expect("the file reads");
+        assert!(!file.contains("complex"), "{file}");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn switching_the_view_mode_moves_no_tab_and_no_connection(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = zoo_and_a(cx, "");
+        assert_eq!(profile_state(&workspace, cx, "b"), "connected");
+        workspace.update_in(cx, |workspace, window, cx| {
+            let editor = workspace
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("a profile opens on a query tab")
+                .editor
+                .clone();
+            editor.update(cx, |input, cx| input.set_value("select 1", window, cx));
+        });
+        settle(cx);
+        let snapshot = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let text = buffer(workspace, cx);
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().expect("b is in front").session;
+                (
+                    session.queries.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                    text,
+                    session.active,
+                    workspace.active,
+                    workspace.next_generation,
+                    profile_state_of(workspace, "b"),
+                    profile_state_of(workspace, "a"),
+                )
+            })
+        };
+        let before = snapshot(&workspace, cx);
+        assert_eq!(before.6, "idle");
+
+        for _ in 0..2 {
+            run_command(
+                &workspace,
+                cx,
+                Command::SetProjectViewMode(0, Some(ViewMode::Complex)),
+            );
+            assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Complex);
+            run_command(&workspace, cx, Command::SetProjectViewMode(0, None));
+            assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+        }
+        assert_eq!(snapshot(&workspace, cx), before);
+        quit(workspace, cx);
     });
 }

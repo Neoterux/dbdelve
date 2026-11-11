@@ -54,6 +54,7 @@ use crate::{
         CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
         routine_name,
     },
+    sidebar::ViewMode,
     sql,
     store::{HistoryEntry, StoredProject},
     structure_grid::Section,
@@ -366,6 +367,8 @@ pub enum Command {
     ToggleProject(usize),
     /// Put the palette back up over what can be done to this project.
     ProjectActions(usize),
+    /// A project's sidebar: its own choice, or with `None` the global setting.
+    SetProjectViewMode(usize, Option<ViewMode>),
     EditConnection(usize),
     DuplicateConnection(usize),
     /// Open the dialog that makes this connection visible to agents. Changes
@@ -1072,6 +1075,7 @@ pub fn waits_for_import(scope: Scope, command: &Command) -> bool {
             Command::SwitchConnection
                 | Command::ConnectionActions(_)
                 | Command::ProjectActions(_)
+                | Command::SetProjectViewMode(..)
                 | Command::ChooseProject(_)
                 | Command::MoveToProject(..)
                 | Command::Confirm(_)
@@ -1224,7 +1228,7 @@ impl Palette {
             (Mode::ProjectActions(at), _) => workspace
                 .projects
                 .get(at)
-                .map(|project| project_action_items(at, &project.name, Group::Bare))
+                .map(|project| project_action_items(at, project, Group::Bare))
                 .unwrap_or_default(),
             (Mode::MoveToProject(index), _) => workspace
                 .profiles
@@ -2743,7 +2747,7 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
     if let Some(at) = project {
         items.extend(project_action_items(
             at,
-            &workspace.projects[at].name,
+            &workspace.projects[at],
             Group::Named(PROJECT),
         ));
     }
@@ -2751,7 +2755,8 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
 }
 
 /// Everything that can be done to one project.
-fn project_action_items(at: usize, name: &str, group: Group) -> Vec<Item> {
+fn project_action_items(at: usize, project: &StoredProject, group: Group) -> Vec<Item> {
+    let name = project.name.as_str();
     [
         Item::new(
             format!("New connection in {name}…"),
@@ -5038,6 +5043,7 @@ mod tests {
         StoredProject {
             name: name.into(),
             connections: connections.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -5384,13 +5390,62 @@ mod tests {
     }
 
     #[test]
+    fn a_projects_actions_offer_its_sidebar_view_with_its_own_choice_marked() {
+        let rows = |project: &StoredProject| {
+            project_action_items(0, project, Group::Bare)
+                .into_iter()
+                .filter(|item| item.label.starts_with("Sidebar in "))
+                .map(|item| (item.label, item.hint.to_string(), item.command))
+                .collect::<Vec<_>>()
+        };
+        let complex = StoredProject {
+            view_mode: Some("complex".into()),
+            ..project("Zoo", &[])
+        };
+        let rows_of_complex = rows(&complex);
+        let marked: Vec<(&str, &str)> = rows_of_complex
+            .iter()
+            .map(|(label, hint, _)| (label.as_str(), hint.as_str()))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                ("Sidebar in Zoo: follow the setting", ""),
+                ("Sidebar in Zoo: the connection in front", ""),
+                ("Sidebar in Zoo: every connection", "current"),
+            ]
+        );
+        assert!(matches!(
+            rows_of_complex[0].2,
+            Command::SetProjectViewMode(0, None)
+        ));
+        assert!(matches!(
+            rows_of_complex[1].2,
+            Command::SetProjectViewMode(0, Some(ViewMode::Simple))
+        ));
+        assert!(matches!(
+            rows_of_complex[2].2,
+            Command::SetProjectViewMode(0, Some(ViewMode::Complex))
+        ));
+
+        // A project with no choice of its own marks the one that follows.
+        let following = rows(&project("Zoo", &[]));
+        let current: Vec<&str> = following
+            .iter()
+            .filter(|(_, hint, _)| hint == "current")
+            .map(|(label, ..)| label.as_str())
+            .collect();
+        assert_eq!(current, ["Sidebar in Zoo: follow the setting"]);
+    }
+
+    #[test]
     fn a_projects_row_folds_on_enter_and_offers_its_actions() {
         let (listed, projects) = connections();
         let items = listed_connections(&listed, &projects, Some(0));
         let billing = items.iter().find(|item| item.label == "Billing").unwrap();
         assert!(matches!(billing.command, Command::ToggleProject(0)));
         assert!(!billing.in_all);
-        let actions: Vec<String> = project_action_items(0, "Billing", Group::Bare)
+        let actions: Vec<String> = project_action_items(0, &project("Billing", &[]), Group::Bare)
             .into_iter()
             .map(|item| item.label)
             .collect();

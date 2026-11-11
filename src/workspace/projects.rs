@@ -21,6 +21,19 @@ impl Workspace {
             .and_then(|profile| self.group_of(&profile.id))
     }
 
+    /// The sidebar in effect: the front connection's project's own choice,
+    /// else the global setting. With nothing in front, or a connection in no
+    /// project, it is the global setting.
+    pub(crate) fn view_mode(&self) -> ViewMode {
+        effective_view_mode(self.settings.view_mode, self.front_project())
+    }
+
+    /// The project the connection in front is in.
+    fn front_project(&self) -> Option<&store::StoredProject> {
+        let name = self.current_group()?;
+        self.projects.iter().find(|project| project.name == name)
+    }
+
     pub(crate) fn in_current_group(&self, index: usize) -> bool {
         self.profiles
             .get(index)
@@ -53,6 +66,14 @@ impl Workspace {
             self.collapsed_projects.insert(project.name.clone());
         }
         cx.notify();
+    }
+
+    pub(crate) fn set_project_view_mode(
+        &mut self,
+        _at: usize,
+        _mode: Option<ViewMode>,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     pub(crate) fn open_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -316,6 +337,7 @@ mod tests {
         store::StoredProject {
             name: name.into(),
             connections: connections.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
         }
     }
 

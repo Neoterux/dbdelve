@@ -45,7 +45,7 @@ use crate::actions::{DisconnectAgents, ShowAgentActivity};
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
-use crate::sidebar::ViewMode;
+use crate::sidebar::{ViewMode, effective_view_mode};
 use crate::sql::{Mode, appended_statement, remember_statement, update_batch};
 use crate::theme::{install_fonts, install_theme, restored_fonts, restored_theme};
 use crate::*;
