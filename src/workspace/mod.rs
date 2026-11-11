@@ -2566,7 +2566,7 @@ impl Render for Workspace {
                     ("agent-approval", self.render_agent_approval(cx)),
                     ("agent-audit", self.render_agent_audit(cx)),
                     ("show-ddl", self.render_show_ddl(cx)),
-                    ("filter-picker", self.render_filter_picker(cx)),
+                    ("filter-picker", self.render_filter_picker(window, cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),

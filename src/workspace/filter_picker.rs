@@ -7,6 +7,8 @@
 //! part of the connection. Which sections exist comes from `Target::levels()`,
 //! never from the engine.
 
+use std::ops::Range;
+
 use gpui::SharedString;
 use gpui_component::{
     Sizable,
@@ -16,7 +18,9 @@ use gpui_component::{
 
 use super::*;
 use crate::db::{Include, Levels, Shown};
-use crate::ui::well;
+use crate::fuzzy::{Fuzzy, Query};
+use crate::theme::Theme;
+use crate::ui::{highlighted, well};
 
 /// Which of the two lists a section edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +81,8 @@ pub(crate) struct PickerSection {
     pub(crate) patterns: Vec<String>,
     /// The comma-separated entries that are not ticked names.
     pattern_field: Entity<InputState>,
+    /// Narrows the drawn rows; the stored rule never sees it.
+    search: Entity<InputState>,
 }
 
 pub(crate) struct FilterPicker {
@@ -96,6 +102,8 @@ pub(crate) struct FilterPicker {
     pub(crate) databases: PickerSection,
     /// The own database's schemas, on a target that has both levels.
     pub(crate) schemas: Option<PickerSection>,
+    /// The first draw after opening puts the keyboard in the first search box.
+    focus_search: std::cell::Cell<bool>,
 }
 
 impl PickerSection {
@@ -123,11 +131,20 @@ impl PickerSection {
             },
         )
         .detach();
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(format!("Search {}", which.key())));
+        cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             listing: Listing::Loading,
             ticked: Vec::new(),
             patterns: saved.to_vec(),
             pattern_field,
+            search,
         }
     }
 
@@ -298,6 +315,37 @@ impl FilterPicker {
         }
     }
 
+    /// What a section says in place of its rows: that the names are being
+    /// read, that they could not be, or that there are none.
+    pub(crate) fn status_line(&self, which: Which) -> Option<String> {
+        let key = which.key();
+        Some(match &self.section(which)?.listing {
+            Listing::Loading => format!("Listing {key}…"),
+            Listing::Failed(message) => format!("The list of {key} could not be read: {message}"),
+            Listing::Loaded(names) if names.is_empty() => match which {
+                Which::Databases => "The server lists no databases.".into(),
+                Which::Schemas => match self.own_database.as_deref() {
+                    Some(database) => format!("No schemas in {database}."),
+                    None => "No schemas.".into(),
+                },
+            },
+            Listing::Loaded(_) => return None,
+        })
+    }
+
+    /// What a section says when its search leaves no name drawn.
+    pub(crate) fn no_match_line(&self, which: Which) -> String {
+        format!("No {} matches the search.", which.noun(1))
+    }
+
+    /// Whether either list holds anything Remove Filter would empty.
+    pub(crate) fn can_remove(&self) -> bool {
+        [Which::Databases, Which::Schemas]
+            .into_iter()
+            .filter_map(|which| self.section(which))
+            .any(|section| !section.ticked.is_empty() || !section.patterns.is_empty())
+    }
+
     pub(crate) fn heading(&self) -> &'static str {
         match self.schemas {
             Some(_) => "Filter databases and schemas",
@@ -413,6 +461,22 @@ fn split(saved: &[String], names: &[String]) -> (Vec<String>, Vec<String>) {
     (ticked, patterns)
 }
 
+/// The names the search leaves drawn, by their place in the full list, each
+/// with the bytes the search matched. The one matcher the palette and the
+/// sidebar search use; the stored rule is `db::Include`'s and never goes
+/// through it.
+fn drawn(names: &[String], search: &str) -> Vec<(usize, Vec<Range<usize>>)> {
+    let query = Query::new(search);
+    let mut fuzzy = Fuzzy::new();
+    let mut rows = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        if fuzzy.matches(&query, name) {
+            rows.push((index, fuzzy.highlights(&query, name)));
+        }
+    }
+    rows
+}
+
 impl Workspace {
     /// Put the picker up over `profile`, which must be connected and have
     /// databases to choose between, and read the server's databases for it,
@@ -431,16 +495,13 @@ impl Workspace {
         if levels == Levels::Flat {
             return;
         }
-        let Some(connection) = found.connection() else {
+        if found.connection().is_none() {
             return;
-        };
+        }
         let wants_schemas = lists_schemas(levels);
-        let in_transaction = found.in_transaction;
-        self.last_filter_request += 1;
-        let request = self.last_filter_request;
         self.filter_picker = Some(FilterPicker {
             profile: found.id.clone(),
-            request,
+            request: 0,
             levels,
             own_database: found.active_database(),
             active_schema: found.active_schema().map(str::to_string),
@@ -454,13 +515,51 @@ impl Workspace {
             schemas: wants_schemas.then(|| {
                 PickerSection::loading(&found.include.schemas, Which::Schemas, window, cx)
             }),
+            focus_search: std::cell::Cell::new(true),
         });
+        self.list_names_for_picker(true, wants_schemas, window, cx);
+    }
+
+    /// Read the names of the lists asked for, unfiltered: every database and
+    /// schema, not the shown ones, since the names the tree holds are only
+    /// what the filter lets through. A new `request` number goes with it, so
+    /// what an earlier read brings back is dropped.
+    fn list_names_for_picker(
+        &mut self,
+        databases: bool,
+        schemas: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = self.filter_picker.as_ref() else {
+            return;
+        };
+        let Some(found) = self
+            .profiles
+            .iter()
+            .find(|found| found.id == picker.profile)
+        else {
+            return;
+        };
+        let Some(connection) = found.connection() else {
+            return;
+        };
+        let engine = found.config.target().engine;
+        let in_transaction = found.in_transaction;
+        self.last_filter_request += 1;
+        let request = self.last_filter_request;
+        if let Some(picker) = self.filter_picker.as_mut() {
+            picker.request = request;
+            for (which, wanted) in [(Which::Databases, databases), (Which::Schemas, schemas)] {
+                if let Some(section) = picker.section_mut(which).filter(|_| wanted) {
+                    section.listing = Listing::Loading;
+                }
+            }
+        }
         cx.notify();
-        // Every database and schema, not the shown ones: the names the tree
-        // holds are only what the filter lets through.
         let fetch = spawn_blocking(cx.background_executor(), move || {
-            let databases = connection.databases(target.engine, &Shown::everything());
-            let schemas = wants_schemas.then(|| {
+            let databases = databases.then(|| connection.databases(engine, &Shown::everything()));
+            let schemas = schemas.then(|| {
                 // A failed read inside the user's transaction fails the
                 // transaction on Postgres, so it is read on another session.
                 let reader = match in_transaction {
@@ -487,10 +586,26 @@ impl Workspace {
         .detach();
     }
 
+    /// Ask again for a list that could not be read, and for any list still
+    /// being read, which the new request number would otherwise drop.
+    fn retry_listing(&mut self, which: Which, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.filter_picker.as_ref() else {
+            return;
+        };
+        let wanted = |other: Which| {
+            which == other
+                || picker
+                    .section(other)
+                    .is_some_and(|section| section.listing == Listing::Loading)
+        };
+        let (databases, schemas) = (wanted(Which::Databases), wanted(Which::Schemas));
+        self.list_names_for_picker(databases, schemas, window, cx);
+    }
+
     fn names_listed_for_picker(
         &mut self,
         request: u64,
-        databases: Result<Databases, DbError>,
+        databases: Option<Result<Databases, DbError>>,
         schemas: Option<Result<Vec<String>, DbError>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -513,13 +628,14 @@ impl Workspace {
             return;
         };
         match databases {
-            Ok(listed) => {
+            None => {}
+            Some(Ok(listed)) => {
                 picker.databases.listed(listed.names, window, cx);
                 if listed.current.is_some() {
                     picker.own_database = listed.current;
                 }
             }
-            Err(error) => picker.databases.listing = Listing::Failed(error.message),
+            Some(Err(error)) => picker.databases.listing = Listing::Failed(error.message),
         }
         if let (Some(section), Some(result)) = (picker.schemas.as_mut(), schemas) {
             match result {
@@ -588,6 +704,55 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Tick, or untick, the names the search leaves drawn. A name that is
+    /// shown whatever the list says, or by a typed pattern, has no tick to
+    /// set; the pattern field is not touched.
+    fn tick_drawn(&mut self, which: Which, on: bool, cx: &mut Context<Self>) {
+        let Some(picker) = self.filter_picker.as_ref() else {
+            return;
+        };
+        let Some(section) = picker.section(which) else {
+            return;
+        };
+        let Listing::Loaded(names) = &section.listing else {
+            return;
+        };
+        let search = section.search.read(cx).value();
+        let drawn: Vec<String> = drawn(names, &search)
+            .into_iter()
+            .map(|(index, _)| names[index].clone())
+            .filter(|name| !on || picker.listed_hint(which, name).is_none())
+            .collect();
+        let Some(section) = self
+            .filter_picker
+            .as_mut()
+            .and_then(|picker| picker.section_mut(which))
+        else {
+            return;
+        };
+        section.ticked.retain(|ticked| !drawn.contains(ticked));
+        if on {
+            section.ticked.extend(drawn);
+        }
+        cx.notify();
+    }
+
+    /// Empty both lists in the dialog. The profile keeps what it holds until
+    /// Save Filter writes this.
+    fn remove_picker_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.filter_picker.as_mut() else {
+            return;
+        };
+        for section in [Some(&mut picker.databases), picker.schemas.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            section.ticked.clear();
+            section.set_patterns(Vec::new(), window, cx);
+        }
+        cx.notify();
+    }
+
     /// Write the lists to the profile and read its catalog again. The lists
     /// are not part of the connection, so nothing reconnects, no tab closes
     /// and the agent keeps its view of the profile.
@@ -625,8 +790,9 @@ impl Workspace {
         }
     }
 
-    /// One list of the dialog: its label, what it is of, the names over a
-    /// well, and how many of them Save will show.
+    /// One list of the dialog: its label, what it is of, a search over its
+    /// names, the names over a well with the field for patterns, and how many
+    /// of them Save will show.
     fn render_section(
         &self,
         picker: &FilterPicker,
@@ -648,27 +814,52 @@ impl Workspace {
                 .child(text)
                 .into_any_element()
         };
+        let search_text = section.search.read(cx).value();
+        let shown = match &section.listing {
+            Listing::Loaded(names) => drawn(names, &search_text),
+            _ => Vec::new(),
+        };
+        let status = picker.status_line(which).unwrap_or_default();
         let list = match &section.listing {
-            Listing::Loading => line(
-                format!("filter-picker-loading-{key}"),
+            Listing::Loading => line(format!("filter-picker-loading-{key}"), t.text_muted, status),
+            Listing::Failed(_) => div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(layout::SPACE_XS))
+                .child(line(
+                    format!("filter-picker-failed-{key}"),
+                    t.danger,
+                    status,
+                ))
+                .child(
+                    div()
+                        .debug_selector(move || format!("filter-picker-retry-{key}"))
+                        .px(px(layout::SPACE_SM))
+                        .pb(px(layout::SPACE_XS))
+                        .child(
+                            button(
+                                SharedString::from(format!("filter-picker-retry-button-{key}")),
+                                "Retry Listing",
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .on_click(cx.listener(
+                                move |workspace, _: &gpui::ClickEvent, window, cx| {
+                                    workspace.retry_listing(which, window, cx);
+                                },
+                            )),
+                        ),
+                )
+                .into_any_element(),
+            Listing::Loaded(names) if names.is_empty() => {
+                line(format!("filter-picker-empty-{key}"), t.text_muted, status)
+            }
+            Listing::Loaded(_) if shown.is_empty() => line(
+                format!("filter-picker-no-match-{key}"),
                 t.text_muted,
-                format!("Listing {key}…"),
-            ),
-            Listing::Failed(message) => line(
-                format!("filter-picker-failed-{key}"),
-                t.danger,
-                format!("The list of {key} could not be read: {message}"),
-            ),
-            Listing::Loaded(names) if names.is_empty() => line(
-                format!("filter-picker-empty-{key}"),
-                t.text_muted,
-                match which {
-                    Which::Databases => "The server lists no databases.".into(),
-                    Which::Schemas => match picker.own_database.as_deref() {
-                        Some(database) => format!("No schemas in {database}."),
-                        None => "No schemas.".into(),
-                    },
-                },
+                picker.no_match_line(which),
             ),
             // ponytail: every row is drawn, not virtualised, so a server
             // listing thousands of names draws thousands of checkboxes.
@@ -678,7 +869,9 @@ impl Workspace {
                 .debug_selector(move || format!("filter-picker-list-{key}"))
                 .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
                 .overflow_y_scroll()
-                .children(names.iter().enumerate().map(|(index, listed)| {
+                .children(shown.iter().map(|(index, ranges)| {
+                    let index = *index;
+                    let listed = &names[index];
                     let hint = picker.listed_hint(which, listed);
                     let checked = hint.is_some() || section.ticked.contains(listed);
                     let toggled = listed.clone();
@@ -712,7 +905,7 @@ impl Workspace {
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
-                                            .child(listed.clone()),
+                                            .child(highlighted(listed.clone(), ranges, t)),
                                     ),
                                 ),
                         )
@@ -727,26 +920,71 @@ impl Workspace {
                 }))
                 .into_any_element(),
         };
+        // Select and Clear act on the rows drawn, so they have none to act on
+        // until the names are read and the search leaves some.
+        let acts = !shown.is_empty();
+        let action = |selector: String, label: &'static str, on: bool, cx: &mut Context<Self>| {
+            div().debug_selector(move || selector.clone()).child(
+                button(
+                    SharedString::from(format!("{label}-{key}")),
+                    label,
+                    Tone::Quiet,
+                    Control::Compact,
+                    t,
+                )
+                .disabled(!acts)
+                .on_click(cx.listener(
+                    move |workspace, _: &gpui::ClickEvent, _, cx| {
+                        workspace.tick_drawn(which, on, cx);
+                    },
+                )),
+            )
+        };
+        // The actions follow the search box in the tree, so Tab reaches them
+        // right after it.
+        let search_row = div()
+            .flex()
+            .flex_col()
+            .gap(px(layout::SPACE_XS))
+            .px(px(layout::SPACE_SM))
+            .py(px(layout::SPACE_XS))
+            .child(field_box(
+                format!("filter-picker-search-{key}"),
+                &section.search,
+                t,
+                row_height,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(layout::SPACE_XS))
+                    .child(action(
+                        format!("filter-picker-select-all-{key}"),
+                        "Select Names",
+                        true,
+                        cx,
+                    ))
+                    .child(action(
+                        format!("filter-picker-clear-{key}"),
+                        "Clear Names",
+                        false,
+                        cx,
+                    )),
+            )
+            .into_any_element();
         let patterns_row = div()
             .flex()
             .flex_col()
             .gap(px(layout::SPACE_XS))
             .px(px(layout::SPACE_SM))
             .py(px(layout::SPACE_XS))
-            .child(
-                div()
-                    .debug_selector(move || format!("filter-picker-patterns-{key}"))
-                    .h(row_height)
-                    .px(px(layout::SPACE_SM))
-                    .flex()
-                    .items_center()
-                    .rounded(px(layout::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(t.border)
-                    .child(div().flex_1().min_w_0().child(Sizable::small(
-                        Input::new(&section.pattern_field).appearance(false).p_0(),
-                    ))),
-            )
+            .child(field_box(
+                format!("filter-picker-patterns-{key}"),
+                &section.pattern_field,
+                t,
+                row_height,
+            ))
             .child(
                 div()
                     .text_size(text_size)
@@ -772,7 +1010,7 @@ impl Workspace {
                         .text_color(t.text_muted)
                         .child(caption)
                 }))
-                .child(well(t, [list, patterns_row]))
+                .child(well(t, [search_row, list, patterns_row]))
                 .children(picker.preview(which).map(|preview| {
                     div()
                         .debug_selector(move || format!("filter-picker-preview-{key}"))
@@ -792,11 +1030,23 @@ impl Workspace {
     }
 
     /// The dialog: a checklist per list over what Save will show of it.
-    pub(crate) fn render_filter_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_filter_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let picker = self.filter_picker_in_front()?;
         let name = self.profile()?.name.clone();
         let t = popup_theme(cx);
         let text_size = px(layout::chrome(layout::TEXT_SM));
+        // The layer takes the keyboard for the dialog as it goes up, so the
+        // search box takes it from the layer on the frame after.
+        if picker.focus_search.replace(false) {
+            let search = picker.databases.search.clone();
+            cx.on_next_frame(window, move |_, window, cx| {
+                search.update(cx, |input, cx| input.focus(window, cx));
+            });
+        }
         let sections: Vec<AnyElement> = [Which::Databases, Which::Schemas]
             .into_iter()
             .filter_map(|which| self.render_section(picker, which, cx))
@@ -843,56 +1093,107 @@ impl Workspace {
                     .child(
                         div()
                             .flex()
-                            .justify_end()
-                            .gap(px(layout::SPACE_SM))
+                            .items_center()
+                            .justify_between()
                             .child(
-                                self.choice(
-                                    "filter-picker",
-                                    1,
-                                    button(
-                                        "filter-picker-discard",
-                                        "Discard Changes",
-                                        Tone::Quiet,
-                                        Control::Standard,
-                                        t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = discard.update(cx, |workspace, cx| {
-                                                workspace.close_filter_picker(cx);
-                                            });
-                                        },
+                                div()
+                                    .debug_selector(|| "filter-picker-remove".into())
+                                    .child(
+                                        button(
+                                            "filter-picker-remove-button",
+                                            "Remove Filter",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .disabled(!picker.can_remove())
+                                        .on_click(
+                                            cx.listener(
+                                                |workspace, _: &gpui::ClickEvent, window, cx| {
+                                                    workspace.remove_picker_filter(window, cx);
+                                                },
+                                            ),
+                                        ),
                                     ),
-                                    t,
-                                ),
                             )
                             .child(
-                                self.choice(
-                                    "filter-picker",
-                                    0,
-                                    button(
-                                        "filter-picker-save",
-                                        "Save Filter",
-                                        Tone::Primary,
-                                        Control::Standard,
-                                        t,
+                                div()
+                                    .flex()
+                                    .gap(px(layout::SPACE_SM))
+                                    .child(
+                                        self.choice(
+                                            "filter-picker",
+                                            1,
+                                            button(
+                                                "filter-picker-discard",
+                                                "Discard Changes",
+                                                Tone::Quiet,
+                                                Control::Standard,
+                                                t,
+                                            )
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    _ = discard.update(cx, |workspace, cx| {
+                                                        workspace.close_filter_picker(cx);
+                                                    });
+                                                },
+                                            ),
+                                            t,
+                                        ),
                                     )
-                                    .disabled(!picker.can_save())
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = save.update(cx, |workspace, cx| {
-                                                workspace.save_filter(cx);
-                                            });
-                                        },
+                                    .child(
+                                        self.choice(
+                                            "filter-picker",
+                                            0,
+                                            button(
+                                                "filter-picker-save",
+                                                "Save Filter",
+                                                Tone::Primary,
+                                                Control::Standard,
+                                                t,
+                                            )
+                                            .disabled(!picker.can_save())
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    _ = save.update(cx, |workspace, cx| {
+                                                        workspace.save_filter(cx);
+                                                    });
+                                                },
+                                            ),
+                                            t,
+                                        ),
                                     ),
-                                    t,
-                                ),
                             ),
                     ),
                 )
                 .into_any_element(),
         )
     }
+}
+
+/// A text field in a box of its own: the box is the field's edge, so the
+/// input draws nothing around itself.
+fn field_box(
+    selector: String,
+    input: &Entity<InputState>,
+    t: Theme,
+    height: gpui::Pixels,
+) -> gpui::Div {
+    div()
+        .debug_selector(move || selector.clone())
+        .h(height)
+        .px(px(layout::SPACE_SM))
+        .flex()
+        .items_center()
+        .rounded(px(layout::RADIUS_CONTROL))
+        .border_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Sizable::small(Input::new(input).appearance(false).p_0())),
+        )
 }
 
 #[cfg(test)]
