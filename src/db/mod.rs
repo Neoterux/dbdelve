@@ -2069,6 +2069,26 @@ impl Connection {
         }
     }
 
+    /// A session for the (connection, `database`) pair, which the connections
+    /// tree reads that database's catalog over and a tab bound to it will run
+    /// on. Built from this live connection -- its resolved password and its
+    /// tunnel -- and never from the profile's config, and sharing no mutable
+    /// state with it: moving the session's database moves nothing here. It
+    /// carries no read-only hold of its own; the caller applies it before the
+    /// session is stored (`set_read_only`).
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        match self {
+            Self::DuckDb(connection) => connection.on_database(database).map(Self::DuckDb),
+            Self::MySql(_) | Self::MongoDb(_) | Self::Redis(_) | Self::Snowflake(_) => {
+                Err(not_offered())
+            }
+            Self::Postgres(_) | Self::SqlServer(_) | Self::ClickHouse(_) => Err(not_offered()),
+            Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Err(plain_error(
+                "This connection has no other database to open a session on.".into(),
+            )),
+        }
+    }
+
     /// Open now what the first run would otherwise wait on opening.
     pub fn warm(&self) {
         if let Self::Postgres(connection) = self {
@@ -3855,6 +3875,12 @@ pub(super) fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
     plain_error(format!(
         "A value in {column} is not valid UTF-8 text and cannot be displayed."
     ))
+}
+
+/// What a connection says of a session on another database that its engine's
+/// arm does not open yet.
+fn not_offered() -> DbError {
+    plain_error("Opening a session on another database is not offered on this connection.".into())
 }
 
 pub(super) fn plain_error(message: String) -> DbError {

@@ -1350,6 +1350,16 @@ fn a_connect_that_fails_stays_on_its_own_row(cx: &mut TestAppContext) {
 fn launch_duckdb_connection(
     cx: &mut TestAppContext,
 ) -> (Entity<Workspace>, &mut VisualTestContext) {
+    launch_duckdb(cx, "")
+}
+
+/// The same, with `extra` among the profile's scalar keys and a second file,
+/// `other.duckdb` holding `u (id INTEGER)`, beside it for a statement to
+/// attach. Both files are closed again before the app opens one.
+fn launch_duckdb<'a>(
+    cx: &'a mut TestAppContext,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
     // Left alone, CI's live job puts a connection from `PG*` among these.
     crate::IGNORE_ENVIRONMENT.set(true);
     let directory = store::dbdelve_directory().expect("the test home has a data directory");
@@ -1358,6 +1368,9 @@ fn launch_duckdb_connection(
     ::duckdb::Connection::open(&database)
         .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
         .expect("the schema must apply");
+    ::duckdb::Connection::open(directory.join("other.duckdb"))
+        .and_then(|connection| connection.execute_batch("CREATE TABLE u (id INTEGER);"))
+        .expect("the second schema must apply");
     std::fs::write(
         directory.join("profiles.toml"),
         format!(
@@ -1372,7 +1385,8 @@ fn launch_duckdb_connection(
              database = \"\"\n\
              user = \"\"\n\
              engine = \"duckdb\"\n\
-             path = {:?}\n",
+             path = {:?}\n\
+             {extra}\n",
             database.display().to_string()
         ),
     )
@@ -1429,7 +1443,7 @@ fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppConte
         workspace.read_with(cx, |workspace, _| {
             assert!(matches!(
                 workspace.connections.nodes.get(&db),
-                Some(crate::sidebar::Node::Database)
+                Some(crate::sidebar::Node::Database { .. })
             ));
             // Each folder row counts what it holds, from what has loaded.
             let counts = &workspace.connections.counts;
@@ -1461,6 +1475,225 @@ fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppConte
             tree.selected_item().map(|item| item.id.to_string())
         });
         assert_eq!(selected, Some(t));
+
+        quit(workspace, cx);
+    });
+}
+
+/// Runs `sql` in the query tab in front, and waits for the answer.
+fn run_in_front(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
+    cx.update(|window, cx| {
+        let editor = workspace
+            .read(cx)
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .expect("a connected profile opens on a query tab")
+            .editor
+            .clone();
+        editor.update(cx, |input, cx| input.set_value(sql, window, cx));
+    });
+    cx.dispatch_action(crate::actions::RunQuery);
+    settle(cx);
+    query_tab(workspace, cx, |tab, _, _| match &tab.query {
+        QueryState::Complete { .. } => {}
+        QueryState::Failed(error) => panic!("{sql} failed: {error}"),
+        _ => panic!("{sql} never completed"),
+    });
+}
+
+/// What `SELECT current_database()` answers on the connection of the profile
+/// in front, which is the one its own tabs run on.
+fn own_database(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    let connection = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .and_then(|profile| profile.connection())
+            .expect("the profile is connected")
+    });
+    let result = connection
+        .query(
+            "SELECT current_database()",
+            &CancelToken::default(),
+            Fetch::default(),
+        )
+        .expect("the connection answers");
+    result.rows[0]
+        .iter()
+        .next()
+        .flatten()
+        .map(str::to_string)
+        .expect("a database is named")
+}
+
+/// The DuckDB profile of `launch_duckdb`, connected and holding `other`
+/// attached, with the connection listed again to say so.
+fn duckdb_with_other_attached<'a>(
+    cx: &'a mut TestAppContext,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
+    let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+    click_connections_row(cx, at);
+    let other = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("other.duckdb");
+    run_in_front(
+        &workspace,
+        cx,
+        &format!("ATTACH '{}' AS other", other.display()),
+    );
+    workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+    settle(cx);
+    (workspace, cx)
+}
+
+#[gpui::test]
+fn an_attached_duckdb_database_expands_over_a_session_of_its_own(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let (own, other) = (database_row("e2e", "e2e"), database_row("e2e", "other"));
+        assert_eq!(
+            connections_item(&workspace, cx, &connection_row("e2e"))
+                .map(|(_, rows)| rows.into_iter().map(|(id, ..)| id).collect::<Vec<_>>()),
+            Some(vec![own.clone(), other.clone()]),
+            "the own database and the one attached"
+        );
+        assert_eq!(
+            connections_item(&workspace, cx, &other),
+            Some((
+                false,
+                vec![(
+                    scoped_row("e2e", Some("other"), "loading"),
+                    LOADING.to_string(),
+                    true
+                )]
+            )),
+            "folded, and nothing has opened a session"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(profile.bound.is_empty() && profile.database_catalogs.is_empty());
+        });
+
+        let click = |id: &str, cx: &mut VisualTestContext| {
+            let at = connections_row(&workspace, cx, id)
+                .unwrap_or_else(|| panic!("{id} is not showing"));
+            click_connections_row(cx, at);
+        };
+        click(&other, cx);
+        let schema = scoped_row("e2e", Some("other"), "schema-main");
+        let tables = scoped_row("e2e", Some("other"), "category-Tables-main");
+        let u = scoped_row("e2e", Some("other"), &explorer::relation_row("main", "u"));
+        click(&schema, cx);
+        click(&tables, cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(matches!(
+                profile.bound.get("other"),
+                Some(crate::session::BoundSession::Open(_))
+            ));
+            match profile.database_catalogs.get("other") {
+                Some(CatalogState::Loaded(catalog, _)) => {
+                    let names: Vec<_> = catalog
+                        .schemas
+                        .iter()
+                        .flat_map(|schema| &schema.relations)
+                        .map(|relation| relation.name.as_str())
+                        .collect();
+                    assert_eq!(names, ["u"]);
+                }
+                _ => panic!("the catalog of `other` has not loaded"),
+            }
+            assert_eq!(profile.active_database().as_deref(), Some("e2e"));
+        });
+        assert!(
+            connections_row(&workspace, cx, &u).is_some(),
+            "`u` is listed under the database it is in"
+        );
+        // The profile's own tabs are where they were.
+        assert_eq!(own_database(&workspace, cx), "e2e");
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let other = database_row("e2e", "other");
+        let at = connections_row(&workspace, cx, &other).expect("`other` shows");
+        click_connections_row(cx, at);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.sessions_to_hold().len(), 2, "its own and `other`'s");
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::ReadOnly, cx)
+        });
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::ReadWrite, cx)
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.held, [2, 2], "both were handed to the hold");
+        });
+
+        // A mode picked while a session is still opening finds nothing of it
+        // to hold, so its landing drops it and opens another under the mode.
+        workspace.update(cx, |workspace, cx| {
+            let profile = workspace.profile_mut().expect("the connection is in front");
+            profile.bound.clear();
+            profile.database_catalogs.clear();
+            workspace.expand_node(&other.clone().into(), cx);
+            workspace.set_mode(crate::sql::Mode::ReadOnly, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.opened, ["other", "other", "other"]);
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(matches!(
+                profile.bound.get("other"),
+                Some(crate::session::BoundSession::Open(_))
+            ));
+            assert_eq!(workspace.held.last(), Some(&1), "only its own was open");
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn expanding_a_database_twice_while_it_opens_opens_one_session(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let other = database_row("e2e", "other");
+        workspace.update(cx, |workspace, cx| {
+            let tree = workspace.connections.tree.clone();
+            tree.update(cx, |_, cx| {
+                for _ in 0..2 {
+                    cx.emit(TreeEvent::Expanded(other.clone().into()));
+                }
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(matches!(
+                profile.bound.get("other"),
+                Some(crate::session::BoundSession::Opening)
+            ));
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.opened, ["other"], "one session was opened");
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(matches!(
+                profile.database_catalogs.get("other"),
+                Some(CatalogState::Loaded(..))
+            ));
+        });
 
         quit(workspace, cx);
     });

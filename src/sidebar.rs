@@ -257,6 +257,17 @@ pub(crate) struct Listed<'a> {
     /// The database its target's catalog is of, where the shape draws one
     /// over the schemas.
     pub(crate) database: Option<String>,
+    /// The other databases of its server, in the order the server listed
+    /// them, with how much of each is known. Empty unless the shape draws
+    /// databases over its schemas or objects.
+    pub(crate) databases: Vec<(String, Content)>,
+}
+
+/// The databases of a server that are not `current`, the one the connection
+/// is in, in the order the server listed them: the rows listed beside the
+/// connection's own database, which appears once whatever the engine.
+pub(crate) fn other_databases<'a>(names: &'a [String], _current: Option<&str>) -> Vec<&'a str> {
+    names.iter().map(String::as_str).collect()
 }
 
 /// What a row stands for.
@@ -266,8 +277,12 @@ pub(crate) enum Node {
     Connection {
         profile: String,
     },
-    /// A connection's database, with nothing to act on yet.
-    Database,
+    /// A connection's database, the connection's own or another of its
+    /// server's.
+    Database {
+        profile: String,
+        database: String,
+    },
     /// Says what happened to its connection, and is never acted on.
     Notice,
     /// One of simple mode's rows, its leaf when it opens an object.
@@ -478,7 +493,13 @@ fn connection_item(
                     let row = database_row(connection.id, database);
                     let named = search.builder.name_matches(&row, database);
                     if !search.filtering || named || !under.is_empty() {
-                        tree.nodes.insert(row.clone(), Node::Database);
+                        tree.nodes.insert(
+                            row.clone(),
+                            Node::Database {
+                                profile: connection.id.to_string(),
+                                database: database.to_string(),
+                            },
+                        );
                         tree.counts.insert(row.clone(), under.len());
                         let open = search.filtering || folds.get(&row).copied().unwrap_or(false);
                         let mut item = TreeItem::new(row.clone(), database.to_string());
@@ -624,6 +645,7 @@ mod tests {
             content,
             levels: Levels::Flat,
             database: None,
+            databases: Vec::new(),
         }
     }
 
@@ -819,6 +841,7 @@ mod tests {
             content: Content::Loaded(content),
             levels,
             database: Some(database.to_string()),
+            databases: Vec::new(),
         }
     }
 
@@ -888,7 +911,7 @@ mod tests {
         );
         assert!(matches!(
             tree.nodes.get(&database_row("a", "d")),
-            Some(Node::Database)
+            Some(Node::Database { .. })
         ));
         let database = find(&tree.items, &database_row("a", "d"));
         let schema = scoped_row("a", Some("d"), "schema-main");
@@ -941,7 +964,7 @@ mod tests {
             !tree
                 .nodes
                 .values()
-                .any(|node| matches!(node, Node::Database))
+                .any(|node| matches!(node, Node::Database { .. }))
         );
     }
 
@@ -1024,12 +1047,200 @@ mod tests {
             !tree
                 .nodes
                 .values()
-                .any(|node| matches!(node, Node::Database))
+                .any(|node| matches!(node, Node::Database { .. }))
         );
         assert!(schema_row_is_a_database(Levels::DatabaseHoldsObjects));
         assert!(schema_row_is_a_database(Levels::DatabaseIsSchema));
         assert!(!schema_row_is_a_database(Levels::DatabaseThenSchema));
         assert!(!schema_row_is_a_database(Levels::Flat));
+    }
+
+    /// A connection of `levels` on `database`, holding `birds`, with `others`
+    /// beside it.
+    fn with_others<'a>(
+        levels: Levels,
+        database: &str,
+        others: Vec<(String, Content)>,
+    ) -> Listed<'a> {
+        Listed {
+            databases: others,
+            ..database_listed(
+                "a",
+                content_of(vec![schema(
+                    match levels {
+                        Levels::DatabaseHoldsObjects => database,
+                        _ => "main",
+                    },
+                    vec![relation("birds", RelationKind::Table, None)],
+                )]),
+                levels,
+                database,
+            )
+        }
+    }
+
+    #[test]
+    fn other_databases_are_listed_folded_until_they_load() {
+        let other = database_row("a", "other");
+        // The fold is the user's, and says open: an unloaded database is
+        // folded whatever it says, since nothing here has asked it to load.
+        let open = HashMap::from([(other.clone(), true)]);
+        let build_with = |content| {
+            build(
+                &[],
+                vec![with_others(
+                    Levels::DatabaseThenSchema,
+                    "d",
+                    vec![("other".into(), content)],
+                )],
+                &open,
+            )
+        };
+
+        let tree = build_with(Content::Unloaded);
+        let connection = find(&tree.items, &connection_row("a"));
+        assert_eq!(
+            row_ids(&connection.children),
+            [database_row("a", "d"), other.clone()]
+        );
+        let row = find(&tree.items, &other);
+        assert!(!row.is_expanded());
+        assert_eq!(
+            row_ids(&row.children),
+            [scoped_row("a", Some("other"), "loading")]
+        );
+        assert_eq!(row.children[0].label.as_str(), LOADING);
+        assert!(row.children[0].is_disabled());
+        assert!(matches!(
+            tree.nodes.get(&other),
+            Some(Node::Database { profile, database }) if (profile.as_str(), database.as_str()) == ("a", "other")
+        ));
+        // Nothing is counted of what has not loaded.
+        assert_eq!(count_of(&tree, &other), None);
+
+        let tree = build_with(Content::Failed("It would not open.".into()));
+        let row = find(&tree.items, &other);
+        assert!(row.is_expanded(), "a failure follows its fold");
+        assert_eq!(
+            row_ids(&row.children),
+            [scoped_row("a", Some("other"), "notice")]
+        );
+        assert_eq!(row.children[0].label.as_str(), "It would not open.");
+        assert!(row.children[0].is_disabled());
+
+        let tree = build_with(Content::Loading);
+        let row = find(&tree.items, &other);
+        assert!(row.is_expanded(), "the row just clicked stays open");
+        assert_eq!(row.children[0].label.as_str(), LOADING);
+
+        let tree = build_with(Content::Loaded(birds()));
+        let row = find(&tree.items, &other);
+        assert_eq!(
+            row_ids(&row.children),
+            [scoped_row("a", Some("other"), "schema-main")]
+        );
+        assert_eq!(count_of(&tree, &other), Some(1));
+        // The own database is untouched by any of it.
+        assert!(search(&tree.items, &database_row("a", "d")).is_some());
+    }
+
+    #[test]
+    fn the_own_database_is_listed_once_whatever_engine() {
+        for (levels, names, current) in [
+            (Levels::DatabaseHoldsObjects, ["db0", "db1"], "db0"),
+            (
+                Levels::DatabaseThenSchema,
+                ["dbdelve_dev", "postgres"],
+                "dbdelve_dev",
+            ),
+        ] {
+            let names = names.map(str::to_string);
+            let others = other_databases(&names, Some(current));
+            assert_eq!(others, [names[1].as_str()], "{levels:?}");
+
+            let tree = build(
+                &[],
+                vec![with_others(
+                    levels,
+                    current,
+                    others
+                        .into_iter()
+                        .map(|name| (name.to_string(), Content::Unloaded))
+                        .collect(),
+                )],
+                &HashMap::new(),
+            );
+            let databases = tree
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| match node {
+                    Node::Database { database, .. } => Some((id.clone(), database.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // The shape that draws its schema as its database has no
+            // database row of its own to count.
+            let own = match levels {
+                Levels::DatabaseHoldsObjects => {
+                    assert!(
+                        search(
+                            &tree.items,
+                            &scoped_row("a", None, &format!("schema-{current}"))
+                        )
+                        .is_some()
+                    );
+                    0
+                }
+                _ => 1,
+            };
+            assert_eq!(databases.len(), own + 1, "{levels:?}: {databases:?}");
+            assert!(databases.contains(&(database_row("a", &names[1]), names[1].clone())));
+            assert_eq!(
+                count_of(&tree, &connection_row("a")),
+                Some(2),
+                "{levels:?}: the own database and the other"
+            );
+        }
+    }
+
+    #[test]
+    fn another_database_of_a_database_holds_objects_connection_holds_its_kinds_directly() {
+        let shop = content_of(vec![schema(
+            "shop",
+            vec![relation("orders", RelationKind::Table, None)],
+        )]);
+        let tree = build(
+            &[],
+            vec![Listed {
+                content: Content::Loaded(ExplorerTree::default()),
+                databases: vec![("shop".into(), Content::Loaded(shop))],
+                ..database_listed(
+                    "a",
+                    ExplorerTree::default(),
+                    Levels::DatabaseHoldsObjects,
+                    "other",
+                )
+            }],
+            &HashMap::new(),
+        );
+
+        let row = find(&tree.items, &database_row("a", "shop"));
+        assert_eq!(
+            row_ids(&row.children),
+            [scoped_row("a", Some("shop"), "category-Tables-shop")]
+        );
+        assert!(
+            !all_ids(&tree.items)
+                .iter()
+                .any(|id| id.ends_with("schema-shop")),
+            "no schema row is repeated under the database"
+        );
+        let orders = scoped_row("a", Some("shop"), &explorer::relation_row("shop", "orders"));
+        assert!(search(&row.children, &orders).is_some());
+        assert!(matches!(
+            tree.nodes.get(&orders),
+            Some(Node::Row { leaf: Some(_) })
+        ));
     }
 
     fn relation(name: &str, kind: RelationKind, partition_of: Option<&str>) -> Relation {
