@@ -4390,6 +4390,38 @@ mod tests {
 
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_MONGO_URL"]
+    fn live_a_session_on_another_database_reads_there() {
+        let profile = live();
+        // The app user holds a role on this one besides the profile's own.
+        let session = profile.on_database("dbdelve_archive");
+        let scratch = Scratch(&session, format!("dbdelve_test_{}", ObjectId::new()));
+        ran(
+            &session,
+            &format!("db.getCollection('{}').insertOne({{ _id: 1 }})", scratch.1),
+        );
+
+        let listed = |connection: &Connection| {
+            connection
+                .catalog()
+                .expect("catalog should load")
+                .schemas
+                .iter()
+                .flat_map(|schema| schema.relations.iter())
+                .any(|relation| relation.name == scratch.1)
+        };
+        assert!(listed(&session), "the session lists what it wrote");
+        assert!(
+            !listed(&profile),
+            "the profile's own database does not hold it"
+        );
+        assert_eq!(
+            profile.databases().unwrap().current.as_deref(),
+            Some("dbdelve_dev")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MONGO_URL"]
     fn live_a_blank_database_is_in_none_and_lists_no_collections() {
         let mut config = live_config();
         config.server.database = String::new();

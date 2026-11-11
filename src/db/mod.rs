@@ -2084,7 +2084,8 @@ impl Connection {
             Self::Snowflake(connection) => Ok(Self::Snowflake(connection.on_database(database))),
             Self::MongoDb(connection) => Ok(Self::MongoDb(connection.on_database(database))),
             Self::Postgres(connection) => connection.on_database(database).map(Self::Postgres),
-            Self::SqlServer(_) | Self::ClickHouse(_) => Err(not_offered()),
+            Self::SqlServer(connection) => connection.on_database(database).map(Self::SqlServer),
+            Self::ClickHouse(connection) => connection.on_database(database).map(Self::ClickHouse),
             Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Err(plain_error(
                 "This connection has no other database to open a session on.".into(),
             )),
@@ -3877,12 +3878,6 @@ pub(super) fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
     plain_error(format!(
         "A value in {column} is not valid UTF-8 text and cannot be displayed."
     ))
-}
-
-/// What a connection says of a session on another database that its engine's
-/// arm does not open yet.
-fn not_offered() -> DbError {
-    plain_error("Opening a session on another database is not offered on this connection.".into())
 }
 
 pub(super) fn plain_error(message: String) -> DbError {
