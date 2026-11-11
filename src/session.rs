@@ -2481,6 +2481,11 @@ pub(crate) struct ObjectTab {
     /// is the only thing that tells two overloads of one function apart.
     pub(crate) name: String,
     pub(crate) kind: ObjectKind,
+    /// The database of the connection's server this tab's object is in, as the
+    /// server listed it, or `None` for the connection's own. Every read and
+    /// write the tab makes runs on that database's session
+    /// ([`Profile::connection_for`]).
+    pub(crate) database: Option<String>,
     pub(crate) body: ObjectBody,
 }
 
@@ -2644,14 +2649,17 @@ impl OpenedObject {
 /// `customers` and `customers WHERE id = 42` are two tabs. Fed an iterator
 /// rather than a session, so the invariant has a test that needs no window.
 pub(crate) fn matching_tab<'a>(
-    open: impl Iterator<Item = (u64, &'a str, &'a str, &'a str)>,
+    open: impl Iterator<Item = (u64, Option<&'a str>, &'a str, &'a str, &'a str)>,
+    _database: Option<&str>,
     schema: &str,
     name: &str,
     filter: &str,
 ) -> Option<u64> {
-    open.filter(|(_, candidate_schema, candidate_name, candidate_filter)| {
-        *candidate_schema == schema && *candidate_name == name && *candidate_filter == filter
-    })
+    open.filter(
+        |(_, _candidate_database, candidate_schema, candidate_name, candidate_filter)| {
+            *candidate_schema == schema && *candidate_name == name && *candidate_filter == filter
+        },
+    )
     .map(|(id, ..)| id)
     .next()
 }
@@ -4142,16 +4150,17 @@ mod tests {
     #[test]
     fn one_relation_and_one_filter_is_one_tab() {
         let open = [
-            (7u64, "public", "customers", ""),
-            (9u64, "public", "customers", r#""id" = '42'"#),
+            (7u64, None, "public", "customers", ""),
+            (9u64, None, "public", "customers", r#""id" = '42'"#),
         ];
         assert_eq!(
-            matching_tab(open.iter().copied(), "public", "customers", ""),
+            matching_tab(open.iter().copied(), None, "public", "customers", ""),
             Some(7)
         );
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "public",
                 "customers",
                 r#""id" = '42'"#
@@ -4161,13 +4170,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tabs_identity_includes_its_database() {
+        let open = [
+            (7u64, Some("other"), "main", "t", ""),
+            (9u64, None, "main", "t", ""),
+        ];
+        assert_eq!(
+            matching_tab(open.iter().copied(), Some("other"), "main", "t", ""),
+            Some(7)
+        );
+        assert_eq!(
+            matching_tab(open.iter().copied(), None, "main", "t", ""),
+            Some(9),
+            "no database matches only a tab with none"
+        );
+        assert_eq!(
+            matching_tab(open.iter().copied(), Some("third"), "main", "t", ""),
+            None
+        );
+        assert_eq!(
+            matching_tab(open[..1].iter().copied(), None, "main", "t", ""),
+            None,
+            "a tab of another database is not the profile's own"
+        );
+    }
+
+    #[test]
     fn a_filtered_relation_does_not_take_over_the_unfiltered_tab() {
         // The invariant this tier changes: following a key cannot clobber what
         // the relation's own tab was showing.
-        let open = [(7u64, "public", "customers", "")];
+        let open = [(7u64, None, "public", "customers", "")];
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "public",
                 "customers",
                 r#""id" = '42'"#
@@ -4178,10 +4214,11 @@ mod tests {
 
     #[test]
     fn two_schemas_can_hold_a_relation_of_the_same_name_and_filter() {
-        let open = [(7u64, "public", "customers", r#""id" = '42'"#)];
+        let open = [(7u64, None, "public", "customers", r#""id" = '42'"#)];
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "archive",
                 "customers",
                 r#""id" = '42'"#

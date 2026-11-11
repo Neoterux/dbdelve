@@ -75,7 +75,16 @@ impl Workspace {
                 .objects
                 .iter()
                 .filter(|tab| matches!(tab.body, ObjectBody::Structure { .. }) == structure)
-                .map(|tab| (tab.id, tab.schema.as_str(), tab.name.as_str(), tab.filter())),
+                .map(|tab| {
+                    (
+                        tab.id,
+                        tab.database.as_deref(),
+                        tab.schema.as_str(),
+                        tab.name.as_str(),
+                        tab.filter(),
+                    )
+                }),
+            None,
             &schema,
             &name,
             opened.filter(),
@@ -160,6 +169,7 @@ impl Workspace {
             schema,
             name,
             kind,
+            database: None,
             body,
         });
         // See `new_query`'s own `place_last`. A session restored at launch
