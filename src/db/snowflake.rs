@@ -2638,6 +2638,41 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_run_sends_its_own_schema_and_never_the_sessions() {
+        let mock = Mock::start();
+        let sql = "SELECT 1 AS one, NULL AS nothing, '' AS blank, DATE '2024-02-29' AS leap";
+        mock.answer(sql, "query");
+        let session = connected(&mock).on_database("OTHER_DB");
+        session.set_schema(Some("Archive"));
+        let session = crate::db::Connection::Snowflake(session);
+        for schema in [Some("Sales EU"), None] {
+            session
+                .query_bound(schema, sql, &CancelToken::default(), Fetch::default())
+                .expect("runs");
+        }
+
+        let sent = mock
+            .requests()
+            .iter()
+            .filter(|request| request.body["statement"] == sql)
+            .map(|request| {
+                (
+                    request.body["database"].clone(),
+                    request.body["schema"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent,
+            [
+                (json!("OTHER_DB"), json!(r#""Sales EU""#)),
+                (json!("OTHER_DB"), json!(null)),
+            ],
+            "the tab's schema, or none, and not the one the session had picked"
+        );
+    }
+
+    #[test]
     fn a_statement_still_running_is_polled_until_it_finishes() {
         let mock = Mock::start();
         let sql = "SELECT 1 AS one, NULL AS nothing, '' AS blank, DATE '2024-02-29' AS leap";

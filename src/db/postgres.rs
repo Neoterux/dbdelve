@@ -3354,6 +3354,82 @@ mod tests {
 
     #[test]
     #[ignore = "requires the compose databases"]
+    fn live_two_tabs_on_one_session_each_run_in_their_own_schema() {
+        let plain = Connection::open(&live_config()).expect("connection should open");
+        let clean = || {
+            plain
+                .query(
+                    "DROP SCHEMA IF EXISTS dbdelve_bound_a CASCADE; \
+                     DROP SCHEMA IF EXISTS dbdelve_bound_b CASCADE",
+                    Fetch::default(),
+                )
+                .expect("the probe schemas should drop");
+        };
+        clean();
+        plain
+            .query(
+                "CREATE SCHEMA dbdelve_bound_a; CREATE SCHEMA dbdelve_bound_b; \
+                 CREATE TABLE dbdelve_bound_a.t (which text); \
+                 CREATE TABLE dbdelve_bound_b.t (which text); \
+                 INSERT INTO dbdelve_bound_a.t VALUES ('a'); \
+                 INSERT INTO dbdelve_bound_b.t VALUES ('b')",
+                Fetch::default(),
+            )
+            .expect("the probe tables should be created");
+
+        let session = super::super::Connection::Postgres(plain.clone())
+            .on_database(&live_config().database)
+            .expect("a session should open");
+        let cancel = crate::db::CancelToken::default();
+        let answer = |schema: Option<&str>, sql: &str| {
+            let result = session.query_bound(schema, sql, &cancel, Fetch::default());
+            result
+                .ok()
+                .and_then(|result| result.rows.first()?.get(0).map(str::to_string))
+        };
+        // One session, two tabs, run in turn: each in its own schema.
+        for _ in 0..2 {
+            assert_eq!(
+                answer(Some("dbdelve_bound_a"), "SELECT which FROM t"),
+                Some("a".into())
+            );
+            assert_eq!(
+                answer(Some("dbdelve_bound_b"), "SELECT which FROM t"),
+                Some("b".into())
+            );
+        }
+        // A tab that binds no schema starts from the session's default, not
+        // from where the last tab left it.
+        let path = answer(None, "SHOW search_path").expect("the search_path reads");
+        assert!(!path.contains("dbdelve_bound"), "{path}");
+
+        // Inside a transaction the schema cannot be moved: the statement is
+        // not sent, and the transaction can still be ended.
+        let refused = session
+            .query("BEGIN", &cancel, Fetch::default())
+            .and_then(|_| {
+                session.query_bound(
+                    Some("dbdelve_bound_a"),
+                    "SELECT 1",
+                    &cancel,
+                    Fetch::default(),
+                )
+            })
+            .expect_err("the schema cannot be switched inside a transaction");
+        assert!(
+            refused.message.starts_with("The statement was not sent"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(refused.position, None);
+        session
+            .query("ROLLBACK", &cancel, Fetch::default())
+            .expect("a statement that ends the transaction goes as it is");
+        clean();
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
     fn live_the_side_session_sizes_opens_is_read_only() {
         let plain = Connection::open(&live_config()).expect("connection should open");
         plain

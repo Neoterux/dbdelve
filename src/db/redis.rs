@@ -2498,6 +2498,45 @@ mod tests {
 
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_REDIS_URL"]
+    fn live_a_bound_run_selects_its_database_again() {
+        const KEY: &str = "dbdelve_bound_probe";
+        let first = live();
+        let other = Connection::open(&ServerConfig {
+            database: "db1".into(),
+            ..live_config()
+        })
+        .unwrap();
+        let clean = || {
+            ran(&first, &format!("DEL {KEY}"));
+            ran(&other, &format!("DEL {KEY}"));
+        };
+        clean();
+
+        let session = first.on_database("db1").expect("the session should open");
+        // Redis refuses a `SELECT` in a user's text, so the session is moved
+        // the way a script could, under the driver's own client.
+        {
+            let mut held = lock(&session.session);
+            let live = held.as_mut().expect("the session is dialled");
+            ::redis::cmd("SELECT")
+                .arg(0)
+                .query::<()>(&mut live.client)
+                .expect("the session moves");
+        }
+        let cancel = crate::db::CancelToken::default();
+        let session = crate::db::Connection::Redis(session);
+        let exists = |connection: &Connection| cells(&ran(connection, &format!("EXISTS {KEY}")));
+
+        session
+            .query_bound(None, &format!("SET {KEY} 1"), &cancel, Fetch::default())
+            .expect("the bound run goes through");
+        assert_eq!(exists(&other), [some(&["1"])], "written into database 1");
+        assert_eq!(exists(&first), [some(&["0"])], "and not into database 0");
+        clean();
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_REDIS_URL"]
     fn live_the_development_database_is_fully_seeded() {
         let connection = live();
         assert_eq!(cells(&ran(&connection, "DBSIZE")), [some(&["214"])]);
