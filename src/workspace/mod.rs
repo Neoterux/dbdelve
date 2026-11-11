@@ -24,6 +24,7 @@ mod objects;
 mod profiles;
 mod projects;
 mod queries;
+mod sidebar;
 mod tabs;
 mod transactions;
 mod welcome;
@@ -378,6 +379,8 @@ pub(crate) struct Workspace {
     /// Around the sidebar's tree, whose own handle the library keeps to
     /// itself: what tells an `escape` in the tree from one anywhere else.
     pub(crate) explorer_focus: FocusHandle,
+    /// Complex mode's tree: every connection under its project.
+    pub(crate) connections: sidebar::ConnectionsSidebar,
     /// The dialogs' own, so `enter` answers the one in front instead of
     /// editing the buffer or the grid it covers.
     pub(crate) dialog_focus: FocusHandle,
@@ -546,6 +549,7 @@ impl Workspace {
             opacity_input,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
+            connections: sidebar::ConnectionsSidebar::new(cx),
             dialog_focus: cx.focus_handle(),
             dialog_in_front: std::cell::Cell::default(),
             dialog_choice: std::cell::Cell::default(),
