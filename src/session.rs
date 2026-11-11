@@ -298,6 +298,14 @@ impl Profile {
             })
     }
 
+    /// The connection a Cancel for `tab` is sent over: the session its
+    /// statement runs on, which for a bound tab is not the profile's own. What
+    /// MongoDB keeps of a running statement, and ClickHouse's fallback, is on
+    /// that session and nowhere else.
+    pub(crate) fn connection_to_stop(&self, tab: Tab) -> Option<Connection> {
+        self.connection_for(tab).existing().cloned()
+    }
+
     /// Where a run of `tab` goes. See [`Profile::route`].
     pub(crate) fn connection_for(&self, tab: Tab) -> Routed {
         self.route(self.binding_of(tab))
