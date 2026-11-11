@@ -11,15 +11,17 @@ use super::*;
 use crate::session::BOUND_TRANSACTION;
 
 impl Workspace {
-    /// Whether the tab these controls would run in is bound, which says so and
-    /// sends nothing: they act on the connection's own session, and a bound
-    /// tab runs on its database's. A control with no query tab in front opens
-    /// an ordinary one, which is unbound.
+    /// Whether the tab in front is bound, which says so and sends nothing: these
+    /// controls act on the connection's own session, and a bound tab, query or
+    /// object, runs on its database's. It is the predicate the status bar draws
+    /// its controls by (`render_transaction`), so the bar and the action cannot
+    /// disagree. An unbound object tab in front still has a control open an
+    /// ordinary query tab (`run_in_buffer`).
     fn refused_on_bound_tab(&mut self, cx: &mut Context<Self>) -> bool {
         let bound = self
             .profile()
-            .and_then(|profile| profile.session.active_query_tab())
-            .is_some_and(|tab| tab.binding.is_some());
+            .and_then(|profile| profile.binding_of(profile.session.active))
+            .is_some();
         if bound {
             self.note(BOUND_TRANSACTION.into(), cx);
         }

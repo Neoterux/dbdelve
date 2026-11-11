@@ -115,9 +115,12 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   in a bound tab is reset, not rewritten: the binding stays what the tab was
   opened for, the run's notice says `The next run in this tab starts again on
   {database}.` (`Binding::label`), and the next run puts the session back
-  there. Toggle Auto-commit, Commit and Roll Back are refused on a bound tab
-  with `BOUND_TRANSACTION` and send nothing, because they act on the
-  connection's own session. A bound session is auto-commit and its tabs never
+  there. Toggle Auto-commit, Commit and Roll Back are refused on a bound tab,
+  query or object, with `BOUND_TRANSACTION` and send nothing, because they act
+  on the connection's own session; `Profile::binding_of` decides it, the same
+  predicate the status bar reads. A bound tab's status bar draws no controls
+  but also reports the connection's own session: `Connection: Manual` and the
+  `Transaction open` indicator. A bound session is auto-commit and its tabs never
   run reads at once (`ponytail:` upgrade: a session of the tab's own, which
   would also give a tab its own transaction and queue). A bound tab completes
   from the profile's own catalog (`ponytail:` upgrade: a provider per
