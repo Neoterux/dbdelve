@@ -1097,9 +1097,24 @@ impl Connection {
         })
     }
 
-    /// RED stub: shares state like `alongside`.
-    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
-        self.alongside()
+    /// A session on `database`, for the (connection, database) pair: a new
+    /// connection from this one's live server config -- its resolved password
+    /// and its route -- with the database replaced and no schema picked, which
+    /// that database may not have. It is not [`Self::alongside`], which shares
+    /// `server` and `side`: a schema picked here would move the first's, and
+    /// a size read would run on the first's side session. It is not warmed, so
+    /// the side session opens only when a sizes read asks for it. It carries
+    /// the read-only hold only if the config it was built from did; the
+    /// caller applies the rest.
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        Self::connect(
+            &ServerConfig {
+                database: database.to_string(),
+                schema: None,
+                ..self.server()
+            },
+            self.route.clone(),
+        )
     }
 
     /// A poisoned mutex counts: every later statement would fail on it too.
