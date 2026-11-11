@@ -423,6 +423,8 @@ pub(crate) enum NodeAction {
     CopyName(String),
     ShowDdl,
     Refresh,
+    /// Choose which of the server's databases the connection lists.
+    FilterDatabases,
 }
 
 /// What a node of `kind` named `name` offers, in the order its menu lists
@@ -431,6 +433,12 @@ pub(crate) enum NodeAction {
 pub(crate) fn node_actions(kind: NodeKind, name: &str, target: Target) -> Vec<NodeAction> {
     let copy = NodeAction::CopyName(name.to_string());
     match kind {
+        NodeKind::Connection if target.levels() != Levels::Flat => vec![
+            NodeAction::NewQueryHere,
+            copy,
+            NodeAction::Refresh,
+            NodeAction::FilterDatabases,
+        ],
         NodeKind::Connection | NodeKind::Database | NodeKind::Schema => {
             vec![NodeAction::NewQueryHere, copy, NodeAction::Refresh]
         }
@@ -451,6 +459,7 @@ impl NodeAction {
             NodeAction::CopyName(_) => "Copy Name",
             NodeAction::ShowDdl => "Show DDL",
             NodeAction::Refresh => "Refresh",
+            NodeAction::FilterDatabases => "Filter Databases",
         }
     }
 }

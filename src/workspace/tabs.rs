@@ -1027,6 +1027,9 @@ impl Workspace {
         if self.close_ddl_view(cx) {
             return;
         }
+        if self.close_filter_picker(cx) {
+            return;
+        }
         if self.close_agent_audit(cx) {
             return;
         }

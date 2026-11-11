@@ -1063,7 +1063,9 @@ impl Workspace {
                     .is_some_and(|pending| pending.every_row.is_ok());
                 if all { 3 } else { 2 }
             }
-            Some("import-rows") | None => 0,
+            // Forms with fields and a list of their own, which Tab moves the
+            // keyboard through and whose buttons act through their own handlers.
+            Some("import-rows" | "filter-picker") | None => 0,
             // Deny alone: Approve is click-only and never a stop.
             Some("agent-approval") => 1,
             Some("agent-audit") => 1,
