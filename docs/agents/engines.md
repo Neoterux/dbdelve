@@ -327,6 +327,16 @@ Decided, and not to be re-litigated:
   `Catalog::by_name` is the display order. Until `Routines::Loaded`, a stored
   routine tab stays pending rather than being resolved against a catalog that
   cannot have it yet.
+- **Sequences are their own kind, read in the second half.** They are never a
+  relation, so no preview, DROP, TRUNCATE, insert or import path can reach one.
+  `Connection::routines` reads them only where `Abilities.lists_sequences` is
+  set (DuckDB so far, from `duckdb_sequences()` for the current database
+  alone), joins them into the routines catalog with `Catalog::join_sequences`,
+  and `Catalog::merge` carries both onto the schema on screen, so a slow or
+  missing sequence catalog never holds back the relations. A schema holding only
+  sequences arrives in that half and is appended like a routines-only one. A
+  sequence read that fails lists none and leaves the routines. The agent reads
+  `Connection::catalog` alone, the first half, so it never sees a sequence.
 - **Snowflake's catalog needs a running warehouse.** It is read through
   `INFORMATION_SCHEMA`, so connecting resumes a suspended warehouse and so does
   opening a Structure tab. That view has nothing naming the columns of a key,
