@@ -2301,6 +2301,27 @@ mod tests {
     }
 
     #[test]
+    fn the_table_a_bound_reads_name_is_resolved_in_the_database_it_was_put_back_in() {
+        let mock = Mock::start();
+        let connection = open(&mock);
+        numbers(&mock);
+        bound(&connection, "SELECT n FROM t").unwrap();
+        // Another tab's `USE` could land between the statement and the read
+        // that says where `t` was read from, on a session they share.
+        let order: Vec<&str> = mock
+            .requests()
+            .iter()
+            .filter_map(|request| match request.statement.as_str() {
+                statement if statement.starts_with("USE") => Some("USE"),
+                statement if statement.starts_with("SELECT currentDatabase") => Some("resolve"),
+                "SELECT n FROM t" => Some("statement"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["USE", "statement", "USE", "resolve"]);
+    }
+
+    #[test]
     fn a_bound_run_that_cannot_put_its_database_back_says_nothing_was_sent() {
         let mock = Mock::start();
         let connection = open(&mock);
