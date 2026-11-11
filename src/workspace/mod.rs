@@ -2566,21 +2566,39 @@ impl Render for Workspace {
 /// What the `Show DDL` dialog shows, and which object it was asked about: the
 /// answer lands only while the view still names the same request.
 pub(crate) struct DdlView {
-    /// The connection the object belongs to, by id.
+    /// The connection the object belongs to, by id; of several, the one acted
+    /// on last.
     pub(crate) profile: String,
     /// The object's database when it is not the connection's own.
     pub(crate) database: Option<String>,
     pub(crate) schema: String,
     pub(crate) name: String,
-    /// What a relation is, `None` for an object with no columns: only a
-    /// relation is offered a [`DiagramState`] to toggle to.
+    /// What a relation is, `None` for an object with no columns, and for
+    /// several objects: only one relation is offered a [`DiagramState`] to
+    /// toggle to.
     pub(crate) kind: Option<RelationKind>,
-    pub(crate) title: String,
-    pub(crate) text: DdlText,
+    /// One definition for one object, one per object for several.
+    pub(crate) sections: Vec<DdlSection>,
     /// Read the first time it is chosen, not with the definition.
     pub(crate) diagram: Option<DiagramState>,
     pub(crate) showing_diagram: bool,
     pub(crate) request: u64,
+}
+
+impl DdlView {
+    /// What the dialog's header says: the object's, or how many it lists.
+    pub(crate) fn heading(&self) -> String {
+        match self.sections.as_slice() {
+            [only] => only.title.clone(),
+            sections => format!("{} definitions", sections.len()),
+        }
+    }
+}
+
+/// One object's definition in the dialog, under its name.
+pub(crate) struct DdlSection {
+    pub(crate) title: String,
+    pub(crate) text: DdlText,
 }
 
 /// The diagram as the dialog has it.

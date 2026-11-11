@@ -897,8 +897,10 @@ impl Workspace {
                 ObjectKind::Relation(kind) => Some(kind),
                 ObjectKind::Routine(_) | ObjectKind::Sequence => None,
             },
-            title,
-            text: DdlText::Loading,
+            sections: vec![DdlSection {
+                title,
+                text: DdlText::Loading,
+            }],
             diagram: None,
             showing_diagram: false,
             request,
@@ -921,7 +923,7 @@ impl Workspace {
                     else {
                         return;
                     };
-                    view.text = match result {
+                    view.sections[0].text = match result {
                         Ok(ddl) => DdlText::Ready(ddl),
                         Err(error) => {
                             DdlText::Failed(format!("Could not read the definition: {error}"))
@@ -1060,13 +1062,34 @@ impl Workspace {
         true
     }
 
-    /// Put the shown definition on the clipboard. Nothing when there is none
-    /// to put there: still loading, failed, or empty.
+    /// Put the shown definitions on the clipboard, a blank line between them.
+    /// Nothing when there is none to put there: still loading, failed, or
+    /// empty.
     pub(crate) fn copy_shown_ddl(&mut self, cx: &mut Context<Self>) {
-        let Some(DdlView {
-            text: DdlText::Ready(text),
-            ..
-        }) = self.ddl_view_in_front()
+        let Some(view) = self.ddl_view_in_front() else {
+            return;
+        };
+        let ready: Vec<&str> = view
+            .sections
+            .iter()
+            .filter_map(|section| match &section.text {
+                DdlText::Ready(text) if !text.is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if ready.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(ready.join("\n\n")));
+        self.confirm("Copied the CREATE statement.".into(), cx);
+    }
+
+    /// Put one of the listed definitions on the clipboard.
+    pub(crate) fn copy_ddl_section(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Some(DdlText::Ready(text)) = self
+            .ddl_view_in_front()
+            .and_then(|view| view.sections.get(at))
+            .map(|section| &section.text)
         else {
             return;
         };
