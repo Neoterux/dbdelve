@@ -2054,7 +2054,11 @@ impl Connection {
                 ..fetch
             };
             match self {
+                Self::Postgres(connection) => connection.query_bound(schema, sql, fetch),
+                Self::MySql(connection) => connection.query_bound(sql, fetch),
                 Self::DuckDb(connection) => connection.query_bound(schema, sql, fetch),
+                Self::Redis(connection) => connection.query_bound(sql, fetch),
+                Self::Snowflake(connection) => connection.query_bound(schema, sql, cancel, fetch),
                 _ => self.query(sql, cancel, fetch),
             }
         })
@@ -2062,8 +2066,9 @@ impl Connection {
 
     /// [`Connection::generated`] for a tab bound to this session's database:
     /// where that is [`Connection::query`] (Postgres, MySQL, MariaDB and
-    /// DuckDB) it is [`Connection::query_bound`], and every other engine's
-    /// own statement already names where it goes. An edit applied from a bound
+    /// DuckDB) it is [`Connection::query_bound`], Redis's is put back on its
+    /// database too, and every other engine's own statement already names
+    /// where it goes. An edit applied from a bound
     /// tab's grid writes to the database the rows came from, whichever way the
     /// session has been moved since.
     pub fn generated_bound(
@@ -2079,6 +2084,14 @@ impl Connection {
                 schema,
                 sql,
                 cancel,
+                Fetch {
+                    feed,
+                    limit,
+                    ..Fetch::default()
+                },
+            ),
+            Self::Redis(connection) => connection.generated_bound(
+                sql,
                 Fetch {
                     feed,
                     limit,

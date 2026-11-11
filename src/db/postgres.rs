@@ -636,6 +636,18 @@ fn set_search_path(client: &mut Client, schema: &str) -> Result<(), DbError> {
     }
 }
 
+/// The session's own `search_path` again, as the role, database or server set
+/// it: where a session opened with no schema picked starts.
+fn reset_search_path(client: &mut Client) -> Result<(), DbError> {
+    let reset = "RESET search_path";
+    let Client { client, driver, .. } = client;
+    driver
+        .block_on(client.simple_query(reset))
+        .and_then(|done| done)
+        .map(|_| ())
+        .map_err(|error| query_error(&error, reset))
+}
+
 /// The server's own name, which TLS verifies, dialled at the tunnel's address
 /// through `hostaddr`, which the certificate check never sees.
 /// An empty `dbname` would have the server pick the user's name, often a
@@ -1167,7 +1179,35 @@ impl Connection {
     /// dropped, so the statement runs to completion exactly as typed. Kept
     /// rows go to `feed` when there is one; see [`super::Connection::query`].
     pub fn query(&self, sql: &str, fetch: Fetch) -> Result<QueryResult, DbError> {
-        let result = self.run(sql, true, fetch);
+        self.query_as(sql, fetch, None)
+    }
+
+    /// [`Self::query`] for a tab bound to this session's database: `schema`
+    /// goes first on the `search_path`, or the session's own default is put
+    /// back where the tab binds none, before the statement and under the lock
+    /// that runs it. A statement of another tab, or one of the user's own,
+    /// may have moved it since, and two tabs bound to different schemas of one
+    /// database share this session, so applying and running as two
+    /// acquisitions would let one run in the other's schema.
+    ///
+    /// Inside a transaction block the `search_path` cannot be moved
+    /// ([`set_search_path`]), and the statement is not sent.
+    pub fn query_bound(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        fetch: Fetch,
+    ) -> Result<QueryResult, DbError> {
+        self.query_as(sql, fetch, Some(schema))
+    }
+
+    fn query_as(
+        &self,
+        sql: &str,
+        fetch: Fetch,
+        bound: Option<Option<&str>>,
+    ) -> Result<QueryResult, DbError> {
+        let result = self.run(sql, true, fetch, bound);
         if let Some(feed) = fetch.feed {
             feed.release();
         }
@@ -1177,15 +1217,28 @@ impl Connection {
     /// dbdelve's own SQL. Its column types are never shown, so it does not pay
     /// for the extra round trip that learns them.
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
-        self.run(sql, false, Fetch::default())
+        self.run(sql, false, Fetch::default(), None)
     }
 
-    fn run(&self, sql: &str, typed: bool, fetch: Fetch) -> Result<QueryResult, DbError> {
+    /// `bound` is the schema to put the session back on first, itself `None`
+    /// for its own default, when the run is a bound tab's.
+    fn run(
+        &self,
+        sql: &str,
+        typed: bool,
+        fetch: Fetch,
+        bound: Option<Option<&str>>,
+    ) -> Result<QueryResult, DbError> {
         let mut client = self.client.lock().map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
         })?;
         fetch.hold()?;
+        match bound {
+            Some(Some(schema)) => set_search_path(&mut client, schema).map_err(super::unplaced)?,
+            Some(None) => reset_search_path(&mut client).map_err(super::unplaced)?,
+            None => {}
+        }
 
         // Timed from here, not from the call: one client serialises a profile's
         // queries, and time spent waiting behind the catalog load is not time
@@ -1204,7 +1257,13 @@ impl Connection {
                 .map_err(failed)?
                 .map_err(failed)?,
         );
-        if typed && let Some(feed) = fetch.feed {
+        // Not for a run in a schema of a tab's: the side session lacks that
+        // `search_path` and would type streamed rows from another table of
+        // the same name. They are typed once the statement is done instead.
+        if typed
+            && !matches!(bound, Some(Some(_)))
+            && let Some(feed) = fetch.feed
+        {
             self.describe_aside(sql, feed);
         }
         let mut assembly = Assembly::new(sql, fetch, started);

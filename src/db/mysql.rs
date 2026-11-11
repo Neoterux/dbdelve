@@ -543,13 +543,24 @@ impl Connection {
     /// rows are read off the socket as they come, so one past the limit is
     /// dropped as soon as it is counted.
     pub fn query(&self, sql: &str, fetch: Fetch) -> Result<QueryResult, DbError> {
-        self.run(sql, true, fetch)
+        self.run(sql, true, fetch, false)
+    }
+
+    /// [`Self::query`] for a tab bound to this session's database, which is
+    /// the one it was opened on ([`Self::on_database`]): the session is put
+    /// back on it, by the driver's own call and not a `USE`, before the
+    /// statement and under the lock that runs it. A `USE` of the user's, in
+    /// this tab or another bound to the same database, may have moved it
+    /// since, and applying and running as two acquisitions would let a run
+    /// land in the other's database.
+    pub fn query_bound(&self, sql: &str, fetch: Fetch) -> Result<QueryResult, DbError> {
+        self.run(sql, true, fetch, true)
     }
 
     /// dbdelve's own SQL. Its rows are never editable, so it does not pay for the
     /// round trip that reads a primary key.
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
-        self.run(sql, false, Fetch::default())
+        self.run(sql, false, Fetch::default(), false)
     }
 
     /// `ask` on the side session, opened if there is none. A failure is taken
@@ -597,12 +608,24 @@ impl Connection {
         }) == Some(true)
     }
 
-    fn run(&self, sql: &str, editable: bool, fetch: Fetch) -> Result<QueryResult, DbError> {
+    /// `bound` puts the session back on its own database first.
+    fn run(
+        &self,
+        sql: &str,
+        editable: bool,
+        fetch: Fetch,
+        bound: bool,
+    ) -> Result<QueryResult, DbError> {
         let mut connection = self.connection.lock().map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
         })?;
         fetch.hold()?;
+        if bound {
+            connection
+                .select_db(&self.server.database)
+                .map_err(|error| super::unplaced(query_error(&error)))?;
+        }
 
         let mut result = QueryResult::default();
         let mut probed = Vec::new();
