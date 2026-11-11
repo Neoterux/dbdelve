@@ -14288,8 +14288,7 @@ fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
 fn last_statement(text: &str) -> String {
     text.split(';')
         .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .next_back()
+        .rfind(|statement| !statement.is_empty())
         .unwrap_or_default()
         .to_string()
 }
