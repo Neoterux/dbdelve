@@ -8,7 +8,10 @@
 //! reads a catalog nor sees a window, so what a row says is what the caller
 //! had already been told.
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use gpui_component::tree::TreeItem;
 
@@ -432,6 +435,78 @@ pub(crate) struct SelectedNode {
     /// The schema an object is in.
     pub(crate) schema: Option<String>,
     pub(crate) leaf: Option<ExplorerLeaf>,
+}
+
+/// The rows of the connections tree the user has selected, by row id, in the
+/// order they were picked. The tree selects one row of its own; this is the
+/// set a modifier click builds around it, and `anchor` is where a Shift-click
+/// range starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub(crate) rows: Vec<String>,
+    pub(crate) anchor: Option<String>,
+}
+
+impl Selection {
+    /// A plain click: the row is the whole selection.
+    pub(crate) fn click(&mut self, id: &str) {
+        _ = id;
+    }
+
+    /// A Cmd- or Ctrl-click: the row joins the selection, or leaves it.
+    pub(crate) fn toggle(&mut self, id: &str) {
+        _ = id;
+    }
+
+    /// A Shift-click: every row of `visible` from the anchor to `id`. With no
+    /// anchor, or one that is not showing, it is a plain click.
+    pub(crate) fn extend_to(&mut self, id: &str, visible: &[String]) {
+        _ = (id, visible);
+    }
+
+    /// Forget the rows a rebuild no longer lists.
+    pub(crate) fn retain(&mut self, present: &HashSet<String>) {
+        _ = present;
+    }
+}
+
+/// What a selection of several rows offers, from its menu and the palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionAction {
+    OpenAll,
+    CopyNames,
+    CopyDdl,
+    ShowDdl,
+    Pin,
+    Refresh,
+}
+
+impl SelectionAction {
+    /// What a menu and the palette call it.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SelectionAction::OpenAll => "Open All",
+            SelectionAction::CopyNames => "Copy Names",
+            SelectionAction::CopyDdl => "Copy DDL",
+            SelectionAction::ShowDdl => "Show DDL",
+            SelectionAction::Pin => "Pin",
+            SelectionAction::Refresh => "Refresh",
+        }
+    }
+}
+
+/// What every one of `items` offers, in the order the menu lists it: an action
+/// that does not apply to all of them is left out.
+pub(crate) fn selection_actions(items: &[(NodeKind, Target)]) -> Vec<SelectionAction> {
+    _ = items;
+    Vec::new()
+}
+
+/// What the selection's menu says it holds: `3 tables selected`, or `3 items
+/// selected` when the rows are not all one kind.
+pub(crate) fn selection_header(kinds: &[NodeKind]) -> String {
+    _ = kinds;
+    String::new()
 }
 
 /// The rows, and what each stands for, by row id.
@@ -2226,6 +2301,62 @@ mod tests {
             node_actions(NodeKind::Sequence, "s", Target::built_in(Engine::Redis)),
             [NodeAction::CopyName("s".into())],
             "a target with no definition to write offers none to show"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_selects_one_a_modifier_click_toggles_and_shift_extends() {
+        let ids = |rows: &[&str]| rows.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let mut selection = Selection::default();
+        selection.click("x");
+        assert_eq!(selection.rows, ids(&["x"]));
+        selection.toggle("y");
+        assert_eq!(selection.rows, ids(&["x", "y"]), "a toggle adds a row");
+        selection.toggle("x");
+        assert_eq!(selection.rows, ids(&["y"]), "and takes one away again");
+        selection.click("z");
+        assert_eq!(
+            selection.rows,
+            ids(&["z"]),
+            "a plain click is the whole selection"
+        );
+
+        let visible = ids(&["r1", "r2", "r3", "r4"]);
+        selection.click("r1");
+        selection.extend_to("r3", &visible);
+        assert_eq!(selection.rows, ids(&["r1", "r2", "r3"]));
+        selection.extend_to("r2", &visible);
+        assert_eq!(
+            selection.rows,
+            ids(&["r1", "r2"]),
+            "a range is always from the anchor, which a Shift-click does not move"
+        );
+        let mut backwards = Selection::default();
+        backwards.click("r4");
+        backwards.extend_to("r2", &visible);
+        assert_eq!(backwards.rows, ids(&["r2", "r3", "r4"]));
+
+        let mut lost = Selection::default();
+        lost.extend_to("r2", &visible);
+        assert_eq!(lost.rows, ids(&["r2"]), "no anchor: a plain click");
+        lost.click("gone");
+        lost.extend_to("r3", &visible);
+        assert_eq!(
+            lost.rows,
+            ids(&["r3"]),
+            "an anchor that is not showing: a plain click"
+        );
+
+        let mut kept = Selection::default();
+        kept.click("r1");
+        kept.toggle("r2");
+        kept.toggle("r3");
+        let present: HashSet<String> = ids(&["r2", "r3", "r4"]).into_iter().collect();
+        kept.retain(&present);
+        assert_eq!(
+            kept.rows,
+            ids(&["r2", "r3"]),
+            "a row that is gone drops out"
         );
     }
 }
