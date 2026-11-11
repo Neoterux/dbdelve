@@ -13551,7 +13551,7 @@ fn an_edit_is_refused_while_a_transaction_is_open_on_its_databases_session(
         new_query_here(&workspace, cx, Some("other"), None);
         match apply_insert_from_the_front_tab(&workspace, cx) {
             QueryState::Failed(error) => assert!(
-                error.message.contains("transaction") && error.message.contains("not sent"),
+                error.message.contains("Not sent") && error.message.contains("transaction"),
                 "{}",
                 error.message
             ),
