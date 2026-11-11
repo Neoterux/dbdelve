@@ -2188,7 +2188,11 @@ impl Connection {
     /// [`Catalog::merge`] to fold into the one already on screen.
     pub fn routines(&self) -> Result<Catalog, DbError> {
         match self {
-            Self::Postgres(connection) => connection.routines(),
+            Self::Postgres(connection) => {
+                with_sequences(Engine::Postgres, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::MySql(connection) => connection.routines(),
             Self::SqlServer(connection) => connection.routines(),
             Self::Sqlite(connection) => connection.routines(),

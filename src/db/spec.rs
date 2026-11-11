@@ -1075,6 +1075,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         copies_ddl: true,
         switches_database: true,
         picks_schema: true,
+        lists_sequences: true,
         schema_switch_waits_for_transaction: true,
         ..Abilities::NONE
     },
@@ -1265,6 +1266,7 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         copies_ddl: true,
         switches_database: true,
         catalog_lists_databases: true,
+        lists_sequences: true,
         ..Abilities::NONE
     },
     hooks: Hooks {
@@ -1634,6 +1636,7 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
         copies_ddl: true,
         switches_database: true,
         picks_schema: true,
+        lists_sequences: true,
         // An exact `ROW_COUNT` per table, where the others' numbers are as of
         // the last time statistics were gathered, and SQLite keeps none.
         exact_row_estimates: true,
@@ -1751,6 +1754,7 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
         assigns_default: true,
         copies_ddl: true,
         switches_database: true,
+        lists_sequences: true,
         // No `picks_schema`: the default schema is the login's.
         ..Abilities::NONE
     },

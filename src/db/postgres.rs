@@ -20,9 +20,9 @@ use super::ssh::{self, Bridged, SocketBridge, Tunnel, tunnelled};
 use super::{
     Catalog, Column, DbError, EditTarget, Engine, Feed, Fetch, QueryResult, Reference,
     RelationKind, Row, RowBuilder, ServerConfig, Sizes, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sizes,
-    assemble_structure, create_table, non_utf8_error, optional_cell, plain_error, required_cell,
-    terminated,
+    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
+    assemble_sizes, assemble_structure, create_table, non_utf8_error, optional_cell, plain_error,
+    required_cell, terminated,
 };
 
 mod pgpass;
@@ -151,6 +151,17 @@ SELECT
     ELSE parent.row_estimate
     END AS row_estimate
 FROM sized AS parent
+";
+
+// The names alone: a sequence's current value is null without USAGE or SELECT
+// on it, and a listing has no use for it.
+const SEQUENCES_SQL: &str = "
+SELECT schemaname AS schema_name,
+       sequencename AS sequence_name
+FROM pg_catalog.pg_sequences
+WHERE schemaname <> 'information_schema'
+    AND schemaname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY 1, 2
 ";
 
 const ROUTINES_SQL: &str = "
@@ -1368,6 +1379,10 @@ impl Connection {
 
     pub fn routines(&self) -> Result<Catalog, DbError> {
         assemble_catalog(QueryResult::default(), self.internal_query(ROUTINES_SQL)?)
+    }
+
+    pub fn sequences(&self) -> Result<Catalog, DbError> {
+        assemble_sequences(self.internal_query(SEQUENCES_SQL)?)
     }
 
     /// On a connection of its own, opened exactly as this one was, so a size
