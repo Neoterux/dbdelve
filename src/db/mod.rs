@@ -2356,7 +2356,7 @@ impl Connection {
             Self::Turso(connection) => connection.catalog(),
             Self::DuckDb(connection) => connection.catalog(),
             Self::Snowflake(connection) => connection.catalog(),
-            Self::ClickHouse(connection) => connection.catalog(),
+            Self::ClickHouse(connection) => connection.catalog(shown),
             Self::MongoDb(connection) => connection.catalog(),
             Self::Redis(connection) => connection.catalog(),
             Self::External(connection) => connection.catalog(),

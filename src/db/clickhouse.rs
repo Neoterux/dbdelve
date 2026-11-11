@@ -34,7 +34,7 @@ use self::tsv::{Framed, Next, Reader, Untagged, is_cut};
 use super::ssh::tunnelled;
 use super::{
     CancelToken, Cancelling, Catalog, Column, Databases, DbError, EditTarget, Engine, Fetch,
-    QueryResult, RelationKind, RowBuilder, ServerConfig, Stopped, Structure, UpdateSpelling,
+    QueryResult, RelationKind, RowBuilder, ServerConfig, Shown, Stopped, Structure, UpdateSpelling,
     assemble_catalog, assemble_databases, assemble_structure, plain_error, required_cell,
     terminated,
 };
@@ -103,10 +103,24 @@ SELECT
     total_bytes AS size_bytes,
     total_rows AS row_estimate
 FROM system.tables
-WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema'){only}
     AND NOT is_temporary
     AND NOT startsWith(name, '.inner')
 ORDER BY database, name";
+
+/// [`RELATIONS_SQL`] over the server-listed databases a filter matched, or all
+/// of them for `None`. Each name is quoted by the engine and the pattern a
+/// person typed never gets here.
+fn relations_sql(names: Option<&[String]>) -> String {
+    let only = names.map_or_else(String::new, |names| {
+        let quoted = names
+            .iter()
+            .map(|name| Engine::ClickHouse.quote_literal(name))
+            .collect::<Vec<_>>();
+        format!("\n    AND database IN ({})", quoted.join(", "))
+    });
+    RELATIONS_SQL.replace("{only}", &only)
+}
 
 // The structure queries name one relation, so they carry `{schema}` and
 // `{relation}` placeholders substituted by `structure_sql`.
@@ -751,8 +765,29 @@ impl Connection {
         })
     }
 
-    pub fn catalog(&self) -> Result<Catalog, DbError> {
-        assemble_catalog(self.internal_query(RELATIONS_SQL)?, QueryResult::default())
+    /// Only the matched databases are asked about; the listing is read here,
+    /// in the read's own closure, so the statement carries names the server
+    /// just gave. ClickHouse would accept an empty `IN`, but a match of nothing
+    /// sends no statement on any engine.
+    pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
+        let matched = if shown.narrows_catalog() {
+            shown.matched_databases(&self.databases()?, Engine::ClickHouse)
+        } else {
+            None
+        };
+        let names = matched.as_ref().map(|(names, _)| names.as_slice());
+        let left_out = matched.as_ref().map_or(0, |(_, left_out)| *left_out);
+        if names.is_some_and(<[String]>::is_empty) {
+            return Ok(Catalog {
+                left_out,
+                ..Catalog::default()
+            });
+        }
+        let relations = self.internal_query(&relations_sql(names))?;
+        Ok(Catalog {
+            left_out,
+            ..assemble_catalog(relations, QueryResult::default())?
+        })
     }
 
     pub fn databases(&self) -> Result<Databases, DbError> {
