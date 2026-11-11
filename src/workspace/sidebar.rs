@@ -43,14 +43,21 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) shortcuts: Arc<HashMap<String, Shortcut>>,
     /// How many rows each folder row holds, by row id.
     pub(crate) counts: Arc<HashMap<String, usize>>,
+    /// What the tree is narrowed by.
+    pub(crate) filter: Entity<InputState>,
+    /// The folds the tree had when the first key was typed, which come back
+    /// when the field is cleared: while text is in it every kept row is open.
+    pub(crate) folds_before_filter: Option<HashMap<String, bool>>,
     /// The group the last build was made for, which `None` outer says is no
     /// build yet. A build for another group opens that one.
     group: Option<Option<String>>,
 }
 
 impl ConnectionsSidebar {
-    pub(crate) fn new(cx: &mut Context<Workspace>) -> Self {
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let tree = cx.new(|cx| TreeState::new(cx));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter connections and objects…"));
         // The tree emits `Expanded` for a click, `enter` and an arrow, and
         // also for every ancestor a reveal opens, so what listens must be
         // happy to hear it twice (`expand_node`).
@@ -66,6 +73,8 @@ impl ConnectionsSidebar {
             highlights: Arc::default(),
             shortcuts: Arc::default(),
             counts: Arc::default(),
+            filter,
+            folds_before_filter: None,
             group: None,
         }
     }
@@ -123,6 +132,7 @@ impl Workspace {
             &folds,
             self.listing_scope(),
             current.as_deref(),
+            "",
         );
         self.connections.group = Some(current);
         let front = self

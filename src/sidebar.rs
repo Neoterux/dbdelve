@@ -190,6 +190,19 @@ fn length_prefixed(text: &str) -> Option<(&str, &str)> {
     Some((name, rest.get(name.len()..)?))
 }
 
+/// Whether `filter` keeps a connection's rows whole, because it matches the
+/// connection's name or its database's: what a name matches takes its rows
+/// with it, as a schema's name does in simple mode.
+pub(crate) fn keeps_rows_whole(
+    filter: &str,
+    name: &str,
+    levels: Levels,
+    database: Option<&str>,
+) -> bool {
+    let _ = (filter, name, levels, database);
+    false
+}
+
 /// The database the catalog's rows sit under in the tree, if its shape draws
 /// one over them.
 fn catalog_database(levels: Levels, database: Option<&str>) -> Option<&str> {
@@ -298,7 +311,9 @@ pub(crate) fn build(
     folds: &HashMap<String, bool>,
     scope: ListingScope,
     current: Option<&str>,
+    filter: &str,
 ) -> SidebarTree {
+    let _ = filter;
     let mut tree = SidebarTree::default();
     // One bucket per project, and the first for the connections in none. A
     // connection a second project also names stays under the first, as it
@@ -563,6 +578,10 @@ mod tests {
         listed(id, id, Content::Unloaded)
     }
 
+    fn unloaded_named<'a>(id: &'a str, name: &'a str) -> Listed<'a> {
+        listed(id, name, Content::Unloaded)
+    }
+
     /// `main.birds`, as SQLite lists it.
     fn birds() -> ExplorerTree {
         explorer::tree(
@@ -620,7 +639,7 @@ mod tests {
         listed: Vec<Listed<'_>>,
         folds: &HashMap<String, bool>,
     ) -> SidebarTree {
-        super::build(projects, listed, folds, ListingScope::All, None)
+        super::build(projects, listed, folds, ListingScope::All, None, "")
     }
 
     #[test]
@@ -1260,6 +1279,156 @@ mod tests {
         );
     }
 
+    fn filtered(projects: &[StoredProject], listed: Vec<Listed<'_>>, filter: &str) -> SidebarTree {
+        super::build(
+            projects,
+            listed,
+            &HashMap::new(),
+            ListingScope::All,
+            None,
+            filter,
+        )
+    }
+
+    /// The rows of a catalog holding `names` as tables, narrowed by `filter` as
+    /// the caller narrows a connection's.
+    fn tables(names: &[&str], filter: &str) -> ExplorerTree {
+        explorer::tree(
+            &Catalog {
+                schemas: vec![schema(
+                    "main",
+                    names
+                        .iter()
+                        .map(|name| relation(name, RelationKind::Table, None))
+                        .collect(),
+                )],
+                database: None,
+            },
+            filter,
+        )
+    }
+
+    #[test]
+    fn a_filter_keeps_connections_whose_loaded_rows_or_name_match() {
+        let tree = filtered(
+            &[],
+            vec![
+                listed("a", "Zoo", Content::Loaded(tables(&["birds"], "bir"))),
+                listed("b", "Pond", Content::Loaded(tables(&["fish"], "bir"))),
+            ],
+            "bir",
+        );
+
+        assert_eq!(row_ids(&tree.items), [connection_row("a")]);
+        let zoo = find(&tree.items, &connection_row("a"));
+        assert!(zoo.is_expanded());
+        let schema = find(&tree.items, &scoped_row("a", None, "schema-main"));
+        let category = find(&tree.items, &scoped_row("a", None, "category-Tables-main"));
+        assert!(schema.is_expanded() && category.is_expanded());
+        let birds = scoped_row("a", None, &explorer::relation_row("main", "birds"));
+        assert!(search(&category.children, &birds).is_some());
+        assert!(tree.highlights.contains_key(&birds));
+
+        // A name that matches keeps the connection with every row it has,
+        // which the caller reads whole.
+        let name = "Birdhouse";
+        assert!(keeps_rows_whole("bir", name, Levels::Flat, None));
+        assert!(!keeps_rows_whole("bir", "Pond", Levels::Flat, None));
+        let tree = filtered(
+            &[],
+            vec![
+                listed("c", name, Content::Loaded(tables(&["fish", "eel"], ""))),
+                listed("b", "Pond", Content::Loaded(tables(&["fish"], "bir"))),
+            ],
+            "bir",
+        );
+        assert_eq!(row_ids(&tree.items), [connection_row("c")]);
+        let fish = scoped_row("c", None, &explorer::relation_row("main", "fish"));
+        assert!(search(&tree.items, &fish).is_some());
+        assert!(tree.highlights.contains_key(&connection_row("c")));
+    }
+
+    #[test]
+    fn an_unloaded_connection_is_kept_only_by_its_name_and_stays_folded() {
+        let open = HashMap::from([(connection_row("u"), true)]);
+        let with = |filter: &str| {
+            super::build(
+                &[],
+                vec![unloaded_named("u", "Flocks")],
+                &open,
+                ListingScope::All,
+                None,
+                filter,
+            )
+        };
+
+        assert!(with("bir").items.is_empty());
+        let kept = with("flo");
+        let row = find(&kept.items, &connection_row("u"));
+        assert!(!row.is_expanded());
+        assert_eq!(row.children.len(), 1);
+        assert_eq!(row.children[0].label.as_str(), LOADING);
+        assert!(kept.highlights.contains_key(&connection_row("u")));
+        // No text keeps every connection, as before.
+        assert_eq!(with("").items.len(), 1);
+    }
+
+    #[test]
+    fn while_filtering_counts_are_of_the_rows_kept() {
+        let table_count = |filter: &str| {
+            let tree = filtered(
+                &[],
+                vec![listed(
+                    "a",
+                    "Zoo",
+                    Content::Loaded(tables(&["birds", "bison", "fish"], filter)),
+                )],
+                filter,
+            );
+            count_of(&tree, &scoped_row("a", None, "category-Tables-main"))
+        };
+
+        assert_eq!(table_count("bi"), Some(2));
+        assert_eq!(table_count(""), Some(3));
+    }
+
+    #[test]
+    fn the_filter_highlights_the_matched_characters_of_connection_and_database_names() {
+        let content = || tables(&["fish"], "");
+        let zoo = project("Birdy", &["a"]);
+        let tree = filtered(
+            &[zoo],
+            vec![database_listed(
+                "a",
+                content(),
+                Levels::DatabaseThenSchema,
+                "birds_db",
+            )],
+            "bird",
+        );
+
+        // Each name the filter matched is lit where it matched, and keeps what
+        // is under it.
+        for id in [project_row("Birdy"), database_row("a", "birds_db")] {
+            assert_eq!(tree.highlights.get(&id), Some(&vec![0..4]), "{id}");
+        }
+        assert!(search(&tree.items, &database_row("a", "birds_db")).is_some());
+        // The connection's own name did not match, so only its rows do.
+        assert!(!tree.highlights.contains_key(&connection_row("a")));
+        assert!(keeps_rows_whole(
+            "bird",
+            "a",
+            Levels::DatabaseThenSchema,
+            Some("birds_db")
+        ));
+        assert!(!keeps_rows_whole(
+            "bird",
+            "a",
+            Levels::Flat,
+            Some("birds_db")
+        ));
+    }
+
     #[test]
     fn an_idle_connection_is_folded_whatever_its_stored_fold_says() {
         let folds = HashMap::from([(connection_row("a"), true)]);
@@ -1374,6 +1543,7 @@ mod tests {
                 &HashMap::new(),
                 ListingScope::Current,
                 current,
+                "",
             )
         };
 
@@ -1396,6 +1566,7 @@ mod tests {
                 folds,
                 ListingScope::All,
                 current,
+                "",
             );
             find(&tree.items, row).is_expanded()
         };
