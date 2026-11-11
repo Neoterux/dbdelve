@@ -1277,7 +1277,7 @@ mod tests {
                 SettingId::Keybinding("sort_active_column"),
             ]
         );
-        assert_eq!(found("!keyboard").len(), 16);
+        assert_eq!(found("!keyboard").len(), 19);
     }
 
     #[test]
