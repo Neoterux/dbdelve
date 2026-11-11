@@ -14439,6 +14439,84 @@ fn the_auto_prompt_leaves_auto_off_when_its_commit_is_not_sent(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn the_auto_prompt_rolls_back_or_cancels_and_cancelling_changes_nothing(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (8)");
+        let before = (
+            buffer(&workspace, cx),
+            transaction_state(&workspace, cx),
+            open_transaction_statements(&workspace, cx),
+        );
+        assert_eq!((before.1.0, before.1.1), (false, true));
+
+        let unchanged = |cx: &mut VisualTestContext, how: &str| {
+            assert_eq!(
+                front_dialog(&workspace, cx),
+                None,
+                "{how}: the dialog closes"
+            );
+            assert_eq!(
+                (
+                    buffer(&workspace, cx),
+                    transaction_state(&workspace, cx),
+                    open_transaction_statements(&workspace, cx)
+                ),
+                before,
+                "{how}: nothing changed"
+            );
+            assert_eq!(
+                drawn(cx, &["transaction-open"]),
+                [true],
+                "{how}: the transaction is still open"
+            );
+        };
+
+        click_selector(cx, "auto-commit-auto");
+        click_selector(cx, "end-transaction-2");
+        unchanged(cx, "Cancel");
+
+        click_selector(cx, "auto-commit-auto");
+        press(cx, "escape");
+        unchanged(cx, "Escape");
+
+        click_selector(cx, "auto-commit-auto");
+        press(cx, "enter");
+        unchanged(cx, "Enter on the opening ring");
+
+        // A chord, so it is dispatched as one.
+        cx.dispatch_action(crate::actions::ToggleAutoCommit);
+        settle(cx);
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("end-transaction"),
+            "the chord asks too"
+        );
+        click_selector(cx, "end-transaction-2");
+        unchanged(cx, "Cancel after the chord");
+
+        click_selector(cx, "auto-commit-auto");
+        click_selector(cx, "end-transaction-1");
+        assert_eq!(front_dialog(&workspace, cx), None, "Roll back closes it");
+        assert_eq!(
+            last_statement(&buffer(&workspace, cx)),
+            "ROLLBACK",
+            "a bare ROLLBACK, with no BEGIN after it"
+        );
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(auto_commit && !open, "Roll back: Auto, nothing open");
+        assert!(open_transaction_statements(&workspace, cx).is_empty());
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("0"),
+            "the INSERT was discarded"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_use_in_a_bound_tab_is_undone_before_its_next_run(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
