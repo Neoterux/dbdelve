@@ -1124,6 +1124,8 @@ fn front_profile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> S
 
 /// Two SQLite profiles over one file holding `birds`, `b` in the Zoo project.
 fn two_connections(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    // Left alone, CI's live job puts a connection from `PG*` among these.
+    crate::IGNORE_ENVIRONMENT.set(true);
     launch_connections(
         cx,
         "create table birds (name text);",
@@ -1276,6 +1278,7 @@ fn an_object_row_of_a_connection_behind_opens_on_that_connection(cx: &mut TestAp
 #[gpui::test]
 fn a_connect_that_fails_stays_on_its_own_row(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
         let (workspace, cx) = launch_connections(
             cx,
             "create table birds (name text);",
@@ -1299,9 +1302,12 @@ fn a_connect_that_fails_stays_on_its_own_row(cx: &mut TestAppContext) {
         let at = connections_row(&workspace, cx, &c).unwrap();
         click_connections_row(cx, at);
 
-        let failure = workspace.read_with(cx, |workspace, _| match &workspace.profiles[2].state {
-            ProfileState::Failed(message) => message.clone(),
-            _ => panic!("the connect did not fail"),
+        let failure = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profiles.iter().find(|profile| profile.id == "c");
+            match profile.map(|profile| &profile.state) {
+                Some(ProfileState::Failed(message)) => message.clone(),
+                _ => panic!("the connect did not fail"),
+            }
         });
         assert_eq!(
             connections_item(&workspace, cx, &c),
