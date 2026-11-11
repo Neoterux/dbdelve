@@ -627,6 +627,17 @@ impl Workspace {
         .detach();
     }
 
+    /// Open the `Show DDL` dialog over `schema.relation` of `database`.
+    pub(crate) fn show_ddl(
+        &mut self,
+        _database: Option<String>,
+        _schema: String,
+        _relation: String,
+        _kind: RelationKind,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     pub(crate) fn load_structure(
         &mut self,
         id: u64,

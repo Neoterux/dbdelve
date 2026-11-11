@@ -402,6 +402,13 @@ pub(crate) struct Workspace {
     /// Whether the `Agent activity` dialog is up. Only the popover's item
     /// opens it and only its own close and `escape` end it.
     pub(crate) agent_audit_open: bool,
+    /// The `Show DDL` dialog: one object's definition, read-only. Only the
+    /// relation menu's Show DDL opens it and only its own Close and `escape`
+    /// end it.
+    pub(crate) ddl_view: Option<DdlView>,
+    /// Numbers each Show DDL read, so an answer that comes back after the
+    /// dialog was closed, or put up for another object, is not drawn.
+    pub(crate) last_ddl_request: u64,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -578,6 +585,8 @@ impl Workspace {
             agent_visibility_prompt: None,
             agent_visibility_blocks_commits: false,
             agent_audit_open: false,
+            ddl_view: None,
+            last_ddl_request: 0,
             agent: agent::AgentState::default(),
             opacity_input,
             #[cfg(test)]
@@ -2547,6 +2556,29 @@ impl Render for Workspace {
             .children(self.palette.clone())
             .children(self.render_reference_popup(cx))
     }
+}
+
+/// What the `Show DDL` dialog shows, and which object it was asked about: the
+/// answer lands only while the view still names the same request.
+pub(crate) struct DdlView {
+    /// The connection the object belongs to, by id.
+    pub(crate) profile: String,
+    /// The object's database when it is not the connection's own.
+    pub(crate) database: Option<String>,
+    pub(crate) schema: String,
+    pub(crate) name: String,
+    pub(crate) kind: RelationKind,
+    pub(crate) title: String,
+    pub(crate) text: DdlText,
+    pub(crate) request: u64,
+}
+
+/// The definition as the dialog has it.
+pub(crate) enum DdlText {
+    Loading,
+    /// Empty when the server returned no definition.
+    Ready(String),
+    Failed(String),
 }
 
 /// A relation a reference arrow lists, by its index into the structure's
