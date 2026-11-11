@@ -2469,6 +2469,258 @@ mod tests {
         assert!(row.children[0].is_disabled());
     }
 
+    /// `tree` as built from a catalog the filter dropped `left_out` of.
+    fn left_out(tree: ExplorerTree, left_out: usize) -> ExplorerTree {
+        ExplorerTree { left_out, ..tree }
+    }
+
+    fn schemas(names: &[&str]) -> Vec<Schema> {
+        names.iter().map(|name| schema(name, Vec::new())).collect()
+    }
+
+    #[test]
+    fn the_filtered_empty_line_names_how_many_the_filter_hides() {
+        assert_eq!(
+            empty_catalog_line(Levels::DatabaseIsSchema, 0),
+            "No database objects found."
+        );
+        assert_eq!(
+            empty_catalog_line(Levels::DatabaseIsSchema, 37),
+            "No database objects shown: the filter hides 37 databases."
+        );
+        assert_eq!(
+            empty_catalog_line(Levels::DatabaseHoldsObjects, 1),
+            "No database objects shown: the filter hides 1 database."
+        );
+        assert_eq!(
+            empty_catalog_line(Levels::DatabaseThenSchema, 2),
+            "No database objects shown: the filter hides 2 schemas."
+        );
+        assert!(empty_catalog_line(Levels::DatabaseThenSchema, 1).ends_with("1 schema."));
+    }
+
+    #[test]
+    fn a_connection_the_filter_emptied_says_so_in_its_notice_row() {
+        let emptied = |hidden: usize| {
+            let listed = Listed {
+                levels: Levels::DatabaseIsSchema,
+                ..listed(
+                    "a",
+                    "a",
+                    Content::Loaded(left_out(ExplorerTree::default(), hidden)),
+                )
+            };
+            let tree = build(&[], vec![listed], &opened([connection_row("a")]));
+            let row = find(&tree.items, &connection_row("a"));
+            assert_eq!(row.children.len(), 1);
+            assert!(row.children[0].is_disabled());
+            (
+                row.children[0].label.to_string(),
+                count_of(&tree, &connection_row("a")),
+                tree.totals.get(&connection_row("a")).copied(),
+            )
+        };
+        assert_eq!(
+            emptied(37),
+            (
+                empty_catalog_line(Levels::DatabaseIsSchema, 37),
+                Some(0),
+                Some(37)
+            )
+        );
+        assert_eq!(
+            emptied(0),
+            ("No database objects found.".to_string(), Some(0), None)
+        );
+    }
+
+    #[test]
+    fn a_connection_count_carries_its_total_only_when_the_filter_left_a_database_out() {
+        let total = |levels: Levels, hidden: usize| {
+            let listed = Listed {
+                databases_left_out: hidden,
+                ..with_others(levels, "d", vec![("other".into(), Content::Unloaded)])
+            };
+            let tree = build(&[], vec![listed], &opened([connection_row("a")]));
+            (
+                count_of(&tree, &connection_row("a")),
+                tree.totals.get(&connection_row("a")).copied(),
+            )
+        };
+        assert_eq!(total(Levels::DatabaseThenSchema, 3), (Some(2), Some(5)));
+        assert_eq!(total(Levels::DatabaseThenSchema, 0), (Some(2), None));
+        assert_eq!(total(Levels::Flat, 3), (None, None));
+    }
+
+    #[test]
+    fn a_connection_count_drops_its_total_while_the_search_box_has_text() {
+        let listed = Listed {
+            databases_left_out: 3,
+            ..with_others(
+                Levels::DatabaseThenSchema,
+                "d",
+                vec![("other".into(), Content::Unloaded)],
+            )
+        };
+        let tree = super::build(
+            &[],
+            vec![listed],
+            &opened([connection_row("a")]),
+            ListingScope::All,
+            None,
+            "a",
+        );
+        assert!(search(&tree.items, &connection_row("a")).is_some());
+        assert!(tree.totals.is_empty());
+    }
+
+    #[test]
+    fn a_count_reads_shown_of_total_from_counts_alone() {
+        assert_eq!(count_label(4, Some(38)), "4 of 38");
+        assert_eq!(count_label(0, Some(38)), "0 of 38");
+        assert_eq!(count_label(38, None), "38");
+
+        let counted = |names: [String; 2]| {
+            let listed = Listed {
+                databases_left_out: 3,
+                ..with_others(
+                    Levels::DatabaseThenSchema,
+                    "d",
+                    names
+                        .into_iter()
+                        .map(|name| (name, Content::Unloaded))
+                        .collect(),
+                )
+            };
+            let tree = build(&[], vec![listed], &opened([connection_row("a")]));
+            (
+                count_of(&tree, &connection_row("a")),
+                tree.totals.get(&connection_row("a")).copied(),
+            )
+        };
+        assert_eq!(
+            counted(["x".repeat(200), "ü日本語".repeat(40)]),
+            counted(["p".into(), "q".into()])
+        );
+    }
+
+    #[test]
+    fn a_database_row_says_how_many_of_its_schemas_it_shows() {
+        let listed = || Listed {
+            databases: vec![(
+                "other".into(),
+                Content::Loaded(left_out(content_of(schemas(&["main"])), 1)),
+            )],
+            ..database_listed(
+                "a",
+                left_out(content_of(schemas(&["main", "extra"])), 3),
+                Levels::DatabaseThenSchema,
+                "d",
+            )
+        };
+        let (own, other) = (database_row("a", "d"), database_row("a", "other"));
+        let tree = build(&[], vec![listed()], &opened([connection_row("a")]));
+        assert_eq!(tree.totals.get(&own), Some(&5));
+        assert_eq!(tree.totals.get(&other), Some(&2));
+
+        let tree = super::build(
+            &[],
+            vec![listed()],
+            &opened([connection_row("a")]),
+            ListingScope::All,
+            None,
+            "a",
+        );
+        assert!(tree.totals.is_empty());
+    }
+
+    #[test]
+    fn where_schemas_are_databases_the_connection_says_how_many_it_shows() {
+        let listed = Listed {
+            levels: Levels::DatabaseIsSchema,
+            ..listed(
+                "a",
+                "a",
+                Content::Loaded(left_out(content_of(schemas(&["a1", "a2", "a3", "a4"])), 34)),
+            )
+        };
+        let tree = build(&[], vec![listed], &opened([connection_row("a")]));
+        assert_eq!(count_of(&tree, &connection_row("a")), Some(4));
+        assert_eq!(tree.totals.get(&connection_row("a")), Some(&38));
+    }
+
+    #[test]
+    fn the_totals_add_up_to_the_rows_drawn_and_the_rows_left_out() {
+        let loaded = |names: &[&str], hidden: usize| {
+            Content::Loaded(left_out(content_of(schemas(names)), hidden))
+        };
+        // Each case: the connection as listed, and every row that may carry
+        // a total with what the filter left out of it.
+        let cases = [
+            (
+                Levels::DatabaseIsSchema,
+                Listed {
+                    levels: Levels::DatabaseIsSchema,
+                    ..listed("a", "a", loaded(&["main", "other"], 5))
+                },
+                vec![(connection_row("a"), 5)],
+            ),
+            (
+                Levels::DatabaseThenSchema,
+                Listed {
+                    databases: vec![("other".into(), loaded(&["main"], 1))],
+                    databases_left_out: 4,
+                    ..database_listed(
+                        "a",
+                        left_out(content_of(schemas(&["main", "extra"])), 3),
+                        Levels::DatabaseThenSchema,
+                        "d",
+                    )
+                },
+                vec![
+                    (connection_row("a"), 4),
+                    (database_row("a", "d"), 3),
+                    (database_row("a", "other"), 1),
+                ],
+            ),
+            (
+                Levels::DatabaseHoldsObjects,
+                Listed {
+                    levels: Levels::DatabaseHoldsObjects,
+                    databases: vec![("other".into(), loaded(&["other"], 0))],
+                    databases_left_out: 4,
+                    ..listed("a", "a", loaded(&["d"], 0))
+                },
+                vec![(connection_row("a"), 4)],
+            ),
+        ];
+        for (levels, listed, fed) in cases {
+            let tree = build(&[], vec![listed], &opened([connection_row("a")]));
+            let mut totals: Vec<_> = tree.totals.keys().cloned().collect();
+            let mut expected: Vec<_> = fed.iter().map(|(row, _)| row.clone()).collect();
+            totals.sort();
+            expected.sort();
+            assert_eq!(totals, expected, "{levels:?}");
+            for (row, left_out) in fed {
+                let count = count_of(&tree, &row).expect("a counted row");
+                assert_eq!(tree.totals[&row], count + left_out, "{levels:?}: {row}");
+            }
+        }
+        // A kept row is one of the shown, never also one left out: the own
+        // database's two schemas are its count whatever the filter hid.
+        let tree = build(
+            &[],
+            vec![database_listed(
+                "a",
+                left_out(content_of(schemas(&["main", "extra"])), 3),
+                Levels::DatabaseThenSchema,
+                "d",
+            )],
+            &opened([connection_row("a")]),
+        );
+        assert_eq!(count_of(&tree, &database_row("a", "d")), Some(2));
+    }
+
     #[test]
     fn rows_under_a_connection_start_folded_and_keep_the_folds_they_are_given() {
         let schema = scoped_row("a", None, "schema-main");
