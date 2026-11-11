@@ -94,7 +94,13 @@ where the user can read it:
   `START TRANSACTION`). So while `Profile::in_transaction` is set, an edit on
   the connection's own session is written without brackets
   (`sql::update_batch_joining`) and joins the open transaction, committed or
-  rolled back with it, as a single-statement edit always has. A bracketed
+  rolled back with it, as a single-statement edit always has. That batch is
+  not all-or-nothing: where a failed statement leaves the transaction open
+  (SQLite, MySQL, MariaDB, SQL Server without `XACT_ABORT`), one that fails
+  partway leaves the rows before the failure inside it, and the error says so.
+  Postgres aborts the transaction instead. dbdelve writes no `SAVEPOINT` to
+  undo them, because a savepoint alone undoes nothing without a statement to
+  follow it, and the gate admits none. A bracketed
   batch that still reaches the run (written before the transaction opened) is
   not sent: `Profile::own_write_refusal` says `Not sent: …`, in the way
   `Profile::bound_write_refusal` does for a bound session. So is the reverse, a

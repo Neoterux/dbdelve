@@ -2379,6 +2379,7 @@ impl Workspace {
         // An edit dbdelve applies on the connection's own session runs inside
         // the user's open transaction and is committed or rolled back with it,
         // so the prompt that ends it lists it. Its reads stay out.
+        let mut joined_batch = false;
         if generated
             && edit
             && binding.is_none()
@@ -2386,6 +2387,12 @@ impl Workspace {
             && let Some(profile) = self.issued_to(&id, generation)
         {
             profile.record_sent(&sql, None);
+            // Without brackets of its own it is not all-or-nothing: on an
+            // engine where a failed statement leaves the transaction open,
+            // the rows before the failure stay in it.
+            joined_batch = profile.in_transaction
+                && engine.transaction_start().is_some()
+                && sql::Buffer::for_engine(engine, &sql).statements().len() > 1;
         }
         // A plan is never cut short: its rows are the plan, not data.
         let limit = match tab {
@@ -2930,6 +2937,13 @@ impl Workspace {
                                 error.position = error
                                     .position
                                     .and_then(|position| position.checked_sub(prefix));
+                                if joined_batch {
+                                    error.message.push_str(
+                                        " Rows of the batch before the failed one were applied \
+                                         inside the open transaction and stay in it, to be \
+                                         committed or rolled back with it.",
+                                    );
+                                }
                                 *state = match restored {
                                     Some(previous) if cancelled => previous,
                                     _ => QueryState::Failed(error),
