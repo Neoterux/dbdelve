@@ -2254,6 +2254,9 @@ impl Render for Workspace {
             .flex_col()
             .child(div().flex_1().min_h_0().child(views::render_main_content(
                 profile,
+                &self.profiles,
+                self.view_mode(),
+                self.settings.color_titlebar,
                 self.editor_size(),
                 (self.chrome_zoom, self.editor_zoom, self.grid_zoom),
                 &self.row_panel,
