@@ -2198,8 +2198,7 @@ mod tests {
         );
         assert_eq!(
             on(NodeKind::Sequence, Engine::Postgres),
-            [copy()],
-            "a sequence's definition is a later plan's"
+            [copy(), NodeAction::ShowDdl]
         );
         assert_eq!(
             on(NodeKind::Routine, Engine::Postgres),
@@ -2212,5 +2211,19 @@ mod tests {
                 "{kind:?} has no definition of its own"
             );
         }
+    }
+
+    #[test]
+    fn a_sequence_offers_copy_name_and_show_ddl() {
+        use crate::db::Engine;
+        assert_eq!(
+            node_actions(NodeKind::Sequence, "s", Target::built_in(Engine::DuckDb)),
+            [NodeAction::CopyName("s".into()), NodeAction::ShowDdl]
+        );
+        assert_eq!(
+            node_actions(NodeKind::Sequence, "s", Target::built_in(Engine::Redis)),
+            [NodeAction::CopyName("s".into())],
+            "a target with no definition to write offers none to show"
+        );
     }
 }

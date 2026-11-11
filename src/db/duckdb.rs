@@ -495,6 +495,12 @@ impl Connection {
         assemble_sequences(result)
     }
 
+    /// The CREATE statement of `schema.name`, read as the server writes it.
+    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        let _ = (schema, name);
+        Err(plain_error("not yet".into()))
+    }
+
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
         let (schema_literal, relation_literal) = (
             Engine::DuckDb.quote_literal(schema),
@@ -1345,6 +1351,43 @@ mod tests {
             connection.query(setup, Fetch::default()).expect("setup");
         }
         connection
+    }
+
+    #[test]
+    fn a_sequences_ddl_is_its_create_statement() {
+        let connection = memory("CREATE SEQUENCE ticket START 5 INCREMENT 2;");
+        let ddl = connection
+            .sequence_ddl("main", "ticket")
+            .expect("the definition is read");
+        assert!(ddl.starts_with("CREATE SEQUENCE"), "{ddl}");
+        assert!(ddl.contains("ticket"), "{ddl}");
+        assert!(ddl.contains('5') && ddl.contains('2'), "{ddl}");
+    }
+
+    #[test]
+    fn a_sequences_ddl_does_not_move_with_its_counter() {
+        let connection = memory("CREATE SEQUENCE ticket START 5 INCREMENT 2;");
+        let before = connection.sequence_ddl("main", "ticket").unwrap();
+        connection
+            .query(
+                "SELECT nextval('ticket'); SELECT nextval('ticket');",
+                Fetch::default(),
+            )
+            .expect("the counter moves");
+        assert_eq!(
+            connection.sequence_ddl("main", "ticket").unwrap(),
+            before,
+            "the definition carries no current value"
+        );
+    }
+
+    #[test]
+    fn a_missing_sequence_has_no_definition() {
+        let connection = memory("");
+        let error = connection
+            .sequence_ddl("main", "nope")
+            .expect_err("there is none");
+        assert!(error.message.contains("nope"), "{}", error.message);
     }
 
     fn sequences_by_schema(catalog: &Catalog) -> Vec<(&str, Vec<&str>)> {

@@ -1517,6 +1517,86 @@ fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppConte
     });
 }
 
+#[gpui::test]
+fn a_sequence_row_opens_nothing_and_shows_its_ddl_from_its_menu(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_duckdb_seeded(cx, "", "", "CREATE SEQUENCE ticket START 5;", "");
+        let click = |id: &str, cx: &mut VisualTestContext| {
+            let at = connections_row(&workspace, cx, id)
+                .unwrap_or_else(|| panic!("{id} is not showing"));
+            click_connections_row(cx, at);
+        };
+        click(&connection_row("e2e"), cx);
+        let database = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .and_then(|profile| profile.active_database())
+                .expect("the connection names its database")
+        });
+        for id in [
+            database_row("e2e", &database),
+            scoped_row("e2e", Some(&database), "schema-main"),
+            scoped_row("e2e", Some(&database), "category-Sequences-main"),
+        ] {
+            click(&id, cx);
+        }
+        let tabs = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().unwrap().session;
+                (session.queries.len(), session.objects.len())
+            })
+        };
+        let before = tabs(&workspace, cx);
+        let row = scoped_row(
+            "e2e",
+            Some(&database),
+            &explorer::sequence_row("main", "ticket"),
+        );
+        click(&row, cx);
+        assert_eq!(tabs(&workspace, cx), before, "a click opens nothing");
+
+        let node = workspace.read_with(cx, |workspace, cx| workspace.selected_node(cx));
+        let node = node.expect("the clicked row is selected");
+        assert_eq!(
+            (node.kind, node.name.as_str(), node.schema.as_deref()),
+            (crate::sidebar::NodeKind::Sequence, "ticket", Some("main"))
+        );
+        let actions = crate::sidebar::node_actions(
+            node.kind,
+            &node.name,
+            crate::db::Target::built_in(Engine::DuckDb),
+        );
+        assert_eq!(actions.len(), 2, "its name and its definition");
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        for action in actions {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.run_node_action(&node, action, window, cx)
+                })
+            });
+            settle(cx);
+        }
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert_eq!(copied, "ticket");
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        let text = ddl_text(&workspace, cx).expect("the dialog holds a definition");
+        assert!(text.starts_with("CREATE SEQUENCE"), "{text}");
+        assert!(text.contains("ticket"), "{text}");
+        assert!(
+            cx.debug_bounds("show-ddl-diagram-choice").is_none(),
+            "a sequence has no columns to draw"
+        );
+        assert_eq!(tabs(&workspace, cx), before, "the dialog is no tab");
+        press(cx, "escape");
+        quit(workspace, cx);
+    });
+}
+
 /// Runs `sql` in the query tab in front, and waits for the answer.
 fn run_in_front(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
     cx.update(|window, cx| {
