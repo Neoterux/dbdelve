@@ -26,8 +26,33 @@ fn mark_rows_stale(profile: &mut Profile) {
     }
 }
 
+/// What `profile` lists in the sidebar under `filter`: its Pinned group and
+/// folders, its saved queries, then the catalog's schemas. Both trees draw
+/// this, so a connection's rows are the same in either.
+pub(super) fn explorer_content(profile: &Profile, filter: &str) -> explorer::ExplorerTree {
+    let catalog = match &profile.catalog {
+        CatalogState::Loaded(catalog, _) => Some(catalog),
+        _ => None,
+    };
+    let mut explorer = explorer::shortcuts(
+        &profile.shortcuts,
+        catalog,
+        &profile.session.saved_queries,
+        &profile.shortcut_database(),
+        filter,
+    );
+    explorer.extend(explorer::queries(&profile.session.saved_queries, filter));
+    if let Some(catalog) = catalog {
+        explorer.extend(build_explorer_tree(catalog, filter));
+    }
+    explorer
+}
+
 impl Workspace {
     pub(crate) fn remember_profiles(&mut self, cx: &mut Context<Self>) {
+        // A connection added, removed, renamed or moved between projects is
+        // saved through here, and the connections tree lists exactly those.
+        self.rebuild_connections(cx);
         // The file we could not read at startup is still the user's, and what
         // this session holds is not what they have -- so it must not flatten
         // it. The notice said nothing would be saved.
@@ -72,6 +97,7 @@ impl Workspace {
             verbose_logging: Some(self.settings.verbose_logging),
             welcomed: Some(self.settings.welcomed),
             agent_access,
+            view_mode: Some(self.settings.view_mode.slug().into()),
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };
@@ -2192,21 +2218,7 @@ impl Workspace {
             return;
         };
         let filter = profile.session.explorer_filter.read(cx).value();
-        let catalog = match &profile.catalog {
-            CatalogState::Loaded(catalog, _) => Some(catalog),
-            _ => None,
-        };
-        let mut explorer = explorer::shortcuts(
-            &profile.shortcuts,
-            catalog,
-            &profile.session.saved_queries,
-            &profile.shortcut_database(),
-            &filter,
-        );
-        explorer.extend(explorer::queries(&profile.session.saved_queries, &filter));
-        if let Some(catalog) = catalog {
-            explorer.extend(build_explorer_tree(catalog, &filter));
-        }
+        let explorer = explorer_content(profile, &filter);
         let front = profile.front_row();
         let tree = profile.session.explorer_tree.clone();
         let (items, selected) = match keep {
@@ -2241,6 +2253,10 @@ impl Workspace {
                 .or_else(|| super::tabs::front_index(tree, front.as_deref(), &shortcuts));
             tree.set_selected_index(row, cx);
         });
+        // Every landing of a catalog, routines, sizes, shortcuts or queries
+        // and every connect starting comes through here, so the connections
+        // tree is rebuilt from the same moments as this one and nowhere else.
+        self.rebuild_connections(cx);
     }
 
     pub(crate) fn activate(&mut self, index: usize, cx: &mut Context<Self>) {

@@ -1054,13 +1054,15 @@ fn connections_row(
     })
 }
 
-/// The row `id` as the tree holds it: whether it is open, and its children's
-/// ids and labels with whether each is disabled.
+/// A row of the connections tree: whether it is open, and its children's ids
+/// and labels with whether each is disabled.
+type ConnectionsItem = (bool, Vec<(String, String, bool)>);
+
 fn connections_item(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
     id: &str,
-) -> Option<(bool, Vec<(String, String, bool)>)> {
+) -> Option<ConnectionsItem> {
     let index = connections_row(workspace, cx, id)?;
     workspace.read_with(cx, |workspace, cx| {
         let item = workspace
@@ -1162,12 +1164,12 @@ fn the_connections_tree_lists_every_connection_under_its_project_and_connects_on
             "an idle connection is folded over one row that is not a spinner"
         );
 
+        let before = workspace.read_with(cx, |workspace, _| workspace.next_generation);
         let at = connections_row(&workspace, cx, &b).unwrap();
-        let selector: &'static str = format!("connections-row-{at}").leak();
-        let bounds = cx.debug_bounds(selector).expect("the row is drawn");
-        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
-        assert_eq!(profile_state(&workspace, cx, "b"), "connecting");
-        settle(cx);
+        click_connections_row(cx, at);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.next_generation, before + 1, "one connect");
+        });
         assert_eq!(profile_state(&workspace, cx, "b"), "connected");
 
         assert!(
@@ -1220,6 +1222,10 @@ fn expanding_a_connection_again_while_it_connects_starts_no_second_connect(
 fn an_object_row_of_a_connection_behind_opens_on_that_connection(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = two_connections(cx);
+        // Tall enough to draw every row of both connections, which a click
+        // needs: the list draws only what is in view.
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
         for id in ["a", "b"] {
             // Opened and let load, the way a person would, one after the other.
             let at = connections_row(&workspace, cx, &connection_row(id)).unwrap();
@@ -1229,7 +1235,10 @@ fn an_object_row_of_a_connection_behind_opens_on_that_connection(cx: &mut TestAp
             let row = scoped_row(id, &explorer::relation_row("main", "birds"));
             workspace.update(cx, |workspace, cx| {
                 workspace.connections.tree.update(cx, |tree, cx| {
-                    tree.reveal_item(&row.clone().into(), gpui::ScrollStrategy::Top, cx);
+                    let row = row.clone().into();
+                    tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
+                    // A reveal alone repaints nothing; selecting does.
+                    tree.set_selected_index(tree.index_of(&row), cx);
                 });
             });
             settle(cx);
