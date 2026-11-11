@@ -13,7 +13,7 @@ use std::{collections::HashMap, ops::Range};
 use gpui_component::tree::TreeItem;
 
 use crate::db::Levels;
-use crate::explorer::{ExplorerLeaf, ExplorerTree, Shortcut, is_schema_row, saved_query};
+use crate::explorer::{Builder, ExplorerLeaf, ExplorerTree, Shortcut, is_schema_row, saved_query};
 use crate::store::StoredProject;
 
 /// Which sidebar the window draws: today's tree for the connection in front,
@@ -199,8 +199,10 @@ pub(crate) fn keeps_rows_whole(
     levels: Levels,
     database: Option<&str>,
 ) -> bool {
-    let _ = (filter, name, levels, database);
-    false
+    let mut builder = Builder::new(filter);
+    builder.name_matches("", name)
+        || catalog_database(levels, database)
+            .is_some_and(|database| builder.name_matches("", database))
 }
 
 /// The database the catalog's rows sit under in the tree, if its shape draws
@@ -305,6 +307,13 @@ pub(crate) const NO_OBJECTS: &str = "No objects";
 /// `folds` is whether each row was open in the tree this one replaces, by
 /// row id, so a rebuild puts the user's folding back. It wins over every
 /// default.
+///
+/// `filter` is what the tree is narrowed by. The rows of a loaded connection
+/// arrive narrowed already; what is left to decide is which names match. A
+/// connection that has not loaded is kept only by its own name, and folded,
+/// since nothing here can load it; a project is kept by its name or by a
+/// connection it kept. While there is text every kept row that has rows under
+/// it is open, so a match is seen, and the counts are of the rows kept.
 pub(crate) fn build(
     projects: &[StoredProject],
     listed: Vec<Listed<'_>>,
@@ -313,8 +322,11 @@ pub(crate) fn build(
     current: Option<&str>,
     filter: &str,
 ) -> SidebarTree {
-    let _ = filter;
     let mut tree = SidebarTree::default();
+    let mut search = Search {
+        builder: Builder::new(filter),
+        filtering: !filter.trim().is_empty(),
+    };
     // One bucket per project, and the first for the connections in none. A
     // connection a second project also names stays under the first, as it
     // does in the palette.
@@ -324,10 +336,11 @@ pub(crate) fn build(
             .iter()
             .position(|project| project.connections.iter().any(|id| id == connection.id))
             .map_or(0, |at| at + 1);
-        buckets[bucket].push(connection_item(&mut tree, connection, folds));
+        buckets[bucket].extend(connection_item(&mut tree, connection, folds, &mut search));
     }
     if projects.is_empty() {
         tree.items = buckets.swap_remove(0);
+        tree.highlights.extend(search.builder.into_highlights());
         return tree;
     }
     if scope == ListingScope::Current {
@@ -335,6 +348,7 @@ pub(crate) fn build(
             .and_then(|name| projects.iter().position(|project| project.name == name))
             .map_or(0, |at| at + 1);
         tree.items = buckets.swap_remove(bucket);
+        tree.highlights.extend(search.builder.into_highlights());
         return tree;
     }
     let current_row = group_row(current);
@@ -343,30 +357,58 @@ pub(crate) fn build(
     // of a project the user made and not of the absence of one.
     let unlisted = buckets.next().unwrap_or_default();
     let groups = (!unlisted.is_empty())
-        .then(|| (NO_PROJECT_ROW.to_string(), "No project", unlisted))
+        .then(|| (NO_PROJECT_ROW.to_string(), "No project", unlisted, false))
         .into_iter()
         .chain(projects.iter().zip(buckets).map(|(project, members)| {
-            (project_row(&project.name), project.name.as_str(), members)
+            (
+                project_row(&project.name),
+                project.name.as_str(),
+                members,
+                true,
+            )
         }));
-    for (id, label, members) in groups {
+    for (id, label, members, named_by_user) in groups {
+        // "No project" is not a name anyone gave, so typing never matches it.
+        let named = named_by_user && search.builder.name_matches(&id, label);
+        if search.filtering && !named && members.is_empty() {
+            continue;
+        }
         tree.nodes.insert(id.clone(), Node::Group);
         tree.counts.insert(id.clone(), members.len());
-        let open = folds.get(&id).copied().unwrap_or(id == current_row);
+        let open = search.filtering || folds.get(&id).copied().unwrap_or(id == current_row);
         tree.items.push(
             TreeItem::new(id, label.to_string())
                 .expanded(open)
                 .children(members),
         );
     }
+    tree.highlights.extend(search.builder.into_highlights());
     tree
 }
 
+/// One search over the names the tree lists.
+struct Search {
+    builder: Builder,
+    /// There is text typed: what it matches is kept, the rest is not.
+    filtering: bool,
+}
+
+/// The connection's row and its own rows, or `None` when the filter keeps
+/// neither its name nor anything it has loaded.
 fn connection_item(
     tree: &mut SidebarTree,
     connection: Listed<'_>,
     folds: &HashMap<String, bool>,
-) -> TreeItem {
+    search: &mut Search,
+) -> Option<TreeItem> {
     let id = connection_row(connection.id);
+    let named = search.builder.name_matches(&id, connection.name);
+    // Without rows of its own to match, only its name can keep a connection.
+    let has_rows =
+        matches!(&connection.content, Content::Loaded(content) if !content.items.is_empty());
+    if search.filtering && !named && !has_rows {
+        return None;
+    }
     tree.nodes.insert(
         id.clone(),
         Node::Connection {
@@ -413,6 +455,7 @@ fn connection_item(
                 highlights,
                 shortcuts,
                 folds,
+                filtering: search.filtering,
             };
             // The Pinned group, the folders and the Queries group stay on the
             // connection; the catalog's rows go under its database.
@@ -433,16 +476,21 @@ fn connection_item(
                         .map(|item| scoped_item(tree, &mut rows, Some(database), item))
                         .collect();
                     let row = database_row(connection.id, database);
-                    tree.nodes.insert(row.clone(), Node::Database);
-                    tree.counts.insert(row.clone(), under.len());
-                    let open = folds.get(&row).copied().unwrap_or(false);
-                    let mut item = TreeItem::new(row.clone(), database.to_string());
-                    item = match under.is_empty() {
-                        true => item.children(vec![empty_row(tree, &row)]),
-                        false => item.children(under),
-                    };
-                    children.push(item.expanded(open));
-                    count = Some(1);
+                    let named = search.builder.name_matches(&row, database);
+                    if !search.filtering || named || !under.is_empty() {
+                        tree.nodes.insert(row.clone(), Node::Database);
+                        tree.counts.insert(row.clone(), under.len());
+                        let open = search.filtering || folds.get(&row).copied().unwrap_or(false);
+                        let mut item = TreeItem::new(row.clone(), database.to_string());
+                        item = match under.is_empty() {
+                            true => item.children(vec![empty_row(tree, &row)]),
+                            false => item.children(under),
+                        };
+                        children.push(item.expanded(open));
+                        count = Some(1);
+                    } else {
+                        count = Some(0);
+                    }
                 }
                 None => {
                     count = counts_databases.then_some(catalog.len());
@@ -453,15 +501,17 @@ fn connection_item(
                     );
                 }
             }
-            (followed, children)
+            (search.filtering || followed, children)
         }
     };
     if let Some(count) = count {
         tree.counts.insert(id.clone(), count);
     }
-    TreeItem::new(id, connection.name.to_string())
-        .expanded(open)
-        .children(children)
+    Some(
+        TreeItem::new(id, connection.name.to_string())
+            .expanded(open)
+            .children(children),
+    )
 }
 
 /// The one row a loaded folder with nothing in it holds, so that it can be
@@ -488,6 +538,8 @@ struct Rows<'a> {
     highlights: HashMap<String, Vec<Range<usize>>>,
     shortcuts: HashMap<String, Shortcut>,
     folds: &'a HashMap<String, bool>,
+    /// There is text typed: every row with rows under it is open.
+    filtering: bool,
 }
 
 /// `item` and everything under it with its id scoped to the connection, and
@@ -541,7 +593,8 @@ fn scoped_item(
     if children.is_empty() && schema {
         children.push(empty_row(tree, &id));
     }
-    let open = !children.is_empty() && rows.folds.get(&id).copied().unwrap_or(false);
+    let open =
+        !children.is_empty() && (rows.filtering || rows.folds.get(&id).copied().unwrap_or(false));
     TreeItem::new(id, label)
         .expanded(open)
         .disabled(disabled)
@@ -1410,7 +1463,12 @@ mod tests {
         // Each name the filter matched is lit where it matched, and keeps what
         // is under it.
         for id in [project_row("Birdy"), database_row("a", "birds_db")] {
-            assert_eq!(tree.highlights.get(&id), Some(&vec![0..4]), "{id}");
+            let lit = tree.highlights.get(&id).expect("the name is lit");
+            assert_eq!(
+                (lit.first().map(|r| r.start), lit.last().map(|r| r.end)),
+                (Some(0), Some(4)),
+                "{id}"
+            );
         }
         assert!(search(&tree.items, &database_row("a", "birds_db")).is_some());
         // The connection's own name did not match, so only its rows do.

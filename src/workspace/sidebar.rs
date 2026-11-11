@@ -58,6 +58,12 @@ impl ConnectionsSidebar {
         let tree = cx.new(|cx| TreeState::new(cx));
         let filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter connections and objects…"));
+        cx.subscribe(&filter, |workspace, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                workspace.rebuild_connections(cx);
+            }
+        })
+        .detach();
         // The tree emits `Expanded` for a click, `enter` and an arrow, and
         // also for every ancestor a reveal opens, so what listens must be
         // happy to hear it twice (`expand_node`).
@@ -96,6 +102,22 @@ impl Workspace {
             .map(|entry| entry.item().clone())
             .collect();
         let mut folds = folds(&roots);
+        // While text is in the filter every kept row is open, so the folds
+        // the user had are kept aside from its first key and come back when
+        // the field is empty. Read on every rebuild: a landing in the
+        // background rebuilds mid-filter, and must not mistake the opened
+        // tree for the user's.
+        let text = self.connections.filter.read(cx).value();
+        let filter = text.trim();
+        match (
+            filter.is_empty(),
+            self.connections.folds_before_filter.take(),
+        ) {
+            (true, Some(before)) => folds = before,
+            (false, None) => self.connections.folds_before_filter = Some(folds.clone()),
+            (false, kept) => self.connections.folds_before_filter = kept,
+            (true, None) => {}
+        }
         // The group in front starts open. What the last build left of its
         // fold is only how it started, so it is let go when the front
         // connection has moved to another group; a fold made in the group
@@ -109,21 +131,38 @@ impl Workspace {
         let listed = self
             .profiles
             .iter()
-            .map(|profile| Listed {
-                id: &profile.id,
-                name: &profile.name,
-                content: match (&profile.state, &profile.catalog) {
-                    (ProfileState::Idle, _) => Content::Unloaded,
-                    (ProfileState::Connecting, _) | (_, CatalogState::Loading) => Content::Loading,
-                    (ProfileState::Failed(message), _) | (_, CatalogState::Failed(message)) => {
-                        Content::Failed(message.clone())
-                    }
-                    (ProfileState::Connected(_), CatalogState::Loaded(..)) => {
-                        Content::Loaded(explorer_content(profile, ""))
-                    }
-                },
-                levels: profile.config.target().levels(),
-                database: profile.active_database(),
+            .map(|profile| {
+                let levels = profile.config.target().levels();
+                let database = profile.active_database();
+                // What the filter matches by name it keeps whole: a connection
+                // or a database named for it lists everything it has.
+                let narrowed = match model::keeps_rows_whole(
+                    filter,
+                    &profile.name,
+                    levels,
+                    database.as_deref(),
+                ) {
+                    true => "",
+                    false => filter,
+                };
+                Listed {
+                    id: &profile.id,
+                    name: &profile.name,
+                    content: match (&profile.state, &profile.catalog) {
+                        (ProfileState::Idle, _) => Content::Unloaded,
+                        (ProfileState::Connecting, _) | (_, CatalogState::Loading) => {
+                            Content::Loading
+                        }
+                        (ProfileState::Failed(message), _) | (_, CatalogState::Failed(message)) => {
+                            Content::Failed(message.clone())
+                        }
+                        (ProfileState::Connected(_), CatalogState::Loaded(..)) => {
+                            Content::Loaded(explorer_content(profile, narrowed))
+                        }
+                    },
+                    levels,
+                    database,
+                }
             })
             .collect();
         let built = model::build(
@@ -132,7 +171,7 @@ impl Workspace {
             &folds,
             self.listing_scope(),
             current.as_deref(),
-            "",
+            filter,
         );
         self.connections.group = Some(current);
         let front = self
@@ -408,14 +447,43 @@ impl Workspace {
                 });
             })
         });
-        div().size_full().flex().flex_col().child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .key_context("Explorer")
-                .track_focus(&self.explorer_focus)
-                .on_action(cx.listener(Self::open_sidebar_item))
-                .child(tree),
-        )
+        let t = *theme(cx);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            // The same quiet filter row simple mode draws over its tree.
+            .child(
+                div()
+                    .w_full()
+                    .h(px(layout::chrome(layout::TAB_HEIGHT)))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .px(px(layout::SPACE_SM))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(row_icon(t, icon::SEARCH))
+                    // Clipped by a box of its own: the input lays its
+                    // placeholder out at its full width.
+                    .child(
+                        div().flex_1().min_w_0().overflow_hidden().child(
+                            Input::new(&self.connections.filter)
+                                .w_full()
+                                .min_w_0()
+                                .appearance(false),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .key_context("Explorer")
+                    .track_focus(&self.explorer_focus)
+                    .on_action(cx.listener(Self::open_sidebar_item))
+                    .child(tree),
+            )
     }
 }

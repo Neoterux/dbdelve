@@ -1478,13 +1478,20 @@ fn typing_in_the_connections_filter_never_connects_or_loads_anything(cx: &mut Te
             click_connections_row(cx, at);
         }
         assert_eq!(profile_state(&workspace, cx, "b"), "idle");
-        let type_in = |text: &str, cx: &mut VisualTestContext| {
-            cx.update(|window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    let filter = workspace.connections.filter.clone();
-                    filter.update(cx, |input, cx| input.set_value(text, window, cx));
-                });
+        // Typed as a person types, into the field with the keyboard: only a
+        // key press tells the tree what it holds.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let filter = workspace.connections.filter.clone();
+                filter.update(cx, |input, cx| input.focus(window, cx));
             });
+        });
+        let type_in = |text: &str, cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes("secondary-a");
+            match text.is_empty() {
+                true => cx.simulate_keystrokes("backspace"),
+                false => cx.simulate_input(text),
+            }
             settle(cx);
         };
         let shown = |cx: &mut VisualTestContext| connections_rows(&workspace, cx);
