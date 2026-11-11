@@ -27,7 +27,7 @@ use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
     db::{
         CancelToken, Catalog, Connection, ConnectionConfig, DbError, ExplainMode, Fetch, IndexKind,
-        QueryResult, RelationKind, Structure,
+        QueryResult, RelationKind, Shown, Structure,
     },
     explain::compact,
     sql::{AgentVerdict, agent_gate},
@@ -1133,7 +1133,7 @@ fn list(
     schema: Option<&str>,
     note: Option<&str>,
 ) -> Result<Option<Listing>, DbError> {
-    let mut catalog = connection.catalog()?;
+    let mut catalog = connection.catalog(&Shown::everything())?;
     let Some(schema) = schema else {
         let rows = catalog.schemas.len();
         let text = schemas_text(&catalog, note);
@@ -1150,7 +1150,7 @@ fn list(
     };
     // The estimate is optional, and the query behind it can need privileges
     // the catalog does not, so a failure here leaves the rows `null`.
-    if let Ok(sizes) = connection.sizes() {
+    if let Ok(sizes) = connection.sizes(&Shown::everything()) {
         catalog.set_sizes(&sizes);
     }
     Ok(tables_text(&catalog, schema, note).map(|text| Listing { text, rows }))
@@ -1164,11 +1164,13 @@ fn describe_on(
     table: &str,
     note: Option<&str>,
 ) -> Ran {
-    let listed = connection.catalog().and_then(|catalog| {
-        describe(&catalog, schema, table, note, |s, t| {
-            connection.structure(s, t)
-        })
-    });
+    let listed = connection
+        .catalog(&Shown::everything())
+        .and_then(|catalog| {
+            describe(&catalog, schema, table, note, |s, t| {
+                connection.structure(s, t)
+            })
+        });
     Ran::Listed {
         connection,
         hidden,
@@ -1771,6 +1773,7 @@ mod tests {
                 ],
             )],
             database: None,
+            ..Default::default()
         };
         let text = tables_text(&catalog, "public", None).expect("the schema is there");
         assert_eq!(
@@ -1900,6 +1903,7 @@ mod tests {
                 vec![relation("t", RelationKind::Table, None, None)],
             )],
             database: None,
+            ..Default::default()
         };
         let refuse = |_: &str, _: &str| -> Result<Structure, DbError> {
             panic!("the loader was handed a name the catalog does not hold")
@@ -1929,6 +1933,7 @@ mod tests {
         let catalog = Catalog {
             schemas: vec![schema("empty", Vec::new())],
             database: None,
+            ..Default::default()
         };
         let text = tables_text(&catalog, "empty", None).expect("the schema is there");
         let mut lines = text.lines();
@@ -1949,6 +1954,7 @@ mod tests {
                 vec![relation("keys", RelationKind::Table, None, Some(7))],
             )],
             database: None,
+            ..Default::default()
         };
         let note = Engine::Redis.agent_catalog_note();
         let note_line = format!("note: {}\n", note.expect("Redis has a note"));
@@ -1975,6 +1981,7 @@ mod tests {
         let catalog = Catalog {
             schemas: vec![schema("b", Vec::new()), schema("a", Vec::new())],
             database: None,
+            ..Default::default()
         };
         assert_eq!(
             schemas_text(&catalog, None),

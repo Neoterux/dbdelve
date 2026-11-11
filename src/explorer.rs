@@ -1570,6 +1570,7 @@ mod tests {
                 },
             ],
             database: None,
+            ..Default::default()
         }
     }
 
@@ -1616,6 +1617,7 @@ mod tests {
                 sequences: Vec::new(),
             }],
             database: None,
+            ..Default::default()
         }
     }
 
@@ -2486,8 +2488,12 @@ mod tests {
                 Fetch::default(),
             )
             .unwrap();
-        let mut catalog = connection.catalog().unwrap();
-        catalog.merge(connection.routines().unwrap());
+        let mut catalog = connection.catalog(&crate::db::Shown::everything()).unwrap();
+        catalog.merge(
+            connection
+                .routines(&crate::db::Shown::everything())
+                .unwrap(),
+        );
 
         let tree = tree(&catalog, "");
         let ids = row_ids(&tree.items);

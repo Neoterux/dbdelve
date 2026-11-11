@@ -1287,6 +1287,7 @@ mod tests {
                     sequences: Vec::new(),
                 }],
                 database: None,
+                ..Default::default()
             },
             "",
         )
@@ -1493,6 +1494,7 @@ mod tests {
                 sequences: Vec::new(),
             }],
             database: None,
+            ..Default::default()
         };
         let shortcuts = Shortcuts {
             folders: Vec::new(),
@@ -1653,6 +1655,7 @@ mod tests {
                     sequences: Vec::new(),
                 }],
                 database: None,
+                ..Default::default()
             },
             "",
         );
@@ -1905,6 +1908,7 @@ mod tests {
             &Catalog {
                 schemas,
                 database: None,
+                ..Default::default()
             },
             "",
         )
@@ -2125,6 +2129,7 @@ mod tests {
                 ],
             )],
             database: None,
+            ..Default::default()
         };
         let object = |name: &str| {
             Member::Object(ObjectRef {
@@ -2209,6 +2214,7 @@ mod tests {
                         .collect(),
                 )],
                 database: None,
+                ..Default::default()
             },
             filter,
         )

@@ -243,6 +243,7 @@ impl Profile {
         self.include.resolve(
             self.config.target().levels(),
             self.active_database().as_deref(),
+            self.active_schema(),
         )
     }
 

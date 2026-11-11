@@ -4961,7 +4961,9 @@ mod live {
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
     fn live_every_seeded_kind_lands_right_and_the_system_databases_stay_out() {
-        let catalog = live_any(live_config()).catalog().unwrap();
+        let catalog = live_any(live_config())
+            .catalog(&crate::db::Shown::everything())
+            .unwrap();
         let seeded = kinds_of(&catalog, "dbdelve_dev");
         let kind = |name: &str| {
             seeded
@@ -4995,7 +4997,7 @@ mod live {
     #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
     fn live_the_servers_own_row_and_byte_counts_ride_on_the_catalog() {
         let connection = live_any(live_config());
-        let catalog = connection.catalog().unwrap();
+        let catalog = connection.catalog(&crate::db::Shown::everything()).unwrap();
         let relation = |name: &str| {
             catalog
                 .schemas
@@ -5009,8 +5011,19 @@ mod live {
         assert_eq!(relation("accounts").rows, Some(50));
         assert_eq!(relation("active_accounts").rows, None);
         assert_eq!(relation("active_accounts").size, None);
-        assert!(connection.sizes().unwrap().is_empty());
-        assert!(connection.routines().unwrap().schemas.is_empty());
+        assert!(
+            connection
+                .sizes(&crate::db::Shown::everything())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            connection
+                .routines(&crate::db::Shown::everything())
+                .unwrap()
+                .schemas
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5029,7 +5042,7 @@ mod live {
             &connection,
             "SELECT count() FROM system.tables WHERE startsWith(name, '.inner')",
         ));
-        let catalog = live_any(live_config()).catalog();
+        let catalog = live_any(live_config()).catalog(&crate::db::Shown::everything());
         ran(&connection, &format!("DROP VIEW `{view}`"));
         let listed = kinds_of(&catalog.unwrap(), "dbdelve_dev");
         assert!(inner.parse::<u32>().unwrap() > 0, "no .inner table to hide");
