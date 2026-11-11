@@ -1155,6 +1155,8 @@ impl Workspace {
                         return;
                     }
                 }
+                // The tree reads the same list for its database rows.
+                workspace.rebuild_connections(cx);
                 // Moved to another connection while the list was coming: the
                 // palette would open over that one's databases. And
                 // `open_palette` toggles, so one already up -- a second press,
