@@ -80,7 +80,10 @@ where the user can read it:
   and Cancel leaves both alone. Manual's own Commit and Roll Back keep sending
   the next `BEGIN` with them, for the reason above, so the dialog's end is the
   only one that leaves manual-commit mode. The list is held in memory only
-  (`Profile::transaction_statements`) and is never written to disk.
+  (`Profile::transaction_statements`) and is never written to disk. A
+  submission that ends the transaction and opens the next lists only what
+  follows its last end (`sql::after_last_end`), so Manual's `COMMIT;` and
+  `BEGIN;` leave the `BEGIN;` alone.
 - **Format Query** rewrites the buffer on command only, through
   `sqlformat`'s token-level reformatter (on MongoDB, `mql::format`'s
   bracket-depth layout over the tree-sitter tokens, refused unless the

@@ -153,7 +153,8 @@ impl Profile {
     /// `ROLLBACK` will end it. `transaction` is what `sql::Leaves` says the
     /// submission does to the transaction: `Some(false)` ends one and empties
     /// the record, `Some(true)` leaves one open and starts the record again
-    /// with this submission when the open transaction really ended, and
+    /// with what this submission runs after its last end when the open
+    /// transaction really ended, and
     /// `None` appends only while one is open. Called before [`Profile::in_transaction`] is
     /// updated for the same submission, because it reads whether a
     /// transaction was open before it.
@@ -168,10 +169,17 @@ impl Profile {
             // on the safe side, and one dropping a statement still to be
             // committed is not.
             Some(true) => {
-                let ended = !self.in_transaction
-                    || crate::sql::ends_transaction(self.config.engine(), sql)
-                    || self.config.engine().begin_ends_open_transaction();
-                if ended {
+                let engine = self.config.engine();
+                if crate::sql::ends_transaction(engine, sql) {
+                    // Only what follows the last end belongs to the new
+                    // transaction: the `COMMIT;` Manual sends ahead of its
+                    // `BEGIN;` closed the one before.
+                    let rest = crate::sql::after_last_end(engine, sql);
+                    self.transaction_statements = match rest.is_empty() {
+                        true => Vec::new(),
+                        false => vec![rest.to_string()],
+                    };
+                } else if !self.in_transaction || engine.begin_ends_open_transaction() {
                     self.transaction_statements = vec![sql.to_string()];
                 } else {
                     self.transaction_statements.push(sql.to_string());
