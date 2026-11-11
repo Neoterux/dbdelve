@@ -12,7 +12,8 @@ use std::{collections::HashMap, ops::Range};
 
 use gpui_component::tree::TreeItem;
 
-use crate::explorer::{ExplorerLeaf, ExplorerTree, Shortcut};
+use crate::db::Levels;
+use crate::explorer::{ExplorerLeaf, ExplorerTree, Shortcut, saved_query};
 use crate::store::StoredProject;
 
 /// Which sidebar the window draws: today's tree for the connection in front,
@@ -124,21 +125,97 @@ pub(crate) fn connection_row(profile: &str) -> String {
     format!("connection:{}:{profile}", profile.len())
 }
 
-/// The id of `row`, one of simple mode's rows, listed under `profile`. The
-/// profile's length keeps a `/` in either from moving the seam.
-pub(crate) fn scoped_row(profile: &str, row: &str) -> String {
-    format!("{}/{row}", connection_row(profile))
+/// A database's row id under its connection. The database follows its length,
+/// as a profile's does, so no name can be read as another row's.
+pub(crate) fn database_row(profile: &str, database: &str) -> String {
+    format!(
+        "{}/database:{}:{database}",
+        connection_row(profile),
+        database.len()
+    )
 }
 
-/// The profile and the simple-mode row id a [`scoped_row`] was made from.
-/// `None` for any other id, including a connection's own row.
-pub(crate) fn unscoped(id: &str) -> Option<(&str, &str)> {
-    let (length, rest) = id.strip_prefix("connection:")?.split_once(':')?;
-    let profile = rest.get(..length.parse().ok()?)?;
-    let row = rest.get(profile.len()..)?.strip_prefix('/')?;
+/// The id of `row`, one of simple mode's rows, listed under `profile`, and
+/// under `database` where the connection draws one over its schemas. The
+/// lengths keep a `/` in any of them from moving a seam.
+pub(crate) fn scoped_row(profile: &str, database: Option<&str>, row: &str) -> String {
+    match database {
+        Some(database) => format!("{}/{row}", database_row(profile, database)),
+        None => format!("{}/{row}", connection_row(profile)),
+    }
+}
+
+/// What a [`scoped_row`] was made from.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Scoped<'a> {
+    pub(crate) profile: &'a str,
+    pub(crate) database: Option<&'a str>,
+    /// The simple-mode row id.
+    pub(crate) inner: &'a str,
+}
+
+/// The profile, the database if any, and the simple-mode row id a
+/// [`scoped_row`] was made from. `None` for any other id, including a
+/// connection's own row and a database's.
+///
+/// A row id that itself began `database:` would read back as under a
+/// database; no row simple mode lists is named that way.
+pub(crate) fn unscoped(id: &str) -> Option<Scoped<'_>> {
+    let (profile, rest) = length_prefixed(id.strip_prefix("connection:")?)?;
+    let rest = rest.strip_prefix('/')?;
+    let scoped = match rest.strip_prefix("database:") {
+        Some(rest) => {
+            let (database, rest) = length_prefixed(rest)?;
+            Scoped {
+                profile,
+                database: Some(database),
+                inner: rest.strip_prefix('/')?,
+            }
+        }
+        None => Scoped {
+            profile,
+            database: None,
+            inner: rest,
+        },
+    };
     // Read back the way it was written: `+3` parses as a length, and would
     // otherwise name the same row as `3`.
-    (scoped_row(profile, row) == id).then_some((profile, row))
+    (scoped_row(scoped.profile, scoped.database, scoped.inner) == id).then_some(scoped)
+}
+
+/// `{length}:{name}` and what follows the name.
+fn length_prefixed(text: &str) -> Option<(&str, &str)> {
+    let (length, rest) = text.split_once(':')?;
+    let name = rest.get(..length.parse().ok()?)?;
+    Some((name, rest.get(name.len()..)?))
+}
+
+/// The database the catalog's rows sit under in the tree, if its shape draws
+/// one over them.
+fn catalog_database(levels: Levels, database: Option<&str>) -> Option<&str> {
+    database.filter(|_| levels == Levels::DatabaseThenSchema)
+}
+
+/// The id the tree gives `row`, one of the rows simple mode lists for the tab
+/// in front of a connection: an object's sits under the database where the
+/// connection has one, a saved query's under the connection.
+pub(crate) fn listed_row(
+    profile: &str,
+    levels: Levels,
+    database: Option<&str>,
+    row: &str,
+) -> String {
+    let database = match saved_query(row) {
+        Some(_) => None,
+        None => catalog_database(levels, database),
+    };
+    scoped_row(profile, database, row)
+}
+
+/// Whether a connection of this shape draws its schema rows as databases.
+pub(crate) fn schema_row_is_a_database(levels: Levels) -> bool {
+    let _ = levels;
+    false
 }
 
 /// What a connection that has nothing to list says in its one row.
@@ -158,6 +235,11 @@ pub(crate) struct Listed<'a> {
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
     pub(crate) content: Content,
+    /// The shape its target gives its rows.
+    pub(crate) levels: Levels,
+    /// The database its target's catalog is of, where the shape draws one
+    /// over the schemas.
+    pub(crate) database: Option<String>,
 }
 
 /// What a row stands for.
@@ -167,6 +249,8 @@ pub(crate) enum Node {
     Connection {
         profile: String,
     },
+    /// A connection's database, with nothing to act on yet.
+    Database,
     /// Says what happened to its connection, and is never acted on.
     Notice,
     /// One of simple mode's rows, its leaf when it opens an object.
@@ -293,15 +377,15 @@ fn connection_item(
             } = content;
             let children = items
                 .into_iter()
-                .map(|item| scoped_item(tree, connection.id, item, &leaves, folds))
+                .map(|item| scoped_item(tree, connection.id, None, item, &leaves, folds))
                 .collect();
             for (row, ranges) in highlights {
                 tree.highlights
-                    .insert(scoped_row(connection.id, &row), ranges);
+                    .insert(scoped_row(connection.id, None, &row), ranges);
             }
             for (row, shortcut) in shortcuts {
                 tree.shortcuts
-                    .insert(scoped_row(connection.id, &row), shortcut);
+                    .insert(scoped_row(connection.id, None, &row), shortcut);
             }
             (followed, children)
         }
@@ -314,7 +398,7 @@ fn connection_item(
 /// A row that says something about its connection and opens nothing. Its id
 /// is one no simple-mode row can have.
 fn notice(tree: &mut SidebarTree, profile: &str, row: &str, text: &str) -> TreeItem {
-    let id = scoped_row(profile, row);
+    let id = scoped_row(profile, None, row);
     tree.nodes.insert(id.clone(), Node::Notice);
     TreeItem::new(id, text.to_string()).disabled(true)
 }
@@ -325,11 +409,12 @@ fn notice(tree: &mut SidebarTree, profile: &str, row: &str, text: &str) -> TreeI
 fn scoped_item(
     tree: &mut SidebarTree,
     profile: &str,
+    database: Option<&str>,
     mut item: TreeItem,
     leaves: &HashMap<String, ExplorerLeaf>,
     folds: &HashMap<String, bool>,
 ) -> TreeItem {
-    let id = scoped_row(profile, &item.id);
+    let id = scoped_row(profile, database, &item.id);
     tree.nodes.insert(
         id.clone(),
         Node::Row {
@@ -341,7 +426,7 @@ fn scoped_item(
     let label = item.label.clone();
     let children: Vec<TreeItem> = std::mem::take(&mut item.children)
         .into_iter()
-        .map(|child| scoped_item(tree, profile, child, leaves, folds))
+        .map(|child| scoped_item(tree, profile, database, child, leaves, folds))
         .collect();
     let open = folder && folds.get(&id).copied().unwrap_or(false);
     TreeItem::new(id, label)
@@ -367,7 +452,13 @@ mod tests {
     }
 
     fn listed<'a>(id: &'a str, name: &'a str, content: Content) -> Listed<'a> {
-        Listed { id, name, content }
+        Listed {
+            id,
+            name,
+            content,
+            levels: Levels::Flat,
+            database: None,
+        }
     }
 
     fn unloaded(id: &str) -> Listed<'_> {
@@ -505,7 +596,7 @@ mod tests {
         let ids = all_ids(&tree.items);
         assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
         for profile in ["x", "y"] {
-            let birds = scoped_row(profile, &explorer::relation_row("main", "birds"));
+            let birds = scoped_row(profile, None, &explorer::relation_row("main", "birds"));
             assert!(ids.contains(&birds));
             assert!(matches!(
                 tree.nodes.get(&birds),
@@ -520,8 +611,12 @@ mod tests {
         for profile in names {
             for row in names {
                 assert_eq!(
-                    unscoped(&scoped_row(profile, row)),
-                    Some((profile, row)),
+                    unscoped(&scoped_row(profile, None, row)),
+                    Some(Scoped {
+                        profile,
+                        database: None,
+                        inner: row
+                    }),
                     "{profile:?} {row:?}"
                 );
             }
@@ -532,7 +627,239 @@ mod tests {
         assert_eq!(unscoped("schema-main"), None);
         // The same row under a length that is not the one it was written with.
         assert_eq!(unscoped("connection:+1:a/x"), None);
-        assert_eq!(unscoped("connection:1:a/x"), Some(("a", "x")));
+        assert_eq!(
+            unscoped("connection:1:a/x"),
+            Some(Scoped {
+                profile: "a",
+                database: None,
+                inner: "x"
+            })
+        );
+    }
+
+    fn database_listed<'a>(
+        id: &'a str,
+        content: ExplorerTree,
+        levels: Levels,
+        database: &str,
+    ) -> Listed<'a> {
+        Listed {
+            id,
+            name: id,
+            content: Content::Loaded(content),
+            levels,
+            database: Some(database.to_string()),
+        }
+    }
+
+    /// What `profiles::explorer_content` gives for a connection holding a
+    /// pinned `birds`, the saved query `q` and `main.birds`.
+    fn content_with_shortcuts(database: &str, filter: &str) -> ExplorerTree {
+        use crate::explorer::{Member, ObjectKind, ObjectRef, Pin, ShortcutDatabase, Shortcuts};
+
+        let catalog = Catalog {
+            schemas: vec![Schema {
+                name: "main".into(),
+                relations: vec![Relation {
+                    name: "birds".into(),
+                    kind: RelationKind::Table,
+                    partition_of: None,
+                    size: None,
+                    rows: None,
+                }],
+                routines: Vec::new(),
+                sequences: Vec::new(),
+            }],
+            database: None,
+        };
+        let shortcuts = Shortcuts {
+            folders: Vec::new(),
+            pins: vec![Pin::Member(Member::Object(ObjectRef {
+                database: Some(database.to_string()),
+                schema: "main".into(),
+                name: "birds".into(),
+                kind: ObjectKind::Relation(RelationKind::Table),
+            }))],
+        };
+        let queries = ["birds q".to_string()];
+        let mut content = explorer::shortcuts(
+            &shortcuts,
+            Some(&catalog),
+            &queries,
+            &ShortcutDatabase::On(database.to_string()),
+            filter,
+        );
+        content.extend(explorer::queries(&queries, filter));
+        content.extend(explorer::tree(&catalog, filter));
+        content
+    }
+
+    #[test]
+    fn a_database_then_schema_connection_lists_its_shortcuts_ahead_of_its_database() {
+        let tree = build(
+            &[],
+            vec![database_listed(
+                "a",
+                content_with_shortcuts("d", "bir"),
+                Levels::DatabaseThenSchema,
+                "d",
+            )],
+            &HashMap::new(),
+        );
+
+        let connection = find(&tree.items, &connection_row("a"));
+        assert_eq!(
+            row_ids(&connection.children),
+            [
+                scoped_row("a", None, explorer::PINNED_GROUP),
+                scoped_row("a", None, explorer::QUERIES_GROUP),
+                database_row("a", "d"),
+            ]
+        );
+        assert!(matches!(
+            tree.nodes.get(&database_row("a", "d")),
+            Some(Node::Database)
+        ));
+        let database = find(&tree.items, &database_row("a", "d"));
+        let schema = scoped_row("a", Some("d"), "schema-main");
+        assert_eq!(row_ids(&database.children), [schema.clone()]);
+        let birds = scoped_row("a", Some("d"), &explorer::relation_row("main", "birds"));
+        assert!(search(&find(&tree.items, &schema).children, &birds).is_some());
+        assert!(matches!(
+            tree.nodes.get(&birds),
+            Some(Node::Row { leaf: Some(_) })
+        ));
+        // What the filter matched and what a shortcut stands for are keyed by
+        // the ids the rows were given, under the database or not.
+        assert!(tree.highlights.contains_key(&birds));
+        assert!(
+            tree.shortcuts
+                .keys()
+                .all(|row| unscoped(row).is_some_and(|scoped| scoped.database.is_none()))
+        );
+        assert!(!tree.shortcuts.is_empty());
+        let ids = all_ids(&tree.items);
+        assert!(ids.iter().all(|id| tree.nodes.contains_key(id)));
+    }
+
+    #[test]
+    fn a_database_then_schema_connection_with_no_known_database_lists_its_schemas_directly() {
+        let tree = build(
+            &[],
+            vec![listed(
+                "a",
+                "a",
+                Content::Loaded(content_with_shortcuts("d", "")),
+            )]
+            .into_iter()
+            .map(|listed| Listed {
+                levels: Levels::DatabaseThenSchema,
+                ..listed
+            })
+            .collect(),
+            &HashMap::new(),
+        );
+
+        let connection = find(&tree.items, &connection_row("a"));
+        assert!(
+            connection
+                .children
+                .iter()
+                .any(|child| child.id.as_str() == scoped_row("a", None, "schema-main"))
+        );
+        assert!(
+            !tree
+                .nodes
+                .values()
+                .any(|node| matches!(node, Node::Database))
+        );
+    }
+
+    #[test]
+    fn row_ids_under_a_database_name_the_connection_and_the_database() {
+        let names = ["a", "a/b", "1:x", "x:1/", "\0", "ü/ß", "database:1:x", ""];
+        for profile in names {
+            for database in names {
+                for row in ["x", "a/b", "1:x", "\0", "ü/ß", "schema-main", ""] {
+                    assert_eq!(
+                        unscoped(&scoped_row(profile, Some(database), row)),
+                        Some(Scoped {
+                            profile,
+                            database: Some(database),
+                            inner: row
+                        }),
+                        "{profile:?} {database:?} {row:?}"
+                    );
+                }
+                // A database's own row is not a row under one.
+                assert_eq!(unscoped(&database_row(profile, database)), None);
+            }
+        }
+        // A database named like a schema's id is still a database's.
+        let spoof = scoped_row("a", Some("schema-main"), "x");
+        assert_ne!(spoof, scoped_row("a", None, "schema-main"));
+        assert_eq!(
+            unscoped(&spoof).and_then(|scoped| scoped.database),
+            Some("schema-main")
+        );
+        // The length is the one written, and a database name cannot lend its
+        // tail to the next segment.
+        assert_eq!(unscoped("connection:1:a/database:9:short/x"), None);
+        assert_eq!(unscoped("connection:1:a/database:+1:d/x"), None);
+        assert_eq!(unscoped("connection:1:a/database:1:d"), None);
+    }
+
+    #[test]
+    fn a_database_holds_objects_connection_draws_its_one_schema_as_its_database() {
+        let content = explorer::tree(
+            &Catalog {
+                schemas: vec![Schema {
+                    name: "shop".into(),
+                    relations: vec![Relation {
+                        name: "orders".into(),
+                        kind: RelationKind::Table,
+                        partition_of: None,
+                        size: None,
+                        rows: None,
+                    }],
+                    routines: Vec::new(),
+                    sequences: Vec::new(),
+                }],
+                database: None,
+            },
+            "",
+        );
+        let tree = build(
+            &[],
+            vec![database_listed(
+                "a",
+                content,
+                Levels::DatabaseHoldsObjects,
+                "shop",
+            )],
+            &HashMap::new(),
+        );
+
+        let connection = find(&tree.items, &connection_row("a"));
+        assert_eq!(
+            row_ids(&connection.children),
+            [scoped_row("a", None, "schema-shop")]
+        );
+        assert!(
+            !all_ids(&tree.items)
+                .iter()
+                .any(|id| id.contains("/database:"))
+        );
+        assert!(
+            !tree
+                .nodes
+                .values()
+                .any(|node| matches!(node, Node::Database))
+        );
+        assert!(schema_row_is_a_database(Levels::DatabaseHoldsObjects));
+        assert!(schema_row_is_a_database(Levels::DatabaseIsSchema));
+        assert!(!schema_row_is_a_database(Levels::DatabaseThenSchema));
+        assert!(!schema_row_is_a_database(Levels::Flat));
     }
 
     #[test]
@@ -544,7 +871,7 @@ mod tests {
         assert!(!row.is_expanded());
         assert_eq!(row.children.len(), 1);
         let loading = &row.children[0];
-        assert_eq!(loading.id.as_str(), scoped_row("a", "loading"));
+        assert_eq!(loading.id.as_str(), scoped_row("a", None, "loading"));
         assert_eq!(loading.label.as_str(), LOADING);
         assert!(loading.is_disabled());
     }
@@ -598,8 +925,8 @@ mod tests {
 
     #[test]
     fn rows_under_a_connection_start_folded_and_keep_the_folds_they_are_given() {
-        let schema = scoped_row("a", "schema-main");
-        let category = scoped_row("a", "category-Tables-main");
+        let schema = scoped_row("a", None, "schema-main");
+        let category = scoped_row("a", None, "category-Tables-main");
         let build_with = |folds: &HashMap<String, bool>| {
             build(&[], vec![listed("a", "a", Content::Loaded(birds()))], folds)
         };

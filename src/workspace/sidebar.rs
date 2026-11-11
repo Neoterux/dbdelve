@@ -15,13 +15,25 @@ use gpui_component::tree::{TreeEvent, TreeState};
 
 use super::profiles::explorer_content;
 use super::*;
-use crate::db::Syntax;
+use crate::db::{Levels, Syntax};
 use crate::explorer::{
     Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, folds, is_schema_row, saved_query,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
-use crate::sidebar::{self as model, Content, Listed, Node};
+use crate::sidebar::{self as model, Content, Listed, Node, schema_row_is_a_database};
 use crate::ui::row_icon_tinted;
+
+/// The id of the row of `profile`'s front tab in the connections tree, if
+/// the tab has one.
+pub(crate) fn front_row_id(profile: &Profile) -> Option<String> {
+    let row = profile.front_row()?;
+    Some(model::listed_row(
+        &profile.id,
+        profile.config.target().levels(),
+        profile.active_database().as_deref(),
+        &row,
+    ))
+}
 
 pub(crate) struct ConnectionsSidebar {
     pub(crate) tree: Entity<TreeState>,
@@ -98,6 +110,8 @@ impl Workspace {
                         Content::Loaded(explorer_content(profile, ""))
                     }
                 },
+                levels: profile.config.target().levels(),
+                database: profile.active_database(),
             })
             .collect();
         let built = model::build(
@@ -108,12 +122,9 @@ impl Workspace {
             current.as_deref(),
         );
         self.connections.group = Some(current);
-        let front = self.profile().map(|profile| {
-            let row = profile
-                .front_row()
-                .map_or_else(String::new, |row| model::scoped_row(&profile.id, &row));
-            SharedString::from(row)
-        });
+        let front = self
+            .profile()
+            .map(|profile| SharedString::from(front_row_id(profile).unwrap_or_default()));
 
         self.connections.nodes = Arc::new(built.nodes);
         self.connections.highlights = Arc::new(built.highlights);
@@ -156,12 +167,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((profile, row)) = model::unscoped(id) else {
+        let Some(model::Scoped {
+            profile,
+            database,
+            inner: row,
+        }) = model::unscoped(id)
+        else {
             return false;
         };
         let Some(index) = self.profiles.iter().position(|p| p.id == profile) else {
             return false;
         };
+        // Only the connection's own database opens through its own catalog.
+        if database.is_some_and(|database| {
+            self.profiles[index].active_database().as_deref() != Some(database)
+        }) {
+            return false;
+        }
         let leaf = match self.connections.nodes.get(id) {
             Some(Node::Row { leaf }) => *leaf,
             _ => None,
@@ -190,7 +212,7 @@ impl Workspace {
         let shortcuts = self.connections.shortcuts.clone();
         // What each connection's rows are drawn in, by profile id: its logo
         // and the dialect its saved queries are written in.
-        let targets: HashMap<String, (&'static str, Syntax)> = self
+        let targets: HashMap<String, (&'static str, Syntax, Levels)> = self
             .profiles
             .iter()
             .map(|profile| {
@@ -199,6 +221,7 @@ impl Workspace {
                     (
                         profile.config.target().logo(),
                         profile.config.engine().syntax(),
+                        profile.config.target().levels(),
                     ),
                 )
             })
@@ -208,10 +231,10 @@ impl Workspace {
             let id = entry.item().id.as_str();
             let node = nodes.get(id);
             let scoped = model::unscoped(id);
-            let inner = scoped.map(|(_, row)| row);
-            let target = match (node, scoped) {
+            let inner = scoped.as_ref().map(|scoped| scoped.inner);
+            let target = match (node, &scoped) {
                 (Some(Node::Connection { profile }), _) => targets.get(profile.as_str()),
-                (_, Some((profile, _))) => targets.get(profile),
+                (_, Some(scoped)) => targets.get(scoped.profile),
                 _ => None,
             };
             let leaf = match node {
@@ -243,7 +266,7 @@ impl Workspace {
                     highlighted(label, matched, t),
                     ListItem::new(index).text_color(t.text),
                 ),
-                Some(Node::Group | Node::Connection { .. }) => (
+                Some(Node::Group | Node::Connection { .. } | Node::Database) => (
                     highlighted(label, matched, t),
                     ListItem::new(index)
                         .text_color(t.text)
@@ -278,19 +301,27 @@ impl Workspace {
                     }),
                 ) => Some(object_icon(object.kind)),
                 _ if query.is_some() || missing => {
-                    target.map(|(_, syntax)| saved_query_icon(*syntax))
+                    target.map(|(_, syntax, _)| saved_query_icon(*syntax))
                 }
                 _ if entry.is_expanded() => Some(icon::CHEVRON_DOWN),
                 _ => Some(icon::CHEVRON_RIGHT),
             };
             let heading = match node {
                 Some(Node::Group) => Some(icon::PROJECT),
-                Some(Node::Connection { .. }) => target.map(|(logo, _)| *logo),
+                Some(Node::Connection { .. }) => target.map(|(logo, ..)| *logo),
+                Some(Node::Database) => Some(icon::DATABASE),
                 _ if inner == Some(QUERIES_GROUP) => {
-                    target.map(|(_, syntax)| queries_group_icon(*syntax))
+                    target.map(|(_, syntax, _)| queries_group_icon(*syntax))
                 }
                 _ if pinned_group => Some(icon::PIN),
-                _ if schema_row => Some(icon::SCHEMA),
+                // A shape that lists databases as schemas, or whose one
+                // schema is its database, draws that row as a database.
+                _ if schema_row => Some(
+                    match target.is_some_and(|(.., levels)| schema_row_is_a_database(*levels)) {
+                        true => icon::DATABASE,
+                        false => icon::SCHEMA,
+                    },
+                ),
                 _ if folder_shortcut => Some(icon::FOLDER),
                 _ => None,
             };
