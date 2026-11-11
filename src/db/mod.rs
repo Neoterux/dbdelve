@@ -2094,14 +2094,19 @@ impl Connection {
                     ..Fetch::default()
                 },
             ),
-            Self::Redis(connection) => connection.generated_bound(
-                sql,
-                Fetch {
-                    feed,
-                    limit,
-                    ..Fetch::default()
-                },
-            ),
+            // Registered in the token as `query_bound` does, or a Cancel on a
+            // bound run finds nothing to stop.
+            Self::Redis(connection) => running_on(cancel, self, |held| {
+                connection.generated_bound(
+                    sql,
+                    Fetch {
+                        feed,
+                        limit,
+                        held: Some(held),
+                        ..Fetch::default()
+                    },
+                )
+            }),
             _ => self.generated(sql, cancel, feed, limit),
         }
     }
