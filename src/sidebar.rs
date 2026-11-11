@@ -1717,6 +1717,50 @@ mod tests {
     }
 
     #[test]
+    fn a_database_the_filter_left_out_is_never_a_row_where_databases_hold_objects() {
+        use crate::db::{Databases, Include};
+        let others_of = |own: &str, all: &[&str], list: &[&str]| {
+            let include = Include::from_stored(
+                list.iter().map(|entry| entry.to_string()).collect(),
+                Vec::new(),
+            );
+            let narrowed = include
+                .resolve(Levels::DatabaseHoldsObjects, Some(own), None)
+                .narrow_databases(Databases {
+                    names: all.iter().map(|name| name.to_string()).collect(),
+                    current: Some(own.into()),
+                    left_out: 0,
+                });
+            let others = other_databases(&narrowed.names, narrowed.current.as_deref())
+                .into_iter()
+                .map(|name| (name.to_string(), Content::Unloaded))
+                .collect();
+            let tree = build(
+                &[],
+                vec![with_others(Levels::DatabaseHoldsObjects, own, others)],
+                &opened([connection_row("a")]),
+            );
+            row_ids(&find(&tree.items, &connection_row("a")).children)
+        };
+
+        assert_eq!(
+            others_of("db0", &["db0", "db1", "db2"], &["db1"]),
+            [
+                scoped_row("a", None, "schema-db0"),
+                database_row("a", "db1")
+            ]
+        );
+        assert_eq!(
+            others_of(
+                "dbdelve_dev",
+                &["dbdelve_archive", "dbdelve_dev"],
+                &["nothing*"]
+            ),
+            [scoped_row("a", None, "schema-dbdelve_dev")]
+        );
+    }
+
+    #[test]
     fn other_databases_are_listed_folded_until_they_load() {
         let other = database_row("a", "other");
         // The fold is the user's, and says open: an unloaded database is

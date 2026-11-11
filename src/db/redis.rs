@@ -2664,6 +2664,26 @@ mod tests {
     /// fails it along with the premise it rests on.
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_REDIS_URL"]
+    fn live_the_include_list_lists_only_the_matched_databases() {
+        use crate::db::{Include, Levels, Shown};
+        let connection = crate::db::Connection::Redis(live());
+        let all = connection
+            .databases(Engine::Redis, &Shown::everything())
+            .expect("databases should list");
+        let shown = Include::from_stored(vec!["db1".into()], Vec::new()).resolve(
+            Levels::DatabaseHoldsObjects,
+            Some("db0"),
+            None,
+        );
+        let listed = connection
+            .databases(Engine::Redis, &shown)
+            .expect("databases should list");
+        assert_eq!(listed.names, ["db0", "db1"]);
+        assert_eq!(listed.left_out, all.names.len() - 2);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_REDIS_URL"]
     fn live_config_get_and_client_list_still_disclose_what_the_gate_now_stops() {
         /// Puts `masterauth` back as it was found, whether the test passed or
         /// panicked. A failure reports neither the value nor the server's

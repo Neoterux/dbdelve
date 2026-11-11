@@ -245,6 +245,27 @@ pub fn matches(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Routine, RoutineKind, Schema};
+
+    fn schema(name: &str) -> Schema {
+        Schema {
+            name: name.into(),
+            relations: Vec::new(),
+            routines: Vec::new(),
+            sequences: Vec::new(),
+        }
+    }
+
+    fn catalog(names: &[&str]) -> Catalog {
+        Catalog {
+            schemas: names.iter().map(|name| schema(name)).collect(),
+            ..Catalog::default()
+        }
+    }
+
+    fn names(catalog: &Catalog) -> Vec<&str> {
+        catalog.schemas.iter().map(|s| s.name.as_str()).collect()
+    }
 
     fn listed(names: &[&str], current: Option<&str>) -> Databases {
         Databases {
@@ -398,5 +419,92 @@ mod tests {
             .narrow_databases(listed(&["a", "own", "b"], None));
         assert!(narrowed.names.is_empty());
         assert_eq!(narrowed.left_out, 3);
+    }
+
+    #[test]
+    fn a_catalog_drops_the_schemas_the_filter_hides_and_counts_each_once() {
+        let include = Include::from_stored(Vec::new(), text(&["s*"]));
+        let shown = include.resolve(Levels::DatabaseThenSchema, None, Some("public"));
+
+        let narrowed = shown.narrow_catalog(catalog(&["public", "s1", "t1", "t2"]));
+        assert_eq!(names(&narrowed), ["public", "s1"]);
+        assert_eq!(narrowed.left_out, 2);
+
+        let again = shown.narrow_catalog(narrowed);
+        assert_eq!(names(&again), ["public", "s1"]);
+        assert_eq!(again.left_out, 2, "nothing more was dropped");
+
+        let mut arriving = catalog(&["s1", "t1"]);
+        arriving.left_out = 3;
+        assert_eq!(shown.narrow_catalog(arriving).left_out, 4);
+    }
+
+    #[test]
+    fn routines_of_a_hidden_schema_are_dropped_before_they_merge() {
+        let include = Include::from_stored(Vec::new(), text(&["main"]));
+        let shown = include.resolve(Levels::DatabaseThenSchema, None, None);
+        let mut relations = shown.narrow_catalog(catalog(&["main"]));
+
+        let mut routines = catalog(&["main", "extra"]);
+        routines.schemas[0].routines.push(Routine {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            identity_arguments: String::new(),
+            result_type: String::new(),
+            language: String::new(),
+            definition: String::new(),
+        });
+        routines.schemas[1].sequences.push("s".into());
+        let narrowed = shown.narrow_routines(routines);
+        assert_eq!(narrowed.left_out, 0, "the routines step counts nothing");
+
+        relations.merge(narrowed);
+        assert_eq!(names(&relations), ["main"]);
+        assert_eq!(relations.schemas[0].routines.len(), 1);
+        assert_eq!(relations.left_out, 0);
+    }
+
+    #[test]
+    fn where_schemas_are_databases_the_database_list_narrows_the_catalog() {
+        let include = Include::from_stored(text(&["app*"]), text(&["x"]));
+        let shown = include.resolve(Levels::DatabaseIsSchema, Some("own"), None);
+        let narrowed = shown.narrow_catalog(catalog(&["app1", "own", "other"]));
+        assert_eq!(names(&narrowed), ["app1", "own"]);
+        assert_eq!(narrowed.left_out, 1, "the schemas list is ignored here");
+
+        let shown = include.resolve(Levels::DatabaseHoldsObjects, Some("own"), None);
+        let kept = shown.narrow_catalog(catalog(&["other"]));
+        assert_eq!(names(&kept), ["other"]);
+        assert_eq!(kept.left_out, 0);
+    }
+
+    #[test]
+    fn another_database_keeps_no_active_schema() {
+        let include = Include::from_stored(Vec::new(), text(&["x"]));
+        let shown = include.resolve(Levels::DatabaseThenSchema, Some("db"), Some("main"));
+        assert_eq!(
+            names(&shown.narrow_catalog(catalog(&["main", "x"]))),
+            ["main", "x"]
+        );
+
+        let other = shown
+            .in_another_database()
+            .narrow_catalog(catalog(&["main", "x"]));
+        assert_eq!(names(&other), ["x"]);
+        assert_eq!(other.left_out, 1);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_still_keeps_the_own_database_and_the_active_schema() {
+        let include = Include::from_stored(text(&["zzz"]), text(&["zzz"]));
+        let shown = include.resolve(Levels::DatabaseThenSchema, Some("db"), Some("main"));
+
+        let databases = shown.narrow_databases(listed(&["db", "a", "b"], Some("db")));
+        assert_eq!(databases.names, ["db"]);
+        assert_eq!(databases.left_out, 2, "1 of 3");
+
+        let narrowed = shown.narrow_catalog(catalog(&["main", "s"]));
+        assert_eq!(names(&narrowed), ["main"]);
+        assert_eq!(narrowed.left_out, 1, "1 of 2");
     }
 }
