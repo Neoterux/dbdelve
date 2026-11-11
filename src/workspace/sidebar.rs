@@ -41,6 +41,8 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) nodes: Arc<HashMap<String, Node>>,
     pub(crate) highlights: Arc<HashMap<String, Vec<Range<usize>>>>,
     pub(crate) shortcuts: Arc<HashMap<String, Shortcut>>,
+    /// How many rows each folder row holds, by row id.
+    pub(crate) counts: Arc<HashMap<String, usize>>,
     /// The group the last build was made for, which `None` outer says is no
     /// build yet. A build for another group opens that one.
     group: Option<Option<String>>,
@@ -63,6 +65,7 @@ impl ConnectionsSidebar {
             nodes: Arc::default(),
             highlights: Arc::default(),
             shortcuts: Arc::default(),
+            counts: Arc::default(),
             group: None,
         }
     }
@@ -129,6 +132,7 @@ impl Workspace {
         self.connections.nodes = Arc::new(built.nodes);
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
+        self.connections.counts = Arc::new(built.counts);
         tree.update(cx, |tree, cx| {
             tree.set_items(built.items, cx);
             // A row the user moved to stays selected: a landing in the
@@ -210,6 +214,7 @@ impl Workspace {
         let nodes = self.connections.nodes.clone();
         let highlights = self.connections.highlights.clone();
         let shortcuts = self.connections.shortcuts.clone();
+        let counts = self.connections.counts.clone();
         // What each connection's rows are drawn in, by profile id: its logo
         // and the dialect its saved queries are written in.
         let targets: HashMap<String, (&'static str, Syntax, Levels)> = self
@@ -359,6 +364,16 @@ impl Workspace {
                                 .text_ellipsis()
                                 .whitespace_nowrap()
                                 .child(label),
+                        })
+                        .when_some(counts.get(id), |row, count| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .text_color(t.text_faint)
+                                    .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                    .child(count.to_string()),
+                            )
                         })
                         .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
                             row.child(
