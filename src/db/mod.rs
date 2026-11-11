@@ -4384,6 +4384,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_mysql_and_mariadb_commit_an_open_transaction_at_a_begin() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert!(engine.begin_ends_open_transaction(), "{engine:?}");
+        }
+        for engine in [
+            Engine::Postgres,
+            Engine::Sqlite,
+            Engine::Turso,
+            Engine::DuckDb,
+            Engine::SqlServer,
+        ] {
+            assert!(!engine.begin_ends_open_transaction(), "{engine:?}");
+        }
+    }
+
+    #[test]
     fn placeholders_are_filled_in_one_pass() {
         assert_eq!(
             fill_placeholders("{schema}.{relation} {x}", "'{relation}'", "'a''b'"),
