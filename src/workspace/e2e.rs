@@ -1431,6 +1431,15 @@ fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppConte
                 workspace.connections.nodes.get(&db),
                 Some(crate::sidebar::Node::Database)
             ));
+            // Each folder row counts what it holds, from what has loaded.
+            let counts = &workspace.connections.counts;
+            for id in [connection_row("e2e"), db.clone()] {
+                assert_eq!(counts.get(&id), Some(&1), "{id}");
+            }
+            assert_eq!(
+                counts.get(&scoped_row("e2e", Some(&database), "schema-main")),
+                Some(&1)
+            );
         });
 
         // The table opens on the profile, and the tree finds the row of the

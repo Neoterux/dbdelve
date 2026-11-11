@@ -335,6 +335,7 @@ pub(crate) fn build(
         }));
     for (id, label, members) in groups {
         tree.nodes.insert(id.clone(), Node::Group);
+        tree.counts.insert(id.clone(), members.len());
         let open = folds.get(&id).copied().unwrap_or(id == current_row);
         tree.items.push(
             TreeItem::new(id, label.to_string())
@@ -358,6 +359,10 @@ fn connection_item(
         },
     );
     let followed = folds.get(&id).copied().unwrap_or(false);
+    // What it counts is the rows where databases would be, which a flat
+    // connection has none of.
+    let counts_databases = connection.levels != Levels::Flat;
+    let mut count = None;
     let (open, children) = match connection.content {
         // Nothing has asked it to load, and nothing will until this row is
         // opened: an open row here would show a `Loading…` that no answer is
@@ -368,15 +373,18 @@ fn connection_item(
             vec![notice(tree, connection.id, "loading", LOADING)],
         ),
         Content::Failed(text) => (followed, vec![notice(tree, connection.id, "notice", &text)]),
-        Content::Loaded(content) if content.items.is_empty() => (
-            followed,
-            vec![notice(
-                tree,
-                connection.id,
-                "notice",
-                "No database objects found.",
-            )],
-        ),
+        Content::Loaded(content) if content.items.is_empty() => {
+            count = counts_databases.then_some(0);
+            (
+                followed,
+                vec![notice(
+                    tree,
+                    connection.id,
+                    "notice",
+                    "No database objects found.",
+                )],
+            )
+        }
         Content::Loaded(content) => {
             let ExplorerTree {
                 items,
@@ -411,25 +419,43 @@ fn connection_item(
                         .collect();
                     let row = database_row(connection.id, database);
                     tree.nodes.insert(row.clone(), Node::Database);
+                    tree.counts.insert(row.clone(), under.len());
                     let open = folds.get(&row).copied().unwrap_or(false);
-                    children.push(
-                        TreeItem::new(row, database.to_string())
-                            .expanded(open)
-                            .children(under),
+                    let mut item = TreeItem::new(row.clone(), database.to_string());
+                    item = match under.is_empty() {
+                        true => item.children(vec![empty_row(tree, &row)]),
+                        false => item.children(under),
+                    };
+                    children.push(item.expanded(open));
+                    count = Some(1);
+                }
+                None => {
+                    count = counts_databases.then_some(catalog.len());
+                    children.extend(
+                        catalog
+                            .into_iter()
+                            .map(|item| scoped_item(tree, &mut rows, None, item)),
                     );
                 }
-                None => children.extend(
-                    catalog
-                        .into_iter()
-                        .map(|item| scoped_item(tree, &mut rows, None, item)),
-                ),
             }
             (followed, children)
         }
     };
+    if let Some(count) = count {
+        tree.counts.insert(id.clone(), count);
+    }
     TreeItem::new(id, connection.name.to_string())
         .expanded(open)
         .children(children)
+}
+
+/// The one row a loaded folder with nothing in it holds, so that it can be
+/// opened and says why there is nothing. Its id starts where no other row's
+/// does, and names `parent`.
+fn empty_row(tree: &mut SidebarTree, parent: &str) -> TreeItem {
+    let id = format!("empty:{}:{parent}", parent.len());
+    tree.nodes.insert(id.clone(), Node::Notice);
+    TreeItem::new(id, NO_OBJECTS.to_string()).disabled(true)
 }
 
 /// A row that says something about its connection and opens nothing. Its id
@@ -470,17 +496,37 @@ fn scoped_item(
     if let Some(ranges) = rows.highlights.remove(item.id.as_str()) {
         tree.highlights.insert(id.clone(), ranges);
     }
-    if let Some(shortcut) = rows.shortcuts.remove(item.id.as_str()) {
+    let shortcut = rows.shortcuts.remove(item.id.as_str());
+    // A folder of shortcuts counts its members even with none; an object and
+    // a member of a folder are one row each and hold nothing to count.
+    let schema = is_schema_row(&item.id);
+    let counted = !rows.leaves.contains_key(item.id.as_str())
+        && (item.is_folder() || schema || matches!(shortcut, Some(Shortcut::Folder(_))));
+    if let Some(shortcut) = shortcut {
         tree.shortcuts.insert(id.clone(), shortcut);
     }
-    let folder = item.is_folder();
     let disabled = item.is_disabled();
     let label = item.label.clone();
-    let children: Vec<TreeItem> = std::mem::take(&mut item.children)
+    let mut children: Vec<TreeItem> = std::mem::take(&mut item.children)
         .into_iter()
         .map(|child| scoped_item(tree, rows, database, child))
         .collect();
-    let open = folder && rows.folds.get(&id).copied().unwrap_or(false);
+    if counted {
+        // A schema counts the objects of its kinds, each already counted once
+        // with its partitions under it; anything else its own rows.
+        let count = match schema {
+            true => children
+                .iter()
+                .filter_map(|child| tree.counts.get(child.id.as_str()))
+                .sum(),
+            false => children.len(),
+        };
+        tree.counts.insert(id.clone(), count);
+    }
+    if children.is_empty() && schema {
+        children.push(empty_row(tree, &id));
+    }
+    let open = !children.is_empty() && rows.folds.get(&id).copied().unwrap_or(false);
     TreeItem::new(id, label)
         .expanded(open)
         .disabled(disabled)
