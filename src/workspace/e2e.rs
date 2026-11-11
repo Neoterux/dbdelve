@@ -1678,6 +1678,38 @@ fn attach_other(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
+fn select_database_lists_a_new_database_in_the_connections_tree(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let other = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("other.duckdb");
+        // Attached without the schema refresh that lists databases again, as
+        // a database created on the server is.
+        run_in_front(
+            &workspace,
+            cx,
+            &format!("ATTACH '{}' AS other", other.display()),
+        );
+        let shown = |cx: &mut VisualTestContext| {
+            connections_item(&workspace, cx, &database_row("e2e", "other")).is_some()
+        };
+        assert!(!shown(cx), "the tree has not been told of it yet");
+
+        cx.dispatch_action(crate::actions::SelectDatabase);
+        settle(cx);
+        assert!(
+            shown(cx),
+            "the fetch that fills the Select Database list shows the database too"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_attached_duckdb_database_expands_over_a_session_of_its_own(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
