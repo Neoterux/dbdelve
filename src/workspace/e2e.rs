@@ -1781,6 +1781,49 @@ fn an_attached_duckdb_database_expands_over_a_session_of_its_own(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn a_filtered_duckdb_connection_lists_one_of_its_two_databases_and_never_reads_the_other(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+
+        assert_eq!(
+            connections_item(&workspace, cx, &connection_row("e2e"))
+                .map(|(_, rows)| rows.into_iter().map(|(id, ..)| id).collect::<Vec<_>>()),
+            Some(vec![database_row("e2e", "e2e")]),
+            "only the database the filter names"
+        );
+        assert!(
+            connections_row(&workspace, cx, &database_row("e2e", "other")).is_none(),
+            "the database it leaves out is not drawn"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let row = connection_row("e2e");
+            assert_eq!(workspace.connections.counts.get(&row), Some(&1));
+            assert_eq!(workspace.connections.totals.get(&row), Some(&2));
+            assert_eq!(crate::sidebar::count_label(1, Some(2)), "1 of 2");
+
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.databases.names, ["e2e"]);
+            assert_eq!(profile.databases.current.as_deref(), Some("e2e"));
+            assert_eq!(profile.databases.left_out, 1);
+            assert!(
+                profile.bound.is_empty() && profile.database_catalogs.is_empty(),
+                "nothing opened a session to the database the filter hides"
+            );
+            let stored = profile.stored();
+            assert_eq!(stored.include_databases, ["e2e"]);
+            assert!(stored.include_schemas.is_empty());
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
