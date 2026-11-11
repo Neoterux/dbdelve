@@ -330,6 +330,7 @@ impl Profile {
             .objects
             .iter()
             .map(|tab| store::StoredObject {
+                database: None,
                 active: active == Tab::Object(tab.id),
                 ..tab.stored(engine)
             })
@@ -2665,6 +2666,7 @@ impl ObjectTab {
 
     pub(crate) fn stored(&self, engine: Engine) -> store::StoredObject {
         store::StoredObject {
+            database: None,
             schema: self.schema.clone(),
             name: self.name.clone(),
             filter: self.filter().to_string(),

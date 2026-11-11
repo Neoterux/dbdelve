@@ -402,7 +402,7 @@ impl Workspace {
     /// Run `refetch` and stream its rows into `path`, once the save panel has
     /// answered. Asked again here, since the panel is modeless: a `BEGIN` or a
     /// mode change while it was open would change the answer.
-    fn start_export(
+    pub(super) fn start_export(
         &mut self,
         id: &str,
         generation: u64,

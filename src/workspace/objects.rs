@@ -1959,6 +1959,7 @@ mod tests {
 
     fn stored(name: &str, routine: bool) -> store::StoredObject {
         store::StoredObject {
+            database: None,
             schema: "public".into(),
             name: name.into(),
             routine,
@@ -2022,6 +2023,7 @@ mod tests {
     fn a_stored_structure_tab_comes_back_as_a_structure_tab() {
         let pending = [
             store::StoredObject {
+                database: None,
                 structure: true,
                 ..stored("accounts", false)
             },
@@ -2037,6 +2039,7 @@ mod tests {
     #[test]
     fn a_stored_relation_opens_before_the_connection_and_the_catalog() {
         let pending = [store::StoredObject {
+            database: None,
             active: true,
             ..stored("accounts", false)
         }];

@@ -313,6 +313,11 @@ pub struct StoredObject {
     /// it was kept, and goes back to any data tab for the relation.
     #[serde(default)]
     pub origin: Option<String>,
+    /// The database this tab's object is in, as the server listed it, or
+    /// absent for the connection's own. A name the server no longer has fails
+    /// the tab's reads; it never retargets the tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
     /// The filter bars [`Self::filter`] was derived from. The bars are the
     /// editable state and the expression is what runs, so both are kept:
     /// nothing here parses a `WHERE` back into controls. Last, because TOML
@@ -2226,6 +2231,42 @@ pub(crate) mod tests {
         assert!(!old_saved.contains("schema = "), "{old_saved}");
     }
 
+    #[test]
+    fn an_object_tabs_database_round_trips_and_an_old_tab_reads_as_the_profiles() {
+        let text = supported_stub(
+            None,
+            "[[profiles.open_objects]]\nschema = \"main\"\nname = \"t\"\n\n\
+             [[profiles.open_objects]]\nschema = \"main\"\nname = \"t\"\ndatabase = \"other\"\n",
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        let tabs = &decoded.profiles[0].open_objects;
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| tab.database.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("other")]
+        );
+
+        let saved = resaved(&text);
+        assert_eq!(saved.matches("database = \"other\"").count(), 1, "{saved}");
+        let again = decode_profiles(&saved, &[]).expect("what was written loads");
+        assert_eq!(again.profiles[0].open_objects, *tabs);
+        assert_eq!(
+            resaved(&saved),
+            saved,
+            "saving what was saved changes nothing"
+        );
+
+        // A file from before the key held tabs without it, and writes them
+        // back without it: the profile's own `database` is the only one.
+        let old = supported_stub(
+            None,
+            "[[profiles.open_objects]]\nschema = \"main\"\nname = \"t\"\n",
+        );
+        let old_saved = resaved(&old);
+        assert_eq!(old_saved.matches("database = ").count(), 1, "{old_saved}");
+    }
+
     /// `decode_profiles` as it was before any profile could be unavailable:
     /// the reference every file with no unavailable profile must still match.
     fn decoded_as_before(text: &str) -> Result<ProfileList, String> {
@@ -3306,6 +3347,7 @@ user = "shayan"
             open_queries: Vec::new(),
             open_objects: vec![
                 StoredObject {
+                    database: None,
                     schema: "public".into(),
                     name: "accounts".into(),
                     routine: false,
@@ -3319,6 +3361,7 @@ user = "shayan"
                     bars: Vec::new(),
                 },
                 StoredObject {
+                    database: None,
                     schema: "public".into(),
                     name: "total(integer)".into(),
                     routine: true,
@@ -3486,6 +3529,7 @@ open_objects = []
         };
         let profile = StoredProfile {
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "public".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -3623,6 +3667,7 @@ folder = "Hot"
                 run_as: None,
             }),
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "public".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -3796,6 +3841,7 @@ folder = "Hot"
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "public".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -3876,6 +3922,7 @@ folder = "Hot"
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "main".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -4057,6 +4104,7 @@ open_objects = []
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "main".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -5021,6 +5069,7 @@ open_objects = []
                 },
             ],
             open_objects: vec![StoredObject {
+                database: None,
                 schema: "public".into(),
                 name: "accounts".into(),
                 routine: false,
@@ -5311,6 +5360,7 @@ name = \"accounts\"
     #[test]
     fn a_structure_tab_keeps_the_data_tab_it_came_from() {
         let object = StoredObject {
+            database: None,
             schema: "public".into(),
             name: "customers".into(),
             routine: false,
@@ -5375,6 +5425,7 @@ name = \"accounts\"
             open_queries: Vec::new(),
             open_objects: vec![
                 StoredObject {
+                    database: None,
                     schema: "public".into(),
                     name: "customers".into(),
                     routine: false,
@@ -5388,6 +5439,7 @@ name = \"accounts\"
                     bars: Vec::new(),
                 },
                 StoredObject {
+                    database: None,
                     schema: "public".into(),
                     name: "customers".into(),
                     routine: false,
@@ -5430,6 +5482,7 @@ name = \"accounts\"
         // have to survive the file -- values with a quote and a separator in
         // them included.
         let object = StoredObject {
+            database: None,
             schema: "public".into(),
             name: "customers".into(),
             routine: false,
