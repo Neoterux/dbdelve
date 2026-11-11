@@ -683,6 +683,9 @@ pub(crate) struct Session {
     /// The tab a close is asking about, because it holds cell edits nobody
     /// has applied.
     pub(crate) pending_discard: Option<PendingDiscard>,
+    /// The question turning auto-commit back on asks while a transaction is
+    /// open: commit it, roll it back, or leave it.
+    pub(crate) auto_commit_prompt: Option<AutoCommitPrompt>,
     pub(crate) notice: Option<String>,
     /// What a statement's run cost beyond its result (`QueryResult::notice`),
     /// said only while the tab it ran on is in front, under any `notice`.
@@ -1148,6 +1151,7 @@ impl Session {
             query_rename: None,
             query_rename_needs_focus: false,
             pending_discard: None,
+            auto_commit_prompt: None,
             notice,
             tab_notice: None,
             apply_review: None,
@@ -1551,6 +1555,7 @@ impl Session {
         self.query_rename = None;
         self.query_rename_needs_focus = false;
         self.pending_discard = None;
+        self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;
         // A stopped statement must not survive a tab or profile switch and get
@@ -1606,6 +1611,12 @@ pub(crate) enum PendingDelete {
 pub(crate) struct PendingDiscard {
     pub(crate) tab: Tab,
     pub(crate) deleting: Option<String>,
+}
+
+/// The question Auto asks while a transaction is open, and whether its list
+/// of the statements that transaction has run is open.
+pub(crate) struct AutoCommitPrompt {
+    pub(crate) statements_shown: bool,
 }
 
 /// What takes focus when a surface comes to the front. A buffer, a field and a
