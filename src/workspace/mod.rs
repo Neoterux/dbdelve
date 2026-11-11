@@ -2031,6 +2031,11 @@ impl Render for Workspace {
                 .px(px(layout::SPACE_MD))
                 .bg(t.data_glass())
                 .children(inline_status)
+                // The control ends a transaction, so it takes its room before
+                // either side shares the rest. One that overflows its group is
+                // painted under whatever comes after it, and that element
+                // takes the click.
+                .children(transaction)
                 .child(
                     div()
                         .flex_1()
@@ -2038,7 +2043,6 @@ impl Render for Workspace {
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
-                        .children(transaction)
                         .children(view_sorting)
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
@@ -2069,10 +2073,18 @@ impl Render for Workspace {
                 // Each control appears only when it does something. A pair
                 // of buttons that do nothing is a pair to read past --
                 // see `apply_edits` for its `cmd+s` binding.
+                //
+                // Its box holds its content, because a `justify_end` group
+                // narrower than its controls spills them leftward over paging
+                // and the transaction control.
+                //
+                // ponytail: below the width that fits the control, paging and
+                // this cluster, the bar runs off its right edge and the
+                // rightmost controls are out of reach. The upgrade is an
+                // overflow menu for the cluster.
                 .child(
                     div()
                         .flex_1()
-                        .min_w_0()
                         .justify_end()
                         .flex()
                         .items_center()
