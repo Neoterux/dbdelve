@@ -1334,6 +1334,213 @@ mod tests {
             .collect()
     }
 
+    const BEFORE_RELATIONS: &str = r#"
+SELECT TABLE_SCHEMA AS schema_name,
+       TABLE_NAME AS relation_name,
+       CASE TABLE_TYPE
+           WHEN 'BASE TABLE' THEN 'table'
+           WHEN 'VIEW' THEN 'view'
+       END AS relation_kind
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+ORDER BY TABLE_SCHEMA, TABLE_NAME
+"#;
+
+    const BEFORE_SIZES: &str = r#"
+SELECT TABLE_SCHEMA AS schema_name,
+       TABLE_NAME AS relation_name,
+       DATA_LENGTH + INDEX_LENGTH AS size_bytes,
+       TABLE_ROWS AS row_estimate
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND TABLE_TYPE = 'BASE TABLE'
+"#;
+
+    const BEFORE_ROUTINES: &str = r#"
+SELECT routine.ROUTINE_SCHEMA AS schema_name,
+       routine.ROUTINE_NAME AS routine_name,
+       CASE routine.ROUTINE_TYPE
+           WHEN 'FUNCTION' THEN 'function'
+           WHEN 'PROCEDURE' THEN 'procedure'
+       END AS routine_kind,
+       COALESCE((
+           SELECT GROUP_CONCAT(
+                      CONCAT_WS(' ', parameter.PARAMETER_NAME, parameter.DTD_IDENTIFIER)
+                      ORDER BY parameter.ORDINAL_POSITION
+                      SEPARATOR ', '
+                  )
+           FROM information_schema.PARAMETERS AS parameter
+           WHERE parameter.SPECIFIC_SCHEMA = routine.ROUTINE_SCHEMA
+             AND parameter.SPECIFIC_NAME = routine.SPECIFIC_NAME
+             -- Position zero is a function's return value, not an argument.
+             AND parameter.ORDINAL_POSITION > 0
+       ), '') AS identity_arguments,
+       COALESCE(routine.DTD_IDENTIFIER, '') AS result_type,
+       LOWER(COALESCE(routine.ROUTINE_BODY, '')) AS language,
+       COALESCE(routine.ROUTINE_DEFINITION, '') AS definition
+FROM information_schema.ROUTINES AS routine
+WHERE routine.ROUTINE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND routine.ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')
+ORDER BY routine.ROUTINE_SCHEMA, routine.ROUTINE_NAME
+"#;
+
+    const BEFORE_SEQUENCES: &str = r#"
+SELECT TABLE_SCHEMA AS schema_name,
+       TABLE_NAME AS sequence_name
+FROM information_schema.TABLES
+WHERE TABLE_TYPE = 'SEQUENCE'
+  AND TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+ORDER BY 1, 2
+"#;
+
+    #[test]
+    fn an_unfiltered_catalog_statement_is_byte_identical_to_the_one_before_the_filter() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert_eq!(relations_sql(engine, None), BEFORE_RELATIONS);
+            assert_eq!(sizes_sql(engine, None), BEFORE_SIZES);
+            assert_eq!(routines_sql(engine, None), BEFORE_ROUTINES);
+            assert_eq!(sequences_sql(engine, None), BEFORE_SEQUENCES);
+            for sql in [
+                relations_sql(engine, None),
+                sizes_sql(engine, None),
+                routines_sql(engine, None),
+                sequences_sql(engine, None),
+            ] {
+                assert!(!sql.contains("{only}"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_matched_names_reach_the_statement_quoted_by_the_engine() {
+        let names = ["a'b".to_string(), "c\\d".to_string()];
+        let relations = relations_sql(Engine::MySql, Some(&names));
+        assert!(
+            relations.contains("AND TABLE_SCHEMA IN ('a''b', 'c\\\\d')"),
+            "{relations}"
+        );
+        assert!(
+            routines_sql(Engine::MySql, Some(&names)).contains("AND routine.ROUTINE_SCHEMA IN ("),
+        );
+        assert!(sizes_sql(Engine::MariaDb, Some(&names)).contains("AND TABLE_SCHEMA IN ("));
+        assert!(sequences_sql(Engine::MariaDb, Some(&names)).contains("AND TABLE_SCHEMA IN ("));
+
+        let matched = ["dbdelve_archive".to_string()];
+        for sql in [
+            relations_sql(Engine::MySql, Some(&matched)),
+            sizes_sql(Engine::MySql, Some(&matched)),
+            routines_sql(Engine::MySql, Some(&matched)),
+            sequences_sql(Engine::MariaDb, Some(&matched)),
+        ] {
+            assert!(sql.contains("'dbdelve_archive'"), "{sql}");
+            assert!(!sql.contains("dbdelve_arch*"), "{sql}");
+            assert!(!sql.contains("{only}"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_in_list_keeps_the_server_order_and_each_listed_spelling_once() {
+        let names = ["Zed".to_string(), "Ab".to_string(), "ab".to_string()];
+        assert!(
+            relations_sql(Engine::MySql, Some(&names)).contains("IN ('Zed', 'Ab', 'ab')"),
+            "case-sensitive servers keep both spellings"
+        );
+    }
+
+    /// One test over both servers: the filter is matched in Rust against the
+    /// server's own listing, so only a listed name reaches a statement, and a
+    /// match of nothing sends none (an empty `IN ()` is error 1064).
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_include_list_reads_only_the_listed_databases() {
+        use crate::db::{Include, Levels, Shown};
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let connection = live(engine);
+            let listed = connection.databases().expect("databases should list");
+            let user_databases = listed
+                .names
+                .iter()
+                .filter(|name| !engine.is_system_database(name))
+                .count();
+            let shown = |entries: &[&str]| {
+                Include {
+                    databases: entries.iter().map(|entry| (*entry).to_string()).collect(),
+                    ..Include::default()
+                }
+                .resolve(Levels::DatabaseIsSchema, None, None)
+            };
+
+            let archive = shown(&["dbdelve_arch*"]);
+            let catalog = connection.catalog(&archive).expect("catalog should load");
+            let schema_names = catalog
+                .schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(schema_names, ["dbdelve_archive"], "{engine:?}");
+            assert_eq!(catalog.left_out, user_databases - 1, "{engine:?}");
+            let routines = connection.routines(&archive).expect("routines should load");
+            assert!(
+                routines
+                    .schemas
+                    .iter()
+                    .all(|schema| schema.name == "dbdelve_archive"),
+                "{engine:?}"
+            );
+            let sequences = connection
+                .sequences(&archive)
+                .expect("sequences should load");
+            assert!(
+                sequences
+                    .schemas
+                    .iter()
+                    .all(|schema| schema.name == "dbdelve_archive"),
+                "{engine:?}"
+            );
+            let sizes = connection.sizes(&archive).expect("sizes should load");
+            assert!(
+                sizes.keys().all(|schema| schema == "dbdelve_archive"),
+                "{engine:?}: {:?}",
+                sizes.keys().collect::<Vec<_>>()
+            );
+            assert!(!sizes.is_empty(), "{engine:?}");
+
+            let nothing = shown(&["no_such*"]);
+            let catalog = connection
+                .catalog(&nothing)
+                .expect("a match of nothing is an empty catalog, not error 1064");
+            assert!(catalog.schemas.is_empty(), "{engine:?}");
+            assert_eq!(catalog.left_out, user_databases, "{engine:?}");
+            assert!(
+                connection
+                    .routines(&nothing)
+                    .expect("no routines statement is sent")
+                    .schemas
+                    .is_empty()
+            );
+            assert!(
+                connection
+                    .sizes(&nothing)
+                    .expect("no sizes statement is sent")
+                    .is_empty()
+            );
+
+            let all = connection
+                .catalog(&Shown::everything())
+                .expect("catalog should load");
+            let all_names = all
+                .schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(all_names.contains(&"dbdelve_dev"), "{engine:?}");
+            assert!(all_names.contains(&"dbdelve_archive"), "{engine:?}");
+            assert_eq!(all.left_out, 0, "{engine:?}");
+        }
+    }
+
     fn probed(columns: &[(Option<&str>, Option<&str>)]) -> Vec<ProbedColumn> {
         columns
             .iter()
