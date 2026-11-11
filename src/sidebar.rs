@@ -2669,4 +2669,118 @@ mod tests {
         assert_eq!(rows[0], connection_row("c"));
         assert_eq!(rows[1], "folder-0", "what is dropped is the latest");
     }
+
+    #[test]
+    fn a_folded_loaded_row_carries_one_inert_row_and_no_descendants() {
+        let listed = || {
+            vec![database_listed(
+                "a",
+                content_with_shortcuts("d", ""),
+                Levels::DatabaseThenSchema,
+                "d",
+            )]
+        };
+        let (database, schema) = (
+            database_row("a", "d"),
+            scoped_row("a", Some("d"), "schema-main"),
+        );
+        let mut folds = HashMap::from([(connection_row("a"), true)]);
+        let folded = build(&[], listed(), &folds);
+
+        let row = find(&folded.items, &database);
+        assert!(!row.is_expanded());
+        let inert = format!("{database}/folded");
+        assert_eq!(row_ids(&row.children), [inert.as_str()]);
+        assert!(row.children[0].is_disabled());
+        assert!(matches!(folded.nodes.get(&inert), Some(Node::Notice)));
+        assert!(
+            search(&folded.items, &schema).is_none(),
+            "what is under a folded row is not built as rows"
+        );
+        assert!(
+            folded.nodes.contains_key(&schema),
+            "though it is still a row a selection or a reveal can name"
+        );
+        assert_eq!(
+            count_of(&folded, &database),
+            Some(1),
+            "and it is counted from the whole content, not from what is drawn"
+        );
+
+        folds.insert(database.clone(), true);
+        let opened = build(&[], listed(), &folds);
+        assert_eq!(
+            row_ids(&find(&opened.items, &database).children),
+            [schema.as_str()],
+            "opened, it is built with its rows, folded in their turn"
+        );
+        assert!(!find(&opened.items, &schema).is_expanded());
+        assert_eq!(
+            row_ids(&find(&opened.items, &schema).children),
+            [format!("{schema}/folded")]
+        );
+    }
+
+    #[test]
+    fn ten_folded_connections_of_five_thousand_relations_build_one_row_each() {
+        let names: Vec<String> = (0..5000).map(|at| format!("t{at}")).collect();
+        let listed: Vec<Listed<'_>> = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"]
+            .into_iter()
+            .map(|id| {
+                let relations = names
+                    .iter()
+                    .map(|name| relation(name, RelationKind::Table, None))
+                    .collect();
+                listed(
+                    id,
+                    id,
+                    Content::Loaded(content_of(vec![schema("main", relations)])),
+                )
+            })
+            .collect();
+        let tree = built(listed);
+
+        assert_eq!(tree.items.len(), 10);
+        for item in &tree.items {
+            assert_eq!(item.children.len(), 1, "{} holds one inert row", item.id);
+            assert!(item.children[0].is_disabled());
+        }
+        assert!(
+            all_ids(&tree.items).len() < 100,
+            "ten folded connections are twenty rows, not fifty thousand"
+        );
+        assert_eq!(
+            count_of(&tree, &connection_row("c0")),
+            None,
+            "a flat connection counts nothing, as it did"
+        );
+    }
+
+    #[test]
+    fn a_typed_filter_builds_every_matching_row_open_whatever_was_folded() {
+        let listed = vec![listed(
+            "a",
+            "a",
+            Content::Loaded(tables(&["birds", "flocks"], "bir")),
+        )];
+        let tree = filtered(&[], listed, "bir");
+        let (schema, category) = (
+            scoped_row("a", None, "schema-main"),
+            scoped_row("a", None, "category-Tables-main"),
+        );
+        let birds = scoped_row("a", None, &explorer::relation_row("main", "birds"));
+        for row in [connection_row("a"), schema, category] {
+            assert!(find(&tree.items, &row).is_expanded(), "{row} is open");
+        }
+        assert!(
+            search(&tree.items, &birds).is_some(),
+            "the match is built, not folded away"
+        );
+        assert!(
+            all_ids(&tree.items)
+                .iter()
+                .all(|id| !id.ends_with("/folded")),
+            "nothing is pruned while text is typed"
+        );
+    }
 }
