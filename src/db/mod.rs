@@ -2183,8 +2183,9 @@ impl Connection {
         }
     }
 
-    /// The stored functions and procedures, as a catalog holding nothing else,
-    /// for [`Catalog::merge`] to fold into the one already on screen.
+    /// The stored functions and procedures, and the sequences of an engine
+    /// that lists them, as a catalog holding nothing else, for
+    /// [`Catalog::merge`] to fold into the one already on screen.
     pub fn routines(&self) -> Result<Catalog, DbError> {
         match self {
             Self::Postgres(connection) => connection.routines(),
@@ -2192,7 +2193,11 @@ impl Connection {
             Self::SqlServer(connection) => connection.routines(),
             Self::Sqlite(connection) => connection.routines(),
             Self::Turso(connection) => connection.routines(),
-            Self::DuckDb(connection) => connection.routines(),
+            Self::DuckDb(connection) => {
+                with_sequences(Engine::DuckDb, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::Snowflake(connection) => connection.routines(),
             Self::ClickHouse(_) => Ok(Catalog::default()),
             Self::MongoDb(connection) => connection.routines(),
@@ -2876,8 +2881,9 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Fold a later half into this one: the routines of a schema already here
-    /// join it, and a schema that holds only routines is added in its place.
+    /// Fold a later half into this one: the routines and sequences of a schema
+    /// already here join it, and a schema that holds only those is added in its
+    /// place.
     ///
     /// Assembled by name rather than by position, because the two halves are
     /// separate queries and a schema can appear in either alone -- one holding
@@ -2894,14 +2900,30 @@ impl Catalog {
                 .iter_mut()
                 .find(|existing| existing.name == schema.name)
             {
-                Some(existing) => existing.routines = schema.routines,
+                Some(existing) => {
+                    existing.routines = schema.routines;
+                    existing.sequences = schema.sequences;
+                }
                 None => self.schemas.push(schema),
             }
         }
     }
 
-    /// Put each schema's sequences on the schema of that name here.
-    pub fn join_sequences(&mut self, _sequences: Self) {}
+    /// Put each schema's sequences on the schema of that name here, pushing a
+    /// schema it does not hold, so [`Self::merge`] later brings in one that
+    /// holds only sequences.
+    pub fn join_sequences(&mut self, sequences: Self) {
+        for schema in sequences.schemas {
+            match self
+                .schemas
+                .iter_mut()
+                .find(|existing| existing.name == schema.name)
+            {
+                Some(existing) => existing.sequences = schema.sequences,
+                None => self.schemas.push(schema),
+            }
+        }
+    }
 
     /// Write sizes and row estimates onto the relations already here, leaving
     /// any it has no number for alone. It touches nothing but those and
@@ -3459,12 +3481,46 @@ impl std::error::Error for DbError {}
 
 /// The second half of the catalog: the routines, with the sequences joined
 /// in where the engine lists them.
+///
+/// A failed sequence read lists none and keeps the routines. The catalogs that
+/// hold sequences are readable by every role on every engine that lists them,
+/// so what fails is a server that has none (SQL Server before 2012 has no
+/// `sys.sequences`), and an empty list is then the true one.
 fn with_sequences(
-    _engine: Engine,
+    engine: Engine,
     routines: Result<Catalog, DbError>,
-    _sequences: impl FnOnce() -> Result<Catalog, DbError>,
+    sequences: impl FnOnce() -> Result<Catalog, DbError>,
 ) -> Result<Catalog, DbError> {
-    routines
+    let mut second = routines?;
+    if Target::built_in(engine).abilities().lists_sequences
+        && let Ok(sequences) = sequences()
+    {
+        second.join_sequences(sequences);
+    }
+    Ok(second)
+}
+
+/// Sequence rows, `schema_name` and `sequence_name`, grouped by schema in the
+/// order the server gave them, as a catalog holding nothing else.
+pub(super) fn assemble_sequences(result: QueryResult) -> Result<Catalog, DbError> {
+    let mut schemas = Vec::<Schema>::new();
+    for row in &result.rows {
+        let schema_name = required_cell(&result, row, "schema_name")?;
+        let name = required_cell(&result, row, "sequence_name")?.to_string();
+        match schemas.last_mut() {
+            Some(last) if last.name == schema_name => last.sequences.push(name),
+            _ => schemas.push(Schema {
+                name: schema_name.to_string(),
+                relations: Vec::new(),
+                routines: Vec::new(),
+                sequences: vec![name],
+            }),
+        }
+    }
+    Ok(Catalog {
+        schemas,
+        database: None,
+    })
 }
 
 pub(super) fn assemble_catalog(
