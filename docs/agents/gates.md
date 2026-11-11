@@ -76,9 +76,11 @@ where the user can read it:
   session and offers Commit, Roll Back or Cancel. On Commit or Roll Back it
   appends a plain `COMMIT` or `ROLLBACK` to the buffer, runs it from there and
   opens no next transaction, then the switch reads on once that statement has
-  succeeded (`Session::auto_after_end`); one that fails puts the transaction
-  and its list back, leaves auto-commit off and the dialog can be asked
-  again. dbdelve still never
+  succeeded (`Session::auto_after_end`); one that fails leaves auto-commit
+  off, and puts the transaction and its list back only where the engine keeps
+  a transaction whose end failed (`Engine::failed_end_keeps_transaction`:
+  SQLite, unless it says none was active), because a profile reading "open"
+  over a session that is not is a flag no `COMMIT` can clear. dbdelve still never
   picks between committing the user's work and discarding it: the user does,
   and Cancel leaves both alone. Manual's own Commit and Roll Back keep sending
   the next `BEGIN` with them, for the reason above, so the dialog's end is the

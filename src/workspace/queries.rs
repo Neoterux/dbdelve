@@ -2339,9 +2339,9 @@ impl Workspace {
         // Not a bound tab's: what it leaves is left on the session of its
         // database, which is not the profile's own.
         // What a lone COMMIT or ROLLBACK cleared, kept to put back when it
-        // fails: it is read off what was sent, not off what the server did,
-        // and a failed COMMIT (SQLite's `SQLITE_BUSY`) leaves the transaction
-        // open.
+        // fails where the engine keeps the transaction (SQLite's
+        // `SQLITE_BUSY`): it is read off what was sent, not off what the
+        // server did.
         let mut ended = None;
         if !generated
             && binding.is_none()
@@ -2685,9 +2685,16 @@ impl Workspace {
                         // end the block: whether the end really ended anything
                         // is only known now.
                         let ended_ok = result.is_ok();
+                        // Put back only where the engine says the failed end
+                        // left the transaction open; a guess would keep a
+                        // flag no COMMIT could clear, or offer a Roll Back
+                        // for work the server had already rolled back.
                         if let Some(statements) = ended
-                            && !ended_ok
                             && !lost
+                            && result
+                                .as_ref()
+                                .err()
+                                .is_some_and(|error| engine.failed_end_keeps_transaction(&error.message))
                         {
                             profile.in_transaction = true;
                             profile.transaction_statements = statements;
