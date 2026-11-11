@@ -838,6 +838,19 @@ impl Connection {
         self.submit(sql, Cancellable::Yes(cancel), fetch, schema.as_deref())
     }
 
+    /// [`Self::query_with`] in `schema` of the database this session was
+    /// opened on, for a tab bound to them: both ride on the request, so
+    /// nothing a tab or the session's own active schema holds can move it.
+    pub fn query_bound(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        cancel: &CancelToken,
+        fetch: Fetch,
+    ) -> Result<QueryResult, DbError> {
+        self.submit(sql, Cancellable::Yes(cancel), fetch, schema)
+    }
+
     /// [`Self::query_with`] outside the active schema, for a statement dbdelve
     /// wrote for the user to run: a relation's preview or an applied edit.
     pub fn generated(
