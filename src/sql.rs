@@ -10270,6 +10270,33 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_or_rollback_anywhere_in_a_submission_ends_its_transaction() {
+        for (engine, statement) in [
+            (Engine::Postgres, "COMMIT"),
+            (Engine::Postgres, "ROLLBACK"),
+            (Engine::Postgres, "COMMIT;\n\nBEGIN;"),
+            (Engine::Postgres, "ROLLBACK;\n\nBEGIN;"),
+            (Engine::MySql, "COMMIT;\n\nBEGIN;"),
+            (Engine::SqlServer, "COMMIT TRANSACTION"),
+        ] {
+            assert!(ends_transaction(engine, statement), "{statement}");
+        }
+        for (engine, statement) in [
+            (Engine::Postgres, "BEGIN"),
+            (Engine::Postgres, "ROLLBACK TO SAVEPOINT a"),
+            (Engine::Postgres, "SELECT 1"),
+            (Engine::Postgres, "COMMIT\nselec 1"),
+            (Engine::Redis, "EXEC"),
+            (Engine::Snowflake, "COMMIT"),
+        ] {
+            let ended = ends_transaction(engine, statement);
+            // Snowflake's requests are stateless: no session holds a
+            // transaction there for a submission to end.
+            assert!(!ended, "{statement}");
+        }
+    }
+
+    #[test]
     fn only_an_open_transaction_or_a_changed_session_is_left_behind() {
         let open = Leaves {
             transaction: Some(true),

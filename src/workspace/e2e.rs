@@ -16390,3 +16390,60 @@ fn the_open_transactions_statements_are_recorded_from_its_begin_to_its_end(
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transaction_ended(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        run_in_front(&workspace, cx, "INSERT INTO t VALUES (1)");
+        assert_eq!(recorded_statements(&workspace, cx).len(), 2);
+
+        // As a BEGIN the server warns about and ignores would arrive: the
+        // transaction it sits in is still open, and its COMMIT still ends
+        // everything before it.
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .profile_mut()
+                .unwrap()
+                .record_sent("BEGIN", Some(true));
+        });
+        assert_eq!(
+            recorded_statements(&workspace, cx),
+            ["BEGIN", "INSERT INTO t VALUES (1)", "BEGIN"],
+            "a BEGIN that ends nothing is appended"
+        );
+
+        // A COMMIT and a BEGIN in one submission: the open transaction ended.
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .profile_mut()
+                .unwrap()
+                .record_sent("COMMIT;\n\nBEGIN;", Some(true));
+        });
+        assert_eq!(
+            recorded_statements(&workspace, cx),
+            ["COMMIT;\n\nBEGIN;"],
+            "a submission that ends one and opens the next starts the record again"
+        );
+        run_in_front(&workspace, cx, "ROLLBACK");
+        assert!(recorded_statements(&workspace, cx).is_empty());
+
+        // Manual's own reopen, as the controls send it.
+        cx.dispatch_action(crate::actions::ToggleAutoCommit);
+        settle(cx);
+        assert_eq!(recorded_statements(&workspace, cx), ["BEGIN"], "Manual");
+        run_in_front(&workspace, cx, "INSERT INTO t VALUES (2)");
+        assert_eq!(recorded_statements(&workspace, cx).len(), 2);
+        cx.dispatch_action(crate::actions::CommitTransaction);
+        settle(cx);
+        assert_eq!(
+            recorded_statements(&workspace, cx),
+            ["COMMIT;\n\nBEGIN;"],
+            "Manual's COMMIT and reopen leave exactly that submission"
+        );
+        quit(workspace, cx);
+    });
+}
