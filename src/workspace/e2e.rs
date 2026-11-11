@@ -14633,3 +14633,53 @@ fn no_node_action_sends_a_generated_statement(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_palette_row_acts_on_the_connection_of_the_node_it_was_built_for(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "create table birds (name text);",
+            "view_mode = \"complex\"",
+            &format!(
+                "{}{}",
+                sqlite_profile("a", "Birds", ""),
+                sqlite_profile("b", "Flocks", ""),
+            ),
+        );
+        for id in [
+            connection_row("b"),
+            scoped_row("b", None, "schema-main"),
+            scoped_row("b", None, "category-Tables-main"),
+        ] {
+            let at = connections_row(&workspace, cx, &id).expect("the row is showing");
+            click_connections_row(cx, at);
+        }
+        // Selected by arrowing to it, which opens nothing and moves nothing.
+        let birds = scoped_row("b", None, &explorer::relation_row("main", "birds"));
+        workspace.update(cx, |workspace, cx| {
+            let tree = workspace.connections.tree.clone();
+            tree.update(cx, |tree, cx| {
+                let at = tree.index_of(&birds.clone().into());
+                tree.set_selected_index(at, cx);
+            });
+        });
+        settle(cx);
+        assert_eq!(front_profile(&workspace, cx), "a");
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Show DDL");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        assert_eq!(
+            front_profile(&workspace, cx),
+            "b",
+            "the node's connection is in front once the row acts"
+        );
+        press(cx, "escape");
+        quit(workspace, cx);
+    });
+}

@@ -295,8 +295,21 @@ impl Workspace {
     }
 
     /// The node the sidebar has selected, in whichever tree is drawn.
-    pub(crate) fn selected_node(&self, _cx: &App) -> Option<SelectedNode> {
-        None
+    pub(crate) fn selected_node(&self, cx: &App) -> Option<SelectedNode> {
+        if self.view_mode() == model::ViewMode::Complex {
+            let id = self.connections.tree.read(cx).selected_item()?.id.clone();
+            return self.connections_node(&id);
+        }
+        let profile = self.profile()?;
+        let id = profile
+            .session
+            .explorer_tree
+            .read(cx)
+            .selected_item()?
+            .id
+            .clone();
+        let leaf = profile.session.explorer_leaves.get(id.as_ref()).copied();
+        self.row_node(&profile.id, None, &id, leaf)
     }
 
     /// What the connections tree's row `id` is, if it is a node an action
