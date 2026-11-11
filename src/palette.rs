@@ -1522,6 +1522,15 @@ impl Palette {
         self.items.iter().map(|item| item.label.as_str()).collect()
     }
 
+    /// Each row's label with the detail drawn beside it.
+    #[cfg(test)]
+    pub fn labels_with_details(&self) -> Vec<(&str, Option<&str>)> {
+        self.items
+            .iter()
+            .map(|item| (item.label.as_str(), item.detail.as_deref()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn history(&self) -> HistoryView {
         self.history
