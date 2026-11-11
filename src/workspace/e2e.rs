@@ -17,7 +17,8 @@ use crate::{
     connection_form::ConnectionForm,
     db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, RelationKind, SshTunnel},
     explain::analysis::Basis,
-    explorer, keybindings,
+    explorer::{self, ObjectKind},
+    keybindings,
     palette::{Command, Mode as PaletteMode, Scope},
     session::{CatalogState, ObjectBody, ProfileState, QueryState, QueryTab, Tab},
     sidebar::{
@@ -2991,7 +2992,13 @@ fn show_ddl_opens_a_read_only_view_of_a_tables_definition_and_hands_the_keyboard
         assert!(editor_has_keyboard(&workspace, cx));
 
         workspace.update(cx, |workspace, cx| {
-            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+            workspace.show_ddl(
+                None,
+                "main".into(),
+                "birds".into(),
+                ObjectKind::Relation(RelationKind::Table),
+                cx,
+            )
         });
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
@@ -3150,7 +3157,13 @@ fn show_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestApp
         let shown = |database: Option<&str>, cx: &mut VisualTestContext| {
             let database = database.map(str::to_string);
             workspace.update(cx, |workspace, cx| {
-                workspace.show_ddl(database, "main".into(), "t".into(), RelationKind::Table, cx)
+                workspace.show_ddl(
+                    database,
+                    "main".into(),
+                    "t".into(),
+                    ObjectKind::Relation(RelationKind::Table),
+                    cx,
+                )
             });
             settle(cx);
             let text = ddl_text(&workspace, cx).expect("the dialog holds a definition");
@@ -3231,7 +3244,13 @@ fn the_diagram_shows_a_tables_keys_and_targets_and_sends_no_new_statement(cx: &m
         };
         let before = history(cx);
         workspace.update(cx, |workspace, cx| {
-            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+            workspace.show_ddl(
+                None,
+                "main".into(),
+                "birds".into(),
+                ObjectKind::Relation(RelationKind::Table),
+                cx,
+            )
         });
         settle(cx);
         assert!(cx.debug_bounds("show-ddl-text").is_some(), "SQL first");
@@ -3262,7 +3281,13 @@ fn the_diagram_choice_is_offered_only_for_an_object_with_columns(cx: &mut TestAp
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
         workspace.update(cx, |workspace, cx| {
-            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+            workspace.show_ddl(
+                None,
+                "main".into(),
+                "birds".into(),
+                ObjectKind::Relation(RelationKind::Table),
+                cx,
+            )
         });
         settle(cx);
         assert!(cx.debug_bounds("show-ddl-diagram-choice").is_some());
@@ -3294,7 +3319,13 @@ fn the_diagram_reads_another_databases_structure_over_its_session(cx: &mut TestA
         let columns = |database: Option<&str>, cx: &mut VisualTestContext| {
             let database = database.map(str::to_string);
             workspace.update(cx, |workspace, cx| {
-                workspace.show_ddl(database, "main".into(), "t".into(), RelationKind::Table, cx)
+                workspace.show_ddl(
+                    database,
+                    "main".into(),
+                    "t".into(),
+                    ObjectKind::Relation(RelationKind::Table),
+                    cx,
+                )
             });
             settle(cx);
             choose_in_ddl_dialog(cx, "show-ddl-diagram-choice");
