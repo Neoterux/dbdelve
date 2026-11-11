@@ -15047,11 +15047,12 @@ fn copy_names_and_copy_ddl_cover_every_selected_table(cx: &mut TestAppContext) {
         two_tables_selected(&workspace, cx);
         let at = connections_row(&workspace, cx, &table_row("a", "birds")).unwrap();
 
-        // Open All, Copy Names, Copy DDL, Show DDL, Pin, Refresh.
-        pick_from_connections_menu(cx, at, 2);
+        // The header, then Open All, Copy Names, Copy DDL, Show DDL, Pin and
+        // Refresh: the header is a row the keyboard stops at.
+        pick_from_connections_menu(cx, at, 3);
         assert_eq!(clipboard_text(cx), "birds\nflocks");
 
-        pick_from_connections_menu(cx, at, 3);
+        pick_from_connections_menu(cx, at, 4);
         settle(cx);
         assert_eq!(
             clipboard_text(cx),
@@ -15073,7 +15074,7 @@ fn show_ddl_on_a_selection_lists_each_definition_in_one_dialog(cx: &mut TestAppC
         two_tables_selected(&workspace, cx);
         let at = connections_row(&workspace, cx, &table_row("a", "birds")).unwrap();
 
-        pick_from_connections_menu(cx, at, 4);
+        pick_from_connections_menu(cx, at, 5);
         settle(cx);
         assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
         workspace.read_with(cx, |workspace, _| {
@@ -15233,7 +15234,11 @@ fn the_selection_survives_a_rebuild_and_drops_rows_that_are_gone(cx: &mut TestAp
         workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
         settle(cx);
         let (rows, tree_row) = selected_rows(&workspace, cx);
-        assert_eq!(rows, [birds.clone()], "a row that is gone drops out");
+        assert_eq!(
+            rows,
+            std::slice::from_ref(&birds),
+            "a row that is gone drops out"
+        );
         assert_eq!(
             tree_row.as_deref(),
             Some(birds.as_str()),

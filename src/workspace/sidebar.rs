@@ -20,7 +20,7 @@ use gpui_component::{
     tree::{TreeEvent, TreeState},
 };
 
-use super::forms::{MenuRow, explorer_menu, node_items};
+use super::forms::{MenuRow, explorer_menu, node_items, selection_menu};
 use super::profiles::{database_content, explorer_content};
 use super::*;
 use crate::db::{Levels, Syntax};
@@ -31,8 +31,8 @@ use crate::explorer::{
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::session::Binding;
 use crate::sidebar::{
-    self as model, Content, Listed, Node, NodeKind, SelectedNode, Selection, node_actions,
-    schema_row_is_a_database, shown_size,
+    self as model, Content, Listed, Node, NodeKind, SelectedNode, Selection, SelectionAction,
+    node_actions, schema_row_is_a_database, shown_size,
 };
 use crate::ui::{Status, row_icon_tinted, status_dot};
 
@@ -272,12 +272,21 @@ impl Workspace {
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
         self.connections.counts = Arc::new(built.counts);
+        // When the row the tree had is gone, one of the rows still selected
+        // is where it goes, so the selection is not left with none of its own.
+        let kept = self
+            .connections
+            .selection
+            .rows
+            .last()
+            .map(|id| SharedString::from(id.clone()));
         tree.update(cx, |tree, cx| {
             tree.set_items(built.items, cx);
             // A row the user moved to stays selected: a landing in the
             // background must not send Enter elsewhere.
             let row = selected
                 .and_then(|selected| tree.index_of(&selected))
+                .or_else(|| kept.and_then(|kept| tree.index_of(&kept)))
                 .or_else(|| front.and_then(|front| tree.index_of(&front)));
             tree.set_selected_index(row, cx);
         });
@@ -349,12 +358,48 @@ impl Workspace {
     }
 
     /// The nodes of those rows, in the order they were picked.
-    #[allow(dead_code)] // read by the selection's menu, which the next commit draws
     pub(crate) fn selected_nodes(&self, cx: &App) -> Vec<SelectedNode> {
-        self.selected_rows(cx)
-            .iter()
+        self.nodes_of(&self.selected_rows(cx))
+    }
+
+    /// The nodes of the rows `ids` that are nodes an action applies to.
+    fn nodes_of(&self, ids: &[String]) -> Vec<SelectedNode> {
+        ids.iter()
             .filter_map(|id| self.connections_node(id))
             .collect()
+    }
+
+    /// What every one of `nodes` offers: the menu's and the palette's list of
+    /// what a selection can do. Pin is withheld unless each is an object of
+    /// its connection's own database that a shortcut can hold.
+    pub(crate) fn selection_offers(&self, nodes: &[SelectedNode]) -> Vec<SelectionAction> {
+        let mut items = Vec::new();
+        for node in nodes {
+            let Some(profile) = self.profiles.iter().find(|found| found.id == node.profile) else {
+                return Vec::new();
+            };
+            items.push((node.kind, profile.config.target()));
+        }
+        let mut actions = model::selection_actions(&items);
+        let pinnable = |node: &SelectedNode| {
+            let own = self
+                .profiles
+                .iter()
+                .find(|found| found.id == node.profile)
+                .and_then(|found| found.active_database());
+            let elsewhere = node
+                .database
+                .as_ref()
+                .is_some_and(|database| own.as_ref() != Some(database));
+            !elsewhere
+                && node
+                    .leaf
+                    .is_some_and(|leaf| self.member_in(&node.profile, leaf.target).is_some())
+        };
+        if !nodes.iter().all(pinnable) {
+            actions.retain(|action| *action != SelectionAction::Pin);
+        }
+        actions
     }
 
     /// What a click on the connections tree's row `id` does with `modifiers`
@@ -625,13 +670,16 @@ impl Workspace {
             .collect();
         // The rows a modifier click gathered, which the tree does not know to
         // draw as selected: a lone row is the tree's own.
-        let gathered: HashSet<String> = Some(self.selected_rows(cx))
+        let selected = Arc::new(self.selected_rows(cx));
+        let gathered: HashSet<String> = Some(selected.as_slice())
             .filter(|rows| rows.len() > 1)
             .into_iter()
             .flatten()
+            .cloned()
             .collect();
         let menu_workspace = workspace.clone();
         let menu_shortcuts = shortcuts.clone();
+        let menu_selected = selected.clone();
         let (density, show_host, show_sizes) = (
             self.settings.density,
             self.settings.show_host,
@@ -935,6 +983,22 @@ impl Workspace {
                 return menu;
             };
             let state = entity.read(cx);
+            // A row of several selected is the menu of all of them.
+            // As of the last frame: the tree is being updated while its menu
+            // is built, so it cannot be read for its row.
+            let rows = &menu_selected;
+            if rows.len() > 1 && rows.iter().any(|row| row == id) {
+                let nodes = state.nodes_of(rows);
+                if nodes.len() == rows.len() {
+                    let kinds: Vec<_> = nodes.iter().map(|node| node.kind).collect();
+                    return selection_menu(
+                        menu,
+                        model::selection_header(&kinds),
+                        state.selection_offers(&nodes),
+                        &menu_workspace,
+                    );
+                }
+            }
             let Some(node) = state.connections_node(id) else {
                 return menu;
             };
