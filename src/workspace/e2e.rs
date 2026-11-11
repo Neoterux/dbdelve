@@ -14346,3 +14346,175 @@ fn the_connections_trees_object_menu_is_simple_modes_menu(cx: &mut TestAppContex
         quit(workspace, cx);
     });
 }
+
+/// The tabs of the connection in front, as the number of query tabs.
+fn query_tab_count(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().session.queries.len()
+    })
+}
+
+/// A right click on the simple tree's row `row`, `downs` items down its menu.
+fn pick_from_explorer_menu(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    row: &str,
+    downs: usize,
+) {
+    let at = explorer_row(workspace, row, cx).center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: at,
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Right,
+        click_count: 1,
+        first_mouse: false,
+    });
+    settle(cx);
+    for _ in 0..downs {
+        cx.simulate_keystrokes("down");
+    }
+    press(cx, "enter");
+}
+
+#[gpui::test]
+fn new_query_here_in_simple_mode_moves_the_schema_then_opens_a_tab(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA s2; CREATE TABLE s2.u (id INTEGER);",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx)
+        });
+        settle(cx);
+        let (before, schema) = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            (
+                profile.session.queries.len(),
+                profile.active_schema().map(str::to_string),
+            )
+        });
+        assert_eq!(schema.as_deref(), Some("main"));
+
+        // Set as Active Schema, then New Query Here.
+        pick_from_explorer_menu(&workspace, cx, "schema-s2", 2);
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert_eq!(profile.active_schema(), Some("s2"));
+            assert_eq!(
+                profile.session.queries.len(),
+                before + 1,
+                "a new tab opened"
+            );
+            let front = profile
+                .session
+                .active_query_tab()
+                .expect("the new tab is in front");
+            assert!(
+                front.binding.is_none(),
+                "unbound: the profile moved, not the tab"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn new_query_here_in_simple_mode_stops_when_the_database_cannot_move(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'wren');",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx)
+        });
+        settle(cx);
+        cx.simulate_input("select * from t");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().set_pending(
+                0,
+                1,
+                crate::result_grid::NewValue::Value("robin".into())
+            ));
+        });
+        let before = query_tab_count(&workspace, cx);
+
+        // No local engine draws its schema rows as databases, so the row's
+        // meaning is what the caller says it is.
+        let moved = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.move_to_schema_row("other".into(), true, window, cx)
+            })
+        });
+        assert!(!moved, "the database was not switched");
+        assert_eq!(query_tab_count(&workspace, cx), before);
+        workspace.read_with(cx, |workspace, _| {
+            let notice = workspace.profile().unwrap().session.notice.clone();
+            assert!(
+                notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.ends_with("so the database was not switched.")),
+                "{notice:?}"
+            );
+        });
+
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn refresh_on_another_database_rereads_it_over_its_session(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        let other = database_row("e2e", "other");
+        let at = connections_row(&workspace, cx, &other).expect("other is listed");
+        click_connections_row(cx, at);
+        let tables = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                match workspace.profile().unwrap().database_catalogs.get("other") {
+                    Some(CatalogState::Loaded(catalog, _)) => catalog
+                        .schemas
+                        .iter()
+                        .flat_map(|schema| schema.relations.iter().map(|r| r.name.clone()))
+                        .collect::<Vec<_>>(),
+                    _ => panic!("the catalog of `other` has not loaded"),
+                }
+            })
+        };
+        assert_eq!(tables(cx), ["t"]);
+        run_in_front(&workspace, cx, "CREATE TABLE other.main.fresh (id INTEGER)");
+        run_in_front(&workspace, cx, "CREATE TABLE fresh_own (id INTEGER)");
+        assert_eq!(tables(cx), ["t"], "nothing has read it again");
+
+        // New Query Here, Copy Name, Refresh.
+        let at = connections_row(&workspace, cx, &other).expect("other is listed");
+        pick_from_connections_menu(cx, at, 3);
+        settle(cx);
+        let mut listed = tables(cx);
+        listed.sort();
+        assert_eq!(listed, ["fresh", "t"]);
+        // Only that database was read: the connection's own is as it was.
+        workspace.read_with(cx, |workspace, _| {
+            let own = workspace.catalog().expect("the connection's own catalog");
+            let names: Vec<_> = own
+                .schemas
+                .iter()
+                .flat_map(|schema| schema.relations.iter().map(|r| r.name.as_str()))
+                .collect();
+            assert_eq!(names, ["t"]);
+        });
+        quit(workspace, cx);
+    });
+}
