@@ -16666,8 +16666,9 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
         });
         assert_eq!(
             recorded_statements(&workspace, cx),
-            ["COMMIT;\n\nBEGIN;"],
-            "a submission that ends one and opens the next starts the record again"
+            ["BEGIN;"],
+            "a submission that ends one and opens the next starts the record again \
+             with the new transaction's BEGIN, not the COMMIT that closed the old"
         );
         run_in_front(&workspace, cx, "ROLLBACK");
         assert!(recorded_statements(&workspace, cx).is_empty());
@@ -16682,8 +16683,8 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
         settle(cx);
         assert_eq!(
             recorded_statements(&workspace, cx),
-            ["COMMIT;\n\nBEGIN;"],
-            "Manual's COMMIT and reopen leave exactly that submission"
+            ["BEGIN;"],
+            "Manual's COMMIT and reopen leave only the BEGIN that opened the next transaction"
         );
         quit(workspace, cx);
     });

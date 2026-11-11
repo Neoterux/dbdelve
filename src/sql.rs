@@ -4772,6 +4772,27 @@ pub(crate) fn ends_transaction(engine: Engine, sql: &str) -> bool {
     })
 }
 
+/// What `sql` runs after the last statement that ends a transaction: all of
+/// it when none does or the text cannot be read, nothing when it ends on the
+/// end. What a submission leaves inside the transaction it opens, for a
+/// `COMMIT;` and `BEGIN;` sent as one is not part of the transaction after it.
+///
+/// Cut by [`Buffer::for_engine`], the same boundaries a run is cut at, with
+/// each piece read as [`ends_transaction`] reads a submission.
+pub(crate) fn after_last_end(engine: Engine, sql: &str) -> &str {
+    let buffer = Buffer::for_engine(engine, sql);
+    let statements = buffer.statements();
+    match statements
+        .iter()
+        .rposition(|range| ends_transaction(engine, &sql[range.clone()]))
+    {
+        Some(last) => statements
+            .get(last + 1)
+            .map_or("", |next| sql[next.start..].trim()),
+        None => sql,
+    }
+}
+
 impl Leaves {
     fn add(&mut self, statement: &Statement) {
         match statement {
@@ -10314,6 +10335,35 @@ mod tests {
             // Snowflake's requests are stateless: no session holds a
             // transaction there for a submission to end.
             assert!(!ended, "{statement}");
+        }
+    }
+
+    #[test]
+    fn only_what_follows_the_last_end_belongs_to_the_next_transaction() {
+        for (engine, sql, rest) in [
+            (Engine::Postgres, "COMMIT;\n\nBEGIN;", "BEGIN;"),
+            (Engine::Postgres, "ROLLBACK;\n\nBEGIN;", "BEGIN;"),
+            (Engine::MySql, "COMMIT;\n\nBEGIN;", "BEGIN;"),
+            (Engine::MariaDb, "COMMIT;\n\nBEGIN;", "BEGIN;"),
+            (Engine::Sqlite, "COMMIT;\n\nBEGIN;", "BEGIN;"),
+            (Engine::DuckDb, "COMMIT;\n\nBEGIN;", "BEGIN;"),
+            (
+                Engine::SqlServer,
+                "COMMIT;\n\nBEGIN TRANSACTION;",
+                "BEGIN TRANSACTION;",
+            ),
+            (
+                Engine::Postgres,
+                "INSERT INTO t VALUES (1); COMMIT; BEGIN; INSERT INTO t VALUES (2);",
+                "BEGIN; INSERT INTO t VALUES (2);",
+            ),
+            (Engine::Postgres, "COMMIT", ""),
+            (Engine::Postgres, "INSERT INTO t VALUES (1); COMMIT;", ""),
+            (Engine::Postgres, "BEGIN", "BEGIN"),
+            (Engine::Postgres, "SELECT 1; SELECT 2", "SELECT 1; SELECT 2"),
+            (Engine::Postgres, "selec 1", "selec 1"),
+        ] {
+            assert_eq!(after_last_end(engine, sql), rest, "{engine:?}: {sql}");
         }
     }
 
