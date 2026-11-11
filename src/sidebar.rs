@@ -92,12 +92,16 @@ impl ListingScope {
     }
 }
 
-/// The scope a project in front lists.
+/// The scope a project in front lists: its own choice, or `global` when it
+/// has none, when its choice is one this build cannot read, and when no
+/// project is in front.
 pub(crate) fn effective_listing_scope(
     global: ListingScope,
-    _project: Option<&StoredProject>,
+    project: Option<&StoredProject>,
 ) -> ListingScope {
-    global
+    project
+        .and_then(|project| ListingScope::parse(project.listing_scope.as_deref()))
+        .unwrap_or(global)
 }
 
 /// The row of connections that belong to no project, listed first while any
@@ -107,6 +111,12 @@ pub(crate) const NO_PROJECT_ROW: &str = "no-project";
 /// A project's row id. The name follows its length, as a folder's does.
 pub(crate) fn project_row(name: &str) -> String {
     format!("project:{}:{name}", name.len())
+}
+
+/// The row of the group a connection is in: a project's, or `None` for the
+/// connections in none.
+pub(crate) fn group_row(project: Option<&str>) -> String {
+    project.map_or_else(|| NO_PROJECT_ROW.to_string(), project_row)
 }
 
 /// A connection's row id, by the profile's id.
@@ -180,14 +190,21 @@ pub(crate) struct SidebarTree {
 /// connection in the order `listed` has it. Nothing is sorted, so two builds
 /// over the same input give the same rows.
 ///
+/// `scope` is which groups are listed. `Current` lists the connections of the
+/// group named by `current` (`None` is the connections in no project) and
+/// nothing else, with no group row over them, as the palette lists the
+/// current project's connections as one flat group. `All` lists every group,
+/// and a group starts open only when it is `current`.
+///
 /// `folds` is whether each row was open in the tree this one replaces, by
-/// row id, so a rebuild puts the user's folding back.
+/// row id, so a rebuild puts the user's folding back. It wins over every
+/// default.
 pub(crate) fn build(
     projects: &[StoredProject],
     listed: Vec<Listed<'_>>,
     folds: &HashMap<String, bool>,
-    _scope: ListingScope,
-    _current: Option<&str>,
+    scope: ListingScope,
+    current: Option<&str>,
 ) -> SidebarTree {
     let mut tree = SidebarTree::default();
     // One bucket per project, and the first for the connections in none. A
@@ -205,6 +222,14 @@ pub(crate) fn build(
         tree.items = buckets.swap_remove(0);
         return tree;
     }
+    if scope == ListingScope::Current {
+        let bucket = current
+            .and_then(|name| projects.iter().position(|project| project.name == name))
+            .map_or(0, |at| at + 1);
+        tree.items = buckets.swap_remove(bucket);
+        return tree;
+    }
+    let current_row = group_row(current);
     let mut buckets = buckets.into_iter();
     // A group with nothing in it is a row that only says so, which is wanted
     // of a project the user made and not of the absence of one.
@@ -217,7 +242,7 @@ pub(crate) fn build(
         }));
     for (id, label, members) in groups {
         tree.nodes.insert(id.clone(), Node::Group);
-        let open = folds.get(&id).copied().unwrap_or(true);
+        let open = folds.get(&id).copied().unwrap_or(id == current_row);
         tree.items.push(
             TreeItem::new(id, label.to_string())
                 .expanded(open)

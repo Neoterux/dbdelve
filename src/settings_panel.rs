@@ -191,6 +191,24 @@ fn setting_rows() -> Vec<SettingRow> {
             ],
         ),
         row(
+            SettingId::SidebarEveryConnection,
+            SettingsTab::General,
+            "Sidebar",
+            "Every connection in the sidebar",
+            "List every connection as a tree; a query opened from one of its \
+             rows with New Query Here stays on that row's connection, database \
+             and schema. Off, the sidebar shows the connection in front.",
+            &["sidebar", "tree", "connections", "project", "explorer"],
+        ),
+        row(
+            SettingId::SidebarCurrentProject,
+            SettingsTab::General,
+            "Sidebar",
+            "Only the current project",
+            "List only the connections of the project in front.",
+            &["sidebar", "tree", "connections", "project", "explorer"],
+        ),
+        row(
             SettingId::CheckForUpdates,
             SettingsTab::General,
             "Updates",
@@ -1185,7 +1203,7 @@ mod tests {
                 SettingId::Keybinding("sort_active_column"),
             ]
         );
-        assert_eq!(found("!keyboard").len(), 14);
+        assert_eq!(found("!keyboard").len(), 16);
     }
 
     #[test]

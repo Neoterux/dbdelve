@@ -29,6 +29,9 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) nodes: Arc<HashMap<String, Node>>,
     pub(crate) highlights: Arc<HashMap<String, Vec<Range<usize>>>>,
     pub(crate) shortcuts: Arc<HashMap<String, Shortcut>>,
+    /// The group the last build was made for, which `None` outer says is no
+    /// build yet. A build for another group opens that one.
+    group: Option<Option<String>>,
 }
 
 impl ConnectionsSidebar {
@@ -48,6 +51,7 @@ impl ConnectionsSidebar {
             nodes: Arc::default(),
             highlights: Arc::default(),
             shortcuts: Arc::default(),
+            group: None,
         }
     }
 }
@@ -67,7 +71,15 @@ impl Workspace {
             .filter(|entry| entry.depth() == 0)
             .map(|entry| entry.item().clone())
             .collect();
-        let folds = folds(&roots);
+        let mut folds = folds(&roots);
+        // The group in front starts open. What the last build left of its
+        // fold is only how it started, so it is let go when the front
+        // connection has moved to another group; a fold made in the group
+        // it stays in is kept.
+        let current = self.current_group().map(str::to_string);
+        if self.connections.group.as_ref() != Some(&current) {
+            folds.remove(&model::group_row(current.as_deref()));
+        }
         let selected = state.selected_item().map(|item| item.id.clone());
 
         let listed = self
@@ -93,8 +105,9 @@ impl Workspace {
             listed,
             &folds,
             self.listing_scope(),
-            self.current_group(),
+            current.as_deref(),
         );
+        self.connections.group = Some(current);
         let front = self.profile().map(|profile| {
             let row = profile
                 .front_row()

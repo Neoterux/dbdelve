@@ -1127,7 +1127,8 @@ fn front_profile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> S
 }
 
 /// Two SQLite profiles over one file holding `birds`, `b` in the Zoo project.
-fn two_connections(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+/// `a` is in front, so Zoo starts folded.
+fn two_connections_folded(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
     // Left alone, CI's live job puts a connection from `PG*` among these.
     crate::IGNORE_ENVIRONMENT.set(true);
     launch_connections(
@@ -1142,14 +1143,33 @@ fn two_connections(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTe
     )
 }
 
+/// `two_connections_folded` with Zoo opened, as a person opens it.
+fn two_connections(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let (workspace, cx) = two_connections_folded(cx);
+    let zoo = connections_row(&workspace, cx, &project_row("Zoo")).expect("Zoo is listed");
+    click_connections_row(cx, zoo);
+    (workspace, cx)
+}
+
 #[gpui::test]
 fn the_connections_tree_lists_every_connection_under_its_project_and_connects_one_on_expand(
     cx: &mut TestAppContext,
 ) {
     store::tests::with_home(|| {
-        let (workspace, cx) = two_connections(cx);
+        let (workspace, cx) = two_connections_folded(cx);
         let (a, b) = (connection_row("a"), connection_row("b"));
 
+        // The project in front starts open and every other one folded.
+        assert_eq!(
+            connections_rows(&workspace, cx),
+            [
+                (0, NO_PROJECT_ROW.to_string()),
+                (1, a.clone()),
+                (0, project_row("Zoo")),
+            ]
+        );
+        let zoo = connections_row(&workspace, cx, &project_row("Zoo")).unwrap();
+        click_connections_row(cx, zoo);
         assert_eq!(
             connections_rows(&workspace, cx),
             [
@@ -1327,7 +1347,7 @@ fn a_connect_that_fails_stays_on_its_own_row(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_connections_tree_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
-        let (workspace, cx) = two_connections(cx);
+        let (workspace, cx) = two_connections_folded(cx);
         assert!(!sidebar_has_keyboard(&workspace, cx));
 
         let selected = |cx: &mut VisualTestContext| {
@@ -11400,7 +11420,9 @@ fn switching_the_view_mode_moves_no_tab_and_no_connection(cx: &mut TestAppContex
 fn the_every_connection_switch_flips_the_sidebar_and_persists(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = zoo_and_a(cx, "");
-        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        // Tall enough to draw the General tab's rows, which are drawn only
+        // while in view.
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(2000.)));
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.show_settings(window, cx)
         });
