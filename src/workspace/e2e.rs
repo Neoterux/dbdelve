@@ -1467,6 +1467,77 @@ fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn typing_in_the_connections_filter_never_connects_or_loads_anything(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_connections(cx);
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
+        // `a` connected, with its schema opened; `b` never asked to load.
+        for id in [connection_row("a"), scoped_row("a", None, "schema-main")] {
+            let at = connections_row(&workspace, cx, &id).expect("the row is showing");
+            click_connections_row(cx, at);
+        }
+        assert_eq!(profile_state(&workspace, cx, "b"), "idle");
+        let type_in = |text: &str, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let filter = workspace.connections.filter.clone();
+                    filter.update(cx, |input, cx| input.set_value(text, window, cx));
+                });
+            });
+            settle(cx);
+        };
+        let shown = |cx: &mut VisualTestContext| connections_rows(&workspace, cx);
+        let before = shown(cx);
+        let state = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (
+                    workspace.next_generation,
+                    store::history("a").len(),
+                    store::history("b").len(),
+                )
+            })
+        };
+        let untouched = state(cx);
+        assert!(
+            before
+                .iter()
+                .any(|(_, id)| *id == scoped_row("a", None, "schema-main"))
+        );
+
+        // `birds` is a's; `b` is idle, named Flocks, and holds nothing loaded.
+        type_in("bir", cx);
+        let narrowed = shown(cx);
+        let birds = scoped_row("a", None, &explorer::relation_row("main", "birds"));
+        assert!(narrowed.iter().any(|(_, id)| *id == birds), "{narrowed:?}");
+        assert!(!narrowed.iter().any(|(_, id)| *id == connection_row("b")));
+        assert_eq!(profile_state(&workspace, cx, "b"), "idle");
+        assert_eq!(state(cx), untouched);
+
+        // An idle connection is kept by its own name, and still not loaded.
+        type_in("flo", cx);
+        assert!(
+            shown(cx).iter().any(|(_, id)| *id == connection_row("b")),
+            "{:?}",
+            shown(cx)
+        );
+        assert_eq!(profile_state(&workspace, cx, "b"), "idle");
+        assert_eq!(state(cx), untouched);
+
+        // Cleared, the tree is the user's again: every fold as it was.
+        type_in("", cx);
+        assert_eq!(shown(cx), before);
+        assert_eq!(profile_state(&workspace, cx, "b"), "idle");
+        assert_eq!(state(cx), untouched);
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.connections.folds_before_filter.is_none()
+        }));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_connections_tree_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = two_connections_folded(cx);

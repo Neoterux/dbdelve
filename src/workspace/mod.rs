@@ -558,7 +558,7 @@ impl Workspace {
             opacity_input,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
-            connections: sidebar::ConnectionsSidebar::new(cx),
+            connections: sidebar::ConnectionsSidebar::new(window, cx),
             dialog_focus: cx.focus_handle(),
             dialog_in_front: std::cell::Cell::default(),
             dialog_choice: std::cell::Cell::default(),
