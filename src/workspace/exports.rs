@@ -161,12 +161,20 @@ impl Workspace {
 
     /// The statement that fetches every row of the grid in front again, or
     /// why there is none to run.
-    fn refetch(&self) -> Result<Refetch, &'static str> {
+    pub(super) fn refetch(&self) -> Result<Refetch, &'static str> {
         let profile = self.profile().ok_or("the connection is gone.")?;
         let engine = profile.config.engine();
         let refetch = match profile.session.active {
             Tab::Query(id) => {
                 let tab = profile.session.query_tab(id).ok_or("the tab is gone.")?;
+                // The rows came from the session of the tab's database, and
+                // every row is fetched again on the profile's own.
+                if tab.binding.is_some() {
+                    return Err(
+                        "this tab runs on the session of the database it is bound to, \
+                         and every row would be fetched on the connection's own.",
+                    );
+                }
                 // Which statement Refresh would run: on a queue, the one
                 // behind the result the switcher shows.
                 let queued = tab.queue.as_ref().and_then(|queue| {

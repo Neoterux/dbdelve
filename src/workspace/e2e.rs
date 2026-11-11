@@ -12876,3 +12876,28 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn every_row_of_a_bound_tabs_result_is_not_fetched_on_the_profiles_own_session(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        run_in_front(&workspace, cx, "SELECT 1");
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.refetch().is_ok()),
+            "an ordinary tab's statement is fetched again as it always was"
+        );
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT 1");
+        let refusal = workspace.read_with(cx, |workspace, _| workspace.refetch());
+        assert_eq!(
+            refusal.err(),
+            Some(
+                "this tab runs on the session of the database it is bound to, \
+                 and every row would be fetched on the connection's own."
+            )
+        );
+        quit(workspace, cx);
+    });
+}
