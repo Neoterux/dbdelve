@@ -23,6 +23,7 @@ use crate::{
     keybindings::{self, KeybindingSpec},
     palette::Mode as PaletteMode,
     scroller::{SmoothScrollable, smooth},
+    sidebar::{ListingScope, ViewMode},
     theme::{
         Appearance, FontSlot, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, Theme, fonts, layout,
         popup_theme,
@@ -116,6 +117,8 @@ enum SettingId {
     SystemTheme(Appearance),
     Opacity,
     ColorTitlebar,
+    SidebarEveryConnection,
+    SidebarCurrentProject,
     Font(FontSlot),
     /// A [`KeybindingSpec::id`].
     Keybinding(&'static str),
@@ -817,6 +820,42 @@ fn render_control(
                 workspace.set_color_titlebar(color, cx);
             }))
             .into_any_element(),
+        SettingId::SidebarEveryConnection => div()
+            .debug_selector(|| "sidebar-every-connection".into())
+            .flex_shrink_0()
+            .child(
+                switch(
+                    "sidebar-every-connection",
+                    settings.view_mode == ViewMode::Complex,
+                    t,
+                )
+                .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                    let mode = match workspace.settings.view_mode {
+                        ViewMode::Simple => ViewMode::Complex,
+                        ViewMode::Complex => ViewMode::Simple,
+                    };
+                    workspace.set_view_mode(mode, cx);
+                })),
+            )
+            .into_any_element(),
+        SettingId::SidebarCurrentProject => div()
+            .debug_selector(|| "sidebar-current-project".into())
+            .flex_shrink_0()
+            .child(
+                switch(
+                    "sidebar-current-project",
+                    settings.listing_scope == ListingScope::Current,
+                    t,
+                )
+                .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                    let scope = match workspace.settings.listing_scope {
+                        ListingScope::All => ListingScope::Current,
+                        ListingScope::Current => ListingScope::All,
+                    };
+                    workspace.set_listing_scope(scope, cx);
+                })),
+            )
+            .into_any_element(),
         SettingId::MatchSystemAppearance => switch(
             "match-system-appearance",
             settings.match_system_appearance,
@@ -1068,6 +1107,19 @@ mod tests {
 
     fn found(query: &str) -> Vec<SettingId> {
         ids(filter_settings(query, &HashMap::new()))
+    }
+
+    #[test]
+    fn the_sidebar_switches_are_found_by_their_words() {
+        for word in ["sidebar", "connections", "project"] {
+            let found = found(word);
+            for id in [
+                SettingId::SidebarEveryConnection,
+                SettingId::SidebarCurrentProject,
+            ] {
+                assert!(found.contains(&id), "{word}: {found:?}");
+            }
+        }
     }
 
     #[test]

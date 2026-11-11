@@ -98,6 +98,7 @@ impl Workspace {
             welcomed: Some(self.settings.welcomed),
             agent_access,
             view_mode: Some(self.settings.view_mode.slug().into()),
+            listing_scope: Some(self.settings.listing_scope.slug().into()),
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };

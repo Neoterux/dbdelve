@@ -58,6 +58,48 @@ pub(crate) fn effective_view_mode(global: ViewMode, project: Option<&StoredProje
         .unwrap_or(global)
 }
 
+/// Which connections the sidebar lists: every project's, or only those of the
+/// project in front.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ListingScope {
+    #[default]
+    All,
+    Current,
+}
+
+impl ListingScope {
+    /// How `profiles.toml` spells it.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            ListingScope::All => "all",
+            ListingScope::Current => "current",
+        }
+    }
+
+    /// The scope a stored slug names, if it names one this build knows.
+    pub(crate) fn parse(slug: Option<&str>) -> Option<Self> {
+        match slug {
+            Some("all") => Some(ListingScope::All),
+            Some("current") => Some(ListingScope::Current),
+            _ => None,
+        }
+    }
+
+    /// The scope a stored slug names; none, or one this build does not know,
+    /// lists every project.
+    pub(crate) fn from_slug(slug: Option<&str>) -> Self {
+        Self::parse(slug).unwrap_or_default()
+    }
+}
+
+/// The scope a project in front lists.
+pub(crate) fn effective_listing_scope(
+    global: ListingScope,
+    _project: Option<&StoredProject>,
+) -> ListingScope {
+    global
+}
+
 /// The row of connections that belong to no project, listed first while any
 /// project exists.
 pub(crate) const NO_PROJECT_ROW: &str = "no-project";
@@ -144,6 +186,8 @@ pub(crate) fn build(
     projects: &[StoredProject],
     listed: Vec<Listed<'_>>,
     folds: &HashMap<String, bool>,
+    _scope: ListingScope,
+    _current: Option<&str>,
 ) -> SidebarTree {
     let mut tree = SidebarTree::default();
     // One bucket per project, and the first for the connections in none. A
@@ -356,6 +400,15 @@ mod tests {
         search(items, id).unwrap_or_else(|| panic!("{id} is not a row"))
     }
 
+    /// Every project listed, with nothing in front: what most tests mean.
+    fn build(
+        projects: &[StoredProject],
+        listed: Vec<Listed<'_>>,
+        folds: &HashMap<String, bool>,
+    ) -> SidebarTree {
+        super::build(projects, listed, folds, ListingScope::All, None)
+    }
+
     #[test]
     fn connections_are_grouped_no_project_first_then_projects_in_their_order() {
         let projects = [project("P2", &["c"]), project("P1", &["a"])];
@@ -559,6 +612,85 @@ mod tests {
             assert_eq!(effective_view_mode(global, Some(&with("tree"))), global);
             assert_eq!(effective_view_mode(global, None), global);
         }
+    }
+
+    #[test]
+    fn the_current_scope_lists_only_the_front_group_with_no_group_row() {
+        let projects = [project("Zoo", &["b"]), project("Other", &["c"])];
+        let tree_for = |current| {
+            super::build(
+                &projects,
+                vec![unloaded("a"), unloaded("b"), unloaded("c")],
+                &HashMap::new(),
+                ListingScope::Current,
+                current,
+            )
+        };
+
+        let zoo = tree_for(Some("Zoo"));
+        assert_eq!(row_ids(&zoo.items), [connection_row("b")]);
+        assert!(!zoo.nodes.values().any(|node| matches!(node, Node::Group)));
+
+        let none = tree_for(None);
+        assert_eq!(row_ids(&none.items), [connection_row("a")]);
+        assert!(!none.nodes.values().any(|node| matches!(node, Node::Group)));
+    }
+
+    #[test]
+    fn with_every_project_listed_only_the_current_group_starts_open() {
+        let projects = [project("Zoo", &["b"]), project("Other", &["c"])];
+        let open_in = |folds: &HashMap<String, bool>, current, row: &str| {
+            let tree = super::build(
+                &projects,
+                vec![unloaded("a"), unloaded("b"), unloaded("c")],
+                folds,
+                ListingScope::All,
+                current,
+            );
+            find(&tree.items, row).is_expanded()
+        };
+        let none = HashMap::new();
+
+        assert!(open_in(&none, Some("Zoo"), &project_row("Zoo")));
+        assert!(!open_in(&none, Some("Zoo"), NO_PROJECT_ROW));
+        assert!(!open_in(&none, Some("Zoo"), &project_row("Other")));
+        // With no project in front the connections in none are the current group.
+        assert!(open_in(&none, None, NO_PROJECT_ROW));
+        assert!(!open_in(&none, None, &project_row("Zoo")));
+
+        // A fold the caller passes wins either way.
+        let opened = HashMap::from([(project_row("Other"), true)]);
+        assert!(open_in(&opened, Some("Zoo"), &project_row("Other")));
+        let closed = HashMap::from([(project_row("Zoo"), false)]);
+        assert!(!open_in(&closed, Some("Zoo"), &project_row("Zoo")));
+    }
+
+    #[test]
+    fn the_listing_scope_follows_the_project_in_front() {
+        let with = |slug: &str| StoredProject {
+            listing_scope: Some(slug.into()),
+            ..project("Zoo", &[])
+        };
+        assert_eq!(
+            effective_listing_scope(ListingScope::All, Some(&with("current"))),
+            ListingScope::Current
+        );
+        assert_eq!(
+            effective_listing_scope(ListingScope::Current, Some(&with("all"))),
+            ListingScope::All
+        );
+        for global in [ListingScope::All, ListingScope::Current] {
+            assert_eq!(
+                effective_listing_scope(global, Some(&project("Zoo", &[]))),
+                global
+            );
+            assert_eq!(effective_listing_scope(global, Some(&with("some"))), global);
+            assert_eq!(effective_listing_scope(global, None), global);
+        }
+        for scope in [ListingScope::All, ListingScope::Current] {
+            assert_eq!(ListingScope::from_slug(Some(scope.slug())), scope);
+        }
+        assert_eq!(ListingScope::from_slug(None), ListingScope::All);
     }
 
     #[test]

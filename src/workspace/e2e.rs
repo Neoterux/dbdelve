@@ -20,7 +20,9 @@ use crate::{
     explorer, keybindings,
     palette::{Command, Mode as PaletteMode, Scope},
     session::{CatalogState, ObjectBody, ProfileState, QueryState, QueryTab, Tab},
-    sidebar::{LOADING, NO_PROJECT_ROW, ViewMode, connection_row, project_row, scoped_row},
+    sidebar::{
+        LOADING, ListingScope, NO_PROJECT_ROW, ViewMode, connection_row, project_row, scoped_row,
+    },
     store,
     theme::{self, Fonts},
 };
@@ -11390,6 +11392,85 @@ fn switching_the_view_mode_moves_no_tab_and_no_connection(cx: &mut TestAppContex
             assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
         }
         assert_eq!(snapshot(&workspace, cx), before);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_every_connection_switch_flips_the_sidebar_and_persists(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = zoo_and_a(cx, "");
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_settings(window, cx)
+        });
+        settle(cx);
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(selector).expect("the switch is drawn");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            settle(cx);
+        };
+        let saved = || {
+            store::peek_profiles(&[])
+                .and_then(|list| list.settings)
+                .expect("the settings are saved")
+        };
+
+        click("sidebar-every-connection", cx);
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Complex);
+        assert_eq!(saved().view_mode.as_deref(), Some("complex"));
+        click("sidebar-every-connection", cx);
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+        assert_eq!(saved().view_mode.as_deref(), Some("simple"));
+
+        click("sidebar-current-project", cx);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.listing_scope()),
+            ListingScope::Current
+        );
+        assert_eq!(saved().listing_scope.as_deref(), Some("current"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_project_can_list_only_its_own_connections_while_the_setting_lists_all(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = zoo_and_a(cx, "view_mode = \"complex\"");
+        assert_eq!(
+            connections_rows(&workspace, cx)
+                .into_iter()
+                .filter(|(depth, _)| *depth == 0)
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>(),
+            [NO_PROJECT_ROW.to_string(), project_row("Zoo")],
+            "every project is listed"
+        );
+
+        run_command(
+            &workspace,
+            cx,
+            Command::SetProjectListing(0, Some(ListingScope::Current)),
+        );
+        assert_eq!(
+            connections_rows(&workspace, cx),
+            [(0, connection_row("b"))],
+            "Zoo lists its own connections, with no group row"
+        );
+        let saved = store::peek_profiles(&[]).expect("the file reads");
+        assert_eq!(saved.projects[0].listing_scope.as_deref(), Some("current"));
+
+        // A connection in no project follows the setting, which lists all.
+        activate_by_id(&workspace, cx, "a");
+        assert_eq!(
+            connections_rows(&workspace, cx)
+                .into_iter()
+                .filter(|(depth, _)| *depth == 0)
+                .count(),
+            2
+        );
         quit(workspace, cx);
     });
 }

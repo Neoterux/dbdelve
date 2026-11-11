@@ -28,6 +28,27 @@ impl Workspace {
         effective_view_mode(self.settings.view_mode, self.front_project())
     }
 
+    /// The connections the sidebar lists: the front connection's project's
+    /// own choice, else the global setting.
+    pub(crate) fn listing_scope(&self) -> ListingScope {
+        effective_listing_scope(self.settings.listing_scope, self.front_project())
+    }
+
+    /// The global sidebar. A project's own choice still wins where it has one.
+    pub(crate) fn set_view_mode(&mut self, _mode: ViewMode, _cx: &mut Context<Self>) {}
+
+    /// The global listing scope. A project's own choice still wins where it
+    /// has one.
+    pub(crate) fn set_listing_scope(&mut self, _scope: ListingScope, _cx: &mut Context<Self>) {}
+
+    pub(crate) fn set_project_listing(
+        &mut self,
+        _at: usize,
+        _scope: Option<ListingScope>,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     /// The project the connection in front is in.
     fn front_project(&self) -> Option<&store::StoredProject> {
         let name = self.current_group()?;
