@@ -2219,11 +2219,7 @@ fn repeats(count: u64) -> Result<(), String> {
 /// the change the user made, and dbdelve would have no way to say which part of
 /// it ran.
 pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String, String> {
-    match engine.syntax() {
-        Syntax::Sql => sql_update_batch(engine.spec(), rows),
-        Syntax::Mongo => crate::mql::update_batch(rows),
-        Syntax::Redis => crate::redis_cmd::edit::update_batch(rows),
-    }
+    batch_of(engine, rows, true)
 }
 
 /// [`update_batch`] for a session that already has a transaction of the
@@ -2232,17 +2228,29 @@ pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String
 /// `COMMIT` would end the user's transaction, and on MySQL and MariaDB its
 /// `START TRANSACTION` would commit it first.
 pub(crate) fn update_batch_joining(engine: Engine, rows: &[PendingRow]) -> Result<String, String> {
+    batch_of(engine, rows, false)
+}
+
+/// Mongo and Redis write no brackets either way.
+fn batch_of(engine: Engine, rows: &[PendingRow], own_brackets: bool) -> Result<String, String> {
     match engine.syntax() {
-        Syntax::Sql => sql_statements(engine.spec(), rows, false),
-        _ => update_batch(engine, rows),
+        Syntax::Sql => sql_statements(engine.spec(), rows, own_brackets),
+        Syntax::Mongo => crate::mql::update_batch(rows),
+        Syntax::Redis => crate::redis_cmd::edit::update_batch(rows),
     }
 }
 
+/// [`update_batch`] for a spec of its own, which `src/sql_snapshots` writes.
+#[cfg(test)]
 pub(crate) fn sql_update_batch(spec: &EngineSpec, rows: &[PendingRow]) -> Result<String, String> {
     sql_statements(spec, rows, true)
 }
 
-fn sql_statements(spec: &EngineSpec, rows: &[PendingRow], bracket: bool) -> Result<String, String> {
+fn sql_statements(
+    spec: &EngineSpec,
+    rows: &[PendingRow],
+    own_brackets: bool,
+) -> Result<String, String> {
     if rows.is_empty() {
         return Err("There are no edits to apply.".into());
     }
@@ -2284,11 +2292,11 @@ fn sql_statements(spec: &EngineSpec, rows: &[PendingRow], bracket: bool) -> Resu
     let batch = statements
         .ok_or("dbdelve cannot name an edited row by its primary key.")?
         .join("\n");
-    let bracket = spec
+    let opening = spec
         .sql
         .transaction_opening()
-        .filter(|_| bracket && rows.len() > 1);
-    Ok(match bracket {
+        .filter(|_| own_brackets && rows.len() > 1);
+    Ok(match opening {
         Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
         None => batch,
     })
