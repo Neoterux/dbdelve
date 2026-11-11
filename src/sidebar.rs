@@ -16,7 +16,9 @@ use std::{
 use gpui_component::tree::TreeItem;
 
 use crate::db::{Levels, RelationKind, Target};
-use crate::explorer::{Builder, ExplorerLeaf, ExplorerTree, Shortcut, is_schema_row, saved_query};
+use crate::explorer::{
+    Builder, ExplorerLeaf, ExplorerTree, RELATION_CATEGORIES, Shortcut, is_schema_row, saved_query,
+};
 use crate::store::StoredProject;
 
 /// Which sidebar the window draws: today's tree for the connection in front,
@@ -379,6 +381,24 @@ pub(crate) enum NodeKind {
     Sequence,
 }
 
+impl NodeKind {
+    /// What a number of them are called, as the tree's categories call them.
+    #[allow(dead_code)] // read by the selection's menu, which the next commit draws
+    fn plural(self) -> String {
+        match self {
+            NodeKind::Connection => "connections".into(),
+            NodeKind::Database => "databases".into(),
+            NodeKind::Schema => "schemas".into(),
+            NodeKind::Routine => "routines".into(),
+            NodeKind::Sequence => "sequences".into(),
+            NodeKind::Relation(kind) => RELATION_CATEGORIES
+                .iter()
+                .find(|(of, _)| *of == kind)
+                .map_or_else(|| "items".into(), |(_, label)| label.to_lowercase()),
+        }
+    }
+}
+
 /// One thing a node offers, from its menu and the palette alike.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NodeAction {
@@ -450,27 +470,41 @@ pub(crate) struct Selection {
 impl Selection {
     /// A plain click: the row is the whole selection.
     pub(crate) fn click(&mut self, id: &str) {
-        _ = id;
+        self.rows = vec![id.to_string()];
+        self.anchor = Some(id.to_string());
     }
 
     /// A Cmd- or Ctrl-click: the row joins the selection, or leaves it.
     pub(crate) fn toggle(&mut self, id: &str) {
-        _ = id;
+        match self.rows.iter().position(|row| row == id) {
+            Some(at) => _ = self.rows.remove(at),
+            None => self.rows.push(id.to_string()),
+        }
+        self.anchor = Some(id.to_string());
     }
 
-    /// A Shift-click: every row of `visible` from the anchor to `id`. With no
-    /// anchor, or one that is not showing, it is a plain click.
+    /// A Shift-click: every row of `visible` from the anchor to `id`, the
+    /// anchor staying where it is. With no anchor, or one that is not
+    /// showing, it is a plain click.
     pub(crate) fn extend_to(&mut self, id: &str, visible: &[String]) {
-        _ = (id, visible);
+        let at = |wanted: &str| visible.iter().position(|row| row == wanted);
+        match self.anchor.as_deref().and_then(at).zip(at(id)) {
+            Some((from, to)) => self.rows = visible[from.min(to)..=from.max(to)].to_vec(),
+            None => self.click(id),
+        }
     }
 
     /// Forget the rows a rebuild no longer lists.
     pub(crate) fn retain(&mut self, present: &HashSet<String>) {
-        _ = present;
+        self.rows.retain(|row| present.contains(row));
+        self.anchor = self.anchor.take().filter(|anchor| present.contains(anchor));
     }
 }
 
 /// What a selection of several rows offers, from its menu and the palette.
+// The menu and the palette that offer all of these arrive with the next
+// commit; until then only Open All is run.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectionAction {
     OpenAll,
@@ -482,6 +516,7 @@ pub(crate) enum SelectionAction {
 }
 
 impl SelectionAction {
+    #[allow(dead_code)]
     /// What a menu and the palette call it.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -497,6 +532,7 @@ impl SelectionAction {
 
 /// What every one of `items` offers, in the order the menu lists it: an action
 /// that does not apply to all of them is left out.
+#[allow(dead_code)]
 pub(crate) fn selection_actions(items: &[(NodeKind, Target)]) -> Vec<SelectionAction> {
     _ = items;
     Vec::new()
@@ -504,9 +540,15 @@ pub(crate) fn selection_actions(items: &[(NodeKind, Target)]) -> Vec<SelectionAc
 
 /// What the selection's menu says it holds: `3 tables selected`, or `3 items
 /// selected` when the rows are not all one kind.
+#[allow(dead_code)] // read by the selection's menu, which the next commit draws
 pub(crate) fn selection_header(kinds: &[NodeKind]) -> String {
-    _ = kinds;
-    String::new()
+    let count = kinds.len();
+    match kinds.split_first() {
+        Some((first, rest)) if rest.iter().all(|kind| kind == first) => {
+            format!("{count} {} selected", first.plural())
+        }
+        _ => format!("{count} items selected"),
+    }
 }
 
 /// The rows, and what each stands for, by row id.

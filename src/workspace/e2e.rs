@@ -14967,6 +14967,18 @@ fn shift_clicking_selects_every_row_between_the_anchor_and_the_click(cx: &mut Te
             selected_rows(&workspace, cx).0,
             [birds.clone(), flocks.clone()]
         );
+        // A modifier click on a folder selects it and leaves it as it was.
+        let schema = scoped_row("a", None, "schema-main");
+        assert_eq!(
+            connections_item(&workspace, cx, &schema).map(|item| item.0),
+            Some(true)
+        );
+        click_connections_row_with(&workspace, cx, &schema, gpui::Modifiers::secondary_key());
+        assert_eq!(
+            connections_item(&workspace, cx, &schema).map(|item| item.0),
+            Some(true)
+        );
+        assert!(selected_rows(&workspace, cx).0.contains(&schema));
         // The category's label between them is no node an action applies to,
         // and a plain click on it is the whole selection again.
         click_connections_row_with(&workspace, cx, &tables, gpui::Modifiers::default());

@@ -8,10 +8,17 @@
 //! the engine a statement meets are always those of the connection it was
 //! opened on.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use gpui::{Entity, SharedString, StyledText};
-use gpui_component::tree::{TreeEvent, TreeState};
+use gpui_component::{
+    ActiveTheme as _,
+    tree::{TreeEvent, TreeState},
+};
 
 use super::forms::{MenuRow, explorer_menu, node_items};
 use super::profiles::{database_content, explorer_content};
@@ -255,6 +262,12 @@ impl Workspace {
             .profile()
             .map(|profile| SharedString::from(front_row_id(profile).unwrap_or_default()));
 
+        // A row that no longer exists is no longer selected. A filter hides
+        // rows without removing them, so it keeps what it hides.
+        if filter.is_empty() {
+            let present: HashSet<String> = built.nodes.keys().cloned().collect();
+            self.connections.selection.retain(&present);
+        }
         self.connections.nodes = Arc::new(built.nodes);
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
@@ -315,11 +328,91 @@ impl Workspace {
         self.row_node(&profile.id, None, &id, leaf)
     }
 
-    /// The nodes of the rows the connections tree has selected, in the order
-    /// they were picked.
+    /// The ids of the rows the connections tree has selected: the set a
+    /// modifier click gathered while the tree's own row is in it, and that
+    /// row alone once an arrow or a click has moved the tree off the set.
+    pub(crate) fn selected_rows(&self, cx: &App) -> Vec<String> {
+        let Some(front) = self
+            .connections
+            .tree
+            .read(cx)
+            .selected_item()
+            .map(|item| item.id.to_string())
+        else {
+            return Vec::new();
+        };
+        let rows = &self.connections.selection.rows;
+        match rows.contains(&front) {
+            true => rows.clone(),
+            false => vec![front],
+        }
+    }
+
+    /// The nodes of those rows, in the order they were picked.
+    #[allow(dead_code)] // read by the selection's menu, which the next commit draws
     pub(crate) fn selected_nodes(&self, cx: &App) -> Vec<SelectedNode> {
-        _ = cx;
-        Vec::new()
+        self.selected_rows(cx)
+            .iter()
+            .filter_map(|id| self.connections_node(id))
+            .collect()
+    }
+
+    /// What a click on the connections tree's row `id` does with `modifiers`
+    /// held. Whether the tree is to be kept from its own click: a Cmd-, Ctrl-
+    /// or Shift-click on a node changes the selection and nothing else, where
+    /// the tree would also move its row and fold or unfold it.
+    pub(crate) fn click_connections_row(
+        &mut self,
+        id: &str,
+        opens: bool,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if (modifiers.secondary() || modifiers.shift) && self.connections_node(id).is_some() {
+            // The tree's own row is where a range or a toggle starts, whether
+            // or not a modifier click has been there before.
+            let current = self.selected_rows(cx);
+            let selection = &mut self.connections.selection;
+            if selection.rows != current {
+                *selection = Selection {
+                    anchor: current.last().cloned(),
+                    rows: current,
+                };
+            }
+            match modifiers.shift {
+                true => {
+                    let visible = self.visible_nodes(cx);
+                    self.connections.selection.extend_to(id, &visible);
+                }
+                false => self.connections.selection.toggle(id),
+            }
+            let rows = &self.connections.selection.rows;
+            let shown = match rows.iter().any(|row| row == id) {
+                true => id.to_string(),
+                false => rows.last().cloned().unwrap_or_else(|| id.to_string()),
+            };
+            self.connections.tree.update(cx, |tree, cx| {
+                tree.set_selected_index(tree.index_of(&shown.into()), cx);
+            });
+            cx.notify();
+            return true;
+        }
+        self.connections.selection.click(id);
+        if opens {
+            self.open_connection_row(id, window, cx);
+        }
+        false
+    }
+
+    /// The ids of the rows the tree is showing that an action applies to.
+    fn visible_nodes(&self, cx: &App) -> Vec<String> {
+        let tree = self.connections.tree.read(cx);
+        (0..)
+            .map_while(|ix| tree.entry(ix))
+            .map(|entry| entry.item().id.to_string())
+            .filter(|id| self.connections_node(id).is_some())
+            .collect()
     }
 
     /// What the connections tree's row `id` is, if it is a node an action
@@ -530,6 +623,13 @@ impl Workspace {
                 )
             })
             .collect();
+        // The rows a modifier click gathered, which the tree does not know to
+        // draw as selected: a lone row is the tree's own.
+        let gathered: HashSet<String> = Some(self.selected_rows(cx))
+            .filter(|rows| rows.len() > 1)
+            .into_iter()
+            .flatten()
+            .collect();
         let menu_workspace = workspace.clone();
         let menu_shortcuts = shortcuts.clone();
         let (density, show_host, show_sizes) = (
@@ -653,6 +753,13 @@ impl Workspace {
                 .rounded(px(layout::RADIUS_CONTROL))
                 .when_some(connection.and_then(|(_, look)| look.color), |row, color| {
                     row.bg(color.fill())
+                })
+                .when(gathered.contains(id), |row| {
+                    // What the tree draws its own selected row with.
+                    row.bg(match cx.theme().list.active_highlight {
+                        true => cx.theme().list_active,
+                        false => cx.theme().accent,
+                    })
                 })
                 // `ListItem` sizes its text in `rems`, which tracks the
                 // library's 16 rather than dbdelve's body size.
@@ -806,15 +913,20 @@ impl Workspace {
                         ),
                 )
                 .debug_selector(move || format!("connections-row-{index}"));
-            if missing || (leaf.is_none() && query.is_none()) {
+            if matches!(node, Some(Node::Notice)) {
                 return row;
             }
+            let opens = !missing && (leaf.is_some() || query.is_some());
             let workspace = workspace.clone();
             let id = id.to_string();
-            row.on_click(move |_, window, cx| {
-                _ = workspace.update(cx, |workspace, cx| {
-                    workspace.open_connection_row(&id, window, cx)
+            row.on_click(move |event, window, cx| {
+                let modifiers = event.modifiers();
+                let gathered = workspace.update(cx, |workspace, cx| {
+                    workspace.click_connections_row(&id, opens, modifiers, window, cx)
                 });
+                if gathered.unwrap_or(false) {
+                    cx.stop_propagation();
+                }
             })
         })
         .context_menu(move |_, entry, menu, window, cx| {

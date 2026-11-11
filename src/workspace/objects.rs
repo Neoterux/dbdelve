@@ -653,12 +653,7 @@ impl Workspace {
                         ObjectKind::Sequence,
                         cx,
                     ),
-                    (NodeKind::Routine, _, Some(leaf)) => match node.database.clone() {
-                        Some(database) => {
-                            self.open_object_on(&node.profile, database, leaf.target, window, cx)
-                        }
-                        None => self.open_explorer_target(leaf.target, window, cx),
-                    },
+                    (NodeKind::Routine, _, Some(_)) => self.open_node(node, window, cx),
                     _ => {}
                 }
             }
@@ -704,13 +699,40 @@ impl Workspace {
     }
 
     /// What `action` does to every row the connections tree has selected.
+    #[allow(dead_code)] // run by the selection's menu and palette rows, which the next commits draw
     pub(crate) fn run_selection_action(
         &mut self,
         action: SelectionAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        _ = (action, window, cx);
+        match action {
+            SelectionAction::OpenAll => {
+                for node in self.selected_nodes(cx) {
+                    self.open_node(&node, window, cx);
+                }
+            }
+            SelectionAction::CopyNames
+            | SelectionAction::CopyDdl
+            | SelectionAction::ShowDdl
+            | SelectionAction::Pin
+            | SelectionAction::Refresh => {}
+        }
+    }
+
+    /// Open the object `node` is on its own connection, which comes to the
+    /// front first, as a click on its row does.
+    fn open_node(&mut self, node: &SelectedNode, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(leaf) = node.leaf else {
+            return;
+        };
+        if !self.make_front(&node.profile, cx) {
+            return;
+        }
+        match node.database.clone() {
+            Some(database) => self.open_object_on(&node.profile, database, leaf.target, window, cx),
+            None => self.open_explorer_target(leaf.target, window, cx),
+        }
     }
 
     /// Move the connection in front onto the schema row `name`, which is a
