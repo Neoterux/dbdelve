@@ -2131,6 +2131,50 @@ impl Workspace {
         .detach();
     }
 
+    /// A session a bound tab's run opened for itself, kept before the run
+    /// sends anything on it, so the tree reads the database over it too and a
+    /// Cancel on the run finds it. Returns the session the run goes on using:
+    /// the one already open when another landed first, the later one being
+    /// dropped, and this one on its own when the tree's open of the same
+    /// database is still under way, or when the profile's mode crossed
+    /// Read-only while it opened (`held` is whether it was held), which would
+    /// store a session `sessions_to_hold` had never seen.
+    pub(crate) fn keep_session(
+        &mut self,
+        id: &str,
+        generation: u64,
+        database: String,
+        held: bool,
+        session: Connection,
+        cx: &mut Context<Self>,
+    ) -> Connection {
+        let Some(profile) = self.issued_to(id, generation) else {
+            return session;
+        };
+        match profile.bound.get(&database) {
+            Some(BoundSession::Open(open)) => return (**open).clone(),
+            Some(BoundSession::Opening) => return session,
+            None => {}
+        }
+        if (profile.mode == Mode::ReadOnly) != held {
+            return session;
+        }
+        profile.bound.insert(
+            database.clone(),
+            BoundSession::Open(Box::new(session.clone())),
+        );
+        // The connection's own database is read over its own session, and
+        // another is not asked for again once a session is registered.
+        if profile.active_database().as_deref() != Some(database.as_str()) {
+            profile
+                .database_catalogs
+                .entry(database.clone())
+                .or_insert(CatalogState::Loading);
+            self.load_database_catalog(id, database, generation, cx);
+        }
+        session
+    }
+
     /// Read the catalog of `database` over its open session, then its
     /// routines and sizes, each landing into `profile.database_catalogs` as
     /// the profile's own do into `profile.catalog`. A session that has been

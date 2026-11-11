@@ -23,7 +23,8 @@ use crate::{
     Workspace, completion,
     db::{
         CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine,
-        ExplainMode, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax, Target,
+        ExplainMode, Levels, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax,
+        Target,
     },
     explain::{self, Plan, analysis::Analysis},
     explorer::{
@@ -225,6 +226,21 @@ impl Profile {
     pub(crate) fn drop_sessions(&mut self) {
         self.bound.clear();
         self.database_catalogs.clear();
+    }
+
+    /// The connection `tab`'s statements run on: the session open for the
+    /// database a bound query tab is bound to, else the profile's own.
+    pub(crate) fn connection_for(&self, tab: Tab) -> Option<Connection> {
+        if let Tab::Query(query) = tab
+            && let Some(binding) = self
+                .session
+                .query_tab(query)
+                .and_then(|query| query.binding.as_ref())
+            && let Some(BoundSession::Open(session)) = self.bound.get(&binding.database)
+        {
+            return Some((**session).clone());
+        }
+        self.connection()
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -979,6 +995,12 @@ impl Session {
         self.queries.iter_mut().find(|tab| tab.id == id)
     }
 
+    /// Whether `tab` is a query tab bound to a database, whose statements run
+    /// on that database's session and never beside one another.
+    pub(crate) fn is_bound(&self, tab: Tab) -> bool {
+        matches!(tab, Tab::Query(id) if self.query_tab(id).is_some_and(|tab| tab.binding.is_some()))
+    }
+
     /// Put away the new-row form and the review a closed tab, query or
     /// object, had open. Left in place, a form holds its inputs alive for
     /// nothing, a query tab's id is handed to the next buffer, which would
@@ -1447,11 +1469,20 @@ impl Binding {
     /// a blank name, which is the login default and so the profile's own
     /// session. The schema is kept only where the target picks one.
     pub(crate) fn for_target(
-        _target: Target,
-        _database: Option<&str>,
-        _schema: Option<&str>,
+        target: Target,
+        database: Option<&str>,
+        schema: Option<&str>,
     ) -> Option<Self> {
-        None
+        let database = database.filter(|database| !database.is_empty())?;
+        if !target.switches_database() {
+            return None;
+        }
+        Some(Self {
+            database: database.to_string(),
+            schema: schema
+                .filter(|schema| !schema.is_empty() && target.picks_schema())
+                .map(str::to_string),
+        })
     }
 
     /// The binding for a tab opened on the schema row `row` of a connection
@@ -1459,11 +1490,17 @@ impl Binding {
     /// under one. Where the catalog lists databases as schemas, or a
     /// database's one schema is the database, the row is the database.
     pub(crate) fn for_schema_row(
-        _target: Target,
-        _database: Option<&str>,
-        _row: &str,
+        target: Target,
+        database: Option<&str>,
+        row: &str,
     ) -> Option<Self> {
-        None
+        match target.levels() {
+            Levels::Flat => None,
+            Levels::DatabaseIsSchema | Levels::DatabaseHoldsObjects => {
+                Self::for_target(target, Some(row), None)
+            }
+            Levels::DatabaseThenSchema => Self::for_target(target, database, Some(row)),
+        }
     }
 }
 

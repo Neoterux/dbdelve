@@ -11,13 +11,17 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::{Entity, SharedString, StyledText};
-use gpui_component::tree::{TreeEvent, TreeState};
+use gpui_component::{
+    menu::PopupMenuItem,
+    tree::{TreeEvent, TreeState},
+};
 
 use super::profiles::{database_content, explorer_content};
 use super::*;
 use crate::db::{Levels, Syntax};
 use crate::explorer::{
     Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, folds, is_schema_row, saved_query,
+    schema_row_name,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::session::Binding;
@@ -52,6 +56,36 @@ fn status_name(status: Status) -> &'static str {
         Status::Connecting => "connecting",
         Status::Connected => "connected",
         Status::Failed => "failed",
+    }
+}
+
+/// What New Query Here on the row `id` opens a tab on: the connection, and the
+/// database and schema it binds, or `None` where the row offers none. A
+/// connection row names no database, so its tab is an ordinary one; a database
+/// row binds that database; a schema row binds by its connection's levels
+/// ([`Binding::for_schema_row`]), and offers nothing where that is no binding.
+fn new_query_here_at(
+    nodes: &HashMap<String, Node>,
+    targets: &HashMap<String, Target>,
+    id: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    match nodes.get(id)? {
+        Node::Connection { profile } => Some((profile.clone(), None, None)),
+        Node::Database { profile, database } => {
+            Some((profile.clone(), Some(database.clone()), None))
+        }
+        Node::Row { .. } => {
+            let scoped = model::unscoped(id)?;
+            let row = schema_row_name(scoped.inner)?;
+            let target = *targets.get(scoped.profile)?;
+            let binding = Binding::for_schema_row(target, scoped.database, row)?;
+            Some((
+                scoped.profile.to_string(),
+                Some(binding.database),
+                binding.schema,
+            ))
+        }
+        Node::Group | Node::Notice => None,
     }
 }
 
@@ -399,6 +433,13 @@ impl Workspace {
                 )
             })
             .collect();
+        let menu_workspace = workspace.clone();
+        let menu_nodes = nodes.clone();
+        let menu_targets: HashMap<String, Target> = self
+            .profiles
+            .iter()
+            .map(|profile| (profile.id.clone(), profile.config.target()))
+            .collect();
         let (density, show_host, show_sizes) = (
             self.settings.density,
             self.settings.show_host,
@@ -683,6 +724,24 @@ impl Workspace {
                     workspace.open_connection_row(&id, window, cx)
                 });
             })
+        })
+        .context_menu(move |_, entry, menu, _, _| {
+            let id = entry.item().id.as_str();
+            let Some((profile, database, schema)) =
+                new_query_here_at(&menu_nodes, &menu_targets, id)
+            else {
+                return menu;
+            };
+            let workspace = menu_workspace.clone();
+            menu.item(
+                PopupMenuItem::new("New Query Here").on_click(move |_, window, cx| {
+                    let (profile, database, schema) =
+                        (profile.clone(), database.clone(), schema.clone());
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.new_query_here(&profile, database, schema, window, cx);
+                    });
+                }),
+            )
         });
         let t = *theme(cx);
         div()
@@ -722,5 +781,76 @@ impl Workspace {
                     .on_action(cx.listener(Self::open_sidebar_item))
                     .child(tree),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Engine;
+    use crate::sidebar::{connection_row, database_row, scoped_row};
+
+    fn offered(
+        engine: Engine,
+        database: Option<&str>,
+        row: &str,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        let id = scoped_row("p", database, row);
+        let nodes = HashMap::from([(id.clone(), Node::Row { leaf: None })]);
+        let targets = HashMap::from([("p".to_string(), Target::built_in(engine))]);
+        new_query_here_at(&nodes, &targets, &id)
+    }
+
+    #[test]
+    fn a_connection_row_opens_an_ordinary_tab_and_a_database_row_a_bound_one() {
+        let targets = HashMap::from([("p".to_string(), Target::built_in(Engine::Postgres))]);
+        let nodes = HashMap::from([
+            (
+                connection_row("p"),
+                Node::Connection {
+                    profile: "p".into(),
+                },
+            ),
+            (
+                database_row("p", "app"),
+                Node::Database {
+                    profile: "p".into(),
+                    database: "app".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            new_query_here_at(&nodes, &targets, &connection_row("p")),
+            Some(("p".into(), None, None)),
+            "a connection row names no database"
+        );
+        assert_eq!(
+            new_query_here_at(&nodes, &targets, &database_row("p", "app")),
+            Some(("p".into(), Some("app".into()), None))
+        );
+    }
+
+    #[test]
+    fn a_schema_row_binds_by_the_levels_of_its_connection_and_by_its_id_not_its_label() {
+        assert_eq!(
+            offered(Engine::Postgres, Some("app"), "schema-we ird/name"),
+            Some(("p".into(), Some("app".into()), Some("we ird/name".into()))),
+            "a schema under the database it sits in, spelled as the server listed it"
+        );
+        assert_eq!(
+            offered(Engine::MySql, None, "schema-shop"),
+            Some(("p".into(), Some("shop".into()), None)),
+            "MySQL lists a database as a schema"
+        );
+        assert_eq!(
+            offered(Engine::Sqlite, None, "schema-main"),
+            None,
+            "a target with no database to switch offers none"
+        );
+        assert_eq!(
+            offered(Engine::Postgres, Some("app"), "category-Tables-public"),
+            None,
+            "only a schema row offers it"
+        );
     }
 }
