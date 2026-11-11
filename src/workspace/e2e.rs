@@ -16508,7 +16508,7 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
             "a connect leaves nothing of the transaction it replaces"
         );
         settle(cx);
-        assert_eq!(profile_flags(&workspace, cx).0, false);
+        assert!(!profile_flags(&workspace, cx).0);
 
         run_in_front(&workspace, cx, "BEGIN");
         assert_eq!(recorded_statements(&workspace, cx), ["BEGIN"]);

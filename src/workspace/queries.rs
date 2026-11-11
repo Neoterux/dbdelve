@@ -2362,6 +2362,16 @@ impl Workspace {
                 None => false,
             };
         }
+        // An edit dbdelve applies on the connection's own session runs inside
+        // the user's open transaction and is committed or rolled back with it,
+        // so the prompt that ends it lists it. Its reads stay out.
+        if generated
+            && edit
+            && binding.is_none()
+            && let Some(profile) = self.issued_to(&id, generation)
+        {
+            profile.record_sent(&sql, None);
+        }
         // A plan is never cut short: its rows are the plan, not data.
         let limit = match tab {
             Tab::Query(query) if explaining.is_none() => self

@@ -1345,6 +1345,7 @@ impl Workspace {
         profile.drop_sessions();
         profile.state = ProfileState::Idle;
         profile.in_transaction = false;
+        profile.transaction_statements.clear();
         profile.session_changed = false;
         profile.session.clear_prompts();
         mark_rows_stale(profile);
@@ -1835,6 +1836,7 @@ impl Workspace {
         profile.drop_sessions();
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
+        profile.transaction_statements.clear();
         // The transaction it was holding died with the session, and silently
         // opening another on a connection the user has just watched drop is
         // the kind of surprise this feature exists to avoid.
