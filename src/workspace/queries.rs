@@ -12,8 +12,8 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
-    Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume, Step,
-    TabKey, next_step, query_name_refusal, reveals_results,
+    Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume,
+    Step, TabKey, next_step, query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -1462,6 +1462,17 @@ impl Workspace {
     /// persisted and then emptied: one editor meant a new query had nowhere to
     /// go but on top of the old one.
     pub(crate) fn new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_query_tab(None, window, cx);
+    }
+
+    /// [`Workspace::new_query`]'s tab, bound to a database where `binding`
+    /// says so (New Query Here).
+    pub(crate) fn open_query_tab(
+        &mut self,
+        binding: Option<Binding>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Err(message) = self.persist_buffer(cx) {
             self.note(message, cx);
             return;
@@ -1493,6 +1504,8 @@ impl Workspace {
             return;
         };
         let profile_id = profile.id.clone();
+        let mut tab = tab;
+        tab.binding = binding;
         profile.session.queries.push(tab);
         // Placed at the end of the strip rather than left for `strip_order`'s
         // default, which groups every unsaved buffer ahead of the saved

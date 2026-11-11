@@ -12634,3 +12634,174 @@ fn with_sizes_off_no_size_read_starts(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// Opens a tab with New Query Here on `database` and `schema` of the profile
+/// in front, and waits for it to be the one in front.
+fn new_query_here(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    database: Option<&str>,
+    schema: Option<&str>,
+) {
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.new_query_here(
+                "e2e",
+                database.map(str::to_string),
+                schema.map(str::to_string),
+                window,
+                cx,
+            );
+        });
+    });
+    settle(cx);
+}
+
+/// The binding of the query tab in front.
+fn front_binding(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::session::Binding> {
+    query_tab(workspace, cx, |tab, _, _| tab.binding.clone())
+}
+
+/// The first cell of the result in the query tab in front.
+fn answer(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    query_tab(workspace, cx, |tab, _, cx| {
+        let grid = tab.results.read(cx);
+        let result = grid.delegate().result();
+        result.rows.first()?.get(0).map(str::to_string)
+    })
+}
+
+/// Whether the profile in front has left a transaction open or changed its
+/// session, as its own tabs' statements are read to.
+fn profile_flags(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (bool, bool) {
+    workspace.read_with(cx, |workspace, _| {
+        let profile = workspace.profile().expect("a profile is in front");
+        (profile.in_transaction, profile.session_changed)
+    })
+}
+
+#[gpui::test]
+fn a_query_tab_opened_on_an_attached_database_runs_there_and_moves_nothing_else(
+    cx: &mut TestAppContext,
+) {
+    use crate::session::Binding;
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("e2e"));
+        let own = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.active
+        });
+
+        new_query_here(&workspace, cx, Some("other"), None);
+        assert_eq!(
+            front_binding(&workspace, cx),
+            Some(Binding {
+                database: "other".into(),
+                schema: None
+            })
+        );
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+        assert_eq!(
+            buffer(&workspace, cx),
+            "SELECT current_database()",
+            "the text is what was typed"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert_eq!(profile.session.history[0].sql, "SELECT current_database()");
+            assert_eq!(profile.active_database().as_deref(), Some("e2e"));
+            assert!(matches!(
+                profile.bound.get("other"),
+                Some(crate::session::BoundSession::Open(_))
+            ));
+        });
+
+        // A transaction of the user's on the shared session is that
+        // session's, never the profile's.
+        for statement in ["BEGIN", "SELECT current_database()", "ROLLBACK"] {
+            run_in_front(&workspace, cx, statement);
+            assert_eq!(profile_flags(&workspace, cx), (false, false), "{statement}");
+        }
+        assert_eq!(buffer(&workspace, cx), "ROLLBACK");
+
+        // The profile's own tab is where it was.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.activate_tab(own, window, cx));
+        });
+        settle(cx);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("e2e"));
+        assert_eq!(own_database(&workspace, cx), "e2e");
+        assert_eq!(profile_flags(&workspace, cx), (false, false));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn new_query_here_on_a_connection_row_opens_an_ordinary_tab(cx: &mut TestAppContext) {
+    use crate::session::Binding;
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, None, None);
+        assert_eq!(
+            front_binding(&workspace, cx),
+            None,
+            "a connection row names no database"
+        );
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("e2e"));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.profile().unwrap().bound.is_empty(),
+                "the profile's own session ran it"
+            );
+        });
+
+        new_query_here(&workspace, cx, Some(""), None);
+        assert_eq!(
+            front_binding(&workspace, cx),
+            None,
+            "a blank name is the login default"
+        );
+
+        new_query_here(&workspace, cx, Some("other"), None);
+        assert_eq!(
+            front_binding(&workspace, cx),
+            Some(Binding {
+                database: "other".into(),
+                schema: None
+            })
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn new_query_in_complex_mode_opens_an_unbound_tab_on_the_profiles_own_session(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.new_query(&crate::actions::NewQuery, window, cx);
+            });
+        });
+        settle(cx);
+        assert_eq!(front_binding(&workspace, cx), None);
+        assert_eq!(profile_flags(&workspace, cx), (false, false));
+        run_in_front(&workspace, cx, "BEGIN");
+        assert_eq!(
+            profile_flags(&workspace, cx),
+            (true, false),
+            "the profile's own session, which keeps its transaction controls"
+        );
+        run_in_front(&workspace, cx, "ROLLBACK");
+        quit(workspace, cx);
+    });
+}

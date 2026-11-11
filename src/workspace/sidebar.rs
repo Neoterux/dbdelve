@@ -20,6 +20,7 @@ use crate::explorer::{
     Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, folds, is_schema_row, saved_query,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
+use crate::session::Binding;
 use crate::sidebar::{self as model, Content, Listed, Node, schema_row_is_a_database, shown_size};
 use crate::ui::{Status, row_icon_tinted, status_dot};
 
@@ -229,6 +230,34 @@ impl Workspace {
                 .or_else(|| front.and_then(|front| tree.index_of(&front)));
             tree.set_selected_index(row, cx);
         });
+    }
+
+    /// New Query Here: a query tab on `profile`, which comes to the front
+    /// first, so the gate, the mode and the engine its statements meet are
+    /// that connection's. Bound to `database` and `schema` where the
+    /// connection has them to bind ([`Binding::for_target`]); on a connection
+    /// row, which names no database, an ordinary tab on the profile's own
+    /// session.
+    pub(crate) fn new_query_here(
+        &mut self,
+        profile: &str,
+        database: Option<String>,
+        schema: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.profiles.iter().position(|p| p.id == profile) else {
+            return;
+        };
+        if self.active != Some(index) {
+            self.activate(index, cx);
+        }
+        let binding = Binding::for_target(
+            self.profiles[index].config.target(),
+            database.as_deref(),
+            schema.as_deref(),
+        );
+        self.open_query_tab(binding, window, cx);
     }
 
     /// A connection row was opened: connect it if it has not been asked to.

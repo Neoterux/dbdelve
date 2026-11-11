@@ -1432,6 +1432,41 @@ pub(crate) enum BoundSession {
     Open(Box<Connection>),
 }
 
+/// Where a query tab opened with New Query Here runs: a database of its
+/// connection's server, and where the engine picks one, a schema in it. Both
+/// as the server listed them, handed to the driver unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) database: String,
+    pub(crate) schema: Option<String>,
+}
+
+impl Binding {
+    /// The binding for a tab opened on `database` and `schema`, or `None`
+    /// where there is nothing to bind: a target that switches no database, and
+    /// a blank name, which is the login default and so the profile's own
+    /// session. The schema is kept only where the target picks one.
+    pub(crate) fn for_target(
+        _target: Target,
+        _database: Option<&str>,
+        _schema: Option<&str>,
+    ) -> Option<Self> {
+        None
+    }
+
+    /// The binding for a tab opened on the schema row `row` of a connection
+    /// whose tree shape is `target`'s, under `database` where the row sits
+    /// under one. Where the catalog lists databases as schemas, or a
+    /// database's one schema is the database, the row is the database.
+    pub(crate) fn for_schema_row(
+        _target: Target,
+        _database: Option<&str>,
+        _row: &str,
+    ) -> Option<Self> {
+        None
+    }
+}
+
 /// The second half of a loaded catalog. A catalog whose routines are not
 /// `Loaded` holds none, and a routine missing from it says nothing about the
 /// database.
@@ -1704,6 +1739,14 @@ pub(crate) struct QueryTab {
     /// tab must not resize another's. Not persisted -- a fresh tab always
     /// starts at the built-in default.
     pub(crate) row_panel_split: Entity<ResizableState>,
+    /// The database, and where the engine picks one the schema, this tab was
+    /// opened for with New Query Here, or `None` for a tab that runs on the
+    /// profile's own session. Kept for good: running the tab puts its
+    /// session back here, and never moves the profile's own database or
+    /// schema.
+    ///
+    /// ponytail: not stored, so a relaunch restores the tab unbound.
+    pub(crate) binding: Option<Binding>,
 }
 
 /// A plan, and what it is a plan of.
@@ -2338,6 +2381,7 @@ impl QueryTab {
             row_panel_editing: false,
             row_panel_filter: Default::default(),
             row_panel_split: cx.new(|_| ResizableState::default()),
+            binding: None,
         };
         (tab, notice)
     }
@@ -3030,6 +3074,78 @@ mod tests {
             rows_affected: None,
             messages: Vec::new(),
         }
+    }
+
+    fn binding(database: &str, schema: Option<&str>) -> Binding {
+        Binding {
+            database: database.into(),
+            schema: schema.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_a_database_or_a_picked_schema_makes_a_binding() {
+        let target = Target::built_in;
+        assert_eq!(
+            Binding::for_target(target(Engine::Sqlite), Some("main"), None),
+            None,
+            "SQLite switches no database"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some(""), None),
+            None,
+            "a blank name is the login default, which is the profile's own session"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), None, Some("s")),
+            None,
+            "a schema alone names no database"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some("d"), Some("s")),
+            Some(binding("d", Some("s")))
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some("d"), None),
+            Some(binding("d", None))
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::SqlServer), Some("d"), Some("s")),
+            Some(binding("d", None)),
+            "SQL Server picks no schema, so none is kept"
+        );
+    }
+
+    #[test]
+    fn a_schema_row_binds_by_the_levels_of_its_connection() {
+        let target = Target::built_in;
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::MySql), None, "shop"),
+            Some(binding("shop", None)),
+            "MySQL lists a database as a schema"
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Redis), None, "db3"),
+            Some(binding("db3", None))
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Postgres), Some("app"), "billing"),
+            Some(binding("app", Some("billing")))
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Postgres), None, "billing"),
+            None,
+            "a schema whose database is not known binds nothing"
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Sqlite), None, "main"),
+            None
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::MySql), None, ""),
+            None,
+            "a blank row is never a database"
+        );
     }
 
     #[test]
