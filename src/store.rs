@@ -3619,6 +3619,53 @@ open_objects = []
     }
 
     #[test]
+    fn the_include_lists_round_trip_before_ssh_and_an_old_file_reads_unfiltered() {
+        let mut profile = a_stored_profile();
+        profile.include_databases = vec!["app*".into(), "Billing".into()];
+        profile.include_schemas = vec!["public".into(), "tenant_?".into()];
+        profile.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            ..Default::default()
+        });
+        let text = written_alone(profile.clone());
+        let databases = text
+            .find("include_databases")
+            .expect("the database list is written");
+        let schemas = text.find("include_schemas").expect("so is the schema list");
+        let tunnel = text.find("[profiles.ssh]").expect("and the tunnel");
+        assert!(
+            databases < tunnel && schemas < tunnel,
+            "TOML cannot emit a scalar after a table, so both come before `ssh`:\n{text}"
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        assert_eq!(
+            decoded.profiles[0].include_databases,
+            profile.include_databases
+        );
+        assert_eq!(decoded.profiles[0].include_schemas, profile.include_schemas);
+        assert_eq!(
+            written_alone(decoded.profiles[0].clone()),
+            text,
+            "saving what was saved changes nothing"
+        );
+
+        let bare = written_alone(a_stored_profile());
+        assert!(
+            !bare.contains("include_databases") && !bare.contains("include_schemas"),
+            "a profile with none is written as it always was:\n{bare}"
+        );
+        let old = decode_profiles(&bare, &[]).expect("an older file loads");
+        assert!(old.profiles[0].include_databases.is_empty());
+        assert!(old.profiles[0].include_schemas.is_empty());
+        let golden = include_str!("testdata/every-engine.resaved.toml");
+        assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
+        assert!(
+            !golden.contains("include_databases") && !golden.contains("include_schemas"),
+            "the fixtures hold neither key"
+        );
+    }
+
+    #[test]
     fn a_profile_without_folders_or_pins_is_written_as_it_always_was() {
         let text = written_alone(a_stored_profile());
         assert!(

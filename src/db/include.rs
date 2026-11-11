@@ -162,3 +162,162 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     }
     pattern[at..].iter().all(|&rest| rest == '*')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(names: &[&str], current: Option<&str>) -> Databases {
+        Databases {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            current: current.map(str::to_string),
+            left_out: 0,
+        }
+    }
+
+    fn text(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    const FILTERED: [Levels; 3] = [
+        Levels::DatabaseIsSchema,
+        Levels::DatabaseThenSchema,
+        Levels::DatabaseHoldsObjects,
+    ];
+
+    #[test]
+    fn a_star_matches_any_run_and_a_question_mark_one_character() {
+        for name in ["a", "ab", "", "dbdelve_dev"] {
+            assert!(matches("*", name), "{name:?}");
+        }
+        assert!(matches("a*b", "ab"));
+        assert!(matches("a*b", "axyb"));
+        assert!(!matches("a*b", "abx"));
+        assert!(matches("db?", "db1"));
+        assert!(!matches("db?", "db"));
+        assert!(!matches("db?", "db12"));
+        assert!(matches("?", "x"));
+    }
+
+    #[test]
+    fn an_empty_pattern_matches_nothing_and_underscore_and_percent_are_literal() {
+        assert!(!matches("", "a"));
+        assert!(!matches("", ""));
+        assert!(matches("a_b", "a_b"));
+        assert!(!matches("a_b", "axb"));
+        assert!(matches("a%", "a%"));
+        assert!(!matches("a%", "ab"));
+    }
+
+    #[test]
+    fn matching_ignores_case_by_unicode_lowercase() {
+        assert!(matches("PROD*", "prod_eu"));
+        assert!(matches("prod_*", "PROD_EU"));
+        assert!(matches("Ä*", "ä_db"));
+        assert!(matches("snowflake_db", "SNOWFLAKE_DB"));
+    }
+
+    #[test]
+    fn whether_a_name_is_shown_does_not_depend_on_entry_order() {
+        let entries = ["a*", "b", "?c"];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let answers = |order: [usize; 3]| {
+            let include = Include::from_stored(
+                order.iter().map(|at| entries[*at].to_string()).collect(),
+                Vec::new(),
+            );
+            let shown = include.resolve(Levels::DatabaseThenSchema, None);
+            ["ab", "b", "xc", "zz"].map(|name| shown.shows_database(name))
+        };
+        let first = answers(orders[0]);
+        assert_eq!(first, [true, true, true, false]);
+        for order in orders {
+            assert_eq!(answers(order), first, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn a_pathological_pattern_answers_without_blowing_up() {
+        assert!(!matches("*a*a*a*a*a*a*a*a*a*a*b", &"a".repeat(10_000)));
+    }
+
+    #[test]
+    fn an_absent_empty_or_blank_list_shows_everything() {
+        let names = ["a", "b", "mysql"];
+        for include in [
+            Include::from_stored(Vec::new(), Vec::new()),
+            Include::from_stored(text(&["", "  "]), Vec::new()),
+            Include::default(),
+        ] {
+            for levels in FILTERED {
+                let narrowed = include
+                    .resolve(levels, None)
+                    .narrow_databases(listed(&names, None));
+                assert_eq!(narrowed.names, names, "{levels:?}");
+                assert_eq!(narrowed.left_out, 0, "{levels:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_list_drops_blank_entries_and_keeps_at_most_the_cap() {
+        let kept = Include::from_stored(text(&["b", "", "a*", "   ", "c"]), Vec::new());
+        assert_eq!(kept.databases, ["b", "a*", "c"]);
+
+        let many = (0..ENTRIES_CAP + 7)
+            .map(|at| format!("db{at}"))
+            .collect::<Vec<_>>();
+        let capped = Include::from_stored(many.clone(), many.clone());
+        assert_eq!(capped.databases.len(), ENTRIES_CAP);
+        assert_eq!(capped.schemas.len(), ENTRIES_CAP);
+        assert_eq!(capped.databases, many[..ENTRIES_CAP]);
+    }
+
+    #[test]
+    fn each_level_filters_the_list_it_owns() {
+        let include = Include::from_stored(text(&["a*"]), text(&["s"]));
+        for levels in FILTERED {
+            let narrowed = include
+                .resolve(levels, None)
+                .narrow_databases(listed(&["a1", "b1"], None));
+            assert_eq!(narrowed.names, ["a1"], "{levels:?}");
+        }
+        assert_eq!(
+            include.resolve(Levels::Flat, None),
+            Shown::everything(),
+            "nothing to choose between, so nothing is filtered"
+        );
+
+        let schemas_only = Include::from_stored(Vec::new(), text(&["s"]));
+        for levels in FILTERED {
+            let narrowed = schemas_only
+                .resolve(levels, None)
+                .narrow_databases(listed(&["a1", "b1"], None));
+            assert_eq!(narrowed.names, ["a1", "b1"], "{levels:?}");
+        }
+    }
+
+    #[test]
+    fn the_connections_own_database_is_always_shown_and_counted_as_shown() {
+        let include = Include::from_stored(text(&["nothing*"]), Vec::new());
+        let narrowed = include
+            .resolve(Levels::DatabaseThenSchema, Some("Own"))
+            .narrow_databases(listed(&["a", "own", "b"], Some("own")));
+        assert_eq!(narrowed.names, ["own"]);
+        assert_eq!(narrowed.left_out, 2);
+        assert_eq!(narrowed.current.as_deref(), Some("own"));
+
+        let narrowed = include
+            .resolve(Levels::DatabaseThenSchema, None)
+            .narrow_databases(listed(&["a", "own", "b"], None));
+        assert!(narrowed.names.is_empty());
+        assert_eq!(narrowed.left_out, 3);
+    }
+}
