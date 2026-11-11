@@ -1637,6 +1637,86 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
+    const BEFORE_RELATIONS: &str = r#"
+SELECT
+    database AS schema_name,
+    name AS relation_name,
+    multiIf(
+        engine IN ('View', 'LiveView', 'WindowView'), 'view',
+        engine = 'MaterializedView', 'materialized_view',
+        engine = 'Dictionary', 'dictionary',
+        engine IN ('MySQL', 'PostgreSQL', 'MongoDB', 'S3', 'S3Queue', 'URL', 'HDFS', 'Kafka',
+                   'RabbitMQ', 'NATS', 'JDBC', 'ODBC', 'Hudi', 'Redis', 'AzureBlobStorage')
+            OR startsWith(engine, 'Iceberg') OR startsWith(engine, 'DeltaLake'), 'foreign_table',
+        'table'
+    ) AS relation_kind,
+    total_bytes AS size_bytes,
+    total_rows AS row_estimate
+FROM system.tables
+WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+    AND NOT is_temporary
+    AND NOT startsWith(name, '.inner')
+ORDER BY database, name"#;
+
+    #[test]
+    fn an_unfiltered_relations_statement_is_byte_identical_and_a_filtered_one_names_only_matched_databases()
+     {
+        assert_eq!(relations_sql(None), BEFORE_RELATIONS);
+        assert!(!relations_sql(None).contains("{only}"));
+
+        let names = ["analytics".to_string(), "o'k".to_string()];
+        let filtered = relations_sql(Some(&names));
+        assert!(
+            filtered.contains("AND database IN ('analytics', 'o''k')"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("{only}"));
+    }
+
+    /// The filter is matched in Rust against the server's own listing, so only
+    /// a listed name reaches the statement.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_include_list_reads_only_the_listed_databases() {
+        use crate::db::{Include, Levels, Shown};
+
+        let connection = Connection::open(&live::live_config()).expect("connection should open");
+        let user_databases = connection
+            .databases()
+            .expect("databases should list")
+            .names
+            .iter()
+            .filter(|name| !Engine::ClickHouse.is_system_database(name))
+            .count();
+        let shown = |entries: &[&str]| {
+            Include {
+                databases: entries.iter().map(|entry| (*entry).to_string()).collect(),
+                ..Include::default()
+            }
+            .resolve(Levels::DatabaseIsSchema, None, None)
+        };
+        let schema_names = |catalog: &Catalog| {
+            catalog
+                .schemas
+                .iter()
+                .map(|schema| schema.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let catalog = connection.catalog(&shown(&["analyt*"])).unwrap();
+        assert_eq!(schema_names(&catalog), ["analytics"]);
+        assert_eq!(catalog.left_out, user_databases - 1);
+
+        let catalog = connection.catalog(&shown(&["no_such*"])).unwrap();
+        assert!(catalog.schemas.is_empty());
+        assert_eq!(catalog.left_out, user_databases);
+
+        let all = connection.catalog(&Shown::everything()).unwrap();
+        let all = schema_names(&all);
+        assert!(all.contains(&"analytics".to_string()), "{all:?}");
+        assert!(all.contains(&"dbdelve_dev".to_string()), "{all:?}");
+    }
+
     #[test]
     fn a_schema_named_like_a_placeholder_is_not_substituted_into() {
         assert_eq!(
