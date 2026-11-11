@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use super::{
     CancelToken, Cancelling, Catalog, Column, Databases, DbError, Engine, Fetch, ForeignKey,
     NamedDefinition, QueryResult, RelationKind, Row, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_structure, plain_error, terminated,
+    assemble_databases, assemble_sequences, assemble_structure, plain_error, terminated,
 };
 
 /// What it takes to reach one database in one Snowflake account.
@@ -1055,6 +1055,15 @@ impl Connection {
         )
     }
 
+    /// Asked for after the routines, on a round of its own.
+    ///
+    /// ponytail: one more `INFORMATION_SCHEMA` round beside the routines'
+    /// `at_once` pair, so the ceiling is a warehouse that takes seconds to
+    /// answer each view; the upgrade is to fold this query into that pair.
+    pub fn sequences(&self) -> Result<Catalog, DbError> {
+        assemble_sequences(self.internal_query(SEQUENCES_SQL)?)
+    }
+
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
         // `INFORMATION_SCHEMA` names a constraint and its type but has no view
         // of the columns in it, so the keys come from `SHOW`.
@@ -1191,6 +1200,14 @@ SELECT TABLE_SCHEMA AS "schema_name",
        ROW_COUNT AS "row_estimate"
 FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
+ORDER BY 1, 2"#;
+
+// The names alone: `NEXT_VALUE` is not needed to list a sequence.
+const SEQUENCES_SQL: &str = r#"
+SELECT SEQUENCE_SCHEMA AS "schema_name",
+       SEQUENCE_NAME AS "sequence_name"
+FROM INFORMATION_SCHEMA.SEQUENCES
+WHERE SEQUENCE_SCHEMA <> 'INFORMATION_SCHEMA'
 ORDER BY 1, 2"#;
 
 const FUNCTIONS_SQL: &str = r#"

@@ -36,8 +36,8 @@ use super::ssh::{Tunnel, tunnelled};
 use super::{
     Catalog, Cell, Column, DbError, EditTarget, Engine, Fetch, QueryResult, Reference,
     RelationKind, Row, ServerConfig, SslMode, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_structure,
-    create_table, plain_error, required_cell, terminated,
+    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
+    assemble_structure, create_table, plain_error, required_cell, terminated,
 };
 
 const DATABASES_SQL: &str = "
@@ -75,6 +75,16 @@ LEFT JOIN (
 WHERE o.type IN ('U', 'V')
     AND o.is_ms_shipped = 0
 ORDER BY s.name, o.name
+";
+
+// The names alone: a sequence's `current_value` is not needed to list it, and
+// reading it asks for more than the catalog view does. `sys.sequences` is SQL
+// Server 2012 and later; an older server refuses it and the routines stay.
+const SEQUENCES_SQL: &str = "
+SELECT SCHEMA_NAME(schema_id) AS schema_name,
+       name AS sequence_name
+FROM sys.sequences
+ORDER BY 1, 2
 ";
 
 // `COALESCE` throughout because the assembler refuses a null, and these are
@@ -1191,6 +1201,10 @@ impl Connection {
             QueryResult::default(),
             self.internal_query(&ROUTINES_SQL.replace("{type}", TYPE_SQL))?,
         )
+    }
+
+    pub fn sequences(&self) -> Result<Catalog, DbError> {
+        assemble_sequences(self.internal_query(SEQUENCES_SQL)?)
     }
 
     pub fn references(&self, schema: &str, relation: &str) -> Result<Vec<Reference>, DbError> {

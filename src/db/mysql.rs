@@ -31,8 +31,8 @@ use super::ssh::{Tunnel, tunnelled};
 use super::{
     Catalog, Column, DbError, EditTarget, Engine, Fetch, Index, IndexKind, QueryResult, Reference,
     RowBuilder, ServerConfig, Sizes, SslMode, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sizes,
-    assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
+    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
+    assemble_sizes, assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
 };
 
 /// Without this the driver waits out the OS SYN retry budget, so a host that
@@ -122,6 +122,17 @@ FROM information_schema.ROUTINES AS routine
 WHERE routine.ROUTINE_SCHEMA NOT IN {system}
   AND routine.ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')
 ORDER BY routine.ROUTINE_SCHEMA, routine.ROUTINE_NAME
+";
+
+// The names alone: reading a sequence's own table for its current value is not
+// needed to list it.
+const SEQUENCES_SQL: &str = "
+SELECT TABLE_SCHEMA AS schema_name,
+       TABLE_NAME AS sequence_name
+FROM information_schema.TABLES
+WHERE TABLE_TYPE = 'SEQUENCE'
+  AND TABLE_SCHEMA NOT IN {system}
+ORDER BY 1, 2
 ";
 
 // The four structure queries name one relation, so they carry `{schema}` and
@@ -758,8 +769,14 @@ impl Connection {
         assemble_catalog(QueryResult::default(), routines)
     }
 
+    /// MariaDB's only: MySQL has no sequences, and a MariaDB before 10.3 answers
+    /// the filter with no rows, so there is no version probe.
     pub fn sequences(&self) -> Result<Catalog, DbError> {
-        Ok(Catalog::default())
+        if self.engine != Engine::MariaDb {
+            return Ok(Catalog::default());
+        }
+        let sequences = self.internal_query(&SEQUENCES_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
+        assemble_sequences(sequences)
     }
 
     /// On a connection of its own, as [`Self::cancel`] is, so opening every

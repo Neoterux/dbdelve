@@ -2193,8 +2193,16 @@ impl Connection {
                     connection.sequences()
                 })
             }
-            Self::MySql(connection) => connection.routines(),
-            Self::SqlServer(connection) => connection.routines(),
+            Self::MySql(connection) => {
+                with_sequences(connection.engine(), connection.routines(), || {
+                    connection.sequences()
+                })
+            }
+            Self::SqlServer(connection) => {
+                with_sequences(Engine::SqlServer, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::Sqlite(connection) => connection.routines(),
             Self::Turso(connection) => connection.routines(),
             Self::DuckDb(connection) => {
@@ -2202,7 +2210,11 @@ impl Connection {
                     connection.sequences()
                 })
             }
-            Self::Snowflake(connection) => connection.routines(),
+            Self::Snowflake(connection) => {
+                with_sequences(Engine::Snowflake, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::ClickHouse(_) => Ok(Catalog::default()),
             Self::MongoDb(connection) => connection.routines(),
             Self::Redis(_) | Self::External(_) => Ok(Catalog::default()),
