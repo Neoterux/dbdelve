@@ -16898,6 +16898,47 @@ fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
 }
 
 #[gpui::test]
+fn a_joined_batch_that_fails_part_way_says_its_earlier_rows_stay_in_the_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text); \
+             insert into birds values (1, 'wren');",
+        );
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
+
+        // As `sql::update_batch_joining` writes a multi-row apply; the second
+        // statement collides with the first's key.
+        apply_from_the_front_tab(
+            &workspace,
+            cx,
+            "INSERT INTO birds VALUES (2, 'tit');\nINSERT INTO birds VALUES (2, 'jay');",
+        );
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert!(
+                error.message.ends_with(
+                    "Rows of the batch before the failed one were applied inside the open \
+                     transaction and stay in it, to be committed or rolled back with it."
+                ),
+                "{}",
+                error.message
+            ),
+            _ => panic!("the second row was not refused by the table"),
+        });
+        run_in_front(&workspace, cx, "SELECT count(*) FROM birds");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("2"),
+            "the first row is in the open transaction, as the message says"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_multi_row_edit_joins_the_users_open_transaction_without_brackets_of_its_own(
     cx: &mut TestAppContext,
 ) {
