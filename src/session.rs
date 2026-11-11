@@ -86,6 +86,13 @@ pub(crate) struct Profile {
     pub(crate) schema_refresh: Option<u64>,
     /// What the server listed the last time Select Database asked.
     pub(crate) databases: Databases,
+    /// The session opened for each other database of the server, by name,
+    /// for the connections tree to read its catalog over. Never the profile's
+    /// own connection, and dropped with it.
+    pub(crate) bound: HashMap<String, BoundSession>,
+    /// What each other database's catalog has got to, by name. A database
+    /// with no entry has not been asked for.
+    pub(crate) database_catalogs: HashMap<String, CatalogState>,
     /// Whether the connection opened on another database than the one the
     /// tabs were opened on, because the picked one was no longer there. What
     /// is left of that database goes on the next frame, which has the window
@@ -192,6 +199,19 @@ impl Profile {
 
     pub(crate) fn refreshing_schema(&self) -> bool {
         self.schema_refresh == Some(self.generation)
+    }
+
+    /// Every connection of this profile a read-only hold has to reach: its
+    /// own, then each session open for another database. A session still
+    /// opening is not here; its landing applies the hold itself.
+    pub(crate) fn sessions_to_hold(&self) -> Vec<Connection> {
+        self.connection()
+            .into_iter()
+            .chain(self.bound.values().filter_map(|session| match session {
+                BoundSession::Open(connection) => Some(connection.clone()),
+                BoundSession::Opening => None,
+            }))
+            .collect()
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -1387,6 +1407,14 @@ pub(crate) enum CatalogState {
     /// The relations, and how far the routines behind them have got.
     Loaded(Catalog, Routines),
     Failed(String),
+}
+
+/// A session for one (profile, database) pair other than the profile's own.
+pub(crate) enum BoundSession {
+    /// Being opened on the blocking pool. Holds the database's place, so a
+    /// second expand does not open a second session.
+    Opening,
+    Open(Connection),
 }
 
 /// The second half of a loaded catalog. A catalog whose routines are not

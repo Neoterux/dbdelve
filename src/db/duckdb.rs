@@ -232,6 +232,13 @@ impl Connection {
         })
     }
 
+    /// A session on `database` of this instance, for the connections tree to
+    /// read that database's catalog over. Opened from the instance, like
+    /// [`Self::alongside`], and not from the connection's own `pick`.
+    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
+        self.alongside()
+    }
+
     fn pick(&self) -> std::sync::MutexGuard<'_, Pick> {
         self.pick
             .lock()
@@ -2475,6 +2482,26 @@ mod tests {
         // it sees one made on another.
         let beside = connection.alongside().unwrap();
         assert_eq!(beside.databases().unwrap().names, ["memory", "other"]);
+    }
+
+    #[test]
+    fn a_session_on_another_database_leaves_the_first_where_it_was() {
+        let connection = memory("ATTACH ':memory:' AS other");
+        let session = connection.on_database("other").unwrap();
+        assert_eq!(at(&session), on("other", "main"));
+        assert_eq!(at(&connection), on("memory", "main"));
+        // The pick is the session's own: a schema picked on the first would
+        // otherwise land on the second when it is next applied.
+        connection.set_schema(Some("x"));
+        session.apply_pick().unwrap();
+        assert_eq!(at(&session), on("other", "main"));
+        // And the other way: moving the session's pick leaves the first's.
+        session.set_database(Some("memory"));
+        connection.set_schema(None);
+        connection.apply_pick().unwrap();
+        assert_eq!(at(&connection), on("memory", "main"));
+        // The database it names has to be there.
+        assert!(connection.on_database("gone").is_err());
     }
 
     #[test]

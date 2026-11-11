@@ -162,6 +162,7 @@ impl Workspace {
                     },
                     levels,
                     database,
+                    databases: Vec::new(),
                 }
             })
             .collect();
@@ -320,7 +321,7 @@ impl Workspace {
                     highlighted(label, matched, t),
                     ListItem::new(index).text_color(t.text),
                 ),
-                Some(Node::Group | Node::Connection { .. } | Node::Database) => (
+                Some(Node::Group | Node::Connection { .. } | Node::Database { .. }) => (
                     highlighted(label, matched, t),
                     ListItem::new(index)
                         .text_color(t.text)
@@ -363,7 +364,7 @@ impl Workspace {
             let heading = match node {
                 Some(Node::Group) => Some(icon::PROJECT),
                 Some(Node::Connection { .. }) => target.map(|(logo, ..)| *logo),
-                Some(Node::Database) => Some(icon::DATABASE),
+                Some(Node::Database { .. }) => Some(icon::DATABASE),
                 _ if inner == Some(QUERIES_GROUP) => {
                     target.map(|(_, syntax, _)| queries_group_icon(*syntax))
                 }
