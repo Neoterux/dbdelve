@@ -8,7 +8,11 @@
 //! never from the engine.
 
 use gpui::SharedString;
-use gpui_component::checkbox::Checkbox;
+use gpui_component::{
+    Sizable,
+    checkbox::Checkbox,
+    input::{Input, InputEvent, InputState},
+};
 
 use super::*;
 use crate::db::{Include, Levels, Shown};
@@ -68,10 +72,11 @@ pub(crate) struct PickerSection {
     pub(crate) listing: Listing,
     /// The listed names ticked by hand, in the spelling the server lists.
     pub(crate) ticked: Vec<String>,
-    /// Every saved entry that is not a ticked name: wildcards, and names the
-    /// server no longer lists. Written back by Save, so an entry the dialog
-    /// has no field for yet is never dropped.
+    /// What the pattern field holds, split on commas: wildcards, and names the
+    /// server does not list. Kept in step with the field by its subscription.
     pub(crate) patterns: Vec<String>,
+    /// The comma-separated entries that are not ticked names.
+    pattern_field: Entity<InputState>,
 }
 
 pub(crate) struct FilterPicker {
@@ -94,21 +99,43 @@ pub(crate) struct FilterPicker {
 }
 
 impl PickerSection {
-    /// Before the names arrive every saved entry waits as a pattern, so a
-    /// list that never loads still writes back what it held.
-    fn loading(saved: &[String]) -> Self {
+    /// Before the names arrive every saved entry waits in the pattern field,
+    /// so a list that never loads still writes back what it held.
+    fn loading(
+        saved: &[String],
+        which: Which,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
+        let seed = saved.join(", ");
+        let pattern_field = cx.new(|cx| {
+            let mut field =
+                InputState::new(window, cx).placeholder("Patterns, e.g. prod_*, ?_test");
+            field.set_value(seed, window, cx);
+            field
+        });
+        cx.subscribe(
+            &pattern_field,
+            move |workspace, field, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    workspace.patterns_typed(which, &field, cx);
+                }
+            },
+        )
+        .detach();
         Self {
             listing: Listing::Loading,
             ticked: Vec::new(),
             patterns: saved.to_vec(),
+            pattern_field,
         }
     }
 
     /// The list Save writes: ticked names in the order and spelling the server
-    /// lists them, then the kept patterns, blanks dropped and duplicates
+    /// lists them, then the typed patterns, blanks dropped and duplicates
     /// ignoring case dropped.
     fn entries(&self) -> Vec<String> {
-        let mut entries: Vec<String> = match &self.listing {
+        let ticked: Vec<String> = match &self.listing {
             Listing::Loaded(names) => names
                 .iter()
                 .filter(|name| self.ticked.contains(name))
@@ -116,14 +143,92 @@ impl PickerSection {
                 .collect(),
             _ => self.ticked.clone(),
         };
-        for pattern in &self.patterns {
-            let repeated = entries.iter().any(|entry| same_name(entry, pattern));
-            if !pattern.trim().is_empty() && !repeated {
-                entries.push(pattern.clone());
+        written_entries(&ticked, &self.patterns.join(","))
+    }
+
+    /// The server's names have arrived: each entry that names one becomes a
+    /// tick, and the rest stay in the field as typed. What was typed while
+    /// the names were read counts as much as what was saved.
+    fn listed(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Workspace>) {
+        let (ticked, kept) = split(&self.patterns, &names);
+        if kept != self.patterns {
+            self.set_patterns(kept, window, cx);
+        }
+        for name in ticked {
+            if !self.ticked.contains(&name) {
+                self.ticked.push(name);
             }
         }
-        entries
+        self.listing = Listing::Loaded(names);
     }
+
+    /// Put `patterns` in the field and keep the list in step: `set_value`
+    /// reports no change, so the subscription does not do it.
+    fn set_patterns(
+        &mut self,
+        patterns: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let text = patterns.join(", ");
+        self.pattern_field
+            .update(cx, |field, cx| field.set_value(text, window, cx));
+        self.patterns = patterns;
+    }
+}
+
+/// `entries` in the order given, trimmed, blanks dropped and a repeat ignoring
+/// case dropped.
+fn merged<'a>(entries: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for entry in entries.map(str::trim) {
+        if !entry.is_empty() && !kept.iter().any(|known| same_name(known, entry)) {
+            kept.push(entry.to_string());
+        }
+    }
+    kept
+}
+
+/// What Save writes for one list: the `ticked` names, then the comma-separated
+/// `patterns` as typed, each once.
+///
+/// ponytail: an entry that itself holds a comma is split when the field is
+/// edited; the ceiling is a database named with one, the upgrade is an escape.
+fn written_entries(ticked: &[String], patterns: &str) -> Vec<String> {
+    merged(ticked.iter().map(String::as_str).chain(patterns.split(',')))
+}
+
+/// Whether `pattern` admits `name`, by the rule the read sites apply: asked of
+/// the stored rule's own matcher, so the preview cannot drift from what Save
+/// will show. The databases list stands for any list here; a name this admits
+/// is admitted by the same pattern in the schemas list.
+fn admits(pattern: &str, name: &str) -> bool {
+    Include {
+        databases: vec![pattern.to_string()],
+        schemas: Vec::new(),
+    }
+    .resolve(Levels::DatabaseHoldsObjects, None, None)
+    .shows_database(name)
+}
+
+/// The line naming the patterns that admit none of the listed `names`: the
+/// first three, then how many more. `noun` is what the names are, `database` or
+/// `schema in {database}`.
+fn unmatched_line(noun: &str, patterns: &[String], names: &[String]) -> Option<String> {
+    let patterns = merged(patterns.iter().map(String::as_str));
+    let unmatched: Vec<&str> = patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|pattern| !names.iter().any(|name| admits(pattern, name)))
+        .collect();
+    if unmatched.is_empty() {
+        return None;
+    }
+    let named = unmatched[..unmatched.len().min(3)].join(", ");
+    Some(match unmatched.len() - unmatched.len().min(3) {
+        0 => format!("No {noun} matches: {named}"),
+        more => format!("No {noun} matches: {named} and {more} more"),
+    })
 }
 
 impl FilterPicker {
@@ -150,6 +255,33 @@ impl FilterPicker {
             Which::Databases => self.row_hint(name),
             Which::Schemas => self.schema_hint(name),
         }
+    }
+
+    /// What a listed row says about itself: why it is shown whatever the list
+    /// says, or that a typed pattern shows it. A name that is ticked as well
+    /// shows once, as a ticked row.
+    pub(crate) fn listed_hint(&self, which: Which, name: &str) -> Option<&'static str> {
+        self.hint(which, name).or_else(|| {
+            let section = self.section(which)?;
+            let ticked = section.ticked.iter().any(|ticked| same_name(ticked, name));
+            let matched = section.patterns.iter().any(|pattern| admits(pattern, name));
+            (matched && !ticked).then_some("by pattern")
+        })
+    }
+
+    /// The line under the preview naming the typed patterns that match no
+    /// listed name, once the names are read.
+    pub(crate) fn unmatched(&self, which: Which) -> Option<String> {
+        let section = self.section(which)?;
+        let Listing::Loaded(names) = &section.listing else {
+            return None;
+        };
+        let noun = match (which, self.own_database.as_deref()) {
+            (Which::Databases, _) => "database".to_string(),
+            (Which::Schemas, Some(database)) => format!("schema in {database}"),
+            (Which::Schemas, None) => "schema".to_string(),
+        };
+        unmatched_line(&noun, &section.patterns, names)
     }
 
     fn section(&self, which: Which) -> Option<&PickerSection> {
@@ -288,7 +420,7 @@ impl Workspace {
     pub(crate) fn open_filter_picker(
         &mut self,
         profile: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(found) = self.profiles.iter().find(|found| found.id == profile) else {
@@ -313,8 +445,15 @@ impl Workspace {
             own_database: found.active_database(),
             active_schema: found.active_schema().map(str::to_string),
             saved: found.include.clone(),
-            databases: PickerSection::loading(&found.include.databases),
-            schemas: wants_schemas.then(|| PickerSection::loading(&found.include.schemas)),
+            databases: PickerSection::loading(
+                &found.include.databases,
+                Which::Databases,
+                window,
+                cx,
+            ),
+            schemas: wants_schemas.then(|| {
+                PickerSection::loading(&found.include.schemas, Which::Schemas, window, cx)
+            }),
         });
         cx.notify();
         // Every database and schema, not the shown ones: the names the tree
@@ -339,10 +478,10 @@ impl Workspace {
             });
             (databases, schemas)
         });
-        cx.spawn(async move |workspace, cx| {
+        cx.spawn_in(window, async move |workspace, cx| {
             let (databases, schemas) = fetch.await;
-            _ = workspace.update(cx, |workspace, cx| {
-                workspace.names_listed_for_picker(request, databases, schemas, cx);
+            _ = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.names_listed_for_picker(request, databases, schemas, window, cx);
             });
         })
         .detach();
@@ -353,6 +492,7 @@ impl Workspace {
         request: u64,
         databases: Result<Databases, DbError>,
         schemas: Option<Result<Vec<String>, DbError>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Closed, or put up again, since: the answer is not this dialog's.
@@ -374,10 +514,7 @@ impl Workspace {
         };
         match databases {
             Ok(listed) => {
-                let (ticked, patterns) = split(&picker.saved.databases, &listed.names);
-                picker.databases.ticked = ticked;
-                picker.databases.patterns = patterns;
-                picker.databases.listing = Listing::Loaded(listed.names);
+                picker.databases.listed(listed.names, window, cx);
                 if listed.current.is_some() {
                     picker.own_database = listed.current;
                 }
@@ -386,12 +523,7 @@ impl Workspace {
         }
         if let (Some(section), Some(result)) = (picker.schemas.as_mut(), schemas) {
             match result {
-                Ok(names) => {
-                    let (ticked, patterns) = split(&picker.saved.schemas, &names);
-                    section.ticked = ticked;
-                    section.patterns = patterns;
-                    section.listing = Listing::Loaded(names);
-                }
+                Ok(names) => section.listed(names, window, cx),
                 Err(error) => section.listing = Listing::Failed(error.message),
             }
         }
@@ -418,6 +550,27 @@ impl Workspace {
         self.refocus_front();
         cx.notify();
         true
+    }
+
+    /// A change in a section's pattern field: what Save writes and what the
+    /// rows and the preview say follow it.
+    fn patterns_typed(&mut self, which: Which, field: &Entity<InputState>, cx: &mut Context<Self>) {
+        let typed = field.read(cx).value();
+        let Some(section) = self
+            .filter_picker
+            .as_mut()
+            .and_then(|picker| picker.section_mut(which))
+            .filter(|section| section.pattern_field == *field)
+        else {
+            return;
+        };
+        section.patterns = typed
+            .split(',')
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .map(str::to_string)
+            .collect();
+        cx.notify();
     }
 
     fn tick_name(&mut self, which: Which, name: &str, on: bool, cx: &mut Context<Self>) {
@@ -526,7 +679,7 @@ impl Workspace {
                 .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
                 .overflow_y_scroll()
                 .children(names.iter().enumerate().map(|(index, listed)| {
-                    let hint = picker.hint(which, listed);
+                    let hint = picker.listed_hint(which, listed);
                     let checked = hint.is_some() || section.ticked.contains(listed);
                     let toggled = listed.clone();
                     div()
@@ -574,6 +727,33 @@ impl Workspace {
                 }))
                 .into_any_element(),
         };
+        let patterns_row = div()
+            .flex()
+            .flex_col()
+            .gap(px(layout::SPACE_XS))
+            .px(px(layout::SPACE_SM))
+            .py(px(layout::SPACE_XS))
+            .child(
+                div()
+                    .debug_selector(move || format!("filter-picker-patterns-{key}"))
+                    .h(row_height)
+                    .px(px(layout::SPACE_SM))
+                    .flex()
+                    .items_center()
+                    .rounded(px(layout::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(t.border)
+                    .child(div().flex_1().min_w_0().child(Sizable::small(
+                        Input::new(&section.pattern_field).appearance(false).p_0(),
+                    ))),
+            )
+            .child(
+                div()
+                    .text_size(text_size)
+                    .text_color(t.text_muted)
+                    .child("* matches any run of characters and ? matches one. Case is ignored."),
+            )
+            .into_any_element();
         let caption = match which {
             Which::Databases => None,
             Which::Schemas => picker.schemas_caption(),
@@ -592,13 +772,20 @@ impl Workspace {
                         .text_color(t.text_muted)
                         .child(caption)
                 }))
-                .child(well(t, [list]))
+                .child(well(t, [list, patterns_row]))
                 .children(picker.preview(which).map(|preview| {
                     div()
                         .debug_selector(move || format!("filter-picker-preview-{key}"))
                         .text_size(text_size)
                         .text_color(t.text_muted)
                         .child(preview)
+                }))
+                .children(picker.unmatched(which).map(|unmatched| {
+                    div()
+                        .debug_selector(move || format!("filter-picker-unmatched-{key}"))
+                        .text_size(text_size)
+                        .text_color(t.text_muted)
+                        .child(unmatched)
                 }))
                 .into_any_element(),
         )
