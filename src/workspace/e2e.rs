@@ -2021,6 +2021,228 @@ fn a_tab_bound_to_a_hidden_database_runs_and_its_catalog_is_never_read(cx: &mut 
     });
 }
 
+/// The labels the completion menu of the query tab in front lists after
+/// `text` is typed and the menu asked for.
+fn completion_labels(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    text: &str,
+) -> Vec<String> {
+    cx.simulate_input(text);
+    settle(cx);
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    cx.simulate_keystrokes("ctrl-space");
+    settle(cx);
+    let labels = query_tab(workspace, cx, |tab, _, cx| {
+        tab.editor
+            .read(cx)
+            .completion_menu_state()
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    });
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    labels
+}
+
+#[gpui::test]
+fn everything_that_reads_the_catalog_follows_the_filter(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"\ninclude_databases = [\"e2e\"]\ninclude_schemas = [\"main\"]",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; CREATE TABLE extra.x (id INTEGER);",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+
+        cx.dispatch_action(crate::actions::SelectDatabase);
+        settle(cx);
+        let databases = palette_labels(&workspace, cx);
+        assert!(
+            databases.iter().any(|label| label == "e2e"),
+            "{databases:?}"
+        );
+        assert!(
+            !databases.iter().any(|label| label == "other"),
+            "{databases:?}"
+        );
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.select_schema(window, cx))
+        });
+        settle(cx);
+        let schemas = palette_labels(&workspace, cx);
+        assert!(schemas.iter().any(|label| label == "main"), "{schemas:?}");
+        assert!(!schemas.iter().any(|label| label == "extra"), "{schemas:?}");
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+
+        cx.simulate_keystrokes("secondary-p");
+        settle(cx);
+        let objects = palette_labels(&workspace, cx);
+        assert!(objects.iter().any(|label| label == "main.t"), "{objects:?}");
+        assert!(
+            !objects.iter().any(|label| label == "extra.x"),
+            "{objects:?}"
+        );
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+
+        new_query_here(&workspace, cx, None, None);
+        let offered = completion_labels(&workspace, cx, "SELECT * FROM a");
+        // `a` is in `main` and in `extra`: only the one the filter shows is
+        // offered.
+        assert!(
+            offered.iter().any(|label| label.contains("main")),
+            "{offered:?}"
+        );
+        assert!(
+            !offered
+                .iter()
+                .any(|label| label.contains("extra") || label.ends_with('x')),
+            "{offered:?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_tab_open_on_a_hidden_object_keeps_working_and_its_pin_draws_missing(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        store::write_query("e2e", "q", "SELECT 1").expect("the test home takes a saved query");
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+             CREATE TABLE extra.x (id INTEGER); INSERT INTO extra.x VALUES (1), (2);",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let click = |id: &str, cx: &mut VisualTestContext| {
+            let at = connections_row(&workspace, cx, id)
+                .unwrap_or_else(|| panic!("{id} is not showing"));
+            click_connections_row(cx, at);
+        };
+        click(&connection_row("e2e"), cx);
+        let x = scoped_row("e2e", Some("e2e"), &explorer::relation_row("extra", "x"));
+        for id in [
+            database_row("e2e", "e2e"),
+            scoped_row("e2e", Some("e2e"), "schema-extra"),
+            scoped_row("e2e", Some("e2e"), "category-Tables-extra"),
+            x.clone(),
+        ] {
+            click(&id, cx);
+        }
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_selection_action(crate::sidebar::SelectionAction::Pin, window, cx)
+        });
+        settle(cx);
+
+        // What the tree draws of the pin, by whether its object is listed.
+        let pin_missing = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("a profile is in front");
+                let content = super::profiles::explorer_content(profile, "");
+                let mut pins = content
+                    .shortcuts
+                    .values()
+                    .filter_map(|shortcut| match shortcut {
+                        crate::explorer::Shortcut::Member {
+                            folder: None,
+                            missing,
+                            ..
+                        } => Some(*missing),
+                        _ => None,
+                    });
+                let pin = pins.next().expect("the object is pinned");
+                assert_eq!(pins.next(), None, "one pin");
+                pin
+            })
+        };
+        let survivors = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("a profile is in front");
+                (
+                    profile
+                        .session
+                        .objects
+                        .iter()
+                        .map(|tab| (tab.schema.clone(), tab.name.clone()))
+                        .collect::<Vec<_>>(),
+                    profile.shortcuts.pins.len(),
+                    profile.session.saved_queries.clone(),
+                )
+            })
+        };
+        let object = ("extra".to_string(), "x".to_string());
+        assert_eq!(
+            survivors(cx),
+            (vec![object.clone()], 1, vec!["q".to_string()])
+        );
+        assert!(!pin_missing(cx));
+
+        // The two steps Save performs on the filter.
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .profile_mut()
+                .expect("a profile is in front")
+                .include
+                .schemas = vec!["main".to_string()];
+            workspace.refresh_schema(cx);
+        });
+        settle(cx);
+        assert_eq!(own_catalog(&workspace, cx).0, ["main"]);
+        assert_eq!(
+            survivors(cx),
+            (vec![object.clone()], 1, vec!["q".to_string()])
+        );
+        assert!(pin_missing(cx), "the pin is greyed, not dropped");
+        assert_eq!(
+            store::read_query("e2e", "q").expect("the file reads"),
+            Some("SELECT 1".to_string())
+        );
+
+        // The tab still reads its rows through the session it was opened on.
+        let id = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.objects[0].id
+        });
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let tab = &workspace.profile().unwrap().session.objects[0];
+            let ObjectBody::Relation { query, .. } = &tab.body else {
+                panic!("x is a table");
+            };
+            assert!(matches!(query, QueryState::Complete { .. }));
+        });
+
+        // Removing the filter lists the object again, and the pin with it.
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .profile_mut()
+                .expect("a profile is in front")
+                .include
+                .schemas
+                .clear();
+            workspace.refresh_schema(cx);
+        });
+        settle(cx);
+        assert!(!pin_missing(cx), "the pin is drawn present again");
+        assert_eq!(survivors(cx), (vec![object], 1, vec!["q".to_string()]));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
