@@ -2392,6 +2392,131 @@ fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
     });
 }
 
+/// What the palette's Commands scope draws at the end of each row.
+fn palette_hints(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<(String, String)> {
+    cx.simulate_keystrokes("secondary-shift-p");
+    settle(cx);
+    let rows = workspace.read_with(cx, |workspace, cx| {
+        let palette = workspace.palette.as_ref().expect("the palette is up");
+        palette
+            .read(cx)
+            .labels_with_hints()
+            .into_iter()
+            .map(|(label, hint)| (label.to_string(), hint.to_string()))
+            .collect()
+    });
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    rows
+}
+
+#[gpui::test]
+fn filter_databases_in_the_palette_opens_the_picker_in_simple_mode(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx)
+        });
+        settle(cx);
+        assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
+
+        let filter = palette_hints(&workspace, cx)
+            .into_iter()
+            .find(|(label, _)| label == "Filter databases…");
+        assert_eq!(
+            filter,
+            Some(("Filter databases…".to_string(), String::new())),
+            "simple mode has no count slot, though the filter leaves `other` out"
+        );
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Filter databases");
+        settle(cx);
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        assert!(cx.debug_bounds("filter-picker-list-databases").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.databases.listing,
+                super::filter_picker::Listing::Loaded(vec!["e2e".into(), "other".into()]),
+                "the names the filter hides are listed too"
+            );
+            assert_eq!(picker.databases.ticked, ["e2e"]);
+        });
+        press(cx, "escape");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_filter_command_shows_the_count_the_tree_shows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let hint = |cx: &mut VisualTestContext| {
+            palette_hints(&workspace, cx)
+                .into_iter()
+                .find(|(label, _)| label == "Filter databases…")
+                .map(|(_, hint)| hint)
+        };
+        assert_eq!(hint(cx).as_deref(), Some("1 of 2"));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .profile_mut()
+                .expect("a profile is in front")
+                .include
+                .databases
+                .clear();
+            workspace.refresh_schema(cx);
+        });
+        settle(cx);
+        assert_eq!(
+            hint(cx).as_deref(),
+            Some(""),
+            "an unfiltered profile has no count to show"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_flat_connection_offers_no_filter(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        assert!(
+            palette_hints(&workspace, cx)
+                .iter()
+                .all(|(label, _)| label != "Filter databases…"),
+            "a target with no databases to choose between has no command"
+        );
+        let target = workspace.read_with(cx, |workspace, _| workspace.target());
+        assert!(
+            !crate::sidebar::node_actions(crate::sidebar::NodeKind::Connection, "x", target)
+                .contains(&crate::sidebar::NodeAction::FilterDatabases)
+        );
+        // Asked for anyway, the picker does not open.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_command(Command::FilterDatabases, window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

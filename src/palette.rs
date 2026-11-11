@@ -1538,6 +1538,15 @@ impl Palette {
             .collect()
     }
 
+    /// Each row's label with the hint drawn at its end, empty where it has none.
+    #[cfg(test)]
+    pub fn labels_with_hints(&self) -> Vec<(&str, &str)> {
+        self.items
+            .iter()
+            .map(|item| (item.label.as_str(), item.hint.as_ref()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn history(&self) -> HistoryView {
         self.history
