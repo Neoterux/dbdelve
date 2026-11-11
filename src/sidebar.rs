@@ -117,10 +117,151 @@ pub(crate) struct SidebarTree {
     pub(crate) shortcuts: HashMap<String, Shortcut>,
 }
 
+/// The rows for `listed`, grouped under `projects` the way the palette's
+/// Connections scope orders them: the connections in no project first, and
+/// only while a project exists, then each project in its stored order, every
+/// connection in the order `listed` has it. Nothing is sorted, so two builds
+/// over the same input give the same rows.
+///
+/// `folds` is whether each row was open in the tree this one replaces, by
+/// row id, so a rebuild puts the user's folding back.
 pub(crate) fn build(
-    _projects: &[StoredProject],
-    _listed: Vec<Listed<'_>>,
-    _folds: &HashMap<String, bool>,
+    projects: &[StoredProject],
+    listed: Vec<Listed<'_>>,
+    folds: &HashMap<String, bool>,
 ) -> SidebarTree {
-    SidebarTree::default()
+    let mut tree = SidebarTree::default();
+    // One bucket per project, and the first for the connections in none. A
+    // connection a second project also names stays under the first, as it
+    // does in the palette.
+    let mut buckets: Vec<Vec<TreeItem>> = vec![Vec::new(); projects.len() + 1];
+    for connection in listed {
+        let bucket = projects
+            .iter()
+            .position(|project| project.connections.iter().any(|id| id == connection.id))
+            .map_or(0, |at| at + 1);
+        buckets[bucket].push(connection_item(&mut tree, connection, folds));
+    }
+    if projects.is_empty() {
+        tree.items = buckets.swap_remove(0);
+        return tree;
+    }
+    let mut buckets = buckets.into_iter();
+    // A group with nothing in it is a row that only says so, which is wanted
+    // of a project the user made and not of the absence of one.
+    let unlisted = buckets.next().unwrap_or_default();
+    let groups = (!unlisted.is_empty())
+        .then(|| (NO_PROJECT_ROW.to_string(), "No project", unlisted))
+        .into_iter()
+        .chain(projects.iter().zip(buckets).map(|(project, members)| {
+            (project_row(&project.name), project.name.as_str(), members)
+        }));
+    for (id, label, members) in groups {
+        tree.nodes.insert(id.clone(), Node::Group);
+        let open = folds.get(&id).copied().unwrap_or(true);
+        tree.items.push(
+            TreeItem::new(id, label.to_string())
+                .expanded(open)
+                .children(members),
+        );
+    }
+    tree
+}
+
+fn connection_item(
+    tree: &mut SidebarTree,
+    connection: Listed<'_>,
+    folds: &HashMap<String, bool>,
+) -> TreeItem {
+    let id = connection_row(connection.id);
+    tree.nodes.insert(
+        id.clone(),
+        Node::Connection {
+            profile: connection.id.to_string(),
+        },
+    );
+    let followed = folds.get(&id).copied().unwrap_or(false);
+    let (open, children) = match connection.content {
+        // Nothing has asked it to load, and nothing will until this row is
+        // opened: an open row here would show a `Loading…` that no answer is
+        // coming to replace.
+        Content::Unloaded => (false, vec![notice(tree, connection.id, "loading", LOADING)]),
+        Content::Loading => (
+            followed,
+            vec![notice(tree, connection.id, "loading", LOADING)],
+        ),
+        Content::Failed(text) => (followed, vec![notice(tree, connection.id, "notice", &text)]),
+        Content::Loaded(content) if content.items.is_empty() => (
+            followed,
+            vec![notice(
+                tree,
+                connection.id,
+                "notice",
+                "No database objects found.",
+            )],
+        ),
+        Content::Loaded(content) => {
+            let ExplorerTree {
+                items,
+                leaves,
+                highlights,
+                shortcuts,
+            } = content;
+            let children = items
+                .into_iter()
+                .map(|item| scoped_item(tree, connection.id, item, &leaves, folds))
+                .collect();
+            for (row, ranges) in highlights {
+                tree.highlights
+                    .insert(scoped_row(connection.id, &row), ranges);
+            }
+            for (row, shortcut) in shortcuts {
+                tree.shortcuts
+                    .insert(scoped_row(connection.id, &row), shortcut);
+            }
+            (followed, children)
+        }
+    };
+    TreeItem::new(id, connection.name.to_string())
+        .expanded(open)
+        .children(children)
+}
+
+/// A row that says something about its connection and opens nothing. Its id
+/// is one no simple-mode row can have.
+fn notice(tree: &mut SidebarTree, profile: &str, row: &str, text: &str) -> TreeItem {
+    let id = scoped_row(profile, row);
+    tree.nodes.insert(id.clone(), Node::Notice);
+    TreeItem::new(id, text.to_string()).disabled(true)
+}
+
+/// `item` and everything under it with its id scoped to `profile`. A folder
+/// is folded unless `folds` says it was open: a connect must not unfold the
+/// thousands of rows a catalog can hold.
+fn scoped_item(
+    tree: &mut SidebarTree,
+    profile: &str,
+    mut item: TreeItem,
+    leaves: &HashMap<String, ExplorerLeaf>,
+    folds: &HashMap<String, bool>,
+) -> TreeItem {
+    let id = scoped_row(profile, &item.id);
+    tree.nodes.insert(
+        id.clone(),
+        Node::Row {
+            leaf: leaves.get(item.id.as_str()).copied(),
+        },
+    );
+    let folder = item.is_folder();
+    let disabled = item.is_disabled();
+    let label = item.label.clone();
+    let children: Vec<TreeItem> = std::mem::take(&mut item.children)
+        .into_iter()
+        .map(|child| scoped_item(tree, profile, child, leaves, folds))
+        .collect();
+    let open = folder && folds.get(&id).copied().unwrap_or(false);
+    TreeItem::new(id, label)
+        .expanded(open)
+        .disabled(disabled)
+        .children(children)
 }

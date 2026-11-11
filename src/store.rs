@@ -509,6 +509,11 @@ pub struct StoredSettings {
     /// value forward, so one window's save never undoes another's choice.
     #[serde(default)]
     pub agent_access: Option<bool>,
+    /// Which sidebar the window draws, `simple` or `complex`. Absent reads as
+    /// simple, which is what every file written before it showed. A scalar,
+    /// so it stays above the tables below.
+    #[serde(default)]
+    pub view_mode: Option<String>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -4055,6 +4060,7 @@ open_objects = []
                 verbose_logging: Some(true),
                 welcomed: Some(true),
                 agent_access: Some(true),
+                view_mode: Some("complex".into()),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),
@@ -4182,6 +4188,7 @@ open_objects = []
             let file = ProfileFile {
                 settings: Some(StoredSettings {
                     agent_access: choice,
+                    view_mode: Some("complex".into()),
                     custom_keybindings: Some(HashMap::from([(
                         "apply_edits".to_string(),
                         "cmd-shift-s".to_string(),
