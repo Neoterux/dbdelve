@@ -1591,7 +1591,15 @@ impl Workspace {
         let pending = results.read(cx).delegate().pending_updates();
         // Nothing partial runs: a batch missing one of its rows is not the
         // change the user made.
-        let batch = match update_batch(self.engine(), &pending) {
+        // A bound tab's edit is refused outright while its session holds a
+        // transaction (`Profile::bound_write_refusal`); on the connection's own
+        // session the edit joins the user's open one, as a single row's does.
+        let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
+        let written = match joins {
+            true => sql::update_batch_joining(self.engine(), &pending),
+            false => update_batch(self.engine(), &pending),
+        };
+        let batch = match written {
             Ok(batch) => batch,
             Err(message) => {
                 self.note(message, cx);

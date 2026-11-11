@@ -2226,7 +2226,23 @@ pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Result<String
     }
 }
 
+/// [`update_batch`] for a session that already has a transaction of the
+/// user's open: no brackets of its own, so the batch runs inside that
+/// transaction and is committed or rolled back with it. Bracketed, its
+/// `COMMIT` would end the user's transaction, and on MySQL and MariaDB its
+/// `START TRANSACTION` would commit it first.
+pub(crate) fn update_batch_joining(engine: Engine, rows: &[PendingRow]) -> Result<String, String> {
+    match engine.syntax() {
+        Syntax::Sql => sql_statements(engine.spec(), rows, false),
+        _ => update_batch(engine, rows),
+    }
+}
+
 pub(crate) fn sql_update_batch(spec: &EngineSpec, rows: &[PendingRow]) -> Result<String, String> {
+    sql_statements(spec, rows, true)
+}
+
+fn sql_statements(spec: &EngineSpec, rows: &[PendingRow], bracket: bool) -> Result<String, String> {
     if rows.is_empty() {
         return Err("There are no edits to apply.".into());
     }
@@ -2268,7 +2284,10 @@ pub(crate) fn sql_update_batch(spec: &EngineSpec, rows: &[PendingRow]) -> Result
     let batch = statements
         .ok_or("dbdelve cannot name an edited row by its primary key.")?
         .join("\n");
-    let bracket = spec.sql.transaction_opening().filter(|_| rows.len() > 1);
+    let bracket = spec
+        .sql
+        .transaction_opening()
+        .filter(|_| bracket && rows.len() > 1);
     Ok(match bracket {
         Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
         None => batch,
@@ -7725,6 +7744,30 @@ mod tests {
 
         let postgres = update_batch(Engine::Postgres, &rows).unwrap();
         assert!(!postgres.contains("BEGIN"), "{postgres}");
+    }
+
+    #[test]
+    fn a_batch_joining_an_open_transaction_carries_no_brackets_and_passes_the_gate() {
+        // Its own COMMIT would end the user's transaction, and MySQL's
+        // START TRANSACTION would commit it first.
+        let rows = vec![
+            pending_row(&[("name", set("Ada"))], &[("id", "1")]),
+            pending_row(&[("name", set("Bo"))], &[("id", "2")]),
+        ];
+        for engine in [
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::SqlServer,
+            Engine::Postgres,
+        ] {
+            let batch = update_batch_joining(engine, &rows).unwrap();
+            assert_eq!(batch.matches("UPDATE").count(), 2, "{engine:?} {batch}");
+            assert!(!ends_transaction(engine, &batch), "{engine:?} {batch}");
+            assert!(!batch.contains("BEGIN"), "{engine:?} {batch}");
+            assert!(!batch.contains("START TRANSACTION"), "{engine:?} {batch}");
+            assert!(is_generated_write_on(engine, &batch), "{engine:?} {batch}");
+        }
     }
 
     #[test]
