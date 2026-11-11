@@ -2568,10 +2568,26 @@ impl Render for Workspace {
 pub(crate) struct DdlView {
     /// The connection the object belongs to, by id.
     pub(crate) profile: String,
+    /// The object's database when it is not the connection's own.
+    pub(crate) database: Option<String>,
+    pub(crate) schema: String,
     pub(crate) name: String,
+    /// What a relation is, `None` for an object with no columns: only a
+    /// relation is offered a [`DiagramState`] to toggle to.
+    pub(crate) kind: Option<RelationKind>,
     pub(crate) title: String,
     pub(crate) text: DdlText,
+    /// Read the first time it is chosen, not with the definition.
+    pub(crate) diagram: Option<DiagramState>,
+    pub(crate) showing_diagram: bool,
     pub(crate) request: u64,
+}
+
+/// The diagram as the dialog has it.
+pub(crate) enum DiagramState {
+    Loading,
+    Ready(crate::diagram::Diagram),
+    Failed(String),
 }
 
 /// The definition as the dialog has it.

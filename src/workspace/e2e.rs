@@ -2982,9 +2982,14 @@ fn an_empty_definition_says_so_and_offers_nothing_to_copy(cx: &mut TestAppContex
                     .clone();
                 workspace.ddl_view = Some(super::DdlView {
                     profile,
+                    database: None,
+                    schema: "main".into(),
                     name: "birds".into(),
+                    kind: Some(RelationKind::Table),
                     title: "Table main.birds".into(),
                     text,
+                    diagram: None,
+                    showing_diagram: false,
                     request: 1,
                 });
                 cx.notify();
@@ -3099,6 +3104,82 @@ fn copy_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestApp
             assert!(text.contains("CREATE TABLE t"), "{database:?}: {text}");
             assert_eq!(text.contains("extra"), has_extra, "{database:?}: {text}");
         }
+        quit(workspace, cx);
+    });
+}
+
+/// Clicks the dialog's `SQL` or `Diagram` choice.
+fn choose_in_ddl_dialog(cx: &mut VisualTestContext, choice: &'static str) {
+    let at = cx
+        .debug_bounds(choice)
+        .unwrap_or_else(|| panic!("{choice} is drawn"))
+        .center();
+    cx.simulate_click(at, gpui::Modifiers::default());
+    settle(cx);
+}
+
+#[gpui::test]
+fn the_diagram_shows_a_tables_keys_and_targets_and_sends_no_new_statement(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table owners (id integer primary key); \
+             create table birds (id integer primary key, owner_id integer references owners(id));",
+        );
+        let history = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.history.len()
+            })
+        };
+        let before = history(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+        });
+        settle(cx);
+        assert!(cx.debug_bounds("show-ddl-text").is_some(), "SQL first");
+        assert!(cx.debug_bounds("diagram-table-birds").is_none());
+
+        choose_in_ddl_dialog(cx, "show-ddl-diagram-choice");
+        for drawn in [
+            "diagram-table-birds",
+            "diagram-pk-id",
+            "diagram-fk-owner_id",
+            "diagram-target-owners",
+        ] {
+            assert!(cx.debug_bounds(drawn).is_some(), "{drawn} is drawn");
+        }
+        assert!(cx.debug_bounds("diagram-pk-owner_id").is_none());
+        assert!(cx.debug_bounds("show-ddl-text").is_none());
+        assert_eq!(history(cx), before, "the diagram ran nothing of its own");
+
+        choose_in_ddl_dialog(cx, "show-ddl-sql-choice");
+        assert!(cx.debug_bounds("show-ddl-text").is_some());
+        assert!(cx.debug_bounds("diagram-table-birds").is_none());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_diagram_choice_is_offered_only_for_an_object_with_columns(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+        });
+        settle(cx);
+        assert!(cx.debug_bounds("show-ddl-diagram-choice").is_some());
+        assert!(cx.debug_bounds("show-ddl-sql-choice").is_some());
+
+        // An object with no structure, as a sequence is.
+        workspace.update(cx, |workspace, cx| {
+            let view = workspace.ddl_view.as_mut().expect("the dialog is up");
+            view.kind = None;
+            cx.notify();
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        assert!(cx.debug_bounds("show-ddl-diagram-choice").is_none());
+        assert!(cx.debug_bounds("show-ddl-sql-choice").is_none());
         quit(workspace, cx);
     });
 }
