@@ -3991,6 +3991,44 @@ mod live {
         );
     }
 
+    /// A `USE` of a bound tab's lives on the `session_id` every tab bound to
+    /// the database shares, so the next bound statement must put it back;
+    /// dbdelve's own statements go out sessionless, naming the database.
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
+    fn live_a_bound_run_is_put_back_in_its_database_after_a_use() {
+        let session = crate::db::Connection::ClickHouse(
+            live()
+                .on_database("system")
+                .expect("a session on another database should open"),
+        );
+        let cancel = crate::db::CancelToken::alongside();
+        let sql = "SELECT currentDatabase()";
+        let bound = |sql: &str| {
+            let read = session
+                .query_bound(None, sql, &cancel, Fetch::default())
+                .unwrap_or_else(|error| panic!("{sql}: {}", error.message));
+            let row = read.rows.first()?;
+            row.iter().next().flatten().map(str::to_string)
+        };
+        assert_eq!(bound(sql).as_deref(), Some("system"));
+
+        bound("USE dbdelve_dev");
+        let edit = session
+            .generated_bound(None, sql, &cancel, None, None)
+            .expect("the read runs");
+        assert_eq!(
+            edit.rows[0].iter().next().flatten(),
+            Some("system"),
+            "dbdelve's own statements name the database and take no session"
+        );
+        assert_eq!(
+            bound(sql).as_deref(),
+            Some("system"),
+            "another tab's USE does not carry a later bound run to its database"
+        );
+    }
+
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
     fn live_connects_and_prefer_falls_back_to_plaintext() {
