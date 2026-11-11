@@ -232,11 +232,29 @@ impl Connection {
         })
     }
 
-    /// A session on `database` of this instance, for the connections tree to
-    /// read that database's catalog over. Opened from the instance, like
-    /// [`Self::alongside`], and not from the connection's own `pick`.
-    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
-        self.alongside()
+    /// A session on `database` of this instance, for the (connection,
+    /// database) pair: opened from the instance as [`Self::alongside`] is,
+    /// but with a `pick` of its own, which `alongside` shares with the
+    /// connection it came from, so moving either never moves the other. It
+    /// starts on the database with no schema picked, through the same `USE`
+    /// every move makes. It carries no read-only hold; there is none to take
+    /// on DuckDB, whose gate is the boundary.
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        let connection = lock(&self.origin)?
+            .try_clone()
+            .map_err(|error| plain_error(error.to_string()))?;
+        let pick = Pick {
+            database: Some(database.to_string()),
+            schema: None,
+        };
+        self.go(&connection, &pick)?;
+        Ok(Self {
+            interrupt: connection.interrupt_handle(),
+            connection: Arc::new(Mutex::new(connection)),
+            pick: Arc::new(Mutex::new(pick)),
+            unpicked: None,
+            ..self.clone()
+        })
     }
 
     fn pick(&self) -> std::sync::MutexGuard<'_, Pick> {

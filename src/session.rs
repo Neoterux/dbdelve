@@ -208,10 +208,23 @@ impl Profile {
         self.connection()
             .into_iter()
             .chain(self.bound.values().filter_map(|session| match session {
-                BoundSession::Open(connection) => Some(connection.clone()),
+                BoundSession::Open(connection) => Some((**connection).clone()),
                 BoundSession::Opening => None,
             }))
             .collect()
+    }
+
+    /// Let go of every session opened for another database, and what was read
+    /// over them: the connection they were opened from has ended or been
+    /// replaced, and a landing issued to it is dropped by its generation.
+    ///
+    /// ponytail: a session lives as long as its connection and ends with
+    /// nothing else, so a server with many databases expanded holds one
+    /// session each until it disconnects. The upgrade is to close one when
+    /// the last tab bound to it is gone and its row is folded.
+    pub(crate) fn drop_sessions(&mut self) {
+        self.bound.clear();
+        self.database_catalogs.clear();
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -1414,7 +1427,9 @@ pub(crate) enum BoundSession {
     /// Being opened on the blocking pool. Holds the database's place, so a
     /// second expand does not open a second session.
     Opening,
-    Open(Connection),
+    // Boxed, as `ProfileState::Connected` is: a server connection is far
+    // larger than the place-holder.
+    Open(Box<Connection>),
 }
 
 /// The second half of a loaded catalog. A catalog whose routines are not

@@ -424,6 +424,19 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A session on `database`, for the (connection, database) pair: the
+    /// same client and login, reading `database` where this one reads its
+    /// own, so the one never follows the other. The statements in flight are
+    /// its own to stop. It carries no read-only hold; the gate holds every
+    /// statement to reads here.
+    pub(super) fn on_database(&self, database: &str) -> Self {
+        Self {
+            database: database.to_string(),
+            stops: Arc::default(),
+            ..self.clone()
+        }
+    }
+
     pub fn open(config: &MongoConfig) -> Result<Self, DbError> {
         let server = &config.server;
         if let Some(error) = owned_option(&config.options, server.ssh.is_some()) {

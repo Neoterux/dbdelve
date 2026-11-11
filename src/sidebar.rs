@@ -205,6 +205,12 @@ pub(crate) fn keeps_rows_whole(
             .is_some_and(|database| builder.name_matches("", database))
 }
 
+/// Whether `filter` matches the name of `database`, so the rows of it are
+/// kept whole.
+pub(crate) fn database_kept_whole(filter: &str, database: &str) -> bool {
+    Builder::new(filter).name_matches("", database)
+}
+
 /// The database the catalog's rows sit under in the tree, if its shape draws
 /// one over them.
 fn catalog_database(levels: Levels, database: Option<&str>) -> Option<&str> {
@@ -266,8 +272,12 @@ pub(crate) struct Listed<'a> {
 /// The databases of a server that are not `current`, the one the connection
 /// is in, in the order the server listed them: the rows listed beside the
 /// connection's own database, which appears once whatever the engine.
-pub(crate) fn other_databases<'a>(names: &'a [String], _current: Option<&str>) -> Vec<&'a str> {
-    names.iter().map(String::as_str).collect()
+pub(crate) fn other_databases<'a>(names: &'a [String], current: Option<&str>) -> Vec<&'a str> {
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| Some(*name) != current)
+        .collect()
 }
 
 /// What a row stands for.
@@ -435,23 +445,34 @@ fn connection_item(
     // connection has none of.
     let counts_databases = connection.levels != Levels::Flat;
     let mut count = None;
+    let others = connection.databases;
     let (open, children) = match connection.content {
         // Nothing has asked it to load, and nothing will until this row is
         // opened: an open row here would show a `Loading…` that no answer is
         // coming to replace.
-        Content::Unloaded => (false, vec![notice(tree, connection.id, "loading", LOADING)]),
+        Content::Unloaded => (
+            false,
+            vec![notice(tree, connection.id, None, "loading", LOADING)],
+        ),
         Content::Loading => (
             followed,
-            vec![notice(tree, connection.id, "loading", LOADING)],
+            vec![notice(tree, connection.id, None, "loading", LOADING)],
         ),
-        Content::Failed(text) => (followed, vec![notice(tree, connection.id, "notice", &text)]),
-        Content::Loaded(content) if content.items.is_empty() => {
+        Content::Failed(text) => (
+            followed,
+            vec![notice(tree, connection.id, None, "notice", &text)],
+        ),
+        // Another database of the server is rows of its own to list, even
+        // where the connection's own has none (a MongoDB profile naming no
+        // database).
+        Content::Loaded(content) if content.items.is_empty() && others.is_empty() => {
             count = counts_databases.then_some(0);
             (
                 followed,
                 vec![notice(
                     tree,
                     connection.id,
+                    None,
                     "notice",
                     "No database objects found.",
                 )],
@@ -522,6 +543,17 @@ fn connection_item(
                     );
                 }
             }
+            let others = others_items(
+                tree,
+                connection.id,
+                connection.levels,
+                others,
+                folds,
+                search,
+            );
+            // Each database row is one more of what the connection counts.
+            count = count.map(|count| count + others.len());
+            children.extend(others);
             (search.filtering || followed, children)
         }
     };
@@ -535,6 +567,108 @@ fn connection_item(
     )
 }
 
+/// The rows of the other databases of a connection's server, each folded
+/// until its catalog has loaded over the session opened for it. Where the
+/// shape's one schema is its database, a database's row holds that schema's
+/// kinds directly. A database the filter keeps by neither its name nor
+/// anything loaded under it is left out.
+fn others_items(
+    tree: &mut SidebarTree,
+    profile: &str,
+    levels: Levels,
+    others: Vec<(String, Content)>,
+    folds: &HashMap<String, bool>,
+    search: &mut Search,
+) -> Vec<TreeItem> {
+    let mut items = Vec::new();
+    for (database, content) in others {
+        let row = database_row(profile, &database);
+        let named = search.builder.name_matches(&row, &database);
+        let followed = folds.get(&row).copied().unwrap_or(false);
+        let (open, children, count) = match content {
+            // Nothing will load it until its row is opened, as for a
+            // connection: an open row here would wait on no answer.
+            Content::Unloaded => (
+                false,
+                vec![notice(tree, profile, Some(&database), "loading", LOADING)],
+                None,
+            ),
+            Content::Loading => (
+                followed,
+                vec![notice(tree, profile, Some(&database), "loading", LOADING)],
+                None,
+            ),
+            Content::Failed(text) => (
+                followed,
+                vec![notice(tree, profile, Some(&database), "notice", &text)],
+                None,
+            ),
+            Content::Loaded(content) => {
+                let ExplorerTree {
+                    items,
+                    leaves,
+                    highlights,
+                    shortcuts,
+                } = content;
+                let mut rows = Rows {
+                    profile,
+                    leaves,
+                    highlights,
+                    shortcuts,
+                    folds,
+                    filtering: search.filtering,
+                };
+                let holds_objects = levels == Levels::DatabaseHoldsObjects;
+                let schemas = match holds_objects {
+                    true => items
+                        .into_iter()
+                        .flat_map(|schema| schema.children)
+                        .collect(),
+                    false => items,
+                };
+                let under: Vec<TreeItem> = schemas
+                    .into_iter()
+                    .map(|item| scoped_item(tree, &mut rows, Some(&database), item))
+                    .collect();
+                let count = match holds_objects {
+                    true => under
+                        .iter()
+                        .filter_map(|child| tree.counts.get(child.id.as_str()))
+                        .sum(),
+                    false => under.len(),
+                };
+                if search.filtering && !named && under.is_empty() {
+                    continue;
+                }
+                let children = match under.is_empty() {
+                    true => vec![empty_row(tree, &row)],
+                    false => under,
+                };
+                (search.filtering || followed, children, Some(count))
+            }
+        };
+        if search.filtering && !named && count.is_none() {
+            continue;
+        }
+        tree.nodes.insert(
+            row.clone(),
+            Node::Database {
+                profile: profile.to_string(),
+                database: database.clone(),
+            },
+        );
+        if let Some(count) = count {
+            tree.counts.insert(row.clone(), count);
+        }
+        items.push(
+            TreeItem::new(row, database)
+                .expanded(open)
+                .children(children),
+        );
+    }
+    items
+}
+
 /// The one row a loaded folder with nothing in it holds, so that it can be
 /// opened and says why there is nothing. Its id starts where no other row's
 /// does, and names `parent`.
@@ -546,8 +680,14 @@ fn empty_row(tree: &mut SidebarTree, parent: &str) -> TreeItem {
 
 /// A row that says something about its connection and opens nothing. Its id
 /// is one no simple-mode row can have.
-fn notice(tree: &mut SidebarTree, profile: &str, row: &str, text: &str) -> TreeItem {
-    let id = scoped_row(profile, None, row);
+fn notice(
+    tree: &mut SidebarTree,
+    profile: &str,
+    database: Option<&str>,
+    row: &str,
+    text: &str,
+) -> TreeItem {
+    let id = scoped_row(profile, database, row);
     tree.nodes.insert(id.clone(), Node::Notice);
     TreeItem::new(id, text.to_string()).disabled(true)
 }
