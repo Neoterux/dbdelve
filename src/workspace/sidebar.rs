@@ -24,7 +24,7 @@ use crate::explorer::{
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::session::Binding;
 use crate::sidebar::{
-    self as model, Content, Listed, Node, NodeKind, SelectedNode, node_actions,
+    self as model, Content, Listed, Node, NodeKind, SelectedNode, Selection, node_actions,
     schema_row_is_a_database, shown_size,
 };
 use crate::ui::{Status, row_icon_tinted, status_dot};
@@ -103,6 +103,8 @@ pub(crate) struct ConnectionsSidebar {
     /// The folds the tree had when the first key was typed, which come back
     /// when the field is cleared: while text is in it every kept row is open.
     pub(crate) folds_before_filter: Option<HashMap<String, bool>>,
+    /// The rows a modifier click gathered; complex mode only.
+    pub(crate) selection: Selection,
     /// The group the last build was made for, which `None` outer says is no
     /// build yet. A build for another group opens that one.
     group: Option<Option<String>>,
@@ -136,6 +138,7 @@ impl ConnectionsSidebar {
             counts: Arc::default(),
             filter,
             folds_before_filter: None,
+            selection: Selection::default(),
             group: None,
         }
     }
@@ -310,6 +313,13 @@ impl Workspace {
             .clone();
         let leaf = profile.session.explorer_leaves.get(id.as_ref()).copied();
         self.row_node(&profile.id, None, &id, leaf)
+    }
+
+    /// The nodes of the rows the connections tree has selected, in the order
+    /// they were picked.
+    pub(crate) fn selected_nodes(&self, cx: &App) -> Vec<SelectedNode> {
+        _ = cx;
+        Vec::new()
     }
 
     /// What the connections tree's row `id` is, if it is a node an action

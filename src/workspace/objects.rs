@@ -8,7 +8,9 @@ use super::*;
 use super::sidebar::new_query_binding;
 use crate::db::{ColumnDefinition, Structure};
 use crate::session::{Binding, Explained, Finished, Queue, Routed, TabKey};
-use crate::sidebar::{NodeAction, NodeKind, SelectedNode, schema_row_is_a_database};
+use crate::sidebar::{
+    NodeAction, NodeKind, SelectedNode, SelectionAction, schema_row_is_a_database,
+};
 
 /// A definition being read: the connection it was asked of, by id and
 /// generation, and the read itself.
@@ -699,6 +701,16 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// What `action` does to every row the connections tree has selected.
+    pub(crate) fn run_selection_action(
+        &mut self,
+        action: SelectionAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        _ = (action, window, cx);
     }
 
     /// Move the connection in front onto the schema row `name`, which is a
