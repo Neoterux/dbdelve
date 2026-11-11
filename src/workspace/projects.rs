@@ -47,6 +47,12 @@ impl Workspace {
         self.sidebar_changed(cx);
     }
 
+    pub(crate) fn set_density(&mut self, _density: Density, _cx: &mut Context<Self>) {}
+
+    pub(crate) fn set_show_host(&mut self, _show: bool, _cx: &mut Context<Self>) {}
+
+    pub(crate) fn set_show_sizes(&mut self, _show: bool, _cx: &mut Context<Self>) {}
+
     /// A project's listing scope: its own choice, or with `None` the global
     /// setting's.
     pub(crate) fn set_project_listing(

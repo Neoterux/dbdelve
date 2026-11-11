@@ -1360,6 +1360,15 @@ fn launch_duckdb<'a>(
     cx: &'a mut TestAppContext,
     extra: &str,
 ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    launch_duckdb_with(cx, "", extra)
+}
+
+/// `launch_duckdb` with more `[settings]` keys.
+fn launch_duckdb_with<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
     // Left alone, CI's live job puts a connection from `PG*` among these.
     crate::IGNORE_ENVIRONMENT.set(true);
     let directory = store::dbdelve_directory().expect("the test home has a data directory");
@@ -1378,6 +1387,7 @@ fn launch_duckdb<'a>(
              [settings]\n\
              check_for_updates = false\n\
              view_mode = \"complex\"\n\
+             {settings}\n\
              [[profiles]]\n\
              id = \"e2e\"\n\
              name = \"E2E\"\n\
@@ -12516,6 +12526,111 @@ fn two_connections_of_one_colour_are_two_tinted_rows(cx: &mut TestAppContext) {
             connection_part(cx, "fill", "b").unwrap(),
         );
         assert_ne!(a.origin.y, b.origin.y, "two rows, not one");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_density_setting_sets_the_connections_trees_row_height(cx: &mut TestAppContext) {
+    use crate::{sidebar::Density, theme::layout};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = coloured_connections(cx, "sidebar_density = \"compact\"", "", "");
+        let height = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is drawn"))
+                .size
+                .height
+        };
+        assert_eq!(
+            height(cx, "connections-row-0"),
+            gpui::px(layout::chrome(22.))
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_density(Density::Comfortable, cx)
+        });
+        settle(cx);
+        assert_eq!(
+            height(cx, "connections-row-0"),
+            gpui::px(layout::chrome(30.))
+        );
+
+        // The simple tree keeps its rows whatever the density.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(ViewMode::Simple, cx)
+        });
+        settle(cx);
+        let simple = height(cx, "explorer-row-0");
+        for density in Density::ALL {
+            workspace.update(cx, |workspace, cx| workspace.set_density(density, cx));
+            settle(cx);
+            assert_eq!(height(cx, "explorer-row-0"), simple, "{density:?}");
+        }
+        let saved = store::peek_profiles(&[]).expect("the file reads");
+        let saved = saved.settings.and_then(|settings| settings.sidebar_density);
+        assert_eq!(saved.as_deref(), Some(Density::ALL[2].slug()));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hiding_the_host_drops_it_from_connection_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = coloured_connections(cx, "", "", "");
+        assert!(connection_part(cx, "host", "a").is_some());
+        workspace.update(cx, |workspace, cx| workspace.set_show_host(false, cx));
+        settle(cx);
+        assert!(connection_part(cx, "host", "a").is_none());
+        assert!(connection_part(cx, "host", "b").is_none());
+        let saved = store::peek_profiles(&[]).expect("the file reads");
+        assert_eq!(
+            saved
+                .settings
+                .and_then(|settings| settings.sidebar_show_host),
+            Some(false)
+        );
+        workspace.update(cx, |workspace, cx| workspace.set_show_host(true, cx));
+        settle(cx);
+        assert!(connection_part(cx, "host", "a").is_some());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn with_sizes_off_no_size_read_starts(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            launch_duckdb_with(cx, "sidebar_show_sizes = false", "mode = \"full\"");
+        let reads = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.size_reads)
+        };
+        let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("it shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let other = database_row("e2e", "other");
+        let at = connections_row(&workspace, cx, &other).expect("the attached database shows");
+        click_connections_row(cx, at);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(
+                matches!(
+                    profile.database_catalogs.get("other"),
+                    Some(CatalogState::Loaded(..))
+                ),
+                "the other database loaded"
+            );
+        });
+        assert_eq!(reads(&workspace, cx), 0, "no size was asked for");
+        assert!(connection_part(cx, "count", "e2e").is_some(), "counts stay");
+
+        workspace.update(cx, |workspace, cx| workspace.set_show_sizes(true, cx));
+        settle(cx);
+        assert_eq!(
+            reads(&workspace, cx),
+            2,
+            "one for the connection and one for the loaded database"
+        );
         quit(workspace, cx);
     });
 }

@@ -93,6 +93,55 @@ impl ListingScope {
     }
 }
 
+/// How tall the connections tree's rows are and how far each level steps in.
+/// The simple tree keeps its own rows whatever this is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Density {
+    Compact,
+    #[default]
+    Standard,
+    Comfortable,
+}
+
+impl Density {
+    pub(crate) const ALL: [Density; 3] =
+        [Density::Compact, Density::Standard, Density::Comfortable];
+
+    /// How `profiles.toml` spells it.
+    pub(crate) fn slug(self) -> &'static str {
+        ""
+    }
+
+    /// The density a stored slug names; none, or one this build does not
+    /// know, is the standard one.
+    pub(crate) fn from_slug(_slug: Option<&str>) -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Density::Compact => "Compact",
+            Density::Standard => "Standard",
+            Density::Comfortable => "Comfortable",
+        }
+    }
+
+    /// A row's height before zoom.
+    pub(crate) fn row_height(self) -> f32 {
+        0.
+    }
+
+    /// What each level of depth adds to a row's indent, before zoom.
+    pub(crate) fn indent(self) -> f32 {
+        0.
+    }
+}
+
+/// The size a row draws: the one it has, while sizes are shown.
+pub(crate) fn shown_size(size: Option<u64>, _show_sizes: bool) -> Option<u64> {
+    size
+}
+
 /// The scope a project in front lists: its own choice, or `global` when it
 /// has none, when its choice is one this build cannot read, and when no
 /// project is in front.
@@ -769,6 +818,25 @@ mod tests {
     use super::*;
     use crate::db::{Catalog, Relation, RelationKind, Schema};
     use crate::explorer;
+
+    #[test]
+    fn each_density_has_its_row_height_and_indent() {
+        let steps = Density::ALL.map(|density| (density.row_height(), density.indent()));
+        assert_eq!(steps, [(22., 12.), (26., 14.), (30., 16.)]);
+        assert_eq!(Density::default(), Density::Standard);
+        for density in Density::ALL {
+            assert_eq!(Density::from_slug(Some(density.slug())), density);
+        }
+        assert_eq!(Density::from_slug(None), Density::Standard);
+        assert_eq!(Density::from_slug(Some("roomy")), Density::Standard);
+    }
+
+    #[test]
+    fn a_size_is_shown_only_while_sizes_are_on() {
+        assert_eq!(shown_size(Some(10), true), Some(10));
+        assert_eq!(shown_size(Some(10), false), None);
+        assert_eq!(shown_size(None, true), None);
+    }
 
     fn project(name: &str, members: &[&str]) -> StoredProject {
         StoredProject {
