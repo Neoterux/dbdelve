@@ -2213,6 +2213,44 @@ mod tests {
     /// holds the live password.
     #[cfg(unix)]
     #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_sequence_is_listed_in_its_own_kind() {
+        let plain = Connection::open(&live_config()).expect("connection should open");
+        plain
+            .query(
+                "DROP SCHEMA IF EXISTS dbdelve_sequence_probe CASCADE",
+                Fetch::default(),
+            )
+            .expect("an earlier run's schema should drop");
+        plain
+            .query(
+                "CREATE SCHEMA dbdelve_sequence_probe; \
+                 CREATE SEQUENCE dbdelve_sequence_probe.ticket",
+                Fetch::default(),
+            )
+            .expect("the probe sequence should be created");
+
+        let second = super::super::Connection::Postgres(plain)
+            .routines()
+            .expect("the second half should read");
+        let listed: Vec<_> = second
+            .schemas
+            .iter()
+            .filter(|schema| schema.name == "dbdelve_sequence_probe")
+            .map(|schema| schema.sequences.clone())
+            .collect();
+
+        let plain = Connection::open(&live_config()).expect("connection should open");
+        plain
+            .query(
+                "DROP SCHEMA dbdelve_sequence_probe CASCADE",
+                Fetch::default(),
+            )
+            .expect("the probe schema should drop");
+        assert_eq!(listed, vec![vec!["ticket".to_string()]]);
+    }
+
+    #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_a_profile_naming_a_service_connects_where_the_file_says() {
         use std::os::unix::fs::DirBuilderExt as _;
