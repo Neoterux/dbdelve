@@ -16863,6 +16863,41 @@ fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
 }
 
 #[gpui::test]
+fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        // As `sql::update_batch_joining` writes a multi-row apply, run once
+        // the transaction it was written for is gone: each statement would
+        // commit on its own.
+        run_in_front(&workspace, cx, "SELECT 1");
+        assert!(!transaction_state(&workspace, cx).1, "nothing is open");
+        apply_from_the_front_tab(
+            &workspace,
+            cx,
+            "INSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);",
+        );
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert_eq!(
+                error.message,
+                "Not sent: no transaction is open on this connection, and the batch of edits \
+                 was written to join one."
+            ),
+            _ => panic!("the batch was not refused"),
+        });
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("0"), "no row ran");
+
+        // One statement carries no bracket and is unaffected.
+        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_multi_row_edit_joins_the_users_open_transaction_without_brackets_of_its_own(
     cx: &mut TestAppContext,
 ) {

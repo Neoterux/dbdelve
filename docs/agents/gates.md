@@ -97,7 +97,11 @@ where the user can read it:
   rolled back with it, as a single-statement edit always has. A bracketed
   batch that still reaches the run (written before the transaction opened) is
   not sent: `Profile::own_write_refusal` says `Not sent: …`, in the way
-  `Profile::bound_write_refusal` does for a bound session.
+  `Profile::bound_write_refusal` does for a bound session. So is the reverse, a
+  batch written to join a transaction that has since ended: unbracketed and
+  of several statements on an engine that brackets (`Engine::transaction_start`),
+  its statements would each commit alone and a failure partway would leave the
+  rows before it committed. A single statement is never refused either way.
 - **Format Query** rewrites the buffer on command only, through
   `sqlformat`'s token-level reformatter (on MongoDB, `mql::format`'s
   bracket-depth layout over the tree-sitter tokens, refused unless the
