@@ -2096,7 +2096,8 @@ impl Workspace {
         let engine = target.engine;
         let id = profile.id.clone();
         let generation = profile.generation;
-        let read_only = profile.mode == Mode::ReadOnly;
+        let issued_under = profile.mode;
+        let read_only = issued_under == Mode::ReadOnly;
         let alongside = lane.is_some();
         // A tab bound to a database -- a query tab opened with New Query Here,
         // an object tab of another database -- runs on the session of that
@@ -2455,6 +2456,9 @@ impl Workspace {
                     binding.label()
                 )
             });
+        // The verdict the mode is asked again of once a session this run opens
+        // has landed, which can take as long as a connect.
+        let reopened = matches!(routed, Routed::Open { .. }).then(|| sql::classify(engine, &sql));
         let work = move |connection: Connection| {
             let fetch = Fetch {
                 limit,
@@ -2509,10 +2513,31 @@ impl Workspace {
                                 .await;
                         match opening {
                             Ok((session, _)) => match workspace.update(cx, |workspace, cx| {
-                                workspace
-                                    .keep_session(&id, generation, database, read_only, session, cx)
+                                let session = workspace
+                                    .keep_session(&id, generation, database, read_only, session, cx);
+                                // Gated under the mode it was issued in, and the
+                                // session it was waiting for was opened under
+                                // that one: a mode picked since has not been put
+                                // on it, and the statement is still unsent.
+                                let moved = workspace
+                                    .issued_to(&id, generation)
+                                    .map(|profile| profile.mode)
+                                    .filter(|mode| {
+                                        *mode != issued_under
+                                            && reopened.as_ref().is_some_and(|verdict| verdict.mode > *mode)
+                                    });
+                                match moved {
+                                    Some(mode) => Err(DbError {
+                                        message: format!(
+                                            "Not sent: the connection moved to {} while the session opened.",
+                                            mode.label()
+                                        ),
+                                        position: None,
+                                    }),
+                                    None => Ok(session),
+                                }
                             }) {
-                                Ok(session) => Ok(session),
+                                Ok(session) => session,
                                 Err(_) => return,
                             },
                             Err(error) => Err(error),
