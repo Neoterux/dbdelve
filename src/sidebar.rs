@@ -383,7 +383,6 @@ pub(crate) enum NodeKind {
 
 impl NodeKind {
     /// What a number of them are called, as the tree's categories call them.
-    #[allow(dead_code)] // read by the selection's menu, which the next commit draws
     fn plural(self) -> String {
         match self {
             NodeKind::Connection => "connections".into(),
@@ -502,9 +501,6 @@ impl Selection {
 }
 
 /// What a selection of several rows offers, from its menu and the palette.
-// The menu and the palette that offer all of these arrive with the next
-// commit; until then only Open All is run.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectionAction {
     OpenAll,
@@ -516,7 +512,6 @@ pub(crate) enum SelectionAction {
 }
 
 impl SelectionAction {
-    #[allow(dead_code)]
     /// What a menu and the palette call it.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -532,15 +527,53 @@ impl SelectionAction {
 
 /// What every one of `items` offers, in the order the menu lists it: an action
 /// that does not apply to all of them is left out.
-#[allow(dead_code)]
 pub(crate) fn selection_actions(items: &[(NodeKind, Target)]) -> Vec<SelectionAction> {
-    _ = items;
-    Vec::new()
+    let all = |applies: &dyn Fn(NodeKind, Target) -> bool| {
+        !items.is_empty() && items.iter().all(|(kind, target)| applies(*kind, *target))
+    };
+    let offers = |kind, target, action: fn(&NodeAction) -> bool| {
+        node_actions(kind, "", target).iter().any(action)
+    };
+    // The text of a definition is shown for what has one to read: a routine's
+    // is its own tab, which a list of texts has no place for.
+    let definition = |kind, target| {
+        kind != NodeKind::Routine && offers(kind, target, |action| *action == NodeAction::ShowDdl)
+    };
+    [
+        (
+            SelectionAction::OpenAll,
+            all(&|kind, _| matches!(kind, NodeKind::Relation(_) | NodeKind::Routine)),
+        ),
+        (
+            SelectionAction::CopyNames,
+            all(&|kind, target| {
+                offers(kind, target, |action| {
+                    matches!(action, NodeAction::CopyName(_))
+                })
+            }),
+        ),
+        (SelectionAction::CopyDdl, all(&definition)),
+        (SelectionAction::ShowDdl, all(&definition)),
+        (
+            SelectionAction::Pin,
+            all(&|kind, _| {
+                matches!(
+                    kind,
+                    NodeKind::Relation(_) | NodeKind::Routine | NodeKind::Sequence
+                )
+            }),
+        ),
+        // Whatever a row is, it belongs to a connection or a database that
+        // can be read again.
+        (SelectionAction::Refresh, !items.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(action, applies)| applies.then_some(action))
+    .collect()
 }
 
 /// What the selection's menu says it holds: `3 tables selected`, or `3 items
 /// selected` when the rows are not all one kind.
-#[allow(dead_code)] // read by the selection's menu, which the next commit draws
 pub(crate) fn selection_header(kinds: &[NodeKind]) -> String {
     let count = kinds.len();
     match kinds.split_first() {

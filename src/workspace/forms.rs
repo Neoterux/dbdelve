@@ -29,7 +29,7 @@ use crate::explorer::{
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
 use crate::session::PendingDelete;
-use crate::sidebar::{NodeAction, NodeKind, SelectedNode, node_actions};
+use crate::sidebar::{NodeAction, NodeKind, SelectedNode, SelectionAction, node_actions};
 use crate::sql::{Destructive, Stop};
 use crate::ui::{
     Status, button_inked, code_lines, code_lines_visible, dot, raised_card, row_icon_tinted,
@@ -4309,6 +4309,29 @@ pub(super) fn node_items(
             }
         }))
     })
+}
+
+/// The menu of a selection of several rows: how many, then what applies to
+/// all of them.
+pub(super) fn selection_menu(
+    menu: PopupMenu,
+    header: String,
+    actions: Vec<SelectionAction>,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenu {
+    actions.into_iter().fold(
+        menu.item(PopupMenuItem::label(header)).separator(),
+        |menu, action| {
+            let workspace = workspace.clone();
+            menu.item(
+                PopupMenuItem::new(action.label()).on_click(move |_, window, cx| {
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.run_selection_action(action, window, cx)
+                    });
+                }),
+            )
+        },
+    )
 }
 
 /// Run `act` with the connection `profile` in front. A row of another
