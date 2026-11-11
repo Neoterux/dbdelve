@@ -8,8 +8,24 @@
 //! edited and undone, and what runs is what is on screen.
 
 use super::*;
+use crate::session::BOUND_TRANSACTION;
 
 impl Workspace {
+    /// Whether the tab these controls would run in is bound, which says so and
+    /// sends nothing: they act on the connection's own session, and a bound
+    /// tab runs on its database's. A control with no query tab in front opens
+    /// an ordinary one, which is unbound.
+    fn refused_on_bound_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let bound = self
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .is_some_and(|tab| tab.binding.is_some());
+        if bound {
+            self.note(BOUND_TRANSACTION.into(), cx);
+        }
+        bound
+    }
+
     /// Turn each statement committing on its own off or back on.
     ///
     /// Turning it off opens the transaction at once rather than waiting for
@@ -22,6 +38,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.refused_on_bound_tab(cx) {
+            return;
+        }
         let Some((auto_commit, open, engine)) = self.profile().map(|profile| {
             (
                 profile.auto_commit,
@@ -92,6 +111,9 @@ impl Workspace {
     /// itself under a switch that reads "off". `sql::leaves` reads the pair
     /// and lands on the `BEGIN`, so `in_transaction` stays true across it.
     fn end_transaction(&mut self, verb: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refused_on_bound_tab(cx) {
+            return;
+        }
         let Some((open, auto_commit, engine)) = self.profile().map(|profile| {
             (
                 profile.in_transaction,

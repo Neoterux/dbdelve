@@ -1524,6 +1524,9 @@ impl Workspace {
         // default, which groups every unsaved buffer ahead of the saved
         // queries and objects regardless of when each was opened.
         profile.session.place_last(TabKey::Unsaved(id));
+        // ponytail: a bound tab completes from the profile's own catalog, not
+        // its database's; the upgrade is a provider per (profile, database)
+        // catalog.
         self.install_completions(&profile_id, cx);
         self.activate_tab(Tab::Query(id), window, cx);
     }
@@ -2426,6 +2429,18 @@ impl Workspace {
         let ends_transaction =
             binding.is_some() && sql::leaves(engine, &sql).transaction == Some(false);
         let bound_db = binding.as_ref().map(|binding| binding.database.clone());
+        // A `USE` or `SET` in a bound tab is undone, not rewritten: the
+        // binding stays what the tab was opened for, and the next run puts the
+        // session back on it first. Said once the run has landed.
+        let reset = binding
+            .as_ref()
+            .filter(|_| !generated && sql::leaves(engine, &sql).settings)
+            .map(|binding| {
+                format!(
+                    "The next run in this tab starts again on {}.",
+                    binding.label()
+                )
+            });
         let work = move |connection: Connection| {
             let fetch = Fetch {
                 limit,
@@ -2864,6 +2879,11 @@ impl Workspace {
                         && let Some(profile) = workspace.issued_to(&id, generation)
                     {
                         profile.session.tab_notice = Some((tab, notice));
+                    }
+                    if let Some(reset) = reset
+                        && let Some(profile) = workspace.issued_to(&id, generation)
+                    {
+                        profile.session.tab_notice = Some((tab, reset));
                     }
                     if succeeded && let Some(profile) = workspace.issued_to(&id, generation) {
                         // A statement that returned no columns produced no grid,
