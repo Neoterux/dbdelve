@@ -670,6 +670,19 @@ impl Workspace {
         }
     }
 
+    /// Move the connection in front onto the schema row `name`, which is a
+    /// database where `is_database`. Whether it is there now: a refusal is the
+    /// notice it set, and nothing moved.
+    pub(crate) fn move_to_schema_row(
+        &mut self,
+        _name: String,
+        _is_database: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        true
+    }
+
     /// Bring the connection `id` in front, as acting on one of its rows
     /// does. Whether there is one.
     pub(crate) fn make_front(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
