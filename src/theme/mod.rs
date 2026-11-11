@@ -2230,6 +2230,18 @@ mod tests {
     }
 
     #[test]
+    fn a_tinted_tab_chip_reads_in_every_theme() {
+        for t in Theme::all() {
+            for color in ConnectionColor::ALL {
+                // The chip in front of a coloured connection sits on the band,
+                // over the panel the editor is on, under the tab's name.
+                let ground = color.band(t).flatten(t.panel);
+                check(t, "a tinted chip's label", t.text, ground, AA_TEXT);
+            }
+        }
+    }
+
+    #[test]
     fn a_tinted_sidebar_row_reads_in_every_theme() {
         for t in Theme::all() {
             for color in ConnectionColor::ALL {

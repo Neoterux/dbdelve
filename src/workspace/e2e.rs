@@ -13565,6 +13565,15 @@ fn a_in_front_of_b<'a>(
     cx: &'a mut TestAppContext,
     settings: &str,
 ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    a_in_front_of_b_with(cx, settings, "")
+}
+
+/// `a_in_front_of_b`, `b` with `extra` among its scalar keys.
+fn a_in_front_of_b_with<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
     // Left alone, CI's live job puts a connection from `PG*` among these.
     crate::IGNORE_ENVIRONMENT.set(true);
     let (workspace, cx) = launch_connections(
@@ -13574,7 +13583,7 @@ fn a_in_front_of_b<'a>(
         &format!(
             "{}{}",
             sqlite_profile("a", "Birds", ""),
-            sqlite_profile("b", "Flocks", "")
+            sqlite_profile("b", "Flocks", extra)
         ),
     );
     cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
@@ -13777,6 +13786,88 @@ fn only_the_front_connections_chips_can_be_dragged(cx: &mut TestAppContext) {
         settle(cx);
         assert_eq!(front_profile(&workspace, cx), "b");
         assert!(pick_up(cx, &b.0, b.1), "once in front, its chip drags");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_coloured_connections_chips_follow_the_titlebar_setting(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            a_in_front_of_b_with(cx, "view_mode = \"complex\"", "color = \"red\"");
+        new_query_tab(&workspace, cx);
+        let chips = strip_chips(&workspace, cx);
+        assert_eq!(chips.len(), 3);
+        let tinted = |cx: &mut VisualTestContext| -> Vec<bool> {
+            chips
+                .iter()
+                .map(|(id, tab)| chip_part(cx, "tint", id, *tab).is_some())
+                .collect()
+        };
+        assert_eq!(tinted(cx), [false, false, true], "b is coloured, a is not");
+
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(false, cx));
+        settle(cx);
+        assert_eq!(tinted(cx), [false, false, false]);
+
+        workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(true, cx));
+        settle(cx);
+        assert_eq!(tinted(cx), [false, false, true]);
+
+        // The colour is complex mode's: simple mode draws b's chips as before.
+        activate_by_id(&workspace, cx, "b");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(ViewMode::Simple, cx)
+        });
+        settle(cx);
+        let (id, tab) = chips[2].clone();
+        assert!(chip_part(cx, "", &id, tab).is_some());
+        assert!(chip_part(cx, "tint", &id, tab).is_none());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_tab_chords_walk_every_connections_tabs_in_complex_mode(cx: &mut TestAppContext) {
+    use crate::actions::{NextTab, PreviousTab};
+    store::tests::with_home(|| {
+        let (workspace, cx) = a_in_front_of_b(cx, "view_mode = \"complex\"");
+        new_query_tab(&workspace, cx);
+        let chips = strip_chips(&workspace, cx);
+        assert_eq!(chips.len(), 3);
+        let at = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (
+                    workspace.profile().unwrap().id.clone(),
+                    workspace.profile().unwrap().session.active,
+                )
+            })
+        };
+        let next = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| workspace.next_tab(&NextTab, window, cx));
+            });
+            settle(cx);
+        };
+        let previous = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.previous_tab(&PreviousTab, window, cx)
+                });
+            });
+            settle(cx);
+        };
+        // a is in front on its last tab.
+        assert_eq!(at(cx), chips[1]);
+        next(cx);
+        assert_eq!(at(cx), chips[2], "b's first tab, and b in front");
+        // The end of the strip wraps to its start.
+        next(cx);
+        assert_eq!(at(cx), chips[0]);
+        previous(cx);
+        assert_eq!(at(cx), chips[2]);
+        previous(cx);
+        assert_eq!(at(cx), chips[1], "back on a");
         quit(workspace, cx);
     });
 }
