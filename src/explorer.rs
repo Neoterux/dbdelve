@@ -2995,4 +2995,21 @@ mod tests {
         );
         assert_eq!(land(&hot_c, folder), None);
     }
+
+    #[test]
+    fn copy_name_is_the_first_thing_a_relation_menu_copies() {
+        for name in ["birds", "b\"ü rds"] {
+            let [reads, _] = relation_copies(
+                Target::built_in(Engine::Postgres),
+                "public",
+                name,
+                RelationKind::Table,
+            );
+            assert_eq!(
+                reads[0],
+                ("Copy Name", Some(name.to_string())),
+                "the name as the catalog lists it, unquoted"
+            );
+        }
+    }
 }

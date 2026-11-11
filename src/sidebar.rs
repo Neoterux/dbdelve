@@ -12,7 +12,7 @@ use std::{collections::HashMap, ops::Range};
 
 use gpui_component::tree::TreeItem;
 
-use crate::db::Levels;
+use crate::db::{Levels, RelationKind, Target};
 use crate::explorer::{Builder, ExplorerLeaf, ExplorerTree, Shortcut, is_schema_row, saved_query};
 use crate::store::StoredProject;
 
@@ -363,6 +363,34 @@ pub(crate) enum Node {
     Row {
         leaf: Option<ExplorerLeaf>,
     },
+}
+
+/// What the sidebar's row is, as far as an action on it needs to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+    Connection,
+    Database,
+    Schema,
+    Relation(RelationKind),
+    Routine,
+    Sequence,
+}
+
+/// One thing a node offers, from its menu and the palette alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NodeAction {
+    NewQueryHere,
+    /// The name as the catalog lists it, so what is copied is what is read.
+    CopyName(String),
+    ShowDdl,
+    Refresh,
+}
+
+/// What a node of `kind` named `name` offers, in the order its menu lists
+/// them. The one list both trees' menus and the palette read, as
+/// [`crate::explorer::relation_copies`] is for the copies.
+pub(crate) fn node_actions(_kind: NodeKind, _name: &str, _target: Target) -> Vec<NodeAction> {
+    Vec::new()
 }
 
 /// The rows, and what each stands for, by row id.
@@ -2114,6 +2142,39 @@ mod tests {
         assert_eq!(ViewMode::from_slug(Some("tree")), ViewMode::Simple);
         for mode in [ViewMode::Simple, ViewMode::Complex] {
             assert_eq!(ViewMode::from_slug(Some(mode.slug())), mode);
+        }
+    }
+
+    #[test]
+    fn each_node_offers_the_actions_its_target_allows() {
+        use crate::db::Engine;
+        let on = |kind, engine| node_actions(kind, "birds", Target::built_in(engine));
+        let table = NodeKind::Relation(RelationKind::Table);
+        let copy = NodeAction::CopyName("birds".into());
+        assert_eq!(
+            on(table, Engine::Postgres),
+            [copy.clone(), NodeAction::ShowDdl]
+        );
+        assert_eq!(
+            on(table, Engine::Redis),
+            [copy.clone()],
+            "a target with no definition to write offers none to show"
+        );
+        assert_eq!(
+            on(NodeKind::Sequence, Engine::Postgres),
+            [copy.clone()],
+            "a sequence's definition is a later plan's"
+        );
+        assert_eq!(
+            on(NodeKind::Routine, Engine::Postgres),
+            [copy.clone(), NodeAction::ShowDdl]
+        );
+        for kind in [NodeKind::Connection, NodeKind::Database, NodeKind::Schema] {
+            assert_eq!(
+                on(kind, Engine::Postgres),
+                [NodeAction::NewQueryHere, copy.clone(), NodeAction::Refresh],
+                "{kind:?} has no definition of its own"
+            );
         }
     }
 }
