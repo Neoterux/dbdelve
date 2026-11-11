@@ -216,6 +216,7 @@ impl ObjectKind {
             .map(|(kind, _)| ObjectKind::Relation(kind))
             .into_iter()
             .chain(ROUTINE_CATEGORIES.map(|(kind, _)| ObjectKind::Routine(kind)))
+            .chain([ObjectKind::Sequence])
             .find(|kind| kind.slug() == slug)
     }
 }
@@ -369,6 +370,33 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
                 if !children.is_empty() {
                     groups.push(category(label, &schema.name, children));
                 }
+            }
+
+            let sequences = schema
+                .sequences
+                .iter()
+                .enumerate()
+                .filter_map(|(sequence_index, name)| {
+                    let id = sequence_row(&schema.name, name);
+                    if !(builder.name_matches(&id, name) || schema_matches) {
+                        return None;
+                    }
+                    builder.leaves.insert(
+                        id.clone(),
+                        ExplorerLeaf {
+                            target: ExplorerTarget::Sequence {
+                                schema_index,
+                                sequence_index,
+                            },
+                            kind: ObjectKind::Sequence,
+                            size: None,
+                        },
+                    );
+                    Some(TreeItem::new(id, name.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !sequences.is_empty() {
+                groups.push(category("Sequences", &schema.name, sequences));
             }
 
             if !schema_matches && groups.is_empty() {
