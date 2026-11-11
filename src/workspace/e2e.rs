@@ -2970,6 +2970,140 @@ fn the_relation_menu_offers_show_ddl_where_the_target_copies_ddl(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn an_empty_definition_says_so_and_offers_nothing_to_copy(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let put_up = |text: super::DdlText, cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let profile = workspace
+                    .profile()
+                    .expect("a connection is in front")
+                    .id
+                    .clone();
+                workspace.ddl_view = Some(super::DdlView {
+                    profile,
+                    name: "birds".into(),
+                    title: "Table main.birds".into(),
+                    text,
+                    request: 1,
+                });
+                cx.notify();
+            });
+            settle(cx);
+        };
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+
+        put_up(super::DdlText::Ready(String::new()), cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        assert!(cx.debug_bounds("show-ddl-empty").is_some());
+        assert!(cx.debug_bounds("show-ddl-text").is_none());
+        // Neither the button nor the ring puts anything on the clipboard.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        let copy = cx
+            .debug_bounds("show-ddl-1")
+            .expect("Copy is drawn")
+            .center();
+        cx.simulate_click(copy, gpui::Modifiers::default());
+        settle(cx);
+        press(cx, "left");
+        assert_eq!(ringed_button(&workspace, cx), 1, "the ring is on Copy");
+        press(cx, "enter");
+        assert_eq!(clipboard(cx), "before");
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("show-ddl"),
+            "Copy leaves the dialog up"
+        );
+
+        // The same click copies a definition that is there.
+        put_up(
+            super::DdlText::Ready("CREATE TABLE birds (name text);".into()),
+            cx,
+        );
+        let copy = cx
+            .debug_bounds("show-ddl-1")
+            .expect("Copy is drawn")
+            .center();
+        cx.simulate_click(copy, gpui::Modifiers::default());
+        settle(cx);
+        assert_eq!(clipboard(cx), "CREATE TABLE birds (name text);");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn show_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        run_in_front(
+            &workspace,
+            cx,
+            "ALTER TABLE other.main.t ADD COLUMN extra TEXT",
+        );
+        let shown = |database: Option<&str>, cx: &mut VisualTestContext| {
+            let database = database.map(str::to_string);
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_ddl(database, "main".into(), "t".into(), RelationKind::Table, cx)
+            });
+            settle(cx);
+            let text = ddl_text(&workspace, cx).expect("the dialog holds a definition");
+            press(cx, "escape");
+            text
+        };
+        let other = shown(Some("other"), cx);
+        assert!(
+            other.contains("extra"),
+            "`other`'s `t`, which has `extra`: {other}"
+        );
+        let own = shown(None, cx);
+        assert!(
+            own.contains("CREATE TABLE t") && !own.contains("extra"),
+            "the connection's own `t`: {own}"
+        );
+        // Asking for the own database by name is the connection's own `t` too.
+        let named = shown(Some("e2e"), cx);
+        assert_eq!(named, own);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn copy_ddl_reads_another_databases_definition_over_its_session(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        run_in_front(
+            &workspace,
+            cx,
+            "ALTER TABLE other.main.t ADD COLUMN extra TEXT",
+        );
+        for (database, has_extra) in [(Some("other"), true), (None, false)] {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+            workspace.update(cx, |workspace, cx| {
+                workspace.copy_ddl(
+                    database.map(str::to_string),
+                    "main".into(),
+                    "t".into(),
+                    RelationKind::Table,
+                    cx,
+                )
+            });
+            settle(cx);
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert!(text.contains("CREATE TABLE t"), "{database:?}: {text}");
+            assert_eq!(text.contains("extra"), has_extra, "{database:?}: {text}");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_empty_table_opened_from_the_sidebar_keeps_the_keyboard(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
