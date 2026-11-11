@@ -3015,15 +3015,16 @@ fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestA
         let focus = |cx: &mut VisualTestContext| -> &'static str {
             cx.update(|window, cx| {
                 let picker = workspace.read(cx).filter_picker.as_ref().expect("up");
-                if picker.databases.search.focus_handle(cx).is_focused(window) {
-                    "search"
-                } else if picker
-                    .databases
-                    .pattern_field
-                    .focus_handle(cx)
-                    .is_focused(window)
-                {
-                    "patterns"
+                let schemas = picker.schemas.as_ref().expect("DuckDB lists schemas");
+                let held = |input: &Entity<InputState>| input.focus_handle(cx).is_focused(window);
+                if held(&picker.databases.search) {
+                    "databases search"
+                } else if held(&picker.databases.pattern_field) {
+                    "databases patterns"
+                } else if held(&schemas.search) {
+                    "schemas search"
+                } else if held(&schemas.pattern_field) {
+                    "schemas patterns"
                 } else {
                     "elsewhere"
                 }
@@ -3035,7 +3036,11 @@ fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestA
                 picker.databases.ticked.clone()
             })
         };
-        assert_eq!(focus(cx), "search", "the first search box has the keyboard");
+        assert_eq!(
+            focus(cx),
+            "databases search",
+            "the first search box has the keyboard"
+        );
 
         // Select Names, then Clear Names, each pressed from the keyboard.
         press(cx, "tab");
@@ -3045,18 +3050,25 @@ fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestA
         press(cx, "enter");
         assert!(ticked(cx).is_empty());
 
-        // The checklist: `space` ticks the focused row; the next row, then
-        // the pattern field.
+        // The checklist: `space` ticks the focused row, the next row is
+        // passed, then the pattern field.
         press(cx, "tab");
         press(cx, "space");
         assert_eq!(ticked(cx), ["other"]);
         press(cx, "tab");
         press(cx, "tab");
-        assert_eq!(focus(cx), "patterns");
+        assert_eq!(focus(cx), "databases patterns");
 
-        // Remove Filter, Discard Changes, Save Filter.
+        // The second list in turn, then Remove Filter, Discard Changes and
+        // Save Filter.
         cx.simulate_input("sc*");
         settle(cx);
+        press(cx, "tab");
+        assert_eq!(focus(cx), "schemas search");
+        press(cx, "tab");
+        press(cx, "tab");
+        press(cx, "tab");
+        assert_eq!(focus(cx), "schemas patterns", "after its Select and Clear");
         press(cx, "tab");
         press(cx, "tab");
         press(cx, "tab");
@@ -3064,7 +3076,7 @@ fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestA
         assert_eq!(
             front_dialog(&workspace, cx),
             None,
-            "Save Filter was the third stop"
+            "Save Filter was the third stop after the last field"
         );
         workspace.read_with(cx, |workspace, _| {
             let profile = workspace.profile().expect("the connection is in front");
@@ -3076,7 +3088,7 @@ fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestA
             connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
         pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
         settle(cx);
-        assert_eq!(focus(cx), "search");
+        assert_eq!(focus(cx), "databases search");
         press(cx, "escape");
         assert_eq!(front_dialog(&workspace, cx), None);
         assert!(editor_has_keyboard(&workspace, cx));
