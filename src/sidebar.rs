@@ -286,6 +286,20 @@ fn catalog_database(levels: Levels, database: Option<&str>) -> Option<&str> {
     database.filter(|_| levels == Levels::DatabaseThenSchema)
 }
 
+/// What a catalog with no rows to list says: that none was found, or how many
+/// the filter hid. Both trees say it, so it is built once.
+pub(crate) fn empty_catalog_line(levels: Levels, left_out: usize) -> String {
+    if left_out == 0 {
+        return "No database objects found.".to_string();
+    }
+    let noun = match levels {
+        Levels::DatabaseThenSchema => "schema",
+        Levels::Flat | Levels::DatabaseIsSchema | Levels::DatabaseHoldsObjects => "database",
+    };
+    let plural = if left_out == 1 { "" } else { "s" };
+    format!("No database objects shown: the filter hides {left_out} {noun}{plural}.")
+}
+
 /// The id the tree gives `row`, one of the rows simple mode lists for the tab
 /// in front of a connection: an object's sits under the database where the
 /// connection has one, a saved query's under the connection.
@@ -877,7 +891,7 @@ fn connection_item(
                     connection.id,
                     None,
                     "notice",
-                    "No database objects found.",
+                    &empty_catalog_line(connection.levels, content.left_out),
                 )],
             )
         }
