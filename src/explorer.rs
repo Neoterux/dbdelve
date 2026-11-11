@@ -3010,6 +3010,30 @@ mod tests {
     }
 
     #[test]
+    fn extending_a_tree_carries_what_the_filter_left_out() {
+        let narrowed = Catalog {
+            left_out: 3,
+            ..catalog()
+        };
+        let built = super::tree(&narrowed, "");
+        assert_eq!(built.left_out, 3);
+
+        let mut after_queries = super::queries(&["q".to_string()], "");
+        after_queries.extend(built);
+        assert_eq!(after_queries.left_out, 3);
+
+        let mut after_shortcuts = super::shortcuts(
+            &Shortcuts::default(),
+            Some(&narrowed),
+            &[],
+            &ShortcutDatabase::On("dev".into()),
+            "",
+        );
+        after_shortcuts.extend(super::tree(&narrowed, ""));
+        assert_eq!(after_shortcuts.left_out, 3);
+    }
+
+    #[test]
     fn copy_name_is_the_first_thing_a_relation_menu_copies() {
         for name in ["birds", "b\"ü rds"] {
             let [reads, _] = relation_copies(
