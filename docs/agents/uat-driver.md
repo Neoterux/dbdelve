@@ -5,6 +5,15 @@ operate the real window the way a person does, and read back what it drew.
 The code is `src/drive.rs`; the GPUI side is the `dbdelve patch` in
 `vendor/gpui-pre` (`Window::debug_selectors`, `Window::debug_text`).
 
+## When to use it
+
+Always, for a UI change, before a person is asked to look at it (`AGENTS.md`,
+Build, run and check). The run is the agent's own UAT: drive the change, read
+the window and the database back, and hand a person only what the driver
+cannot judge. Keep the change drivable: a new control, dialog or status text
+paints its label as text or carries a `debug_selector`, and a new interaction
+works through a click, a chord or typing.
+
 ## What it is, and what it is not
 
 - Input is real input. A click is a `MouseMove`, `MouseDown` and `MouseUp`
