@@ -13892,6 +13892,56 @@ fn transaction_controls_are_refused_on_a_bound_tab(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn transaction_controls_are_refused_on_a_bound_object_tab(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        open_table_by_clicking(&workspace, cx, "other", "u");
+        let tabs = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("a profile is in front");
+                (
+                    profile.session.queries.len(),
+                    profile.bound_transactions.is_empty(),
+                    profile
+                        .binding_of(profile.session.active)
+                        .map(|binding| binding.database),
+                )
+            })
+        };
+        let before = (transaction_state(&workspace, cx), tabs(&workspace, cx));
+        assert_eq!(before.1.2.as_deref(), Some("other"), "a bound object tab");
+        assert_eq!((before.0.0, before.0.1), (true, false));
+
+        let controls: [(&str, Box<dyn gpui::Action>); 3] = [
+            (
+                "Toggle Auto-commit",
+                Box::new(crate::actions::ToggleAutoCommit),
+            ),
+            ("Commit", Box::new(crate::actions::CommitTransaction)),
+            ("Roll Back", Box::new(crate::actions::RollbackTransaction)),
+        ];
+        for (name, action) in controls {
+            workspace.update(cx, |workspace, _| workspace.clear_notice());
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.profile().unwrap().session.notice.as_deref(),
+                    Some(crate::session::BOUND_TRANSACTION),
+                    "{name}"
+                );
+            });
+            assert_eq!(
+                (transaction_state(&workspace, cx), tabs(&workspace, cx)),
+                before,
+                "{name} opens no tab and sends nothing"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
 /// A click is routed to whichever hitbox is topmost at the point, and a
 /// control laid out under paging or the right cluster is covered by it.
 /// `debug_bounds` reports laid-out bounds even then, so the click is by
