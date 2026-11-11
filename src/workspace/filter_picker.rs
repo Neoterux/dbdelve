@@ -1,16 +1,59 @@
 //! The filter picker: a dialog that edits one profile's include list.
 //!
-//! On open it reads the server's databases unfiltered, whatever the tree
-//! shows, so a name the filter hides can be ticked again. Save writes the
-//! profile's list and reads the catalog again; it never reconnects, because
-//! the list is not part of the connection. Which sections exist comes from
-//! `Target::levels()`, never from the engine.
+//! On open it reads the server's databases, and the own database's schemas
+//! where the target has both levels, unfiltered whatever the tree shows, so a
+//! name the filter hides can be ticked again. Save writes the profile's lists
+//! and reads the catalog again; it never reconnects, because the lists are not
+//! part of the connection. Which sections exist comes from `Target::levels()`,
+//! never from the engine.
 
+use gpui::SharedString;
 use gpui_component::checkbox::Checkbox;
 
 use super::*;
 use crate::db::{Include, Levels, Shown};
 use crate::ui::well;
+
+/// Which of the two lists a section edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Which {
+    Databases,
+    Schemas,
+}
+
+impl Which {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Databases => "Databases",
+            Self::Schemas => "Schemas",
+        }
+    }
+
+    /// Singular only when the list holds one name.
+    fn noun(self, total: usize) -> &'static str {
+        match (self, total == 1) {
+            (Self::Databases, true) => "database",
+            (Self::Databases, false) => "databases",
+            (Self::Schemas, true) => "schema",
+            (Self::Schemas, false) => "schemas",
+        }
+    }
+
+    /// What the dialog's ids and selectors call it.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Databases => "databases",
+            Self::Schemas => "schemas",
+        }
+    }
+}
+
+/// Whether a target of shape `levels` has schemas to choose between inside a
+/// database. Where a database is its own schema, or holds objects directly,
+/// the one list is the whole filter.
+fn lists_schemas(levels: Levels) -> bool {
+    levels == Levels::DatabaseThenSchema
+}
 
 /// What a section's full list of names has got to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,9 +83,14 @@ pub(crate) struct FilterPicker {
     levels: Levels,
     /// The database the connection is in, which is shown whatever the list says.
     own_database: Option<String>,
+    /// The schema the connection is in, shown whatever the schemas list says
+    /// in the own database.
+    active_schema: Option<String>,
     /// What the profile held when the dialog opened.
     saved: Include,
     pub(crate) databases: PickerSection,
+    /// The own database's schemas, on a target that has both levels.
+    pub(crate) schemas: Option<PickerSection>,
 }
 
 impl PickerSection {
@@ -88,20 +136,83 @@ impl FilterPicker {
             .then_some("current database")
     }
 
+    /// The same for the active schema, which only the own database's list
+    /// holds: the schema list the dialog fetches is that one's.
+    pub(crate) fn schema_hint(&self, name: &str) -> Option<&'static str> {
+        self.active_schema
+            .as_deref()
+            .is_some_and(|active| same_name(active, name))
+            .then_some("active schema")
+    }
+
+    fn hint(&self, which: Which, name: &str) -> Option<&'static str> {
+        match which {
+            Which::Databases => self.row_hint(name),
+            Which::Schemas => self.schema_hint(name),
+        }
+    }
+
+    fn section(&self, which: Which) -> Option<&PickerSection> {
+        match which {
+            Which::Databases => Some(&self.databases),
+            Which::Schemas => self.schemas.as_ref(),
+        }
+    }
+
+    fn section_mut(&mut self, which: Which) -> Option<&mut PickerSection> {
+        match which {
+            Which::Databases => Some(&mut self.databases),
+            Which::Schemas => self.schemas.as_mut(),
+        }
+    }
+
+    pub(crate) fn heading(&self) -> &'static str {
+        match self.schemas {
+            Some(_) => "Filter databases and schemas",
+            None => "Filter databases",
+        }
+    }
+
+    /// Says which database the schema list is of, and that the filter reaches
+    /// the others too.
+    pub(crate) fn schemas_caption(&self) -> Option<String> {
+        self.schemas.as_ref()?;
+        let database = self.own_database.as_deref()?;
+        Some(format!(
+            "Schemas of {database}. The schema filter applies inside every database."
+        ))
+    }
+
     fn loading(&self) -> bool {
-        self.databases.listing == Listing::Loading
+        [Which::Databases, Which::Schemas]
+            .into_iter()
+            .filter_map(|which| self.section(which))
+            .any(|section| section.listing == Listing::Loading)
+    }
+
+    /// What Save writes: each section's entries, and for a list with no
+    /// section the one the profile held.
+    fn written(&self) -> Include {
+        Include {
+            databases: self.databases.entries(),
+            schemas: self
+                .schemas
+                .as_ref()
+                .map_or_else(|| self.saved.schemas.clone(), PickerSection::entries),
+        }
     }
 
     /// Nothing to write while a section is still being read, or when the lists
     /// are the ones the profile already holds.
-    fn can_save(&self) -> bool {
-        !self.loading() && self.databases.entries() != self.saved.databases
+    pub(crate) fn can_save(&self) -> bool {
+        !self.loading() && self.written() != self.saved
     }
 
-    /// The line under the list: how many of the listed names the lists, as
-    /// ticked and typed, show now.
-    fn preview(&self) -> Option<String> {
-        let names = match &self.databases.listing {
+    /// The line under a list: how many of the listed names the list, as
+    /// ticked and typed, shows now.
+    pub(crate) fn preview(&self, which: Which) -> Option<String> {
+        let section = self.section(which)?;
+        let names = match &section.listing {
             Listing::Loading => return None,
             Listing::Failed(_) => {
                 return Some("Matches cannot be previewed: the names were not read.".into());
@@ -109,21 +220,42 @@ impl FilterPicker {
             Listing::Loaded(names) => names,
         };
         let total = names.len();
-        let noun = if total == 1 { "database" } else { "databases" };
-        let entries = self.databases.entries();
+        let noun = which.noun(total);
+        let place = match which {
+            Which::Databases => String::new(),
+            Which::Schemas => self
+                .own_database
+                .as_deref()
+                .map(|database| format!(" in {database}"))
+                .unwrap_or_default(),
+        };
+        let entries = section.entries();
         if entries.is_empty() {
-            return Some(format!("Showing all {total} {noun}"));
+            return Some(format!("Showing all {total} {noun}{place}"));
         }
-        let shown = Include {
-            databases: entries,
-            schemas: Vec::new(),
-        }
-        .resolve(self.levels, self.own_database.as_deref(), None);
+        let include = match which {
+            Which::Databases => Include {
+                databases: entries,
+                schemas: Vec::new(),
+            },
+            Which::Schemas => Include {
+                databases: Vec::new(),
+                schemas: entries,
+            },
+        };
+        let shown = include.resolve(
+            self.levels,
+            self.own_database.as_deref(),
+            self.active_schema.as_deref(),
+        );
         let count = names
             .iter()
-            .filter(|name| shown.shows_database(name))
+            .filter(|name| match which {
+                Which::Databases => shown.shows_database(name),
+                Which::Schemas => shown.shows_schema(name),
+            })
             .count();
-        Some(format!("Showing {count} of {total} {noun}"))
+        Some(format!("Showing {count} of {total} {noun}{place}"))
     }
 }
 
@@ -151,7 +283,8 @@ fn split(saved: &[String], names: &[String]) -> (Vec<String>, Vec<String>) {
 
 impl Workspace {
     /// Put the picker up over `profile`, which must be connected and have
-    /// databases to choose between, and read the server's databases for it.
+    /// databases to choose between, and read the server's databases for it,
+    /// and the own database's schemas where there are two levels.
     pub(crate) fn open_filter_picker(
         &mut self,
         profile: &str,
@@ -169,6 +302,8 @@ impl Workspace {
         let Some(connection) = found.connection() else {
             return;
         };
+        let wants_schemas = lists_schemas(levels);
+        let in_transaction = found.in_transaction;
         self.last_filter_request += 1;
         let request = self.last_filter_request;
         self.filter_picker = Some(FilterPicker {
@@ -176,28 +311,48 @@ impl Workspace {
             request,
             levels,
             own_database: found.active_database(),
+            active_schema: found.active_schema().map(str::to_string),
             saved: found.include.clone(),
             databases: PickerSection::loading(&found.include.databases),
+            schemas: wants_schemas.then(|| PickerSection::loading(&found.include.schemas)),
         });
         cx.notify();
-        // Every database, not the shown ones: the names the tree holds are
-        // only what the filter lets through.
+        // Every database and schema, not the shown ones: the names the tree
+        // holds are only what the filter lets through.
         let fetch = spawn_blocking(cx.background_executor(), move || {
-            connection.databases(target.engine, &Shown::everything())
+            let databases = connection.databases(target.engine, &Shown::everything());
+            let schemas = wants_schemas.then(|| {
+                // A failed read inside the user's transaction fails the
+                // transaction on Postgres, so it is read on another session.
+                let reader = match in_transaction {
+                    true => connection.apart()?,
+                    false => connection.clone(),
+                };
+                let catalog = reader.catalog(&Shown::everything())?;
+                Ok::<_, DbError>(
+                    catalog
+                        .schemas
+                        .into_iter()
+                        .map(|schema| schema.name)
+                        .collect::<Vec<_>>(),
+                )
+            });
+            (databases, schemas)
         });
         cx.spawn(async move |workspace, cx| {
-            let result = fetch.await;
+            let (databases, schemas) = fetch.await;
             _ = workspace.update(cx, |workspace, cx| {
-                workspace.databases_listed_for_picker(request, result, cx);
+                workspace.names_listed_for_picker(request, databases, schemas, cx);
             });
         })
         .detach();
     }
 
-    fn databases_listed_for_picker(
+    fn names_listed_for_picker(
         &mut self,
         request: u64,
-        result: Result<Databases, DbError>,
+        databases: Result<Databases, DbError>,
+        schemas: Option<Result<Vec<String>, DbError>>,
         cx: &mut Context<Self>,
     ) {
         // Closed, or put up again, since: the answer is not this dialog's.
@@ -217,7 +372,7 @@ impl Workspace {
         let Some(picker) = self.filter_picker.as_mut() else {
             return;
         };
-        match result {
+        match databases {
             Ok(listed) => {
                 let (ticked, patterns) = split(&picker.saved.databases, &listed.names);
                 picker.databases.ticked = ticked;
@@ -228,6 +383,17 @@ impl Workspace {
                 }
             }
             Err(error) => picker.databases.listing = Listing::Failed(error.message),
+        }
+        if let (Some(section), Some(result)) = (picker.schemas.as_mut(), schemas) {
+            match result {
+                Ok(names) => {
+                    let (ticked, patterns) = split(&picker.saved.schemas, &names);
+                    section.ticked = ticked;
+                    section.patterns = patterns;
+                    section.listing = Listing::Loaded(names);
+                }
+                Err(error) => section.listing = Listing::Failed(error.message),
+            }
         }
         cx.notify();
     }
@@ -254,13 +420,17 @@ impl Workspace {
         true
     }
 
-    fn tick_database(&mut self, name: &str, on: bool, cx: &mut Context<Self>) {
-        let Some(picker) = self.filter_picker.as_mut() else {
+    fn tick_name(&mut self, which: Which, name: &str, on: bool, cx: &mut Context<Self>) {
+        let Some(section) = self
+            .filter_picker
+            .as_mut()
+            .and_then(|picker| picker.section_mut(which))
+        else {
             return;
         };
-        picker.databases.ticked.retain(|ticked| ticked != name);
+        section.ticked.retain(|ticked| ticked != name);
         if on {
-            picker.databases.ticked.push(name.to_string());
+            section.ticked.push(name.to_string());
         }
         cx.notify();
     }
@@ -276,11 +446,7 @@ impl Workspace {
             return;
         };
         let id = picker.profile.clone();
-        let include = Include {
-            databases: picker.databases.entries(),
-            // Not edited here: written back as the profile held it.
-            schemas: picker.saved.schemas.clone(),
-        };
+        let include = picker.written();
         let Some(profile) = self.profiles.iter_mut().find(|found| found.id == id) else {
             return;
         };
@@ -296,16 +462,22 @@ impl Workspace {
         self.refresh_schema(cx);
     }
 
-    /// The dialog: the databases checklist over what Save will show of them.
-    pub(crate) fn render_filter_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let picker = self.filter_picker_in_front()?;
-        let name = self.profile()?.name.clone();
+    /// One list of the dialog: its label, what it is of, the names over a
+    /// well, and how many of them Save will show.
+    fn render_section(
+        &self,
+        picker: &FilterPicker,
+        which: Which,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let section = picker.section(which)?;
         let t = popup_theme(cx);
+        let key = which.key();
         let text_size = px(layout::chrome(layout::TEXT_SM));
         let row_height = px(layout::chrome(layout::CONTROL_HEIGHT_COMPACT));
-        let line = |selector: &'static str, ink: crate::theme::color::Srgb, text: String| {
+        let line = |selector: String, ink: crate::theme::color::Srgb, text: String| {
             div()
-                .debug_selector(move || selector.to_string())
+                .debug_selector(move || selector.clone())
                 .px(px(layout::SPACE_SM))
                 .py(px(layout::SPACE_XS))
                 .text_size(text_size)
@@ -313,33 +485,39 @@ impl Workspace {
                 .child(text)
                 .into_any_element()
         };
-        let list = match &picker.databases.listing {
+        let list = match &section.listing {
             Listing::Loading => line(
-                "filter-picker-loading-databases",
+                format!("filter-picker-loading-{key}"),
                 t.text_muted,
-                "Listing databases…".into(),
+                format!("Listing {key}…"),
             ),
             Listing::Failed(message) => line(
-                "filter-picker-failed-databases",
+                format!("filter-picker-failed-{key}"),
                 t.danger,
-                format!("The list of databases could not be read: {message}"),
+                format!("The list of {key} could not be read: {message}"),
             ),
             Listing::Loaded(names) if names.is_empty() => line(
-                "filter-picker-empty-databases",
+                format!("filter-picker-empty-{key}"),
                 t.text_muted,
-                "The server lists no databases.".into(),
+                match which {
+                    Which::Databases => "The server lists no databases.".into(),
+                    Which::Schemas => match picker.own_database.as_deref() {
+                        Some(database) => format!("No schemas in {database}."),
+                        None => "No schemas.".into(),
+                    },
+                },
             ),
             // ponytail: every row is drawn, not virtualised, so a server
-            // listing thousands of databases draws thousands of checkboxes.
+            // listing thousands of names draws thousands of checkboxes.
             // The upgrade is `uniform_list`.
             Listing::Loaded(names) => div()
-                .id("filter-picker-list-databases")
-                .debug_selector(|| "filter-picker-list-databases".into())
+                .id(SharedString::from(format!("filter-picker-list-{key}")))
+                .debug_selector(move || format!("filter-picker-list-{key}"))
                 .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
                 .overflow_y_scroll()
                 .children(names.iter().enumerate().map(|(index, listed)| {
-                    let hint = picker.row_hint(listed);
-                    let checked = hint.is_some() || picker.databases.ticked.contains(listed);
+                    let hint = picker.hint(which, listed);
+                    let checked = hint.is_some() || section.ticked.contains(listed);
                     let toggled = listed.clone();
                     div()
                         .h(row_height)
@@ -349,32 +527,30 @@ impl Workspace {
                         .gap(px(layout::SPACE_XS))
                         .child(
                             div()
-                                .debug_selector(move || {
-                                    format!("filter-picker-row-databases-{index}")
-                                })
+                                .debug_selector(move || format!("filter-picker-row-{key}-{index}"))
                                 .flex_1()
                                 .min_w_0()
                                 .child(
-                                    Checkbox::new(("filter-picker-databases", index))
-                                        .w_full()
-                                        .text_size(text_size)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .accessibility_label(listed.clone())
-                                        .checked(checked)
-                                        .disabled(hint.is_some())
-                                        .on_click(cx.listener(
-                                            move |workspace, on: &bool, _, cx| {
-                                                workspace.tick_database(&toggled, *on, cx);
-                                            },
-                                        ))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_ellipsis()
-                                                .child(listed.clone()),
-                                        ),
+                                    Checkbox::new(SharedString::from(format!(
+                                        "filter-picker-{key}-{index}"
+                                    )))
+                                    .w_full()
+                                    .text_size(text_size)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .accessibility_label(listed.clone())
+                                    .checked(checked)
+                                    .disabled(hint.is_some())
+                                    .on_click(cx.listener(move |workspace, on: &bool, _, cx| {
+                                        workspace.tick_name(which, &toggled, *on, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(listed.clone()),
+                                    ),
                                 ),
                         )
                         .children(hint.map(|hint| {
@@ -388,6 +564,54 @@ impl Workspace {
                 }))
                 .into_any_element(),
         };
+        let caption = match which {
+            Which::Databases => None,
+            Which::Schemas => picker.schemas_caption(),
+        };
+        Some(
+            div()
+                .flex_1()
+                .min_w(px(layout::SETTINGS_TEXT_MIN_WIDTH))
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_XS))
+                .child(section_label(t, which.label()))
+                .children(caption.map(|caption| {
+                    div()
+                        .text_size(text_size)
+                        .text_color(t.text_muted)
+                        .child(caption)
+                }))
+                .child(well(t, [list]))
+                .children(picker.preview(which).map(|preview| {
+                    div()
+                        .debug_selector(move || format!("filter-picker-preview-{key}"))
+                        .text_size(text_size)
+                        .text_color(t.text_muted)
+                        .child(preview)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The dialog: a checklist per list over what Save will show of it.
+    pub(crate) fn render_filter_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.filter_picker_in_front()?;
+        let name = self.profile()?.name.clone();
+        let t = popup_theme(cx);
+        let text_size = px(layout::chrome(layout::TEXT_SM));
+        let sections: Vec<AnyElement> = [Which::Databases, Which::Schemas]
+            .into_iter()
+            .filter_map(|which| self.render_section(picker, which, cx))
+            .collect();
+        let card = dialog(t).debug_selector(|| "filter-picker".into());
+        // Two lists need two columns.
+        let card = match picker.schemas {
+            Some(_) => card
+                .w(px(layout::APPROVAL_DIALOG_WIDTH))
+                .max_w(gpui::relative(0.9)),
+            None => card,
+        };
         let save = cx.entity().downgrade();
         let discard = save.clone();
         Some(
@@ -399,85 +623,75 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .child(
-                    dialog(t)
-                        .debug_selector(|| "filter-picker".into())
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(layout::SPACE_XS))
-                                .child(section_label(t, "Filter databases"))
-                                .child(
-                                    div()
-                                        .text_size(text_size)
-                                        .text_color(t.text_muted)
-                                        .child(name),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(layout::SPACE_XS))
-                                .child(section_label(t, "Databases"))
-                                .child(well(t, [list])),
-                        )
-                        .children(picker.preview().map(|preview| {
-                            div()
-                                .debug_selector(|| "filter-picker-preview-databases".into())
-                                .text_size(text_size)
-                                .text_color(t.text_muted)
-                                .child(preview)
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap(px(layout::SPACE_SM))
-                                .child(
-                                    self.choice(
-                                        "filter-picker",
-                                        1,
-                                        button(
-                                            "filter-picker-discard",
-                                            "Discard Changes",
-                                            Tone::Quiet,
-                                            Control::Standard,
-                                            t,
-                                        )
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                _ = discard.update(cx, |workspace, cx| {
-                                                    workspace.close_filter_picker(cx);
-                                                });
-                                            },
-                                        ),
+                    card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_XS))
+                            .child(section_label(t, picker.heading()))
+                            .child(
+                                div()
+                                    .text_size(text_size)
+                                    .text_color(t.text_muted)
+                                    .child(name),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(layout::SPACE_MD))
+                            .children(sections),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(layout::SPACE_SM))
+                            .child(
+                                self.choice(
+                                    "filter-picker",
+                                    1,
+                                    button(
+                                        "filter-picker-discard",
+                                        "Discard Changes",
+                                        Tone::Quiet,
+                                        Control::Standard,
                                         t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = discard.update(cx, |workspace, cx| {
+                                                workspace.close_filter_picker(cx);
+                                            });
+                                        },
                                     ),
-                                )
-                                .child(
-                                    self.choice(
-                                        "filter-picker",
-                                        0,
-                                        button(
-                                            "filter-picker-save",
-                                            "Save Filter",
-                                            Tone::Primary,
-                                            Control::Standard,
-                                            t,
-                                        )
-                                        .disabled(!picker.can_save())
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                _ = save.update(cx, |workspace, cx| {
-                                                    workspace.save_filter(cx);
-                                                });
-                                            },
-                                        ),
-                                        t,
-                                    ),
+                                    t,
                                 ),
-                        ),
+                            )
+                            .child(
+                                self.choice(
+                                    "filter-picker",
+                                    0,
+                                    button(
+                                        "filter-picker-save",
+                                        "Save Filter",
+                                        Tone::Primary,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .disabled(!picker.can_save())
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = save.update(cx, |workspace, cx| {
+                                                workspace.save_filter(cx);
+                                            });
+                                        },
+                                    ),
+                                    t,
+                                ),
+                            ),
+                    ),
                 )
                 .into_any_element(),
         )
