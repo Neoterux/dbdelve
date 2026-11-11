@@ -13753,7 +13753,11 @@ fn only_the_front_connections_chips_can_be_dragged(cx: &mut TestAppContext) {
                 cx.update(|window, cx| window.draw(cx).clear(cx));
             }
             let held = dragging(cx);
-            cx.simulate_mouse_up(from, gpui::MouseButton::Left, none);
+            // Let go well below the chip: over it, the press would be a click
+            // and bring its connection forward.
+            let off = from + gpui::point(gpui::px(12.), gpui::px(300.));
+            cx.simulate_mouse_move(off, gpui::MouseButton::Left, none);
+            cx.simulate_mouse_up(off, gpui::MouseButton::Left, none);
             settle(cx);
             held
         };
