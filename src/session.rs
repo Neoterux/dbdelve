@@ -347,20 +347,42 @@ impl Profile {
             })
     }
 
-    /// Why an edit of dbdelve's is not sent on the connection's own session:
-    /// a transaction of the user's is open on it and the batch brackets itself
+    /// Why an edit of dbdelve's is not sent on the connection's own session.
+    ///
+    /// A transaction of the user's is open and the batch brackets itself
     /// (`sql::update_batch` on MySQL, MariaDB, SQLite and SQL Server), so its
     /// `COMMIT` would end the user's -- and on MySQL and MariaDB its opening
     /// `START TRANSACTION` would commit it first. A single statement carries
     /// no bracket and joins the transaction, as the user's own would.
+    ///
+    /// Or none is open and the batch was written to join one
+    /// (`sql::update_batch_joining`): its statements would each commit on
+    /// their own, and a failure on row N would leave rows 1..N-1 committed,
+    /// the outcome the brackets exist to rule out.
     pub(crate) fn own_write_refusal(&self, sql: &str) -> Option<String> {
-        (self.in_transaction && crate::sql::ends_transaction(self.config.engine(), sql)).then(
-            || {
+        let engine = self.config.engine();
+        let ends = crate::sql::ends_transaction(engine, sql);
+        if self.in_transaction && ends {
+            return Some(
                 "Not sent: a transaction is open on this connection, and the batch of edits \
-             would end it with a COMMIT of its own."
-                    .into()
-            },
-        )
+                 would end it with a COMMIT of its own."
+                    .into(),
+            );
+        }
+        // A batch opening with its own bracket is one the parse above could
+        // not read the end of, not one written to join.
+        let bracketed = engine
+            .transaction_start()
+            .is_none_or(|opening| sql.trim_start().starts_with(opening));
+        let several = crate::sql::Buffer::for_engine(engine, sql)
+            .statements()
+            .len()
+            > 1;
+        (!self.in_transaction && !ends && !bracketed && several).then(|| {
+            "Not sent: no transaction is open on this connection, and the batch of edits \
+             was written to join one."
+                .into()
+        })
     }
 
     /// The connection a Cancel for `tab` is sent over: the session its
