@@ -14227,3 +14227,104 @@ fn the_tab_chords_walk_every_connections_tabs_in_complex_mode(cx: &mut TestAppCo
         quit(workspace, cx);
     });
 }
+
+/// Right-click the connections tree's row `index`, step `downs` items down its
+/// menu and take that one. The menu's labels are not readable from outside
+/// the widget, so a menu is compared by what each of its items does.
+fn pick_from_connections_menu(cx: &mut VisualTestContext, index: usize, downs: usize) {
+    // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+    let selector: &'static str = format!("connections-row-{index}").leak();
+    let at = cx
+        .debug_bounds(selector)
+        .expect("the row is drawn")
+        .center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: at,
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Right,
+        click_count: 1,
+        first_mouse: false,
+    });
+    settle(cx);
+    cx.update(|window, _| {
+        assert!(
+            window
+                .context_stack()
+                .iter()
+                .any(|context| context.contains("PopupMenu")),
+            "the row's menu is up"
+        )
+    });
+    for _ in 0..downs {
+        cx.simulate_keystrokes("down");
+    }
+    press(cx, "enter");
+}
+
+#[gpui::test]
+fn the_connections_trees_object_menu_is_simple_modes_menu(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "create table birds (name text);",
+            "view_mode = \"complex\"",
+            &format!(
+                "{}{}",
+                sqlite_profile("a", "Bïrds \"prod\"", ""),
+                sqlite_profile("b", "Flocks", ""),
+            ),
+        );
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+        // Connection `b` is not in front. Its table's menu is the one simple
+        // mode offers: the same item does the same thing at the same place.
+        let b = connection_row("b");
+        let at = connections_row(&workspace, cx, &b).expect("b is listed");
+        click_connections_row(cx, at);
+        for id in [
+            scoped_row("b", None, "schema-main"),
+            scoped_row("b", None, "category-Tables-main"),
+        ] {
+            let at = connections_row(&workspace, cx, &id).expect("the row is showing");
+            click_connections_row(cx, at);
+        }
+        let birds = scoped_row("b", None, &explorer::relation_row("main", "birds"));
+        // Open Data, Open Structure, Import Rows, Export, then the copies:
+        // Copy Name, Copy DDL, and Show DDL right after it.
+        for (downs, copied, dialog) in [
+            (5, "birds", None),
+            (6, "CREATE TABLE birds (name text);", None),
+            (7, "before menu", Some("show-ddl")),
+        ] {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before menu".into()));
+            let at = connections_row(&workspace, cx, &birds).expect("birds is showing");
+            pick_from_connections_menu(cx, at, downs);
+            assert_eq!(clipboard(cx), copied, "item {downs}");
+            assert_eq!(front_dialog(&workspace, cx), dialog, "item {downs}");
+            assert_eq!(
+                front_profile(&workspace, cx),
+                "b",
+                "the row's connection is in front once an item acts"
+            );
+            if dialog.is_some() {
+                press(cx, "escape");
+            }
+            // Back to `a`, so each item has to bring `b` forward itself.
+            workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+            settle(cx);
+        }
+
+        // A connection's Copy Name is its name, whatever characters it holds.
+        // New Query Here, Copy Name, Refresh.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before menu".into()));
+        let at = connections_row(&workspace, cx, &connection_row("a")).expect("a is listed");
+        pick_from_connections_menu(cx, at, 2);
+        assert_eq!(clipboard(cx), "Bïrds \"prod\"");
+
+        quit(workspace, cx);
+    });
+}
