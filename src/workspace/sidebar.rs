@@ -63,7 +63,9 @@ fn status_name(status: Status) -> &'static str {
 /// database and schema it binds, or `None` where the row offers none. A
 /// connection row names no database, so its tab is an ordinary one; a database
 /// row binds that database; a schema row binds by its connection's levels
-/// ([`Binding::for_schema_row`]), and offers nothing where that is no binding.
+/// ([`Binding::for_schema_row`]), and where that is no binding (a connection
+/// that switches no database, or a schema whose database is not known) its tab
+/// is an ordinary one too. Only a row that is not one of those offers nothing.
 fn new_query_here_at(
     nodes: &HashMap<String, Node>,
     targets: &HashMap<String, Target>,
@@ -78,11 +80,11 @@ fn new_query_here_at(
             let scoped = model::unscoped(id)?;
             let row = schema_row_name(scoped.inner)?;
             let target = *targets.get(scoped.profile)?;
-            let binding = Binding::for_schema_row(target, scoped.database, row)?;
+            let binding = Binding::for_schema_row(target, scoped.database, row);
             Some((
                 scoped.profile.to_string(),
-                Some(binding.database),
-                binding.schema,
+                binding.as_ref().map(|binding| binding.database.clone()),
+                binding.and_then(|binding| binding.schema),
             ))
         }
         Node::Group | Node::Notice => None,
@@ -844,8 +846,13 @@ mod tests {
         );
         assert_eq!(
             offered(Engine::Sqlite, None, "schema-main"),
-            None,
-            "a target with no database to switch offers none"
+            Some(("p".into(), None, None)),
+            "a target with no database to switch opens an ordinary tab"
+        );
+        assert_eq!(
+            offered(Engine::Postgres, None, "schema-public"),
+            Some(("p".into(), None, None)),
+            "so does a schema whose database is not known"
         );
         assert_eq!(
             offered(Engine::Postgres, Some("app"), "category-Tables-public"),
