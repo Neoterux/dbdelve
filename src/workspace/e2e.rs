@@ -15247,3 +15247,116 @@ fn the_selection_survives_a_rebuild_and_drops_rows_that_are_gone(cx: &mut TestAp
         quit(workspace, cx);
     });
 }
+
+/// What the palette's Commands scope lists, with each row's detail.
+fn palette_rows(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<(String, Option<String>)> {
+    cx.simulate_keystrokes("secondary-shift-p");
+    settle(cx);
+    let rows = workspace.read_with(cx, |workspace, cx| {
+        let palette = workspace.palette.as_ref().expect("the palette is up");
+        palette
+            .read(cx)
+            .labels_with_details()
+            .into_iter()
+            .map(|(label, detail)| (label.to_string(), detail.map(str::to_string)))
+            .collect()
+    });
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    rows
+}
+
+#[gpui::test]
+fn the_palette_offers_the_selections_actions_as_its_menu_does(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        let selection = [
+            "Open All",
+            "Copy Names",
+            "Copy DDL",
+            "Show DDL",
+            "Pin",
+            "Refresh",
+        ];
+
+        let rows = palette_rows(&workspace, cx);
+        for label in selection {
+            assert!(
+                rows.contains(&(label.to_string(), Some("2 tables selected".to_string()))),
+                "{label} is offered, detailed with how many: {rows:?}"
+            );
+        }
+        for label in ["Copy Name", "New Query Here"] {
+            assert!(
+                rows.iter().all(|(shown, _)| shown != label),
+                "{label} is one row's, and several are selected"
+            );
+        }
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Copy Names");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(clipboard_text(cx), "birds\nflocks");
+
+        // One row selected: its own node's rows, as 07-15's palette lists them.
+        click_connections_row_with(
+            &workspace,
+            cx,
+            &table_row("a", "flocks"),
+            gpui::Modifiers::default(),
+        );
+        let rows = palette_rows(&workspace, cx);
+        for label in ["Open All", "Copy Names"] {
+            assert!(
+                rows.iter().all(|(shown, _)| shown != label),
+                "{label} needs several rows"
+            );
+        }
+        assert!(
+            rows.contains(&("Copy Name".to_string(), Some("flocks".to_string()))),
+            "the one selected row offers its own: {rows:?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn no_selection_action_sends_a_generated_statement(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = selection_fixture(cx);
+        two_tables_selected(&workspace, cx);
+        let counts = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let session = &workspace.profile().unwrap().session;
+                (store::history("a").len(), session.history.len())
+            })
+        };
+        let before = counts(&workspace, cx);
+        for action in [
+            crate::sidebar::SelectionAction::OpenAll,
+            crate::sidebar::SelectionAction::CopyNames,
+            crate::sidebar::SelectionAction::CopyDdl,
+            crate::sidebar::SelectionAction::ShowDdl,
+            crate::sidebar::SelectionAction::Pin,
+            crate::sidebar::SelectionAction::Refresh,
+        ] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.run_selection_action(action, window, cx)
+            });
+            settle(cx);
+            settle(cx);
+            if front_dialog(&workspace, cx).is_some() {
+                press(cx, "escape");
+            }
+        }
+        assert_eq!(counts(&workspace, cx), before, "no statement was recorded");
+        quit(workspace, cx);
+    });
+}
