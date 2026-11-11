@@ -2243,6 +2243,155 @@ fn a_tab_open_on_a_hidden_object_keeps_working_and_its_pin_draws_missing(cx: &mu
     });
 }
 
+/// The `Filter Databases` entry of the connections tree's connection menu:
+/// New Query Here, Copy Name, Refresh, then it.
+const FILTER_DATABASES_DOWNS: usize = 4;
+
+/// The DuckDB connection with `other` and `scratch` attached, the instance
+/// listing three databases, and the picker opened from the connection's menu.
+fn three_databases_with_the_picker_open(
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let (workspace, cx) = duckdb_with_other_attached(cx);
+    let scratch = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("scratch.duckdb");
+    run_in_front(
+        &workspace,
+        cx,
+        &format!("ATTACH '{}' AS scratch", scratch.display()),
+    );
+    workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+    settle(cx);
+    let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+    pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
+    settle(cx);
+    (workspace, cx)
+}
+
+#[gpui::test]
+fn filter_databases_on_the_connection_menu_saves_a_ticked_list_and_rereads_without_reconnecting(
+    cx: &mut TestAppContext,
+) {
+    use super::filter_picker::Listing;
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let scratch = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("scratch.duckdb");
+        run_in_front(
+            &workspace,
+            cx,
+            &format!("ATTACH '{}' AS scratch", scratch.display()),
+        );
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        settle(cx);
+        let before = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            (
+                profile.generation,
+                profile.config.clone(),
+                profile.agent_visible,
+            )
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.connections.totals.get(&connection_row("e2e")),
+                None
+            );
+        });
+
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        assert!(cx.debug_bounds("filter-picker").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.databases.listing,
+                Listing::Loaded(vec!["e2e".into(), "other".into(), "scratch".into()]),
+                "every database the server lists, not only the shown ones"
+            );
+            assert_eq!(picker.row_hint("e2e"), Some("current database"));
+            assert_eq!(picker.row_hint("other"), None);
+        });
+
+        // The connection's own database is checked and cannot be unticked.
+        click_selector(cx, "filter-picker-row-databases-0");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(picker.databases.ticked.is_empty());
+        });
+        click_selector(cx, "filter-picker-row-databases-1");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.ticked, ["other"]);
+        });
+        click_selector(cx, "filter-picker-0");
+        settle(cx);
+
+        assert_eq!(front_dialog(&workspace, cx), None, "Save closes the dialog");
+        assert!(editor_has_keyboard(&workspace, cx));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.filter_picker.is_none());
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.include.databases, ["other"]);
+            assert_eq!(
+                (
+                    profile.generation,
+                    profile.config.clone(),
+                    profile.agent_visible
+                ),
+                before,
+                "a filter edit never reconnects"
+            );
+            assert!(matches!(profile.state, ProfileState::Connected(_)));
+            let row = connection_row("e2e");
+            assert_eq!(workspace.connections.counts.get(&row), Some(&2));
+            assert_eq!(workspace.connections.totals.get(&row), Some(&3));
+        });
+        let saved = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        let saved = saved
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "e2e")
+            .expect("the profile was saved");
+        assert_eq!(saved.include_databases, ["other"]);
+        assert!(
+            connections_row(&workspace, cx, &database_row("e2e", "scratch")).is_none(),
+            "the database the list leaves out is not drawn"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        click_selector(cx, "filter-picker-row-databases-1");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.ticked, ["other"]);
+        });
+
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.filter_picker.is_none());
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(profile.include.databases.is_empty(), "nothing was saved");
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

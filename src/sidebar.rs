@@ -2899,13 +2899,28 @@ mod tests {
             on(NodeKind::Routine, Engine::Postgres),
             [copy(), NodeAction::ShowDdl]
         );
-        for kind in [NodeKind::Connection, NodeKind::Database, NodeKind::Schema] {
+        for kind in [NodeKind::Database, NodeKind::Schema] {
             assert_eq!(
                 on(kind, Engine::Postgres),
                 [NodeAction::NewQueryHere, copy(), NodeAction::Refresh],
                 "{kind:?} has no definition of its own"
             );
         }
+        assert_eq!(
+            on(NodeKind::Connection, Engine::Postgres),
+            [
+                NodeAction::NewQueryHere,
+                copy(),
+                NodeAction::Refresh,
+                NodeAction::FilterDatabases
+            ],
+            "a connection is the one node whose databases a filter lists"
+        );
+        assert_eq!(
+            on(NodeKind::Connection, Engine::Sqlite),
+            [NodeAction::NewQueryHere, copy(), NodeAction::Refresh],
+            "a target with no databases to choose between has nothing to filter"
+        );
     }
 
     #[test]
