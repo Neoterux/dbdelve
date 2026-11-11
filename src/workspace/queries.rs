@@ -2107,6 +2107,17 @@ impl Workspace {
             Some(_) => None,
         };
         let routed = profile.route(binding.clone());
+        // An edit of dbdelve's, which a bound tab shares its session with
+        // others for: not sent while a transaction is open on that session.
+        let refusal = binding
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    refresh,
+                    Some(Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_))
+                )
+            })
+            .and_then(|binding| profile.bound_write_refusal(binding));
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
         // command's does. Not in a queue, where every result holds a grid.
@@ -2336,6 +2347,21 @@ impl Workspace {
                 profile.in_transaction = open;
             }
             profile.session_changed |= leaves.settings;
+        } else if !generated
+            && let Some(binding) = &binding
+            && let Some(profile) = self.issued_to(&id, generation)
+        {
+            // The same, for the session of the tab's database, which a
+            // transaction holds for every tab bound to it.
+            let text = explained.as_deref().unwrap_or(&sql);
+            let open = sql::leaves(engine, text)
+                .transaction
+                .or_else(|| sql::transaction_uncertain(engine, text).then_some(true));
+            match open {
+                Some(true) => profile.bound_transactions.insert(binding.database.clone()),
+                Some(false) => profile.bound_transactions.remove(&binding.database),
+                None => false,
+            };
         }
         // A plan is never cut short: its rows are the plan, not data.
         let limit = match tab {
@@ -2409,10 +2435,11 @@ impl Workspace {
         // refuses inside any, DuckDB inside an aborted one, and Redis would
         // queue the move into the MULTI), so applying it first would stop the
         // COMMIT or ROLLBACK that frees the session.
-        // ponytail: a bound session is auto-commit. A transaction opened in a
-        // bound tab holds the session, and its later statements are refused
-        // by the driver rather than run in whatever schema it is in, until
-        // the transaction is ended; the upgrade is a session of the tab's own.
+        // ponytail: a bound session is auto-commit until the user's own
+        // statement opens a transaction on it, which every tab bound to its
+        // database shares. An edit of dbdelve's is refused while one is open
+        // (`Profile::bound_write_refusal`), and the user's statements go on
+        // running as typed; the upgrade is a session of the tab's own.
         let ends_transaction =
             binding.is_some() && sql::leaves(engine, &sql).transaction == Some(false);
         let bound_db = binding.as_ref().map(|binding| binding.database.clone());
@@ -2468,20 +2495,28 @@ impl Workspace {
             // A bound tab with no session open for its database opens one
             // first, and keeps it where the tree and a Cancel find it before
             // anything is sent on it (`Workspace::keep_session`).
-            let ready = match opens {
-                None => routed.resolve().map(|(connection, _)| connection),
-                Some(database) => {
-                    let opening =
-                        spawn_blocking(cx.background_executor(), move || routed.resolve()).await;
-                    match opening {
-                        Ok((session, _)) => match workspace.update(cx, |workspace, cx| {
-                            workspace
-                                .keep_session(&id, generation, database, read_only, session, cx)
-                        }) {
-                            Ok(session) => Ok(session),
-                            Err(_) => return,
-                        },
-                        Err(error) => Err(error),
+            let ready = if let Some(message) = refusal {
+                Err(DbError {
+                    message,
+                    position: None,
+                })
+            } else {
+                match opens {
+                    None => routed.resolve().map(|(connection, _)| connection),
+                    Some(database) => {
+                        let opening =
+                            spawn_blocking(cx.background_executor(), move || routed.resolve())
+                                .await;
+                        match opening {
+                            Ok((session, _)) => match workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .keep_session(&id, generation, database, read_only, session, cx)
+                            }) {
+                                Ok(session) => Ok(session),
+                                Err(_) => return,
+                            },
+                            Err(error) => Err(error),
+                        }
                     }
                 }
             };
@@ -2577,6 +2612,7 @@ impl Workspace {
                             match &bound_db {
                                 Some(database) => {
                                     profile.bound.remove(database);
+                                    profile.bound_transactions.remove(database);
                                 }
                                 None => {
                                     profile.state = ProfileState::Failed(format!(

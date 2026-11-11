@@ -14,7 +14,7 @@ use crate::session::{BoundSession, STALE_ROWS, restored_shortcuts};
 use crate::sidebar::OPEN_ROWS_CAP;
 use crate::sql::{Destructive, Mode};
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 /// The rows on an object tab were read from what the server held then. Their
 /// statement is dbdelve's own, so it re-runs the moment the tab is looked at
@@ -272,6 +272,7 @@ impl Workspace {
             schema_refresh: None,
             databases: Databases::default(),
             bound: HashMap::new(),
+            bound_transactions: HashSet::new(),
             database_catalogs: HashMap::new(),
             left_database: false,
             shortcuts: restored_shortcuts(&stored.folders, &stored.pins),
@@ -344,6 +345,7 @@ impl Workspace {
             schema_refresh: None,
             databases: Databases::default(),
             bound: HashMap::new(),
+            bound_transactions: HashSet::new(),
             database_catalogs: HashMap::new(),
             left_database: false,
             shortcuts: Shortcuts::default(),
@@ -2283,6 +2285,7 @@ impl Workspace {
                         // next expand opens another.
                         if lost {
                             profile.bound.remove(&database);
+                            profile.bound_transactions.remove(&database);
                         }
                         profile
                             .database_catalogs
