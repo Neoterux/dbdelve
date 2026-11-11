@@ -427,10 +427,11 @@ impl Connection {
         let result = self.request(sql, Kind::Bound, cancel, fetch);
         self.forget_if_changing(sql);
         let mut result = result.map_err(hinted)?;
-        // The session is in the database again, or this statement moved it
-        // itself: either way, where an unqualified table is read from.
+        // Where an unqualified table was read from is asked as a bound run
+        // too: on a session every tab bound to the database shares, another's
+        // `USE` could land between the statement and a plain read of it.
         (result.edit, result.read_only_reason) =
-            self.edit_of_query(sql, &result.columns, Kind::User, cancel);
+            self.edit_of_query(sql, &result.columns, Kind::Bound, cancel);
         Ok(result)
     }
 
@@ -568,7 +569,7 @@ impl Connection {
         // The guard and the write go without the session, and match each
         // value as the text it was shown as: after a `SET session_timezone`,
         // say, that text would name another instant, and so another row.
-        if matches!(kind, Kind::User) && lock(&self.session).set {
+        if matches!(kind, Kind::User | Kind::Bound) && lock(&self.session).set {
             return refused(edit::SESSION_SET);
         }
         let (schema, table) = match read.table.as_slice() {
