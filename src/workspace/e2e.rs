@@ -2422,7 +2422,9 @@ fn filter_databases_in_the_palette_opens_the_picker_in_simple_mode(cx: &mut Test
         click_connections_row(cx, at);
         attach_other(&workspace, cx);
         workspace.update(cx, |workspace, cx| {
-            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx)
+            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx);
+            // The tree row that held the keyboard is gone with the tree.
+            workspace.refocus_front();
         });
         settle(cx);
         assert_eq!(view_mode_in_effect(&workspace, cx), ViewMode::Simple);
