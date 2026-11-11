@@ -109,13 +109,20 @@ impl Density {
 
     /// How `profiles.toml` spells it.
     pub(crate) fn slug(self) -> &'static str {
-        ""
+        match self {
+            Density::Compact => "compact",
+            Density::Standard => "standard",
+            Density::Comfortable => "comfortable",
+        }
     }
 
     /// The density a stored slug names; none, or one this build does not
     /// know, is the standard one.
-    pub(crate) fn from_slug(_slug: Option<&str>) -> Self {
-        Self::default()
+    pub(crate) fn from_slug(slug: Option<&str>) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|density| Some(density.slug()) == slug)
+            .unwrap_or_default()
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -128,18 +135,26 @@ impl Density {
 
     /// A row's height before zoom.
     pub(crate) fn row_height(self) -> f32 {
-        0.
+        match self {
+            Density::Compact => 22.,
+            Density::Standard => 26.,
+            Density::Comfortable => 30.,
+        }
     }
 
     /// What each level of depth adds to a row's indent, before zoom.
     pub(crate) fn indent(self) -> f32 {
-        0.
+        match self {
+            Density::Compact => 12.,
+            Density::Standard => 14.,
+            Density::Comfortable => 16.,
+        }
     }
 }
 
 /// The size a row draws: the one it has, while sizes are shown.
-pub(crate) fn shown_size(size: Option<u64>, _show_sizes: bool) -> Option<u64> {
-    size
+pub(crate) fn shown_size(size: Option<u64>, show_sizes: bool) -> Option<u64> {
+    size.filter(|_| show_sizes)
 }
 
 /// The scope a project in front lists: its own choice, or `global` when it

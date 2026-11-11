@@ -20,7 +20,7 @@ use crate::explorer::{
     Member, PINNED_GROUP, QUERIES_GROUP, Shortcut, folds, is_schema_row, saved_query,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
-use crate::sidebar::{self as model, Content, Listed, Node, schema_row_is_a_database};
+use crate::sidebar::{self as model, Content, Listed, Node, schema_row_is_a_database, shown_size};
 use crate::ui::{Status, row_icon_tinted, status_dot};
 
 /// The id of the row of `profile`'s front tab in the connections tree, if
@@ -370,6 +370,11 @@ impl Workspace {
                 )
             })
             .collect();
+        let (density, show_host, show_sizes) = (
+            self.settings.density,
+            self.settings.show_host,
+            self.settings.show_sizes,
+        );
         let tree = render_tree(&self.connections.tree, move |index, entry, _, _, cx| {
             let t = *theme(cx);
             let id = entry.item().id.as_str();
@@ -477,7 +482,7 @@ impl Workspace {
             };
             let host = connection
                 .map(|(_, look)| look.host.as_str())
-                .filter(|host| !host.is_empty());
+                .filter(|host| show_host && !host.is_empty());
             // The fill sits under the row's own content; `ListItem` draws the
             // selection and the hover over it, so a selected row still reads
             // as selected.
@@ -490,8 +495,11 @@ impl Workspace {
                 // `ListItem` sizes its text in `rems`, which tracks the
                 // library's 16 rather than dbdelve's body size.
                 .text_size(px(layout::chrome(layout::TEXT_MD)))
+                // The tree gives every row the height of its first, so each
+                // is told its density's.
+                .h(px(layout::chrome(density.row_height())))
                 .pl(px(
-                    layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
+                    layout::SPACE_SM + entry.depth() as f32 * density.indent()
                 ))
                 .child(
                     div()
@@ -596,16 +604,19 @@ impl Workspace {
                                     .child(count.to_string()),
                             )
                         })
-                        .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .whitespace_nowrap()
-                                    .text_color(t.text_faint)
-                                    .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                    .child(human_bytes(size)),
-                            )
-                        })
+                        .when_some(
+                            shown_size(leaf.and_then(|leaf| leaf.size), show_sizes),
+                            |row, size| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_color(t.text_faint)
+                                        .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                        .child(human_bytes(size)),
+                                )
+                            },
+                        )
                         // The user's own connection, in a slot as wide as the
                         // icon column.
                         .when_some(connection, |row, (profile, look)| {

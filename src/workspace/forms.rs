@@ -3021,6 +3021,7 @@ impl Workspace {
             }
             CatalogState::Loaded(..) => None,
         };
+        let show_sizes = self.settings.show_sizes;
         let tree = explorer_drawn(profile).then(|| {
             render_tree(
                 &profile.session.explorer_tree,
@@ -3176,16 +3177,22 @@ impl Workspace {
                                             .child(schema),
                                     )
                                 })
-                                .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .whitespace_nowrap()
-                                            .text_color(t.text_faint)
-                                            .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                            .child(human_bytes(size)),
-                                    )
-                                })
+                                .when_some(
+                                    crate::sidebar::shown_size(
+                                        leaf.and_then(|leaf| leaf.size),
+                                        show_sizes,
+                                    ),
+                                    |row, size| {
+                                        row.child(
+                                            div()
+                                                .flex_none()
+                                                .whitespace_nowrap()
+                                                .text_color(t.text_faint)
+                                                .text_size(px(layout::chrome(layout::TEXT_XS)))
+                                                .child(human_bytes(size)),
+                                        )
+                                    },
+                                )
                                 // In a slot as wide as the icon column, so the
                                 // dot has something to hover and sits as far
                                 // in from the right edge as the icons do from
