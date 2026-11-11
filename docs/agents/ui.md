@@ -108,6 +108,17 @@ floors the other tints keep; `Theme::text_faint` is under any floor on some
 surfaces untinted, so the host and the count are held to what a tint takes from
 them instead.
 
+Settings > General > Sidebar carries three display settings, stored in
+`[settings]` (`sidebar_density`, `sidebar_show_host`, `sidebar_show_sizes`, each
+absent when never set). Density (Compact, Standard, Comfortable: row height and
+indent step 22/12, 26/14 and 30/16 px) is the connections tree's alone: the
+simple explorer keeps its own rows whatever it is, since no density reproduces
+its row exactly (its indent step is 12 px, Compact's, but not its height). Show host drops the host from connection rows. Show sizes off
+draws no size in either tree and means no read: `load_sizes` and the database
+sizes step return before sending `sizes()`, and turning it on again reads every
+connected profile and loaded database (`sidebar::shown_size` decides the slot;
+the agent's own catalog read is not part of it).
+
 ## Titlebar and appearance
 
 - **Titlebar**: macOS and Windows get DBDelve's own strip over a transparent

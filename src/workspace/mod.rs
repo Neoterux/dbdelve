@@ -693,6 +693,10 @@ impl Workspace {
                     ViewMode::from_slug(stored_settings.view_mode.as_deref());
                 workspace.settings.listing_scope =
                     ListingScope::from_slug(stored_settings.listing_scope.as_deref());
+                workspace.settings.density =
+                    Density::from_slug(stored_settings.sidebar_density.as_deref());
+                workspace.settings.show_host = stored_settings.sidebar_show_host.unwrap_or(true);
+                workspace.settings.show_sizes = stored_settings.sidebar_show_sizes.unwrap_or(true);
                 // Ahead of the restore, which must not prune grids an
                 // unavailable profile under the same id still owns.
                 workspace.unavailable = unavailable;
