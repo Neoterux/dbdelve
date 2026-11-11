@@ -12273,3 +12273,222 @@ fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut Test
         quit(workspace, cx);
     });
 }
+
+/// Where the connections tree drew `kind` (`logo`, `name`, `agent`, `host`,
+/// `count`, `status`, `fill`) for the connection `id`, if it did.
+fn connection_part(
+    cx: &mut VisualTestContext,
+    kind: &str,
+    id: &str,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    // `debug_bounds` takes a `'static` selector; a test's few rows can leak.
+    let selector: &'static str = format!("connections-{kind}-{id}").leak();
+    cx.debug_bounds(selector)
+}
+
+/// The status the connections tree's dot for `id` was drawn in.
+fn connection_dot(cx: &mut VisualTestContext, id: &str) -> Option<&'static str> {
+    ["idle", "connecting", "connected", "failed"]
+        .into_iter()
+        .find(|status| {
+            let selector: &'static str = format!("connections-dot-{id}-{status}").leak();
+            cx.debug_bounds(selector).is_some()
+        })
+}
+
+/// Two SQLite connections in complex mode, `a` in front and connected, each
+/// with its own extra keys, and `settings` among the `[settings]`.
+fn coloured_connections<'a>(
+    cx: &'a mut TestAppContext,
+    settings: &str,
+    a: &str,
+    b: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    // Left alone, CI's live job puts a connection from `PG*` among these.
+    crate::IGNORE_ENVIRONMENT.set(true);
+    let (workspace, cx) = launch_connections(
+        cx,
+        "create table birds (name text);",
+        &format!("view_mode = \"complex\"\n{settings}"),
+        &format!(
+            "{}{}",
+            sqlite_profile("a", "Birds", a),
+            sqlite_profile("b", "Flocks", b)
+        ),
+    );
+    settle(cx);
+    (workspace, cx)
+}
+
+#[gpui::test]
+fn a_connection_row_carries_its_logo_status_marker_and_colour(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = coloured_connections(
+            cx,
+            "",
+            &format!("color = \"red\"\n{VISIBLE_RW}"),
+            "agent_visible = false",
+        );
+        assert_eq!(profile_state(&workspace, cx, "a"), "connected");
+
+        let [logo, name, agent, host, count, status] =
+            ["logo", "name", "agent", "host", "count", "status"].map(|kind| {
+                connection_part(cx, kind, "a")
+                    .unwrap_or_else(|| panic!("the row of `a` draws its {kind}"))
+            });
+        assert!(
+            connection_part(cx, "fill", "a").is_some(),
+            "red fills its row"
+        );
+        let lefts = [logo, name, agent, host, count, status].map(|bounds| bounds.left());
+        assert!(
+            lefts.windows(2).all(|pair| pair[0] < pair[1]),
+            "logo, name, marker, host, count, status, left to right: {lefts:?}"
+        );
+        assert_eq!(connection_dot(cx, "a"), Some("connected"));
+
+        for kind in ["logo", "host", "status"] {
+            assert!(
+                connection_part(cx, kind, "b").is_some(),
+                "`b` draws its {kind}"
+            );
+        }
+        for kind in ["agent", "fill"] {
+            assert!(
+                connection_part(cx, kind, "b").is_none(),
+                "`b` is hidden from agents and uncoloured, and draws no {kind}"
+            );
+        }
+        assert_eq!(connection_dot(cx, "b"), Some("idle"), "never absent");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_long_host_gives_way_before_the_connection_name(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        let long = directory
+            .join("a".repeat(48))
+            .join("b".repeat(48))
+            .join("c".repeat(48));
+        std::fs::create_dir_all(&long).expect("the directory must be creatable");
+        let long = long.join("birds.db");
+        rusqlite::Connection::open(&long)
+            .and_then(|connection| connection.execute_batch("create table birds (name text);"))
+            .expect("the database must be creatable");
+        let (workspace, cx) = launch_connections(
+            cx,
+            "",
+            "view_mode = \"complex\"",
+            &format!(
+                "[[profiles]]\nid = \"a\"\nname = \"Birds\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"sqlite\"\npath = {:?}\nagent_visible = true\n",
+                long.display().to_string()
+            ),
+        );
+        settle(cx);
+        let name_before = connection_part(cx, "name", "a").expect("the name is drawn");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let narrowest = gpui::px(crate::theme::layout::SIDEBAR_MIN_WIDTH);
+            workspace.sidebar_width.set(narrowest);
+            workspace
+                .shell_split
+                .update(cx, |state, cx| state.resize_panel(0, narrowest, window, cx));
+        });
+        settle(cx);
+
+        let name = connection_part(cx, "name", "a").expect("the name is drawn");
+        let host = connection_part(cx, "host", "a").expect("the host is drawn");
+        let count = connection_part(cx, "count", "a").expect("the count is drawn");
+        assert_eq!(
+            name.size.width, name_before.size.width,
+            "the name keeps its text"
+        );
+        assert!(
+            name.right() <= host.left(),
+            "the host starts after the name"
+        );
+        assert!(
+            host.right() <= count.left(),
+            "the host ends before the count"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_status_dot_follows_the_users_connection_and_never_the_agents(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        // `b` in front and connected; `a` is agent-visible and never
+        // connected by the user.
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "create table t (id integer);",
+            "view_mode = \"complex\"",
+            &format!(
+                "{}{}",
+                sqlite_profile("b", "Flocks", ""),
+                sqlite_profile("a", "Orders", VISIBLE_RW)
+            ),
+        );
+        settle(cx);
+        assert_eq!(connection_dot(cx, "a"), Some("idle"), "idle is a status");
+
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT id FROM t");
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.agent.lanes.contains_key("a"),
+                "the agent's lane is open"
+            );
+        });
+        assert_eq!(profile_state(&workspace, cx, "a"), "idle");
+        assert_eq!(
+            connection_dot(cx, "a"),
+            Some("idle"),
+            "the agent's lane left the user's dot alone"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.connections.tree.update(cx, |_, cx| {
+                cx.emit(TreeEvent::Expanded(connection_row("a").into()));
+            });
+        });
+        assert_eq!(profile_state(&workspace, cx, "a"), "connecting");
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(connection_dot(cx, "a"), Some("connecting"));
+        settle(cx);
+        assert_eq!(connection_dot(cx, "a"), Some("connected"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn two_connections_of_one_colour_are_two_tinted_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let tinted = format!("color = \"blue\"\n{VISIBLE_RW}");
+        let (workspace, cx) = coloured_connections(cx, "", &tinted, &tinted);
+        for id in ["a", "b"] {
+            for kind in ["fill", "agent", "status"] {
+                assert!(
+                    connection_part(cx, kind, id).is_some(),
+                    "`{id}` draws its own {kind}"
+                );
+            }
+        }
+        let (a, b) = (
+            connection_part(cx, "fill", "a").unwrap(),
+            connection_part(cx, "fill", "b").unwrap(),
+        );
+        assert_ne!(a.origin.y, b.origin.y, "two rows, not one");
+        quit(workspace, cx);
+    });
+}
