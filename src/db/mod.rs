@@ -5284,6 +5284,36 @@ mod tests {
         assert!(second.schemas.is_empty());
     }
 
+    #[test]
+    fn only_the_engines_that_have_sequences_list_them() {
+        let plugin: &'static plugin::Plugin = Box::leak(Box::new(plugin::Plugin {
+            id: "odbc".into(),
+            name: "ODBC".into(),
+            version: "1".into(),
+            executable: "dbdelve-odbc".into(),
+        }));
+        for engine in Engine::ALL {
+            let lists = matches!(
+                engine,
+                Engine::Postgres
+                    | Engine::SqlServer
+                    | Engine::Snowflake
+                    | Engine::DuckDb
+                    | Engine::MariaDb
+            );
+            assert_eq!(
+                Target::built_in(engine).abilities().lists_sequences,
+                lists,
+                "{engine:?}"
+            );
+            let through_a_plugin = Target {
+                engine,
+                driver: Driver::Plugin(plugin),
+            };
+            assert!(!through_a_plugin.abilities().lists_sequences, "{engine:?}");
+        }
+    }
+
     fn schema(name: &str, relations: &[&str], routines: &[&str]) -> Schema {
         Schema {
             name: name.to_string(),
