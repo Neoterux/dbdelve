@@ -347,6 +347,9 @@ Read the file a task touches before changing that area:
 - `docs/agents/plugins.md`: **plugins and the ODBC bridge**: the protocol,
   the manifest and discovery, stop vs drain, cancel and resets, the bridge's
   ODBC decisions, and what a plugin connection may not do.
+- `docs/agents/uat-driver.md`: **operating the real window from a shell**:
+  the `uat` build, `dbdelve drive` commands, and running a manual UAT
+  checkpoint without a person at the keyboard.
 - `docs/agents/shipping.md`: **bundling and releasing**: `dev/bundle.sh`, the
   dev and release variants, signing and the Keychain, where the ODBC bridge
   lands in each artifact, and cutting a release.
