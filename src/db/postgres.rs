@@ -1479,8 +1479,25 @@ impl Connection {
 
     /// `CREATE SEQUENCE` for `schema.name`, composed from `pg_sequences`.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
-        let _ = (schema, name, SEQUENCE_PARTS_SQL);
-        Err(plain_error("not yet".into()))
+        let parts = self.internal_query(&structure_sql(SEQUENCE_PARTS_SQL, schema, name))?;
+        let row = parts
+            .rows
+            .first()
+            .ok_or_else(|| plain_error(format!("{schema} has no sequence {name}.")))?;
+        let cell = |column| required_cell(&parts, row, column);
+        Ok(compose_sequence(
+            schema,
+            name,
+            &SequenceParts {
+                data_type: cell("data_type")?,
+                increment: cell("increment_by")?,
+                minimum: cell("min_value")?,
+                maximum: cell("max_value")?,
+                start: cell("start_value")?,
+                cache: cell("cache_size")?,
+                cycle: cell("cycle")? == "true",
+            },
+        ))
     }
 
     /// On a connection of its own, opened exactly as this one was, so a size
@@ -1781,9 +1798,21 @@ struct SequenceParts<'a> {
     cycle: bool,
 }
 
+/// Postgres has no `pg_get_*def` for a sequence, so the statement is written
+/// out of what `pg_sequences` holds, every name quoted.
 fn compose_sequence(schema: &str, name: &str, parts: &SequenceParts) -> String {
-    let _ = (schema, name, parts);
-    String::new()
+    format!(
+        "CREATE SEQUENCE {} AS {} INCREMENT BY {} MINVALUE {} MAXVALUE {} START WITH {} \
+         CACHE {} {};",
+        Engine::Postgres.qualified(schema, name),
+        parts.data_type,
+        parts.increment,
+        parts.minimum,
+        parts.maximum,
+        parts.start,
+        parts.cache,
+        if parts.cycle { "CYCLE" } else { "NO CYCLE" },
+    )
 }
 
 /// A result read off the wire, held across the reads [`Connection::run`]
@@ -2208,7 +2237,9 @@ mod tests {
     #[ignore = "requires the compose databases"]
     fn live_a_composed_sequence_recreates_it() {
         const SCHEMA: &str = "dbdelve_sequence_probe";
-        const NAME: &str = "t\u{ef}cket no";
+        // A double quote, a space and letters outside ASCII.
+        const NAME: &str = "t\"\u{ef}cket no";
+        let quoted = Engine::Postgres.quote_identifier(NAME);
         let connection = Connection::open(&live_config()).expect("connection should open");
         let clean = |connection: &Connection| {
             connection
@@ -2230,7 +2261,7 @@ mod tests {
             .query(
                 &format!(
                     "CREATE SCHEMA {SCHEMA}; \
-                     CREATE SEQUENCE {SCHEMA}.\"{NAME}\" AS integer INCREMENT 3 START 7"
+                     CREATE SEQUENCE {SCHEMA}.{quoted} AS integer INCREMENT 3 START 7"
                 ),
                 Fetch::default(),
             )
@@ -2241,7 +2272,7 @@ mod tests {
             .expect("the definition is read");
         connection
             .query(
-                &format!("DROP SEQUENCE {SCHEMA}.\"{NAME}\""),
+                &format!("DROP SEQUENCE {SCHEMA}.{quoted}"),
                 Fetch::default(),
             )
             .expect("the probe sequence should drop");

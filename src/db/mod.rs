@@ -2541,13 +2541,13 @@ impl Connection {
     /// not.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
         match self {
+            Self::Postgres(connection) => connection.sequence_ddl(schema, name),
+            Self::MySql(connection) => connection.sequence_ddl(schema, name),
+            Self::SqlServer(connection) => connection.sequence_ddl(schema, name),
             Self::DuckDb(connection) => connection.sequence_ddl(schema, name),
-            Self::Postgres(_)
-            | Self::MySql(_)
-            | Self::SqlServer(_)
-            | Self::Sqlite(_)
+            Self::Snowflake(connection) => connection.sequence_ddl(schema, name),
+            Self::Sqlite(_)
             | Self::Turso(_)
-            | Self::Snowflake(_)
             | Self::ClickHouse(_)
             | Self::MongoDb(_)
             | Self::Redis(_)
