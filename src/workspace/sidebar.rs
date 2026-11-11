@@ -88,7 +88,13 @@ impl Workspace {
                 },
             })
             .collect();
-        let built = model::build(&self.projects, listed, &folds);
+        let built = model::build(
+            &self.projects,
+            listed,
+            &folds,
+            self.listing_scope(),
+            self.current_group(),
+        );
         let front = self.profile().map(|profile| {
             let row = profile
                 .front_row()

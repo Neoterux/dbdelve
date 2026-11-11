@@ -54,7 +54,7 @@ use crate::{
         CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
         routine_name,
     },
-    sidebar::ViewMode,
+    sidebar::{ListingScope, ViewMode},
     sql,
     store::{HistoryEntry, StoredProject},
     structure_grid::Section,
@@ -369,6 +369,9 @@ pub enum Command {
     ProjectActions(usize),
     /// A project's sidebar: its own choice, or with `None` the global setting.
     SetProjectViewMode(usize, Option<ViewMode>),
+    /// A project's listing scope: its own choice, or with `None` the global
+    /// setting.
+    SetProjectListing(usize, Option<ListingScope>),
     EditConnection(usize),
     DuplicateConnection(usize),
     /// Open the dialog that makes this connection visible to agents. Changes
@@ -1076,6 +1079,7 @@ pub fn waits_for_import(scope: Scope, command: &Command) -> bool {
                 | Command::ConnectionActions(_)
                 | Command::ProjectActions(_)
                 | Command::SetProjectViewMode(..)
+                | Command::SetProjectListing(..)
                 | Command::ChooseProject(_)
                 | Command::MoveToProject(..)
                 | Command::Confirm(_)
@@ -5456,6 +5460,54 @@ mod tests {
             .map(|(label, ..)| label.as_str())
             .collect();
         assert_eq!(current, ["Sidebar in Zoo: follow the setting"]);
+    }
+
+    #[test]
+    fn a_projects_actions_offer_its_listing_scope_with_its_own_choice_marked() {
+        let rows = |project: &StoredProject| {
+            project_action_items(0, project, Group::Bare)
+                .into_iter()
+                .filter(|item| item.label.starts_with("Connections in "))
+                .map(|item| (item.label, item.hint.to_string(), item.command))
+                .collect::<Vec<_>>()
+        };
+        let current = StoredProject {
+            listing_scope: Some("current".into()),
+            ..project("Zoo", &[])
+        };
+        let rows_of_current = rows(&current);
+        let marked: Vec<(&str, &str)> = rows_of_current
+            .iter()
+            .map(|(label, hint, _)| (label.as_str(), hint.as_str()))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                ("Connections in Zoo: follow the setting", ""),
+                ("Connections in Zoo: only this project", "current"),
+                ("Connections in Zoo: every project", ""),
+            ]
+        );
+        assert!(matches!(
+            rows_of_current[0].2,
+            Command::SetProjectListing(0, None)
+        ));
+        assert!(matches!(
+            rows_of_current[1].2,
+            Command::SetProjectListing(0, Some(ListingScope::Current))
+        ));
+        assert!(matches!(
+            rows_of_current[2].2,
+            Command::SetProjectListing(0, Some(ListingScope::All))
+        ));
+
+        let following = rows(&project("Zoo", &[]));
+        let marked: Vec<&str> = following
+            .iter()
+            .filter(|(_, hint, _)| hint == "current")
+            .map(|(label, ..)| label.as_str())
+            .collect();
+        assert_eq!(marked, ["Connections in Zoo: follow the setting"]);
     }
 
     #[test]

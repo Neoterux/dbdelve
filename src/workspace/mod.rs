@@ -45,7 +45,7 @@ use crate::actions::{DisconnectAgents, ShowAgentActivity};
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
-use crate::sidebar::{ViewMode, effective_view_mode};
+use crate::sidebar::{ListingScope, ViewMode, effective_listing_scope, effective_view_mode};
 use crate::sql::{Mode, appended_statement, remember_statement, update_batch};
 use crate::theme::{install_fonts, install_theme, restored_fonts, restored_theme};
 use crate::*;
@@ -95,6 +95,9 @@ pub(crate) struct Settings {
     /// Which sidebar is drawn: the tree of the connection in front, or every
     /// connection under its project.
     pub(crate) view_mode: ViewMode,
+    /// Which connections that sidebar lists: every project's, or only those
+    /// of the project in front.
+    pub(crate) listing_scope: ListingScope,
 }
 
 impl Settings {
@@ -131,6 +134,7 @@ impl Default for Settings {
             welcomed: false,
             custom_keybindings: HashMap::new(),
             view_mode: ViewMode::default(),
+            listing_scope: ListingScope::default(),
         }
     }
 }
@@ -657,6 +661,8 @@ impl Workspace {
                     .unwrap_or_default();
                 workspace.settings.view_mode =
                     ViewMode::from_slug(stored_settings.view_mode.as_deref());
+                workspace.settings.listing_scope =
+                    ListingScope::from_slug(stored_settings.listing_scope.as_deref());
                 // Ahead of the restore, which must not prune grids an
                 // unavailable profile under the same id still owns.
                 workspace.unavailable = unavailable;
