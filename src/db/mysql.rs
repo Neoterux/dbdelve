@@ -30,7 +30,7 @@ use ::mysql::{Conn, OptsBuilder, SslOpts, Value};
 use super::ssh::{Tunnel, tunnelled};
 use super::{
     Catalog, Column, DbError, EditTarget, Engine, Fetch, Index, IndexKind, QueryResult, Reference,
-    RowBuilder, ServerConfig, Sizes, SslMode, Stopped, Structure, assemble_catalog,
+    RowBuilder, ServerConfig, Shown, Sizes, SslMode, Stopped, Structure, assemble_catalog,
     assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
     assemble_sizes, assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
 };
@@ -73,7 +73,7 @@ SELECT TABLE_SCHEMA AS schema_name,
            WHEN 'VIEW' THEN 'view'
        END AS relation_kind
 FROM information_schema.TABLES
-WHERE TABLE_SCHEMA NOT IN {system}
+WHERE TABLE_SCHEMA NOT IN {system}{only}
   AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
 ORDER BY TABLE_SCHEMA, TABLE_NAME
 ";
@@ -88,7 +88,7 @@ SELECT TABLE_SCHEMA AS schema_name,
        DATA_LENGTH + INDEX_LENGTH AS size_bytes,
        TABLE_ROWS AS row_estimate
 FROM information_schema.TABLES
-WHERE TABLE_SCHEMA NOT IN {system}
+WHERE TABLE_SCHEMA NOT IN {system}{only}
   AND TABLE_TYPE = 'BASE TABLE'
 ";
 
@@ -119,7 +119,7 @@ SELECT routine.ROUTINE_SCHEMA AS schema_name,
        LOWER(COALESCE(routine.ROUTINE_BODY, '')) AS language,
        COALESCE(routine.ROUTINE_DEFINITION, '') AS definition
 FROM information_schema.ROUTINES AS routine
-WHERE routine.ROUTINE_SCHEMA NOT IN {system}
+WHERE routine.ROUTINE_SCHEMA NOT IN {system}{only}
   AND routine.ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')
 ORDER BY routine.ROUTINE_SCHEMA, routine.ROUTINE_NAME
 ";
@@ -131,9 +131,50 @@ SELECT TABLE_SCHEMA AS schema_name,
        TABLE_NAME AS sequence_name
 FROM information_schema.TABLES
 WHERE TABLE_TYPE = 'SEQUENCE'
-  AND TABLE_SCHEMA NOT IN {system}
+  AND TABLE_SCHEMA NOT IN {system}{only}
 ORDER BY 1, 2
 ";
+
+/// ` AND column IN (...)` over the server-listed names a filter matched, on a
+/// line of its own, or nothing when no filter narrows the read. Every name is
+/// quoted by the engine, so none can end the literal; the pattern a person
+/// typed never gets here. Never called with an empty slice, for `IN ()` is a
+/// syntax error on both servers.
+fn only_clause(engine: Engine, column: &str, names: Option<&[String]>) -> String {
+    let Some(names) = names else {
+        return String::new();
+    };
+    let quoted = names
+        .iter()
+        .map(|name| engine.quote_literal(name))
+        .collect::<Vec<_>>();
+    format!("\n  AND {column} IN ({})", quoted.join(", "))
+}
+
+fn relations_sql(engine: Engine, names: Option<&[String]>) -> String {
+    RELATIONS_SQL
+        .replace("{system}", SYSTEM_SCHEMAS)
+        .replace("{only}", &only_clause(engine, "TABLE_SCHEMA", names))
+}
+
+fn sizes_sql(engine: Engine, names: Option<&[String]>) -> String {
+    SIZES_SQL
+        .replace("{system}", SYSTEM_SCHEMAS)
+        .replace("{only}", &only_clause(engine, "TABLE_SCHEMA", names))
+}
+
+fn routines_sql(engine: Engine, names: Option<&[String]>) -> String {
+    ROUTINES_SQL.replace("{system}", SYSTEM_SCHEMAS).replace(
+        "{only}",
+        &only_clause(engine, "routine.ROUTINE_SCHEMA", names),
+    )
+}
+
+fn sequences_sql(engine: Engine, names: Option<&[String]>) -> String {
+    SEQUENCES_SQL
+        .replace("{system}", SYSTEM_SCHEMAS)
+        .replace("{only}", &only_clause(engine, "TABLE_SCHEMA", names))
+}
 
 // The four structure queries name one relation, so they carry `{schema}` and
 // `{relation}` placeholders substituted by `structure_sql`.
@@ -804,23 +845,56 @@ impl Connection {
         assemble_databases(&self.internal_query(DATABASES_SQL)?)
     }
 
-    pub fn catalog(&self) -> Result<Catalog, DbError> {
-        let relations = self.internal_query(&RELATIONS_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
-        assemble_catalog(relations, QueryResult::default())
+    /// The server's databases the filter matches, and how many it left out, or
+    /// `None` for a read that is not narrowed. Listed here, in the read's own
+    /// closure, so the statement it feeds carries only names the server just
+    /// gave.
+    fn matched(&self, shown: &Shown) -> Result<Option<(Vec<String>, usize)>, DbError> {
+        if !shown.narrows_catalog() {
+            return Ok(None);
+        }
+        Ok(shown.matched_databases(&self.databases()?, self.engine))
     }
 
-    pub fn routines(&self) -> Result<Catalog, DbError> {
-        let routines = self.internal_query(&ROUTINES_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
+    pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
+        let matched = self.matched(shown)?;
+        let names = matched.as_ref().map(|(names, _)| names.as_slice());
+        let left_out = matched.as_ref().map_or(0, |(_, left_out)| *left_out);
+        if names.is_some_and(<[String]>::is_empty) {
+            return Ok(Catalog {
+                left_out,
+                ..Catalog::default()
+            });
+        }
+        let relations = self.internal_query(&relations_sql(self.engine, names))?;
+        Ok(Catalog {
+            left_out,
+            ..assemble_catalog(relations, QueryResult::default())?
+        })
+    }
+
+    pub fn routines(&self, shown: &Shown) -> Result<Catalog, DbError> {
+        let matched = self.matched(shown)?;
+        let names = matched.as_ref().map(|(names, _)| names.as_slice());
+        if names.is_some_and(<[String]>::is_empty) {
+            return Ok(Catalog::default());
+        }
+        let routines = self.internal_query(&routines_sql(self.engine, names))?;
         assemble_catalog(QueryResult::default(), routines)
     }
 
     /// MariaDB's only: MySQL has no sequences, and a MariaDB before 10.3 answers
     /// the filter with no rows, so there is no version probe.
-    pub fn sequences(&self) -> Result<Catalog, DbError> {
+    pub fn sequences(&self, shown: &Shown) -> Result<Catalog, DbError> {
         if self.engine != Engine::MariaDb {
             return Ok(Catalog::default());
         }
-        let sequences = self.internal_query(&SEQUENCES_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
+        let matched = self.matched(shown)?;
+        let names = matched.as_ref().map(|(names, _)| names.as_slice());
+        if names.is_some_and(<[String]>::is_empty) {
+            return Ok(Catalog::default());
+        }
+        let sequences = self.internal_query(&sequences_sql(self.engine, names))?;
         assemble_sequences(sequences)
     }
 
@@ -836,9 +910,14 @@ impl Connection {
     /// On a connection of its own, as [`Self::cancel`] is, so opening every
     /// table for its statistics never holds the mutex a user's query waits on.
     /// The side connection is dropped on return.
-    pub fn sizes(&self) -> Result<Sizes, DbError> {
+    pub fn sizes(&self, shown: &Shown) -> Result<Sizes, DbError> {
+        let matched = self.matched(shown)?;
+        let names = matched.as_ref().map(|(names, _)| names.as_slice());
+        if names.is_some_and(<[String]>::is_empty) {
+            return Ok(Sizes::new());
+        }
         let side = self.side_session()?;
-        assemble_sizes(side.internal_query(&SIZES_SQL.replace("{system}", SYSTEM_SCHEMAS))?)
+        assemble_sizes(side.internal_query(&sizes_sql(self.engine, names))?)
     }
 
     /// A session of its own, built from this connection's config, so it
@@ -1454,7 +1533,7 @@ ORDER BY 1, 2
     #[test]
     #[ignore = "requires the compose databases"]
     fn live_the_include_list_reads_only_the_listed_databases() {
-        use crate::db::{Include, Levels, Shown};
+        use crate::db::{Include, Levels};
 
         for engine in [Engine::MySql, Engine::MariaDb] {
             let connection = live(engine);
@@ -1895,7 +1974,9 @@ ORDER BY 1, 2
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(500));
             assert!(
-                canceller.sizes().expect("sizes should load")["dbdelve_dev"]
+                canceller
+                    .sizes(&Shown::everything())
+                    .expect("sizes should load")["dbdelve_dev"]
                     .contains_key("accounts")
             );
             canceller.cancel().expect("the KILL QUERY should send");
@@ -1955,7 +2036,7 @@ ORDER BY 1, 2
                 refusal.message
             );
             let sizes = held
-                .sizes()
+                .sizes(&Shown::everything())
                 .expect("sizes should load on a held connection");
             assert!(
                 sizes["dbdelve_dev"].contains_key("dbdelve_side_probe"),
@@ -2374,8 +2455,14 @@ ORDER BY 1, 2
 
     fn live_catalog_round_trip(engine: Engine) {
         let connection = live(engine);
-        let mut catalog = connection.catalog().expect("catalog should load");
-        catalog.merge(connection.routines().expect("routines should load"));
+        let mut catalog = connection
+            .catalog(&Shown::everything())
+            .expect("catalog should load");
+        catalog.merge(
+            connection
+                .routines(&Shown::everything())
+                .expect("routines should load"),
+        );
         let schema = catalog
             .schemas
             .iter()
@@ -2413,7 +2500,9 @@ ORDER BY 1, 2
                 .any(|schema| schema.name == "mysql" || schema.name == "sys")
         );
 
-        let sizes = connection.sizes().expect("sizes should load");
+        let sizes = connection
+            .sizes(&Shown::everything())
+            .expect("sizes should load");
         assert!(sizes["dbdelve_dev"].contains_key("accounts"));
         assert!(!sizes["dbdelve_dev"].contains_key("account_overview"));
         catalog.set_sizes(&sizes);
@@ -3002,7 +3091,7 @@ ORDER BY 1, 2
         );
         assert!(connection.is_lost());
         let catalog = connection
-            .sequences()
+            .sequences(&Shown::everything())
             .expect("a MySQL connection sends no sequence statement");
         assert!(catalog.schemas.is_empty());
     }
