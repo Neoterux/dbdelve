@@ -5,8 +5,10 @@
 
 use super::*;
 
+use super::sidebar::new_query_binding;
 use crate::db::{ColumnDefinition, Structure};
 use crate::session::{Binding, Explained, Finished, Queue, Routed, TabKey};
+use crate::sidebar::{NodeAction, NodeKind, SelectedNode};
 
 /// A definition being read: the connection it was asked of, by id and
 /// generation, and the read itself.
@@ -573,25 +575,99 @@ impl Workspace {
         );
     }
 
-    /// The relation `target` names in the catalog `profile` read for
-    /// `database` (`None` for its own), by schema, name and kind.
-    pub(crate) fn relation_in(
+    /// The object `target` names in the catalog `profile` read for `database`
+    /// (`None` for its own): its schema, its name as the catalog lists it, and
+    /// what kind of node it is.
+    pub(crate) fn object_in(
         &self,
         profile: &str,
         database: Option<&str>,
         target: ExplorerTarget,
-    ) -> Option<(String, String, RelationKind)> {
-        let ExplorerTarget::Relation {
-            schema_index,
-            relation_index,
-        } = target
-        else {
-            return None;
-        };
+    ) -> Option<(String, String, NodeKind)> {
         let profile = self.profiles.iter().find(|found| found.id == profile)?;
-        let schema = catalog_in(profile, database)?.schemas.get(schema_index)?;
-        let relation = schema.relations.get(relation_index)?;
-        Some((schema.name.clone(), relation.name.clone(), relation.kind))
+        let catalog = catalog_in(profile, database)?;
+        match target {
+            ExplorerTarget::Relation {
+                schema_index,
+                relation_index,
+            } => {
+                let schema = catalog.schemas.get(schema_index)?;
+                let relation = schema.relations.get(relation_index)?;
+                Some((
+                    schema.name.clone(),
+                    relation.name.clone(),
+                    NodeKind::Relation(relation.kind),
+                ))
+            }
+            ExplorerTarget::Routine {
+                schema_index,
+                routine_index,
+            } => {
+                let schema = catalog.schemas.get(schema_index)?;
+                let routine = schema.routines.get(routine_index)?;
+                Some((schema.name.clone(), routine.name.clone(), NodeKind::Routine))
+            }
+            ExplorerTarget::Sequence {
+                schema_index,
+                sequence_index,
+            } => {
+                let schema = catalog.schemas.get(schema_index)?;
+                let sequence = schema.sequences.get(sequence_index)?;
+                Some((schema.name.clone(), sequence.clone(), NodeKind::Sequence))
+            }
+        }
+    }
+
+    /// What `action` does to `node`, from a menu or the palette alike. The
+    /// node's connection comes to the front first, so the gate, the mode and
+    /// the engine anything it sends meets are that connection's. Nothing here
+    /// sends a statement dbdelve writes: a definition is the driver's own read
+    /// and a refresh its own catalog read.
+    pub(crate) fn run_node_action(
+        &mut self,
+        node: &SelectedNode,
+        action: NodeAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            NodeAction::CopyName(name) => cx.write_to_clipboard(ClipboardItem::new_string(name)),
+            NodeAction::ShowDdl => {
+                if !self.make_front(&node.profile, cx) {
+                    return;
+                }
+                match (node.kind, node.schema.clone(), node.leaf) {
+                    (NodeKind::Relation(kind), Some(schema), _) => {
+                        self.show_ddl(node.database.clone(), schema, node.name.clone(), kind, cx)
+                    }
+                    (NodeKind::Routine, _, Some(leaf)) => match node.database.clone() {
+                        Some(database) => {
+                            self.open_object_on(&node.profile, database, leaf.target, window, cx)
+                        }
+                        None => self.open_explorer_target(leaf.target, window, cx),
+                    },
+                    _ => {}
+                }
+            }
+            NodeAction::NewQueryHere => {
+                if !self.make_front(&node.profile, cx) {
+                    return;
+                }
+                match self.view_mode() {
+                    ViewMode::Complex => {
+                        let target = self.target();
+                        let (database, schema) = new_query_binding(node, target);
+                        self.new_query_here(&node.profile, database, schema, window, cx);
+                    }
+                    ViewMode::Simple => self.open_query_tab(None, window, cx),
+                }
+            }
+            NodeAction::Refresh => {
+                if self.make_front(&node.profile, cx) {
+                    self.refresh_schema(cx);
+                }
+            }
+        }
     }
 
     /// Bring the connection `id` in front, as acting on one of its rows
