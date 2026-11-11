@@ -13892,6 +13892,111 @@ fn transaction_controls_are_refused_on_a_bound_tab(cx: &mut TestAppContext) {
     });
 }
 
+/// A click is routed to whichever hitbox is topmost at the point, and a
+/// control laid out under paging or the right cluster is covered by it.
+/// `debug_bounds` reports laid-out bounds even then, so the click is by
+/// position: a dispatched action would reach the handler either way. 800 and
+/// 760 are the widths a debugger measured failing; 640 is narrower still.
+#[gpui::test]
+fn commit_and_roll_back_take_a_click_on_a_crowded_relation_tab_in_a_narrow_window(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"",
+            "CREATE TABLE t AS SELECT range AS id, range * 2 AS doubled, 'row ' || range AS label \
+             FROM range(5000);",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let click = |id: &str, cx: &mut VisualTestContext| {
+            let at = connections_row(&workspace, cx, id)
+                .unwrap_or_else(|| panic!("{id} is not showing"));
+            click_connections_row(cx, at);
+        };
+        click(&connection_row("e2e"), cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (auto_commit, in_transaction, _) = transaction_state(&workspace, cx);
+        assert!(
+            auto_commit && in_transaction,
+            "BEGIN opens a transaction on the connection's own session"
+        );
+
+        let database = database_row("e2e", "e2e");
+        let schema = scoped_row("e2e", Some("e2e"), "schema-main");
+        let tables = scoped_row("e2e", Some("e2e"), "category-Tables-main");
+        let t = scoped_row("e2e", Some("e2e"), &explorer::relation_row("main", "t"));
+        for id in [&database, &schema, &tables] {
+            if !connections_row_open(&workspace, cx, id) {
+                click(id, cx);
+            }
+        }
+        click(&t, cx);
+        let relation = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            let tab = profile
+                .session
+                .active_object()
+                .expect("an object tab is in front");
+            tab.id
+        });
+
+        let front_relation = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_tab(crate::session::Tab::Object(relation), window, cx)
+                });
+            });
+            settle(cx);
+        };
+        let click_at = |selector: &'static str, width: f32, cx: &mut VisualTestContext| {
+            assert!(
+                cx.debug_bounds("status-paging").is_some(),
+                "the bar is crowded by paging at {width}px"
+            );
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("the connection is in front");
+                assert!(
+                    profile.session.active_object().is_some()
+                        && profile.binding_of(profile.session.active).is_none(),
+                    "an unbound object tab is in front at {width}px"
+                );
+            });
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is not drawn at {width}px"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            settle(cx);
+        };
+
+        for width in [800., 760., 640.] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.)));
+            settle(cx);
+            if !transaction_state(&workspace, cx).1 {
+                // Roll back from an object tab leaves a query tab in front.
+                run_in_front(&workspace, cx, "BEGIN");
+            }
+            front_relation(cx);
+            click_at("transaction-rollback", width, cx);
+            assert!(
+                !transaction_state(&workspace, cx).1,
+                "a click on Roll back ends the transaction at {width}px"
+            );
+
+            run_in_front(&workspace, cx, "BEGIN");
+            assert!(transaction_state(&workspace, cx).1);
+            front_relation(cx);
+            click_at("transaction-commit", width, cx);
+            assert!(
+                !transaction_state(&workspace, cx).1,
+                "a click on Commit ends the transaction at {width}px"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_bound_tab_says_its_session_commits_each_statement_whatever_the_connection_holds(
     cx: &mut TestAppContext,

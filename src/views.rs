@@ -3134,6 +3134,7 @@ pub(crate) fn render_paging(
 
     preview.map(|_| {
         div()
+            .debug_selector(|| "status-paging".into())
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -3322,6 +3323,7 @@ pub(crate) fn render_transaction(
                     Control::Compact,
                     t,
                 )
+                .debug_selector(|| "transaction-commit".into())
                 .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
                     workspace.commit_transaction(&CommitTransaction, window, cx);
                 })),
@@ -3334,6 +3336,7 @@ pub(crate) fn render_transaction(
                     Control::Compact,
                     t,
                 )
+                .debug_selector(|| "transaction-rollback".into())
                 .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
                     workspace.rollback_transaction(&RollbackTransaction, window, cx);
                 })),
