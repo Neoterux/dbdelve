@@ -1843,6 +1843,8 @@ fn opened_from(catalog: &Catalog, target: ExplorerTarget) -> Option<OpenedObject
                 routine: routine.clone(),
             })
         }
+        // A sequence is listed and nothing more: it has no tab to open (D-24).
+        ExplorerTarget::Sequence { .. } => None,
     }
 }
 

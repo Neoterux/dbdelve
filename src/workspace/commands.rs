@@ -862,7 +862,7 @@ impl Workspace {
                         ObjectKind::Relation(kind) => {
                             Some((tab.schema.clone(), tab.name.clone(), kind))
                         }
-                        ObjectKind::Routine(_) => None,
+                        ObjectKind::Routine(_) | ObjectKind::Sequence => None,
                     }
                 });
                 if let Some((schema, relation, kind)) = front {

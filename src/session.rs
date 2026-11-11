@@ -2699,7 +2699,8 @@ impl ObjectTab {
             structure: matches!(self.body, ObjectBody::Structure { .. }),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
-                ObjectKind::Routine(_) => RelationKind::default(),
+                // A sequence opens no tab, so this is never stored.
+                ObjectKind::Routine(_) | ObjectKind::Sequence => RelationKind::default(),
             },
             active: false,
         }
