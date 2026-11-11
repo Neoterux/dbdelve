@@ -690,9 +690,14 @@ impl Workspace {
         let request = self.last_ddl_request;
         self.ddl_view = Some(DdlView {
             profile: profile_id.clone(),
+            database: None,
+            schema: String::new(),
             name: shown,
+            kind: Some(kind),
             title,
             text: DdlText::Loading,
+            diagram: None,
+            showing_diagram: false,
             request,
         });
         cx.notify();
@@ -725,6 +730,12 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// The dialog's `Diagram` choice.
+    pub(crate) fn show_diagram(&mut self, _cx: &mut Context<Self>) {}
+
+    /// The dialog's `SQL` choice.
+    pub(crate) fn show_sql(&mut self, _cx: &mut Context<Self>) {}
 
     /// The `Show DDL` dialog, when it is the front connection's: one left up
     /// for a connection that is no longer in front is not drawn and `escape`
