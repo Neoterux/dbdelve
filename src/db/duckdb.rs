@@ -94,6 +94,13 @@ pub struct Connection {
     /// The database and schema a connection of this instance starts on.
     home: Arc<(String, String)>,
     unpicked: Option<Unpicked>,
+    /// Opened by [`Self::on_database`] for the tabs bound to its database,
+    /// which share it. A `USE` of one moves it for all, so what dbdelve reads
+    /// over it for those tabs (a definition, a structure, a catalog) puts it
+    /// back on its database first. The connection of the profile is never
+    /// held: there a `USE` of the user's is meant to stay, and the catalog
+    /// follows it.
+    held: bool,
 }
 
 /// The database and schema unqualified names resolve in, None for where the
@@ -170,6 +177,7 @@ impl Connection {
             pick: Arc::default(),
             home: Arc::new(home),
             unpicked: None,
+            held: false,
         })
     }
 
@@ -253,6 +261,7 @@ impl Connection {
             connection: Arc::new(Mutex::new(connection)),
             pick: Arc::new(Mutex::new(pick)),
             unpicked: None,
+            held: true,
             ..self.clone()
         })
     }
@@ -285,6 +294,24 @@ impl Connection {
         // take it out of order both apply the later one.
         let pick = self.pick().clone();
         self.go(&connection, &pick)
+    }
+
+    /// A session opened for a database back on it, and on `schema` of it (its
+    /// own default when `None`), through the same `USE` every move makes.
+    /// `connection` is held by the caller, so the statement that follows runs
+    /// where this left it, and the pick is read once it is, as
+    /// [`Self::apply_pick`] reads it. Failing is the caller's statement not
+    /// being sent.
+    fn put_back(
+        &self,
+        connection: &duckdb::Connection,
+        schema: Option<&str>,
+    ) -> Result<(), DbError> {
+        let pick = Pick {
+            database: self.pick().database.clone(),
+            schema: schema.map(str::to_string),
+        };
+        self.go(connection, &pick).map_err(super::unplaced)
     }
 
     fn go_here(&self, pick: &Pick) -> Result<(), DbError> {
@@ -415,12 +442,7 @@ impl Connection {
         let connection = lock(&self.connection)?;
         fetch.hold()?;
         if let Some(schema) = bound {
-            // After the lock, as `apply_pick` reads it.
-            let pick = Pick {
-                database: self.pick().database.clone(),
-                schema: schema.map(str::to_string),
-            };
-            self.go(&connection, &pick).map_err(super::unplaced)?;
+            self.put_back(&connection, schema)?;
         }
         let mut result =
             run(&connection, sql, fetch).map_err(|error| rolled_back(&connection, sql, error))?;
@@ -434,6 +456,9 @@ impl Connection {
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
         let _deadline = self.deadline();
         let connection = lock(&self.connection)?;
+        if self.held {
+            self.put_back(&connection, None)?;
+        }
         run(&connection, sql, Fetch::default())
             .map_err(|error| rolled_back(&connection, sql, error))
     }
@@ -444,6 +469,9 @@ impl Connection {
     pub fn catalog(&self) -> Result<Catalog, DbError> {
         let _deadline = self.deadline();
         let connection = lock(&self.connection)?;
+        if self.held {
+            self.put_back(&connection, None)?;
+        }
         // Both under the one lock, so no statement moves the connection
         // between the database named and the objects listed.
         let read = |sql: &str| {
