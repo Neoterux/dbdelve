@@ -7,7 +7,7 @@ use super::*;
 use gpui_component::menu::PopupMenuItem;
 
 use crate::connection_form::{ConnectionTest, Reported, duplicate_profile_name, keep_schema};
-use crate::db::{ExternalConfig, Plugin};
+use crate::db::{ExternalConfig, Include, Plugin};
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{BoundSession, STALE_ROWS, restored_shortcuts};
@@ -257,6 +257,9 @@ impl Workspace {
             // `adopt_saved_visibility` would read the file's grant back; a save
             // from here would write a partial list.
             agent_visible: stored.agent_visible && !read_as_postgres,
+            // A file is a person's to edit: blanks are dropped and each list is
+            // capped, as `open_rows` is.
+            include: Include::from_stored(stored.include_databases, stored.include_schemas),
             confirmed: stored
                 .confirmed
                 .iter()
@@ -335,6 +338,9 @@ impl Workspace {
             // starts hidden. Only the owner's confirmation in the visibility
             // dialog grants it.
             agent_visible: false,
+            // Every way a profile is made starts unfiltered, for the same
+            // reason it starts hidden: the lists are the owner's to write.
+            include: Include::default(),
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
@@ -1140,8 +1146,9 @@ impl Workspace {
             return;
         };
         let (id, generation) = (profile.id.clone(), profile.generation);
+        let shown = profile.shown();
         let fetch = spawn_blocking(cx.background_executor(), move || {
-            connection.databases(target.engine)
+            connection.databases(target.engine, &shown)
         });
         cx.spawn_in(window, async move |workspace, cx| {
             let result = fetch.await;
@@ -2061,8 +2068,9 @@ impl Workspace {
             return;
         };
         let engine = profile.config.engine();
+        let shown = profile.shown();
         let listing = spawn_blocking(cx.background_executor(), move || {
-            connection.databases(engine)
+            connection.databases(engine, &shown)
         });
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {

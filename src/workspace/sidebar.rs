@@ -105,6 +105,8 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) shortcuts: Arc<HashMap<String, Shortcut>>,
     /// How many rows each folder row holds, by row id.
     pub(crate) counts: Arc<HashMap<String, usize>>,
+    /// How many each count is of, where a filter left some out.
+    pub(crate) totals: Arc<HashMap<String, usize>>,
     /// What the tree is narrowed by.
     pub(crate) filter: Entity<InputState>,
     /// The folds the tree had when the first key was typed, which come back
@@ -153,6 +155,7 @@ impl ConnectionsSidebar {
             highlights: Arc::default(),
             shortcuts: Arc::default(),
             counts: Arc::default(),
+            totals: Arc::default(),
             filter,
             folds_before_filter: None,
             selection: Selection::default(),
@@ -275,6 +278,7 @@ impl Workspace {
                     },
                     levels,
                     database,
+                    databases_left_out: profile.databases.left_out,
                 }
             })
             .collect();
@@ -327,6 +331,7 @@ impl Workspace {
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
         self.connections.counts = Arc::new(built.counts);
+        self.connections.totals = Arc::new(built.totals);
         // When the row the tree had is gone, one of the rows still selected
         // is where it goes, so the selection is not left with none of its own.
         let kept = self
@@ -797,6 +802,7 @@ impl Workspace {
         let highlights = self.connections.highlights.clone();
         let shortcuts = self.connections.shortcuts.clone();
         let counts = self.connections.counts.clone();
+        let totals = self.connections.totals.clone();
         // What each connection's rows are drawn in, by profile id: its logo
         // and the dialect its saved queries are written in.
         let targets: HashMap<String, (&'static str, Syntax, Levels)> = self
@@ -1083,7 +1089,7 @@ impl Workspace {
                                             format!("connections-count-{profile}")
                                         })
                                     })
-                                    .child(count.to_string()),
+                                    .child(model::count_label(*count, totals.get(id).copied())),
                             )
                         })
                         .when_some(

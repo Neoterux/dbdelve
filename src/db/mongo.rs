@@ -1219,6 +1219,7 @@ impl Connection {
         Ok(super::Databases {
             names,
             current: Some(self.database.clone()).filter(|name| !name.is_empty()),
+            left_out: 0,
         })
     }
 

@@ -29,8 +29,8 @@ use crate::{
     Workspace, completion,
     db::{
         CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine,
-        ExplainMode, Levels, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax,
-        Target,
+        ExplainMode, Include, Levels, QueryResult, Relation, RelationKind, Routine, Row, Shown,
+        Structure, Syntax, Target,
     },
     explain::{self, Plan, analysis::Analysis},
     explorer::{
@@ -66,6 +66,9 @@ pub(crate) struct Profile {
     /// exists before its owner says otherwise. Read from `profiles.toml` only
     /// at load, and written only by `Workspace::set_agent_visible`.
     pub(crate) agent_visible: bool,
+    /// What the connections tree and the agent lane show of the server. Not
+    /// part of `config`: changing it never reconnects.
+    pub(crate) include: Include,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
@@ -232,6 +235,15 @@ impl Profile {
             .or_else(|| connection?.spelled_database().map(str::to_string))
             .or_else(|| self.config.database_name())
             .or_else(|| connection?.current_database().map(str::to_string))
+    }
+
+    /// The include lists as they apply to this connection now, owned so a
+    /// read on a background thread can narrow its answer with them.
+    pub(crate) fn shown(&self) -> Shown {
+        self.include.resolve(
+            self.config.target().levels(),
+            self.active_database().as_deref(),
+        )
     }
 
     /// The database a folder or a pin names its objects by, where the
@@ -533,6 +545,8 @@ impl Profile {
             color: self.color.map(|color| color.slug().to_string()),
             mode: Some(self.mode.slug().to_string()),
             agent_visible: self.agent_visible,
+            include_databases: self.include.databases.clone(),
+            include_schemas: self.include.schemas.clone(),
             confirmed: self
                 .confirmed
                 .iter()
