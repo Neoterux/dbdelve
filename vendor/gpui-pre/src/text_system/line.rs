@@ -142,6 +142,13 @@ impl ShapedLine {
             &mut Window,
         ),
     ) -> Result<()> {
+        // dbdelve patch: see `Window::record_debug_text`. Gated as
+        // `debug_selector` is, so a release build with test-support pays nothing.
+        #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+        window.record_debug_text(
+            &self.text,
+            Bounds::new(origin, size(self.layout.width, line_height)),
+        );
         paint_line(
             origin,
             &self.layout,
@@ -471,6 +478,19 @@ impl WrappedLine {
             None => self.layout.wrap_width,
         };
 
+        // dbdelve patch: see `Window::record_debug_text`. Gated as
+        // `debug_selector` is, so a release build with test-support pays nothing.
+        #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+        window.record_debug_text(
+            &self.text,
+            Bounds::new(
+                origin,
+                size(
+                    align_width.unwrap_or(self.layout.unwrapped_layout.width),
+                    line_height * (self.wrap_boundaries.len() + 1) as f32,
+                ),
+            ),
+        );
         paint_line(
             origin,
             &self.layout.unwrapped_layout,
