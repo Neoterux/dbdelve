@@ -43,7 +43,7 @@ use crate::{
         PaletteHistoryFilter, PaletteHistorySort, PaletteNext, PaletteNextScope, PalettePrevious,
         PalettePreviousScope, PaletteRowActions, PaletteScopeLeft, PaletteScopeRight,
     },
-    db::{ConnectionConfig, ExplainMode, RelationKind, RoutineKind, Syntax},
+    db::{ConnectionConfig, ExplainMode, Levels, RelationKind, RoutineKind, Syntax},
     explorer::ROW_LIMITS,
     explorer::{ExplorerTarget, ObjectKind},
     export::{ClipboardFormat, FileAs, Format, RowsAs},
@@ -51,12 +51,12 @@ use crate::{
     icons::{icon, saved_query_icon},
     import::Source,
     session::{
-        CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
-        routine_name,
+        CatalogState, ObjectBody, Profile, ProfileState, QueryState, RowCount, Session,
+        StructureState, Tab, routine_name,
     },
     sidebar::{
-        ListingScope, NodeAction, SelectedNode, SelectionAction, ViewMode, node_actions,
-        selection_header,
+        ListingScope, NodeAction, SelectedNode, SelectionAction, ViewMode, connection_row,
+        count_label, node_actions, selection_header,
     },
     sql,
     store::{HistoryEntry, StoredProject},
@@ -427,6 +427,8 @@ pub enum Command {
     ImportTheme(user::Source, usize, Option<Appearance>),
     /// Fetch the server's databases and put the palette back up over them.
     SelectDatabase,
+    /// Open the filter picker over the front connection's databases.
+    FilterDatabases,
     SetDatabase(String),
     /// Put the palette back up over the catalog's schemas.
     SelectSchema,
@@ -4523,6 +4525,32 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             ),
             "select_database",
         ));
+    }
+    // Offered where there are databases to choose between, and omitted rather
+    // than disabled where there are none.
+    if matches!(profile.state, ProfileState::Connected(_))
+        && profile.config.target().levels() != Levels::Flat
+    {
+        // The count the tree draws, from what it already holds: simple mode
+        // has no count slot and shows none.
+        let row = connection_row(&profile.id);
+        let counted = (workspace.view_mode() == ViewMode::Complex)
+            .then(|| {
+                let shown = workspace.connections.counts.get(&row)?;
+                let total = workspace.connections.totals.get(&row)?;
+                Some(count_label(*shown, Some(*total)))
+            })
+            .flatten();
+        let item = command(
+            "Filter databases…",
+            icon::DATABASE,
+            Command::FilterDatabases,
+            CONNECTION,
+        );
+        items.push(match counted {
+            Some(count) => item.hint(count),
+            None => item,
+        });
     }
     if profile.config.target().picks_schema() {
         items.push(command(
