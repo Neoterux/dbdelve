@@ -682,6 +682,12 @@ pub(crate) struct SidebarTree {
     /// loaded under them. Their closed state is the build's, not a fold anyone
     /// chose, so a stored open row is not overruled by it.
     pub(crate) unloaded: HashSet<String>,
+    /// The loaded rows built folded, each holding one inert row where its
+    /// rows would be: opening one asks for a rebuild that builds them.
+    pub(crate) pruned: HashSet<String>,
+    /// The row each row left out under a pruned one hangs from. A row's
+    /// ancestors cannot be read from its id, and a reveal has to open them.
+    pub(crate) hidden: HashMap<String, String>,
 }
 
 /// What a loaded schema or database with nothing in it says in its one row.
@@ -897,9 +903,10 @@ fn connection_item(
                         tree.counts.insert(row.clone(), under.len());
                         let open = search.filtering || folds.get(&row).copied().unwrap_or(false);
                         let mut item = TreeItem::new(row.clone(), database.to_string());
-                        item = match under.is_empty() {
-                            true => item.children(vec![empty_row(tree, &row)]),
-                            false => item.children(under),
+                        item = match (under.is_empty(), open) {
+                            (true, _) => item.children(vec![empty_row(tree, &row)]),
+                            (false, true) => item.children(under),
+                            (false, false) => item.children(prune(tree, &row, under)),
                         };
                         children.push(item.expanded(open));
                         count = Some(1);
@@ -933,6 +940,10 @@ fn connection_item(
     if let Some(count) = count {
         tree.counts.insert(id.clone(), count);
     }
+    let children = match open || search.filtering {
+        true => children,
+        false => prune(tree, &id, children),
+    };
     Some(
         TreeItem::new(id, connection.name.to_string())
             .expanded(open)
@@ -1036,6 +1047,10 @@ fn others_items(
         if let Some(count) = count {
             tree.counts.insert(row.clone(), count);
         }
+        let children = match open || search.filtering {
+            true => children,
+            false => prune(tree, &row, children),
+        };
         items.push(
             TreeItem::new(row, database)
                 .expanded(open)
@@ -1043,6 +1058,41 @@ fn others_items(
         );
     }
     items
+}
+
+/// The one row a folded loaded row holds in place of its rows, so that it is
+/// a folder, can be opened, and fires the event that builds them. Its id names
+/// `parent` and starts where no other row's does.
+fn folded_row(tree: &mut SidebarTree, parent: &str) -> TreeItem {
+    let id = format!("{parent}/folded");
+    tree.nodes.insert(id.clone(), Node::Notice);
+    TreeItem::new(id, String::new()).disabled(true)
+}
+
+/// What a folded row holds: `children`, or one inert row when there are rows
+/// among them to leave out. Counts are taken from the whole content before
+/// this, and every row left out stays in `tree.nodes`, so a selection or a
+/// stored row can still name it; only the items, which the tree flattens and
+/// clones per drawn row, stay small. A search builds everything open and never
+/// asks.
+///
+/// ponytail: the rows are built, then left out; the catalog is still walked
+/// whole on every rebuild. The upgrade is to hand the builder the folds and
+/// walk only what is open, which the counts would then need from the catalog.
+fn prune(tree: &mut SidebarTree, parent: &str, children: Vec<TreeItem>) -> Vec<TreeItem> {
+    if children.iter().all(TreeItem::is_disabled) {
+        return children;
+    }
+    hide(tree, parent, &children);
+    tree.pruned.insert(parent.to_string());
+    vec![folded_row(tree, parent)]
+}
+
+fn hide(tree: &mut SidebarTree, parent: &str, children: &[TreeItem]) {
+    for child in children {
+        tree.hidden.insert(child.id.to_string(), parent.to_string());
+        hide(tree, &child.id, &child.children);
+    }
 }
 
 /// The one row a loaded folder with nothing in it holds, so that it can be
@@ -1132,6 +1182,10 @@ fn scoped_item(
     }
     let open =
         !children.is_empty() && (rows.filtering || rows.folds.get(&id).copied().unwrap_or(false));
+    let children = match open || rows.filtering {
+        true => children,
+        false => prune(tree, &id, children),
+    };
     TreeItem::new(id, label)
         .expanded(open)
         .disabled(disabled)
@@ -1243,6 +1297,21 @@ mod tests {
         search(items, id).unwrap_or_else(|| panic!("{id} is not a row"))
     }
 
+    /// Folds that open `rows`: a folded loaded row is built as one inert row,
+    /// so a test that looks inside one opens it first.
+    fn opened(rows: impl IntoIterator<Item = String>) -> HashMap<String, bool> {
+        rows.into_iter().map(|row| (row, true)).collect()
+    }
+
+    /// The rows `birds()` is under, under `profile`, down to its category.
+    fn above_birds(profile: &str) -> Vec<String> {
+        vec![
+            connection_row(profile),
+            scoped_row(profile, None, "schema-main"),
+            scoped_row(profile, None, "category-Tables-main"),
+        ]
+    }
+
     /// Every project listed, with nothing in front: what most tests mean.
     fn build(
         projects: &[StoredProject],
@@ -1317,7 +1386,7 @@ mod tests {
                 listed("x", "Same", Content::Loaded(birds())),
                 listed("y", "Same", Content::Loaded(birds())),
             ],
-            &HashMap::new(),
+            &opened(["x", "y"].into_iter().flat_map(above_birds)),
         );
 
         let ids = all_ids(&tree.items);
@@ -1432,7 +1501,12 @@ mod tests {
                 Levels::DatabaseThenSchema,
                 "d",
             )],
-            &HashMap::new(),
+            &opened([
+                connection_row("a"),
+                database_row("a", "d"),
+                scoped_row("a", Some("d"), "schema-main"),
+                scoped_row("a", Some("d"), "category-Tables-main"),
+            ]),
         );
 
         let connection = find(&tree.items, &connection_row("a"));
@@ -1485,7 +1559,7 @@ mod tests {
                 ..listed
             })
             .collect(),
-            &HashMap::new(),
+            &opened([connection_row("a")]),
         );
 
         let connection = find(&tree.items, &connection_row("a"));
@@ -1565,7 +1639,7 @@ mod tests {
                 Levels::DatabaseHoldsObjects,
                 "shop",
             )],
-            &HashMap::new(),
+            &opened([connection_row("a")]),
         );
 
         let connection = find(&tree.items, &connection_row("a"));
@@ -1619,7 +1693,7 @@ mod tests {
         let other = database_row("a", "other");
         // The fold is the user's, and says open: an unloaded database is
         // folded whatever it says, since nothing here has asked it to load.
-        let open = HashMap::from([(other.clone(), true)]);
+        let open = opened([other.clone(), connection_row("a")]);
         let build_with = |content| {
             build(
                 &[],
@@ -1703,7 +1777,7 @@ mod tests {
                         .map(|name| (name.to_string(), Content::Unloaded))
                         .collect(),
                 )],
-                &HashMap::new(),
+                &opened([connection_row("a")]),
             );
             let databases = tree
                 .nodes
@@ -1756,7 +1830,11 @@ mod tests {
                     "other",
                 )
             }],
-            &HashMap::new(),
+            &opened([
+                connection_row("a"),
+                database_row("a", "shop"),
+                scoped_row("a", Some("shop"), "category-Tables-shop"),
+            ]),
         );
 
         let row = find(&tree.items, &database_row("a", "shop"));
@@ -1932,11 +2010,15 @@ mod tests {
 
     #[test]
     fn a_loaded_empty_schema_counts_zero_and_says_so() {
-        let tree = built(vec![listed(
-            "a",
-            "a",
-            Content::Loaded(content_of(vec![schema("empty", Vec::new())])),
-        )]);
+        let tree = build(
+            &[],
+            vec![listed(
+                "a",
+                "a",
+                Content::Loaded(content_of(vec![schema("empty", Vec::new())])),
+            )],
+            &opened([connection_row("a")]),
+        );
 
         let id = scoped_row("a", None, "schema-empty");
         assert_eq!(count_of(&tree, &id), Some(0));
@@ -2298,17 +2380,26 @@ mod tests {
     fn rows_under_a_connection_start_folded_and_keep_the_folds_they_are_given() {
         let schema = scoped_row("a", None, "schema-main");
         let category = scoped_row("a", None, "category-Tables-main");
-        let build_with = |folds: &HashMap<String, bool>| {
-            build(&[], vec![listed("a", "a", Content::Loaded(birds()))], folds)
+        let build_with = |rows: &[&String]| {
+            let folds = opened(rows.iter().map(|row| row.to_string()));
+            build(
+                &[],
+                vec![listed("a", "a", Content::Loaded(birds()))],
+                &folds,
+            )
         };
+        let connection = connection_row("a");
 
-        let folded = build_with(&HashMap::new());
+        let folded = build_with(&[&connection]);
         assert!(!find(&folded.items, &schema).is_expanded());
-        assert!(!find(&folded.items, &category).is_expanded());
+        assert!(
+            search(&folded.items, &category).is_none(),
+            "a folded schema is built without its rows"
+        );
 
-        let opened = build_with(&HashMap::from([(schema.clone(), true)]));
-        assert!(find(&opened.items, &schema).is_expanded());
-        assert!(!find(&opened.items, &category).is_expanded());
+        let schema_open = build_with(&[&connection, &schema]);
+        assert!(find(&schema_open.items, &schema).is_expanded());
+        assert!(!find(&schema_open.items, &category).is_expanded());
     }
 
     #[test]
@@ -2581,9 +2672,10 @@ mod tests {
     #[test]
     fn a_stored_open_row_applies_only_once_its_row_exists() {
         let schema = scoped_row("a", None, "schema-main");
-        let stored = HashMap::from([
-            (schema.clone(), true),
-            (scoped_row("a", Some("gone"), "schema-main"), true),
+        let stored = opened([
+            connection_row("a"),
+            schema.clone(),
+            scoped_row("a", Some("gone"), "schema-main"),
         ]);
         let before = build(&[], vec![unloaded("a")], &stored);
         assert_eq!(
@@ -2608,7 +2700,7 @@ mod tests {
                 &build(
                     &[],
                     vec![listed("a", "a", Content::Loaded(birds()))],
-                    &HashMap::from([(schema, true)])
+                    &opened([connection_row("a"), schema])
                 )
                 .items
             ),
