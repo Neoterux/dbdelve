@@ -115,6 +115,9 @@ impl Workspace {
             agent_access,
             view_mode: Some(self.settings.view_mode.slug().into()),
             listing_scope: Some(self.settings.listing_scope.slug().into()),
+            sidebar_density: Some(self.settings.density.slug().into()),
+            sidebar_show_host: Some(self.settings.show_host),
+            sidebar_show_sizes: Some(self.settings.show_sizes),
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };

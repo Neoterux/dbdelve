@@ -45,7 +45,9 @@ use crate::actions::{DisconnectAgents, ShowAgentActivity};
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
-use crate::sidebar::{ListingScope, ViewMode, effective_listing_scope, effective_view_mode};
+use crate::sidebar::{
+    Density, ListingScope, ViewMode, effective_listing_scope, effective_view_mode,
+};
 use crate::sql::{Mode, appended_statement, remember_statement, update_batch};
 use crate::theme::{install_fonts, install_theme, restored_fonts, restored_theme};
 use crate::*;
@@ -98,6 +100,12 @@ pub(crate) struct Settings {
     /// Which connections that sidebar lists: every project's, or only those
     /// of the project in front.
     pub(crate) listing_scope: ListingScope,
+    /// How tall the connections tree's rows are.
+    pub(crate) density: Density,
+    /// Whether the connections tree's rows show their host.
+    pub(crate) show_host: bool,
+    /// Whether either tree shows sizes, and whether any is read.
+    pub(crate) show_sizes: bool,
 }
 
 impl Settings {
@@ -135,6 +143,9 @@ impl Default for Settings {
             custom_keybindings: HashMap::new(),
             view_mode: ViewMode::default(),
             listing_scope: ListingScope::default(),
+            density: Density::default(),
+            show_host: true,
+            show_sizes: true,
         }
     }
 }
@@ -239,6 +250,10 @@ pub(crate) struct Workspace {
     /// in order: a landing that opens again is a second entry.
     #[cfg(test)]
     pub(crate) opened: Vec<String>,
+    /// How many size reads were started, which run on the blocking pool where
+    /// nothing can be counted.
+    #[cfg(test)]
+    pub(crate) size_reads: usize,
     /// Profiles on an engine this build cannot open, held as they were read
     /// and written back by `remember_profiles`; never restored.
     pub(crate) unavailable: Vec<store::UnavailableProfile>,
@@ -569,6 +584,8 @@ impl Workspace {
             held: Vec::new(),
             #[cfg(test)]
             opened: Vec::new(),
+            #[cfg(test)]
+            size_reads: 0,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
             connections: sidebar::ConnectionsSidebar::new(window, cx),

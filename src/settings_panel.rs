@@ -119,6 +119,9 @@ enum SettingId {
     ColorTitlebar,
     SidebarEveryConnection,
     SidebarCurrentProject,
+    SidebarDensity,
+    SidebarShowHost,
+    SidebarShowSizes,
     Font(FontSlot),
     /// A [`KeybindingSpec::id`].
     Keybinding(&'static str),
@@ -874,6 +877,9 @@ fn render_control(
                 })),
             )
             .into_any_element(),
+        SettingId::SidebarDensity | SettingId::SidebarShowHost | SettingId::SidebarShowSizes => {
+            div().into_any_element()
+        }
         SettingId::MatchSystemAppearance => switch(
             "match-system-appearance",
             settings.match_system_appearance,
@@ -1138,6 +1144,13 @@ mod tests {
                 assert!(found.contains(&id), "{word}: {found:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_sidebar_display_settings_are_found_by_their_words() {
+        assert!(found("density").contains(&SettingId::SidebarDensity));
+        assert!(found("host").contains(&SettingId::SidebarShowHost));
+        assert!(found("sizes").contains(&SettingId::SidebarShowSizes));
     }
 
     #[test]
