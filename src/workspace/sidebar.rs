@@ -57,7 +57,7 @@ impl Workspace {
     /// selected row are put back by id, so nothing a landing changes moves the
     /// user's place.
     pub(crate) fn rebuild_connections(&mut self, cx: &mut Context<Self>) {
-        if self.settings.view_mode != model::ViewMode::Complex {
+        if self.view_mode() != model::ViewMode::Complex {
             return;
         }
         let tree = self.connections.tree.clone();

@@ -76,7 +76,7 @@ impl Workspace {
         };
         // The connections tree is always drawn, so it always has a handle a
         // window can be focused on.
-        let complex = self.settings.view_mode == ViewMode::Complex;
+        let complex = self.view_mode() == ViewMode::Complex;
         // A handle no element tracks is a window with no dispatch path.
         if !complex && !super::forms::explorer_drawn(profile) {
             return;
@@ -133,7 +133,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings.view_mode == ViewMode::Complex {
+        if self.view_mode() == ViewMode::Complex {
             let selected = self
                 .connections
                 .tree

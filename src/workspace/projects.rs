@@ -68,12 +68,22 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A project's sidebar: its own choice, or with `None` the global
+    /// setting's. Only what the window draws changes: no tab, binding or
+    /// connection moves, so nothing runs anywhere new because of it.
     pub(crate) fn set_project_view_mode(
         &mut self,
-        _at: usize,
-        _mode: Option<ViewMode>,
-        _cx: &mut Context<Self>,
+        at: usize,
+        mode: Option<ViewMode>,
+        cx: &mut Context<Self>,
     ) {
+        let Some(project) = self.projects.get_mut(at) else {
+            return;
+        };
+        project.view_mode = mode.map(|mode| mode.slug().to_string());
+        self.remember_profiles(cx);
+        self.rebuild_connections(cx);
+        cx.notify();
     }
 
     pub(crate) fn open_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {

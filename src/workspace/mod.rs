@@ -2256,16 +2256,14 @@ impl Render for Workspace {
                                 .size_full()
                                 .flex()
                                 .flex_col()
-                                .child(div().flex_1().min_h_0().child(
-                                    match self.settings.view_mode {
-                                        ViewMode::Complex => {
-                                            self.render_connections(cx).into_any_element()
-                                        }
-                                        ViewMode::Simple => {
-                                            self.render_explorer(profile, cx).into_any_element()
-                                        }
-                                    },
-                                ))
+                                .child(div().flex_1().min_h_0().child(match self.view_mode() {
+                                    ViewMode::Complex => {
+                                        self.render_connections(cx).into_any_element()
+                                    }
+                                    ViewMode::Simple => {
+                                        self.render_explorer(profile, cx).into_any_element()
+                                    }
+                                }))
                                 .child(
                                     div()
                                         .h(px(layout::chrome(layout::STATUS_HEIGHT)))
