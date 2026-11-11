@@ -2108,14 +2108,13 @@ impl Workspace {
         let routed = profile.route(binding.clone());
         // An edit of dbdelve's, which a bound tab shares its session with
         // others for: not sent while a transaction is open on that session.
+        let edit = matches!(
+            refresh,
+            Some(Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_))
+        );
         let refusal = binding
             .as_ref()
-            .filter(|_| {
-                matches!(
-                    refresh,
-                    Some(Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_))
-                )
-            })
+            .filter(|_| edit)
             .and_then(|binding| profile.bound_write_refusal(binding));
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
@@ -2342,6 +2341,7 @@ impl Workspace {
             && let Some(profile) = self.issued_to(&id, generation)
         {
             let leaves = sql::leaves(engine, explained.as_deref().unwrap_or(&sql));
+            profile.record_sent(&sql, leaves.transaction);
             if let Some(open) = leaves.transaction {
                 profile.in_transaction = open;
             }

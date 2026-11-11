@@ -78,6 +78,13 @@ pub(crate) struct Profile {
     /// queue's reads would not see. Read off what was sent, not asked of the
     /// server; cleared by a `COMMIT` or `ROLLBACK`, and on connect.
     pub(crate) in_transaction: bool,
+    /// Every statement the next `COMMIT` or `ROLLBACK` on the connection's own
+    /// session ends: the user's statements from tabs that are not bound, and
+    /// dbdelve's edits applied on that session, but never dbdelve's reads, for
+    /// the Auto prompt to list. Held in memory only and never written to the
+    /// history file, `profiles.toml` or any log, since it is SQL text that
+    /// ends with its session. Emptied with [`Profile::in_transaction`].
+    pub(crate) transaction_statements: Vec<String>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
     /// `BEGIN` into the buffer where they can read it -- never onto the wire
@@ -141,6 +148,28 @@ fn shortcut_database(
 }
 
 impl Profile {
+    /// Keeps `sql`, which was just sent on the connection's own session, in
+    /// [`Profile::transaction_statements`] when the next `COMMIT` or
+    /// `ROLLBACK` will end it. `transaction` is what `sql::Leaves` says the
+    /// submission does to the transaction: `Some(false)` ends one and empties
+    /// the record, `Some(true)` leaves one open and starts the record again
+    /// with this submission when none was open before it, and `None` appends
+    /// only while one is open. Called before [`Profile::in_transaction`] is
+    /// updated for the same submission, because it reads whether a
+    /// transaction was open before it.
+    pub(crate) fn record_sent(&mut self, sql: &str, transaction: Option<bool>) {
+        match transaction {
+            Some(false) => self.transaction_statements.clear(),
+            Some(true) if !self.in_transaction => {
+                self.transaction_statements = vec![sql.to_string()];
+            }
+            Some(true) | None if self.in_transaction => {
+                self.transaction_statements.push(sql.to_string());
+            }
+            Some(true) | None => {}
+        }
+    }
+
     /// Why a queue of reads on this connection runs in turn rather than at
     /// once, said to the user when one does.
     pub(crate) fn in_turn(&self) -> Option<&'static str> {
