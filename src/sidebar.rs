@@ -13,7 +13,7 @@ use std::{collections::HashMap, ops::Range};
 use gpui_component::tree::TreeItem;
 
 use crate::db::Levels;
-use crate::explorer::{ExplorerLeaf, ExplorerTree, Shortcut, saved_query};
+use crate::explorer::{ExplorerLeaf, ExplorerTree, Shortcut, is_schema_row, saved_query};
 use crate::store::StoredProject;
 
 /// Which sidebar the window draws: today's tree for the connection in front,
@@ -214,8 +214,10 @@ pub(crate) fn listed_row(
 
 /// Whether a connection of this shape draws its schema rows as databases.
 pub(crate) fn schema_row_is_a_database(levels: Levels) -> bool {
-    let _ = levels;
-    false
+    matches!(
+        levels,
+        Levels::DatabaseIsSchema | Levels::DatabaseHoldsObjects
+    )
 }
 
 /// What a connection that has nothing to list says in its one row.
@@ -375,17 +377,45 @@ fn connection_item(
                 highlights,
                 shortcuts,
             } = content;
-            let children = items
+            let mut rows = Rows {
+                profile: connection.id,
+                leaves,
+                highlights,
+                shortcuts,
+                folds,
+            };
+            // The Pinned group, the folders and the Queries group stay on the
+            // connection; the catalog's rows go under its database.
+            let (catalog, listed): (Vec<_>, Vec<_>) =
+                items.into_iter().partition(|item| is_schema_row(&item.id));
+            let mut children: Vec<TreeItem> = listed
                 .into_iter()
-                .map(|item| scoped_item(tree, connection.id, None, item, &leaves, folds))
+                .map(|item| scoped_item(tree, &mut rows, None, item))
                 .collect();
-            for (row, ranges) in highlights {
-                tree.highlights
-                    .insert(scoped_row(connection.id, None, &row), ranges);
-            }
-            for (row, shortcut) in shortcuts {
-                tree.shortcuts
-                    .insert(scoped_row(connection.id, None, &row), shortcut);
+            // ponytail: a Snowflake profile that names no database has none
+            // to draw until it lists one, so its schemas sit on the
+            // connection. The upgrade is to read the database the session
+            // reports once connected.
+            match catalog_database(connection.levels, connection.database.as_deref()) {
+                Some(database) => {
+                    let under: Vec<TreeItem> = catalog
+                        .into_iter()
+                        .map(|item| scoped_item(tree, &mut rows, Some(database), item))
+                        .collect();
+                    let row = database_row(connection.id, database);
+                    tree.nodes.insert(row.clone(), Node::Database);
+                    let open = folds.get(&row).copied().unwrap_or(false);
+                    children.push(
+                        TreeItem::new(row, database.to_string())
+                            .expanded(open)
+                            .children(under),
+                    );
+                }
+                None => children.extend(
+                    catalog
+                        .into_iter()
+                        .map(|item| scoped_item(tree, &mut rows, None, item)),
+                ),
             }
             (followed, children)
         }
@@ -403,32 +433,47 @@ fn notice(tree: &mut SidebarTree, profile: &str, row: &str, text: &str) -> TreeI
     TreeItem::new(id, text.to_string()).disabled(true)
 }
 
-/// `item` and everything under it with its id scoped to `profile`. A folder
-/// is folded unless `folds` says it was open: a connect must not unfold the
+/// What one connection's rows are given their ids from.
+struct Rows<'a> {
+    profile: &'a str,
+    leaves: HashMap<String, ExplorerLeaf>,
+    highlights: HashMap<String, Vec<Range<usize>>>,
+    shortcuts: HashMap<String, Shortcut>,
+    folds: &'a HashMap<String, bool>,
+}
+
+/// `item` and everything under it with its id scoped to the connection, and
+/// to `database` where the rows sit under one. What the filter matched and
+/// what a shortcut stands for move to the new id with the row. A folder is
+/// folded unless `folds` says it was open: a connect must not unfold the
 /// thousands of rows a catalog can hold.
 fn scoped_item(
     tree: &mut SidebarTree,
-    profile: &str,
+    rows: &mut Rows<'_>,
     database: Option<&str>,
     mut item: TreeItem,
-    leaves: &HashMap<String, ExplorerLeaf>,
-    folds: &HashMap<String, bool>,
 ) -> TreeItem {
-    let id = scoped_row(profile, database, &item.id);
+    let id = scoped_row(rows.profile, database, &item.id);
     tree.nodes.insert(
         id.clone(),
         Node::Row {
-            leaf: leaves.get(item.id.as_str()).copied(),
+            leaf: rows.leaves.get(item.id.as_str()).copied(),
         },
     );
+    if let Some(ranges) = rows.highlights.remove(item.id.as_str()) {
+        tree.highlights.insert(id.clone(), ranges);
+    }
+    if let Some(shortcut) = rows.shortcuts.remove(item.id.as_str()) {
+        tree.shortcuts.insert(id.clone(), shortcut);
+    }
     let folder = item.is_folder();
     let disabled = item.is_disabled();
     let label = item.label.clone();
     let children: Vec<TreeItem> = std::mem::take(&mut item.children)
         .into_iter()
-        .map(|child| scoped_item(tree, profile, database, child, leaves, folds))
+        .map(|child| scoped_item(tree, rows, database, child))
         .collect();
-    let open = folder && folds.get(&id).copied().unwrap_or(false);
+    let open = folder && rows.folds.get(&id).copied().unwrap_or(false);
     TreeItem::new(id, label)
         .expanded(open)
         .disabled(disabled)
@@ -722,7 +767,7 @@ mod tests {
         ));
         let database = find(&tree.items, &database_row("a", "d"));
         let schema = scoped_row("a", Some("d"), "schema-main");
-        assert_eq!(row_ids(&database.children), [schema.clone()]);
+        assert_eq!(row_ids(&database.children), std::slice::from_ref(&schema));
         let birds = scoped_row("a", Some("d"), &explorer::relation_row("main", "birds"));
         assert!(search(&find(&tree.items, &schema).children, &birds).is_some());
         assert!(matches!(

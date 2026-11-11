@@ -240,7 +240,17 @@ impl Target {
     /// The levels the connections tree draws under a connection of this
     /// target, one pure function of its abilities.
     pub fn levels(self) -> Levels {
-        Levels::Flat
+        let abilities = self.abilities();
+        match (
+            abilities.switches_database,
+            abilities.catalog_lists_databases,
+            abilities.one_schema_per_database,
+        ) {
+            (false, ..) => Levels::Flat,
+            (true, true, _) => Levels::DatabaseIsSchema,
+            (true, false, true) => Levels::DatabaseHoldsObjects,
+            (true, false, false) => Levels::DatabaseThenSchema,
+        }
     }
 
     /// Whether the row count the catalog carries for a table is exact rather
