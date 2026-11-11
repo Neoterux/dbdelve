@@ -153,20 +153,32 @@ impl Profile {
     /// `ROLLBACK` will end it. `transaction` is what `sql::Leaves` says the
     /// submission does to the transaction: `Some(false)` ends one and empties
     /// the record, `Some(true)` leaves one open and starts the record again
-    /// with this submission when none was open before it, and `None` appends
-    /// only while one is open. Called before [`Profile::in_transaction`] is
+    /// with this submission when the open transaction really ended, and
+    /// `None` appends only while one is open. Called before [`Profile::in_transaction`] is
     /// updated for the same submission, because it reads whether a
     /// transaction was open before it.
     pub(crate) fn record_sent(&mut self, sql: &str, transaction: Option<bool>) {
         match transaction {
             Some(false) => self.transaction_statements.clear(),
-            Some(true) if !self.in_transaction => {
-                self.transaction_statements = vec![sql.to_string()];
+            // The record must hold everything the next COMMIT ends, so it
+            // restarts only when the open transaction really ended: none was
+            // open, this submission ends one before opening the next, or the
+            // engine commits at a BEGIN. Where that cannot be told, it
+            // appends: a list showing a statement already committed is wrong
+            // on the safe side, and one dropping a statement still to be
+            // committed is not.
+            Some(true) => {
+                let ended = !self.in_transaction
+                    || crate::sql::ends_transaction(self.config.engine(), sql)
+                    || self.config.engine().begin_ends_open_transaction();
+                if ended {
+                    self.transaction_statements = vec![sql.to_string()];
+                } else {
+                    self.transaction_statements.push(sql.to_string());
+                }
             }
-            Some(true) | None if self.in_transaction => {
-                self.transaction_statements.push(sql.to_string());
-            }
-            Some(true) | None => {}
+            None if self.in_transaction => self.transaction_statements.push(sql.to_string()),
+            None => {}
         }
     }
 

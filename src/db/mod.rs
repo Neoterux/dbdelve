@@ -602,6 +602,18 @@ impl Engine {
         }
     }
 
+    /// Whether a `BEGIN` sent inside an open transaction commits it first.
+    ///
+    /// MySQL and MariaDB do: `START TRANSACTION` implicitly commits the
+    /// current transaction. Postgres warns and keeps the open one, Snowflake
+    /// ignores the second, SQL Server only raises its nesting count, and
+    /// SQLite, Turso and DuckDB refuse the `BEGIN`. Answering `false` where
+    /// unsure keeps statements listed rather than dropping them, which is the
+    /// safe side for the list of what the next `COMMIT` ends.
+    pub fn begin_ends_open_transaction(self) -> bool {
+        matches!(self, Self::MySql | Self::MariaDb)
+    }
+
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
     ///
     /// Where it is not, the gesture has to be withheld rather than attempted.
