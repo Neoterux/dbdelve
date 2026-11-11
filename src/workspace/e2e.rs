@@ -14490,6 +14490,43 @@ fn a_failed_commit_from_the_auto_prompt_does_not_keep_a_stale_open_flag(cx: &mut
 }
 
 #[gpui::test]
+fn the_auto_prompt_arms_nothing_when_the_transaction_ended_under_its_dialog(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
+        click_selector(cx, "auto-commit-auto");
+        assert_eq!(front_dialog(&workspace, cx), Some("end-transaction"));
+
+        // Ended between the dialog being drawn and the answer arriving: the
+        // dialog stops drawing once the transaction is gone, so the answer is
+        // given directly.
+        workspace.update(cx, |workspace, _| {
+            workspace.profile_mut().unwrap().in_transaction = false;
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.end_transaction_for_auto("COMMIT", window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert_eq!(
+                profile.session.auto_after_end, None,
+                "nothing was sent, so nothing waits on it"
+            );
+            assert!(!profile.auto_commit, "Auto stays off");
+        });
+
+        // A later success does not turn auto-commit on behind the user.
+        run_in_front(&workspace, cx, "SELECT 1");
+        let (auto_commit, _, _) = transaction_state(&workspace, cx);
+        assert!(!auto_commit, "the next statement's success reads nothing");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_auto_prompt_rolls_back_or_cancels_and_cancelling_changes_nothing(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
