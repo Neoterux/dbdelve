@@ -2230,6 +2230,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tinted_sidebar_row_reads_in_every_theme() {
+        for t in Theme::all() {
+            for color in ConnectionColor::ALL {
+                // A coloured connection's whole row sits on this, under the
+                // name, the host and the count.
+                let bg = color.fill().flatten(t.surface);
+                check(t, "the row's name", t.text, bg, AA_TEXT);
+                check(t, "the row's count and host", t.text_faint, bg, AA_LARGE);
+                check(t, "a muted row", t.text_muted, bg, AA_TEXT);
+            }
+        }
+    }
+
+    #[test]
     fn a_titlebar_pill_stands_off_every_band() {
         // What sits on a band: the mode pill, in its own hue. The floor is set from the weakest pair that still reads as a separate
         // shape at a glance: a Green mode pill on a Gray band, light theme.
