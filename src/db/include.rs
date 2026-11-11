@@ -479,6 +479,49 @@ mod tests {
     }
 
     #[test]
+    fn matching_server_listed_databases_leaves_out_the_system_ones_and_counts_the_rest() {
+        let server = [
+            "dbdelve_archive",
+            "dbdelve_dev",
+            "information_schema",
+            "mysql",
+            "performance_schema",
+            "sys",
+        ];
+        let shown = |entries: &[&str], own: Option<&str>| {
+            Include::from_stored(text(entries), Vec::new()).resolve(
+                Levels::DatabaseIsSchema,
+                own,
+                None,
+            )
+        };
+        let engine = Engine::MySql;
+
+        assert_eq!(
+            shown(&["dbdelve_arch*"], None).matched_databases(&listed(&server, None), engine),
+            Some((text(&["dbdelve_archive"]), 1))
+        );
+        assert_eq!(
+            shown(&["dbdelve_arch*"], Some("dbdelve_dev"))
+                .matched_databases(&listed(&server, Some("dbdelve_dev")), engine),
+            Some((text(&["dbdelve_archive", "dbdelve_dev"]), 0))
+        );
+        assert_eq!(
+            shown(&["no_such*"], None).matched_databases(&listed(&server, None), engine),
+            Some((Vec::new(), 2))
+        );
+        assert_eq!(
+            shown(&[], None).matched_databases(&listed(&server, None), engine),
+            None
+        );
+        assert_eq!(
+            shown(&["ab"], None).matched_databases(&listed(&["Ab", "ab", "Zed"], None), engine),
+            Some((text(&["Ab", "ab"]), 1)),
+            "each listed spelling, in the server's order"
+        );
+    }
+
+    #[test]
     fn another_database_keeps_no_active_schema() {
         let include = Include::from_stored(Vec::new(), text(&["x"]));
         let shown = include.resolve(Levels::DatabaseThenSchema, Some("db"), Some("main"));
