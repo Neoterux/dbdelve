@@ -14029,6 +14029,145 @@ fn a_bound_tab_says_its_session_commits_each_statement_whatever_the_connection_h
     });
 }
 
+/// Opens a table of `database` by clicking down the connections tree to it,
+/// unfolding only what is folded, and returns the object tab it opened.
+fn open_table_by_clicking(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    database: &str,
+    table: &str,
+) -> u64 {
+    let click = |id: &str, cx: &mut VisualTestContext| {
+        let at =
+            connections_row(workspace, cx, id).unwrap_or_else(|| panic!("{id} is not showing"));
+        click_connections_row(cx, at);
+    };
+    let row = database_row("e2e", database);
+    let schema = scoped_row("e2e", Some(database), "schema-main");
+    let tables = scoped_row("e2e", Some(database), "category-Tables-main");
+    let relation = scoped_row(
+        "e2e",
+        Some(database),
+        &explorer::relation_row("main", table),
+    );
+    for id in [&row, &schema, &tables] {
+        if !connections_row_open(workspace, cx, id) {
+            click(id, cx);
+        }
+    }
+    click(&relation, cx);
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .and_then(|profile| profile.session.active_object())
+            .expect("an object tab is in front")
+            .id
+    })
+}
+
+/// Which of the transaction indicators and controls the status bar draws.
+fn drawn(cx: &mut VisualTestContext, selectors: &[&'static str]) -> Vec<bool> {
+    selectors
+        .iter()
+        .map(|selector| cx.debug_bounds(selector).is_some())
+        .collect()
+}
+
+#[gpui::test]
+fn the_connections_open_transaction_shows_whatever_tab_of_it_is_in_front(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let front = |cx: &mut VisualTestContext, tab: Tab| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| workspace.activate_tab(tab, window, cx));
+            });
+            settle(cx);
+        };
+        let binding_of_front = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("the connection is in front");
+                profile.binding_of(profile.session.active)
+            })
+        };
+
+        new_query_here(&workspace, cx, Some("other"), None);
+        let bound_query = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_query_tab()
+                .unwrap()
+                .id
+        });
+        assert_eq!(
+            drawn(cx, &["transaction-bound", "transaction-open"]),
+            [true, false],
+            "a bound tab on a connection holding nothing open draws no indicator"
+        );
+
+        // An unbound object tab, and Manual from it.
+        let relation = open_table_by_clicking(&workspace, cx, "e2e", "t");
+        assert_eq!(binding_of_front(cx), None);
+        let manual = cx
+            .debug_bounds("auto-commit-manual")
+            .expect("the Manual chip is drawn on an unbound tab");
+        cx.simulate_click(manual.center(), gpui::Modifiers::default());
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let tab = workspace
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("Manual brings a query tab forward");
+            assert_eq!(tab.binding, None);
+        });
+        assert_eq!(buffer(&workspace, cx), "BEGIN");
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(!auto_commit && open, "the BEGIN ran");
+        assert_eq!(
+            drawn(cx, &["transaction-open"]),
+            [true],
+            "the click that sent BEGIN leaves the indicator in the same control"
+        );
+
+        front(cx, Tab::Object(relation));
+        assert_eq!(binding_of_front(cx), None);
+        assert_eq!(
+            drawn(cx, &["transaction-open"]),
+            [true],
+            "unbound object tab"
+        );
+
+        front(cx, Tab::Query(bound_query));
+        assert!(binding_of_front(cx).is_some());
+        assert_eq!(
+            drawn(
+                cx,
+                &[
+                    "transaction-bound",
+                    "transaction-open",
+                    "transaction-commit",
+                    "auto-commit-auto"
+                ]
+            ),
+            [true, true, false, false],
+            "a bound query tab reports the connection's transaction and offers no control"
+        );
+
+        open_table_by_clicking(&workspace, cx, "other", "u");
+        assert_eq!(
+            binding_of_front(cx).map(|binding| binding.database),
+            Some("other".to_string())
+        );
+        assert_eq!(
+            drawn(cx, &["transaction-bound", "transaction-open"]),
+            [true, true],
+            "a bound object tab reports it too"
+        );
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_cancel_for_a_bound_tab_goes_over_the_session_it_runs_on(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
