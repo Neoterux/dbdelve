@@ -26,8 +26,8 @@ use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
     db::{
-        CancelToken, Catalog, Connection, ConnectionConfig, DbError, ExplainMode, Fetch, IndexKind,
-        QueryResult, RelationKind, Shown, Structure,
+        CancelToken, Catalog, Connection, ConnectionConfig, DbError, ExplainMode, Fetch, Include,
+        IndexKind, Levels, QueryResult, RelationKind, Shown, Structure,
     },
     explain::compact,
     sql::{AgentVerdict, agent_gate},
@@ -181,6 +181,10 @@ pub(crate) struct Resolved {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) config: ConnectionConfig,
+    /// The profile's include filter as of this call. It rides with the work and
+    /// is not part of `config`, so a saved edit reaches the next call without
+    /// the lane's connection being reopened.
+    pub(crate) include: Include,
 }
 
 impl Resolved {
@@ -189,6 +193,7 @@ impl Resolved {
             id: profile.id.clone(),
             name: profile.name.clone(),
             config: profile.config.clone(),
+            include: profile.include.clone(),
         }
     }
 }
@@ -284,9 +289,16 @@ pub(crate) enum AgentWork {
     /// The agent connection's catalog: its schemas, or with `schema` the
     /// relations of that one. DBDelve reads it through the driver and sends no
     /// statement of its own for it.
-    Catalog { schema: Option<String> },
+    Catalog {
+        schema: Option<String>,
+        include: Include,
+    },
     /// One relation's definition, read through the driver like the catalog.
-    Structure { schema: String, table: String },
+    Structure {
+        schema: String,
+        table: String,
+        include: Include,
+    },
     /// The engine's EXPLAIN of the agent's statement, already composed and
     /// already judged by the gate as this exact text.
     Explain { statement: String },
@@ -296,8 +308,10 @@ impl AgentWork {
     fn tool(&self) -> Tool {
         match self {
             AgentWork::Query { .. } => Tool::ExecuteSql,
-            AgentWork::Catalog { schema: None } => Tool::ListSchemas,
-            AgentWork::Catalog { schema: Some(_) } => Tool::ListTables,
+            AgentWork::Catalog { schema: None, .. } => Tool::ListSchemas,
+            AgentWork::Catalog {
+                schema: Some(_), ..
+            } => Tool::ListTables,
             AgentWork::Structure { .. } => Tool::DescribeTable,
             AgentWork::Explain { .. } => Tool::ExplainQuery,
         }
@@ -538,6 +552,8 @@ impl Workspace {
             id: profile_id,
             name: profile_name,
             config,
+            // Carried by the work that reads a catalog, not by the lane.
+            include: _,
         } = profile;
         if let Some(refusal) = config.agent_refusal() {
             // Before a lane exists: nothing is opened for a profile an agent
@@ -687,9 +703,9 @@ impl Workspace {
                         return;
                     }
                     let (ran, lost) = spawn_blocking(cx.background_executor(), {
-                        let (work, cancel) = (work.clone(), cancel.clone());
+                        let (work, cancel, config) = (work.clone(), cancel.clone(), config.clone());
                         move || {
-                            let ran = run_work(work, connection, hidden, &cancel, engine);
+                            let ran = run_work(work, connection, hidden, &cancel, &config);
                             // Asked only of a connection that sat idle between
                             // calls and then failed: the driver learns the
                             // server dropped it from the statement that finds
@@ -1032,33 +1048,84 @@ fn open_agent(
     })
 }
 
-/// The blocking half of any call: what `work` asks, on `connection`.
+/// The blocking half of any call: what `work` asks, on `connection`, which was
+/// opened from `config`.
 fn run_work(
     work: AgentWork,
     connection: Connection,
     hidden: Vec<String>,
     cancel: &CancelToken,
-    engine: Engine,
+    config: &ConnectionConfig,
 ) -> Ran {
+    let engine = config.engine();
     match work {
         AgentWork::Query { sql, .. } => read_on(connection, hidden, &sql, cancel, engine),
-        AgentWork::Catalog { schema } => list_on(
-            connection,
-            hidden,
-            schema.as_deref(),
-            engine.agent_catalog_note(),
-        ),
+        AgentWork::Catalog { schema, include } => {
+            let shown = agent_shown(&include, config, &connection);
+            list_on(
+                connection,
+                hidden,
+                schema.as_deref(),
+                &shown,
+                config.target().levels(),
+                engine.agent_catalog_note(),
+            )
+        }
         AgentWork::Explain { statement } => {
             explain_on(connection, hidden, &statement, cancel, engine)
         }
-        AgentWork::Structure { schema, table } => describe_on(
-            connection,
-            hidden,
-            &schema,
-            &table,
-            engine.agent_catalog_note(),
-        ),
+        AgentWork::Structure {
+            schema,
+            table,
+            include,
+        } => {
+            let shown = agent_shown(&include, config, &connection);
+            describe_on(
+                connection,
+                hidden,
+                &schema,
+                &table,
+                &shown,
+                engine.agent_catalog_note(),
+            )
+        }
     }
+}
+
+/// The profile's include filter as it applies to the agent's own connection:
+/// the database and schema that connection is on stay shown whatever the
+/// lists say, as they do for the user's own session.
+fn agent_shown(include: &Include, config: &ConnectionConfig, connection: &Connection) -> Shown {
+    let target = config.target();
+    let database = connection
+        .spelled_database()
+        .map(str::to_string)
+        .or_else(|| config.database_name())
+        .or_else(|| connection.current_database().map(str::to_string));
+    let schema = target
+        .picks_schema()
+        .then(|| config.schema().or(connection.current_schema()))
+        .flatten();
+    include.resolve(target.levels(), database.as_deref(), schema)
+}
+
+/// The line `list_schemas` adds when the filter left names out of the
+/// listing, and nothing otherwise. Counts only, so it names nothing of any
+/// profile. It says what the listing leaves out and that `execute_sql` can
+/// still read it, since the filter is not an access boundary.
+fn filter_note(levels: Levels, shown: usize, left_out: usize) -> Option<String> {
+    if left_out == 0 {
+        return None;
+    }
+    let noun = match levels {
+        Levels::DatabaseIsSchema => "databases",
+        _ => "schemas",
+    };
+    Some(format!(
+        "Showing {shown} of {total} {noun}. The profile's filter hides the rest from this \
+         listing; execute_sql can still read them.",
+        total = shown + left_out,
+    ))
 }
 
 /// The blocking half of a read: run the statement on the agent's connection as
@@ -1118,9 +1185,11 @@ fn list_on(
     connection: Connection,
     hidden: Vec<String>,
     schema: Option<&str>,
+    shown: &Shown,
+    levels: Levels,
     note: Option<&str>,
 ) -> Ran {
-    let listed = list(&connection, schema, note);
+    let listed = list(&connection, schema, shown, levels, note);
     Ran::Listed {
         connection,
         hidden,
@@ -1131,12 +1200,23 @@ fn list_on(
 fn list(
     connection: &Connection,
     schema: Option<&str>,
+    shown: &Shown,
+    levels: Levels,
     note: Option<&str>,
 ) -> Result<Option<Listing>, DbError> {
-    let mut catalog = connection.catalog(&Shown::everything())?;
+    let mut catalog = connection.catalog(shown)?;
     let Some(schema) = schema else {
         let rows = catalog.schemas.len();
-        let text = schemas_text(&catalog, note);
+        // The static note first; a line after it only where the filter left
+        // something out, so the reply keeps its one `note:` line.
+        let note = [
+            note.map(str::to_string),
+            filter_note(levels, rows, catalog.left_out),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|joined, line| format!("{joined} {line}"));
+        let text = schemas_text(&catalog, note.as_deref());
         return Ok(Some(Listing { text, rows }));
     };
     let Some(rows) = catalog
@@ -1150,7 +1230,7 @@ fn list(
     };
     // The estimate is optional, and the query behind it can need privileges
     // the catalog does not, so a failure here leaves the rows `null`.
-    if let Ok(sizes) = connection.sizes(&Shown::everything()) {
+    if let Ok(sizes) = connection.sizes(shown) {
         catalog.set_sizes(&sizes);
     }
     Ok(tables_text(&catalog, schema, note).map(|text| Listing { text, rows }))
@@ -1162,15 +1242,14 @@ fn describe_on(
     hidden: Vec<String>,
     schema: &str,
     table: &str,
+    shown: &Shown,
     note: Option<&str>,
 ) -> Ran {
-    let listed = connection
-        .catalog(&Shown::everything())
-        .and_then(|catalog| {
-            describe(&catalog, schema, table, note, |s, t| {
-                connection.structure(s, t)
-            })
-        });
+    let listed = connection.catalog(shown).and_then(|catalog| {
+        describe(&catalog, schema, table, note, |s, t| {
+            connection.structure(s, t)
+        })
+    });
     Ran::Listed {
         connection,
         hidden,

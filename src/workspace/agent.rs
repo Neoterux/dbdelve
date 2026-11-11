@@ -981,6 +981,8 @@ impl Workspace {
                                     id: profile_id,
                                     name: profile_name,
                                     config: approval.config,
+                                    // A statement reads no catalog.
+                                    include: crate::db::Include::default(),
                                 },
                                 AgentWork::Query {
                                     sql: approval.sql,
@@ -1535,11 +1537,16 @@ impl Workspace {
                     Tool::DescribeTable => AgentWork::Structure {
                         schema: args.schema.unwrap_or_default(),
                         table: args.table.unwrap_or_default(),
+                        include: resolved.include.clone(),
                     },
                     Tool::ListTables => AgentWork::Catalog {
                         schema: Some(args.schema.unwrap_or_default()),
+                        include: resolved.include.clone(),
                     },
-                    _ => AgentWork::Catalog { schema: None },
+                    _ => AgentWork::Catalog {
+                        schema: None,
+                        include: resolved.include.clone(),
+                    },
                 };
                 self.run_agent_work(id, resolved, work, reply, arrived, cx);
             }
