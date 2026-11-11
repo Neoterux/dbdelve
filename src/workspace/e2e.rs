@@ -1823,6 +1823,98 @@ fn a_filtered_duckdb_connection_lists_one_of_its_two_databases_and_never_reads_t
     });
 }
 
+/// The schema names of the front profile's own catalog, how many the filter
+/// left out of it, and whether its routines have landed.
+fn own_catalog(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (Vec<String>, usize, bool) {
+    workspace.read_with(cx, |workspace, _| {
+        match &workspace.profile().expect("a profile is in front").catalog {
+            CatalogState::Loaded(catalog, routines) => (
+                catalog.schemas.iter().map(|s| s.name.clone()).collect(),
+                catalog.left_out,
+                matches!(routines, crate::session::Routines::Loaded),
+            ),
+            _ => panic!("the catalog has not loaded"),
+        }
+    })
+}
+
+#[gpui::test]
+fn a_schema_filter_hides_a_schema_of_the_own_database_and_its_sequence_does_not_bring_it_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "include_schemas = [\"main\"]",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+             CREATE TABLE extra.x (id INTEGER); CREATE SEQUENCE extra.s;",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let database = database_row("e2e", "e2e");
+        let at = connections_row(&workspace, cx, &database).expect("the database shows");
+        click_connections_row(cx, at);
+
+        let check = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            assert_eq!(
+                own_catalog(workspace, cx),
+                (vec!["main".to_string()], 1, true)
+            );
+            workspace.read_with(cx, |workspace, _| {
+                let nodes = &workspace.connections.nodes;
+                assert!(nodes.contains_key(&scoped_row("e2e", Some("e2e"), "schema-main")));
+                assert!(!nodes.contains_key(&scoped_row("e2e", Some("e2e"), "schema-extra")));
+            });
+        };
+        check(&workspace, cx);
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        settle(cx);
+        check(&workspace, cx);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_active_schema_is_kept_only_in_the_connections_own_database(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"\ninclude_schemas = [\"extra\"]",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+             CREATE TABLE extra.x (id INTEGER); CREATE SEQUENCE extra.s;",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let at =
+            connections_row(&workspace, cx, &database_row("e2e", "other")).expect("`other` shows");
+        click_connections_row(cx, at);
+
+        let (mut names, left_out, _) = own_catalog(&workspace, cx);
+        names.sort();
+        assert_eq!((names, left_out), (vec!["extra".into(), "main".into()], 0));
+        workspace.read_with(cx, |workspace, _| {
+            match workspace.profile().unwrap().database_catalogs.get("other") {
+                Some(CatalogState::Loaded(catalog, _)) => {
+                    assert!(catalog.schemas.is_empty());
+                    assert_eq!(catalog.left_out, 1);
+                }
+                _ => panic!("the catalog of `other` has not loaded"),
+            }
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
