@@ -2405,6 +2405,35 @@ mod tests {
         assert!(!refusal("NOPERM no permissions"));
     }
 
+    #[test]
+    fn a_database_name_that_is_not_a_database_number_is_refused_by_name() {
+        assert_eq!(database_number("db3").unwrap(), 3);
+        assert_eq!(database_number("3").unwrap(), 3);
+        // Nothing is dialled below: a session that dialled would fail with
+        // the server's words and not with the name's.
+        let connection = Connection {
+            session: Arc::default(),
+            running: Arc::default(),
+            server: ServerConfig::default(),
+            tunnel: None,
+        };
+        for name in ["dbx", "db-1", "db99999999999999999999", "db 1x", "1.5"] {
+            let refusal = database_number(name).unwrap_err();
+            assert_eq!(
+                refusal.message,
+                format!("Database {name} is not a database number.")
+            );
+            assert_eq!(
+                connection
+                    .on_database(name)
+                    .err()
+                    .map(|error| error.message),
+                Some(refusal.message),
+                "{name}"
+            );
+        }
+    }
+
     fn live_config() -> ServerConfig {
         let url = std::env::var("dbdelve_REDIS_URL").expect("dbdelve_REDIS_URL is required");
         config_from_url(&url).expect("dbdelve_REDIS_URL should parse")
@@ -2441,6 +2470,30 @@ mod tests {
                 .query("BLPOP live:never 0", Fetch::default())
                 .unwrap_err()
         })
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_REDIS_URL"]
+    fn live_a_session_on_another_database_selects_its_number() {
+        const KEY: &str = "dbdelve_session_probe";
+        let first = live();
+        let other = Connection::open(&ServerConfig {
+            database: "db1".into(),
+            ..live_config()
+        })
+        .unwrap();
+        let clean = || {
+            ran(&first, &format!("DEL {KEY}"));
+            ran(&other, &format!("DEL {KEY}"));
+        };
+        clean();
+
+        let session = first.on_database("db1").expect("the session should open");
+        ran(&session, &format!("SET {KEY} 1"));
+        let exists = |connection: &Connection| cells(&ran(connection, &format!("EXISTS {KEY}")));
+        assert_eq!(exists(&other), [some(&["1"])], "written into database 1");
+        assert_eq!(exists(&first), [some(&["0"])], "and not into database 0");
+        clean();
     }
 
     #[test]
