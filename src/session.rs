@@ -694,6 +694,10 @@ pub(crate) struct Session {
     /// The question turning auto-commit back on asks while a transaction is
     /// open: commit it, roll it back, or leave it.
     pub(crate) auto_commit_prompt: Option<AutoCommitPrompt>,
+    /// The tab the Auto dialog's COMMIT or ROLLBACK is running in. Auto is
+    /// read only once that statement lands, because the switch is not
+    /// allowed to say Auto over a transaction the server still holds.
+    pub(crate) auto_after_end: Option<Tab>,
     pub(crate) notice: Option<String>,
     /// What a statement's run cost beyond its result (`QueryResult::notice`),
     /// said only while the tab it ran on is in front, under any `notice`.
@@ -1160,6 +1164,7 @@ impl Session {
             query_rename_needs_focus: false,
             pending_discard: None,
             auto_commit_prompt: None,
+            auto_after_end: None,
             notice,
             tab_notice: None,
             apply_review: None,

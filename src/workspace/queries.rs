@@ -2336,11 +2336,23 @@ impl Workspace {
         // part way may still have opened a transaction.
         // Not a bound tab's: what it leaves is left on the session of its
         // database, which is not the profile's own.
+        // What a lone COMMIT or ROLLBACK cleared, kept to put back when it
+        // fails: it is read off what was sent, not off what the server did,
+        // and a failed COMMIT (SQLite's `SQLITE_BUSY`) leaves the transaction
+        // open.
+        let mut ended = None;
         if !generated
             && binding.is_none()
             && let Some(profile) = self.issued_to(&id, generation)
         {
-            let leaves = sql::leaves(engine, explained.as_deref().unwrap_or(&sql));
+            let text = explained.as_deref().unwrap_or(&sql);
+            let leaves = sql::leaves(engine, text);
+            if leaves.transaction == Some(false)
+                && profile.in_transaction
+                && sql::after_last_end(engine, text).is_empty()
+            {
+                ended = Some(std::mem::take(&mut profile.transaction_statements));
+            }
             profile.record_sent(&sql, leaves.transaction);
             if let Some(open) = leaves.transaction {
                 profile.in_transaction = open;
@@ -2664,6 +2676,23 @@ impl Workspace {
                                     .and_then(|query| query.queue.as_mut())
                             {
                                 queue.remaining.clear();
+                            }
+                        }
+                        // Settled here, before a tab closed under the run can
+                        // end the block: whether the end really ended anything
+                        // is only known now.
+                        let ended_ok = result.is_ok();
+                        if let Some(statements) = ended
+                            && !ended_ok
+                            && !lost
+                        {
+                            profile.in_transaction = true;
+                            profile.transaction_statements = statements;
+                        }
+                        if profile.session.auto_after_end == Some(tab) {
+                            profile.session.auto_after_end = None;
+                            if ended_ok {
+                                profile.auto_commit = true;
                             }
                         }
                         let Some((state, results)) = profile.session.slot_at(tab, lane.as_ref())

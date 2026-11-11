@@ -14439,6 +14439,57 @@ fn the_auto_prompt_leaves_auto_off_when_its_commit_is_not_sent(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn the_auto_prompt_leaves_auto_off_and_the_transaction_listed_when_its_commit_fails(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
+        let listed = open_transaction_statements(&workspace, cx);
+
+        // Ended straight on the session, so the profile still reads the
+        // transaction as open and the COMMIT the dialog sends has none to end
+        // and fails.
+        let session = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.profile().and_then(|profile| profile.connection())
+            })
+            .expect("the profile is connected");
+        session
+            .query("ROLLBACK", &CancelToken::default(), Fetch::default())
+            .expect("the session ends its transaction");
+
+        click_selector(cx, "auto-commit-auto");
+        click_selector(cx, "end-transaction-0");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(
+                matches!(tab.query, QueryState::Failed(_)),
+                "the COMMIT failed"
+            )
+        });
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(
+            !auto_commit && open,
+            "a COMMIT that failed leaves auto-commit off and the transaction read as open"
+        );
+        assert_eq!(
+            open_transaction_statements(&workspace, cx),
+            listed,
+            "the list the failed COMMIT cleared is put back"
+        );
+
+        click_selector(cx, "auto-commit-auto");
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("end-transaction"),
+            "the dialog can be asked again"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_auto_prompt_rolls_back_or_cancels_and_cancelling_changes_nothing(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);

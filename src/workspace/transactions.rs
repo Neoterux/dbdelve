@@ -163,12 +163,14 @@ impl Workspace {
     /// The Auto dialog's answer: end the open transaction with a plain
     /// `verb` (`COMMIT` or `ROLLBACK`) that opens no next one, then read Auto.
     ///
-    /// The switch flips last, and only if the statement was issued. A switch
-    /// reading Auto over a transaction that is still open is wrong for as long
-    /// as it takes to lose a row, the mirror of the reason Manual opens its
-    /// `BEGIN` at once. `in_transaction` is marked as the statement is sent,
-    /// so it is already false here when the run started; still true means a
-    /// statement is running in that tab, or the connection is gone.
+    /// The switch flips last, and only once the statement has succeeded: the
+    /// run's completion does it (`Session::auto_after_end`). A switch reading
+    /// Auto over a transaction that is still open is wrong for as long as it
+    /// takes to lose a row, the mirror of the reason Manual opens its `BEGIN`
+    /// at once, and a `COMMIT` can fail and leave the transaction open.
+    /// `in_transaction` is marked as the statement is sent, so it is already
+    /// false here when the run started; still true means a statement is
+    /// running in that tab, or the connection is gone.
     pub(crate) fn end_transaction_for_auto(
         &mut self,
         verb: &str,
@@ -183,17 +185,17 @@ impl Workspace {
             return;
         }
         self.end_transaction(verb, false, window, cx);
-        let still_open = self.profile().is_some_and(|profile| profile.in_transaction);
-        if still_open {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if profile.in_transaction {
             self.note(
                 format!("The {verb} was not sent, so auto-commit is still off."),
                 cx,
             );
             return;
         }
-        if let Some(profile) = self.profile_mut() {
-            profile.auto_commit = true;
-        }
+        profile.session.auto_after_end = Some(profile.session.active);
         cx.notify();
     }
 
