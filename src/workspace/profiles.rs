@@ -274,6 +274,8 @@ impl Workspace {
             database_catalogs: HashMap::new(),
             left_database: false,
             shortcuts: restored_shortcuts(&stored.folders, &stored.pins),
+            open_rows: Vec::new(),
+            selected_rows: Vec::new(),
             session,
         });
         // The saved queries are listed before anything has connected.
@@ -338,6 +340,8 @@ impl Workspace {
             database_catalogs: HashMap::new(),
             left_database: false,
             shortcuts: Shortcuts::default(),
+            open_rows: Vec::new(),
+            selected_rows: Vec::new(),
             session,
         });
         if let Some(password) = password

@@ -101,6 +101,12 @@ pub(crate) struct Profile {
     pub(crate) left_database: bool,
     /// The explorer's folders and pins.
     pub(crate) shortcuts: Shortcuts,
+    /// The rows of the connections tree this profile has open, and the rows
+    /// of it that are selected, by row id: what `profiles.toml` holds between
+    /// runs. Complex mode only. A row listed here whose subtree has not
+    /// loaded waits for it; the tree owns a row once it holds it.
+    pub(crate) open_rows: Vec<String>,
+    pub(crate) selected_rows: Vec<String>,
     pub(crate) session: Session,
 }
 
@@ -414,6 +420,8 @@ impl Profile {
             // property of its tab now. Kept on the stored shape only so a
             // profile written by an older build still loads with its buffer.
             open_query: None,
+            open_rows: Vec::new(),
+            selected_rows: Vec::new(),
             ssh: self.config.ssh().cloned(),
             open_queries: self
                 .session
