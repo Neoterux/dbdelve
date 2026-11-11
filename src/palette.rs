@@ -2762,6 +2762,7 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
 fn project_action_items(at: usize, project: &StoredProject, group: Group) -> Vec<Item> {
     let name = project.name.as_str();
     let view = ViewMode::parse(project.view_mode.as_deref());
+    let scope = ListingScope::parse(project.listing_scope.as_deref());
     let hint = |here: bool| if here { "current" } else { "" };
     [
         Item::new(
@@ -2797,6 +2798,24 @@ fn project_action_items(at: usize, project: &StoredProject, group: Group) -> Vec
             Command::SetProjectViewMode(at, Some(ViewMode::Complex)),
         )
         .hint(hint(view == Some(ViewMode::Complex))),
+        Item::new(
+            format!("Connections in {name}: follow the setting"),
+            icon::SIDEBAR,
+            Command::SetProjectListing(at, None),
+        )
+        .hint(hint(scope.is_none())),
+        Item::new(
+            format!("Connections in {name}: only this project"),
+            icon::SIDEBAR,
+            Command::SetProjectListing(at, Some(ListingScope::Current)),
+        )
+        .hint(hint(scope == Some(ListingScope::Current))),
+        Item::new(
+            format!("Connections in {name}: every project"),
+            icon::SIDEBAR,
+            Command::SetProjectListing(at, Some(ListingScope::All)),
+        )
+        .hint(hint(scope == Some(ListingScope::All))),
     ]
     .into_iter()
     .map(|item| item.group(group.clone()))
@@ -5530,6 +5549,9 @@ mod tests {
                 "Sidebar in Billing: follow the setting",
                 "Sidebar in Billing: the connection in front",
                 "Sidebar in Billing: every connection",
+                "Connections in Billing: follow the setting",
+                "Connections in Billing: only this project",
+                "Connections in Billing: every project",
             ]
         );
         assert!(waits_for_import(

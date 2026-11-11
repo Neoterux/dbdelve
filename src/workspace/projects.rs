@@ -35,18 +35,39 @@ impl Workspace {
     }
 
     /// The global sidebar. A project's own choice still wins where it has one.
-    pub(crate) fn set_view_mode(&mut self, _mode: ViewMode, _cx: &mut Context<Self>) {}
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.settings.view_mode = mode;
+        self.sidebar_changed(cx);
+    }
 
     /// The global listing scope. A project's own choice still wins where it
     /// has one.
-    pub(crate) fn set_listing_scope(&mut self, _scope: ListingScope, _cx: &mut Context<Self>) {}
+    pub(crate) fn set_listing_scope(&mut self, scope: ListingScope, cx: &mut Context<Self>) {
+        self.settings.listing_scope = scope;
+        self.sidebar_changed(cx);
+    }
 
+    /// A project's listing scope: its own choice, or with `None` the global
+    /// setting's.
     pub(crate) fn set_project_listing(
         &mut self,
-        _at: usize,
-        _scope: Option<ListingScope>,
-        _cx: &mut Context<Self>,
+        at: usize,
+        scope: Option<ListingScope>,
+        cx: &mut Context<Self>,
     ) {
+        let Some(project) = self.projects.get_mut(at) else {
+            return;
+        };
+        project.listing_scope = scope.map(|scope| scope.slug().to_string());
+        self.sidebar_changed(cx);
+    }
+
+    /// A setting of the sidebar changed: saved, and the tree drawn again. Only
+    /// what the window draws changes, so no tab, binding or connection moves.
+    fn sidebar_changed(&mut self, cx: &mut Context<Self>) {
+        self.remember_profiles(cx);
+        self.rebuild_connections(cx);
+        cx.notify();
     }
 
     /// The project the connection in front is in.
@@ -102,9 +123,7 @@ impl Workspace {
             return;
         };
         project.view_mode = mode.map(|mode| mode.slug().to_string());
-        self.remember_profiles(cx);
-        self.rebuild_connections(cx);
-        cx.notify();
+        self.sidebar_changed(cx);
     }
 
     pub(crate) fn open_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
