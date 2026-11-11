@@ -3233,6 +3233,8 @@ pub(crate) fn render_view_sorting(
 /// Only where the engine has a transaction for the user to drive, and only on
 /// a live connection: every control here writes a statement into the buffer
 /// and runs it, and with nothing connected there is nothing to run it on.
+/// A bound tab gets no controls, only the word that its session commits each
+/// statement.
 pub(crate) fn render_transaction(
     profile: &Profile,
     cx: &mut Context<Workspace>,
@@ -3241,6 +3243,38 @@ pub(crate) fn render_transaction(
         return None;
     }
     let t = *theme(cx);
+    // A tab bound to a database runs on that database's own session, which
+    // commits each statement whatever the connection's own session is holding:
+    // the switch and the buttons below are that session's, and drawn for this
+    // tab they would say a write could still be rolled back.
+    if let Some(binding) = profile.binding_of(profile.session.active) {
+        let says = match profile.bound_transactions.contains(&binding.database) {
+            true => "Transaction open on this tab's session",
+            false => "Auto, on this tab's session",
+        };
+        return Some(
+            div()
+                .debug_selector(|| "transaction-bound".into())
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .child(
+                    div()
+                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                        .text_color(t.text_faint)
+                        .child("Tx"),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .text_color(t.text_muted)
+                        .child(says),
+                )
+                .into_any_element(),
+        );
+    }
     let (auto_commit, open) = (profile.auto_commit, profile.in_transaction);
     let mut control = div()
         .flex_shrink_0()
