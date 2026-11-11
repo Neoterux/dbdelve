@@ -719,4 +719,44 @@ mod tests {
         assert!(!lists_schemas(Levels::DatabaseHoldsObjects));
         assert!(!lists_schemas(Levels::Flat));
     }
+
+    #[test]
+    fn names_then_patterns_are_written_once_each_ignoring_case() {
+        assert_eq!(
+            written_entries(&["other".into()], " OTHER, sc*, , SC* ,tmp_"),
+            ["other", "sc*", "tmp_"]
+        );
+    }
+
+    #[test]
+    fn the_unmatched_line_names_three_patterns_then_how_many_more() {
+        let names = ["alpha".to_string(), "beta".to_string()];
+        let patterns = |entries: &[&str]| entries.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            unmatched_line("database", &patterns(&["al*", "?eta"]), &names),
+            None
+        );
+        assert_eq!(
+            unmatched_line("database", &patterns(&["a*", "al*"]), &names),
+            None,
+            "a pattern is unmatched only when no listed name fits it"
+        );
+        assert_eq!(
+            unmatched_line("database", &patterns(&["z*"]), &names).as_deref(),
+            Some("No database matches: z*")
+        );
+        assert_eq!(
+            unmatched_line("schema in e2e", &patterns(&["z*", "y?"]), &names).as_deref(),
+            Some("No schema in e2e matches: z*, y?")
+        );
+        assert_eq!(
+            unmatched_line(
+                "database",
+                &patterns(&["a1", "b1", "c1", "d1", "e1"]),
+                &names
+            )
+            .as_deref(),
+            Some("No database matches: a1, b1, c1 and 2 more")
+        );
+    }
 }

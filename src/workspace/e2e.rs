@@ -2731,6 +2731,73 @@ fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
     });
 }
 
+#[gpui::test]
+fn a_typed_pattern_shows_what_it_matches_before_saving(cx: &mut TestAppContext) {
+    use super::filter_picker::Which;
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        click_selector(cx, "filter-picker-patterns-databases");
+        cx.simulate_input("sc*");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.listed_hint(Which::Databases, "scratch"),
+                Some("by pattern"),
+                "matched, not ticked: drawn checked and fixed"
+            );
+            assert_eq!(picker.listed_hint(Which::Databases, "other"), None);
+            assert_eq!(
+                picker.listed_hint(Which::Databases, "e2e"),
+                Some("current database"),
+                "the own database keeps its own hint"
+            );
+            assert_eq!(
+                picker.preview(Which::Databases).as_deref(),
+                Some("Showing 2 of 3 databases")
+            );
+            assert_eq!(picker.unmatched(Which::Databases), None);
+        });
+
+        cx.simulate_input(", tmp_*, ?_old, x?, y?");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.unmatched(Which::Databases).as_deref(),
+                Some("No database matches: tmp_*, ?_old, x? and 1 more")
+            );
+        });
+        assert!(
+            cx.debug_bounds("filter-picker-unmatched-databases")
+                .is_some()
+        );
+
+        // `enter` in the field is the field's own: nothing is saved.
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(profile.include.databases.is_empty());
+        });
+
+        click_selector(cx, "filter-picker-0");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(
+                profile.include.databases,
+                ["sc*", "tmp_*", "?_old", "x?", "y?"]
+            );
+            let row = connection_row("e2e");
+            assert_eq!(workspace.connections.counts.get(&row), Some(&2));
+            assert_eq!(workspace.connections.totals.get(&row), Some(&3));
+        });
+        quit(workspace, cx);
+    });
+}
+
 /// What the palette's Commands scope draws at the end of each row.
 fn palette_hints(
     workspace: &Entity<Workspace>,
