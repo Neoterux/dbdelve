@@ -63,6 +63,22 @@ fn lists_schemas(levels: Levels) -> bool {
     levels == Levels::DatabaseThenSchema
 }
 
+/// What the dialog says the filter is not. A filter narrows what is listed;
+/// a statement, an agent's included, can still read what it hides, so the
+/// sentence is always drawn.
+pub(crate) fn boundary(levels: Levels) -> &'static str {
+    match lists_schemas(levels) {
+        true => {
+            "This filter changes what is listed, not what can be reached: a statement can \
+             still read a hidden database or schema, an agent's included."
+        }
+        false => {
+            "This filter changes what is listed, not what can be reached: a statement can \
+             still read a hidden database, an agent's included."
+        }
+    }
+}
+
 /// What a section's full list of names has got to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Listing {
@@ -80,9 +96,9 @@ pub(crate) struct PickerSection {
     /// server does not list. Kept in step with the field by its subscription.
     pub(crate) patterns: Vec<String>,
     /// The comma-separated entries that are not ticked names.
-    pattern_field: Entity<InputState>,
+    pub(crate) pattern_field: Entity<InputState>,
     /// Narrows the drawn rows; the stored rule never sees it.
-    search: Entity<InputState>,
+    pub(crate) search: Entity<InputState>,
 }
 
 pub(crate) struct FilterPicker {
@@ -344,6 +360,10 @@ impl FilterPicker {
             .into_iter()
             .filter_map(|which| self.section(which))
             .any(|section| !section.ticked.is_empty() || !section.patterns.is_empty())
+    }
+
+    pub(crate) fn boundary(&self) -> &'static str {
+        boundary(self.levels)
     }
 
     pub(crate) fn heading(&self) -> &'static str {
@@ -1089,6 +1109,13 @@ impl Workspace {
                             .flex_wrap()
                             .gap(px(layout::SPACE_MD))
                             .children(sections),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "filter-picker-boundary".into())
+                            .text_size(text_size)
+                            .text_color(t.text_muted)
+                            .child(picker.boundary()),
                     )
                     .child(
                         div()
