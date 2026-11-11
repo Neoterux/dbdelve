@@ -3185,6 +3185,46 @@ fn the_diagram_choice_is_offered_only_for_an_object_with_columns(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn the_diagram_reads_another_databases_structure_over_its_session(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        run_in_front(
+            &workspace,
+            cx,
+            "ALTER TABLE other.main.t ADD COLUMN extra TEXT",
+        );
+        let columns = |database: Option<&str>, cx: &mut VisualTestContext| {
+            let database = database.map(str::to_string);
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_ddl(database, "main".into(), "t".into(), RelationKind::Table, cx)
+            });
+            settle(cx);
+            choose_in_ddl_dialog(cx, "show-ddl-diagram-choice");
+            let columns = workspace.read_with(cx, |workspace, _| {
+                match workspace
+                    .ddl_view
+                    .as_ref()
+                    .and_then(|view| view.diagram.as_ref())
+                {
+                    Some(super::DiagramState::Ready(diagram)) => diagram
+                        .table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>(),
+                    _ => panic!("the diagram has not loaded"),
+                }
+            });
+            press(cx, "escape");
+            columns
+        };
+        assert_eq!(columns(Some("other"), cx), ["name", "id", "extra"]);
+        assert_eq!(columns(None, cx), ["name", "id"]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_empty_table_opened_from_the_sidebar_keeps_the_keyboard(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");

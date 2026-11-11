@@ -21,6 +21,7 @@ use super::*;
 use crate::actions::{ConfirmDialog, NextDialogButton, PreviousDialogButton, TickDialogBox};
 use crate::agent::result::Total;
 use crate::connection_form::{ConnectionTest, Reported, dialects, suggested_dialect};
+use crate::diagram::{Diagram, DiagramTable};
 use crate::explorer::{
     Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase, Shortcuts,
     is_schema_row, landing, relation_copies, saved_query,
@@ -1781,41 +1782,87 @@ impl Workspace {
         let syntax = self.engine().syntax();
         let text_size = px(layout::chrome(layout::TEXT_SM));
         let copyable = matches!(&view.text, DdlText::Ready(text) if !text.is_empty());
-        let body = match &view.text {
-            DdlText::Loading => div()
-                .debug_selector(|| "show-ddl-loading".into())
-                .text_color(t.text_muted)
-                .child("Reading the definition…")
-                .into_any_element(),
-            DdlText::Failed(message) => div()
+        let body = match (&view.diagram, view.showing_diagram, &view.text) {
+            (Some(DiagramState::Ready(diagram)), true, _) => {
+                render_diagram(diagram, t, code.clone())
+            }
+            (Some(DiagramState::Failed(message)), true, _) => div()
                 .debug_selector(|| "show-ddl-failed".into())
                 .text_color(t.danger)
                 .child(message.clone())
                 .into_any_element(),
-            DdlText::Ready(text) if text.is_empty() => div()
-                .debug_selector(|| "show-ddl-empty".into())
+            (_, true, _) => div()
+                .debug_selector(|| "show-ddl-loading".into())
                 .text_color(t.text_muted)
-                .child(format!(
-                    "The server returned no definition for {}.",
-                    view.name
-                ))
+                .child("Reading the structure…")
                 .into_any_element(),
-            // Nothing moves in it, so it takes no smooth-scroll modifier.
-            DdlText::Ready(text) => div()
-                .id("show-ddl-text")
-                .debug_selector(|| "show-ddl-text".into())
-                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .font_family(code)
-                .children(
-                    code_lines(text, syntax, &cx.theme().highlight_theme)
-                        .into_iter()
-                        .map(|line| div().child(line)),
-                )
-                .into_any_element(),
+            (_, false, text) => match text {
+                DdlText::Loading => div()
+                    .debug_selector(|| "show-ddl-loading".into())
+                    .text_color(t.text_muted)
+                    .child("Reading the definition…")
+                    .into_any_element(),
+                DdlText::Failed(message) => div()
+                    .debug_selector(|| "show-ddl-failed".into())
+                    .text_color(t.danger)
+                    .child(message.clone())
+                    .into_any_element(),
+                DdlText::Ready(text) if text.is_empty() => div()
+                    .debug_selector(|| "show-ddl-empty".into())
+                    .text_color(t.text_muted)
+                    .child(format!(
+                        "The server returned no definition for {}.",
+                        view.name
+                    ))
+                    .into_any_element(),
+                // Nothing moves in it, so it takes no smooth-scroll modifier.
+                DdlText::Ready(text) => div()
+                    .id("show-ddl-text")
+                    .debug_selector(|| "show-ddl-text".into())
+                    .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .font_family(code)
+                    .children(
+                        code_lines(text, syntax, &cx.theme().highlight_theme)
+                            .into_iter()
+                            .map(|line| div().child(line)),
+                    )
+                    .into_any_element(),
+            },
         };
         let close_workspace = cx.entity().downgrade();
         let copy_workspace = close_workspace.clone();
+        let sql_workspace = close_workspace.clone();
+        let diagram_workspace = close_workspace.clone();
+        let choices = view.kind.is_some().then(|| {
+            ui::segmented(t)
+                .child(div().debug_selector(|| "show-ddl-sql-choice".into()).child(
+                    ui::segmented_choice("show-ddl-sql", "SQL", !view.showing_diagram, t).on_click(
+                        move |_, _, cx| {
+                            _ = sql_workspace.update(cx, |workspace, cx| {
+                                workspace.show_sql(cx);
+                            });
+                        },
+                    ),
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| "show-ddl-diagram-choice".into())
+                        .child(
+                            ui::segmented_choice(
+                                "show-ddl-diagram",
+                                "Diagram",
+                                view.showing_diagram,
+                                t,
+                            )
+                            .on_click(move |_, _, cx| {
+                                _ = diagram_workspace.update(cx, |workspace, cx| {
+                                    workspace.show_diagram(cx);
+                                });
+                            }),
+                        ),
+                )
+        });
 
         Some(
             div()
@@ -1827,7 +1874,15 @@ impl Workspace {
                 .justify_center()
                 .child(
                     dialog(t)
-                        .child(section_label(t, &view.title))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(layout::SPACE_MD))
+                                .child(section_label(t, &view.title))
+                                .children(choices),
+                        )
                         .child(div().text_size(text_size).child(body))
                         .child(
                             div()
@@ -3671,6 +3726,126 @@ impl Workspace {
             )
             .child(div().flex_1().min_h_0().child(content))
     }
+}
+
+/// A table's diagram as boxes: the table on the left with each column, its
+/// key marks and, for a foreign key, an arrow to the target's name; the tables
+/// those keys point to stacked on the right in the order the keys name them.
+/// Nothing is painted between the boxes and nothing moves.
+fn render_diagram(diagram: &Diagram, t: Theme, code: gpui::SharedString) -> AnyElement {
+    let mark = px(layout::chrome(layout::ICON_SIZE));
+    let boxed = |table: &DiagramTable, tag: &'static str| -> Div {
+        let qualified = match table.schema.is_empty() {
+            true => table.name.clone(),
+            false => format!("{}.{}", table.schema, table.name),
+        };
+        let name = table.name.clone();
+        div()
+            .debug_selector(move || format!("diagram-{tag}-{name}"))
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .border_1()
+            .border_color(t.border)
+            .rounded(px(layout::RADIUS_CONTROL))
+            .child(
+                div()
+                    .px(px(layout::SPACE_MD))
+                    .py(px(layout::SPACE_SM))
+                    .bg(t.element_hover)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.text)
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(qualified),
+            )
+            .children(table.columns.iter().map(|column| {
+                let (pk, fk) = (column.name.clone(), column.name.clone());
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_MD))
+                    .py(px(layout::SPACE_XS))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(mark)
+                            .children(column.primary_key.then(|| {
+                                div()
+                                    .debug_selector(move || format!("diagram-pk-{pk}"))
+                                    .child(icon(icon::PRIMARY_KEY).size(mark).text_color(t.accent))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_family(code.clone())
+                            .text_color(t.text)
+                            .child(column.name.clone()),
+                    )
+                    .children(column.data_type.clone().map(|data_type| {
+                        div()
+                            .flex_none()
+                            .font_family(code.clone())
+                            .text_color(t.text_muted)
+                            .child(data_type)
+                    }))
+                    .children(
+                        column
+                            .target
+                            .and_then(|at| diagram.targets.get(at))
+                            .map(|target| {
+                                div()
+                                    .debug_selector(move || format!("diagram-fk-{fk}"))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(layout::SPACE_XS))
+                                    .text_color(t.text_muted)
+                                    .child(icon(icon::FOLLOW_KEY).size(mark))
+                                    .child(icon(icon::MAPS_TO).size(mark))
+                                    .child(target.name.clone())
+                            }),
+                    )
+            }))
+    };
+    div()
+        .id("show-ddl-diagram")
+        .debug_selector(|| "show-ddl-diagram".into())
+        .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+        .overflow_y_scroll()
+        .flex()
+        .items_start()
+        .gap(px(layout::SPACE_LG))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(boxed(&diagram.table, "table")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_MD))
+                .children(diagram.targets.iter().map(|target| boxed(target, "target")))
+                .children(diagram.targets.is_empty().then(|| {
+                    div()
+                        .debug_selector(|| "diagram-no-targets".into())
+                        .text_color(t.text_muted)
+                        .child("No foreign keys.")
+                })),
+        )
+        .into_any_element()
 }
 
 /// The button the ring starts on when `dialog` goes up, counted from the right.

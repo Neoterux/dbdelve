@@ -589,10 +589,31 @@ impl Workspace {
         Some((schema.name.clone(), relation.name.clone(), relation.kind))
     }
 
+    /// `database` as an object's own database says it: `None` for the
+    /// profile's own, which is the profile's connection and not a session of
+    /// its own, where asking it for itself by name would open a second one.
+    fn elsewhere(&self, database: Option<String>) -> Option<String> {
+        let own = self.profile()?.active_database();
+        database.filter(|database| own.as_ref() != Some(database))
+    }
+
+    /// The connection of `database` (`None` for the profile's own), by id and
+    /// generation, with how to reach it. Another database's is its session,
+    /// which a read with none open opens first.
+    fn route_to(&self, database: Option<String>) -> Option<(String, u64, Routed)> {
+        let database = self.elsewhere(database);
+        let profile = self.profile()?;
+        let routed = profile.route(database.map(|database| Binding {
+            database,
+            schema: None,
+        }));
+        routed
+            .is_available()
+            .then(|| (profile.id.clone(), profile.generation, routed))
+    }
+
     /// Ask for `schema.relation`'s definition over the connection of its
-    /// database, `None` for the profile's own: another database's is read over
-    /// that database's session, which a read with none open opens first.
-    /// Nothing is sent but the driver's own DDL read.
+    /// database. Nothing is sent but the driver's own DDL read.
     fn read_ddl(
         &mut self,
         database: Option<String>,
@@ -601,19 +622,7 @@ impl Workspace {
         kind: RelationKind,
         cx: &mut Context<Self>,
     ) -> Option<DdlRead> {
-        let profile = self.profile()?;
-        // The own database is the profile's own connection, not a session of
-        // its own: asking it for itself by name would open a second one.
-        let database =
-            database.filter(|database| profile.active_database().as_ref() != Some(database));
-        let routed = profile.route(database.map(|database| Binding {
-            database,
-            schema: None,
-        }));
-        if !routed.is_available() {
-            return None;
-        }
-        let (profile_id, generation) = (profile.id.clone(), profile.generation);
+        let (profile_id, generation, routed) = self.route_to(database)?;
         let task = self.run_routed(
             &profile_id,
             generation,
@@ -680,7 +689,11 @@ impl Workspace {
             kind_name[..1].to_uppercase(),
             &kind_name[1..]
         );
-        let shown = relation.clone();
+        let (shown_database, shown_schema, shown) = (
+            self.elsewhere(database.clone()),
+            schema.clone(),
+            relation.clone(),
+        );
         let Some((profile_id, generation, task)) =
             self.read_ddl(database, schema, relation, kind, cx)
         else {
@@ -690,8 +703,8 @@ impl Workspace {
         let request = self.last_ddl_request;
         self.ddl_view = Some(DdlView {
             profile: profile_id.clone(),
-            database: None,
-            schema: String::new(),
+            database: shown_database,
+            schema: shown_schema,
             name: shown,
             kind: Some(kind),
             title,
@@ -731,11 +744,109 @@ impl Workspace {
         .detach();
     }
 
-    /// The dialog's `Diagram` choice.
-    pub(crate) fn show_diagram(&mut self, _cx: &mut Context<Self>) {}
+    /// The dialog's `Diagram` choice. The structure is read the first time it
+    /// is chosen: from a structure tab of the same object when one holds it,
+    /// else by the read a structure tab makes, over the object's database's
+    /// connection. The targets are drawn from the foreign keys alone, so
+    /// nothing is read per target and no statement is generated.
+    pub(crate) fn show_diagram(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.ddl_view_in_front() else {
+            return;
+        };
+        if view.kind.is_none() {
+            return;
+        }
+        let already = view.diagram.is_some();
+        let (request, database, schema, name) = (
+            view.request,
+            view.database.clone(),
+            view.schema.clone(),
+            view.name.clone(),
+        );
+        let held = self.profile().and_then(|profile| {
+            profile.session.objects.iter().find_map(|tab| {
+                if tab.database != database
+                    || tab.schema != schema
+                    || tab.name != name
+                    || !matches!(tab.kind, ObjectKind::Relation(_))
+                {
+                    return None;
+                }
+                match &tab.body {
+                    ObjectBody::Relation { structure, .. }
+                    | ObjectBody::Structure { structure, .. } => match structure {
+                        StructureState::Loaded(structure) => {
+                            Some(crate::diagram::of(&schema, &name, structure))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+        });
+        let route = match (already, &held) {
+            (false, None) => Some(self.route_to(database)),
+            _ => None,
+        };
+        let Some(view) = self.ddl_view.as_mut() else {
+            return;
+        };
+        view.showing_diagram = true;
+        if !already {
+            view.diagram = Some(match (held, &route) {
+                (Some(diagram), _) => DiagramState::Ready(diagram),
+                (None, Some(None)) => DiagramState::Failed("The connection is not open.".into()),
+                (None, _) => DiagramState::Loading,
+            });
+        }
+        cx.notify();
+        let Some(Some((profile_id, generation, routed))) = route else {
+            return;
+        };
+        let (read_schema, read_name) = (schema.clone(), name.clone());
+        let task = self.run_routed(
+            &profile_id,
+            generation,
+            routed,
+            move |connection| connection.structure(&read_schema, &read_name),
+            cx,
+        );
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    if workspace.issued_to(&profile_id, generation).is_none() {
+                        return;
+                    }
+                    let Some(view) = workspace
+                        .ddl_view
+                        .as_mut()
+                        .filter(|view| view.request == request)
+                    else {
+                        return;
+                    };
+                    view.diagram = Some(match result {
+                        Ok(structure) => {
+                            DiagramState::Ready(crate::diagram::of(&schema, &name, &structure))
+                        }
+                        Err(error) => {
+                            DiagramState::Failed(format!("Could not read the structure: {error}"))
+                        }
+                    });
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
 
     /// The dialog's `SQL` choice.
-    pub(crate) fn show_sql(&mut self, _cx: &mut Context<Self>) {}
+    pub(crate) fn show_sql(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.ddl_view.as_mut() {
+            view.showing_diagram = false;
+            cx.notify();
+        }
+    }
 
     /// The `Show DDL` dialog, when it is the front connection's: one left up
     /// for a connection that is no longer in front is not drawn and `escape`

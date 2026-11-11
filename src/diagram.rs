@@ -32,15 +32,63 @@ pub(crate) struct DiagramColumn {
     pub(crate) target: Option<usize>,
 }
 
-/// The diagram of `schema.name` as `structure` describes it.
-pub(crate) fn of(schema: &str, name: &str, _structure: &Structure) -> Diagram {
+/// The diagram of `schema.name` as `structure` describes it. Targets are
+/// grouped by (schema, table) in the order the foreign keys first name them,
+/// each listing a referenced column once however many keys point at it.
+pub(crate) fn of(schema: &str, name: &str, structure: &Structure) -> Diagram {
+    let mut targets: Vec<DiagramTable> = Vec::new();
+    let mut target_of_key = Vec::with_capacity(structure.foreign_keys.len());
+    for key in &structure.foreign_keys {
+        let at = match targets.iter().position(|target| {
+            target.schema == key.referenced_schema && target.name == key.referenced_table
+        }) {
+            Some(at) => at,
+            None => {
+                targets.push(DiagramTable {
+                    schema: key.referenced_schema.clone(),
+                    name: key.referenced_table.clone(),
+                    columns: Vec::new(),
+                });
+                targets.len() - 1
+            }
+        };
+        let columns = &mut targets[at].columns;
+        if !columns
+            .iter()
+            .any(|column| column.name == key.referenced_column)
+        {
+            columns.push(DiagramColumn {
+                name: key.referenced_column.clone(),
+                data_type: None,
+                primary_key: false,
+                target: None,
+            });
+        }
+        target_of_key.push(at);
+    }
+
+    let primary = structure.primary_key();
+    let columns = structure
+        .columns
+        .iter()
+        .map(|column| DiagramColumn {
+            name: column.name.clone(),
+            data_type: Some(column.data_type.clone()).filter(|data_type| !data_type.is_empty()),
+            primary_key: primary.contains(&column.name),
+            target: structure
+                .foreign_keys
+                .iter()
+                .position(|key| key.column == column.name)
+                .map(|key| target_of_key[key]),
+        })
+        .collect();
     Diagram {
         table: DiagramTable {
             schema: schema.to_string(),
             name: name.to_string(),
-            columns: Vec::new(),
+            columns,
         },
-        targets: Vec::new(),
+        targets,
     }
 }
 
