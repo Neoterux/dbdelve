@@ -13575,6 +13575,51 @@ fn an_edit_is_refused_while_a_transaction_is_open_on_its_databases_session(
 }
 
 #[gpui::test]
+fn a_write_waiting_on_its_session_to_open_is_not_sent_once_the_mode_is_read_only(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.profile().unwrap().bound.is_empty(),
+                "no session is open for `other`, so the run opens one"
+            );
+        });
+        let tab = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.active
+        });
+        // Issued under Full, with the session still to open: the mode is
+        // switched before the run's landing finds it open.
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_unchecked(
+                "INSERT INTO u VALUES (7)".into(),
+                tab,
+                None,
+                false,
+                None,
+                None,
+                cx,
+            );
+            workspace.set_mode(crate::sql::Mode::ReadOnly, cx);
+        });
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert!(
+                error.message.contains("Not sent") && error.message.contains("Read-only"),
+                "{}",
+                error.message
+            ),
+            _ => panic!("a write must not reach a session the mode no longer admits"),
+        });
+        run_in_front(&workspace, cx, "SELECT count(*) FROM u");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("0"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn every_row_of_a_bound_tabs_result_is_not_fetched_on_the_profiles_own_session(
     cx: &mut TestAppContext,
 ) {
