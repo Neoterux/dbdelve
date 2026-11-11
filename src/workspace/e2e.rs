@@ -3365,6 +3365,113 @@ fn the_diagram_reads_another_databases_structure_over_its_session(cx: &mut TestA
     });
 }
 
+/// `other`'s `t` is the only one with `extra`, so a read that lands on the
+/// connection's own database after a bound tab's `USE` shows it without.
+#[gpui::test]
+fn a_use_in_a_bound_tab_moves_no_read_of_its_databases_objects(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        run_in_front(
+            &workspace,
+            cx,
+            "ALTER TABLE other.main.t ADD COLUMN extra TEXT",
+        );
+        new_query_here(&workspace, cx, Some("other"), None);
+        let leave = |cx: &mut VisualTestContext| {
+            run_in_front(&workspace, cx, "USE e2e");
+            assert_eq!(
+                answer_in_the_first_query_tab(&workspace, cx, "SELECT current_database()")
+                    .as_deref(),
+                Some("e2e"),
+                "the profile's own session is where it was"
+            );
+        };
+
+        leave(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_ddl(
+                Some("other".into()),
+                "main".into(),
+                "t".into(),
+                ObjectKind::Relation(RelationKind::Table),
+                cx,
+            )
+        });
+        settle(cx);
+        let shown = ddl_text(&workspace, cx).expect("the dialog holds a definition");
+        assert!(shown.contains("extra"), "Show DDL after a USE: {shown}");
+        press(cx, "escape");
+
+        leave(cx);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        workspace.update(cx, |workspace, cx| {
+            workspace.copy_ddl(
+                Some("other".into()),
+                "main".into(),
+                "t".into(),
+                RelationKind::Table,
+                cx,
+            )
+        });
+        settle(cx);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert!(copied.contains("extra"), "Copy DDL after a USE: {copied}");
+
+        leave(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_ddl(
+                Some("other".into()),
+                "main".into(),
+                "t".into(),
+                ObjectKind::Relation(RelationKind::Table),
+                cx,
+            )
+        });
+        settle(cx);
+        choose_in_ddl_dialog(cx, "show-ddl-diagram-choice");
+        let drawn = workspace.read_with(cx, |workspace, _| {
+            match workspace
+                .ddl_view
+                .as_ref()
+                .and_then(|view| view.diagram.as_ref())
+            {
+                Some(super::DiagramState::Ready(diagram)) => diagram
+                    .table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>(),
+                _ => panic!("the diagram has not loaded"),
+            }
+        });
+        assert_eq!(drawn, ["name", "id", "extra"], "the diagram after a USE");
+        press(cx, "escape");
+
+        leave(cx);
+        click_t_under(&workspace, cx, "other");
+        workspace.read_with(cx, |workspace, _| {
+            let tab = workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_object()
+                .unwrap();
+            let ObjectBody::Relation { structure, .. } = &tab.body else {
+                panic!("a relation tab");
+            };
+            let crate::StructureState::Loaded(structure) = structure else {
+                panic!("the structure has not loaded");
+            };
+            let names: Vec<_> = structure.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["name", "id", "extra"], "the structure after a USE");
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_empty_table_opened_from_the_sidebar_keeps_the_keyboard(cx: &mut TestAppContext) {
     store::tests::with_home(|| {

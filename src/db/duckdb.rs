@@ -2745,6 +2745,54 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_sessions_reads_are_of_its_database_after_a_use_moved_it() {
+        let connection = memory(
+            "CREATE TABLE t (id INTEGER);
+             ATTACH ':memory:' AS other;
+             CREATE TABLE other.t (id INTEGER, extra TEXT);
+             CREATE TABLE other.u (id INTEGER);
+             CREATE SEQUENCE other.counter;",
+        );
+        let session = connection.on_database("other").unwrap();
+        let moved = || session.query("USE memory", Fetch::default()).unwrap();
+        let columns = |structure: &Structure| {
+            structure
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        moved();
+        assert_eq!(
+            columns(&session.structure("main", "t").unwrap()),
+            ["id", "extra"]
+        );
+        moved();
+        assert!(session.ddl("main", "t").unwrap().contains("extra"));
+        moved();
+        assert!(session.sequence_ddl("main", "counter").is_ok());
+        moved();
+        let read = session.catalog().unwrap();
+        assert_eq!(read.database.as_deref(), Some("other"));
+        assert!(
+            read.schemas
+                .iter()
+                .flat_map(|schema| &schema.relations)
+                .any(|relation| relation.name == "u"),
+            "`u` is in `other` alone"
+        );
+        moved();
+        let sequences = session.sequences().unwrap();
+        assert_eq!(sequences.schemas[0].sequences.len(), 1);
+
+        // The profile's own connection follows the user's `USE`: its
+        // catalog is the point of one.
+        connection.query("USE other", Fetch::default()).unwrap();
+        assert!(connection.ddl("main", "t").unwrap().contains("extra"));
+    }
+
+    #[test]
     fn a_bound_run_that_cannot_put_its_schema_back_says_nothing_was_sent() {
         let connection = memory("ATTACH ':memory:' AS other");
         let session = connection.on_database("other").unwrap();
