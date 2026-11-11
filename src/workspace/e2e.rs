@@ -12320,15 +12320,45 @@ fn coloured_connections<'a>(
     (workspace, cx)
 }
 
+/// One DuckDB profile as `profiles.toml` spells it, over the file at `path`,
+/// which is created holding `t`. A DuckDB connection counts the schemas it
+/// lists; a SQLite one is flat and counts nothing.
+fn duckdb_profile(id: &str, name: &str, path: &std::path::Path, extra: &str) -> String {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the directory must be creatable");
+    }
+    ::duckdb::Connection::open(path)
+        .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
+        .expect("the schema must apply");
+    format!(
+        "[[profiles]]\nid = {id:?}\nname = {name:?}\nhost = \"\"\ndatabase = \"\"\n\
+         user = \"\"\nengine = \"duckdb\"\npath = {:?}\n{extra}\n",
+        path.display().to_string()
+    )
+}
+
 #[gpui::test]
 fn a_connection_row_carries_its_logo_status_marker_and_colour(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
-        let (workspace, cx) = coloured_connections(
+        // Left alone, CI's live job puts a connection from `PG*` among these.
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        let (workspace, cx) = launch_connections(
             cx,
             "",
-            &format!("color = \"red\"\n{VISIBLE_RW}"),
-            "agent_visible = false",
+            "view_mode = \"complex\"",
+            &format!(
+                "{}{}",
+                duckdb_profile(
+                    "a",
+                    "Birds",
+                    &directory.join("birds.duckdb"),
+                    &format!("color = \"red\"\n{VISIBLE_RW}")
+                ),
+                sqlite_profile("b", "Flocks", "agent_visible = false")
+            ),
         );
+        settle(cx);
         assert_eq!(profile_state(&workspace, cx, "a"), "connected");
 
         let [logo, name, agent, host, count, status] =
@@ -12372,24 +12402,17 @@ fn a_long_host_gives_way_before_the_connection_name(cx: &mut TestAppContext) {
         let long = directory
             .join("a".repeat(48))
             .join("b".repeat(48))
-            .join("c".repeat(48));
-        std::fs::create_dir_all(&long).expect("the directory must be creatable");
-        let long = long.join("birds.db");
-        rusqlite::Connection::open(&long)
-            .and_then(|connection| connection.execute_batch("create table birds (name text);"))
-            .expect("the database must be creatable");
+            .join("c".repeat(48))
+            .join("birds.duckdb");
         let (workspace, cx) = launch_connections(
             cx,
             "",
             "view_mode = \"complex\"",
-            &format!(
-                "[[profiles]]\nid = \"a\"\nname = \"Birds\"\nhost = \"\"\ndatabase = \"\"\n\
-                 user = \"\"\nengine = \"sqlite\"\npath = {:?}\nagent_visible = true\n",
-                long.display().to_string()
-            ),
+            &duckdb_profile("a", "Birds", &long, "agent_visible = true"),
         );
         settle(cx);
         let name_before = connection_part(cx, "name", "a").expect("the name is drawn");
+        let host_before = connection_part(cx, "host", "a").expect("the host is drawn");
 
         workspace.update_in(cx, |workspace, window, cx| {
             let narrowest = gpui::px(crate::theme::layout::SIDEBAR_MIN_WIDTH);
@@ -12403,6 +12426,10 @@ fn a_long_host_gives_way_before_the_connection_name(cx: &mut TestAppContext) {
         let name = connection_part(cx, "name", "a").expect("the name is drawn");
         let host = connection_part(cx, "host", "a").expect("the host is drawn");
         let count = connection_part(cx, "count", "a").expect("the count is drawn");
+        assert!(
+            host.size.width < host_before.size.width,
+            "the narrow sidebar took its room from the host"
+        );
         assert_eq!(
             name.size.width, name_before.size.width,
             "the name keeps its text"
