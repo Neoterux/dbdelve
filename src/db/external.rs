@@ -504,6 +504,7 @@ impl Connection {
                     })
                     .collect(),
                 routines: Vec::new(),
+                sequences: Vec::new(),
             })
             .collect();
         Ok(Catalog {

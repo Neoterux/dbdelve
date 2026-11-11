@@ -2824,6 +2824,9 @@ pub struct Schema {
     pub name: String,
     pub relations: Vec<Relation>,
     pub routines: Vec<Routine>,
+    /// Names only, in the server's order. Read in the catalog's second half
+    /// with the routines, so [`Connection::catalog`] never carries any.
+    pub sequences: Vec<String>,
 }
 
 /// What a connection did with a picked database or schema that was not there
@@ -2896,6 +2899,9 @@ impl Catalog {
             }
         }
     }
+
+    /// Put each schema's sequences on the schema of that name here.
+    pub fn join_sequences(&mut self, _sequences: Self) {}
 
     /// Write sizes and row estimates onto the relations already here, leaving
     /// any it has no number for alone. It touches nothing but those and
@@ -3451,6 +3457,16 @@ impl std::fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+/// The second half of the catalog: the routines, with the sequences joined
+/// in where the engine lists them.
+fn with_sequences(
+    _engine: Engine,
+    routines: Result<Catalog, DbError>,
+    _sequences: impl FnOnce() -> Result<Catalog, DbError>,
+) -> Result<Catalog, DbError> {
+    routines
+}
+
 pub(super) fn assemble_catalog(
     relations: QueryResult,
     routines: QueryResult,
@@ -3705,6 +3721,7 @@ fn schema<'a>(
         name: name.to_string(),
         relations: Vec::new(),
         routines: Vec::new(),
+        sequences: Vec::new(),
     })
 }
 
@@ -5139,6 +5156,78 @@ mod tests {
         assert_eq!(read_only_statement(Engine::Snowflake, false), None);
     }
 
+    #[test]
+    fn merging_the_second_half_brings_its_sequences_with_its_routines() {
+        let mut screen = Catalog {
+            schemas: vec![schema("main", &["t"], &[])],
+            database: None,
+        };
+        let mut second = schema("main", &[], &["f"]);
+        second.sequences = vec!["s".to_string()];
+        screen.merge(Catalog {
+            schemas: vec![second],
+            database: None,
+        });
+
+        let main = &screen.schemas[0];
+        assert_eq!(main.relations.len(), 1);
+        assert_eq!(main.relations[0].name, "t");
+        assert_eq!(main.routines.len(), 1);
+        assert_eq!(main.routines[0].name, "f");
+        assert_eq!(main.sequences, ["s"]);
+    }
+
+    #[test]
+    fn the_sequences_join_the_routines_where_the_engine_lists_them() {
+        let routines = Ok(Catalog {
+            schemas: vec![schema("main", &[], &["f"])],
+            database: None,
+        });
+        let mut read = schema("main", &[], &[]);
+        read.sequences = vec!["a".to_string(), "b".to_string()];
+        let mut other = schema("other", &[], &[]);
+        other.sequences = vec!["n".to_string()];
+        let second = with_sequences(Engine::DuckDb, routines, || {
+            Ok(Catalog {
+                schemas: vec![read, other],
+                database: None,
+            })
+        })
+        .expect("the second half is read");
+
+        assert_eq!(second.schemas[0].routines.len(), 1);
+        assert_eq!(second.schemas[0].sequences, ["a", "b"]);
+        // A schema holding only sequences is pushed, so it can be listed.
+        assert_eq!(second.schemas[1].name, "other");
+        assert_eq!(second.schemas[1].sequences, ["n"]);
+    }
+
+    #[test]
+    fn a_failed_sequence_read_leaves_the_routines() {
+        let routines = Ok(Catalog {
+            schemas: vec![schema("main", &[], &["f"])],
+            database: None,
+        });
+        let second = with_sequences(Engine::DuckDb, routines, || {
+            Err(plain_error("no sequence catalog".to_string()))
+        })
+        .expect("the routines survive a failed sequence read");
+
+        assert_eq!(second.schemas.len(), 1);
+        assert_eq!(second.schemas[0].routines.len(), 1);
+        assert!(second.schemas[0].sequences.is_empty());
+    }
+
+    #[test]
+    fn sequences_are_read_only_where_the_engine_lists_them() {
+        let routines = Ok(Catalog::default());
+        let second = with_sequences(Engine::Sqlite, routines, || {
+            panic!("SQLite has no sequence catalog to read")
+        })
+        .expect("nothing was read");
+        assert!(second.schemas.is_empty());
+    }
+
     fn schema(name: &str, relations: &[&str], routines: &[&str]) -> Schema {
         Schema {
             name: name.to_string(),
@@ -5163,6 +5252,7 @@ mod tests {
                     definition: String::new(),
                 })
                 .collect(),
+            sequences: Vec::new(),
         }
     }
 
