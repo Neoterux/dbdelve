@@ -859,14 +859,17 @@ impl Workspace {
                 let front = self.profile().and_then(|profile| {
                     let tab = profile.session.active_object()?;
                     match tab.kind {
-                        ObjectKind::Relation(kind) => {
-                            Some((tab.schema.clone(), tab.name.clone(), kind))
-                        }
+                        ObjectKind::Relation(kind) => Some((
+                            tab.database.clone(),
+                            tab.schema.clone(),
+                            tab.name.clone(),
+                            kind,
+                        )),
                         ObjectKind::Routine(_) | ObjectKind::Sequence => None,
                     }
                 });
-                if let Some((schema, relation, kind)) = front {
-                    self.copy_ddl(schema, relation, kind, cx);
+                if let Some((database, schema, relation, kind)) = front {
+                    self.copy_ddl(database, schema, relation, kind, cx);
                 }
             }
             Command::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),

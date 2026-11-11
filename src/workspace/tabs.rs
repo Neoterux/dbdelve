@@ -1013,6 +1013,9 @@ impl Workspace {
         if self.close_apply_review(cx) {
             return;
         }
+        if self.close_ddl_view(cx) {
+            return;
+        }
         if self.close_agent_audit(cx) {
             return;
         }

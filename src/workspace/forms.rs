@@ -1209,6 +1209,8 @@ impl Workspace {
             // The button is disabled while the batch runs.
             ("apply-review", 0) if !running => self.run_apply_review(cx),
             ("apply-review", 1) => _ = self.close_apply_review(cx),
+            ("show-ddl", 0) => _ = self.close_ddl_view(cx),
+            ("show-ddl", _) => self.copy_shown_ddl(cx),
             _ => {}
         }
     }
@@ -1762,6 +1764,119 @@ impl Workspace {
                                     t,
                                 ),
                             ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// An object's definition as the server wrote it, read-only: a header and a
+    /// block that scrolls in the editor's face, drawn like the apply review's
+    /// statement but with nothing to run, so there is no editor and no buffer
+    /// behind it. Copy is the only way the text leaves.
+    pub(crate) fn render_show_ddl(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let view = self.ddl_view_in_front()?;
+        let t = popup_theme(cx);
+        let code = fonts(cx).editor.clone();
+        let syntax = self.engine().syntax();
+        let text_size = px(layout::chrome(layout::TEXT_SM));
+        let copyable = matches!(&view.text, DdlText::Ready(text) if !text.is_empty());
+        let body = match &view.text {
+            DdlText::Loading => div()
+                .debug_selector(|| "show-ddl-loading".into())
+                .text_color(t.text_muted)
+                .child("Reading the definition…")
+                .into_any_element(),
+            DdlText::Failed(message) => div()
+                .debug_selector(|| "show-ddl-failed".into())
+                .text_color(t.danger)
+                .child(message.clone())
+                .into_any_element(),
+            DdlText::Ready(text) if text.is_empty() => div()
+                .debug_selector(|| "show-ddl-empty".into())
+                .text_color(t.text_muted)
+                .child(format!(
+                    "The server returned no definition for {}.",
+                    view.name
+                ))
+                .into_any_element(),
+            // Nothing moves in it, so it takes no smooth-scroll modifier.
+            DdlText::Ready(text) => div()
+                .id("show-ddl-text")
+                .debug_selector(|| "show-ddl-text".into())
+                .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .font_family(code)
+                .children(
+                    code_lines(text, syntax, &cx.theme().highlight_theme)
+                        .into_iter()
+                        .map(|line| div().child(line)),
+                )
+                .into_any_element(),
+        };
+        let close_workspace = cx.entity().downgrade();
+        let copy_workspace = close_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, &view.title))
+                        .child(div().text_size(text_size).child(body))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    self.choice(
+                                        "show-ddl",
+                                        1,
+                                        button(
+                                            "copy-shown-ddl",
+                                            "Copy",
+                                            Tone::Quiet,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .disabled(!copyable)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = copy_workspace.update(cx, |workspace, cx| {
+                                                    workspace.copy_shown_ddl(cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                )
+                                .child(
+                                    self.choice(
+                                        "show-ddl",
+                                        0,
+                                        button(
+                                            "close-shown-ddl",
+                                            "Close",
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                _ = close_workspace.update(cx, |workspace, cx| {
+                                                    workspace.close_ddl_view(cx);
+                                                });
+                                            },
+                                        ),
+                                        t,
+                                    ),
+                                ),
                         ),
                 )
                 .into_any_element(),
@@ -3474,14 +3589,26 @@ impl Workspace {
                                 None => {
                                     let (workspace, names) =
                                         (ddl_workspace.clone(), ddl_names.clone());
+                                    let (show_workspace, show_names) =
+                                        (workspace.clone(), names.clone());
                                     menu.item(PopupMenuItem::new(label).on_click(
                                         move |_, _, cx| {
                                             let (schema, relation) = names.clone();
                                             _ = workspace.update(cx, |workspace, cx| {
-                                                workspace.copy_ddl(schema, relation, kind, cx);
+                                                workspace
+                                                    .copy_ddl(None, schema, relation, kind, cx);
                                             });
                                         },
                                     ))
+                                    .item(
+                                        PopupMenuItem::new("Show DDL").on_click(move |_, _, cx| {
+                                            let (schema, relation) = show_names.clone();
+                                            _ = show_workspace.update(cx, |workspace, cx| {
+                                                workspace
+                                                    .show_ddl(None, schema, relation, kind, cx);
+                                            });
+                                        }),
+                                    )
                                 }
                             })
                     });

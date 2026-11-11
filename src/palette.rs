@@ -4564,7 +4564,7 @@ fn beside_import(command: &Command) -> bool {
     )
 }
 
-fn kind_label(kind: ObjectKind) -> &'static str {
+pub(crate) fn kind_label(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Relation(RelationKind::Table) => "table",
         ObjectKind::Relation(RelationKind::PartitionedTable) => "partitioned table",
