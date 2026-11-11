@@ -50,9 +50,6 @@ pub(super) fn explorer_content(profile: &Profile, filter: &str) -> explorer::Exp
 
 impl Workspace {
     pub(crate) fn remember_profiles(&mut self, cx: &mut Context<Self>) {
-        // A connection added, removed, renamed or moved between projects is
-        // saved through here, and the connections tree lists exactly those.
-        self.rebuild_connections(cx);
         // The file we could not read at startup is still the user's, and what
         // this session holds is not what they have -- so it must not flatten
         // it. The notice said nothing would be saved.
@@ -319,6 +316,7 @@ impl Workspace {
             self.note(message, cx);
         }
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         self.profiles.len() - 1
     }
 
@@ -914,6 +912,8 @@ impl Workspace {
             self.note(message, cx);
         }
         self.remember_profiles(cx);
+        // The name is the row's label.
+        self.rebuild_connections(cx);
 
         if reconnect {
             self.reconnect(index, cx);
@@ -1300,6 +1300,7 @@ impl Workspace {
         let name = profile.name.clone();
         self.active = None;
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         self.refocus_front();
         if let Err(message) = persisted {
             self.note(message, cx);
@@ -1736,6 +1737,7 @@ impl Workspace {
             // leaving one.
             self.project_named(project).connections.extend(ids);
             self.remember_profiles(cx);
+            self.rebuild_connections(cx);
         }
         // A first launch has nothing in front yet. Otherwise the connection
         // in front stays there rather than a batch of new ones each
@@ -2272,6 +2274,9 @@ impl Workspace {
         // Written here rather than at quit, so the profile in front survives a
         // crash as well as a close.
         self.remember_profiles(cx);
+        // The connection in front decides the sidebar, the listing and the
+        // group that starts open.
+        self.rebuild_connections(cx);
         if let Some(profile) = self.profile_mut() {
             profile.session.editor_needs_focus = true;
             profile.session.clear_prompts();
@@ -2373,6 +2378,7 @@ impl Workspace {
         };
         self.active = active_after_removal(self.active, index, self.profiles.len());
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         if self.profile().is_none() {
             self.refocus_front();
         }

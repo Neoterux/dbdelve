@@ -11658,15 +11658,27 @@ fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut Test
         });
         settle(cx);
 
+        // What the rows of `b` are, and the group row they are drawn under.
         let kept = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let group = connections_rows(workspace, cx)
+                .into_iter()
+                .take_while(|(_, id)| id != &b)
+                .filter(|(depth, _)| *depth == 0)
+                .last()
+                .map(|(_, id)| id);
             (
                 connections_row(workspace, cx, &b).is_some(),
                 connections_item(workspace, cx, &schema).map(|(open, _)| open),
                 selected_connections_row(workspace, cx),
+                group,
             )
         };
+        let rows = (true, Some(true), Some(birds.clone()));
         let before = kept(&workspace, cx);
-        assert_eq!(before, (true, Some(true), Some(birds.clone())));
+        assert_eq!(
+            before,
+            (rows.0, rows.1, rows.2.clone(), Some(project_row("Zoo")))
+        );
 
         let index = workspace.read_with(cx, |workspace, _| {
             workspace.profiles.iter().position(|p| p.id == "b").unwrap()
@@ -11675,17 +11687,29 @@ fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut Test
             workspace.move_to_project(index, Some("Other"), cx)
         });
         settle(cx);
-        assert_eq!(kept(&workspace, cx), before, "moved");
+        assert_eq!(
+            kept(&workspace, cx),
+            (rows.0, rows.1, rows.2.clone(), Some(project_row("Other"))),
+            "moved"
+        );
 
         workspace.update(cx, |workspace, cx| {
             workspace.rename_project("Other", "Renamed".into(), cx)
         });
         settle(cx);
-        assert_eq!(kept(&workspace, cx), before, "its project renamed");
+        assert_eq!(
+            kept(&workspace, cx),
+            (rows.0, rows.1, rows.2.clone(), Some(project_row("Renamed"))),
+            "its project renamed"
+        );
 
         workspace.update(cx, |workspace, cx| workspace.remove_project("Renamed", cx));
         settle(cx);
-        assert_eq!(kept(&workspace, cx), before, "its project deleted");
+        assert_eq!(
+            kept(&workspace, cx),
+            (rows.0, rows.1, rows.2, Some(NO_PROJECT_ROW.to_string())),
+            "its project deleted"
+        );
         quit(workspace, cx);
     });
 }
