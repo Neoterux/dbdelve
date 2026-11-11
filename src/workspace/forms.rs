@@ -23,8 +23,8 @@ use crate::agent::result::Total;
 use crate::connection_form::{ConnectionTest, Reported, dialects, suggested_dialect};
 use crate::diagram::{Diagram, DiagramTable};
 use crate::explorer::{
-    Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase, Shortcuts,
-    is_schema_row, landing, relation_copies, saved_query,
+    ExplorerLeaf, Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase,
+    Shortcuts, is_schema_row, landing, relation_copies, saved_query,
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
@@ -3167,8 +3167,7 @@ impl Workspace {
         let menu_workspace = workspace.clone();
         let syntax = profile.config.engine().syntax();
         let active_schema = profile.active_schema().map(gpui::SharedString::from);
-        let menu_schema = active_schema.clone();
-        let picks_schema = profile.config.target().picks_schema();
+        let menu_profile = profile.id.clone();
         let drop_line = self.explorer_drop.clone();
         let open_queries: HashSet<String> = profile
             .session
@@ -3413,7 +3412,9 @@ impl Workspace {
                         (None, Some(name), _) => Some(Pin::Member(Member::Query(name.clone()))),
                         (None, None, Some(leaf)) => workspace
                             .upgrade()
-                            .and_then(|workspace| workspace.read(cx).member_at(leaf.target))
+                            .and_then(|workspace| {
+                                workspace.read(cx).member_in(&profile_id, leaf.target)
+                            })
                             .map(Pin::Member),
                         _ => None,
                     };
@@ -3493,14 +3494,21 @@ impl Workspace {
                 match &shortcut {
                     Some(Shortcut::Folder(name)) => {
                         let pinned = shortcuts.pinned(&Pin::Folder(name.clone()));
-                        return folder_menu(menu, name, id, pinned, &menu_workspace);
+                        return folder_menu(menu, name, id, pinned, &menu_profile, &menu_workspace);
                     }
                     Some(Shortcut::Member {
                         member,
                         missing: true,
                         ..
                     }) => {
-                        return removal_items(menu, member, held_in, &shortcuts, &menu_workspace);
+                        return removal_items(
+                            menu,
+                            member,
+                            held_in,
+                            &shortcuts,
+                            &menu_profile,
+                            &menu_workspace,
+                        );
                     }
                     _ => {}
                 }
@@ -3525,149 +3533,26 @@ impl Workspace {
                         member,
                         held_in,
                         &shortcuts,
+                        &menu_profile,
                         &menu_workspace,
                         window,
                         cx,
                     );
                 }
-                let Some(leaf) = menu_leaves.get(id.as_ref()).copied() else {
-                    if !picks_schema || !is_schema_row(entry.item().id.as_str()) {
-                        return menu;
-                    }
-                    let workspace = menu_workspace.clone();
-                    let schema = entry.item().label.to_string();
-                    return menu.item(
-                        PopupMenuItem::new("Set as Active Schema")
-                            .checked(menu_schema.as_ref() == Some(&entry.item().label))
-                            .on_click(move |_, _, cx| {
-                                let schema = schema.clone();
-                                _ = workspace.update(cx, |workspace, cx| {
-                                    workspace.set_schema(schema, cx);
-                                });
-                            }),
-                    );
-                };
-                let Some(workspace) = menu_workspace.upgrade() else {
-                    return menu;
-                };
-                let workspace = workspace.read(cx);
-                let member = workspace.member_at(leaf.target);
-                let unknown = workspace.profile().is_some_and(|profile| {
-                    profile.shortcut_database() == ShortcutDatabase::Unknown
-                });
-                let with_shortcuts =
-                    |menu: PopupMenu, window: &mut Window, cx: &mut App| match member.clone() {
-                        Some(member) => shortcut_menu(
-                            menu,
-                            member,
-                            held_in.clone(),
-                            &shortcuts,
-                            &menu_workspace,
-                            window,
-                            cx,
-                        ),
-                        None if unknown => unknown_database_items(menu),
-                        None => menu,
-                    };
-                // A routine offers what a folder or a pin does, and no more.
-                let Some((schema, relation, kind)) = workspace.relation_at(leaf.target) else {
-                    return with_shortcuts(menu, window, cx);
-                };
-                let target = workspace.target();
-                let engine = target.engine;
-                let copy = |label: &'static str, text: String| {
-                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    })
-                };
-                let ddl_workspace = menu_workspace.clone();
-                let ddl_names = (schema.clone(), relation.clone());
-                let open = |label: &'static str, structure: bool| {
-                    let workspace = menu_workspace.clone();
-                    let (schema, relation) = (schema.clone(), relation.clone());
-                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        let (schema, relation) = (schema.clone(), relation.clone());
-                        _ = workspace.update(cx, |workspace, cx| {
-                            workspace.open_relation_view(
-                                None, schema, relation, kind, structure, window, cx,
-                            );
-                        });
-                    })
-                };
-                let import_workspace = menu_workspace.clone();
-                let import_names = (schema.clone(), relation.clone());
-                let export_workspace = menu_workspace.clone();
-                let export_names = (schema.clone(), relation.clone());
-                // Built here rather than through `PopupMenu::submenu`, for the
-                // reason the grid's "Copy Rows As" gives: that wants the menu's
-                // own context, and a tree hands over its own.
-                let exports = PopupMenu::build(window, cx, move |submenu, _, _| {
-                    let export = |label: &'static str, format: FileAs| {
-                        let workspace = export_workspace.clone();
-                        let (schema, relation) = export_names.clone();
-                        PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                            let (schema, relation) = (schema.clone(), relation.clone());
-                            _ = workspace.update(cx, |workspace, cx| {
-                                workspace.export_relation(format, schema, relation, cx);
-                            });
-                        })
-                    };
-                    let submenu = submenu
-                        .item(export("CSV", FileAs::Rows(Format::Csv)))
-                        .item(export("JSON", FileAs::Rows(Format::Json)));
-                    match engine.syntax() {
-                        db::Syntax::Sql => submenu.item(export("SQL", FileAs::Inserts)),
-                        _ => submenu,
-                    }
-                });
-                let mut menu = menu
-                    .item(open("Open Data", false))
-                    .item(open("Open Structure", true));
-                if target.takes_imports(kind) {
-                    menu = menu.item(PopupMenuItem::new("Import Rows…").on_click(
-                        move |_, window, cx| {
-                            let (schema, relation) = import_names.clone();
-                            _ = import_workspace.update(cx, |workspace, cx| {
-                                workspace.import_rows_into(None, schema, relation, window, cx);
-                            });
-                        },
-                    ));
-                }
-                menu = menu.item(PopupMenuItem::submenu("Export", exports));
-                let menu = relation_copies(target, &schema, &relation, kind)
-                    .into_iter()
-                    .fold(menu, |menu, group| {
-                        group
-                            .into_iter()
-                            .fold(menu.separator(), |menu, (label, text)| match text {
-                                Some(text) => menu.item(copy(label, text)),
-                                None => {
-                                    let (workspace, names) =
-                                        (ddl_workspace.clone(), ddl_names.clone());
-                                    let (show_workspace, show_names) =
-                                        (workspace.clone(), names.clone());
-                                    menu.item(PopupMenuItem::new(label).on_click(
-                                        move |_, _, cx| {
-                                            let (schema, relation) = names.clone();
-                                            _ = workspace.update(cx, |workspace, cx| {
-                                                workspace
-                                                    .copy_ddl(None, schema, relation, kind, cx);
-                                            });
-                                        },
-                                    ))
-                                    .item(
-                                        PopupMenuItem::new("Show DDL").on_click(move |_, _, cx| {
-                                            let (schema, relation) = show_names.clone();
-                                            _ = show_workspace.update(cx, |workspace, cx| {
-                                                workspace
-                                                    .show_ddl(None, schema, relation, kind, cx);
-                                            });
-                                        }),
-                                    )
-                                }
-                            })
-                    });
-                with_shortcuts(menu, window, cx)
+                explorer_menu(
+                    menu,
+                    MenuRow {
+                        leaf: menu_leaves.get(id.as_ref()).copied(),
+                        label: entry.item().label.clone(),
+                        id,
+                        profile: menu_profile.clone(),
+                        database: None,
+                        shortcut,
+                    },
+                    &menu_workspace,
+                    window,
+                    cx,
+                )
             })
         });
         let content = div()
@@ -3858,6 +3743,205 @@ fn first_choice(dialog: Option<&str>) -> usize {
     }
 }
 
+/// One object's or schema's row of either tree, as its menu needs to know it.
+pub(super) struct MenuRow {
+    /// The row's id among simple mode's rows.
+    pub(super) id: gpui::SharedString,
+    pub(super) label: gpui::SharedString,
+    /// The connection the row belongs to, which comes to the front before an
+    /// item acts.
+    pub(super) profile: String,
+    /// The database the connections tree lists the row under.
+    pub(super) database: Option<String>,
+    /// What the row opens, if it is an object.
+    pub(super) leaf: Option<ExplorerLeaf>,
+    pub(super) shortcut: Option<Shortcut>,
+}
+
+/// What an object's or a schema's row offers on a right click, in either
+/// tree. Resolved against the row's own connection and database rather than
+/// the one in front: a row's indices mean what they do in the catalog that
+/// listed it, and a `main.t` of another database is not this one's.
+pub(super) fn explorer_menu(
+    menu: PopupMenu,
+    row: MenuRow,
+    workspace: &gpui::WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> PopupMenu {
+    let Some(entity) = workspace.upgrade() else {
+        return menu;
+    };
+    let state = entity.read(cx);
+    let Some(profile) = state.profiles.iter().find(|found| found.id == row.profile) else {
+        return menu;
+    };
+    let target = profile.config.target();
+    let shortcuts = profile.shortcuts.clone();
+    let held_in = match &row.shortcut {
+        Some(Shortcut::Member { folder, .. }) => folder.clone(),
+        _ => None,
+    };
+    // The connection's own database is the connection itself: it takes the
+    // shortcuts, the export and the schema switch, which name no database.
+    let elsewhere = row
+        .database
+        .clone()
+        .filter(|database| profile.active_database().as_deref() != Some(database.as_str()));
+    let Some(leaf) = row.leaf else {
+        if !target.picks_schema() || !is_schema_row(&row.id) || elsewhere.is_some() {
+            return menu;
+        }
+        let (workspace, profile_id) = (workspace.clone(), row.profile.clone());
+        let schema = row.label.to_string();
+        return menu.item(
+            PopupMenuItem::new("Set as Active Schema")
+                .checked(
+                    profile
+                        .active_schema()
+                        .map(gpui::SharedString::from)
+                        .as_ref()
+                        == Some(&row.label),
+                )
+                .on_click(move |_, _, cx| {
+                    let schema = schema.clone();
+                    on_profile(&workspace, &profile_id, cx, |workspace, cx| {
+                        workspace.set_schema(schema, cx);
+                    });
+                }),
+        );
+    };
+    let member = match elsewhere {
+        None => state.member_in(&row.profile, leaf.target),
+        Some(_) => None,
+    };
+    let unknown = elsewhere.is_none() && profile.shortcut_database() == ShortcutDatabase::Unknown;
+    let with_shortcuts = |menu: PopupMenu, window: &mut Window, cx: &mut App| match member.clone() {
+        Some(member) => shortcut_menu(
+            menu,
+            member,
+            held_in.clone(),
+            &shortcuts,
+            &row.profile,
+            workspace,
+            window,
+            cx,
+        ),
+        None if unknown => unknown_database_items(menu),
+        None => menu,
+    };
+    // A routine offers what a folder or a pin does, and no more.
+    let Some((schema, relation, kind)) =
+        state.relation_in(&row.profile, elsewhere.as_deref(), leaf.target)
+    else {
+        return with_shortcuts(menu, window, cx);
+    };
+    let engine = target.engine;
+    let copy = |label: &'static str, text: String| {
+        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        })
+    };
+    let ddl_names = (schema.clone(), relation.clone());
+    let open = |label: &'static str, structure: bool| {
+        let (workspace, profile) = (workspace.clone(), row.profile.clone());
+        let (schema, relation, database) = (schema.clone(), relation.clone(), elsewhere.clone());
+        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            let (schema, relation, database) = (schema.clone(), relation.clone(), database.clone());
+            on_profile(&workspace, &profile, cx, |workspace, cx| {
+                workspace
+                    .open_relation_view(database, schema, relation, kind, structure, window, cx);
+            });
+        })
+    };
+    let import_names = (schema.clone(), relation.clone());
+    // Built here rather than through `PopupMenu::submenu`, for the reason the
+    // grid's "Copy Rows As" gives: that wants the menu's own context, and a
+    // tree hands over its own.
+    let (export_workspace, export_names, export_profile) = (
+        workspace.clone(),
+        (schema.clone(), relation.clone()),
+        row.profile.clone(),
+    );
+    let exports = PopupMenu::build(window, cx, move |submenu, _, _| {
+        let export = |label: &'static str, format: FileAs| {
+            let (workspace, profile) = (export_workspace.clone(), export_profile.clone());
+            let (schema, relation) = export_names.clone();
+            PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                let (schema, relation) = (schema.clone(), relation.clone());
+                on_profile(&workspace, &profile, cx, |workspace, cx| {
+                    workspace.export_relation(format, schema, relation, cx);
+                });
+            })
+        };
+        let submenu = submenu
+            .item(export("CSV", FileAs::Rows(Format::Csv)))
+            .item(export("JSON", FileAs::Rows(Format::Json)));
+        match engine.syntax() {
+            db::Syntax::Sql => submenu.item(export("SQL", FileAs::Inserts)),
+            _ => submenu,
+        }
+    });
+    let mut menu = menu
+        .item(open("Open Data", false))
+        .item(open("Open Structure", true));
+    if target.takes_imports(kind) {
+        let (workspace, profile, database) =
+            (workspace.clone(), row.profile.clone(), elsewhere.clone());
+        menu = menu.item(
+            PopupMenuItem::new("Import Rows…").on_click(move |_, window, cx| {
+                let (schema, relation) = import_names.clone();
+                let database = database.clone();
+                on_profile(&workspace, &profile, cx, |workspace, cx| {
+                    workspace.import_rows_into(database, schema, relation, window, cx);
+                });
+            }),
+        );
+    }
+    // An export names no database, so only the connection's own are offered.
+    if elsewhere.is_none() {
+        menu = menu.item(PopupMenuItem::submenu("Export", exports));
+    }
+    let menu = relation_copies(target, &schema, &relation, kind)
+        .into_iter()
+        .fold(menu, |menu, group| {
+            group
+                .into_iter()
+                .fold(menu.separator(), |menu, (label, text)| match text {
+                    Some(text) => menu.item(copy(label, text)),
+                    None => {
+                        let (workspace, profile, database, names) = (
+                            workspace.clone(),
+                            row.profile.clone(),
+                            elsewhere.clone(),
+                            ddl_names.clone(),
+                        );
+                        let (show_workspace, show_profile, show_database, show_names) = (
+                            workspace.clone(),
+                            profile.clone(),
+                            database.clone(),
+                            names.clone(),
+                        );
+                        menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            let (schema, relation) = names.clone();
+                            let database = database.clone();
+                            on_profile(&workspace, &profile, cx, |workspace, cx| {
+                                workspace.copy_ddl(database, schema, relation, kind, cx);
+                            });
+                        }))
+                        .item(PopupMenuItem::new("Show DDL").on_click(move |_, _, cx| {
+                            let (schema, relation) = show_names.clone();
+                            let database = show_database.clone();
+                            on_profile(&show_workspace, &show_profile, cx, |workspace, cx| {
+                                workspace.show_ddl(database, schema, relation, kind, cx);
+                            });
+                        }))
+                    }
+                })
+        });
+    with_shortcuts(menu, window, cx)
+}
+
 /// What a saved query's row offers on a right click: what its tab offers, for
 /// a query that may have no tab open.
 fn saved_query_menu(
@@ -3899,6 +3983,7 @@ fn folder_menu(
     name: &str,
     row: gpui::SharedString,
     pinned: bool,
+    profile: &str,
     workspace: &gpui::WeakEntity<Workspace>,
 ) -> PopupMenu {
     let (rename, name) = ((workspace.clone(), name.to_string()), name.to_string());
@@ -3911,7 +3996,7 @@ fn folder_menu(
             });
         }),
     )
-    .item(pin_item(pinned, Pin::Folder(name), workspace))
+    .item(pin_item(pinned, Pin::Folder(name), profile, workspace))
     .separator()
     .item(PopupMenuItem::new("Delete…").on_click(move |_, _, cx| {
         let (workspace, name) = &delete;
@@ -3929,6 +4014,7 @@ fn shortcut_menu(
     member: Member,
     held_in: Option<String>,
     shortcuts: &Shortcuts,
+    profile: &str,
     workspace: &gpui::WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
@@ -3940,18 +4026,20 @@ fn shortcut_menu(
         .collect();
     folders.sort_by_cached_key(|(name, _)| name.to_lowercase());
     let (submenu_workspace, submenu_member) = (workspace.clone(), member.clone());
+    let submenu_profile = profile.to_string();
     // Built here rather than through `PopupMenu::submenu`, as "Export" is.
     let submenu = PopupMenu::build(window, cx, move |submenu, _, _| {
         let toggle = |name: &String, held: bool| {
-            let (workspace, member, name) = (
+            let (workspace, member, name, profile) = (
                 submenu_workspace.clone(),
                 submenu_member.clone(),
                 name.clone(),
+                submenu_profile.clone(),
             );
             PopupMenuItem::new(name.clone())
                 .checked(held)
                 .on_click(move |_, _, cx| {
-                    _ = workspace.update(cx, |workspace, cx| {
+                    on_profile(&workspace, &profile, cx, |workspace, cx| {
                         workspace.toggle_in_folder(name.clone(), member.clone(), cx)
                     });
                 })
@@ -3966,6 +4054,7 @@ fn shortcut_menu(
         submenu.item(
             PopupMenuItem::new("New Folder…").on_click(move |_, window, cx| {
                 _ = submenu_workspace.update(cx, |workspace, cx| {
+                    workspace.make_front(&submenu_profile, cx);
                     workspace.new_folder(Some(submenu_member.clone()), window, cx)
                 });
             }),
@@ -3975,9 +4064,9 @@ fn shortcut_menu(
     let menu = menu
         .separator()
         .item(PopupMenuItem::submenu("Add to Folder", submenu))
-        .item(pin_item(shortcuts.pinned(&pin), pin, workspace));
+        .item(pin_item(shortcuts.pinned(&pin), pin, profile, workspace));
     match held_in {
-        Some(folder) => menu.item(remove_item(folder, member, workspace)),
+        Some(folder) => menu.item(remove_item(folder, member, profile, workspace)),
         None => menu,
     }
 }
@@ -3997,15 +4086,16 @@ fn removal_items(
     member: &Member,
     held_in: Option<String>,
     shortcuts: &Shortcuts,
+    profile: &str,
     workspace: &gpui::WeakEntity<Workspace>,
 ) -> PopupMenu {
     let pin = Pin::Member(member.clone());
     let menu = match held_in {
-        Some(folder) => menu.item(remove_item(folder, member.clone(), workspace)),
+        Some(folder) => menu.item(remove_item(folder, member.clone(), profile, workspace)),
         None => menu,
     };
     match shortcuts.pinned(&pin) {
-        true => menu.item(pin_item(true, pin, workspace)),
+        true => menu.item(pin_item(true, pin, profile, workspace)),
         false => menu,
     }
 }
@@ -4072,24 +4162,47 @@ fn drop_target(
     })
 }
 
-fn pin_item(pinned: bool, pin: Pin, workspace: &gpui::WeakEntity<Workspace>) -> PopupMenuItem {
-    let workspace = workspace.clone();
+fn pin_item(
+    pinned: bool,
+    pin: Pin,
+    profile: &str,
+    workspace: &gpui::WeakEntity<Workspace>,
+) -> PopupMenuItem {
+    let (workspace, profile) = (workspace.clone(), profile.to_string());
     PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" }).on_click(move |_, _, cx| {
-        _ = workspace.update(cx, |workspace, cx| workspace.toggle_pin(pin.clone(), cx));
+        on_profile(&workspace, &profile, cx, |workspace, cx| {
+            workspace.toggle_pin(pin.clone(), cx)
+        });
     })
 }
 
 fn remove_item(
     folder: String,
     member: Member,
+    profile: &str,
     workspace: &gpui::WeakEntity<Workspace>,
 ) -> PopupMenuItem {
-    let workspace = workspace.clone();
+    let (workspace, profile) = (workspace.clone(), profile.to_string());
     PopupMenuItem::new("Remove from Folder").on_click(move |_, _, cx| {
-        _ = workspace.update(cx, |workspace, cx| {
+        on_profile(&workspace, &profile, cx, |workspace, cx| {
             workspace.toggle_in_folder(folder.clone(), member.clone(), cx)
         });
     })
+}
+
+/// Run `act` with the connection `profile` in front. A row of another
+/// connection in the connections tree acts for that connection: the gate, the
+/// mode and the shortcuts an item meets are its own, never the front one's.
+fn on_profile(
+    workspace: &gpui::WeakEntity<Workspace>,
+    profile: &str,
+    cx: &mut App,
+    act: impl FnOnce(&mut Workspace, &mut Context<Workspace>),
+) {
+    _ = workspace.update(cx, |workspace, cx| {
+        workspace.make_front(profile, cx);
+        act(workspace, cx)
+    });
 }
 
 /// A saved query's name as a field, laid over the label it replaces. The

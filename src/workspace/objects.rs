@@ -573,8 +573,12 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn relation_at(
+    /// The relation `target` names in the catalog `profile` read for
+    /// `database` (`None` for its own), by schema, name and kind.
+    pub(crate) fn relation_in(
         &self,
+        profile: &str,
+        database: Option<&str>,
         target: ExplorerTarget,
     ) -> Option<(String, String, RelationKind)> {
         let ExplorerTarget::Relation {
@@ -584,9 +588,22 @@ impl Workspace {
         else {
             return None;
         };
-        let schema = self.catalog()?.schemas.get(schema_index)?;
+        let profile = self.profiles.iter().find(|found| found.id == profile)?;
+        let schema = catalog_in(profile, database)?.schemas.get(schema_index)?;
         let relation = schema.relations.get(relation_index)?;
         Some((schema.name.clone(), relation.name.clone(), relation.kind))
+    }
+
+    /// Bring the connection `id` in front, as acting on one of its rows
+    /// does. Whether there is one.
+    pub(crate) fn make_front(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.profiles.iter().position(|found| found.id == id) else {
+            return false;
+        };
+        if self.active != Some(index) {
+            self.activate(index, cx);
+        }
+        true
     }
 
     /// `database` as an object's own database says it: `None` for the
@@ -2071,6 +2088,21 @@ impl Workspace {
             Some(CatalogState::Loaded(catalog, _)) => Some(catalog),
             _ => None,
         }
+    }
+}
+
+/// The catalog `profile` has read for `database`: its own for `None` or its
+/// own database's name, another database's from the session opened on it.
+pub(crate) fn catalog_in<'a>(profile: &'a Profile, database: Option<&str>) -> Option<&'a Catalog> {
+    let state = match database {
+        Some(database) if profile.active_database().as_deref() != Some(database) => {
+            profile.database_catalogs.get(database)?
+        }
+        _ => &profile.catalog,
+    };
+    match state {
+        CatalogState::Loaded(catalog, _) => Some(catalog),
+        _ => None,
     }
 }
 

@@ -1123,6 +1123,15 @@ fn profile_state(
     workspace.read_with(cx, |workspace, _| profile_state_of(workspace, id))
 }
 
+/// The id of the connection in front, for a test already holding the workspace.
+fn front_id(workspace: &Workspace) -> String {
+    workspace
+        .profile()
+        .expect("a connection is in front")
+        .id
+        .clone()
+}
+
 fn front_profile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
     workspace.read_with(cx, |workspace, _| workspace.profile().unwrap().id.clone())
 }
@@ -3683,7 +3692,7 @@ fn a_new_folder_takes_its_name_from_the_keyboard_and_hands_it_back(cx: &mut Test
             workspace.update(cx, |workspace, cx| {
                 let leaf =
                     workspace.profile().unwrap().session.explorer_leaves["relation-main\0birds"];
-                let member = workspace.member_at(leaf.target);
+                let member = workspace.member_in(&front_id(workspace), leaf.target);
                 assert!(member.is_some(), "the table is nameable");
                 workspace.new_folder(member, window, cx);
             });
@@ -3821,7 +3830,9 @@ fn a_shortcut_dragged_between_folders_moves_and_one_from_the_schemas_is_added(
         let birds = cx.update(|_, cx| {
             workspace.update(cx, |workspace, cx| {
                 let leaf = workspace.profile().unwrap().session.explorer_leaves[table];
-                let birds = workspace.member_at(leaf.target).unwrap();
+                let birds = workspace
+                    .member_in(&front_id(workspace), leaf.target)
+                    .unwrap();
                 let shortcuts = &mut workspace.profile_mut().unwrap().shortcuts;
                 shortcuts.add_folder("Hot").unwrap();
                 shortcuts.add_folder("Cold").unwrap();
@@ -3896,7 +3907,9 @@ fn a_pin_dropped_on_the_top_half_of_another_goes_before_it(cx: &mut TestAppConte
                 ["birds", "fish"].map(|name| {
                     let leaf = workspace.profile().unwrap().session.explorer_leaves
                         [&explorer::relation_row("main", name)];
-                    let member = workspace.member_at(leaf.target).unwrap();
+                    let member = workspace
+                        .member_in(&front_id(workspace), leaf.target)
+                        .unwrap();
                     workspace.toggle_pin(explorer::Pin::Member(member.clone()), cx);
                     member
                 })
@@ -4387,7 +4400,9 @@ fn pinning_leaves_every_row_its_height(cx: &mut TestAppContext) {
         cx.update(|_, cx| {
             workspace.update(cx, |workspace, cx| {
                 let leaf = workspace.profile().unwrap().session.explorer_leaves[&table];
-                let birds = workspace.member_at(leaf.target).unwrap();
+                let birds = workspace
+                    .member_in(&front_id(workspace), leaf.target)
+                    .unwrap();
                 workspace.toggle_pin(explorer::Pin::Member(birds), cx);
             })
         });
