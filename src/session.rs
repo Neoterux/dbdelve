@@ -3568,7 +3568,7 @@ mod tests {
                 members: vec![
                     entry(None, None, Some("table")),
                     entry(None, None, Some("view")),
-                    entry(None, None, Some("sequence")),
+                    entry(None, None, Some("trigger")),
                     entry(Some("daily"), None, None),
                 ],
             },
