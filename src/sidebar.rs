@@ -268,7 +268,14 @@ pub(crate) struct SidebarTree {
     pub(crate) nodes: HashMap<String, Node>,
     pub(crate) highlights: HashMap<String, Vec<Range<usize>>>,
     pub(crate) shortcuts: HashMap<String, Shortcut>,
+    /// How many rows each folder row holds, drawn in a slot of its own. A row
+    /// that has not loaded has no entry: nothing is counted before it is
+    /// known, and never as `0`.
+    pub(crate) counts: HashMap<String, usize>,
 }
+
+/// What a loaded schema or database with nothing in it says in its one row.
+pub(crate) const NO_OBJECTS: &str = "No objects";
 
 /// The rows for `listed`, grouped under `projects` the way the palette's
 /// Connections scope orders them: the connections in no project first, and
@@ -905,6 +912,306 @@ mod tests {
         assert!(schema_row_is_a_database(Levels::DatabaseIsSchema));
         assert!(!schema_row_is_a_database(Levels::DatabaseThenSchema));
         assert!(!schema_row_is_a_database(Levels::Flat));
+    }
+
+    fn relation(name: &str, kind: RelationKind, partition_of: Option<&str>) -> Relation {
+        Relation {
+            name: name.into(),
+            kind,
+            partition_of: partition_of.map(str::to_string),
+            size: None,
+            rows: None,
+        }
+    }
+
+    fn schema(name: &str, relations: Vec<Relation>) -> Schema {
+        Schema {
+            name: name.into(),
+            relations,
+            routines: Vec::new(),
+            sequences: Vec::new(),
+        }
+    }
+
+    fn content_of(schemas: Vec<Schema>) -> ExplorerTree {
+        explorer::tree(
+            &Catalog {
+                schemas,
+                database: None,
+            },
+            "",
+        )
+    }
+
+    fn count_of(tree: &SidebarTree, id: &str) -> Option<usize> {
+        tree.counts.get(id).copied()
+    }
+
+    fn built(listed: Vec<Listed<'_>>) -> SidebarTree {
+        build(&[], listed, &HashMap::new())
+    }
+
+    #[test]
+    fn a_category_counts_its_top_level_rows_and_not_partitions() {
+        let tree = built(vec![listed(
+            "a",
+            "a",
+            Content::Loaded(content_of(vec![schema(
+                "main",
+                vec![
+                    relation("p", RelationKind::Table, None),
+                    relation("p_1", RelationKind::Table, Some("p")),
+                    relation("p_2", RelationKind::Table, Some("p")),
+                    relation("q", RelationKind::Table, None),
+                    relation("v", RelationKind::View, None),
+                ],
+            )])),
+        )]);
+
+        let category = |label: &str| scoped_row("a", None, &format!("category-{label}-main"));
+        assert_eq!(count_of(&tree, &category("Tables")), Some(2));
+        assert_eq!(count_of(&tree, &category("Views")), Some(1));
+        assert_eq!(count_of(&tree, &category("Dictionaries")), None);
+        // A parent is one row, however many partitions it holds.
+        let p = scoped_row("a", None, &explorer::relation_row("main", "p"));
+        assert_eq!(count_of(&tree, &p), None);
+    }
+
+    #[test]
+    fn a_schema_counts_the_objects_in_its_kinds_and_a_database_its_schemas() {
+        let content = || {
+            content_of(vec![
+                schema(
+                    "main",
+                    vec![
+                        relation("p", RelationKind::Table, None),
+                        relation("p_1", RelationKind::Table, Some("p")),
+                        relation("v", RelationKind::View, None),
+                    ],
+                ),
+                schema("other", vec![relation("t", RelationKind::Table, None)]),
+            ])
+        };
+        let tree = built(vec![database_listed(
+            "a",
+            content(),
+            Levels::DatabaseThenSchema,
+            "d",
+        )]);
+
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", Some("d"), "schema-main")),
+            Some(2)
+        );
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", Some("d"), "schema-other")),
+            Some(1)
+        );
+        assert_eq!(count_of(&tree, &database_row("a", "d")), Some(2));
+        assert_eq!(count_of(&tree, &connection_row("a")), Some(1));
+
+        // Where schemas are databases, a connection counts them.
+        let tree = built(vec![database_listed(
+            "a",
+            content(),
+            Levels::DatabaseIsSchema,
+            "d",
+        )]);
+        assert_eq!(count_of(&tree, &connection_row("a")), Some(2));
+
+        // With no database level there is nothing for a connection to count.
+        let tree = built(vec![listed("a", "a", Content::Loaded(content()))]);
+        assert_eq!(count_of(&tree, &connection_row("a")), None);
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, "schema-main")),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn nothing_is_counted_before_it_loads() {
+        let tree = built(vec![
+            database_listed(
+                "unloaded",
+                ExplorerTree::default(),
+                Levels::DatabaseThenSchema,
+                "d",
+            ),
+            listed("loading", "loading", Content::Loading),
+            listed("failed", "failed", Content::Failed("it failed".into())),
+        ]);
+        let tree_with = |content: Content| {
+            let mut one = listed("x", "x", content);
+            one.levels = Levels::DatabaseThenSchema;
+            built(vec![one])
+        };
+
+        for content in [
+            Content::Unloaded,
+            Content::Loading,
+            Content::Failed("no".into()),
+        ] {
+            let tree = tree_with(content);
+            assert!(tree.counts.is_empty(), "{:?}", tree.counts);
+        }
+        // A flat connection's own row is never counted, loaded or not.
+        let flat = built(vec![listed("f", "f", Content::Loaded(birds()))]);
+        assert_eq!(count_of(&flat, &connection_row("f")), None);
+        // Nor is a notice.
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(id, node)| matches!(node, Node::Notice) && tree.counts.contains_key(id))
+        );
+    }
+
+    #[test]
+    fn a_loaded_empty_schema_counts_zero_and_says_so() {
+        let tree = built(vec![listed(
+            "a",
+            "a",
+            Content::Loaded(content_of(vec![schema("empty", Vec::new())])),
+        )]);
+
+        let id = scoped_row("a", None, "schema-empty");
+        assert_eq!(count_of(&tree, &id), Some(0));
+        let row = find(&tree.items, &id);
+        assert_eq!(row.children.len(), 1);
+        assert_eq!(row.children[0].label.as_str(), NO_OBJECTS);
+        assert!(row.children[0].is_disabled());
+        assert!(matches!(
+            tree.nodes.get(row.children[0].id.as_str()),
+            Some(Node::Notice)
+        ));
+        // The row that says so is not itself counted, and shares no id with
+        // a row of the catalog.
+        assert_eq!(count_of(&tree, row.children[0].id.as_str()), None);
+        let ids = all_ids(&tree.items);
+        assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
+    }
+
+    #[test]
+    fn counts_are_whole_numbers_whatever_their_size() {
+        let relations = (0..100_000)
+            .map(|at| relation(&format!("t{at}"), RelationKind::Table, None))
+            .collect();
+        let tree = built(vec![listed(
+            "a",
+            "a",
+            Content::Loaded(content_of(vec![schema("main", relations)])),
+        )]);
+
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, "category-Tables-main")),
+            Some(100_000)
+        );
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, "schema-main")),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn counts_do_not_depend_on_row_order() {
+        let relations = vec![
+            relation("b", RelationKind::Table, None),
+            relation("b_1", RelationKind::Table, Some("b")),
+            relation("a", RelationKind::View, None),
+            relation("c", RelationKind::Table, None),
+        ];
+        let mut reversed = relations.clone();
+        reversed.reverse();
+        let counts = |relations| {
+            built(vec![listed(
+                "a",
+                "a",
+                Content::Loaded(content_of(vec![
+                    schema("z", Vec::new()),
+                    schema("main", relations),
+                ])),
+            )])
+            .counts
+        };
+
+        let forward = counts(relations);
+        assert_eq!(forward, counts(reversed));
+        assert!(!forward.is_empty());
+    }
+
+    #[test]
+    fn group_rows_count_their_members_and_project_rows_their_connections() {
+        use crate::explorer::{
+            Folder, Member, ObjectKind, ObjectRef, Pin, ShortcutDatabase, Shortcuts,
+        };
+
+        let catalog = Catalog {
+            schemas: vec![schema(
+                "main",
+                vec![
+                    relation("birds", RelationKind::Table, None),
+                    relation("fish", RelationKind::Table, None),
+                ],
+            )],
+            database: None,
+        };
+        let object = |name: &str| {
+            Member::Object(ObjectRef {
+                database: None,
+                schema: "main".into(),
+                name: name.into(),
+                kind: ObjectKind::Relation(RelationKind::Table),
+            })
+        };
+        let shortcuts = Shortcuts {
+            folders: vec![Folder {
+                name: "Wet".into(),
+                members: vec![object("fish"), object("birds")],
+            }],
+            pins: vec![Pin::Member(object("birds"))],
+        };
+        let queries = ["one".to_string(), "two".to_string(), "three".to_string()];
+        let mut content = explorer::shortcuts(
+            &shortcuts,
+            Some(&catalog),
+            &queries,
+            &ShortcutDatabase::Unnamed,
+            "",
+        );
+        content.extend(explorer::queries(&queries, ""));
+        content.extend(explorer::tree(&catalog, ""));
+        let projects = [project("Zoo", &["a", "b"]), project("Empty", &[])];
+        let tree = build(
+            &projects,
+            vec![
+                listed("a", "a", Content::Loaded(content)),
+                listed("b", "b", Content::Unloaded),
+                listed("c", "c", Content::Unloaded),
+            ],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, explorer::PINNED_GROUP)),
+            Some(1)
+        );
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, explorer::QUERIES_GROUP)),
+            Some(3)
+        );
+        assert_eq!(
+            count_of(&tree, &scoped_row("a", None, &explorer::folder_row("Wet"))),
+            Some(2)
+        );
+        assert_eq!(count_of(&tree, &project_row("Zoo")), Some(2));
+        assert_eq!(count_of(&tree, &project_row("Empty")), Some(0));
+        assert_eq!(count_of(&tree, NO_PROJECT_ROW), Some(1));
+        // A member of a folder is one row, not a group.
+        assert!(
+            tree.counts
+                .keys()
+                .all(|id| !id.contains("relation-main\0birds"))
+        );
     }
 
     #[test]
