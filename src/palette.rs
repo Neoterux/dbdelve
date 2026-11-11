@@ -54,7 +54,7 @@ use crate::{
         CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
         routine_name,
     },
-    sidebar::{ListingScope, ViewMode},
+    sidebar::{ListingScope, NodeAction, SelectedNode, ViewMode, node_actions},
     sql,
     store::{HistoryEntry, StoredProject},
     structure_grid::Section,
@@ -470,7 +470,7 @@ pub enum Command {
     /// What the sidebar's menu offers on the node the row was built for: one
     /// of [`crate::sidebar::node_actions`], acting on that node and not on
     /// whatever is selected when it is confirmed.
-    NodeAction(crate::sidebar::SelectedNode, crate::sidebar::NodeAction),
+    NodeAction(SelectedNode, NodeAction),
     CopyRows(RowsAs),
     FollowForeignKey,
     /// Add a filter bar and put the cursor in it.
@@ -3592,6 +3592,7 @@ const CELL: &str = "Cell";
 const EDITS: &str = "Edits";
 const RESULTS: &str = "Results";
 const TAB: &str = "Tab";
+const SIDEBAR: &str = "Sidebar";
 const CONNECTION: &str = "Connection";
 const AGENTS: &str = "Agents";
 const PROJECT: &str = "Project";
@@ -3952,6 +3953,36 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             command("Close tab", icon::CLOSE, Command::CloseObject(tab.id), TAB),
             "close_tab",
         ));
+    }
+
+    // What the sidebar's menu offers on the node selected there, from the
+    // same list; each row carries the node it was built for.
+    if let Some(node) = workspace.selected_node(cx)
+        && let Some(target) = workspace
+            .profiles
+            .iter()
+            .find(|found| found.id == node.profile)
+            .map(|found| found.config.target())
+    {
+        items.extend(
+            node_actions(node.kind, &node.name, target)
+                .into_iter()
+                .map(|action| {
+                    let icon = match action {
+                        NodeAction::NewQueryHere => icon::PLUS,
+                        NodeAction::CopyName(_) => icon::COPY,
+                        NodeAction::ShowDdl => icon::STRUCTURE,
+                        NodeAction::Refresh => icon::REFRESH,
+                    };
+                    command(
+                        action.label(),
+                        icon,
+                        Command::NodeAction(node.clone(), action),
+                        SIDEBAR,
+                    )
+                    .detail(node.name.clone())
+                }),
+        );
     }
 
     if let Some((_, limit)) = row_limit_target(session) {
