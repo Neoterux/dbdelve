@@ -1175,6 +1175,12 @@ impl Connection {
             .ok_or_else(|| plain_error(format!("{name} has no definition to show.")))
     }
 
+    /// `GET_DDL('SEQUENCE', ..)`, named from the database down like [`Self::ddl`].
+    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        let _ = (schema, name);
+        Err(plain_error("not yet".into()))
+    }
+
     /// Run statements dbdelve wrote all at the same time, in their own order.
     ///
     /// One thread each, because there is no connection to serialise them on:
@@ -2015,6 +2021,30 @@ mod tests {
             )
             .expect("runs");
         assert_eq!(shown.rows[0].get(0), Some("INFORMATION_SCHEMA"));
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_sequences_ddl_comes_from_get_ddl() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let drop = |connection: &Connection| {
+            connection
+                .query("DROP SCHEMA IF EXISTS dbdelve_sequence_probe")
+                .expect("the probe schema should drop");
+        };
+        drop(&connection);
+        connection
+            .query("CREATE SCHEMA dbdelve_sequence_probe")
+            .expect("the probe schema should be created");
+        connection
+            .query("CREATE SEQUENCE dbdelve_sequence_probe.ticket START 5 INCREMENT 2")
+            .expect("the probe sequence should be created");
+        // Unquoted names are folded to upper case by the server.
+        let ddl = connection.sequence_ddl("DBDELVE_SEQUENCE_PROBE", "TICKET");
+        drop(&connection);
+        let ddl = ddl.expect("the definition is read");
+        assert!(ddl.to_uppercase().contains("CREATE"), "{ddl}");
+        assert!(ddl.contains("TICKET"), "{ddl}");
     }
 
     #[test]
