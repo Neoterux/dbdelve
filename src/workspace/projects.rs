@@ -240,6 +240,7 @@ impl Workspace {
         }
         self.drop_project_name();
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         cx.notify();
     }
 
@@ -253,6 +254,7 @@ impl Workspace {
             ..Default::default()
         });
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         cx.notify();
     }
 
@@ -289,6 +291,7 @@ impl Workspace {
         self.collapsed_projects.remove(name);
         self.projects.retain(|project| project.name != name);
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         cx.notify();
     }
 
@@ -315,6 +318,7 @@ impl Workspace {
             }
         }
         self.remember_profiles(cx);
+        self.rebuild_connections(cx);
         cx.notify();
     }
 }
