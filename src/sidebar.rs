@@ -2401,4 +2401,54 @@ mod tests {
             "a row that is gone drops out"
         );
     }
+
+    #[test]
+    fn a_mixed_selection_offers_only_what_applies_to_every_row() {
+        use crate::db::Engine;
+        use SelectionAction::*;
+        let pg = Target::built_in(Engine::Postgres);
+        let table = (NodeKind::Relation(RelationKind::Table), pg);
+        let view = NodeKind::Relation(RelationKind::View);
+        assert_eq!(
+            selection_actions(&[table, table]),
+            [OpenAll, CopyNames, CopyDdl, ShowDdl, Pin, Refresh]
+        );
+        assert_eq!(
+            selection_actions(&[table, (NodeKind::Schema, pg)]),
+            [CopyNames, Refresh],
+            "a schema opens nothing, has no definition and is no object to pin"
+        );
+        assert_eq!(
+            selection_actions(&[
+                table,
+                (
+                    NodeKind::Relation(RelationKind::Table),
+                    Target::built_in(Engine::Redis)
+                )
+            ]),
+            [OpenAll, CopyNames, Pin, Refresh],
+            "a target with no definition to write drops both DDL actions"
+        );
+        assert_eq!(
+            selection_actions(&[table, (NodeKind::Routine, pg)]),
+            [OpenAll, CopyNames, Pin, Refresh],
+            "a routine's definition is its own tab, not a text to list"
+        );
+        assert_eq!(
+            selection_actions(&[table, (NodeKind::Sequence, pg)]),
+            [CopyNames, CopyDdl, ShowDdl, Pin, Refresh],
+            "a sequence opens no tab"
+        );
+        assert_eq!(
+            selection_actions(&[(NodeKind::Connection, pg), (NodeKind::Database, pg)]),
+            [CopyNames, Refresh]
+        );
+        assert_eq!(selection_header(&[table.0, table.0]), "2 tables selected");
+        assert_eq!(selection_header(&[table.0, view]), "2 items selected");
+        assert_eq!(selection_header(&[view, view, view]), "3 views selected");
+        assert_eq!(
+            selection_header(&[NodeKind::Schema, NodeKind::Schema]),
+            "2 schemas selected"
+        );
+    }
 }
