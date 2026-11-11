@@ -1488,7 +1488,12 @@ impl Workspace {
                 else {
                     return;
                 };
-                let key = store::object_grid_key(&object.schema, &object.name, object.filter());
+                let key = store::object_grid_key_in(
+                    object.database.as_deref(),
+                    &object.schema,
+                    &object.name,
+                    object.filter(),
+                );
                 let ObjectBody::Relation {
                     query, hydrated, ..
                 } = &mut object.body
@@ -1723,7 +1728,14 @@ impl Workspace {
                 .objects
                 .iter()
                 .find(|tab| tab.id == id && matches!(tab.body, ObjectBody::Relation { .. }))
-                .map(|tab| store::object_grid_key(&tab.schema, &tab.name, tab.filter()));
+                .map(|tab| {
+                    store::object_grid_key_in(
+                        tab.database.as_deref(),
+                        &tab.schema,
+                        &tab.name,
+                        tab.filter(),
+                    )
+                });
             let profile_id = profile.id.clone();
             profile.session.objects.retain(|tab| tab.id != id);
             profile.session.structure_requests.remove(&id);
@@ -1761,12 +1773,12 @@ impl Workspace {
         for stored in &profile.session.pending_objects {
             let (got, waiting) = restorable(
                 profile.config.engine(),
-                profile.catalog_state_of(None),
+                profile.catalog_state_of(stored.database.as_deref()),
                 std::slice::from_ref(stored),
             );
             opened.extend(
                 got.into_iter()
-                    .map(|(object, active)| (object, active, None::<String>)),
+                    .map(|(object, active)| (object, active, stored.database.clone())),
             );
             still_pending.extend(waiting);
         }

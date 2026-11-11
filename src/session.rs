@@ -330,7 +330,6 @@ impl Profile {
             .objects
             .iter()
             .map(|tab| store::StoredObject {
-                database: None,
                 active: active == Tab::Object(tab.id),
                 ..tab.stored(engine)
             })
@@ -741,6 +740,9 @@ pub(crate) struct InsertField {
 
 /// Rows on their way into a table.
 pub(crate) struct ImportDialog {
+    /// The database the table is in, `None` for the connection's own: the
+    /// columns are read, and the rows written, on that database's session.
+    pub(crate) database: Option<String>,
     pub(crate) schema: String,
     pub(crate) table: String,
     /// The table's columns, read for the dialog alone.
@@ -773,6 +775,17 @@ pub(crate) struct ImportDialog {
     /// The file column a jump or the "Map a column" link pointed at.
     pub(crate) focused_mapping: Option<usize>,
     pub(crate) mapping_scroll: gpui::ScrollHandle,
+}
+
+impl ImportDialog {
+    /// Where the import runs: on the session of its table's database, when
+    /// that is not the connection's own.
+    pub(crate) fn binding(&self) -> Option<Binding> {
+        self.database.clone().map(|database| Binding {
+            database,
+            schema: None,
+        })
+    }
 }
 
 /// Where an import's rows were read from.
@@ -876,6 +889,9 @@ pub(crate) struct PendingExport {
 pub(crate) struct Refetch {
     pub(crate) sql: String,
     pub(crate) generated: bool,
+    /// The database a relation tab of another database fetches from, which
+    /// the connection of its own is opened on; `None` for the profile's own.
+    pub(crate) binding: Option<Binding>,
 }
 
 /// An export of every row, running on a connection of its own.
@@ -2666,7 +2682,7 @@ impl ObjectTab {
 
     pub(crate) fn stored(&self, engine: Engine) -> store::StoredObject {
         store::StoredObject {
-            database: None,
+            database: self.database.clone(),
             schema: self.schema.clone(),
             name: self.name.clone(),
             filter: self.filter().to_string(),
@@ -3241,7 +3257,7 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
         }
         let _ = store::write_grid(
             &profile.id,
-            &store::object_grid_key(&tab.schema, &tab.name, filter),
+            &store::object_grid_key_in(tab.database.as_deref(), &tab.schema, &tab.name, filter),
             &store::StoredGrid {
                 limit: Some(limit.unwrap_or(0)),
                 filter: filter.clone(),
