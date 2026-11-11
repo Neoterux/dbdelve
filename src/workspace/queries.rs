@@ -103,12 +103,10 @@ impl Workspace {
         // The session a bound tab runs on, which is where the statements that
         // are stopped by what the connection holds of them (MongoDB's, and
         // ClickHouse's fallback) are kept.
-        let Some(connection) = self.profile().and_then(|profile| {
-            profile
-                .connection_for(profile.session.active)
-                .existing()
-                .cloned()
-        }) else {
+        let Some(connection) = self
+            .profile()
+            .and_then(|profile| profile.connection_to_stop(profile.session.active))
+        else {
             return;
         };
         let Some(profile) = self.profile_mut() else {

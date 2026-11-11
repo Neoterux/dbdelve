@@ -13833,6 +13833,41 @@ fn a_bound_tab_says_its_session_commits_each_statement_whatever_the_connection_h
 }
 
 #[gpui::test]
+fn a_cancel_for_a_bound_tab_goes_over_the_session_it_runs_on(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT 1");
+        let database_of = |cx: &mut VisualTestContext, bound: bool| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().unwrap();
+                let tab = profile
+                    .session
+                    .queries
+                    .iter()
+                    .find(|tab| tab.binding.is_some() == bound)
+                    .expect("the tab is open")
+                    .id;
+                // Which session it is, by the database a statement sent over
+                // it finds itself in.
+                let connection = profile.connection_to_stop(Tab::Query(tab))?;
+                let result = connection
+                    .query(
+                        "SELECT current_database()",
+                        &crate::db::CancelToken::default(),
+                        crate::db::Fetch::default(),
+                    )
+                    .ok()?;
+                result.rows.first()?.get(0).map(str::to_string)
+            })
+        };
+        assert_eq!(database_of(cx, true).as_deref(), Some("other"));
+        assert_eq!(database_of(cx, false).as_deref(), Some("e2e"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_unbound_tab_in_complex_mode_keeps_its_transaction_controls(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
