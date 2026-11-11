@@ -14275,6 +14275,170 @@ fn an_unbound_tab_in_complex_mode_keeps_its_transaction_controls(cx: &mut TestAp
     });
 }
 
+/// Clicks the control drawn under `selector` where it is, as a person does.
+fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not drawn"));
+    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    settle(cx);
+}
+
+/// The last statement of `text`, split on the terminator and trimmed.
+fn last_statement(text: &str) -> String {
+    text.split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The connection holding Manual's transaction open with `statement` run in
+/// it: Manual clicked from an unbound object tab of the own database's `t`,
+/// then `statement` run in the query tab that brings forward.
+fn manual_with_open_transaction(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    statement: &str,
+) {
+    open_table_by_clicking(workspace, cx, "e2e", "t");
+    click_selector(cx, "auto-commit-manual");
+    let (auto_commit, open, _) = transaction_state(workspace, cx);
+    assert!(!auto_commit && open, "the BEGIN ran");
+    run_in_front(workspace, cx, statement);
+}
+
+fn open_transaction_statements(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().transaction_statements.clone()
+    })
+}
+
+#[gpui::test]
+fn auto_from_manual_asks_to_commit_or_roll_back_and_lists_the_transactions_statements(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
+
+        let before = (
+            buffer(&workspace, cx),
+            transaction_state(&workspace, cx),
+            open_transaction_statements(&workspace, cx),
+        );
+        click_selector(cx, "auto-commit-auto");
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            Some("end-transaction"),
+            "Auto over an open transaction asks"
+        );
+        assert_eq!(
+            drawn(
+                cx,
+                &[
+                    "end-transaction-0",
+                    "end-transaction-1",
+                    "end-transaction-2",
+                    "end-transaction-statement-0"
+                ]
+            ),
+            [true, true, true, false],
+            "Commit, Roll back and Cancel are drawn, the statements collapsed"
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.dialog_choice.get()),
+            2,
+            "the ring opens on Cancel"
+        );
+        assert_eq!(
+            (
+                buffer(&workspace, cx),
+                transaction_state(&workspace, cx),
+                open_transaction_statements(&workspace, cx)
+            ),
+            before,
+            "raising the question sends nothing"
+        );
+
+        click_selector(cx, "end-transaction-statements");
+        assert_eq!(
+            drawn(
+                cx,
+                &[
+                    "end-transaction-statement-0",
+                    "end-transaction-statement-1",
+                    "end-transaction-statement-2"
+                ]
+            ),
+            [true, true, false],
+            "the toggle shows one block per statement"
+        );
+        assert_eq!(
+            open_transaction_statements(&workspace, cx),
+            ["BEGIN", "INSERT INTO t VALUES (7)"]
+        );
+
+        click_selector(cx, "end-transaction-0");
+        assert_eq!(front_dialog(&workspace, cx), None, "the answer closes it");
+        assert_eq!(
+            last_statement(&buffer(&workspace, cx)),
+            "COMMIT",
+            "a bare COMMIT, with no BEGIN after it"
+        );
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(auto_commit && !open, "the switch reads Auto, nothing open");
+        assert!(open_transaction_statements(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["transaction-open"]), [false]);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("1"),
+            "the INSERT was committed"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_auto_prompt_leaves_auto_off_when_its_commit_is_not_sent(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
+        click_selector(cx, "auto-commit-auto");
+        assert_eq!(front_dialog(&workspace, cx), Some("end-transaction"));
+
+        // A run that cannot start: a real disconnect would clear the prompt.
+        workspace.update(cx, |workspace, _| {
+            workspace.profile_mut().unwrap().state = ProfileState::Idle;
+        });
+        click_selector(cx, "end-transaction-0");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        assert!(
+            !auto_commit && open,
+            "the switch did not move to Auto over a transaction still open"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.profile().unwrap().session.notice.as_deref(),
+                Some("The COMMIT was not sent, so auto-commit is still off.")
+            );
+        });
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => {
+                assert_eq!(error.message, "The connection is not open.")
+            }
+            _ => panic!("the run was refused"),
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_use_in_a_bound_tab_is_undone_before_its_next_run(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
