@@ -2657,6 +2657,56 @@ fn a_long_database_list_scrolls_inside_the_picker(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn editing_a_filtered_profile_in_the_form_keeps_its_filter_and_a_duplicate_starts_unfiltered(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let (config, generation) = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            (profile.config.clone(), profile.generation)
+        });
+
+        // The form edits the profile in place: the config is the same, so
+        // nothing reconnects, and the include is not the form's to drop.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_profile("e2e", "Renamed".into(), config, None, window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.name, "Renamed");
+            assert_eq!(profile.include.databases, ["e2e"]);
+            assert_eq!(profile.generation, generation, "no reconnect");
+            assert!(matches!(profile.state, ProfileState::Connected(_)));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.duplicate_profile(0, window, cx);
+        });
+        settle(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.submit_connection(&SubmitConnection, window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.profiles.len(), 2);
+            let copy = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id != "e2e")
+                .expect("the duplicate was saved");
+            assert_eq!(copy.include, crate::db::Include::default());
+            assert_eq!(workspace.profiles[0].include.databases, ["e2e"]);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
     cx: &mut TestAppContext,
 ) {
