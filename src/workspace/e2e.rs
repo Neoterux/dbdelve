@@ -1881,6 +1881,71 @@ fn a_schema_filter_hides_a_schema_of_the_own_database_and_its_sequence_does_not_
 }
 
 #[gpui::test]
+fn a_database_row_says_how_many_of_its_schemas_the_filter_shows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "include_schemas = [\"main\"]",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+             CREATE TABLE extra.x (id INTEGER); CREATE SEQUENCE extra.s;",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let database = database_row("e2e", "e2e");
+        let check = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            assert!(own_catalog(workspace, cx).2, "the routines have landed");
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(workspace.connections.counts.get(&database), Some(&1));
+                assert_eq!(workspace.connections.totals.get(&database), Some(&2));
+            });
+        };
+        assert_eq!(crate::sidebar::count_label(1, Some(2)), "1 of 2");
+        check(&workspace, cx);
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        settle(cx);
+        check(&workspace, cx);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_attached_database_row_counts_the_schemas_the_filter_left_out(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"\ninclude_schemas = [\"extra\"]",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+             CREATE TABLE extra.x (id INTEGER); CREATE SEQUENCE extra.s;",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let at =
+            connections_row(&workspace, cx, &database_row("e2e", "other")).expect("`other` shows");
+        click_connections_row(cx, at);
+
+        workspace.read_with(cx, |workspace, _| {
+            let (counts, totals) = (&workspace.connections.counts, &workspace.connections.totals);
+            let own = database_row("e2e", "e2e");
+            let other = database_row("e2e", "other");
+            // `main` is kept as the active schema and `extra` matches, so the
+            // own database left nothing out.
+            assert_eq!(counts.get(&own), Some(&2));
+            assert_eq!(totals.get(&own), None);
+            assert_eq!(counts.get(&other), Some(&0));
+            assert_eq!(totals.get(&other), Some(&1));
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_active_schema_is_kept_only_in_the_connections_own_database(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_duckdb_seeded(
