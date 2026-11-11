@@ -2059,6 +2059,7 @@ impl Connection {
                 Self::DuckDb(connection) => connection.query_bound(schema, sql, fetch),
                 Self::Redis(connection) => connection.query_bound(sql, fetch),
                 Self::Snowflake(connection) => connection.query_bound(schema, sql, cancel, fetch),
+                Self::ClickHouse(connection) => connection.query_bound(sql, cancel, fetch),
                 _ => self.query(sql, cancel, fetch),
             }
         })
