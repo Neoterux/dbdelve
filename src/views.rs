@@ -3296,6 +3296,25 @@ pub(crate) fn render_transaction(
     Some(control.into_any_element())
 }
 
+/// The element name of a chip, or of `part` of it (`context`, `tint`), for a
+/// test to find. `profile` is in it because two connections' tabs can share an
+/// id.
+pub(crate) fn chip_selector(part: &str, profile: &str, tab: Tab) -> String {
+    let (kind, id) = match tab {
+        Tab::Query(id) => ('q', id),
+        Tab::Object(id) => ('o', id),
+    };
+    match part {
+        "" => format!("tab-chip-{profile}-{kind}{id}"),
+        part => format!("tab-chip-{part}-{profile}-{kind}{id}"),
+    }
+}
+
+/// What a chip says besides the tab's name.
+pub(crate) fn chip_context(_profile: &Profile, _tab: Tab, _complex: bool) -> Option<String> {
+    None
+}
+
 /// The tab strip. It sits directly above the tab's surface and starts where the
 /// editor's text does, so a tab labels the surface under it rather than the
 /// window: the active one is lifted to the editor's tone, the rest are names

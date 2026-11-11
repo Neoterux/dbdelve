@@ -514,6 +514,37 @@ impl Workspace {
         }
     }
 
+    /// Every chip the strip draws, left to right: the connection's index and
+    /// the tab behind the chip.
+    pub(crate) fn strip_chips(&self) -> Vec<(usize, Tab)> {
+        let Some(front) = self.active else {
+            return Vec::new();
+        };
+        self.profile()
+            .map(|profile| {
+                profile
+                    .session
+                    .strip_tabs()
+                    .into_iter()
+                    .map(|tab| (front, tab))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A chip was clicked: its connection comes to the front first, so the
+    /// gate, the mode and the engine of whatever runs next are that
+    /// connection's, then its tab.
+    pub(crate) fn activate_chip(
+        &mut self,
+        _index: usize,
+        tab: Tab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(tab, window, cx);
+    }
+
     pub(crate) fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.profile().map(|profile| &profile.session) else {
             return;
