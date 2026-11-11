@@ -109,7 +109,7 @@ fn routine_row(schema: &str, routine: &Routine) -> String {
 }
 
 /// The row id of a sequence, by name like a relation's.
-fn sequence_row(schema: &str, name: &str) -> String {
+pub fn sequence_row(schema: &str, name: &str) -> String {
     format!("sequence-{schema}\0{name}")
 }
 
