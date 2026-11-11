@@ -16447,3 +16447,82 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
         quit(workspace, cx);
     });
 }
+
+/// Applies `INSERT INTO t VALUES (7)` from the tab in front as an edit does,
+/// reading back `SELECT count(*) FROM t` once it lands.
+fn apply_insert_into_own_table_from_the_front_tab(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) {
+    use crate::session::Refresh;
+    let tab = workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().session.active
+    });
+    workspace.update(cx, |workspace, cx| {
+        workspace.execute_unchecked(
+            "INSERT INTO t VALUES (7)".into(),
+            tab,
+            Some(Refresh::Statement("SELECT count(*) FROM t".into())),
+            false,
+            None,
+            None,
+            cx,
+        );
+    });
+    settle(cx);
+    query_tab(workspace, cx, |tab, _, _| match &tab.query {
+        QueryState::Complete { .. } => {}
+        _ => panic!("the edit never completed"),
+    });
+}
+
+#[gpui::test]
+fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect_empties_it(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
+        assert!(
+            recorded_statements(&workspace, cx).is_empty(),
+            "an edit with no transaction open is committed on its own, and not listed"
+        );
+
+        run_in_front(&workspace, cx, "BEGIN");
+        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
+        assert_eq!(
+            recorded_statements(&workspace, cx),
+            [
+                "BEGIN",
+                "INSERT INTO t VALUES (7)",
+                // The tab's own statement run again to show the change: the
+                // user's statement through the user's path, as the history has it.
+                "SELECT count(*) FROM t"
+            ],
+            "an edit applied inside the open transaction is committed with it, so it is listed"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.begin_connect(0, cx));
+        assert!(
+            recorded_statements(&workspace, cx).is_empty(),
+            "a connect leaves nothing of the transaction it replaces"
+        );
+        settle(cx);
+        assert_eq!(profile_flags(&workspace, cx).0, false);
+
+        run_in_front(&workspace, cx, "BEGIN");
+        assert_eq!(recorded_statements(&workspace, cx), ["BEGIN"]);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.disconnect(&Disconnect, window, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = &workspace.profiles[0];
+            assert!(
+                profile.transaction_statements.is_empty() && !profile.in_transaction,
+                "a disconnect empties the record with the transaction"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
