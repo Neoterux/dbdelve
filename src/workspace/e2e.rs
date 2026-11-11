@@ -13512,6 +13512,68 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
     });
 }
 
+/// Applies `INSERT INTO u VALUES (7)` from the tab in front as an edit does,
+/// and reads back what the tab holds once it lands.
+fn apply_insert_from_the_front_tab(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> QueryState {
+    use crate::session::Refresh;
+    let tab = workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().session.active
+    });
+    workspace.update(cx, |workspace, cx| {
+        workspace.execute_unchecked(
+            "INSERT INTO u VALUES (7)".into(),
+            tab,
+            Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+            false,
+            None,
+            None,
+            cx,
+        );
+    });
+    settle(cx);
+    query_tab(workspace, cx, |tab, _, _| tab.query.clone())
+}
+
+#[gpui::test]
+fn an_edit_is_refused_while_a_transaction_is_open_on_its_databases_session(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "BEGIN");
+
+        // A second tab bound to `other` shares the session the BEGIN is on:
+        // an edit applied there would join a transaction nothing shows.
+        new_query_here(&workspace, cx, Some("other"), None);
+        match apply_insert_from_the_front_tab(&workspace, cx) {
+            QueryState::Failed(error) => assert!(
+                error.message.contains("transaction") && error.message.contains("not sent"),
+                "{}",
+                error.message
+            ),
+            _ => panic!("an edit must not join another tab's open transaction"),
+        }
+
+        // Ending it from either tab frees the session, and nothing was written.
+        run_in_front(&workspace, cx, "ROLLBACK");
+        run_in_front(&workspace, cx, "SELECT count(*) FROM u");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("0"));
+        assert!(
+            matches!(
+                apply_insert_from_the_front_tab(&workspace, cx),
+                QueryState::Complete { .. }
+            ),
+            "the edit runs once the transaction has ended"
+        );
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn every_row_of_a_bound_tabs_result_is_not_fetched_on_the_profiles_own_session(
     cx: &mut TestAppContext,
