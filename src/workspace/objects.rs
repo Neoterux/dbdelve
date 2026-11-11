@@ -8,7 +8,7 @@ use super::*;
 use super::sidebar::new_query_binding;
 use crate::db::{ColumnDefinition, Structure};
 use crate::session::{Binding, Explained, Finished, Queue, Routed, TabKey};
-use crate::sidebar::{NodeAction, NodeKind, SelectedNode};
+use crate::sidebar::{NodeAction, NodeKind, SelectedNode, schema_row_is_a_database};
 
 /// A definition being read: the connection it was asked of, by id and
 /// generation, and the read itself.
@@ -659,12 +659,32 @@ impl Workspace {
                         let (database, schema) = new_query_binding(node, target);
                         self.new_query_here(&node.profile, database, schema, window, cx);
                     }
-                    ViewMode::Simple => self.open_query_tab(None, window, cx),
+                    // Simple mode has one active schema for every tab, so it
+                    // moves before the tab opens, and a move that is refused
+                    // leaves no tab on the schema it did not reach.
+                    ViewMode::Simple => {
+                        let moved = match node.kind {
+                            NodeKind::Schema => {
+                                let is_database = schema_row_is_a_database(self.target().levels());
+                                self.move_to_schema_row(node.name.clone(), is_database, window, cx)
+                            }
+                            _ => true,
+                        };
+                        if moved {
+                            self.open_query_tab(None, window, cx);
+                        }
+                    }
                 }
             }
             NodeAction::Refresh => {
-                if self.make_front(&node.profile, cx) {
-                    self.refresh_schema(cx);
+                if !self.make_front(&node.profile, cx) {
+                    return;
+                }
+                // Another database is read over its own session, and only it:
+                // the connection's own catalog is not asked again for it.
+                match self.elsewhere(node.database.clone()) {
+                    Some(database) => self.reload_database(&node.profile, database, cx),
+                    None => self.refresh_schema(cx),
                 }
             }
         }
@@ -675,12 +695,17 @@ impl Workspace {
     /// notice it set, and nothing moved.
     pub(crate) fn move_to_schema_row(
         &mut self,
-        _name: String,
-        _is_database: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        name: String,
+        is_database: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> bool {
-        true
+        match is_database {
+            true => self.set_database(name, window, cx),
+            false if self.target().picks_schema() => self.set_schema(name, cx),
+            // A target that picks no schema has nothing to move.
+            false => true,
+        }
     }
 
     /// Bring the connection `id` in front, as acting on one of its rows

@@ -808,7 +808,7 @@ impl Workspace {
             }
             Command::SelectTheme => self.select_theme(&SelectTheme, window, cx),
             Command::SelectDatabase => self.select_database(&SelectDatabase, window, cx),
-            Command::SetDatabase(name) => self.set_database(name, window, cx),
+            Command::SetDatabase(name) => _ = self.set_database(name, window, cx),
             Command::SetTarget(target) => {
                 if let Some(form) = &mut self.form {
                     form.set_target(target);
@@ -816,7 +816,7 @@ impl Workspace {
                 cx.notify();
             }
             Command::SelectSchema => self.select_schema(window, cx),
-            Command::SetSchema(name) => self.set_schema(name, cx),
+            Command::SetSchema(name) => _ = self.set_schema(name, cx),
             Command::SetTheme(side, theme) => self.set_theme(side, *theme, window, cx),
             Command::BrowseThemes(source, side) => {
                 self.open_palette(PaletteMode::ImportTheme(source, side), window, cx)
