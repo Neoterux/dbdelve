@@ -1305,7 +1305,7 @@ pub fn relation_copies(
     kind: RelationKind,
 ) -> [Vec<(&'static str, Option<String>)>; 2] {
     let engine = target.engine;
-    let mut reads = Vec::new();
+    let mut reads = vec![("Copy Name", Some(relation.to_string()))];
     if target.copies_ddl() {
         reads.push(("Copy DDL", None));
     }

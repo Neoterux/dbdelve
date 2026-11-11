@@ -2935,8 +2935,8 @@ fn the_relation_menu_offers_show_ddl_where_the_target_copies_ddl(cx: &mut TestAp
         cx.simulate_keystrokes("secondary-k e");
         settle(cx);
         // Open Data, Open Structure, Import Rows, Export, then the copies: Copy
-        // DDL is the fifth item and Show DDL the one after it.
-        for (downs, copied, dialog) in [(5, true, None), (6, false, Some("show-ddl"))] {
+        // Name, then Copy DDL as the sixth item and Show DDL the one after it.
+        for (downs, copied, dialog) in [(6, true, None), (7, false, Some("show-ddl"))] {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string("before menu".into()));
             let row = explorer_row(&workspace, "relation-main\0birds", cx).center();
             cx.simulate_event(gpui::MouseDownEvent {
@@ -14320,11 +14320,14 @@ fn the_connections_trees_object_menu_is_simple_modes_menu(cx: &mut TestAppContex
             pick_from_connections_menu(cx, at, downs);
             assert_eq!(clipboard(cx), copied, "item {downs}");
             assert_eq!(front_dialog(&workspace, cx), dialog, "item {downs}");
-            assert_eq!(
-                front_profile(&workspace, cx),
-                "b",
-                "the row's connection is in front once an item acts"
-            );
+            // Copying a name acts on nothing of the connection's.
+            if downs > 5 {
+                assert_eq!(
+                    front_profile(&workspace, cx),
+                    "b",
+                    "the row's connection is in front once an item acts on it"
+                );
+            }
             if dialog.is_some() {
                 press(cx, "escape");
             }
