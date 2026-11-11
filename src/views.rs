@@ -3234,8 +3234,8 @@ pub(crate) fn render_view_sorting(
 /// Only where the engine has a transaction for the user to drive, and only on
 /// a live connection: every control here writes a statement into the buffer
 /// and runs it, and with nothing connected there is nothing to run it on.
-/// A bound tab gets no controls, only the word that its session commits each
-/// statement.
+/// A bound tab gets no controls, only what its session does, plus the
+/// connection's own state when that is not plain auto-commit.
 pub(crate) fn render_transaction(
     profile: &Profile,
     cx: &mut Context<Workspace>,
@@ -3247,34 +3247,56 @@ pub(crate) fn render_transaction(
     // A tab bound to a database runs on that database's own session, which
     // commits each statement whatever the connection's own session is holding:
     // the switch and the buttons below are that session's, and drawn for this
-    // tab they would say a write could still be rolled back.
+    // tab they would say a write could still be rolled back. What the
+    // connection's own session holds is still reported, with no way to end it
+    // from here: a transaction left open there holds locks whatever tab is in
+    // front.
     if let Some(binding) = profile.binding_of(profile.session.active) {
-        let says = match profile.bound_transactions.contains(&binding.database) {
-            true => "Transaction open on this tab's session",
-            false => "Auto, on this tab's session",
-        };
-        return Some(
+        let faint = |text: &'static str| {
             div()
-                .debug_selector(|| "transaction-bound".into())
                 .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                .child(
-                    div()
-                        .text_size(px(layout::chrome(layout::TEXT_SM)))
-                        .text_color(t.text_faint)
-                        .child("Tx"),
-                )
-                .child(
-                    div()
+                .whitespace_nowrap()
+                .text_color(t.text_faint)
+                .child(text)
+        };
+        let mut bound = div()
+            .debug_selector(|| "transaction-bound".into())
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(layout::SPACE_XS))
+            .child(faint("Tx"))
+            .child(
+                match profile.bound_transactions.contains(&binding.database) {
+                    true => open_indicator(
+                        "transaction-bound-open",
+                        "Transaction open on this tab's session",
+                        t,
+                    ),
+                    false => div()
                         .flex_shrink_0()
                         .whitespace_nowrap()
                         .text_color(t.text_muted)
-                        .child(says),
-                )
-                .into_any_element(),
-        );
+                        .child("Auto, on this tab's session")
+                        .into_any_element(),
+                },
+            );
+        if !profile.auto_commit || profile.in_transaction {
+            bound = bound.child(faint("·")).child(
+                div()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(t.text_muted)
+                    .child(match profile.auto_commit {
+                        false => "Connection: Manual",
+                        true => "Connection:",
+                    }),
+            );
+            if profile.in_transaction {
+                bound = bound.child(open_indicator("transaction-open", "Transaction open", t));
+            }
+        }
+        return Some(bound.into_any_element());
     }
     let (auto_commit, open) = (profile.auto_commit, profile.in_transaction);
     let mut control = div()
@@ -3289,32 +3311,34 @@ pub(crate) fn render_transaction(
                 .child("Tx"),
         )
         .children([(true, "Auto"), (false, "Manual")].map(|(choice, label)| {
-            choice_chip(
-                ("auto-commit", choice as usize),
-                label,
-                choice == auto_commit,
-                cx,
-                move |workspace, window, cx| {
-                    // One action that flips, two chips that name a side:
-                    // clicking the one already lit would flip it away from
-                    // what it says. Read now rather than at render, since a
-                    // run since then may have changed it.
-                    let current = workspace.profile().map(|profile| profile.auto_commit);
-                    if current.is_some_and(|current| current != choice) {
-                        workspace.toggle_auto_commit(&ToggleAutoCommit, window, cx);
+            div()
+                .debug_selector(move || {
+                    match choice {
+                        true => "auto-commit-auto",
+                        false => "auto-commit-manual",
                     }
-                },
-            )
+                    .into()
+                })
+                .child(choice_chip(
+                    ("auto-commit", choice as usize),
+                    label,
+                    choice == auto_commit,
+                    cx,
+                    move |workspace, window, cx| {
+                        // One action that flips, two chips that name a side:
+                        // clicking the one already lit would flip it away from
+                        // what it says. Read now rather than at render, since a
+                        // run since then may have changed it.
+                        let current = workspace.profile().map(|profile| profile.auto_commit);
+                        if current.is_some_and(|current| current != choice) {
+                            workspace.toggle_auto_commit(&ToggleAutoCommit, window, cx);
+                        }
+                    },
+                ))
         }));
     if open {
         control = control
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .whitespace_nowrap()
-                    .text_color(t.text_muted)
-                    .child("open"),
-            )
+            .child(open_indicator("transaction-open", "Transaction open", t))
             .child(
                 button(
                     "commit-transaction",
@@ -3343,6 +3367,29 @@ pub(crate) fn render_transaction(
             );
     }
     Some(control.into_any_element())
+}
+
+/// The sign that a transaction is open, drawn as a fill rather than as muted
+/// text: an uncommitted transaction holds locks and dies with its session, so
+/// it must not read like a label. It wears the pending-cell wash because both
+/// are "changed and not yet committed". Sized as a choice chip so it sits level
+/// with the chips beside it.
+fn open_indicator(selector: &'static str, label: &'static str, t: Theme) -> AnyElement {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .whitespace_nowrap()
+        .h(px(layout::chrome(24.)))
+        .px(px(layout::SPACE_SM))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .text_size(px(layout::chrome(layout::TEXT_SM)))
+        .bg(t.edited)
+        .text_color(t.text)
+        .child(label)
+        .into_any_element()
 }
 
 /// The element name of a chip, or of `part` of it (`context`, `tint`), for a
