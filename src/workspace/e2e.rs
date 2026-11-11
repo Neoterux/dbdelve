@@ -15536,3 +15536,111 @@ fn removing_a_connection_takes_its_stored_rows_and_leaves_the_others(cx: &mut Te
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn expanding_a_folded_loaded_row_builds_its_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = remembering_fixture(cx);
+        let (a, main) = (connection_row("a"), scoped_row("a", None, "schema-main"));
+        assert_eq!(profile_state(&workspace, cx, "a"), "connected");
+        assert_eq!(
+            connections_item(&workspace, cx, &a),
+            Some((false, vec![(format!("{a}/folded"), String::new(), true)])),
+            "a connected connection left folded is one row and one inert row"
+        );
+        open_connections_rows(&workspace, cx, &[a.clone()]);
+        assert!(
+            connections_row_open(&workspace, cx, &a),
+            "the click opened it"
+        );
+        let (_, children) = connections_item(&workspace, cx, &a).expect("the row is showing");
+        assert!(
+            children.iter().any(|(id, ..)| *id == main),
+            "and its rows were built for it: {children:?}"
+        );
+        assert_eq!(
+            connections_item(&workspace, cx, &main).map(|(open, children)| (open, children.len())),
+            Some((false, 1)),
+            "each folded in its turn"
+        );
+        open_connections_rows(&workspace, cx, &[main.clone()]);
+        assert!(
+            connections_row_open(
+                &workspace,
+                cx,
+                &scoped_row("a", None, "category-Tables-main")
+            ),
+            "the schema's own rows are there to be clicked"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_rebuild_landing_while_moving_through_the_tree_keeps_folds_and_the_selection(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = remembering_fixture(cx);
+        let rows = [
+            connection_row("a"),
+            scoped_row("a", None, "schema-main"),
+            scoped_row("a", None, "category-Tables-main"),
+        ];
+        open_connections_rows(&workspace, cx, &rows);
+        let (birds, flocks) = (table_row("a", "birds"), table_row("a", "flocks"));
+        click_connections_row_with(&workspace, cx, &birds, gpui::Modifiers::default());
+        click_connections_row_with(&workspace, cx, &flocks, gpui::Modifiers::secondary_key());
+        let before = selected_rows(&workspace, cx);
+        assert_eq!(before.0, [birds, flocks]);
+
+        // A saved query changing, then table sizes landing: both rebuild the
+        // tree while the user is part-way through it.
+        workspace.update(cx, |workspace, cx| {
+            workspace.refresh_query_library("a", cx);
+            workspace.read_sizes_again(cx);
+        });
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.refresh_query_library("a", cx));
+        settle(cx);
+
+        for row in &rows {
+            assert!(connections_row_open(&workspace, cx, row), "{row} is open");
+        }
+        assert_eq!(selected_rows(&workspace, cx), before);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn focusing_the_sidebar_reveals_the_front_row_inside_a_folded_subtree(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = remembering_fixture(cx);
+        let birds = table_row("a", "birds");
+        open_connections_rows(
+            &workspace,
+            cx,
+            &[
+                connection_row("a"),
+                scoped_row("a", None, "schema-main"),
+                scoped_row("a", None, "category-Tables-main"),
+                birds.clone(),
+            ],
+        );
+        // Folded again and the tree rebuilt, so what was under it is gone from
+        // the rows drawn.
+        open_connections_rows(&workspace, cx, &[connection_row("a")]);
+        workspace.update(cx, |workspace, cx| workspace.refresh_query_library("a", cx));
+        settle(cx);
+        assert!(connections_row(&workspace, cx, &birds).is_none());
+
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        assert_eq!(
+            selected_rows(&workspace, cx).1,
+            Some(birds),
+            "the tab in front is revealed where it is, through every folded row above it"
+        );
+        quit(workspace, cx);
+    });
+}
