@@ -824,6 +824,12 @@ impl Connection {
         assemble_sequences(sequences)
     }
 
+    /// `SHOW CREATE SEQUENCE`, MariaDB's only.
+    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        let _ = (schema, name);
+        Err(plain_error("not yet".into()))
+    }
+
     /// On a connection of its own, as [`Self::cancel`] is, so opening every
     /// table for its statistics never holds the mutex a user's query waits on.
     /// The side connection is dropped on return.
@@ -2679,6 +2685,51 @@ mod tests {
 
         drop(&connection);
         assert_eq!(listed, vec!["dbdelve_sequence_probe_ticket".to_string()]);
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_mariadb_shows_a_sequences_create_statement() {
+        let connection = live(Engine::MariaDb);
+        let drop = |connection: &Connection| {
+            connection
+                .query(
+                    "DROP SEQUENCE IF EXISTS dbdelve_sequence_probe_ticket",
+                    Fetch::default(),
+                )
+                .expect("the probe sequence should drop");
+        };
+        drop(&connection);
+        connection
+            .query(
+                "CREATE SEQUENCE dbdelve_sequence_probe_ticket START WITH 5 INCREMENT BY 2",
+                Fetch::default(),
+            )
+            .expect("the probe sequence should be created");
+        connection
+            .query(
+                "SELECT NEXTVAL(dbdelve_sequence_probe_ticket)",
+                Fetch::default(),
+            )
+            .expect("the counter moves");
+        let database = live_config(Engine::MariaDb).database;
+        let ddl = connection.sequence_ddl(&database, "dbdelve_sequence_probe_ticket");
+        drop(&connection);
+        let ddl = ddl.expect("the definition is read");
+        assert!(ddl.starts_with("CREATE SEQUENCE"), "{ddl}");
+        assert!(ddl.contains("dbdelve_sequence_probe_ticket"), "{ddl}");
+        assert!(ddl.ends_with(';'), "{ddl}");
+        assert!(
+            ddl.to_lowercase().contains("start with 5"),
+            "the statement carries the start and not the counter: {ddl}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_mysql_shows_no_sequence_definition() {
+        let connection = live(Engine::MySql);
+        assert!(connection.sequence_ddl("dbdelve_dev", "anything").is_err());
     }
 
     #[test]
