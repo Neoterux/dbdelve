@@ -102,6 +102,10 @@ pub(crate) struct Profile {
     /// cleared, so a reconnect that drops the refresh's answer takes the
     /// refresh with it.
     pub(crate) schema_refresh: Option<u64>,
+    /// Whether a filter was saved while a read of the catalog was under way,
+    /// which a refresh would have declined to start: the landing of that read
+    /// clears this and reads again with the saved filter.
+    pub(crate) reread_after_load: bool,
     /// What the server listed the last time Select Database asked.
     pub(crate) databases: Databases,
     /// The session opened for each other database of the server, by name,

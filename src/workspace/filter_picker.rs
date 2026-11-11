@@ -451,6 +451,14 @@ impl Workspace {
             return;
         };
         profile.include = include;
+        // A refresh declines to start while a read is under way, so the one
+        // that lands reads again instead (the filter is saved either way).
+        let under_way = profile.refreshing_schema()
+            || matches!(
+                profile.catalog,
+                CatalogState::Loading | CatalogState::Loaded(_, Routines::Loading)
+            );
+        profile.reread_after_load = under_way;
         // What the filter now hides is not read: its catalog goes. A session
         // a tab is bound to stays, since the tab keeps running on it.
         let shown = profile.shown();
@@ -459,7 +467,9 @@ impl Workspace {
             .retain(|database, _| shown.shows_database(database));
         self.remember_profiles(cx);
         self.close_filter_picker(cx);
-        self.refresh_schema(cx);
+        if !under_way {
+            self.refresh_schema(cx);
+        }
     }
 
     /// One list of the dialog: its label, what it is of, the names over a
