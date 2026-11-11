@@ -837,6 +837,9 @@ fn connection_item(
     // connection has none of.
     let counts_databases = connection.levels != Levels::Flat;
     let mut count = None;
+    // What the filter dropped from the catalog rows that sit on the
+    // connection itself: where they are databases, the databases it hides.
+    let mut catalog_left_out = 0;
     let others = connection.databases;
     let (open, children) = match connection.content {
         // Nothing has asked it to load, and nothing will until this row is
@@ -862,6 +865,11 @@ fn connection_item(
         // database).
         Content::Loaded(content) if content.items.is_empty() && others.is_empty() => {
             count = counts_databases.then_some(0);
+            // Where the schemas are the database's own, they are not what
+            // the connection counts.
+            if connection.levels != Levels::DatabaseThenSchema {
+                catalog_left_out = content.left_out;
+            }
             (
                 followed,
                 vec![notice(
@@ -879,6 +887,7 @@ fn connection_item(
                 leaves,
                 highlights,
                 shortcuts,
+                left_out,
             } = content;
             let mut rows = Rows {
                 profile: connection.id,
@@ -917,6 +926,9 @@ fn connection_item(
                             },
                         );
                         tree.counts.insert(row.clone(), under.len());
+                        if left_out > 0 && !search.filtering {
+                            tree.totals.insert(row.clone(), under.len() + left_out);
+                        }
                         let open = search.filtering || folds.get(&row).copied().unwrap_or(false);
                         let mut item = TreeItem::new(row.clone(), database.to_string());
                         item = match (under.is_empty(), open) {
@@ -932,6 +944,7 @@ fn connection_item(
                 }
                 None => {
                     count = counts_databases.then_some(catalog.len());
+                    catalog_left_out = left_out;
                     children.extend(
                         catalog
                             .into_iter()
@@ -955,12 +968,13 @@ fn connection_item(
     };
     if let Some(count) = count {
         tree.counts.insert(id.clone(), count);
-        if connection.databases_left_out > 0
-            && connection.levels.lists_other_databases()
-            && !search.filtering
-        {
-            tree.totals
-                .insert(id.clone(), count + connection.databases_left_out);
+        let databases_left_out = match connection.levels.lists_other_databases() {
+            true => connection.databases_left_out,
+            false => 0,
+        };
+        let left_out = catalog_left_out + databases_left_out;
+        if left_out > 0 && !search.filtering {
+            tree.totals.insert(id.clone(), count + left_out);
         }
     }
     let children = match open || search.filtering {
@@ -1019,6 +1033,7 @@ fn others_items(
                     leaves,
                     highlights,
                     shortcuts,
+                    left_out,
                 } = content;
                 let mut rows = Rows {
                     profile,
@@ -1049,6 +1064,9 @@ fn others_items(
                 };
                 if search.filtering && !named && under.is_empty() {
                     continue;
+                }
+                if left_out > 0 && !search.filtering {
+                    tree.totals.insert(row.clone(), count + left_out);
                 }
                 let children = match under.is_empty() {
                     true => vec![empty_row(tree, &row)],
