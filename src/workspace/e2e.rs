@@ -16826,6 +16826,63 @@ fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
 }
 
 #[gpui::test]
+fn a_multi_row_edit_joins_the_users_open_transaction_without_brackets_of_its_own(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text); \
+             insert into birds values (1, 'wren'), (2, 'tit');",
+        );
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        grid.update(cx, |grid, _| {
+            for (row, name) in [(0, "robin"), (1, "jay")] {
+                assert!(grid.delegate_mut().set_pending(
+                    row,
+                    1,
+                    crate::result_grid::NewValue::Value(name.into())
+                ));
+            }
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert!(
+            transaction_state(&workspace, cx).1,
+            "the batch did not end the user's transaction"
+        );
+        let batch = open_transaction_statements(&workspace, cx)
+            .into_iter()
+            .find(|statement| statement.contains("UPDATE"))
+            .expect("the batch is listed in the open transaction");
+        assert_eq!(batch.matches("UPDATE").count(), 2, "{batch}");
+        assert!(
+            !batch.contains("BEGIN") && !batch.contains("COMMIT"),
+            "{batch}"
+        );
+
+        run_in_front(&workspace, cx, "ROLLBACK");
+        run_in_front(
+            &workspace,
+            cx,
+            "select count(*) from birds where name in ('wren', 'tit')",
+        );
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("2"),
+            "the edits rolled back with the transaction they joined"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect_empties_it(
     cx: &mut TestAppContext,
 ) {

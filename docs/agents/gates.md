@@ -89,10 +89,13 @@ where the user can read it:
   `BEGIN;` leave the `BEGIN;` alone. A generated multi-row edit batch brackets
   itself on MySQL, MariaDB, SQLite and SQL Server, and its `COMMIT` would end
   the user's open transaction (MySQL and MariaDB commit it at the batch's
-  `START TRANSACTION`), so while `Profile::in_transaction` is set it is not
-  sent: `Profile::own_write_refusal` says `Not sent: …`, in the way
-  `Profile::bound_write_refusal` does for a bound session. A single-statement
-  edit carries no bracket and joins the transaction.
+  `START TRANSACTION`). So while `Profile::in_transaction` is set, an edit on
+  the connection's own session is written without brackets
+  (`sql::update_batch_joining`) and joins the open transaction, committed or
+  rolled back with it, as a single-statement edit always has. A bracketed
+  batch that still reaches the run (written before the transaction opened) is
+  not sent: `Profile::own_write_refusal` says `Not sent: …`, in the way
+  `Profile::bound_write_refusal` does for a bound session.
 - **Format Query** rewrites the buffer on command only, through
   `sqlformat`'s token-level reformatter (on MongoDB, `mql::format`'s
   bracket-depth layout over the tree-sitter tokens, refused unless the
