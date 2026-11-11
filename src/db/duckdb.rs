@@ -39,7 +39,8 @@ use crate::sql::Projected;
 use super::{
     Catalog, Column, Databases, DbError, EditTarget, Engine, Fetch, QueryResult, Reference,
     RowBuilder, Stopped, Structure, Unpicked, assemble_catalog, assemble_foreign_keys,
-    assemble_references, assemble_structure, plain_error, required_cell, terminated,
+    assemble_references, assemble_sequences, assemble_structure, plain_error, required_cell,
+    terminated,
 };
 
 // Workaround for duckdb-rs#920, fixed upstream by #923 but unreleased past
@@ -420,9 +421,16 @@ impl Connection {
     }
 
     /// The sequences of the database the connection is on, as a catalog holding
-    /// nothing else, for [`Catalog::join_sequences`].
+    /// nothing else, for [`Catalog::join_sequences`]. The same database
+    /// [`Self::catalog`] reads, and the temporary ones left out as it leaves
+    /// out the internal tables.
     pub fn sequences(&self) -> Result<Catalog, DbError> {
-        Ok(Catalog::default())
+        let result = self.internal_query(
+            "SELECT schema_name, sequence_name FROM duckdb_sequences()
+             WHERE NOT temporary AND database_name = current_database()
+             ORDER BY 1, 2",
+        )?;
+        assemble_sequences(result)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {

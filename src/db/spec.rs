@@ -742,6 +742,9 @@ pub struct Abilities {
     /// rather than the one the connection is on.
     pub catalog_lists_databases: bool,
     pub picks_schema: bool,
+    /// The catalog holds sequences, listed as their own kind of object beside
+    /// the routines, in the catalog's second half.
+    pub lists_sequences: bool,
     pub exact_row_estimates: bool,
     pub schema_switch_waits_for_transaction: bool,
     /// Why no transaction spans an import's chunks.
@@ -761,6 +764,7 @@ impl Abilities {
         switches_database_in_session: false,
         catalog_lists_databases: false,
         picks_schema: false,
+        lists_sequences: false,
         exact_row_estimates: false,
         schema_switch_waits_for_transaction: false,
         chunk_refusal: None,
@@ -1534,6 +1538,7 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
         // in-memory database opened again is a new, empty one.
         switches_database_in_session: true,
         picks_schema: true,
+        lists_sequences: true,
         ..Abilities::NONE
     },
     hooks: Hooks {
