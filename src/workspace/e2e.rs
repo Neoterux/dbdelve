@@ -2368,6 +2368,88 @@ fn filter_databases_on_the_connection_menu_saves_a_ticked_list_and_rereads_witho
 }
 
 #[gpui::test]
+fn the_picker_lists_the_own_databases_schemas_and_saves_both_lists(cx: &mut TestAppContext) {
+    use super::filter_picker::{Listing, Which};
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "",
+            "mode = \"full\"",
+            "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; CREATE TABLE extra.x (id INTEGER); \
+             CREATE SCHEMA more; CREATE TABLE more.y (id INTEGER);",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let before = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .expect("the connection is in front")
+                .generation
+        });
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        assert!(cx.debug_bounds("filter-picker-list-schemas").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.heading(), "Filter databases and schemas");
+            let schemas = picker.schemas.as_ref().expect("DuckDB lists schemas");
+            assert_eq!(
+                schemas.listing,
+                Listing::Loaded(vec!["extra".into(), "main".into(), "more".into()]),
+                "every schema of the own database, in the server's order"
+            );
+            assert_eq!(picker.schema_hint("main"), Some("active schema"));
+            assert_eq!(picker.schema_hint("extra"), None);
+            assert_eq!(
+                picker.schemas_caption().as_deref(),
+                Some("Schemas of e2e. The schema filter applies inside every database.")
+            );
+            assert_eq!(
+                picker.preview(Which::Schemas).as_deref(),
+                Some("Showing all 3 schemas in e2e")
+            );
+        });
+
+        // The active schema is checked and cannot be unticked.
+        click_selector(cx, "filter-picker-row-schemas-1");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(picker.schemas.as_ref().unwrap().ticked.is_empty());
+        });
+        click_selector(cx, "filter-picker-row-schemas-0");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.schemas.as_ref().unwrap().ticked, ["extra"]);
+            assert_eq!(
+                picker.preview(Which::Schemas).as_deref(),
+                Some("Showing 2 of 3 schemas in e2e")
+            );
+        });
+        click_selector(cx, "filter-picker-0");
+        settle(cx);
+
+        assert_eq!(front_dialog(&workspace, cx), None, "Save closes the dialog");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.include.schemas, ["extra"]);
+            assert!(profile.include.databases.is_empty());
+            assert_eq!(profile.generation, before, "a filter edit never reconnects");
+        });
+        assert_eq!(
+            own_catalog(&workspace, cx).0,
+            ["extra", "main"],
+            "the catalog holds the ticked schema and the active one, not `more`"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
     cx: &mut TestAppContext,
 ) {

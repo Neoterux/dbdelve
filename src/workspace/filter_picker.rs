@@ -483,3 +483,16 @@ impl Workspace {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_database_then_schema_target_lists_schemas() {
+        assert!(lists_schemas(Levels::DatabaseThenSchema));
+        assert!(!lists_schemas(Levels::DatabaseIsSchema));
+        assert!(!lists_schemas(Levels::DatabaseHoldsObjects));
+        assert!(!lists_schemas(Levels::Flat));
+    }
+}
