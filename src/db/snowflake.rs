@@ -1974,6 +1974,38 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_sequence_is_listed_in_its_own_kind() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let drop = |connection: &Connection| {
+            connection
+                .query("DROP SCHEMA IF EXISTS dbdelve_sequence_probe")
+                .expect("the probe schema should drop");
+        };
+        drop(&connection);
+        connection
+            .query("CREATE SCHEMA dbdelve_sequence_probe")
+            .expect("the probe schema should be created");
+        connection
+            .query("CREATE SEQUENCE dbdelve_sequence_probe.ticket")
+            .expect("the probe sequence should be created");
+
+        let second = crate::db::Connection::Snowflake(connection.clone())
+            .routines()
+            .expect("the second half should read");
+        let listed: Vec<_> = second
+            .schemas
+            .iter()
+            .filter(|schema| schema.name == "DBDELVE_SEQUENCE_PROBE")
+            .map(|schema| schema.sequences.clone())
+            .collect();
+
+        drop(&connection);
+        // Unquoted names are folded to upper case by the server.
+        assert_eq!(listed, vec![vec!["TICKET".to_string()]]);
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
     fn live_a_use_is_refused_rather_than_quietly_forgotten() {
         // The statelessness the module header describes, pinned. The API does
         // not run a `USE` and then lose it between requests; it declines to run

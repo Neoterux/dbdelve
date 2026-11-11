@@ -758,6 +758,10 @@ impl Connection {
         assemble_catalog(QueryResult::default(), routines)
     }
 
+    pub fn sequences(&self) -> Result<Catalog, DbError> {
+        Ok(Catalog::default())
+    }
+
     /// On a connection of its own, as [`Self::cancel`] is, so opening every
     /// table for its statistics never holds the mutex a user's query waits on.
     /// The side connection is dropped on return.
@@ -2458,6 +2462,71 @@ mod tests {
             .unwrap();
         assert_eq!(last.messages.len(), 1, "{:?}", last.messages);
         assert!(last.messages[0].starts_with("Note (1051)"));
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_mariadb_lists_a_sequence_in_its_own_kind() {
+        // In the database the login owns, which cannot create another.
+        let connection = live(Engine::MariaDb);
+        let drop = |connection: &Connection| {
+            connection
+                .query(
+                    "DROP SEQUENCE IF EXISTS dbdelve_sequence_probe_ticket",
+                    Fetch::default(),
+                )
+                .expect("the probe sequence should drop");
+        };
+        drop(&connection);
+        connection
+            .query(
+                "CREATE SEQUENCE dbdelve_sequence_probe_ticket",
+                Fetch::default(),
+            )
+            .expect("the probe sequence should be created");
+
+        let second = super::super::Connection::MySql(live(Engine::MariaDb))
+            .routines()
+            .expect("the second half should read");
+        let listed: Vec<_> = second
+            .schemas
+            .iter()
+            .filter(|schema| schema.name == "dbdelve_dev")
+            .flat_map(|schema| schema.sequences.clone())
+            .filter(|name| name == "dbdelve_sequence_probe_ticket")
+            .collect();
+
+        drop(&connection);
+        assert_eq!(listed, vec!["dbdelve_sequence_probe_ticket".to_string()]);
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_mysql_lists_no_sequence_and_sends_no_sequence_statement() {
+        let connection = live(Engine::MySql);
+        let second = super::super::Connection::MySql(live(Engine::MySql))
+            .routines()
+            .expect("the second half should read");
+        assert!(
+            second
+                .schemas
+                .iter()
+                .all(|schema| schema.sequences.is_empty())
+        );
+
+        // A statement sent to a lost session fails, and a MySQL server answers
+        // a `TABLE_TYPE = 'SEQUENCE'` filter with no rows anyway, so only a
+        // dead session tells a statement never sent from one that found nothing.
+        assert!(
+            connection
+                .query("KILL CONNECTION_ID()", Fetch::default())
+                .is_err()
+        );
+        assert!(connection.is_lost());
+        let catalog = connection
+            .sequences()
+            .expect("a MySQL connection sends no sequence statement");
+        assert!(catalog.schemas.is_empty());
     }
 
     /// Each `live_` body above, run once against each server the driver

@@ -2730,6 +2730,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_sequence_is_listed_in_its_own_kind() {
+        let connection = live();
+        let drop = |connection: &Connection| {
+            connection
+                .query(
+                    "DROP SEQUENCE IF EXISTS dbdelve_sequence_probe.ticket; \
+                     DROP SCHEMA IF EXISTS dbdelve_sequence_probe",
+                    Fetch::default(),
+                )
+                .expect("the probe should drop");
+        };
+        drop(&connection);
+        // `CREATE SCHEMA` must open its own batch.
+        connection
+            .query("CREATE SCHEMA dbdelve_sequence_probe", Fetch::default())
+            .expect("the probe schema should be created");
+        connection
+            .query(
+                "CREATE SEQUENCE dbdelve_sequence_probe.ticket",
+                Fetch::default(),
+            )
+            .expect("the probe sequence should be created");
+
+        let second = crate::db::Connection::SqlServer(live())
+            .routines()
+            .expect("the second half should read");
+        let listed: Vec<_> = second
+            .schemas
+            .iter()
+            .filter(|schema| schema.name == "dbdelve_sequence_probe")
+            .map(|schema| schema.sequences.clone())
+            .collect();
+
+        drop(&connection);
+        assert_eq!(listed, vec![vec!["ticket".to_string()]]);
+    }
+
+    #[test]
     #[ignore = "requires the repository development database configured through dbdelve_MSSQL_URL"]
     fn live_a_database_named_in_another_case_is_held_as_the_server_spells_it() {
         let named = live_config().database;
