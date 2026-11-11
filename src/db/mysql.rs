@@ -1824,6 +1824,43 @@ mod tests {
         }
     }
 
+    /// A used session is put back on its own database by a bound run, whichever
+    /// database a statement of the user's moved it to.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_bound_run_moves_a_used_session_back_to_its_database() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let session = live_profile(engine)
+                .on_database("information_schema")
+                .expect("a session should open");
+            let cancel = crate::db::CancelToken::default();
+            let database = |bound: bool| {
+                let sql = "SELECT DATABASE()";
+                let result = match bound {
+                    true => session.query_bound(None, sql, &cancel, Fetch::default()),
+                    false => session.query(sql, &cancel, Fetch::default()),
+                };
+                result
+                    .ok()
+                    .and_then(|result| result.rows.first()?.get(0).map(str::to_string))
+            };
+            session
+                .query("USE dbdelve_dev", &cancel, Fetch::default())
+                .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+            assert_eq!(database(false), Some("dbdelve_dev".into()), "{engine:?}");
+            assert_eq!(
+                database(true),
+                Some("information_schema".into()),
+                "{engine:?}: put back before the statement"
+            );
+            assert_eq!(
+                database(false),
+                Some("information_schema".into()),
+                "{engine:?}: and it stays there"
+            );
+        }
+    }
+
     fn live_profile(engine: Engine) -> super::super::Connection {
         super::super::Connection::MySql(live(engine))
     }
