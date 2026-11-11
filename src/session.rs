@@ -828,6 +828,16 @@ pub(crate) struct ImportDialog {
 }
 
 impl ImportDialog {
+    /// The table as the dialog names it: with its database when that is not
+    /// the connection's own, where `public.t` of two databases would read the
+    /// same.
+    pub(crate) fn target_name(&self) -> String {
+        match &self.database {
+            Some(database) => format!("{database}.{}.{}", self.schema, self.table),
+            None => format!("{}.{}", self.schema, self.table),
+        }
+    }
+
     /// Where the import runs: on the session of its table's database, when
     /// that is not the connection's own.
     pub(crate) fn binding(&self) -> Option<Binding> {
