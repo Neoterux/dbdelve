@@ -653,6 +653,7 @@ impl Connection {
         Ok(super::Databases {
             names: (0..count).map(|index| format!("db{index}")).collect(),
             current: Some(format!("db{}", database_number(&self.server.database)?)),
+            left_out: 0,
         })
     }
 

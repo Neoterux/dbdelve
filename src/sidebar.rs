@@ -336,6 +336,9 @@ pub(crate) struct Listed<'a> {
     /// them, with how much of each is known. Empty unless the shape draws
     /// databases over its schemas or objects.
     pub(crate) databases: Vec<(String, Content)>,
+    /// How many databases of its server the profile's filter left out of
+    /// `databases`.
+    pub(crate) databases_left_out: usize,
 }
 
 /// The databases of a server that are not `current`, the one the connection
@@ -678,6 +681,10 @@ pub(crate) struct SidebarTree {
     /// that has not loaded has no entry: nothing is counted before it is
     /// known, and never as `0`.
     pub(crate) counts: HashMap<String, usize>,
+    /// What a row's count is of, shown plus left out by a filter, recorded
+    /// only when something was left out and no search text is typed. A row
+    /// without one draws its bare count.
+    pub(crate) totals: HashMap<String, usize>,
     /// The connection and database rows built folded because nothing had
     /// loaded under them. Their closed state is the build's, not a fold anyone
     /// chose, so a stored open row is not overruled by it.
@@ -688,6 +695,15 @@ pub(crate) struct SidebarTree {
     /// The row each row left out under a pruned one hangs from. A row's
     /// ancestors cannot be read from its id, and a reveal has to open them.
     pub(crate) hidden: HashMap<String, String>,
+}
+
+/// What a row's count slot says: `count`, or `count of total` where a filter
+/// left some out.
+pub(crate) fn count_label(count: usize, total: Option<usize>) -> String {
+    match total {
+        Some(total) => format!("{count} of {total}"),
+        None => count.to_string(),
+    }
 }
 
 /// What a loaded schema or database with nothing in it says in its one row.
@@ -939,6 +955,13 @@ fn connection_item(
     };
     if let Some(count) = count {
         tree.counts.insert(id.clone(), count);
+        if connection.databases_left_out > 0
+            && connection.levels.lists_other_databases()
+            && !search.filtering
+        {
+            tree.totals
+                .insert(id.clone(), count + connection.databases_left_out);
+        }
     }
     let children = match open || search.filtering {
         true => children,
@@ -1235,6 +1258,7 @@ mod tests {
             levels: Levels::Flat,
             database: None,
             databases: Vec::new(),
+            databases_left_out: 0,
         }
     }
 
@@ -1446,6 +1470,7 @@ mod tests {
             levels,
             database: Some(database.to_string()),
             databases: Vec::new(),
+            databases_left_out: 0,
         }
     }
 

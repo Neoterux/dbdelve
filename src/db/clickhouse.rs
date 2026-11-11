@@ -3992,7 +3992,7 @@ mod tests {
 #[cfg(test)]
 mod live {
     use super::*;
-    use crate::db::{Column, ConnectionConfig, Engine, ExplainMode, IndexKind, is_cancel};
+    use crate::db::{Column, ConnectionConfig, Engine, ExplainMode, IndexKind, Shown, is_cancel};
     use crate::explorer::{drop_sql, select_top_sql, truncate_sql};
     use crate::export::{RowsAs, render_rows_as};
     use crate::filter::{Operator, filter_predicate};
@@ -5049,7 +5049,7 @@ mod live {
     #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
     fn live_the_databases_list_flags_the_one_connected_to() {
         let databases = live_any(live_config())
-            .databases(Engine::ClickHouse)
+            .databases(Engine::ClickHouse, &Shown::everything())
             .unwrap();
         assert_eq!(databases.current.as_deref(), Some("dbdelve_dev"));
         assert!(databases.names.iter().any(|name| name == "analytics"));

@@ -26,6 +26,7 @@ mod clickhouse;
 mod conformance;
 mod duckdb;
 mod external;
+mod include;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -46,6 +47,7 @@ pub use duckdb::IN_MEMORY as DUCKDB_IN_MEMORY;
 pub use external::ExternalConfig;
 #[cfg(test)]
 pub(crate) use external::echo;
+pub use include::{Include, Shown};
 pub use plugin::Plugin;
 
 pub use mongo::MongoConfig;
@@ -2441,9 +2443,10 @@ impl Connection {
         }
     }
 
-    /// The databases on the server, for a profile to be moved onto one. Empty
-    /// where [`Target::switches_database`] is false.
-    pub fn databases(&self, engine: Engine) -> Result<Databases, DbError> {
+    /// The databases on the server, for a profile to be moved onto one, less
+    /// those `shown` leaves out. Empty where [`Target::switches_database`] is
+    /// false.
+    pub fn databases(&self, engine: Engine, shown: &Shown) -> Result<Databases, DbError> {
         let mut databases = match self {
             Self::Postgres(connection) => connection.databases(),
             Self::MySql(connection) => connection.databases(),
@@ -2456,7 +2459,7 @@ impl Connection {
             Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Ok(Databases::default()),
         }?;
         databases.system_last(engine);
-        Ok(databases)
+        Ok(shown.narrow_databases(databases))
     }
 
     /// Make `schema` the first place unqualified names resolve in every
@@ -3064,6 +3067,10 @@ pub struct Databases {
     pub names: Vec<String>,
     /// The one this connection is in. MySQL can be in none.
     pub current: Option<String>,
+    /// How many names the include filter left out of `names`. Set only by
+    /// [`Shown::narrow_databases`], so zero is also what an unfiltered read
+    /// says.
+    pub left_out: usize,
 }
 
 impl Databases {
@@ -4668,6 +4675,7 @@ mod tests {
             let mut databases = Databases {
                 names: names.iter().map(|name| (*name).to_string()).collect(),
                 current: None,
+                left_out: 0,
             };
             databases.system_last(engine);
             databases.names
