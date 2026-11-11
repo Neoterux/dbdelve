@@ -33,19 +33,29 @@ impl ViewMode {
         }
     }
 
+    /// The mode a stored slug names, if it names one this build knows.
+    pub(crate) fn parse(slug: Option<&str>) -> Option<Self> {
+        match slug {
+            Some("simple") => Some(ViewMode::Simple),
+            Some("complex") => Some(ViewMode::Complex),
+            _ => None,
+        }
+    }
+
     /// The mode a stored slug names. A file with none, or one this build does
     /// not know, reads as Simple: what every file written before it showed.
     pub(crate) fn from_slug(slug: Option<&str>) -> Self {
-        match slug {
-            Some("complex") => ViewMode::Complex,
-            _ => ViewMode::Simple,
-        }
+        Self::parse(slug).unwrap_or_default()
     }
 }
 
-/// The mode in effect.
-pub(crate) fn effective_view_mode(global: ViewMode, _project: Option<&StoredProject>) -> ViewMode {
-    global
+/// The mode a project in front draws: its own choice, or the global
+/// `global` when it has none, when its choice is one this build cannot read,
+/// and when no project is in front.
+pub(crate) fn effective_view_mode(global: ViewMode, project: Option<&StoredProject>) -> ViewMode {
+    project
+        .and_then(|project| ViewMode::parse(project.view_mode.as_deref()))
+        .unwrap_or(global)
 }
 
 /// The row of connections that belong to no project, listed first while any

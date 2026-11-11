@@ -2757,6 +2757,8 @@ fn connection_action_items(workspace: &Workspace, index: usize) -> Vec<Item> {
 /// Everything that can be done to one project.
 fn project_action_items(at: usize, project: &StoredProject, group: Group) -> Vec<Item> {
     let name = project.name.as_str();
+    let view = ViewMode::parse(project.view_mode.as_deref());
+    let hint = |here: bool| if here { "current" } else { "" };
     [
         Item::new(
             format!("New connection in {name}…"),
@@ -2773,6 +2775,24 @@ fn project_action_items(at: usize, project: &StoredProject, group: Group) -> Vec
             icon::DELETE,
             Command::Confirm(Target::Project(at)),
         ),
+        Item::new(
+            format!("Sidebar in {name}: follow the setting"),
+            icon::SIDEBAR,
+            Command::SetProjectViewMode(at, None),
+        )
+        .hint(hint(view.is_none())),
+        Item::new(
+            format!("Sidebar in {name}: the connection in front"),
+            icon::SIDEBAR,
+            Command::SetProjectViewMode(at, Some(ViewMode::Simple)),
+        )
+        .hint(hint(view == Some(ViewMode::Simple))),
+        Item::new(
+            format!("Sidebar in {name}: every connection"),
+            icon::SIDEBAR,
+            Command::SetProjectViewMode(at, Some(ViewMode::Complex)),
+        )
+        .hint(hint(view == Some(ViewMode::Complex))),
     ]
     .into_iter()
     .map(|item| item.group(group.clone()))
@@ -5454,7 +5474,10 @@ mod tests {
             [
                 "New connection in Billing…",
                 "Rename Billing…",
-                "Delete Billing…"
+                "Delete Billing…",
+                "Sidebar in Billing: follow the setting",
+                "Sidebar in Billing: the connection in front",
+                "Sidebar in Billing: every connection",
             ]
         );
         assert!(waits_for_import(
