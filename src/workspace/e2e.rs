@@ -2449,6 +2449,213 @@ fn the_picker_lists_the_own_databases_schemas_and_saves_both_lists(cx: &mut Test
     });
 }
 
+/// The DuckDB connection of `launch_duckdb_seeded` with `extra` and `more`
+/// schemas beside `main`, connected and in front, and the picker open over it.
+fn three_schemas_with_the_picker_open(
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let (workspace, cx) = launch_duckdb_seeded(
+        cx,
+        "",
+        "mode = \"full\"",
+        "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; CREATE TABLE extra.x (id INTEGER); \
+         CREATE SCHEMA more; CREATE TABLE more.y (id INTEGER);",
+        "CREATE TABLE u (id INTEGER);",
+    );
+    let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+    click_connections_row(cx, at);
+    open_the_picker_from_the_menu(&workspace, cx);
+    (workspace, cx)
+}
+
+fn open_the_picker_from_the_menu(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    let at = connections_row(workspace, cx, &connection_row("e2e")).expect("the connection shows");
+    pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
+    settle(cx);
+    assert_eq!(front_dialog(workspace, cx), Some("filter-picker"));
+}
+
+#[gpui::test]
+fn saving_the_filter_while_the_catalog_loads_is_not_lost(cx: &mut TestAppContext) {
+    use crate::session::Routines;
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_schemas_with_the_picker_open(cx);
+        let generation = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .expect("the connection is in front")
+                .generation
+        });
+
+        // The routines of the catalog are on their way when Save lands.
+        click_selector(cx, "filter-picker-row-schemas-0");
+        workspace.update(cx, |workspace, cx| {
+            let profile = workspace.profile_mut().expect("the connection is in front");
+            let id = profile.id.clone();
+            let CatalogState::Loaded(_, routines) = &mut profile.catalog else {
+                panic!("the catalog has loaded");
+            };
+            *routines = Routines::Loading;
+            workspace.load_routines(&id, generation, cx);
+            workspace.save_filter(cx);
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(
+                profile.include.schemas,
+                ["extra"],
+                "the save is not dropped"
+            );
+            assert!(profile.reread_after_load, "it waits for the read under way");
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(!profile.reread_after_load, "the landing took it");
+            assert_eq!(profile.generation, generation, "no reconnect");
+        });
+        assert_eq!(own_catalog(&workspace, cx).0, ["extra", "main"]);
+
+        // A refresh under way is the same case.
+        open_the_picker_from_the_menu(&workspace, cx);
+        click_selector(cx, "filter-picker-row-schemas-0");
+        workspace.update(cx, |workspace, cx| {
+            workspace.refresh_schema(cx);
+            workspace.save_filter(cx);
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(profile.include.schemas.is_empty());
+            assert!(profile.reread_after_load);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(!profile.reread_after_load);
+            assert_eq!(profile.generation, generation);
+        });
+        assert_eq!(own_catalog(&workspace, cx).0, ["extra", "main", "more"]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_listing_that_lands_after_the_picker_closed_changes_nothing(cx: &mut TestAppContext) {
+    use super::filter_picker::Listing;
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\"e2e\"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let before = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .expect("the connection is in front")
+                .include
+                .clone()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_filter_picker("e2e", window, cx);
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.listing, Listing::Loading);
+            workspace.close_filter_picker(cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.filter_picker.is_none(),
+                "the listing found no dialog"
+            );
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.include, before);
+            assert!(!profile.reread_after_load);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn resaving_an_unchanged_filter_leaves_the_file_byte_identical(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(
+            cx,
+            "mode = \"full\"\ninclude_databases = [\"other\", \"s*\"]",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let before = std::fs::read(&file).expect("profiles.toml reads");
+
+        open_the_picker_from_the_menu(&workspace, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.ticked, ["other"]);
+            assert_eq!(picker.databases.patterns, ["s*"]);
+            assert!(!picker.can_save(), "the lists are the ones saved");
+        });
+        click_selector(cx, "filter-picker-0");
+        assert_eq!(front_dialog(&workspace, cx), Some("filter-picker"));
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(std::fs::read(&file).expect("profiles.toml reads"), before);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_long_database_list_scrolls_inside_the_picker(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        let preview = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .filter_picker
+                    .as_ref()
+                    .expect("the picker is up")
+                    .preview(super::filter_picker::Which::Databases)
+            })
+        };
+        open_the_picker_from_the_menu(&workspace, cx);
+        assert_eq!(preview(cx).as_deref(), Some("Showing all 1 database"));
+        press(cx, "escape");
+
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        for number in 1..=37 {
+            run_in_front(
+                &workspace,
+                cx,
+                &format!(
+                    "ATTACH '{}' AS d{number:02}",
+                    directory.join(format!("d{number:02}.duckdb")).display()
+                ),
+            );
+        }
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(700.)));
+        settle(cx);
+        open_the_picker_from_the_menu(&workspace, cx);
+        assert_eq!(preview(cx).as_deref(), Some("Showing all 38 databases"));
+        let list = cx
+            .debug_bounds("filter-picker-list-databases")
+            .expect("the list is drawn");
+        assert!(
+            list.size.height <= gpui::px(crate::theme::layout::DIALOG_TEXT_MAX_HEIGHT),
+            "the rows scroll inside a capped list, not past the window: {:?}",
+            list.size
+        );
+        let save = cx.debug_bounds("filter-picker-0").expect("Save is drawn");
+        assert!(
+            save.bottom() <= gpui::px(700.) && save.top() >= gpui::px(0.),
+            "the footer stays inside the window: {save:?}"
+        );
+        click_selector(cx, "filter-picker-row-databases-1");
+        assert_eq!(preview(cx).as_deref(), Some("Showing 2 of 38 databases"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn escape_closes_the_filter_picker_without_saving_and_hands_the_keyboard_back(
     cx: &mut TestAppContext,
