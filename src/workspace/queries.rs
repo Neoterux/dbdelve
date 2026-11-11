@@ -12,8 +12,8 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
-    Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume,
-    Step, TabKey, next_step, query_name_refusal, reveals_results,
+    Binding, BoundSession, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename,
+    Queue, Resume, Step, TabKey, next_step, query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -100,7 +100,13 @@ impl Workspace {
     /// dies on the thread the driver is running on. Nothing tokio-shaped is
     /// handed to GPUI's executor, which is the thing that panics.
     pub(crate) fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(connection) = self.profile().and_then(Profile::connection) else {
+        // The session a bound tab runs on, which is where the statements that
+        // are stopped by what the connection holds of them (MongoDB's, and
+        // ClickHouse's fallback) are kept.
+        let Some(connection) = self
+            .profile()
+            .and_then(|profile| profile.connection_for(profile.session.active))
+        else {
             return;
         };
         let Some(profile) = self.profile_mut() else {
@@ -380,9 +386,14 @@ impl Workspace {
             // statement apiece at once instead, as they do on every other
             // engine; any batch a split would change stays whole.
             let reads = sql::split_reads(engine, &text, &statements, selection.clone());
+            // Never a bound tab's: its statements share the session of its
+            // database, and one at once would run on a fresh session, which
+            // is not on the binding.
+            // ponytail: a bound alongside session that re-applies the
+            // binding would let them go at once.
             let reads_at_once = reads.len() > 1
                 && self.profile().is_some_and(|profile| {
-                    profile.in_turn().is_none() && {
+                    !profile.session.is_bound(tab) && profile.in_turn().is_none() && {
                         let texts: Vec<&str> =
                             reads.iter().map(|range| &text[range.clone()]).collect();
                         session::runs_at_once(engine, profile.mode, &texts)
@@ -497,7 +508,7 @@ impl Workspace {
             .iter()
             .map(|range| &text[range.clone()])
             .collect();
-        if session::runs_at_once(engine, profile.mode, &texts) {
+        if !profile.session.is_bound(tab) && session::runs_at_once(engine, profile.mode, &texts) {
             match profile.in_turn() {
                 Some(why) => profile.session.notice = Some(why.into()),
                 None => {
@@ -2079,6 +2090,29 @@ impl Workspace {
         let generation = profile.generation;
         let read_only = profile.mode == Mode::ReadOnly;
         let alongside = lane.is_some();
+        // A tab opened with New Query Here runs on the session of the database
+        // it is bound to: the one open for it, else one this run opens first.
+        // A lane belongs to the profile's own tabs, which are never bound.
+        let binding = match (tab, &lane) {
+            (Tab::Query(query), None) => profile
+                .session
+                .query_tab(query)
+                .and_then(|query| query.binding.clone()),
+            _ => None,
+        };
+        let session =
+            binding
+                .as_ref()
+                .and_then(|binding| match profile.bound.get(&binding.database) {
+                    Some(BoundSession::Open(session)) => Some((**session).clone()),
+                    _ => None,
+                });
+        // The connection to open the session from, when there is no session.
+        let opens = binding
+            .as_ref()
+            .filter(|_| session.is_none())
+            .map(|binding| binding.database.clone());
+        let connection = session.or(connection);
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
         // command's does. Not in a queue, where every result holds a grid.
@@ -2124,9 +2158,12 @@ impl Workspace {
             return;
         };
         // A lane's own, so a Cancel on its chip stops it and not the others.
-        let cancel = match lane {
-            Some(_) => CancelToken::alongside(),
-            None => CancelToken::default(),
+        // A bound tab's too, because its session is shared with other tabs: a
+        // Cancel stops what that session is running only while it is running
+        // this tab's statement (`Connection::query_bound`).
+        let cancel = match (&lane, &binding) {
+            (None, None) => CancelToken::default(),
+            _ => CancelToken::alongside(),
         };
         let started = std::time::Instant::now();
         let previous = std::mem::replace(
@@ -2294,7 +2331,12 @@ impl Workspace {
         };
         // Marked on the way out, like the history: a statement that failed
         // part way may still have opened a transaction.
-        if !generated && let Some(profile) = self.issued_to(&id, generation) {
+        // Not a bound tab's: what it leaves is left on the session of its
+        // database, which is not the profile's own.
+        if !generated
+            && binding.is_none()
+            && let Some(profile) = self.issued_to(&id, generation)
+        {
             let leaves = sql::leaves(engine, explained.as_deref().unwrap_or(&sql));
             if let Some(open) = leaves.transaction {
                 profile.in_transaction = open;
@@ -2368,31 +2410,91 @@ impl Workspace {
         }
         let fed = feed.clone();
         let reads_only = sql::stoppable(engine, &sql);
-        let work = move || {
+        // A statement that ends a transaction goes as it is, with the binding
+        // not applied first: a session inside one cannot be moved (Postgres
+        // refuses inside any, DuckDB inside an aborted one, and Redis would
+        // queue the move into the MULTI), so applying it first would stop the
+        // COMMIT or ROLLBACK that frees the session.
+        // ponytail: a bound session is auto-commit. A transaction opened in a
+        // bound tab holds the session, and its later statements are refused
+        // by the driver rather than run in whatever schema it is in, until
+        // the transaction is ended; the upgrade is a session of the tab's own.
+        let ends_transaction =
+            binding.is_some() && sql::leaves(engine, &sql).transaction == Some(false);
+        let bound_db = binding.as_ref().map(|binding| binding.database.clone());
+        let work = move |connection: Connection| {
             let fetch = Fetch {
                 limit,
                 feed: fed.as_ref(),
                 reads_only,
                 held: None,
             };
-            let result = match (generated, alongside) {
-                (true, _) => connection.generated(&sql, &cancel, fed.as_ref(), preview_limit),
-                (false, false) => connection.query(&sql, &cancel, fetch),
-                (false, true) => connection.query_alongside(&sql, &cancel, fetch, read_only),
+            let result = match (generated, alongside, binding.as_ref()) {
+                // An edit applied from a bound tab's grid belongs to its
+                // database whichever way the session has been moved.
+                (true, _, Some(binding)) => connection.generated_bound(
+                    binding.schema.as_deref(),
+                    &sql,
+                    &cancel,
+                    fed.as_ref(),
+                    preview_limit,
+                ),
+                (true, ..) => connection.generated(&sql, &cancel, fed.as_ref(), preview_limit),
+                (false, false, Some(binding)) if !ends_transaction => {
+                    connection.query_bound(binding.schema.as_deref(), &sql, &cancel, fetch)
+                }
+                (false, false, _) => connection.query(&sql, &cancel, fetch),
+                (false, true, _) => connection.query_alongside(&sql, &cancel, fetch, read_only),
             };
             // A connection of the lane's own that failed is gone with it, and
             // says nothing about the profile's.
             let lost = !alongside && result.is_err() && connection.is_lost();
             (result, lost)
         };
-        // Blocks for as long as the server takes, and statements queued
-        // behind it on the same session block on its lock, so none of them
-        // may hold one of the executor's threads (`spawn_blocking`).
-        let query_task = spawn_blocking(cx.background_executor(), work);
         let number = crate::logging::connection_number(&id);
 
         cx.spawn(async move |workspace, cx| {
-            let (result, lost) = query_task.await;
+            // A bound tab with no session open for its database opens one
+            // first, and keeps it where the tree and a Cancel find it before
+            // anything is sent on it (`Workspace::keep_session`).
+            let ready = match opens {
+                None => Ok(connection),
+                Some(database) => {
+                    let opening = spawn_blocking(cx.background_executor(), {
+                        let database = database.clone();
+                        move || {
+                            let session = connection.on_database(&database)?;
+                            // Only Read-only asks the server for anything, as
+                            // at connect: a session that fails to take the
+                            // hold is dropped, not run on looking held.
+                            if read_only {
+                                session.set_read_only(true)?;
+                            }
+                            Ok::<_, DbError>(session)
+                        }
+                    })
+                    .await;
+                    match opening {
+                        Ok(session) => match workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .keep_session(&id, generation, database, read_only, session, cx)
+                        }) {
+                            Ok(session) => Ok(session),
+                            Err(_) => return,
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            // Blocks for as long as the server takes, and statements queued
+            // behind it on the same session block on its lock, so none of them
+            // may hold one of the executor's threads (`spawn_blocking`).
+            let (result, lost) = match ready {
+                Ok(connection) => {
+                    spawn_blocking(cx.background_executor(), move || work(connection)).await
+                }
+                Err(error) => (Err(error), false),
+            };
             // Outcome and duration only. Not even at debug the server's text:
             // some engines quote the statement back in a syntax error.
             let (origin, elapsed) = (
@@ -2469,10 +2571,21 @@ impl Workspace {
                         // Before `slot`: a tab closed mid-run still ran on the
                         // session that died.
                         if lost {
-                            profile.state = ProfileState::Failed(format!(
-                                "Connection to {} was lost.",
-                                profile.config.endpoint()
-                            ));
+                            // A bound tab's session is not the profile's own:
+                            // losing it takes that session out, so the next
+                            // run opens another, and says nothing of the
+                            // connection the profile is on.
+                            match &bound_db {
+                                Some(database) => {
+                                    profile.bound.remove(database);
+                                }
+                                None => {
+                                    profile.state = ProfileState::Failed(format!(
+                                        "Connection to {} was lost.",
+                                        profile.config.endpoint()
+                                    ))
+                                }
+                            }
                             // Nothing left in the queue can run on a dead
                             // session, so it ends here rather than asking
                             // whether to Continue into "not open".
@@ -2811,7 +2924,7 @@ impl Workspace {
                     if succeeded && let Tab::Object(object) = tab {
                         workspace.mark_columns(object, cx);
                     }
-                    if lost {
+                    if lost && bound_db.is_none() {
                         // The connection's row says it failed.
                         workspace.rebuild_connections(cx);
                     }

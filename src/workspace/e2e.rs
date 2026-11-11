@@ -12805,3 +12805,74 @@ fn new_query_in_complex_mode_opens_an_unbound_tab_on_the_profiles_own_session(
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_session_a_bound_run_opened_is_kept_and_its_database_reads_over_it(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().bound.is_empty());
+        });
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(matches!(
+                profile.bound.get("other"),
+                Some(crate::session::BoundSession::Open(_))
+            ));
+            // Left at "Loading" the row would never read the database: a
+            // registered session counts as already being read.
+            assert!(
+                matches!(
+                    profile.database_catalogs.get("other"),
+                    Some(CatalogState::Loaded(..))
+                ),
+                "the database's catalog was read over the session the run kept"
+            );
+        });
+
+        // A second tab bound to the same database shares the session.
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "SELECT current_database()");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("other"));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.profile().unwrap().bound.len(), 1);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext) {
+    use crate::session::Refresh;
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        // `u` is in `other` and in no other database: run on the profile's
+        // own connection, this would fail.
+        let tab = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.active
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_unchecked(
+                "INSERT INTO u VALUES (7)".into(),
+                tab,
+                Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+                false,
+                None,
+                None,
+                cx,
+            );
+        });
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { .. } => {}
+            QueryState::Failed(error) => panic!("the edit failed: {error}"),
+            _ => panic!("the edit never completed"),
+        });
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
