@@ -2434,6 +2434,8 @@ impl QueryTab {
                 .queue
                 .as_ref()
                 .map_or(self.queued_results, |queue| queue.done.len()),
+            database: None,
+            schema: None,
         }
     }
 }
@@ -4214,6 +4216,8 @@ mod tests {
                 name: Some("daily".into()),
                 active: true,
                 queued_results: 0,
+                database: None,
+                schema: None,
             };
             assert_eq!(stored_text("dev", &open), Ok(Some("SELECT 1".to_string())));
 
@@ -4401,6 +4405,8 @@ mod tests {
                     name: None,
                     active: false,
                     queued_results: 0,
+                    database: None,
+                    schema: None,
                 })
                 .collect::<Vec<_>>()
         };
