@@ -11150,6 +11150,79 @@ fn an_agent_lists_only_the_schemas_the_filter_shows_and_says_how_many(cx: &mut T
 }
 
 #[gpui::test]
+fn a_filter_saved_between_two_agent_calls_applies_to_the_second_without_reopening_the_lane(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        db::Include,
+    };
+
+    store::tests::with_home(|| {
+        let path = seed_ducks_file();
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        cx.executor().allow_parking();
+
+        let before = ducks_catalog_call(&workspace, cx, Tool::ListSchemas, None, None);
+        assert_eq!(before.status, Status::Executed, "{}", before.text);
+        assert!(
+            before.text.ends_with("\n[\"extra\"]\n[\"main\"]\n"),
+            "{}",
+            before.text
+        );
+        assert!(!before.text.contains("Showing"), "{}", before.text);
+        let ducks = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == "ducks")
+                    .expect("the profile was restored");
+                (profile.generation, profile.config.clone())
+            })
+        };
+        let (generation, config) = ducks(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            let profile = workspace
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == "ducks")
+                .expect("the profile was restored");
+            profile.include = Include::from_stored(Vec::new(), vec!["main".to_string()]);
+            workspace.remember_profiles(cx);
+        });
+
+        let after = ducks_catalog_call(&workspace, cx, Tool::ListSchemas, None, None);
+        assert_eq!(after.status, Status::Executed, "{}", after.text);
+        assert!(after.text.ends_with("\n[\"main\"]\n"), "{}", after.text);
+        assert!(
+            after.text.contains("Showing 1 of 2 schemas."),
+            "{}",
+            after.text
+        );
+        assert_eq!(
+            ducks(&workspace, cx),
+            (generation, config.clone()),
+            "the save moved the profile's connection"
+        );
+        // A DuckDB file's lane opens per call and goes once its queue empties,
+        // so it need not survive between the calls; what keeps an edit from
+        // reopening one is that the include is no part of the config.
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .agent
+                    .lanes
+                    .get("ducks")
+                    .is_none_or(|lane| lane.opened_from == config)
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
     cx: &mut TestAppContext,
 ) {
