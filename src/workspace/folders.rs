@@ -84,6 +84,14 @@ impl Workspace {
                     ObjectKind::Routine(routine.kind),
                 )
             }
+            ExplorerTarget::Sequence {
+                schema_index,
+                sequence_index,
+            } => {
+                let schema = catalog.schemas.get(schema_index)?;
+                let sequence = schema.sequences.get(sequence_index)?;
+                (schema, sequence.clone(), ObjectKind::Sequence)
+            }
         };
         Some(Member::Object(ObjectRef {
             database,

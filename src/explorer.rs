@@ -108,6 +108,11 @@ fn routine_row(schema: &str, routine: &Routine) -> String {
     routine_id(routine.kind, schema, &crate::session::routine_name(routine))
 }
 
+/// The row id of a sequence, by name like a relation's.
+fn sequence_row(schema: &str, name: &str) -> String {
+    format!("sequence-{schema}\0{name}")
+}
+
 /// `name` is a routine's name and arguments, as its tab is named.
 fn routine_id(kind: RoutineKind, schema: &str, name: &str) -> String {
     format!("routine-{kind:?}-{schema}\0{name}")
@@ -132,6 +137,11 @@ pub fn object_row(catalog: &Catalog, schema: &str, name: &str, kind: ObjectKind)
             .iter()
             .find(|routine| routine.kind == kind && crate::session::routine_name(routine) == name)
             .map(|routine| routine_row(&schema.name, routine)),
+        ObjectKind::Sequence => schema
+            .sequences
+            .iter()
+            .find(|sequence| *sequence == name)
+            .map(|sequence| sequence_row(&schema.name, sequence)),
     }
 }
 
@@ -155,6 +165,11 @@ pub enum ExplorerTarget {
         schema_index: usize,
         routine_index: usize,
     },
+    /// Listed and nothing more: a sequence opens no tab (D-24).
+    Sequence {
+        schema_index: usize,
+        sequence_index: usize,
+    },
 }
 
 /// What kind of object a row stands for. The sidebar draws an icon from this;
@@ -164,6 +179,9 @@ pub enum ExplorerTarget {
 pub enum ObjectKind {
     Relation(RelationKind),
     Routine(RoutineKind),
+    /// Its own kind and never a [`RelationKind`], so no path that reads,
+    /// edits, drops or imports into a relation can be reached with one.
+    Sequence,
 }
 
 /// What the sidebar knows about one openable row: where it points, and what it
@@ -189,6 +207,7 @@ impl ObjectKind {
             ObjectKind::Relation(RelationKind::Dictionary) => "dictionary",
             ObjectKind::Routine(RoutineKind::Function) => "function",
             ObjectKind::Routine(RoutineKind::Procedure) => "procedure",
+            ObjectKind::Sequence => "sequence",
         }
     }
 
@@ -480,6 +499,7 @@ impl ObjectRef {
         match self.kind {
             ObjectKind::Relation(_) => relation_row(&self.schema, &self.name),
             ObjectKind::Routine(kind) => routine_id(kind, &self.schema, &self.name),
+            ObjectKind::Sequence => sequence_row(&self.schema, &self.name),
         }
     }
 
@@ -518,6 +538,18 @@ impl ObjectRef {
                         routine_index,
                     },
                     kind: self.kind,
+                    size: None,
+                }),
+            ObjectKind::Sequence => schema
+                .sequences
+                .iter()
+                .position(|sequence| *sequence == self.name)
+                .map(|sequence_index| ExplorerLeaf {
+                    target: ExplorerTarget::Sequence {
+                        schema_index,
+                        sequence_index,
+                    },
+                    kind: ObjectKind::Sequence,
                     size: None,
                 }),
         }
@@ -2378,7 +2410,119 @@ mod tests {
             let kind = ObjectKind::Routine(kind);
             assert_eq!(ObjectKind::from_slug(kind.slug()), Some(kind));
         }
-        assert_eq!(ObjectKind::from_slug("sequence"), None);
+        assert_eq!(ObjectKind::from_slug("sequence-ish"), None);
+    }
+
+    #[test]
+    fn the_sequence_kind_reads_back_from_its_slug() {
+        assert_eq!(
+            ObjectKind::from_slug("sequence"),
+            Some(ObjectKind::Sequence)
+        );
+        assert_eq!(ObjectKind::Sequence.slug(), "sequence");
+    }
+
+    fn with_sequences(catalog: &mut Catalog, schema: &str, names: &[&str]) {
+        let names = names.iter().map(|name| name.to_string()).collect();
+        match catalog.schemas.iter_mut().find(|held| held.name == schema) {
+            Some(held) => held.sequences = names,
+            None => catalog.schemas.push(Schema {
+                name: schema.into(),
+                relations: Vec::new(),
+                routines: Vec::new(),
+                sequences: names,
+            }),
+        }
+    }
+
+    fn row_ids(items: &[TreeItem]) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut stack: Vec<&TreeItem> = items.iter().collect();
+        while let Some(item) = stack.pop() {
+            ids.push(item.id.to_string());
+            stack.extend(&item.children);
+        }
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_duckdb_sequence_reaches_a_sequences_category_of_its_own() {
+        use crate::db::{CancelToken, Connection, ConnectionConfig, DUCKDB_IN_MEMORY, Fetch};
+        let connection =
+            Connection::open(ConnectionConfig::duckdb(DUCKDB_IN_MEMORY.to_string(), 0)).unwrap();
+        connection
+            .query(
+                "CREATE TABLE t (id INTEGER); CREATE SEQUENCE s;",
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .unwrap();
+        let mut catalog = connection.catalog().unwrap();
+        catalog.merge(connection.routines().unwrap());
+
+        let tree = tree(&catalog, "");
+        let ids = row_ids(&tree.items);
+        assert!(
+            ids.contains(&"category-Sequences-main".to_string()),
+            "{ids:?}"
+        );
+        let id = "sequence-main\0s";
+        assert!(ids.contains(&id.to_string()), "{ids:?}");
+        let sequences = tree
+            .items
+            .iter()
+            .flat_map(|schema| &schema.children)
+            .find(|category| category.id == "category-Sequences-main")
+            .expect("the category is in the schema");
+        assert_eq!(
+            sequences
+                .children
+                .iter()
+                .map(|row| &*row.id)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+        let leaf = tree.leaves[id];
+        assert_eq!(leaf.kind, ObjectKind::Sequence);
+        assert!(matches!(leaf.target, ExplorerTarget::Sequence { .. }));
+        assert_eq!(leaf.size, None);
+    }
+
+    #[test]
+    fn a_schema_without_sequences_draws_exactly_as_before() {
+        let ids = row_ids(&tree(&catalog(), "").items);
+        assert!(ids.iter().all(|id| !id.contains("Sequences")), "{ids:?}");
+        assert!(ids.iter().all(|id| !id.starts_with("sequence-")), "{ids:?}");
+        let mut again = catalog();
+        with_sequences(&mut again, "public", &[]);
+        assert_eq!(row_ids(&tree(&again, "").items), ids);
+    }
+
+    #[test]
+    fn a_flagged_target_with_no_sequence_shows_no_sequences_category_and_a_schema_of_only_sequences_is_listed()
+     {
+        // DuckDB lists sequences, and this schema of its has none.
+        assert!(Target::built_in(Engine::DuckDb).abilities().lists_sequences);
+        let ids = row_ids(&tree(&catalog(), "").items);
+        assert!(ids.iter().all(|id| !id.starts_with("category-Sequences-")));
+
+        let mut only = catalog();
+        with_sequences(&mut only, "queues", &["jobs"]);
+        let tree = tree(&only, "");
+        let queues = tree
+            .items
+            .iter()
+            .find(|schema| schema.id == "schema-queues")
+            .expect("a schema of only sequences is listed");
+        assert_eq!(
+            queues
+                .children
+                .iter()
+                .map(|row| &*row.id)
+                .collect::<Vec<_>>(),
+            ["category-Sequences-queues"]
+        );
     }
 
     #[test]

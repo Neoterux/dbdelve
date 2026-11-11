@@ -4574,6 +4574,7 @@ fn kind_label(kind: ObjectKind) -> &'static str {
         ObjectKind::Relation(RelationKind::Dictionary) => "dictionary",
         ObjectKind::Routine(RoutineKind::Function) => "function",
         ObjectKind::Routine(RoutineKind::Procedure) => "procedure",
+        ObjectKind::Sequence => "sequence",
     }
 }
 
