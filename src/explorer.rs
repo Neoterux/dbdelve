@@ -2517,6 +2517,71 @@ mod tests {
         assert_eq!(leaf.size, None);
     }
 
+    fn sequence(schema: &str, name: &str) -> Member {
+        Member::Object(ObjectRef {
+            database: None,
+            schema: schema.into(),
+            name: name.into(),
+            kind: ObjectKind::Sequence,
+        })
+    }
+
+    #[test]
+    fn a_pinned_sequence_is_a_shortcut_to_its_row() {
+        let mut held = catalog();
+        with_sequences(&mut held, "public", &["s"]);
+        let shortcuts = Shortcuts {
+            folders: Vec::new(),
+            pins: vec![Pin::Member(sequence("public", "s"))],
+        };
+        let built = |catalog: &Catalog| {
+            super::shortcuts(
+                &shortcuts,
+                Some(catalog),
+                &[],
+                &ShortcutDatabase::Unnamed,
+                "",
+            )
+        };
+
+        let pinned = built(&held);
+        let row = &pinned.items[0].children[0];
+        let Shortcut::Member { missing, .. } = &pinned.shortcuts[row.id.as_ref()] else {
+            panic!("a pinned object is a member shortcut");
+        };
+        assert!(!missing);
+        assert_eq!(
+            pinned.shortcuts[row.id.as_ref()].repeats().as_deref(),
+            Some("sequence-public\0s")
+        );
+        assert_eq!(pinned.leaves[row.id.as_ref()].kind, ObjectKind::Sequence);
+
+        let gone = built(&catalog());
+        let row = &gone.items[0].children[0];
+        let Shortcut::Member { missing, .. } = &gone.shortcuts[row.id.as_ref()] else {
+            panic!("a pinned object is a member shortcut");
+        };
+        assert!(missing);
+        assert!(!gone.leaves.contains_key(row.id.as_ref()));
+    }
+
+    #[test]
+    fn a_sequence_matches_the_filter_by_its_name() {
+        let mut held = catalog();
+        with_sequences(&mut held, "main", &["s"]);
+
+        let found = tree(&held, "s");
+        let ids = row_ids(&found.items);
+        assert!(ids.contains(&"sequence-main\0s".to_string()), "{ids:?}");
+        assert!(found.highlights.contains_key("sequence-main\0s"));
+
+        let none = row_ids(&tree(&held, "zzz").items);
+        assert!(
+            none.iter().all(|id| !id.starts_with("category-Sequences-")),
+            "{none:?}"
+        );
+    }
+
     #[test]
     fn a_schema_without_sequences_draws_exactly_as_before() {
         let ids = row_ids(&tree(&catalog(), "").items);
