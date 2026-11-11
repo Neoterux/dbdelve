@@ -127,15 +127,18 @@ impl Workspace {
     /// Auto dialog's end is the only one that opens no next transaction, which
     /// is what `reopen` being false is for: it is the one end that leaves
     /// Manual.
+    ///
+    /// Whether the statement was handed to the run, `false` where a refusal
+    /// already said why nothing was.
     fn end_transaction(
         &mut self,
         verb: &str,
         reopen: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.refused_on_bound_tab(cx) {
-            return;
+            return false;
         }
         let Some((open, auto_commit, engine)) = self.profile().map(|profile| {
             (
@@ -144,11 +147,11 @@ impl Workspace {
                 profile.config.engine(),
             )
         }) else {
-            return;
+            return false;
         };
         if !open {
             self.note("No transaction is open on this connection.".into(), cx);
-            return;
+            return false;
         }
         let begin = (reopen && !auto_commit)
             .then(|| engine.begins_transaction())
@@ -158,6 +161,7 @@ impl Workspace {
             None => verb.to_string(),
         };
         self.run_in_buffer(statement, window, cx);
+        true
     }
 
     /// The Auto dialog's answer: end the open transaction with a plain
@@ -184,7 +188,13 @@ impl Workspace {
         if !asked {
             return;
         }
-        self.end_transaction(verb, false, window, cx);
+        // Not `in_transaction` alone: it is also false when the transaction
+        // ended between the dialog being drawn and the click, and arming
+        // `auto_after_end` then would turn Auto on at the tab's next success.
+        // A refusal there has said why already.
+        if !self.end_transaction(verb, false, window, cx) {
+            return;
+        }
         let Some(profile) = self.profile_mut() else {
             return;
         };
