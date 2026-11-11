@@ -86,7 +86,13 @@ where the user can read it:
   (`Profile::transaction_statements`) and is never written to disk. A
   submission that ends the transaction and opens the next lists only what
   follows its last end (`sql::after_last_end`), so Manual's `COMMIT;` and
-  `BEGIN;` leave the `BEGIN;` alone.
+  `BEGIN;` leave the `BEGIN;` alone. A generated multi-row edit batch brackets
+  itself on MySQL, MariaDB, SQLite and SQL Server, and its `COMMIT` would end
+  the user's open transaction (MySQL and MariaDB commit it at the batch's
+  `START TRANSACTION`), so while `Profile::in_transaction` is set it is not
+  sent: `Profile::own_write_refusal` says `Not sent: …`, in the way
+  `Profile::bound_write_refusal` does for a bound session. A single-statement
+  edit carries no bracket and joins the transaction.
 - **Format Query** rewrites the buffer on command only, through
   `sqlformat`'s token-level reformatter (on MongoDB, `mql::format`'s
   bracket-depth layout over the tree-sitter tokens, refused unless the

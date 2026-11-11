@@ -2112,10 +2112,12 @@ impl Workspace {
             refresh,
             Some(Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_))
         );
-        let refusal = binding
-            .as_ref()
-            .filter(|_| edit)
-            .and_then(|binding| profile.bound_write_refusal(binding));
+        let refusal = edit
+            .then(|| match &binding {
+                Some(binding) => profile.bound_write_refusal(binding),
+                None => profile.own_write_refusal(&sql),
+            })
+            .flatten();
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
         // command's does. Not in a queue, where every result holds a grid.
@@ -2380,6 +2382,7 @@ impl Workspace {
         if generated
             && edit
             && binding.is_none()
+            && refusal.is_none()
             && let Some(profile) = self.issued_to(&id, generation)
         {
             profile.record_sent(&sql, None);
