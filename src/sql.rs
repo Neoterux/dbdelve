@@ -4751,6 +4751,27 @@ pub(crate) fn transaction_uncertain(engine: Engine, sql: &str) -> bool {
         })
 }
 
+/// Whether `sql` ends a transaction somewhere in it. A submission can end the
+/// open transaction and open the next in one go (`COMMIT;` then `BEGIN;`), and
+/// [`Leaves`] only says where it lands.
+pub(crate) fn ends_transaction(engine: Engine, sql: &str) -> bool {
+    let Some(dialect) = dialect(engine).filter(|_| !engine.spec().sql.stateless_requests) else {
+        return false;
+    };
+    SqlParser::parse_sql(dialect.as_ref(), sql).is_ok_and(|statements| {
+        statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Commit { .. }
+                    | Statement::Rollback {
+                        savepoint: None,
+                        ..
+                    }
+            )
+        })
+    })
+}
+
 impl Leaves {
     fn add(&mut self, statement: &Statement) {
         match statement {
