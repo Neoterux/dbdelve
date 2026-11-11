@@ -2237,8 +2237,24 @@ mod tests {
                 // name, the host and the count.
                 let bg = color.fill().flatten(t.surface);
                 check(t, "the row's name", t.text, bg, AA_TEXT);
-                check(t, "the row's count and host", t.text_faint, bg, AA_LARGE);
-                check(t, "a muted row", t.text_muted, bg, AA_TEXT);
+                // Muted text on a row is a short label, never read at length,
+                // so it is held to the floor the titlebar's muted text is. At
+                // body contrast the fill would have to be too weak to pass
+                // `a_coloured_pill_is_visible_and_legible_in_every_theme`'s
+                // step: Dracula Light is 4.51 untinted and 3.6 under red.
+                check(t, "a muted row", t.text_muted, bg, AA_LARGE);
+                // Faint is faint by design: One Light's is 2.27 on the plain
+                // surface, under any floor. What a tint must not do is take
+                // much of it away, so the host and the count keep at least
+                // 70% of the contrast they have on an uncoloured row.
+                let plain = contrast_ratio(t.text_faint, t.surface);
+                let tinted = contrast_ratio(t.text_faint, bg);
+                assert!(
+                    tinted >= plain * 0.7,
+                    "{} {}: the row's count and host fall from {plain:.2} to {tinted:.2}",
+                    t.name,
+                    color.label()
+                );
             }
         }
     }

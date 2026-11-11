@@ -95,6 +95,19 @@ accept a library default appearance; map it to our theme tokens.
 ---
 
 
+A connection row in the complex sidebar reads, left to right, logo (in the
+connection's colour; an uncoloured connection's logo wears its engine's
+brand), name, agent marker (only while the profile is visible to agents),
+host (`ConnectionConfig::endpoint()`, which gives way first: it takes only the
+width the name leaves and shortens with an ellipsis down to nothing before the
+name shortens), count and status dot, with a coloured connection's whole row
+filled with `ConnectionColor::fill()` under the selection and hover `ListItem`
+draws over it. The dot is the user's own connection (`ProfileState`), never an
+agent's lane. `a_tinted_sidebar_row_reads_in_every_theme` holds the fill to the
+floors the other tints keep; `Theme::text_faint` is under any floor on some
+surfaces untinted, so the host and the count are held to what a tint takes from
+them instead.
+
 ## Titlebar and appearance
 
 - **Titlebar**: macOS and Windows get DBDelve's own strip over a transparent
