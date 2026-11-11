@@ -349,9 +349,9 @@ Decided, and not to be re-litigated:
 
   Show DDL on a sequence reads its definition through `Connection::sequence_ddl`
   (`Connection::ddl` takes a `RelationKind`, which a sequence is not), drawn and
-  copied and never run. No current value is read by any of these, and every
-  name in a composed statement or a lookup goes through `quote_identifier` or
-  `quote_literal`:
+  copied and never run. No current value is read by the composed ones, and
+  every name in a composed statement or a lookup goes through
+  `quote_identifier` or `quote_literal`:
   - Postgres has no `pg_get_*def` for a sequence, so `CREATE SEQUENCE` is
     composed from `pg_sequences` (`data_type`, `increment_by`, `min_value`,
     `max_value`, `start_value`, `cache_size`, `cycle`; not `last_value`).
@@ -363,7 +363,9 @@ Decided, and not to be re-litigated:
     it writes `START` as the counter's current value, so it moves with every
     `nextval`.
   - Snowflake asks `GET_DDL('SEQUENCE', ..)`; written against the documented
-    function and not run against an account.
+    function and not run against an account, so whether its `START WITH` is the
+    original start or the counter's next value is not verified (the ignored live
+    test advances the counter and asserts the start).
   - MariaDB asks `SHOW CREATE SEQUENCE`; MySQL has none and the call is refused.
 - **Sessions on other databases.** A database of a server other than the
   profile's gets one session per (profile, database), opened lazily the first

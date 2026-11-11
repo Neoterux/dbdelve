@@ -1162,7 +1162,10 @@ impl Connection {
     }
 
     /// `GET_DDL('SEQUENCE', ..)`, named from the database down like
-    /// [`Self::ddl`]. It writes the sequence's definition, not its next value.
+    /// [`Self::ddl`]. Whether its `START WITH` is the original start or the
+    /// counter's next value is not verified against an account;
+    /// `live_a_sequences_ddl_comes_from_get_ddl` advances the counter first to
+    /// settle it.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
         self.get_ddl("SEQUENCE", schema, name)
     }
@@ -2044,12 +2047,21 @@ mod tests {
         connection
             .query("CREATE SEQUENCE dbdelve_sequence_probe.ticket START 5 INCREMENT 2")
             .expect("the probe sequence should be created");
+        for _ in 0..2 {
+            connection
+                .query("SELECT dbdelve_sequence_probe.ticket.NEXTVAL")
+                .expect("the counter moves");
+        }
         // Unquoted names are folded to upper case by the server.
         let ddl = connection.sequence_ddl("DBDELVE_SEQUENCE_PROBE", "TICKET");
         drop(&connection);
         let ddl = ddl.expect("the definition is read");
         assert!(ddl.to_uppercase().contains("CREATE"), "{ddl}");
         assert!(ddl.contains("TICKET"), "{ddl}");
+        assert!(
+            ddl.to_uppercase().contains("START WITH 5"),
+            "the statement carries the start and not the counter: {ddl}"
+        );
     }
 
     #[test]
