@@ -16302,3 +16302,91 @@ fn focusing_the_sidebar_reveals_the_front_row_inside_a_folded_subtree(cx: &mut T
         quit(workspace, cx);
     });
 }
+
+/// What the profile in front has recorded of the statements its open
+/// transaction has run on the connection's own session.
+fn recorded_statements(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .expect("a profile is in front")
+            .transaction_statements
+            .clone()
+    })
+}
+
+/// Brings `tab` to the front of the profile in front.
+fn front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, tab: Tab) {
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.activate_tab(tab, window, cx));
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn the_open_transactions_statements_are_recorded_from_its_begin_to_its_end(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        let own_tab = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_query_tab()
+                .unwrap()
+                .id
+        });
+        assert!(
+            recorded_statements(&workspace, cx).is_empty(),
+            "nothing is open at the start"
+        );
+
+        run_in_front(&workspace, cx, "BEGIN");
+        assert_eq!(recorded_statements(&workspace, cx), ["BEGIN"], "the BEGIN");
+        run_in_front(&workspace, cx, "INSERT INTO t VALUES (1)");
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            recorded_statements(&workspace, cx),
+            [
+                "BEGIN",
+                "INSERT INTO t VALUES (1)",
+                "SELECT count(*) FROM t"
+            ],
+            "the statements after the BEGIN, in order"
+        );
+
+        // A bound tab's session is another one: its BEGIN and ROLLBACK are
+        // not what the own session's COMMIT will end.
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "BEGIN");
+        run_in_front(&workspace, cx, "ROLLBACK");
+        assert_eq!(
+            recorded_statements(&workspace, cx).len(),
+            3,
+            "a bound tab's statements are not the own session's"
+        );
+
+        // dbdelve's own read, a relation's preview, is not the user's.
+        open_table_by_clicking(&workspace, cx, "e2e", "t");
+        assert_eq!(
+            recorded_statements(&workspace, cx).len(),
+            3,
+            "a relation preview is dbdelve's read"
+        );
+
+        front_tab(&workspace, cx, Tab::Query(own_tab));
+        run_in_front(&workspace, cx, "COMMIT");
+        assert!(
+            recorded_statements(&workspace, cx).is_empty(),
+            "the COMMIT ended the transaction"
+        );
+        run_in_front(&workspace, cx, "SELECT 1");
+        assert!(
+            recorded_statements(&workspace, cx).is_empty(),
+            "a statement outside a transaction is not recorded"
+        );
+        quit(workspace, cx);
+    });
+}
