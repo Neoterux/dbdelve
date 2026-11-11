@@ -114,6 +114,13 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) selection: Selection,
     /// The rows the last build closed because nothing had loaded under them.
     unloaded: HashSet<String>,
+    /// The rows the last build left folded with their rows left out, and the
+    /// row each left-out row hangs from.
+    pruned: HashSet<String>,
+    hidden: HashMap<String, String>,
+    /// Rows the next build opens whatever the folds say: the rows above one
+    /// a reveal is after.
+    reveal: Vec<String>,
     /// The group the last build was made for, which `None` outer says is no
     /// build yet. A build for another group opens that one.
     group: Option<Option<String>>,
@@ -150,6 +157,9 @@ impl ConnectionsSidebar {
             folds_before_filter: None,
             selection: Selection::default(),
             unloaded: HashSet::new(),
+            pruned: HashSet::new(),
+            hidden: HashMap::new(),
+            reveal: Vec::new(),
             group: None,
         }
     }
@@ -198,6 +208,9 @@ impl Workspace {
         // the rest wait for their subtree to load.
         for row in self.profiles.iter().flat_map(|profile| &profile.open_rows) {
             folds.entry(row.clone()).or_insert(true);
+        }
+        for row in std::mem::take(&mut self.connections.reveal) {
+            folds.insert(row, true);
         }
         // The group in front starts open. What the last build left of its
         // fold is only how it started, so it is let go when the front
@@ -275,6 +288,8 @@ impl Workspace {
         );
         self.connections.group = Some(current);
         self.connections.unloaded = built.unloaded;
+        self.connections.pruned = built.pruned;
+        self.connections.hidden = built.hidden;
         let front = self
             .profile()
             .map(|profile| SharedString::from(front_row_id(profile).unwrap_or_default()));
@@ -524,6 +539,23 @@ impl Workspace {
         actions
     }
 
+    /// Opens every row above `id` that the tree has left out, so that the row
+    /// is there to be selected and scrolled to. The rows above it that are
+    /// drawn are the tree's to open (`TreeState::reveal_item`).
+    pub(crate) fn reveal_connections_row(&mut self, id: &str, cx: &mut Context<Self>) {
+        let mut above = Vec::new();
+        let mut at = id.to_string();
+        while let Some(parent) = self.connections.hidden.get(&at) {
+            above.push(parent.clone());
+            at = parent.clone();
+        }
+        if above.is_empty() {
+            return;
+        }
+        self.connections.reveal.extend(above);
+        self.rebuild_connections(cx);
+    }
+
     /// What a click on the connections tree's row `id` does with `modifiers`
     /// held. Whether the tree is to be kept from its own click: a Cmd-, Ctrl-
     /// or Shift-click on a node changes the selection and nothing else, where
@@ -657,6 +689,11 @@ impl Workspace {
     /// Anything else lands here too (a reveal opens every ancestor of its
     /// row, a second expand repeats the first), and does nothing.
     pub(crate) fn expand_node(&mut self, id: &SharedString, cx: &mut Context<Self>) {
+        // A row built folded holds one inert row where its rows are: opened,
+        // it is built again with them.
+        if self.connections.pruned.contains(id.as_str()) {
+            self.rebuild_connections(cx);
+        }
         match self.connections.nodes.get(id.as_str()) {
             Some(Node::Connection { profile }) => {
                 let profile = profile.clone();

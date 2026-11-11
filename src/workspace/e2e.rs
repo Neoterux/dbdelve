@@ -1058,6 +1058,21 @@ fn connections_row(
     })
 }
 
+/// The connections tree's row `id` made showing and selected, through every
+/// folded row above it, those the tree left out as well as those it drew.
+fn reveal_connections_row(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) {
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_connections_row(id, cx);
+        workspace.connections.tree.update(cx, |tree, cx| {
+            let row = id.to_string().into();
+            tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
+            // A reveal alone repaints nothing; selecting does.
+            tree.set_selected_index(tree.index_of(&row), cx);
+        });
+    });
+    settle(cx);
+}
+
 /// A row of the connections tree: whether it is open, and its children's ids
 /// and labels with whether each is disabled.
 type ConnectionsItem = (bool, Vec<(String, String, bool)>);
@@ -1270,15 +1285,7 @@ fn an_object_row_of_a_connection_behind_opens_on_that_connection(cx: &mut TestAp
         }
         let reveal = |id: &str, cx: &mut VisualTestContext| {
             let row = scoped_row(id, None, &explorer::relation_row("main", "birds"));
-            workspace.update(cx, |workspace, cx| {
-                workspace.connections.tree.update(cx, |tree, cx| {
-                    let row = row.clone().into();
-                    tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
-                    // A reveal alone repaints nothing; selecting does.
-                    tree.set_selected_index(tree.index_of(&row), cx);
-                });
-            });
-            settle(cx);
+            reveal_connections_row(&workspace, cx, &row);
             row
         };
         let a_birds = reveal("a", cx);
@@ -12702,6 +12709,8 @@ fn disconnecting_redraws_the_connection_in_front_as_not_open(cx: &mut TestAppCon
         workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
         settle(cx);
         assert_eq!(profile_state(&workspace, cx, "a"), "connected");
+        // Folded until it is opened, so its rows are one inert row until then.
+        open_connections_rows(&workspace, cx, std::slice::from_ref(&a));
         let (_, rows) = connections_item(&workspace, cx, &a).expect("a is listed");
         assert!(rows.iter().any(|(id, ..)| id == &schema), "{rows:?}");
 
@@ -12740,17 +12749,12 @@ fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut Test
             let at = connections_row(&workspace, cx, row).expect("the row is listed");
             click_connections_row(cx, at);
         }
-        workspace.update(cx, |workspace, cx| {
-            workspace.connections.tree.update(cx, |tree, cx| {
-                // A relation is under its category, which a reveal opens.
-                let id = birds.clone().into();
-                tree.reveal_item(&id, gpui::ScrollStrategy::Top, cx);
-                let row = tree.index_of(&id);
-                assert!(row.is_some(), "the schema's relations are listed");
-                tree.set_selected_index(row, cx);
-            });
-        });
-        settle(cx);
+        // A relation is under its category, which a reveal opens.
+        reveal_connections_row(&workspace, cx, &birds);
+        assert!(
+            connections_row(&workspace, cx, &birds).is_some(),
+            "the schema's relations are listed"
+        );
 
         // What the rows of `b` are, and the group row they are drawn under.
         let kept = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
@@ -14824,15 +14828,7 @@ fn selection_fixture(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visual
     // `a`'s `birds` is revealed last, so it is the row the tree has selected.
     for id in ["b", "a"] {
         for name in ["flocks", "birds"] {
-            let row = table_row(id, name);
-            workspace.update(cx, |workspace, cx| {
-                workspace.connections.tree.update(cx, |tree, cx| {
-                    let row = row.clone().into();
-                    tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
-                    tree.set_selected_index(tree.index_of(&row), cx);
-                });
-            });
-            settle(cx);
+            reveal_connections_row(&workspace, cx, &table_row(id, name));
         }
     }
     (workspace, cx)
@@ -15173,14 +15169,7 @@ fn refresh_reads_each_database_of_the_selection_again(cx: &mut TestAppContext) {
             "`t` of each database is listed: {t_rows:?}"
         );
         for row in t_rows.iter().rev() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.connections.tree.update(cx, |tree, cx| {
-                    let row = row.clone().into();
-                    tree.reveal_item(&row, gpui::ScrollStrategy::Top, cx);
-                    tree.set_selected_index(tree.index_of(&row), cx);
-                });
-            });
-            settle(cx);
+            reveal_connections_row(&workspace, cx, row);
         }
         // The first is the tree's row, the second joins it.
         click_connections_row_with(&workspace, cx, &t_rows[1], gpui::Modifiers::secondary_key());
@@ -15548,7 +15537,7 @@ fn expanding_a_folded_loaded_row_builds_its_rows(cx: &mut TestAppContext) {
             Some((false, vec![(format!("{a}/folded"), String::new(), true)])),
             "a connected connection left folded is one row and one inert row"
         );
-        open_connections_rows(&workspace, cx, &[a.clone()]);
+        open_connections_rows(&workspace, cx, std::slice::from_ref(&a));
         assert!(
             connections_row_open(&workspace, cx, &a),
             "the click opened it"
@@ -15563,14 +15552,16 @@ fn expanding_a_folded_loaded_row_builds_its_rows(cx: &mut TestAppContext) {
             Some((false, 1)),
             "each folded in its turn"
         );
-        open_connections_rows(&workspace, cx, &[main.clone()]);
-        assert!(
-            connections_row_open(
+        open_connections_rows(&workspace, cx, std::slice::from_ref(&main));
+        assert_eq!(
+            connections_item(
                 &workspace,
                 cx,
                 &scoped_row("a", None, "category-Tables-main")
-            ),
-            "the schema's own rows are there to be clicked"
+            )
+            .map(|(open, children)| (open, children.len())),
+            Some((false, 1)),
+            "the schema's own rows are there to be clicked, each folded in its turn"
         );
         quit(workspace, cx);
     });
