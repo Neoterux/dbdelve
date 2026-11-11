@@ -829,9 +829,23 @@ impl Connection {
     /// batch moves the session. It shares no session or stop state with this
     /// connection, and carries no read-only hold of its own; the caller
     /// applies it.
-    /// RED stub: shares the profile's database.
-    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
-        Ok(self.alongside())
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        let mut connection = Self {
+            session: Arc::new(Mutex::new(None)),
+            in_flight: Arc::default(),
+            server: ServerConfig {
+                database: database.to_string(),
+                ..self.server.clone()
+            },
+            alongside: false,
+            ..self.clone()
+        };
+        let mut session = connection.connect()?;
+        // The server's spelling, as `open` asks for it: a restore after a
+        // `USE` and a reconnect then name it as the server does.
+        connection.server.database = current_database(&mut session)?;
+        *connection.session.lock().expect("unshared until returned") = Some(session);
+        Ok(connection)
     }
 
     fn in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
