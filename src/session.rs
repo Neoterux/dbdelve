@@ -2418,7 +2418,17 @@ impl QueryTab {
             row_panel_editing: false,
             row_panel_filter: Default::default(),
             row_panel_split: cx.new(|_| ResizableState::default()),
-            binding: None,
+            // Kept as written, and handed to the driver as data on the first
+            // run: a database the server no longer has fails that run with the
+            // open's own words, and the tab stays bound to it.
+            binding: stored
+                .database
+                .clone()
+                .filter(|database| !database.is_empty())
+                .map(|database| Binding {
+                    database,
+                    schema: stored.schema.clone().filter(|schema| !schema.is_empty()),
+                }),
         };
         (tab, notice)
     }
@@ -2434,8 +2444,14 @@ impl QueryTab {
                 .queue
                 .as_ref()
                 .map_or(self.queued_results, |queue| queue.done.len()),
-            database: None,
-            schema: None,
+            database: self
+                .binding
+                .as_ref()
+                .map(|binding| binding.database.clone()),
+            schema: self
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.schema.clone()),
         }
     }
 }
