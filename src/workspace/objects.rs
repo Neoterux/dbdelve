@@ -6,7 +6,11 @@
 use super::*;
 
 use crate::db::{ColumnDefinition, Structure};
-use crate::session::{Explained, Finished, Queue, Routed, TabKey};
+use crate::session::{Binding, Explained, Finished, Queue, Routed, TabKey};
+
+/// A definition being read: the connection it was asked of, by id and
+/// generation, and the read itself.
+type DdlRead = (String, u64, gpui::Task<Result<String, DbError>>);
 
 impl Workspace {
     pub(crate) fn open_explorer_target(
@@ -585,25 +589,55 @@ impl Workspace {
         Some((schema.name.clone(), relation.name.clone(), relation.kind))
     }
 
+    /// Ask for `schema.relation`'s definition over the connection of its
+    /// database, `None` for the profile's own: another database's is read over
+    /// that database's session, which a read with none open opens first.
+    /// Nothing is sent but the driver's own DDL read.
+    fn read_ddl(
+        &mut self,
+        database: Option<String>,
+        schema: String,
+        relation: String,
+        kind: RelationKind,
+        cx: &mut Context<Self>,
+    ) -> Option<DdlRead> {
+        let profile = self.profile()?;
+        // The own database is the profile's own connection, not a session of
+        // its own: asking it for itself by name would open a second one.
+        let database =
+            database.filter(|database| profile.active_database().as_ref() != Some(database));
+        let routed = profile.route(database.map(|database| Binding {
+            database,
+            schema: None,
+        }));
+        if !routed.is_available() {
+            return None;
+        }
+        let (profile_id, generation) = (profile.id.clone(), profile.generation);
+        let task = self.run_routed(
+            &profile_id,
+            generation,
+            routed,
+            move |connection| connection.ddl(&schema, &relation, kind),
+            cx,
+        );
+        Some((profile_id, generation, task))
+    }
+
     pub(crate) fn copy_ddl(
         &mut self,
+        database: Option<String>,
         schema: String,
         relation: String,
         kind: RelationKind,
         cx: &mut Context<Self>,
     ) {
         self.clear_notice();
-        let Some(profile) = self.profile() else {
+        let Some((profile_id, generation, task)) =
+            self.read_ddl(database, schema, relation, kind, cx)
+        else {
             return;
         };
-        let Some(connection) = profile.connection() else {
-            return;
-        };
-        let profile_id = profile.id.clone();
-        let generation = profile.generation;
-        let task = spawn_blocking(cx.background_executor(), move || {
-            connection.ddl(&schema, &relation, kind)
-        });
 
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
@@ -627,15 +661,108 @@ impl Workspace {
         .detach();
     }
 
-    /// Open the `Show DDL` dialog over `schema.relation` of `database`.
+    /// Open the `Show DDL` dialog over `schema.relation` of `database` (`None`
+    /// for the profile's own): the text is read over that database's
+    /// connection and drawn read-only. It is not a buffer, so nothing in it
+    /// can be run.
     pub(crate) fn show_ddl(
         &mut self,
-        _database: Option<String>,
-        _schema: String,
-        _relation: String,
-        _kind: RelationKind,
-        _cx: &mut Context<Self>,
+        database: Option<String>,
+        schema: String,
+        relation: String,
+        kind: RelationKind,
+        cx: &mut Context<Self>,
     ) {
+        self.clear_notice();
+        let kind_name = crate::palette::kind_label(ObjectKind::Relation(kind));
+        let title = format!(
+            "{}{} {schema}.{relation}",
+            kind_name[..1].to_uppercase(),
+            &kind_name[1..]
+        );
+        let shown = relation.clone();
+        let Some((profile_id, generation, task)) =
+            self.read_ddl(database, schema, relation, kind, cx)
+        else {
+            return;
+        };
+        self.last_ddl_request += 1;
+        let request = self.last_ddl_request;
+        self.ddl_view = Some(DdlView {
+            profile: profile_id.clone(),
+            name: shown,
+            title,
+            text: DdlText::Loading,
+            request,
+        });
+        cx.notify();
+
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    if workspace.issued_to(&profile_id, generation).is_none() {
+                        return;
+                    }
+                    // Closed, or put up for another object, since: that answer
+                    // is not this dialog's.
+                    let Some(view) = workspace
+                        .ddl_view
+                        .as_mut()
+                        .filter(|view| view.request == request)
+                    else {
+                        return;
+                    };
+                    view.text = match result {
+                        Ok(ddl) => DdlText::Ready(ddl),
+                        Err(error) => {
+                            DdlText::Failed(format!("Could not read the definition: {error}"))
+                        }
+                    };
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// The `Show DDL` dialog, when it is the front connection's: one left up
+    /// for a connection that is no longer in front is not drawn and `escape`
+    /// does not stop at it.
+    pub(crate) fn ddl_view_in_front(&self) -> Option<&DdlView> {
+        let profile = self.profile()?;
+        self.ddl_view
+            .as_ref()
+            .filter(|view| view.profile == profile.id)
+    }
+
+    /// Close the dialog and hand the keyboard back. Answers whether it was
+    /// drawn, so `escape` is only spent on a dialog that was.
+    pub(crate) fn close_ddl_view(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ddl_view_in_front().is_none() {
+            return false;
+        }
+        self.ddl_view = None;
+        self.refocus_front();
+        cx.notify();
+        true
+    }
+
+    /// Put the shown definition on the clipboard. Nothing when there is none
+    /// to put there: still loading, failed, or empty.
+    pub(crate) fn copy_shown_ddl(&mut self, cx: &mut Context<Self>) {
+        let Some(DdlView {
+            text: DdlText::Ready(text),
+            ..
+        }) = self.ddl_view_in_front()
+        else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.confirm("Copied the CREATE statement.".into(), cx);
     }
 
     pub(crate) fn load_structure(

@@ -1986,7 +1986,7 @@ impl Render for Workspace {
             let insert = engine.syntax() == db::Syntax::Sql
                 && matches!(structure, StructureState::Loaded(loaded) if !loaded.columns.is_empty());
             Some((
-                connected.then(|| (tab.schema.clone(), tab.name.clone(), kind)),
+                connected.then(|| (tab.schema.clone(), tab.name.clone(), kind, tab.database.clone())),
                 insert,
             ))
         });
@@ -2140,7 +2140,7 @@ impl Render for Workspace {
                                 .flex()
                                 .items_center()
                                 .gap(px(layout::SPACE_SM))
-                                .children(ddl.map(|(schema, relation, kind)| {
+                                .children(ddl.map(|(schema, relation, kind, database)| {
                                     button(
                                         "copy-create",
                                         "Copy CREATE",
@@ -2150,10 +2150,14 @@ impl Render for Workspace {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
-                                            let (schema, relation) =
-                                                (schema.clone(), relation.clone());
+                                            let (schema, relation, database) = (
+                                                schema.clone(),
+                                                relation.clone(),
+                                                database.clone(),
+                                            );
                                             _ = ddl_workspace.update(cx, |workspace, cx| {
-                                                workspace.copy_ddl(schema, relation, kind, cx);
+                                                workspace
+                                                    .copy_ddl(database, schema, relation, kind, cx);
                                             });
                                         },
                                     )
@@ -2539,6 +2543,7 @@ impl Render for Workspace {
                     // already answering, and `escape` reaches it last.
                     ("agent-approval", self.render_agent_approval(cx)),
                     ("agent-audit", self.render_agent_audit(cx)),
+                    ("show-ddl", self.render_show_ddl(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),
@@ -2563,11 +2568,7 @@ impl Render for Workspace {
 pub(crate) struct DdlView {
     /// The connection the object belongs to, by id.
     pub(crate) profile: String,
-    /// The object's database when it is not the connection's own.
-    pub(crate) database: Option<String>,
-    pub(crate) schema: String,
     pub(crate) name: String,
-    pub(crate) kind: RelationKind,
     pub(crate) title: String,
     pub(crate) text: DdlText,
     pub(crate) request: u64,
