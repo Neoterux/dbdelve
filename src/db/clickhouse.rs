@@ -709,9 +709,18 @@ impl Connection {
     /// running requests and described tables are its own, since a table
     /// described in one database says nothing of another's. It starts under
     /// the hold this connection has, and the caller applies every later one.
-    /// RED stub: shares the profile's database.
-    pub fn on_database(&self, _database: &str) -> Result<Self, DbError> {
-        Ok(self.apart())
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        Ok(Self {
+            config: Arc::new(ServerConfig {
+                database: database.to_string(),
+                ..(*self.config).clone()
+            }),
+            read_only: Arc::new(AtomicBool::new(self.read_only.load(Ordering::SeqCst))),
+            session: Arc::default(),
+            running: Arc::default(),
+            described: Arc::default(),
+            ..self.clone()
+        })
     }
 
     pub fn catalog(&self) -> Result<Catalog, DbError> {
