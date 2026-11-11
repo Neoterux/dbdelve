@@ -2798,6 +2798,193 @@ fn a_typed_pattern_shows_what_it_matches_before_saving(cx: &mut TestAppContext) 
     });
 }
 
+/// Whether the picker draws the row under `selector`.
+fn picker_row_drawn(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    cx.debug_bounds(selector).is_some()
+}
+
+#[gpui::test]
+fn the_picker_search_narrows_the_rows_and_the_bulk_actions_act_on_what_it_leaves(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        // The pattern field is the one the search and the bulk actions leave alone.
+        click_selector(cx, "filter-picker-patterns-databases");
+        cx.simulate_input("x*");
+        settle(cx);
+
+        click_selector(cx, "filter-picker-search-databases");
+        cx.simulate_input("ot");
+        settle(cx);
+        assert!(!picker_row_drawn(cx, "filter-picker-row-databases-0"));
+        assert!(
+            picker_row_drawn(cx, "filter-picker-row-databases-1"),
+            "`other` is drawn"
+        );
+        assert!(!picker_row_drawn(cx, "filter-picker-row-databases-2"));
+
+        click_selector(cx, "filter-picker-select-all-databases");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.ticked, ["other"], "only what is drawn");
+            assert_eq!(picker.databases.patterns, ["x*"]);
+        });
+
+        // A search nothing answers says so in place of the rows.
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("zzz");
+        settle(cx);
+        assert!(!picker_row_drawn(cx, "filter-picker-row-databases-1"));
+        assert!(
+            cx.debug_bounds("filter-picker-no-match-databases")
+                .is_some()
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.no_match_line(super::filter_picker::Which::Databases),
+                "No database matches the search."
+            );
+        });
+
+        cx.simulate_keystrokes("secondary-a backspace");
+        settle(cx);
+        assert!(picker_row_drawn(cx, "filter-picker-row-databases-2"));
+        click_selector(cx, "filter-picker-clear-databases");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(picker.databases.ticked.is_empty());
+            assert_eq!(picker.databases.patterns, ["x*"]);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn remove_filter_empties_the_dialog_and_takes_effect_on_save(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(
+            cx,
+            "mode = \"full\"\ninclude_databases = [\"other\", \"s*\"]",
+        );
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        attach_other(&workspace, cx);
+        open_the_picker_from_the_menu(&workspace, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(picker.can_remove(), "there is a filter to remove");
+        });
+
+        click_selector(cx, "filter-picker-remove");
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(picker.databases.ticked.is_empty());
+            assert!(picker.databases.patterns.is_empty());
+            assert!(!picker.can_remove(), "nothing left to remove");
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(
+                profile.include.databases,
+                ["other", "s*"],
+                "only Save Filter takes effect"
+            );
+        });
+
+        click_selector(cx, "filter-picker-0");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert!(profile.include.databases.is_empty());
+            assert_eq!(
+                workspace.connections.totals.get(&connection_row("e2e")),
+                None
+            );
+        });
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let saved = std::fs::read_to_string(file).expect("profiles.toml reads");
+        assert!(!saved.contains("include_databases"), "{saved}");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_failed_listing_says_what_happened_and_keeps_save_and_the_patterns_usable(
+    cx: &mut TestAppContext,
+) {
+    use super::filter_picker::{Listing, Which};
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace.filter_picker.as_mut().expect("the picker is up");
+            picker.databases.listing = Listing::Failed("boom".into());
+            cx.notify();
+        });
+        settle(cx);
+        assert!(cx.debug_bounds("filter-picker-failed-databases").is_some());
+        assert!(cx.debug_bounds("filter-picker-retry-databases").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.status_line(Which::Databases).as_deref(),
+                Some("The list of databases could not be read: boom")
+            );
+            assert_eq!(
+                picker.preview(Which::Databases).as_deref(),
+                Some("Matches cannot be previewed: the names were not read.")
+            );
+        });
+
+        click_selector(cx, "filter-picker-patterns-databases");
+        cx.simulate_input("sc*");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.patterns, ["sc*"]);
+            assert!(picker.can_save(), "patterns are valid without the names");
+        });
+
+        click_selector(cx, "filter-picker-retry-databases");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.databases.listing,
+                Listing::Loaded(vec!["e2e".into(), "other".into(), "scratch".into()])
+            );
+            assert_eq!(picker.databases.patterns, ["sc*"], "what was typed stays");
+        });
+        assert!(cx.debug_bounds("filter-picker-retry-databases").is_none());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_server_that_lists_no_databases_says_so(cx: &mut TestAppContext) {
+    use super::filter_picker::{Listing, Which};
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace.filter_picker.as_mut().expect("the picker is up");
+            picker.databases.listing = Listing::Loaded(Vec::new());
+            cx.notify();
+        });
+        settle(cx);
+        assert!(cx.debug_bounds("filter-picker-empty-databases").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.status_line(Which::Databases).as_deref(),
+                Some("The server lists no databases.")
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
 /// What the palette's Commands scope draws at the end of each row.
 fn palette_hints(
     workspace: &Entity<Workspace>,
