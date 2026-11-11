@@ -1520,6 +1520,7 @@ mod tests {
             name: name.to_string(),
             relations,
             routines: Vec::new(),
+            sequences: Vec::new(),
         }
     }
 

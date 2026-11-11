@@ -1227,6 +1227,7 @@ impl Connection {
                 name: self.database.clone(),
                 relations,
                 routines: Vec::new(),
+                sequences: Vec::new(),
             }],
             database: None,
         })
