@@ -1525,10 +1525,14 @@ mod tests {
         assert_eq!(sequences_by_schema(&read), wanted);
 
         let connection = crate::db::Connection::DuckDb(connection);
-        let second = connection.routines().expect("the second half is read");
+        let second = connection
+            .routines(&crate::db::Shown::everything())
+            .expect("the second half is read");
         assert_eq!(sequences_by_schema(&second), wanted);
 
-        let mut screen = connection.catalog().expect("the first half is read");
+        let mut screen = connection
+            .catalog(&crate::db::Shown::everything())
+            .expect("the first half is read");
         screen.merge(second);
         assert_eq!(sequences_by_schema(&screen), wanted);
         let main = &screen.schemas[0];

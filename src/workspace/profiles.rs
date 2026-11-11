@@ -1037,6 +1037,7 @@ impl Workspace {
         profile.schema_refresh = Some(profile.generation);
         let (id, generation) = (profile.id.clone(), profile.generation);
         let in_transaction = profile.in_transaction;
+        let shown = profile.shown();
         cx.notify();
 
         let refresh_task = spawn_blocking(cx.background_executor(), move || {
@@ -1048,8 +1049,8 @@ impl Workspace {
                 true => connection.apart().map_err(lost)?,
                 false => connection.clone(),
             };
-            let catalog = reader.catalog().map_err(lost)?;
-            Ok::<_, (DbError, bool)>((catalog, reader.routines()))
+            let catalog = reader.catalog(&shown).map_err(lost)?;
+            Ok::<_, (DbError, bool)>((catalog, reader.routines(&shown)))
         });
 
         cx.spawn(async move |workspace, cx| {
@@ -2022,7 +2023,9 @@ impl Workspace {
             self.catalog_landed(id, cx);
             return;
         };
-        let catalog_task = spawn_blocking(cx.background_executor(), move || connection.catalog());
+        let shown = profile.shown();
+        let catalog_task =
+            spawn_blocking(cx.background_executor(), move || connection.catalog(&shown));
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
@@ -2260,8 +2263,15 @@ impl Workspace {
         let Some(connection) = self.session_for(id, &database, generation) else {
             return;
         };
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
         let task = spawn_blocking(cx.background_executor(), move || {
-            let result = connection.catalog();
+            let result = connection.catalog(&shown);
             let lost = result.is_err() && connection.is_lost();
             (result, lost)
         });
@@ -2334,7 +2344,16 @@ impl Workspace {
         let Some(connection) = self.session_for(id, database, generation) else {
             return;
         };
-        let task = spawn_blocking(cx.background_executor(), move || connection.routines());
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
+        let task = spawn_blocking(cx.background_executor(), move || {
+            connection.routines(&shown)
+        });
         let (id, database) = (id.to_string(), database.to_string());
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
@@ -2411,11 +2430,18 @@ impl Workspace {
         let Some(connection) = self.session_for(id, database, generation) else {
             return;
         };
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
         #[cfg(test)]
         {
             self.size_reads += 1;
         }
-        let task = spawn_blocking(cx.background_executor(), move || connection.sizes());
+        let task = spawn_blocking(cx.background_executor(), move || connection.sizes(&shown));
         let (id, database) = (id.to_string(), database.to_string());
         cx.spawn(async move |workspace, cx| {
             let Ok(sizes) = task.await else {
@@ -2490,7 +2516,10 @@ impl Workspace {
             }
             return;
         };
-        let routines_task = spawn_blocking(cx.background_executor(), move || connection.routines());
+        let shown = profile.shown();
+        let routines_task = spawn_blocking(cx.background_executor(), move || {
+            connection.routines(&shown)
+        });
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
@@ -2541,9 +2570,9 @@ impl Workspace {
         if !self.settings.show_sizes {
             return;
         }
-        let Some(connection) = self
+        let Some((connection, shown)) = self
             .issued_to(id, generation)
-            .and_then(|profile| profile.connection())
+            .and_then(|profile| Some((profile.connection()?, profile.shown())))
         else {
             return;
         };
@@ -2551,7 +2580,7 @@ impl Workspace {
         {
             self.size_reads += 1;
         }
-        let sizes_task = spawn_blocking(cx.background_executor(), move || connection.sizes());
+        let sizes_task = spawn_blocking(cx.background_executor(), move || connection.sizes(&shown));
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {

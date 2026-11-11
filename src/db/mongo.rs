@@ -1244,6 +1244,7 @@ impl Connection {
                 sequences: Vec::new(),
             }],
             database: None,
+            ..Default::default()
         })
     }
 

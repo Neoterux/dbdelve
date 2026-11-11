@@ -2712,7 +2712,7 @@ mod tests {
             .expect("the probe sequence should be created");
 
         let second = super::super::Connection::MySql(live(Engine::MariaDb))
-            .routines()
+            .routines(&crate::db::Shown::everything())
             .expect("the second half should read");
         let listed: Vec<_> = second
             .schemas
@@ -2776,7 +2776,7 @@ mod tests {
     fn live_mysql_lists_no_sequence_and_sends_no_sequence_statement() {
         let connection = live(Engine::MySql);
         let second = super::super::Connection::MySql(live(Engine::MySql))
-            .routines()
+            .routines(&crate::db::Shown::everything())
             .expect("the second half should read");
         assert!(
             second

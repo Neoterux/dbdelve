@@ -13,7 +13,7 @@
 //!
 //! [`Connection::databases`]: super::Connection::databases
 
-use super::{Databases, Levels};
+use super::{Catalog, Databases, Levels, Sizes};
 
 /// How many entries a list keeps. A file is a person's to edit: no more is
 /// read than a profile would write.
@@ -45,26 +45,38 @@ impl Include {
     }
 
     /// The lists as they apply to a target of shape `levels` whose session is
-    /// on `own_database`. A list the shape does not use is kept on disk and
-    /// ignored here, and a shape with no databases to choose between is never
-    /// filtered.
-    pub fn resolve(&self, levels: Levels, own_database: Option<&str>) -> Shown {
+    /// on `own_database` and `active_schema`. A list the shape does not use is
+    /// kept on disk and ignored here, and a shape with no databases to choose
+    /// between is never filtered.
+    pub fn resolve(
+        &self,
+        levels: Levels,
+        own_database: Option<&str>,
+        active_schema: Option<&str>,
+    ) -> Shown {
+        let entries = |list: &[String]| {
+            let entries = list
+                .iter()
+                .filter(|entry| !entry.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            (!entries.is_empty()).then_some(entries)
+        };
         match levels {
             Levels::Flat => Shown::everything(),
-            Levels::DatabaseIsSchema
-            | Levels::DatabaseThenSchema
-            | Levels::DatabaseHoldsObjects => {
-                let entries = self
-                    .databases
-                    .iter()
-                    .filter(|entry| !entry.trim().is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                Shown {
-                    databases: (!entries.is_empty()).then_some(entries),
-                    own_database: own_database.map(str::to_string),
-                }
-            }
+            Levels::DatabaseIsSchema | Levels::DatabaseHoldsObjects => Shown {
+                databases: entries(&self.databases),
+                own_database: own_database.map(str::to_string),
+                schemas_are_databases: levels == Levels::DatabaseIsSchema,
+                ..Shown::default()
+            },
+            Levels::DatabaseThenSchema => Shown {
+                databases: entries(&self.databases),
+                own_database: own_database.map(str::to_string),
+                schemas: entries(&self.schemas),
+                active_schema: active_schema.map(str::to_string),
+                ..Shown::default()
+            },
         }
     }
 }
@@ -77,6 +89,15 @@ pub struct Shown {
     databases: Option<Vec<String>>,
     /// The database the session is on, which is shown whatever matches.
     own_database: Option<String>,
+    /// The entries a schema of a catalog must match, or none for every
+    /// schema. Unused where the catalog's schemas are databases.
+    schemas: Option<Vec<String>>,
+    /// The schema the session is in, which is shown whatever matches, in the
+    /// connection's own database only.
+    active_schema: Option<String>,
+    /// Whether the catalog's schemas are the server's databases, so the
+    /// databases list narrows it.
+    schemas_are_databases: bool,
 }
 
 impl Shown {
@@ -94,6 +115,64 @@ impl Shown {
             .as_deref()
             .is_some_and(|own| same_name(own, name))
             || entries.iter().any(|entry| matches(entry, name))
+    }
+
+    /// Whether a schema of a catalog is shown: by the databases list where the
+    /// catalog's schemas are databases, else by the schemas list, with the
+    /// active schema kept whatever it says.
+    pub fn shows_schema(&self, name: &str) -> bool {
+        if self.schemas_are_databases {
+            return self.shows_database(name);
+        }
+        let Some(entries) = &self.schemas else {
+            return true;
+        };
+        self.active_schema
+            .as_deref()
+            .is_some_and(|active| same_name(active, name))
+            || entries.iter().any(|entry| matches(entry, name))
+    }
+
+    /// What this shows of a catalog another database's session read: the same
+    /// lists, with no active schema, which is the own database's.
+    pub fn in_another_database(&self) -> Self {
+        Self {
+            active_schema: None,
+            ..self.clone()
+        }
+    }
+
+    /// `catalog` without the schemas this does not show, in the order they
+    /// were read, and how many that was added to `left_out`, so a count a
+    /// read already made is kept.
+    ///
+    /// ponytail: the whole catalog is read and the schemas dropped after. The
+    /// ceiling is a very large single database, which still reads every
+    /// schema; the upgrade is a per-engine schema-names read pushed into the
+    /// catalog SQL.
+    pub fn narrow_catalog(&self, mut catalog: Catalog) -> Catalog {
+        let read = catalog.schemas.len();
+        catalog
+            .schemas
+            .retain(|schema| self.shows_schema(&schema.name));
+        catalog.left_out += read - catalog.schemas.len();
+        catalog
+    }
+
+    /// `routines` without the schemas this does not show, counting none: the
+    /// relations' read has counted them, and a schema holding only a routine
+    /// or a sequence must not come back through [`Catalog::merge`].
+    pub fn narrow_routines(&self, mut routines: Catalog) -> Catalog {
+        routines
+            .schemas
+            .retain(|schema| self.shows_schema(&schema.name));
+        routines
+    }
+
+    /// `sizes` without the schemas this does not show.
+    pub fn narrow_sizes(&self, mut sizes: Sizes) -> Sizes {
+        sizes.retain(|schema, _| self.shows_schema(schema));
+        sizes
     }
 
     /// `databases` with the names this does not show taken out, in the order
@@ -233,7 +312,7 @@ mod tests {
                 order.iter().map(|at| entries[*at].to_string()).collect(),
                 Vec::new(),
             );
-            let shown = include.resolve(Levels::DatabaseThenSchema, None);
+            let shown = include.resolve(Levels::DatabaseThenSchema, None, None);
             ["ab", "b", "xc", "zz"].map(|name| shown.shows_database(name))
         };
         let first = answers(orders[0]);
@@ -258,7 +337,7 @@ mod tests {
         ] {
             for levels in FILTERED {
                 let narrowed = include
-                    .resolve(levels, None)
+                    .resolve(levels, None, None)
                     .narrow_databases(listed(&names, None));
                 assert_eq!(narrowed.names, names, "{levels:?}");
                 assert_eq!(narrowed.left_out, 0, "{levels:?}");
@@ -285,12 +364,12 @@ mod tests {
         let include = Include::from_stored(text(&["a*"]), text(&["s"]));
         for levels in FILTERED {
             let narrowed = include
-                .resolve(levels, None)
+                .resolve(levels, None, None)
                 .narrow_databases(listed(&["a1", "b1"], None));
             assert_eq!(narrowed.names, ["a1"], "{levels:?}");
         }
         assert_eq!(
-            include.resolve(Levels::Flat, None),
+            include.resolve(Levels::Flat, None, None),
             Shown::everything(),
             "nothing to choose between, so nothing is filtered"
         );
@@ -298,7 +377,7 @@ mod tests {
         let schemas_only = Include::from_stored(Vec::new(), text(&["s"]));
         for levels in FILTERED {
             let narrowed = schemas_only
-                .resolve(levels, None)
+                .resolve(levels, None, None)
                 .narrow_databases(listed(&["a1", "b1"], None));
             assert_eq!(narrowed.names, ["a1", "b1"], "{levels:?}");
         }
@@ -308,14 +387,14 @@ mod tests {
     fn the_connections_own_database_is_always_shown_and_counted_as_shown() {
         let include = Include::from_stored(text(&["nothing*"]), Vec::new());
         let narrowed = include
-            .resolve(Levels::DatabaseThenSchema, Some("Own"))
+            .resolve(Levels::DatabaseThenSchema, Some("Own"), None)
             .narrow_databases(listed(&["a", "own", "b"], Some("own")));
         assert_eq!(narrowed.names, ["own"]);
         assert_eq!(narrowed.left_out, 2);
         assert_eq!(narrowed.current.as_deref(), Some("own"));
 
         let narrowed = include
-            .resolve(Levels::DatabaseThenSchema, None)
+            .resolve(Levels::DatabaseThenSchema, None, None)
             .narrow_databases(listed(&["a", "own", "b"], None));
         assert!(narrowed.names.is_empty());
         assert_eq!(narrowed.left_out, 3);
