@@ -2101,10 +2101,15 @@ impl Workspace {
         let Some(profile) = self.issued_to(id, generation) else {
             return;
         };
+        // A session a bound tab opened for a database the filter hides is the
+        // tab's, and the tree reads nothing it does not draw (D-08).
+        let shown = profile.shown();
         let open: Vec<String> = profile
             .bound
             .iter()
-            .filter(|(_, session)| matches!(session, BoundSession::Open(_)))
+            .filter(|(database, session)| {
+                matches!(session, BoundSession::Open(_)) && shown.shows_database(database)
+            })
             .map(|(database, _)| database.clone())
             .collect();
         self.list_databases(id, generation, cx);
@@ -2238,8 +2243,11 @@ impl Workspace {
             BoundSession::Open(Box::new(session.clone())),
         );
         // The connection's own database is read over its own session, and
-        // another is not asked for again once a session is registered.
-        if profile.active_database().as_deref() != Some(database.as_str()) {
+        // another is not asked for again once a session is registered. One the
+        // filter hides keeps its session for the tab and is never read (D-08).
+        if profile.active_database().as_deref() != Some(database.as_str())
+            && profile.shown().shows_database(&database)
+        {
             profile
                 .database_catalogs
                 .entry(database.clone())
