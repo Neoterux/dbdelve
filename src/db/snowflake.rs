@@ -665,6 +665,21 @@ impl Connection {
 
     /// The user's statements resolve in `schema` from here on. dbdelve's own
     /// are qualified and never sent one.
+    /// A session on `database`, as `SHOW DATABASES` lists it, for the
+    /// (connection, database) pair: the same account, key and agent, with a
+    /// config naming the database and an active schema of its own, so a
+    /// schema picked on either never reaches the other. It carries no
+    /// read-only hold; the gate holds every statement to reads here.
+    pub(super) fn on_database(&self, database: &str) -> Self {
+        let mut config = (*self.config).clone();
+        config.set_database(database.to_string());
+        Self {
+            config: Arc::new(config),
+            schema: Arc::new(Mutex::new(None)),
+            ..self.clone()
+        }
+    }
+
     pub fn set_schema(&self, schema: Option<&str>) {
         *self
             .schema

@@ -231,6 +231,28 @@ impl Connection {
         Ok(connection)
     }
 
+    /// A session on `database`, for the (connection, database) pair, which
+    /// the name lists as `db{n}`: the number is read first, so a name that is
+    /// not one opens nothing and dials nothing. Built from this live
+    /// connection's server config and tunnel, with a session and a `running`
+    /// of its own: nothing moves with this connection's. It carries no
+    /// read-only hold; there is no session setting for one, and the caller's
+    /// gate is the boundary.
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        let number = database_number(database)?;
+        let connection = Self {
+            session: Arc::default(),
+            running: Arc::default(),
+            server: ServerConfig {
+                database: number.to_string(),
+                ..self.server.clone()
+            },
+            ..self.clone()
+        };
+        *lock(&connection.session) = Some(connection.connect()?);
+        Ok(connection)
+    }
+
     fn connect(&self) -> Result<Session, DbError> {
         let server = &self.server;
         let dial = self.tunnel.as_deref().map(Tunnel::dial).transpose()?;

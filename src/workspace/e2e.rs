@@ -1527,9 +1527,9 @@ fn own_database(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> St
 
 /// The DuckDB profile of `launch_duckdb`, connected and holding `other`
 /// attached, with the connection listed again to say so.
-fn duckdb_with_other_attached<'a>(
-    cx: &'a mut TestAppContext,
-) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+fn duckdb_with_other_attached(
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
     let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
     let at = connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
     click_connections_row(cx, at);

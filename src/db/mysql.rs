@@ -479,6 +479,28 @@ impl Connection {
         })
     }
 
+    /// A session on `database`, for the (connection, database) pair: a new
+    /// connection from this one's live server config -- its resolved password
+    /// and its tunnel -- with the database replaced, selected by the driver's
+    /// own handshake and not a `USE` statement. It shares no mutable state
+    /// with this connection: `alongside` shares the `side` session a cancel
+    /// reads through, and this has one of its own. It carries no read-only
+    /// hold of its own; the caller applies it.
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        let server = ServerConfig {
+            database: database.to_string(),
+            ..self.server.clone()
+        };
+        let connection = connect(&server, self.engine, self.dial()?)?;
+        Ok(Self {
+            connection_id: connection.connection_id(),
+            server,
+            connection: Arc::new(Mutex::new(connection)),
+            side: Arc::default(),
+            ..self.clone()
+        })
+    }
+
     /// A round trip, unlike Postgres's check: the driver keeps no closed flag.
     /// `COM_PING` is answered inside a failed transaction too, so a statement
     /// that merely errored is not mistaken for a dropped session.

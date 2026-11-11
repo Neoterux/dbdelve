@@ -2079,9 +2079,10 @@ impl Connection {
     pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
         match self {
             Self::DuckDb(connection) => connection.on_database(database).map(Self::DuckDb),
-            Self::MySql(_) | Self::MongoDb(_) | Self::Redis(_) | Self::Snowflake(_) => {
-                Err(not_offered())
-            }
+            Self::MySql(connection) => connection.on_database(database).map(Self::MySql),
+            Self::Redis(connection) => connection.on_database(database).map(Self::Redis),
+            Self::Snowflake(connection) => Ok(Self::Snowflake(connection.on_database(database))),
+            Self::MongoDb(connection) => Ok(Self::MongoDb(connection.on_database(database))),
             Self::Postgres(_) | Self::SqlServer(_) | Self::ClickHouse(_) => Err(not_offered()),
             Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Err(plain_error(
                 "This connection has no other database to open a session on.".into(),
