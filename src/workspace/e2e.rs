@@ -13462,6 +13462,26 @@ fn a_tab_of_another_database_comes_back_after_a_relaunch(cx: &mut TestAppContext
             });
         });
         settle(cx);
+        // Not the snapshot the tab was restored with: a run that completed.
+        workspace.read_with(cx, |workspace, _| {
+            let tab = workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_object()
+                .unwrap();
+            assert!(
+                matches!(
+                    &tab.body,
+                    ObjectBody::Relation {
+                        query: QueryState::Complete { .. },
+                        stale: false,
+                        ..
+                    }
+                ),
+                "the reload ran on `other`"
+            );
+        });
         assert_eq!(
             front_object_database_and_cell(&workspace, cx),
             Some((Some("other".into()), Some("other".into())))
@@ -13480,6 +13500,12 @@ fn select_database_closes_only_the_own_databases_object_tabs(cx: &mut TestAppCon
             assert_eq!(workspace.profile().unwrap().session.objects.len(), 2);
         });
 
+        // The picker is the simple mode's way to another database: the tabs
+        // were opened in the connections tree, which only complex mode has.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view_mode(crate::sidebar::ViewMode::Simple, cx)
+        });
+        settle(cx);
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.set_database("other".into(), window, cx)
@@ -13496,6 +13522,38 @@ fn select_database_closes_only_the_own_databases_object_tabs(cx: &mut TestAppCon
                 [Some("other")],
                 "the connection's own tab went and the other database's stayed"
             );
+        });
+
+        // Its session was dropped with the switch's others and opens again
+        // on the tab's next read.
+        let id = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.objects[0].id
+        });
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_tab(Tab::Object(id), window, cx);
+                workspace.requery_relation(id, |_, _, _, _| true, cx);
+            });
+        });
+        settle(cx);
+        assert_eq!(
+            front_object_database_and_cell(&workspace, cx),
+            Some((Some("other".into()), Some("other".into())))
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let tab = workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_object()
+                .unwrap();
+            assert!(matches!(
+                &tab.body,
+                ObjectBody::Relation {
+                    query: QueryState::Complete { .. },
+                    ..
+                }
+            ));
         });
         quit(workspace, cx);
     });
