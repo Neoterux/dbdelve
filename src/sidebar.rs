@@ -599,7 +599,72 @@ pub(crate) const OPEN_ROWS_CAP: usize = 500;
 /// folded one is as open as it was left: an item keeps its rows until the
 /// next build.
 pub(crate) fn open_rows_of(items: &[TreeItem], profile: &str) -> Vec<String> {
-    Vec::new()
+    let id = connection_row(profile);
+    // A connection is a root, or a row of the group that is.
+    let connection = items
+        .iter()
+        .find(|item| item.id.as_str() == id)
+        .or_else(|| {
+            items
+                .iter()
+                .flat_map(|group| &group.children)
+                .find(|item| item.id.as_str() == id)
+        });
+    let mut rows = Vec::new();
+    if let Some(connection) = connection {
+        collect_open(connection, &mut rows);
+    }
+    rows
+}
+
+fn collect_open(item: &TreeItem, rows: &mut Vec<String>) {
+    if rows.len() >= OPEN_ROWS_CAP {
+        return;
+    }
+    if item.is_folder() && item.is_expanded() {
+        rows.push(item.id.to_string());
+    }
+    for child in &item.children {
+        collect_open(child, rows);
+    }
+}
+
+/// Whether each folder of `items` is open, by row id, for the folds a rebuild
+/// is made with: [`crate::explorer::folds`] less the rows the last build
+/// closed because nothing had loaded under them (`unloaded`), which nobody
+/// chose to fold. A row the user opened since is the user's, and stays.
+pub(crate) fn held_folds(items: &[TreeItem], unloaded: &HashSet<String>) -> HashMap<String, bool> {
+    let mut folds = crate::explorer::folds(items);
+    folds.retain(|row, open| *open || !unloaded.contains(row));
+    folds
+}
+
+/// The rows to keep for a profile: those `open` in its tree, then the ones
+/// already `stored` that the tree has no say over (`held` is what it has a say
+/// over). A stored row the tree does not hold yet is waiting for its subtree
+/// to load; one it holds is as the tree has it. Rows that name something that
+/// no longer exists stay until the cap pushes them out, since a row that is not
+/// there cannot be told from one that is not loaded.
+pub(crate) fn remembered_rows(
+    open: Vec<String>,
+    stored: &[String],
+    held: &HashMap<String, bool>,
+) -> Vec<String> {
+    open.into_iter()
+        .chain(
+            stored
+                .iter()
+                .filter(|row| !held.contains_key(row.as_str()))
+                .cloned(),
+        )
+        .take(OPEN_ROWS_CAP)
+        .collect()
+}
+
+/// The id of the profile a connections-tree row is under or is, for a
+/// connection's row, a database's and every row scoped to one.
+pub(crate) fn profile_of_row(id: &str) -> Option<&str> {
+    length_prefixed(id.strip_prefix("connection:")?).map(|(profile, _)| profile)
 }
 
 /// The rows, and what each stands for, by row id.
@@ -613,6 +678,10 @@ pub(crate) struct SidebarTree {
     /// that has not loaded has no entry: nothing is counted before it is
     /// known, and never as `0`.
     pub(crate) counts: HashMap<String, usize>,
+    /// The connection and database rows built folded because nothing had
+    /// loaded under them. Their closed state is the build's, not a fold anyone
+    /// chose, so a stored open row is not overruled by it.
+    pub(crate) unloaded: HashSet<String>,
 }
 
 /// What a loaded schema or database with nothing in it says in its one row.
@@ -751,10 +820,13 @@ fn connection_item(
         // Nothing has asked it to load, and nothing will until this row is
         // opened: an open row here would show a `Loading…` that no answer is
         // coming to replace.
-        Content::Unloaded => (
-            false,
-            vec![notice(tree, connection.id, None, "loading", LOADING)],
-        ),
+        Content::Unloaded => {
+            tree.unloaded.insert(id.clone());
+            (
+                false,
+                vec![notice(tree, connection.id, None, "loading", LOADING)],
+            )
+        }
         Content::Loading => (
             followed,
             vec![notice(tree, connection.id, None, "loading", LOADING)],
@@ -889,11 +961,14 @@ fn others_items(
         let (open, children, count) = match content {
             // Nothing will load it until its row is opened, as for a
             // connection: an open row here would wait on no answer.
-            Content::Unloaded => (
-                false,
-                vec![notice(tree, profile, Some(&database), "loading", LOADING)],
-                None,
-            ),
+            Content::Unloaded => {
+                tree.unloaded.insert(row.clone());
+                (
+                    false,
+                    vec![notice(tree, profile, Some(&database), "loading", LOADING)],
+                    None,
+                )
+            }
             Content::Loading => (
                 followed,
                 vec![notice(tree, profile, Some(&database), "loading", LOADING)],

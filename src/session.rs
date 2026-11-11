@@ -36,6 +36,7 @@ use crate::{
     },
     import_rows, result_grid,
     result_grid::{InsertTarget, NewValue, ResultGrid},
+    sidebar::OPEN_ROWS_CAP,
     sql::{self, Destructive, Mode, SortKey, Verdict},
     store,
     structure_grid::StructureGrid,
@@ -420,8 +421,13 @@ impl Profile {
             // property of its tab now. Kept on the stored shape only so a
             // profile written by an older build still loads with its buffer.
             open_query: None,
-            open_rows: Vec::new(),
-            selected_rows: Vec::new(),
+            open_rows: self.open_rows.iter().take(OPEN_ROWS_CAP).cloned().collect(),
+            selected_rows: self
+                .selected_rows
+                .iter()
+                .take(OPEN_ROWS_CAP)
+                .cloned()
+                .collect(),
             ssh: self.config.ssh().cloned(),
             open_queries: self
                 .session
