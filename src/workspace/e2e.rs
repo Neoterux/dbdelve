@@ -11043,6 +11043,112 @@ fn an_agent_describes_a_table_and_an_unknown_name_reads_as_missing(cx: &mut Test
     });
 }
 
+/// What an injected catalog call for `Ducks` answered.
+fn ducks_catalog_call(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tool: crate::agent::tools::Tool,
+    schema: Option<&str>,
+    table: Option<&str>,
+) -> crate::agent::Reply {
+    let (_, answers) = inject_call_with(
+        workspace,
+        cx,
+        tool,
+        Some("Ducks"),
+        crate::agent::CallArgs {
+            schema: schema.map(str::to_string),
+            table: table.map(str::to_string),
+            ..crate::agent::CallArgs::default()
+        },
+    );
+    answer_of(cx, &answers)
+}
+
+/// `ducks.duckdb` under the test home, seeded with `t` in `main` and `x` in
+/// `extra`, held by nobody once this returns.
+fn seed_ducks_file() -> String {
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    let path = directory.join("ducks.duckdb");
+    ::duckdb::Connection::open(&path)
+        .and_then(|connection| {
+            connection.execute_batch(
+                "CREATE TABLE t (id INTEGER); CREATE SCHEMA extra; \
+                 CREATE TABLE extra.x (id INTEGER);",
+            )
+        })
+        .expect("the schema applies");
+    path.display().to_string()
+}
+
+#[gpui::test]
+fn an_agent_lists_only_the_schemas_the_filter_shows_and_says_how_many(cx: &mut TestAppContext) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let path = seed_ducks_file();
+        let (workspace, cx) = agent_duckdb_with(cx, &path, "include_schemas = [\"main\"]");
+        cx.executor().allow_parking();
+
+        let schemas = ducks_catalog_call(&workspace, cx, Tool::ListSchemas, None, None);
+        assert_eq!(schemas.status, Status::Executed, "{}", schemas.text);
+        assert!(
+            schemas.text.starts_with("truncated: none (1 row)\nnote: "),
+            "{}",
+            schemas.text
+        );
+        assert!(schemas.text.ends_with("\n[\"main\"]\n"), "{}", schemas.text);
+        assert!(
+            schemas.text.contains(
+                "Showing 1 of 2 schemas. The profile's filter hides the rest from this listing; \
+                 execute_sql can still read them."
+            ),
+            "{}",
+            schemas.text
+        );
+
+        let hidden = ducks_catalog_call(&workspace, cx, Tool::ListTables, Some("extra"), None);
+        let missing = ducks_catalog_call(&workspace, cx, Tool::ListTables, Some("nope"), None);
+        assert_eq!(hidden.status, Status::Failed, "{}", hidden.text);
+        assert_eq!(
+            (hidden.status, &hidden.text),
+            (missing.status, &missing.text),
+            "a hidden schema answered differently from a missing one"
+        );
+        let hidden = ducks_catalog_call(
+            &workspace,
+            cx,
+            Tool::DescribeTable,
+            Some("extra"),
+            Some("x"),
+        );
+        let missing =
+            ducks_catalog_call(&workspace, cx, Tool::DescribeTable, Some("nope"), Some("x"));
+        assert_eq!(hidden.status, Status::Failed, "{}", hidden.text);
+        assert_eq!(
+            (hidden.status, &hidden.text),
+            (missing.status, &missing.text),
+            "a hidden pair answered differently from a missing one"
+        );
+
+        let tables = ducks_catalog_call(&workspace, cx, Tool::ListTables, Some("main"), None);
+        assert_eq!(tables.status, Status::Executed, "{}", tables.text);
+        assert!(tables.text.contains("[\"t\",\"table\""), "{}", tables.text);
+        assert!(
+            !tables.text.contains("filter"),
+            "list_tables adds no filter line: {}",
+            tables.text
+        );
+
+        // The filter is not an access boundary.
+        let answers = inject_sql(&workspace, cx, "Ducks", "SELECT count(*) FROM extra.x");
+        let read = answer_of(cx, &answers);
+        assert_eq!(read.status, Status::Executed, "{}", read.text);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
     cx: &mut TestAppContext,
