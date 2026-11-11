@@ -824,10 +824,13 @@ impl Connection {
         assemble_sequences(sequences)
     }
 
-    /// `SHOW CREATE SEQUENCE`, MariaDB's only.
+    /// MariaDB's `SHOW CREATE SEQUENCE`, whose second column is the statement,
+    /// as [`Self::ddl`] reads `SHOW CREATE TABLE`'s. MySQL has no sequences.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
-        let _ = (schema, name);
-        Err(plain_error("not yet".into()))
+        if self.engine != Engine::MariaDb {
+            return Err(plain_error("MySQL has no sequences.".into()));
+        }
+        self.show_create("SEQUENCE", schema, name)
     }
 
     /// On a connection of its own, as [`Self::cancel`] is, so opening every
@@ -883,16 +886,22 @@ impl Connection {
     /// `SHOW CREATE TABLE` answers for a view too, with its `CREATE VIEW` in
     /// the same second column.
     pub fn ddl(&self, schema: &str, relation: &str) -> Result<String, DbError> {
+        self.show_create("TABLE", schema, relation)
+    }
+
+    /// `SHOW CREATE {what}` for `schema.name`, the statement being the second
+    /// column.
+    fn show_create(&self, what: &str, schema: &str, name: &str) -> Result<String, DbError> {
         let shown = self.internal_query(&format!(
-            "SHOW CREATE TABLE {}",
-            self.engine.qualified(schema, relation)
+            "SHOW CREATE {what} {}",
+            self.engine.qualified(schema, name)
         ))?;
         shown
             .rows
             .first()
             .and_then(|row| row.get(1))
             .map(|definition| format!("{definition};"))
-            .ok_or_else(|| plain_error(format!("{schema}.{relation} has no definition to show.")))
+            .ok_or_else(|| plain_error(format!("{schema}.{name} has no definition to show.")))
     }
 }
 

@@ -1151,11 +1151,6 @@ impl Connection {
     /// Named from the database down, like a `SHOW`, so the answer does not
     /// hang on which database the request's field resolves a schema in.
     pub fn ddl(&self, schema: &str, relation: &str, kind: RelationKind) -> Result<String, DbError> {
-        let name = format!(
-            "{}.{}",
-            Engine::Snowflake.qualified(&self.config.stored_database(), schema),
-            Engine::Snowflake.quote_identifier(relation)
-        );
         let kind = match kind {
             RelationKind::View | RelationKind::MaterializedView => "VIEW",
             RelationKind::Table
@@ -1163,6 +1158,22 @@ impl Connection {
             | RelationKind::ForeignTable
             | RelationKind::Dictionary => "TABLE",
         };
+        self.get_ddl(kind, schema, relation)
+    }
+
+    /// `GET_DDL('SEQUENCE', ..)`, named from the database down like
+    /// [`Self::ddl`]. It writes the sequence's definition, not its next value.
+    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        self.get_ddl("SEQUENCE", schema, name)
+    }
+
+    /// `kind` is one of `GET_DDL`'s object types, a fixed word and not a name.
+    fn get_ddl(&self, kind: &str, schema: &str, name: &str) -> Result<String, DbError> {
+        let name = format!(
+            "{}.{}",
+            Engine::Snowflake.qualified(&self.config.stored_database(), schema),
+            Engine::Snowflake.quote_identifier(name)
+        );
         let result = self.internal_query(&format!(
             "SELECT GET_DDL('{kind}', {})",
             Engine::Snowflake.quote_literal(&name)
@@ -1173,12 +1184,6 @@ impl Connection {
             .and_then(|row| row.get(0))
             .map(terminated)
             .ok_or_else(|| plain_error(format!("{name} has no definition to show.")))
-    }
-
-    /// `GET_DDL('SEQUENCE', ..)`, named from the database down like [`Self::ddl`].
-    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
-        let _ = (schema, name);
-        Err(plain_error("not yet".into()))
     }
 
     /// Run statements dbdelve wrote all at the same time, in their own order.

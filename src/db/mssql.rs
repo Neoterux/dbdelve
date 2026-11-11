@@ -1255,8 +1255,25 @@ impl Connection {
 
     /// `CREATE SEQUENCE` for `schema.name`, composed from `sys.sequences`.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
-        let _ = (schema, name, SEQUENCE_PARTS_SQL);
-        Err(plain_error("not yet".into()))
+        let parts = self.internal_query(&structure_sql(SEQUENCE_PARTS_SQL, schema, name))?;
+        let row = parts
+            .rows
+            .first()
+            .ok_or_else(|| plain_error(format!("{schema} has no sequence {name}.")))?;
+        let cell = |column| required_cell(&parts, row, column);
+        Ok(compose_sequence(
+            schema,
+            name,
+            &SequenceParts {
+                data_type: cell("data_type")?,
+                start: cell("start_value")?,
+                increment: cell("increment")?,
+                minimum: cell("minimum_value")?,
+                maximum: cell("maximum_value")?,
+                cycle: cell("cycle")? == "yes",
+                cache: cell("cache")?,
+            },
+        ))
     }
 
     pub fn references(&self, schema: &str, relation: &str) -> Result<Vec<Reference>, DbError> {
@@ -2025,9 +2042,20 @@ struct SequenceParts<'a> {
     cache: &'a str,
 }
 
+/// SQL Server has no function that writes a sequence out, so the statement is
+/// composed from `sys.sequences`, every name quoted.
 fn compose_sequence(schema: &str, name: &str, parts: &SequenceParts) -> String {
-    let _ = (schema, name, parts);
-    String::new()
+    format!(
+        "CREATE SEQUENCE {} AS {} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} {} {};",
+        Engine::SqlServer.qualified(schema, name),
+        parts.data_type,
+        parts.start,
+        parts.increment,
+        parts.minimum,
+        parts.maximum,
+        if parts.cycle { "CYCLE" } else { "NO CYCLE" },
+        parts.cache,
+    )
 }
 
 /// A literal for a value bound for a column of `data_type`, where the type
@@ -2344,9 +2372,12 @@ mod tests {
             cache: "NO CACHE",
         };
         assert_eq!(
-            compose_sequence("we]ird", "t\u{ef}cket no", &parts),
-            "CREATE SEQUENCE [we]]ird].[t\u{ef}cket no] AS bigint START WITH 5 INCREMENT BY 2 \
-             MINVALUE 1 MAXVALUE 1000 CYCLE NO CACHE;"
+            compose_sequence("we\"ird]", "t\u{ef}cket no", &parts),
+            // As `quote_identifier` spells a name: double quotes, which the
+            // server reads under its default `QUOTED_IDENTIFIER ON`, as the
+            // table statements do.
+            "CREATE SEQUENCE \"we\"\"ird]\".\"t\u{ef}cket no\" AS bigint START WITH 5 \
+             INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CYCLE NO CACHE;"
         );
         let parts = SequenceParts {
             cycle: false,
