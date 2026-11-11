@@ -2985,6 +2985,105 @@ fn a_server_that_lists_no_databases_says_so(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn the_picker_says_the_filter_is_not_an_access_boundary(cx: &mut TestAppContext) {
+    use super::filter_picker::boundary;
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        assert!(cx.debug_bounds("filter-picker-boundary").is_some());
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.boundary(),
+                "This filter changes what is listed, not what can be reached: a statement can \
+                 still read a hidden database or schema, an agent's included."
+            );
+        });
+        assert_eq!(
+            boundary(crate::db::Levels::DatabaseIsSchema),
+            "This filter changes what is listed, not what can be reached: a statement can \
+             still read a hidden database, an agent's included."
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn tab_walks_the_filter_picker_and_escape_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        let focus = |cx: &mut VisualTestContext| -> &'static str {
+            cx.update(|window, cx| {
+                let picker = workspace.read(cx).filter_picker.as_ref().expect("up");
+                if picker.databases.search.focus_handle(cx).is_focused(window) {
+                    "search"
+                } else if picker
+                    .databases
+                    .pattern_field
+                    .focus_handle(cx)
+                    .is_focused(window)
+                {
+                    "patterns"
+                } else {
+                    "elsewhere"
+                }
+            })
+        };
+        let ticked = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+                picker.databases.ticked.clone()
+            })
+        };
+        assert_eq!(focus(cx), "search", "the first search box has the keyboard");
+
+        // Select Names, then Clear Names, each pressed from the keyboard.
+        press(cx, "tab");
+        press(cx, "enter");
+        assert_eq!(ticked(cx), ["other", "scratch"]);
+        press(cx, "tab");
+        press(cx, "enter");
+        assert!(ticked(cx).is_empty());
+
+        // The checklist: `space` ticks the focused row; the next row, then
+        // the pattern field.
+        press(cx, "tab");
+        press(cx, "space");
+        assert_eq!(ticked(cx), ["other"]);
+        press(cx, "tab");
+        press(cx, "tab");
+        assert_eq!(focus(cx), "patterns");
+
+        // Remove Filter, Discard Changes, Save Filter.
+        cx.simulate_input("sc*");
+        settle(cx);
+        press(cx, "tab");
+        press(cx, "tab");
+        press(cx, "tab");
+        press(cx, "enter");
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            None,
+            "Save Filter was the third stop"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.include.databases, ["other", "sc*"]);
+        });
+
+        // `escape` from the search box closes it and hands the keyboard back.
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        pick_from_connections_menu(cx, at, FILTER_DATABASES_DOWNS);
+        settle(cx);
+        assert_eq!(focus(cx), "search");
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
 /// What the palette's Commands scope draws at the end of each row.
 fn palette_hints(
     workspace: &Entity<Workspace>,
