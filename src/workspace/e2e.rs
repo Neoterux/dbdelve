@@ -21,7 +21,8 @@ use crate::{
     palette::{Command, Mode as PaletteMode, Scope},
     session::{CatalogState, ObjectBody, ProfileState, QueryState, QueryTab, Tab},
     sidebar::{
-        LOADING, ListingScope, NO_PROJECT_ROW, ViewMode, connection_row, project_row, scoped_row,
+        LOADING, ListingScope, NO_PROJECT_ROW, ViewMode, connection_row, database_row, project_row,
+        scoped_row,
     },
     store,
     theme::{self, Fonts},
@@ -1185,7 +1186,7 @@ fn the_connections_tree_lists_every_connection_under_its_project_and_connects_on
             connections_item(&workspace, cx, &b),
             Some((
                 false,
-                vec![(scoped_row("b", "loading"), LOADING.to_string(), true)]
+                vec![(scoped_row("b", None, "loading"), LOADING.to_string(), true)]
             )),
             "an idle connection is folded over one row that is not a spinner"
         );
@@ -1199,7 +1200,7 @@ fn the_connections_tree_lists_every_connection_under_its_project_and_connects_on
         assert_eq!(profile_state(&workspace, cx, "b"), "connected");
 
         assert!(
-            connections_row(&workspace, cx, &scoped_row("b", "schema-main")).is_some(),
+            connections_row(&workspace, cx, &scoped_row("b", None, "schema-main")).is_some(),
             "the opened connection lists its schema"
         );
         assert_eq!(front_profile(&workspace, cx), "a");
@@ -1258,7 +1259,7 @@ fn an_object_row_of_a_connection_behind_opens_on_that_connection(cx: &mut TestAp
             click_connections_row(cx, at);
         }
         let reveal = |id: &str, cx: &mut VisualTestContext| {
-            let row = scoped_row(id, &explorer::relation_row("main", "birds"));
+            let row = scoped_row(id, None, &explorer::relation_row("main", "birds"));
             workspace.update(cx, |workspace, cx| {
                 workspace.connections.tree.update(cx, |tree, cx| {
                     let row = row.clone().into();
@@ -1335,10 +1336,122 @@ fn a_connect_that_fails_stays_on_its_own_row(cx: &mut TestAppContext) {
         });
         assert_eq!(
             connections_item(&workspace, cx, &c),
-            Some((true, vec![(scoped_row("c", "notice"), failure, true)]))
+            Some((true, vec![(scoped_row("c", None, "notice"), failure, true)]))
         );
         assert_eq!(connections_item(&workspace, cx, &a), a_before);
         assert_eq!(connections_item(&workspace, cx, &b), b_before);
+
+        quit(workspace, cx);
+    });
+}
+
+/// One DuckDB profile, `e2e`, over a file holding `t (id INTEGER)`, with the
+/// connections tree drawn.
+fn launch_duckdb_connection(
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    // Left alone, CI's live job puts a connection from `PG*` among these.
+    crate::IGNORE_ENVIRONMENT.set(true);
+    let directory = store::dbdelve_directory().expect("the test home has a data directory");
+    std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+    let database = directory.join("e2e.duckdb");
+    ::duckdb::Connection::open(&database)
+        .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
+        .expect("the schema must apply");
+    std::fs::write(
+        directory.join("profiles.toml"),
+        format!(
+            "active = \"e2e\"\n\
+             [settings]\n\
+             check_for_updates = false\n\
+             view_mode = \"complex\"\n\
+             [[profiles]]\n\
+             id = \"e2e\"\n\
+             name = \"E2E\"\n\
+             host = \"\"\n\
+             database = \"\"\n\
+             user = \"\"\n\
+             engine = \"duckdb\"\n\
+             path = {:?}\n",
+            database.display().to_string()
+        ),
+    )
+    .expect("profiles.toml must be writable");
+    let (workspace, cx) = launch(cx);
+    cx.executor().allow_parking();
+    // Tall enough to draw every row, which a click needs.
+    cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+    settle(cx);
+    (workspace, cx)
+}
+
+#[gpui::test]
+fn a_duckdb_connection_shows_its_database_then_its_schemas(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_connection(cx);
+        let click = |id: &str, cx: &mut VisualTestContext| {
+            let at = connections_row(&workspace, cx, id)
+                .unwrap_or_else(|| panic!("{id} is not showing"));
+            click_connections_row(cx, at);
+        };
+
+        click(&connection_row("e2e"), cx);
+        let database = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .and_then(|profile| profile.active_database())
+                .expect("the connection names its database")
+        });
+        assert_eq!(database, "e2e", "DuckDB names a file's database after it");
+        let db = database_row("e2e", &database);
+        let schema = scoped_row("e2e", Some(&database), "schema-main");
+        let tables = scoped_row("e2e", Some(&database), "category-Tables-main");
+        let t = scoped_row("e2e", Some(&database), &explorer::relation_row("main", "t"));
+        assert_eq!(
+            connections_item(&workspace, cx, &connection_row("e2e"))
+                .map(|(_, rows)| { rows.into_iter().map(|(id, ..)| id).collect::<Vec<_>>() }),
+            Some(vec![db.clone()]),
+            "the database is the connection's one row"
+        );
+        for id in [&db, &schema, &tables] {
+            click(id, cx);
+        }
+        assert_eq!(
+            connections_rows(&workspace, cx),
+            [
+                (0, connection_row("e2e")),
+                (1, db.clone()),
+                (2, schema),
+                (3, tables),
+                (4, t.clone()),
+            ]
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(matches!(
+                workspace.connections.nodes.get(&db),
+                Some(crate::sidebar::Node::Database)
+            ));
+        });
+
+        // The table opens on the profile, and the tree finds the row of the
+        // tab in front by the id that names the database.
+        click(&t, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            let tab = profile
+                .session
+                .active_object()
+                .expect("an object tab is in front");
+            assert_eq!((tab.schema.as_str(), tab.name.as_str()), ("main", "t"));
+            assert_eq!(super::sidebar::front_row_id(profile), Some(t.clone()));
+        });
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        let selected = workspace.read_with(cx, |workspace, cx| {
+            let tree = workspace.connections.tree.read(cx);
+            tree.selected_item().map(|item| item.id.to_string())
+        });
+        assert_eq!(selected, Some(t));
 
         quit(workspace, cx);
     });
@@ -11604,7 +11717,7 @@ fn disconnecting_redraws_the_connection_in_front_as_not_open(cx: &mut TestAppCon
     store::tests::with_home(|| {
         let (workspace, cx) = two_connections(cx);
         let a = connection_row("a");
-        let schema = scoped_row("a", "schema-main");
+        let schema = scoped_row("a", None, "schema-main");
         workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
         settle(cx);
         assert_eq!(profile_state(&workspace, cx, "a"), "connected");
@@ -11620,7 +11733,7 @@ fn disconnecting_redraws_the_connection_in_front_as_not_open(cx: &mut TestAppCon
             connections_item(&workspace, cx, &a),
             Some((
                 false,
-                vec![(scoped_row("a", "loading"), LOADING.to_string(), true)]
+                vec![(scoped_row("a", None, "loading"), LOADING.to_string(), true)]
             ))
         );
         quit(workspace, cx);
@@ -11640,8 +11753,8 @@ fn moving_a_connection_to_another_project_keeps_its_rows_and_folds(cx: &mut Test
         activate_by_id(&workspace, cx, "b");
         assert_eq!(profile_state(&workspace, cx, "b"), "connected");
         let b = connection_row("b");
-        let schema = scoped_row("b", "schema-main");
-        let birds = scoped_row("b", &explorer::relation_row("main", "birds"));
+        let schema = scoped_row("b", None, "schema-main");
+        let birds = scoped_row("b", None, &explorer::relation_row("main", "birds"));
         for row in [&b, &schema] {
             let at = connections_row(&workspace, cx, row).expect("the row is listed");
             click_connections_row(cx, at);
