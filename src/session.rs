@@ -1471,6 +1471,15 @@ pub(crate) struct Binding {
 }
 
 impl Binding {
+    /// The database, or `database.schema`: how a notice and a chip name where
+    /// the tab runs.
+    pub(crate) fn label(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{}.{schema}", self.database),
+            None => self.database.clone(),
+        }
+    }
+
     /// The binding for a tab opened on `database` and `schema`, or `None`
     /// where there is nothing to bind: a target that switches no database, and
     /// a blank name, which is the login default and so the profile's own

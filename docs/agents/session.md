@@ -87,8 +87,20 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   session only while it runs this tab's statement. A statement that ends a
   transaction goes as it is, because a session inside one cannot be moved and
   applying the binding first would stop the `COMMIT` that frees it. The
-  binding is not stored yet: a relaunch restores the tab unbound, on the
-  profile's own session. Exporting every row of a bound tab's result is
+  binding is stored with the tab (`StoredQueryTab.{database, schema}`, each
+  absent for an unbound tab) and read back as data: after a relaunch the tab is
+  bound again, and a database the server no longer has fails the run with the
+  open's own words and never retargets the tab. A `USE` or `SET` the user runs
+  in a bound tab is reset, not rewritten: the binding stays what the tab was
+  opened for, the run's notice says `The next run in this tab starts again on
+  {database}.` (`Binding::label`), and the next run puts the session back
+  there. Toggle Auto-commit, Commit and Roll Back are refused on a bound tab
+  with `BOUND_TRANSACTION` and send nothing, because they act on the
+  connection's own session. A bound session is auto-commit and its tabs never
+  run reads at once (`ponytail:` upgrade: a session of the tab's own, which
+  would also give a tab its own transaction and queue). A bound tab completes
+  from the profile's own catalog (`ponytail:` upgrade: a provider per
+  (profile, database) catalog). Exporting every row of a bound tab's result is
   refused with a sentence (`Workspace::refetch`): that re-read runs on the
   profile's own session, which is another database's.
 - **A bound tab makes its connection the one in front.** Running or opening
