@@ -13801,6 +13801,38 @@ fn transaction_controls_are_refused_on_a_bound_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_bound_tab_says_its_session_commits_each_statement_whatever_the_connection_holds(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.new_query(&crate::actions::NewQuery, window, cx)
+            });
+        });
+        settle(cx);
+        cx.dispatch_action(crate::actions::ToggleAutoCommit);
+        settle(cx);
+        assert!(
+            !transaction_state(&workspace, cx).0,
+            "the connection's own session holds a transaction open"
+        );
+        assert!(
+            cx.debug_bounds("transaction-bound").is_none(),
+            "an unbound tab runs on that session and shows its controls"
+        );
+
+        new_query_here(&workspace, cx, Some("other"), None);
+        assert!(
+            cx.debug_bounds("transaction-bound").is_some(),
+            "a bound tab's statements commit on their own, and the bar says so"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_unbound_tab_in_complex_mode_keeps_its_transaction_controls(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
