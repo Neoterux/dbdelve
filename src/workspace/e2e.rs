@@ -15,7 +15,7 @@ use crate::agent::tests::frame;
 use crate::{
     actions::{CancelQuery, Disconnect, ImportRowsFromClipboard, SubmitConnection},
     connection_form::ConnectionForm,
-    db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, SshTunnel},
+    db::{CancelToken, ConnectionConfig, Engine, ExternalConfig, Fetch, RelationKind, SshTunnel},
     explain::analysis::Basis,
     explorer, keybindings,
     palette::{Command, Mode as PaletteMode, Scope},
@@ -2864,6 +2864,107 @@ fn the_palette_copies_what_the_explorer_menu_copies(cx: &mut TestAppContext) {
             .unwrap();
         assert_eq!(tables, 1);
 
+        quit(workspace, cx);
+    });
+}
+
+/// What the `Show DDL` dialog holds, if it is up.
+fn ddl_text(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.ddl_view.as_ref().map(|view| match &view.text {
+            super::DdlText::Loading => "loading".to_string(),
+            super::DdlText::Ready(text) => text.clone(),
+            super::DdlText::Failed(error) => format!("failed: {error}"),
+        })
+    })
+}
+
+#[gpui::test]
+fn show_ddl_opens_a_read_only_view_of_a_tables_definition_and_hands_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let before = workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            (session.queries.len(), session.history.len())
+        });
+        let typed = buffer(&workspace, cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_ddl(None, "main".into(), "birds".into(), RelationKind::Table, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("show-ddl"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+        let text = ddl_text(&workspace, cx).expect("the dialog holds a definition");
+        assert!(text.contains("CREATE TABLE birds"), "{text}");
+        assert!(
+            cx.debug_bounds("show-ddl-text").is_some(),
+            "the definition is drawn"
+        );
+        // A dialog, not a buffer: nothing a tab holds changed.
+        workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            assert_eq!((session.queries.len(), session.history.len()), before);
+        });
+        assert_eq!(buffer(&workspace, cx), typed);
+
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(ddl_text(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_relation_menu_offers_show_ddl_where_the_target_copies_ddl(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        cx.simulate_keystrokes("secondary-k e");
+        settle(cx);
+        // Open Data, Open Structure, Import Rows, Export, then the copies: Copy
+        // DDL is the fifth item and Show DDL the one after it.
+        for (downs, copied, dialog) in [(5, true, None), (6, false, Some("show-ddl"))] {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before menu".into()));
+            let row = explorer_row(&workspace, "relation-main\0birds", cx).center();
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: row,
+                modifiers: gpui::Modifiers::default(),
+                button: gpui::MouseButton::Right,
+                click_count: 1,
+                first_mouse: false,
+            });
+            settle(cx);
+            cx.update(|window, _| {
+                assert!(
+                    window
+                        .context_stack()
+                        .iter()
+                        .any(|context| context.contains("PopupMenu")),
+                    "the row's menu is up"
+                )
+            });
+            for _ in 0..downs {
+                cx.simulate_keystrokes("down");
+            }
+            press(cx, "enter");
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert_eq!(
+                text.contains("CREATE TABLE birds"),
+                copied,
+                "item {downs}: {text}"
+            );
+            assert_eq!(front_dialog(&workspace, cx), dialog, "item {downs}");
+            if dialog.is_some() {
+                press(cx, "escape");
+            }
+        }
         quit(workspace, cx);
     });
 }
