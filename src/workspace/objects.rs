@@ -637,9 +637,20 @@ impl Workspace {
                     return;
                 }
                 match (node.kind, node.schema.clone(), node.leaf) {
-                    (NodeKind::Relation(kind), Some(schema), _) => {
-                        self.show_ddl(node.database.clone(), schema, node.name.clone(), kind, cx)
-                    }
+                    (NodeKind::Relation(kind), Some(schema), _) => self.show_ddl(
+                        node.database.clone(),
+                        schema,
+                        node.name.clone(),
+                        ObjectKind::Relation(kind),
+                        cx,
+                    ),
+                    (NodeKind::Sequence, Some(schema), _) => self.show_ddl(
+                        node.database.clone(),
+                        schema,
+                        node.name.clone(),
+                        ObjectKind::Sequence,
+                        cx,
+                    ),
                     (NodeKind::Routine, _, Some(leaf)) => match node.database.clone() {
                         Some(database) => {
                             self.open_object_on(&node.profile, database, leaf.target, window, cx)
@@ -743,14 +754,14 @@ impl Workspace {
             .then(|| (profile.id.clone(), profile.generation, routed))
     }
 
-    /// Ask for `schema.relation`'s definition over the connection of its
+    /// Ask for `schema.name`'s definition over the connection of its
     /// database. Nothing is sent but the driver's own DDL read.
     fn read_ddl(
         &mut self,
         database: Option<String>,
         schema: String,
-        relation: String,
-        kind: RelationKind,
+        name: String,
+        kind: ObjectKind,
         cx: &mut Context<Self>,
     ) -> Option<DdlRead> {
         let (profile_id, generation, routed) = self.route_to(database)?;
@@ -758,7 +769,16 @@ impl Workspace {
             &profile_id,
             generation,
             routed,
-            move |connection| connection.ddl(&schema, &relation, kind),
+            move |connection| match kind {
+                ObjectKind::Relation(kind) => connection.ddl(&schema, &name, kind),
+                ObjectKind::Sequence => connection.sequence_ddl(&schema, &name),
+                // A routine's definition is its tab, which `run_node_action`
+                // opens; nothing asks for one here.
+                ObjectKind::Routine(_) => Err(DbError {
+                    message: "A routine's definition is shown in its own tab.".into(),
+                    position: None,
+                }),
+            },
             cx,
         );
         Some((profile_id, generation, task))
@@ -774,7 +794,7 @@ impl Workspace {
     ) {
         self.clear_notice();
         let Some((profile_id, generation, task)) =
-            self.read_ddl(database, schema, relation, kind, cx)
+            self.read_ddl(database, schema, relation, ObjectKind::Relation(kind), cx)
         else {
             return;
         };
@@ -804,17 +824,18 @@ impl Workspace {
     /// Open the `Show DDL` dialog over `schema.relation` of `database` (`None`
     /// for the profile's own): the text is read over that database's
     /// connection and drawn read-only. It is not a buffer, so nothing in it
-    /// can be run.
+    /// can be run. A relation or a sequence; a routine's definition is its
+    /// tab and is not shown here.
     pub(crate) fn show_ddl(
         &mut self,
         database: Option<String>,
         schema: String,
         relation: String,
-        kind: RelationKind,
+        kind: ObjectKind,
         cx: &mut Context<Self>,
     ) {
         self.clear_notice();
-        let kind_name = crate::palette::kind_label(ObjectKind::Relation(kind));
+        let kind_name = crate::palette::kind_label(kind);
         let title = format!(
             "{}{} {schema}.{relation}",
             kind_name[..1].to_uppercase(),
@@ -837,7 +858,11 @@ impl Workspace {
             database: shown_database,
             schema: shown_schema,
             name: shown,
-            kind: Some(kind),
+            // A sequence has no columns, which is what withholds the diagram.
+            kind: match kind {
+                ObjectKind::Relation(kind) => Some(kind),
+                ObjectKind::Routine(_) | ObjectKind::Sequence => None,
+            },
             title,
             text: DdlText::Loading,
             diagram: None,

@@ -495,10 +495,37 @@ impl Connection {
         assemble_sequences(result)
     }
 
-    /// The CREATE statement of `schema.name`, read as the server writes it.
+    /// The CREATE statement of `schema.name`, in the database the connection
+    /// is on, composed from the sequence's definition. `duckdb_sequences().sql`
+    /// is not used: it writes `START` as the counter's current value, so each
+    /// `nextval` would change the statement and the read would disclose it.
     pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
-        let _ = (schema, name);
-        Err(plain_error("not yet".into()))
+        let listed = self.internal_query(&format!(
+            "SELECT increment_by::VARCHAR AS increment_by, min_value::VARCHAR AS min_value,
+                        max_value::VARCHAR AS max_value, start_value::VARCHAR AS start_value,
+                        CASE WHEN cycle THEN 'CYCLE' ELSE 'NO CYCLE' END AS cycle
+                 FROM duckdb_sequences()
+                 WHERE NOT temporary AND database_name = current_database()
+                   AND schema_name = {} AND sequence_name = {}",
+            Engine::DuckDb.quote_literal(schema),
+            Engine::DuckDb.quote_literal(name),
+        ))?;
+        let row = listed
+            .rows
+            .first()
+            .ok_or_else(|| plain_error(format!("{schema} has no sequence {name}.")))?;
+        let cell = |column| required_cell(&listed, row, column);
+        Ok(compose_sequence(
+            schema,
+            name,
+            [
+                cell("increment_by")?,
+                cell("min_value")?,
+                cell("max_value")?,
+                cell("start_value")?,
+            ],
+            cell("cycle")?,
+        ))
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
@@ -612,6 +639,18 @@ impl Connection {
         }
         Ok(statements.join("\n"))
     }
+}
+
+/// `CREATE SEQUENCE` for `schema.name`, every name quoted. `numbers` are
+/// increment, minimum, maximum and start, as the server prints them; `cycle`
+/// is `CYCLE` or `NO CYCLE`.
+fn compose_sequence(schema: &str, name: &str, numbers: [&str; 4], cycle: &str) -> String {
+    let [increment, minimum, maximum, start] = numbers;
+    format!(
+        "CREATE SEQUENCE {} INCREMENT BY {increment} MINVALUE {minimum} MAXVALUE {maximum} \
+         START {start} {cycle};",
+        Engine::DuckDb.qualified(schema, name)
+    )
 }
 
 /// Arrow's export of a DuckDB type it has no type of its own for: tagged
@@ -1361,7 +1400,8 @@ mod tests {
             .expect("the definition is read");
         assert!(ddl.starts_with("CREATE SEQUENCE"), "{ddl}");
         assert!(ddl.contains("ticket"), "{ddl}");
-        assert!(ddl.contains('5') && ddl.contains('2'), "{ddl}");
+        assert!(ddl.contains("START 5"), "{ddl}");
+        assert!(ddl.contains("INCREMENT BY 2"), "{ddl}");
     }
 
     #[test]
@@ -1378,6 +1418,45 @@ mod tests {
             connection.sequence_ddl("main", "ticket").unwrap(),
             before,
             "the definition carries no current value"
+        );
+    }
+
+    #[test]
+    fn a_composed_sequence_quotes_names_whatever_they_hold() {
+        assert_eq!(
+            compose_sequence(
+                "we \"ird\"",
+                "t\u{ef}cket no",
+                ["-3", "-9", "-1", "-1"],
+                "CYCLE"
+            ),
+            "CREATE SEQUENCE \"we \"\"ird\"\"\".\"t\u{ef}cket no\" INCREMENT BY -3 MINVALUE -9 \
+             MAXVALUE -1 START -1 CYCLE;"
+        );
+    }
+
+    #[test]
+    fn a_composed_sequence_recreates_it() {
+        let setup = "CREATE SCHEMA \"we \"\"ird\"\"\"; \
+                     CREATE SEQUENCE \"we \"\"ird\"\"\".\"t\u{ef}cket no\" \
+                     START 7 INCREMENT 3 MAXVALUE 100 CYCLE;";
+        let connection = memory(setup);
+        let ddl = connection
+            .sequence_ddl("we \"ird\"", "t\u{ef}cket no")
+            .expect("the definition is read");
+        connection
+            .query(
+                "DROP SEQUENCE \"we \"\"ird\"\"\".\"t\u{ef}cket no\"",
+                Fetch::default(),
+            )
+            .expect("dropped");
+        connection.query(&ddl, Fetch::default()).expect(&ddl);
+        assert_eq!(
+            connection
+                .sequence_ddl("we \"ird\"", "t\u{ef}cket no")
+                .unwrap(),
+            ddl,
+            "the statement names the sequence it was read from and defines it the same"
         );
     }
 

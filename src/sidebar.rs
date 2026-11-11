@@ -396,7 +396,9 @@ pub(crate) fn node_actions(kind: NodeKind, name: &str, target: Target) -> Vec<No
             vec![NodeAction::NewQueryHere, copy, NodeAction::Refresh]
         }
         // A target with no definition to write out has none to show.
-        NodeKind::Relation(_) if target.copies_ddl() => vec![copy, NodeAction::ShowDdl],
+        NodeKind::Relation(_) | NodeKind::Sequence if target.copies_ddl() => {
+            vec![copy, NodeAction::ShowDdl]
+        }
         NodeKind::Relation(_) | NodeKind::Sequence => vec![copy],
         NodeKind::Routine => vec![copy, NodeAction::ShowDdl],
     }
