@@ -13,7 +13,7 @@
 //!
 //! [`Connection::databases`]: super::Connection::databases
 
-use super::{Catalog, Databases, Levels, Sizes};
+use super::{Catalog, Databases, Engine, Levels, Sizes};
 
 /// How many entries a list keeps. A file is a person's to edit: no more is
 /// read than a profile would write.
@@ -173,6 +173,45 @@ impl Shown {
     pub fn narrow_sizes(&self, mut sizes: Sizes) -> Sizes {
         sizes.retain(|schema, _| self.shows_schema(schema));
         sizes
+    }
+
+    /// Whether a list narrows what a catalog read returns, so a read with none
+    /// need not list the databases first.
+    pub fn narrows_catalog(&self) -> bool {
+        if self.schemas_are_databases {
+            self.databases.is_some()
+        } else {
+            self.schemas.is_some()
+        }
+    }
+
+    /// Where one catalog read spans every database, the names of `listed`
+    /// that read may ask about, and how many it need not: `None` when no list
+    /// narrows the catalog, so the read stays exactly as it was. Otherwise the
+    /// non-system names this shows, in the server's order, each listed
+    /// spelling once, and how many non-system names it hid. The names are the
+    /// server's own, never the pattern text, so they are all a statement ever
+    /// carries. An empty list means nothing matched, which is the caller's cue
+    /// to send no statement.
+    ///
+    /// ponytail: a database that matches but holds no table or view is
+    /// in neither number, since the catalog is read from the tables view; the
+    /// upgrade is counting from the database listing, which would change the
+    /// unfiltered number Phase 7 draws.
+    pub fn matched_databases(
+        &self,
+        listed: &Databases,
+        engine: Engine,
+    ) -> Option<(Vec<String>, usize)> {
+        if !self.narrows_catalog() {
+            return None;
+        }
+        let (shown, left_out): (Vec<_>, Vec<_>) = listed
+            .names
+            .iter()
+            .filter(|name| !engine.is_system_database(name))
+            .partition(|name| self.shows_schema(name));
+        Some((shown.into_iter().cloned().collect(), left_out.len()))
     }
 
     /// `databases` with the names this does not show taken out, in the order

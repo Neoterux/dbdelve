@@ -2350,7 +2350,7 @@ impl Connection {
     pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
         let catalog = match self {
             Self::Postgres(connection) => connection.catalog(),
-            Self::MySql(connection) => connection.catalog(),
+            Self::MySql(connection) => connection.catalog(shown),
             Self::SqlServer(connection) => connection.catalog(),
             Self::Sqlite(connection) => connection.catalog(),
             Self::Turso(connection) => connection.catalog(),
@@ -2377,8 +2377,8 @@ impl Connection {
                 })
             }
             Self::MySql(connection) => {
-                with_sequences(connection.engine(), connection.routines(), || {
-                    connection.sequences()
+                with_sequences(connection.engine(), connection.routines(shown), || {
+                    connection.sequences(shown)
                 })
             }
             Self::SqlServer(connection) => {
@@ -2421,7 +2421,7 @@ impl Connection {
     pub fn sizes(&self, shown: &Shown) -> Result<Sizes, DbError> {
         let sizes = match self {
             Self::Postgres(connection) => connection.sizes(),
-            Self::MySql(connection) => connection.sizes(),
+            Self::MySql(connection) => connection.sizes(shown),
             Self::MongoDb(connection) => connection.sizes(),
             Self::SqlServer(_)
             | Self::Sqlite(_)
