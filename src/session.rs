@@ -347,6 +347,22 @@ impl Profile {
             })
     }
 
+    /// Why an edit of dbdelve's is not sent on the connection's own session:
+    /// a transaction of the user's is open on it and the batch brackets itself
+    /// (`sql::update_batch` on MySQL, MariaDB, SQLite and SQL Server), so its
+    /// `COMMIT` would end the user's -- and on MySQL and MariaDB its opening
+    /// `START TRANSACTION` would commit it first. A single statement carries
+    /// no bracket and joins the transaction, as the user's own would.
+    pub(crate) fn own_write_refusal(&self, sql: &str) -> Option<String> {
+        (self.in_transaction && crate::sql::ends_transaction(self.config.engine(), sql)).then(
+            || {
+                "Not sent: a transaction is open on this connection, and the batch of edits \
+             would end it with a COMMIT of its own."
+                    .into()
+            },
+        )
+    }
+
     /// The connection a Cancel for `tab` is sent over: the session its
     /// statement runs on, which for a bound tab is not the profile's own. What
     /// MongoDB keeps of a running statement, and ClickHouse's fallback, is on

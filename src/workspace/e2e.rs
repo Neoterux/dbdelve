@@ -16741,19 +16741,16 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
     });
 }
 
-/// Applies `INSERT INTO t VALUES (7)` from the tab in front as an edit does,
-/// reading back `SELECT count(*) FROM t` once it lands.
-fn apply_insert_into_own_table_from_the_front_tab(
-    workspace: &Entity<Workspace>,
-    cx: &mut VisualTestContext,
-) {
+/// Applies `sql` from the tab in front as an edit does, reading back
+/// `SELECT count(*) FROM t` once it lands.
+fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
     use crate::session::Refresh;
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
-            "INSERT INTO t VALUES (7)".into(),
+            sql.into(),
             tab,
             Some(Refresh::Statement("SELECT count(*) FROM t".into())),
             false,
@@ -16763,9 +16760,68 @@ fn apply_insert_into_own_table_from_the_front_tab(
         );
     });
     settle(cx);
+}
+
+/// Applies `INSERT INTO t VALUES (7)` from the tab in front as an edit does.
+fn apply_insert_into_own_table_from_the_front_tab(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) {
+    apply_from_the_front_tab(workspace, cx, "INSERT INTO t VALUES (7)");
     query_tab(workspace, cx, |tab, _, _| match &tab.query {
         QueryState::Complete { .. } => {}
         _ => panic!("the edit never completed"),
+    });
+}
+
+#[gpui::test]
+fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        // As `sql::update_batch` writes a multi-row apply on an engine whose
+        // statements commit on their own.
+        let batch =
+            "BEGIN TRANSACTION;\nINSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);\nCOMMIT;";
+        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
+        let (auto_commit, open, _) = transaction_state(&workspace, cx);
+        let listed = open_transaction_statements(&workspace, cx);
+
+        apply_from_the_front_tab(&workspace, cx, batch);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert_eq!(
+                error.message,
+                "Not sent: a transaction is open on this connection, and the batch of edits \
+                 would end it with a COMMIT of its own."
+            ),
+            _ => panic!("the batch was not refused"),
+        });
+        let (auto_commit_now, open_now, _) = transaction_state(&workspace, cx);
+        assert_eq!(
+            (
+                auto_commit_now,
+                open_now,
+                open_transaction_statements(&workspace, cx)
+            ),
+            (auto_commit, open, listed),
+            "a refused batch changes nothing and is not listed"
+        );
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("1"),
+            "only the user's own INSERT ran"
+        );
+        run_in_front(&workspace, cx, "ROLLBACK");
+
+        apply_from_the_front_tab(&workspace, cx, batch);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { .. } => {}
+            _ => panic!("the batch never completed with no transaction open"),
+        });
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("2"));
+        quit(workspace, cx);
     });
 }
 

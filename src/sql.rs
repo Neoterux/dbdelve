@@ -7662,6 +7662,26 @@ mod tests {
     }
 
     #[test]
+    fn only_a_batch_that_brackets_itself_ends_the_transaction_it_runs_in() {
+        let rows = vec![
+            pending_row(&[("name", set("a"))], &[("id", "1")]),
+            pending_row(&[("name", set("b"))], &[("id", "2")]),
+        ];
+        for (engine, brackets) in [
+            (Engine::MySql, true),
+            (Engine::MariaDb, true),
+            (Engine::Sqlite, true),
+            (Engine::SqlServer, true),
+            (Engine::Postgres, false),
+        ] {
+            let batch = update_batch(engine, &rows).unwrap();
+            assert_eq!(ends_transaction(engine, &batch), brackets, "{engine:?}");
+            let lone = update_batch(engine, &rows[..1]).unwrap();
+            assert!(!ends_transaction(engine, &lone), "{engine:?}: one row");
+        }
+    }
+
+    #[test]
     fn several_pending_rows_become_one_semicolon_joined_batch() {
         let rows = vec![
             pending_row(&[("name", set("Ada"))], &[("id", "1")]),
