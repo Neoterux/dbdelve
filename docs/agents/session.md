@@ -86,20 +86,20 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   (`Connection::generated_bound`), and a Cancel is a token that stops that
   session only while it runs this tab's statement. A statement that ends a
   transaction goes as it is, because a session inside one cannot be moved and
-  applying the binding first would stop the `COMMIT` that frees it.
-  **A bound tab makes its connection the one in front.** Running or opening
-  one is acting on a row of that connection (`Workspace::new_query_here`
-  activates it), because the gate, the mode and the engine a statement meets
-  are the front connection's, never the binding's (D-14). So the titlebar
-  names that connection, the status bar shows that profile's mode, the
-  palette's Objects and Commands scopes act on that profile, and in simple
-  mode the explorer shows that profile's own tree, its own database and
-  schema and not the tab's binding. The profile's own database and schema do
-  not move (D-09).
-  The binding is not stored yet: a relaunch restores the tab unbound, on the
+  applying the binding first would stop the `COMMIT` that frees it. The
+  binding is not stored yet: a relaunch restores the tab unbound, on the
   profile's own session. Exporting every row of a bound tab's result is
   refused with a sentence (`Workspace::refetch`): that re-read runs on the
   profile's own session, which is another database's.
+- **A bound tab makes its connection the one in front.** Running or opening
+  one is acting on a row of that connection (`Workspace::new_query_here`
+  activates it), because the gate, the mode and the engine a statement meets
+  are the front connection's, never the binding's. So the titlebar names that
+  connection, the status bar shows that profile's mode, the palette's Objects
+  and Commands scopes act on that profile, and in simple mode the explorer
+  shows that profile's own tree, its own database and schema and not the
+  tab's binding. The profile's own database and schema do not move: a tab's
+  binding is where its statements run, not where the connection is.
 - **The titlebar's project and connection open the palette on Connections**
   (`Workspace::open_connections`, also `SwitchConnection`, no default chord);
   there is no switcher panel of its own. That scope is a tree
