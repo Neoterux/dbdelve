@@ -3418,8 +3418,9 @@ impl Workspace {
                     PopupMenuItem::new(label).on_click(move |_, window, cx| {
                         let (schema, relation) = (schema.clone(), relation.clone());
                         _ = workspace.update(cx, |workspace, cx| {
-                            workspace
-                                .open_relation_view(schema, relation, kind, structure, window, cx);
+                            workspace.open_relation_view(
+                                None, schema, relation, kind, structure, window, cx,
+                            );
                         });
                     })
                 };
