@@ -879,11 +879,12 @@ impl Connection {
 
     /// The server's databases the filter matches, or `None` for a read that is
     /// not narrowed. Listed here, in the read's own closure, so the statement
-    /// it feeds carries only names the server just gave. Its callers
-    /// (`routines`, `sequences` and `sizes`) use only the names, never the
-    /// hidden count, and a `SCHEMATA` name holding nothing adds no row, so the
-    /// lighter full listing serves and the heavier one stays off the read
-    /// `sizes` makes on the main connection.
+    /// it feeds carries only names the server just gave. It lists on whichever
+    /// connection it is called on: `routines` and `sequences` call it on the
+    /// user's connection, where they read, and `sizes` on its side session.
+    /// Those callers use only the names, never the hidden count, and a
+    /// `SCHEMATA` name holding nothing adds no row, so the lighter full
+    /// listing serves.
     fn matched(&self, shown: &Shown) -> Result<Option<(Vec<String>, usize)>, DbError> {
         if !shown.narrows_catalog() {
             return Ok(None);
