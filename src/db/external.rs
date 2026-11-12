@@ -510,6 +510,7 @@ impl Connection {
         Ok(Catalog {
             schemas,
             database: None,
+            ..Default::default()
         })
     }
 
@@ -1081,7 +1082,13 @@ mod tests {
             .generated("rows 10", &cancel, None, Some(3))
             .unwrap();
         assert_eq!(preview.rows.len(), 3);
-        assert!(!connection.catalog().unwrap().schemas.is_empty());
+        assert!(
+            !connection
+                .catalog(&crate::db::Shown::everything())
+                .unwrap()
+                .schemas
+                .is_empty()
+        );
         for result in [&read, &preview] {
             assert!(result.edit.is_none());
             assert_eq!(

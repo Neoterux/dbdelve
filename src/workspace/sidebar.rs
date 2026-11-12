@@ -31,8 +31,8 @@ use crate::explorer::{
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::session::Binding;
 use crate::sidebar::{
-    self as model, Content, Listed, Node, NodeKind, OPEN_ROWS_CAP, SelectedNode, Selection,
-    SelectionAction, node_actions, schema_row_is_a_database, shown_size,
+    self as model, Content, Listed, Node, NodeAction, NodeKind, OPEN_ROWS_CAP, SelectedNode,
+    Selection, SelectionAction, node_actions, schema_row_is_a_database, shown_size,
 };
 use crate::ui::{Status, row_icon_tinted, status_dot};
 
@@ -105,6 +105,8 @@ pub(crate) struct ConnectionsSidebar {
     pub(crate) shortcuts: Arc<HashMap<String, Shortcut>>,
     /// How many rows each folder row holds, by row id.
     pub(crate) counts: Arc<HashMap<String, usize>>,
+    /// How many each count is of, where a filter left some out.
+    pub(crate) totals: Arc<HashMap<String, usize>>,
     /// What the tree is narrowed by.
     pub(crate) filter: Entity<InputState>,
     /// The folds the tree had when the first key was typed, which come back
@@ -153,6 +155,7 @@ impl ConnectionsSidebar {
             highlights: Arc::default(),
             shortcuts: Arc::default(),
             counts: Arc::default(),
+            totals: Arc::default(),
             filter,
             folds_before_filter: None,
             selection: Selection::default(),
@@ -275,6 +278,7 @@ impl Workspace {
                     },
                     levels,
                     database,
+                    databases_left_out: profile.databases.left_out,
                 }
             })
             .collect();
@@ -327,6 +331,7 @@ impl Workspace {
         self.connections.highlights = Arc::new(built.highlights);
         self.connections.shortcuts = Arc::new(built.shortcuts);
         self.connections.counts = Arc::new(built.counts);
+        self.connections.totals = Arc::new(built.totals);
         // When the row the tree had is gone, one of the rows still selected
         // is where it goes, so the selection is not left with none of its own.
         let kept = self
@@ -797,6 +802,7 @@ impl Workspace {
         let highlights = self.connections.highlights.clone();
         let shortcuts = self.connections.shortcuts.clone();
         let counts = self.connections.counts.clone();
+        let totals = self.connections.totals.clone();
         // What each connection's rows are drawn in, by profile id: its logo
         // and the dialect its saved queries are written in.
         let targets: HashMap<String, (&'static str, Syntax, Levels)> = self
@@ -1083,7 +1089,7 @@ impl Workspace {
                                             format!("connections-count-{profile}")
                                         })
                                     })
-                                    .child(count.to_string()),
+                                    .child(model::count_label(*count, totals.get(id).copied())),
                             )
                         })
                         .when_some(
@@ -1171,15 +1177,16 @@ impl Workspace {
             let inner = model::unscoped(id).map(|scoped| scoped.inner.to_string());
             match node.kind {
                 NodeKind::Connection | NodeKind::Database => {
-                    let Some(target) = state
+                    let Some((target, filterable)) = state
                         .profiles
                         .iter()
                         .find(|found| found.id == node.profile)
-                        .map(|found| found.config.target())
+                        .map(|found| (found.config.target(), found.offers_filter()))
                     else {
                         return menu;
                     };
-                    let actions = node_actions(node.kind, &node.name, target);
+                    let mut actions = node_actions(node.kind, &node.name, target);
+                    actions.retain(|action| filterable || *action != NodeAction::FilterDatabases);
                     node_items(menu, &node, actions, &menu_workspace)
                 }
                 // A row of one connection's own rows: the menu simple mode

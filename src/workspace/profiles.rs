@@ -7,7 +7,7 @@ use super::*;
 use gpui_component::menu::PopupMenuItem;
 
 use crate::connection_form::{ConnectionTest, Reported, duplicate_profile_name, keep_schema};
-use crate::db::{ExternalConfig, Plugin};
+use crate::db::{ExternalConfig, Include, Plugin};
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{BoundSession, STALE_ROWS, restored_shortcuts};
@@ -257,6 +257,9 @@ impl Workspace {
             // `adopt_saved_visibility` would read the file's grant back; a save
             // from here would write a partial list.
             agent_visible: stored.agent_visible && !read_as_postgres,
+            // A file is a person's to edit: blanks are dropped and each list is
+            // capped, as `open_rows` is.
+            include: Include::from_stored(stored.include_databases, stored.include_schemas),
             confirmed: stored
                 .confirmed
                 .iter()
@@ -271,6 +274,7 @@ impl Workspace {
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
+            reread_after_load: false,
             databases: Databases::default(),
             bound: HashMap::new(),
             bound_transactions: HashSet::new(),
@@ -335,6 +339,9 @@ impl Workspace {
             // starts hidden. Only the owner's confirmation in the visibility
             // dialog grants it.
             agent_visible: false,
+            // Every way a profile is made starts unfiltered, for the same
+            // reason it starts hidden: the lists are the owner's to write.
+            include: Include::default(),
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
@@ -345,6 +352,7 @@ impl Workspace {
             session_changed: false,
             catalog: CatalogState::Loading,
             schema_refresh: None,
+            reread_after_load: false,
             databases: Databases::default(),
             bound: HashMap::new(),
             bound_transactions: HashSet::new(),
@@ -1008,9 +1016,15 @@ impl Workspace {
     /// at once, so the sidebar neither blanks nor loses the rows folded open.
     /// With no session to read over, this is a connect.
     pub(crate) fn refresh_schema(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.active else {
-            return;
-        };
+        if let Some(index) = self.active {
+            self.refresh_schema_of(index, cx);
+        }
+    }
+
+    /// [`Self::refresh_schema`] for the profile at `index`, which is the front
+    /// one except when a read that was under way when a filter was saved comes
+    /// back after the user moved on.
+    fn refresh_schema_of(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(profile) = self.profiles.get_mut(index) else {
             return;
         };
@@ -1031,6 +1045,7 @@ impl Workspace {
         profile.schema_refresh = Some(profile.generation);
         let (id, generation) = (profile.id.clone(), profile.generation);
         let in_transaction = profile.in_transaction;
+        let shown = profile.shown();
         cx.notify();
 
         let refresh_task = spawn_blocking(cx.background_executor(), move || {
@@ -1042,8 +1057,8 @@ impl Workspace {
                 true => connection.apart().map_err(lost)?,
                 false => connection.clone(),
             };
-            let catalog = reader.catalog().map_err(lost)?;
-            Ok::<_, (DbError, bool)>((catalog, reader.routines()))
+            let catalog = reader.catalog(&shown).map_err(lost)?;
+            Ok::<_, (DbError, bool)>((catalog, reader.routines(&shown)))
         });
 
         cx.spawn(async move |workspace, cx| {
@@ -1060,6 +1075,8 @@ impl Workspace {
                         // A session that is gone has no transaction left to
                         // keep, and a new one is the only way to get an answer.
                         Err((_, true)) => {
+                            // The new session reads with the saved filter.
+                            profile.reread_after_load = false;
                             let index = workspace
                                 .profiles
                                 .iter()
@@ -1074,6 +1091,7 @@ impl Workspace {
                         // they were rather than trading them for an error.
                         Err((error, false)) => {
                             profile.session.notice = Some(error.message);
+                            workspace.reread_if_saved(&id, cx);
                             return;
                         }
                     };
@@ -1107,10 +1125,22 @@ impl Workspace {
                     if complete && workspace.profile().is_some_and(|front| front.id == id) {
                         workspace.confirm("Schema refreshed.".into(), cx);
                     }
+                    workspace.reread_if_saved(&id, cx);
                 })
                 .ok();
         })
         .detach();
+    }
+
+    /// A filter was saved while the read that has just landed was under way:
+    /// read again, which now starts, so the saved filter applies.
+    fn reread_if_saved(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            return;
+        };
+        if std::mem::take(&mut self.profiles[index].reread_after_load) {
+            self.refresh_schema_of(index, cx);
+        }
     }
 
     /// Ask the server which databases it holds, then offer them in the palette.
@@ -1140,8 +1170,9 @@ impl Workspace {
             return;
         };
         let (id, generation) = (profile.id.clone(), profile.generation);
+        let shown = profile.shown();
         let fetch = spawn_blocking(cx.background_executor(), move || {
-            connection.databases(target.engine)
+            connection.databases(target.engine, &shown)
         });
         cx.spawn_in(window, async move |workspace, cx| {
             let result = fetch.await;
@@ -2011,11 +2042,14 @@ impl Workspace {
         // paints the same sentence twice in the same red.
         let Some(connection) = profile.connection() else {
             profile.catalog = CatalogState::Failed("Not connected.".into());
+            profile.reread_after_load = false;
             self.refresh_explorer(id, cx);
             self.catalog_landed(id, cx);
             return;
         };
-        let catalog_task = spawn_blocking(cx.background_executor(), move || connection.catalog());
+        let shown = profile.shown();
+        let catalog_task =
+            spawn_blocking(cx.background_executor(), move || connection.catalog(&shown));
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
@@ -2027,7 +2061,13 @@ impl Workspace {
                     };
                     profile.catalog = match result {
                         Ok(catalog) => CatalogState::Loaded(catalog, Routines::Loading),
-                        Err(error) => CatalogState::Failed(error.message),
+                        Err(error) => {
+                            // A failed read stored nothing drawn with the old filter, and every
+                            // read takes `shown()` as it starts, so the next one applies the
+                            // saved filter; reading again here would be a retry nobody asked for.
+                            profile.reread_after_load = false;
+                            CatalogState::Failed(error.message)
+                        }
                     };
                     workspace.catalog_replaced(&id, generation, false, cx);
                     cx.notify();
@@ -2061,8 +2101,9 @@ impl Workspace {
             return;
         };
         let engine = profile.config.engine();
+        let shown = profile.shown();
         let listing = spawn_blocking(cx.background_executor(), move || {
-            connection.databases(engine)
+            connection.databases(engine, &shown)
         });
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
@@ -2090,10 +2131,15 @@ impl Workspace {
         let Some(profile) = self.issued_to(id, generation) else {
             return;
         };
+        // A session a bound tab opened for a database the filter hides is the
+        // tab's, and the tree reads nothing it does not draw (D-08).
+        let shown = profile.shown();
         let open: Vec<String> = profile
             .bound
             .iter()
-            .filter(|(_, session)| matches!(session, BoundSession::Open(_)))
+            .filter(|(database, session)| {
+                matches!(session, BoundSession::Open(_)) && shown.shows_database(database)
+            })
             .map(|(database, _)| database.clone())
             .collect();
         self.list_databases(id, generation, cx);
@@ -2227,8 +2273,11 @@ impl Workspace {
             BoundSession::Open(Box::new(session.clone())),
         );
         // The connection's own database is read over its own session, and
-        // another is not asked for again once a session is registered.
-        if profile.active_database().as_deref() != Some(database.as_str()) {
+        // another is not asked for again once a session is registered. One the
+        // filter hides keeps its session for the tab and is never read (D-08).
+        if profile.active_database().as_deref() != Some(database.as_str())
+            && profile.shown().shows_database(&database)
+        {
             profile
                 .database_catalogs
                 .entry(database.clone())
@@ -2252,8 +2301,15 @@ impl Workspace {
         let Some(connection) = self.session_for(id, &database, generation) else {
             return;
         };
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
         let task = spawn_blocking(cx.background_executor(), move || {
-            let result = connection.catalog();
+            let result = connection.catalog(&shown);
             let lost = result.is_err() && connection.is_lost();
             (result, lost)
         });
@@ -2326,7 +2382,16 @@ impl Workspace {
         let Some(connection) = self.session_for(id, database, generation) else {
             return;
         };
-        let task = spawn_blocking(cx.background_executor(), move || connection.routines());
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
+        let task = spawn_blocking(cx.background_executor(), move || {
+            connection.routines(&shown)
+        });
         let (id, database) = (id.to_string(), database.to_string());
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
@@ -2403,11 +2468,18 @@ impl Workspace {
         let Some(connection) = self.session_for(id, database, generation) else {
             return;
         };
+        // The active schema is kept in the connection's own database only.
+        let Some(shown) = self
+            .issued_to(id, generation)
+            .map(|profile| profile.shown().in_another_database())
+        else {
+            return;
+        };
         #[cfg(test)]
         {
             self.size_reads += 1;
         }
-        let task = spawn_blocking(cx.background_executor(), move || connection.sizes());
+        let task = spawn_blocking(cx.background_executor(), move || connection.sizes(&shown));
         let (id, database) = (id.to_string(), database.to_string());
         cx.spawn(async move |workspace, cx| {
             let Ok(sizes) = task.await else {
@@ -2472,7 +2544,7 @@ impl Workspace {
     /// A failure here leaves the relations alone and is said once in the status
     /// bar. Replacing a working explorer with an error because the functions
     /// could not be listed would cost more than it reports.
-    fn load_routines(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+    pub(super) fn load_routines(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
         let Some(profile) = self.issued_to(id, generation) else {
             return;
         };
@@ -2482,7 +2554,10 @@ impl Workspace {
             }
             return;
         };
-        let routines_task = spawn_blocking(cx.background_executor(), move || connection.routines());
+        let shown = profile.shown();
+        let routines_task = spawn_blocking(cx.background_executor(), move || {
+            connection.routines(&shown)
+        });
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
@@ -2513,6 +2588,7 @@ impl Workspace {
                     workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
                     workspace.catalog_landed(&id, cx);
+                    workspace.reread_if_saved(&id, cx);
                     cx.notify();
                 })
                 .ok();
@@ -2533,9 +2609,9 @@ impl Workspace {
         if !self.settings.show_sizes {
             return;
         }
-        let Some(connection) = self
+        let Some((connection, shown)) = self
             .issued_to(id, generation)
-            .and_then(|profile| profile.connection())
+            .and_then(|profile| Some((profile.connection()?, profile.shown())))
         else {
             return;
         };
@@ -2543,7 +2619,7 @@ impl Workspace {
         {
             self.size_reads += 1;
         }
-        let sizes_task = spawn_blocking(cx.background_executor(), move || connection.sizes());
+        let sizes_task = spawn_blocking(cx.background_executor(), move || connection.sizes(&shown));
 
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
