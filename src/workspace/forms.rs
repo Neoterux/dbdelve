@@ -28,7 +28,7 @@ use crate::explorer::{
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
-use crate::session::PendingDelete;
+use crate::session::{Depth, PendingDelete};
 use crate::sidebar::{NodeAction, NodeKind, SelectedNode, SelectionAction, node_actions};
 use crate::sql::{Destructive, Stop};
 use crate::ui::{
@@ -616,6 +616,34 @@ impl Workspace {
                             .text_color(t.text_faint)
                             .child("s"),
                     ),
+                t,
+            )
+            .into_any_element(),
+        );
+        // Every target's connect runs the loads this chooses among.
+        let depths = Depth::ALL.into_iter().enumerate().map(|(index, depth)| {
+            ui::segmented_choice(
+                ("introspection", index),
+                depth.label(),
+                depth == form.depth,
+                t,
+            )
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                if let Some(form) = &mut workspace.form {
+                    form.depth = depth;
+                    cx.notify();
+                }
+            }))
+        });
+        behaviour.push(
+            ui::option_row(
+                "Introspection",
+                Some(
+                    "What a connect reads before the tree is drawn: relations always, then \
+                     routines and sequences, then table sizes while Show sizes is on."
+                        .into(),
+                ),
+                ui::segmented(t).children(depths),
                 t,
             )
             .into_any_element(),

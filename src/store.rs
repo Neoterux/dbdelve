@@ -177,6 +177,12 @@ pub struct StoredProfile {
     /// The schemas this profile shows, by the same rules as `include_databases`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_schemas: Vec<String>,
+    /// The slug of the connect-time loads this profile runs; absent is every
+    /// load, which is every profile written before the setting existed. A slug
+    /// this build cannot read reads as every load, so a newer build's value
+    /// costs this one field and nothing else. A scalar, so it comes before `ssh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introspection_depth: Option<String>,
     /// The SSH tunnel this profile dials through, or absent for a direct
     /// connection -- which is every profile written before tunnels existed. A
     /// table, so it has to come after every scalar above. Nothing secret is in
@@ -3349,6 +3355,7 @@ user = "shayan"
                 selected_rows: Vec::new(),
                 include_databases: Vec::new(),
                 include_schemas: Vec::new(),
+                introspection_depth: None,
                 ssh: None,
                 open_queries: Vec::new(),
                 open_objects: Vec::new(),
@@ -3409,6 +3416,7 @@ user = "shayan"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![
@@ -3550,6 +3558,7 @@ open_objects = []
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
@@ -4015,6 +4024,7 @@ folder = "Hot"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4100,6 +4110,7 @@ folder = "Hot"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4171,6 +4182,7 @@ folder = "Hot"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
@@ -4290,6 +4302,7 @@ open_objects = []
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4433,6 +4446,7 @@ open_objects = []
                     selected_rows: Vec::new(),
                     include_databases: Vec::new(),
                     include_schemas: Vec::new(),
+                    introspection_depth: None,
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -4473,6 +4487,7 @@ open_objects = []
                     selected_rows: Vec::new(),
                     include_databases: Vec::new(),
                     include_schemas: Vec::new(),
+                    introspection_depth: None,
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -5250,6 +5265,7 @@ open_objects = []
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: vec![
                 StoredQueryTab {
@@ -5626,6 +5642,7 @@ name = \"accounts\"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![
@@ -5749,6 +5766,7 @@ name = \"accounts\"
             selected_rows: Vec::new(),
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
+            introspection_depth: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![object],

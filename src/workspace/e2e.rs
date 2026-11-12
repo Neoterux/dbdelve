@@ -2610,7 +2610,13 @@ fn a_profile_saved_with_relations_depth_reads_only_its_relations(cx: &mut TestAp
                 "nothing reconnects"
             );
             assert!(matches!(profile.state, ProfileState::Connected(..)));
-            assert!(profile.session.notice.is_none(), "a skip is no notice");
+            // The refresh's own confirmation, which a skip counts as
+            // complete for; the skip itself writes none.
+            assert_eq!(
+                profile.session.notice.as_deref(),
+                Some("Schema refreshed."),
+                "a skip is no failure"
+            );
             assert_eq!(
                 profile.stored().introspection_depth.as_deref(),
                 Some("relations")

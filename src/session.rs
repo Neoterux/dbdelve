@@ -69,6 +69,9 @@ pub(crate) struct Profile {
     /// What the connections tree and the agent lane show of the server. Not
     /// part of `config`: changing it never reconnects.
     pub(crate) include: Include,
+    /// What this profile does with its connection rather than what the
+    /// connection is. Not part of `config`: changing it never reconnects.
+    pub(crate) behaviour: Behaviour,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
@@ -561,6 +564,8 @@ impl Profile {
             agent_visible: self.agent_visible,
             include_databases: self.include.databases.clone(),
             include_schemas: self.include.schemas.clone(),
+            introspection_depth: (self.behaviour.depth != Depth::default())
+                .then(|| self.behaviour.depth.slug().to_string()),
             confirmed: self
                 .confirmed
                 .iter()
@@ -1880,6 +1885,54 @@ pub(crate) enum Routines {
     Loading,
     Loaded,
     Failed,
+    /// The profile's [`Depth`] chose not to read them. Not an error and no
+    /// notice is written, but nothing about a routine can be said from it
+    /// either, so a restored routine tab keeps waiting as under `Failed`.
+    Skipped,
+}
+
+/// Which of the connect-time loads run. `Sizes` is every load, as before the
+/// setting existed; columns are no level, since no connect reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Depth {
+    /// The relations of the catalog.
+    Relations,
+    /// Then the routines and sequences.
+    Routines,
+    /// Then table sizes, which also need Show sizes.
+    #[default]
+    Sizes,
+}
+
+impl Depth {
+    pub(crate) const ALL: [Depth; 3] = [Depth::Relations, Depth::Routines, Depth::Sizes];
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Depth::Relations => "relations",
+            Depth::Routines => "routines",
+            Depth::Sizes => "sizes",
+        }
+    }
+
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|depth| depth.slug() == slug)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Depth::Relations => "Relations",
+            Depth::Routines => "+ Routines",
+            Depth::Sizes => "+ Sizes",
+        }
+    }
+}
+
+/// What a profile does with its connection rather than what the connection
+/// is, so changing it never reconnects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Behaviour {
+    pub(crate) depth: Depth,
 }
 
 /// Which surface the main pane is showing, and what a run targets. Both kinds
