@@ -3428,6 +3428,100 @@ fn a_flat_connection_offers_no_filter(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_connection_that_is_not_open_offers_no_filter_until_it_connects(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("closed.duckdb");
+        // Bytes that are not a DuckDB database, so the connect fails.
+        std::fs::write(&path, b"not a database, not a database, not a database")
+            .expect("the file must be writable");
+        let (workspace, cx) = launch_with_settings(
+            cx,
+            "view_mode = \"complex\"",
+            &format!(
+                "[[profiles]]\nid = \"e2e\"\nname = \"E2E\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"duckdb\"\npath = {:?}\n",
+                path.display().to_string()
+            ),
+        );
+        cx.executor().allow_parking();
+        cx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(900.)));
+        settle(cx);
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        assert_eq!(profile_state(&workspace, cx, "e2e"), "failed");
+
+        let offered = |cx: &mut VisualTestContext| {
+            let labels: Vec<String> = palette_hints(&workspace, cx)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+            let has = |wanted: &str| labels.iter().any(|label| label == wanted);
+            (
+                has("Refresh"),
+                has("Filter Databases"),
+                has("Filter databases…"),
+            )
+        };
+        assert_eq!(
+            offered(cx),
+            (true, false, false),
+            "the node's rows are there, and neither way in to a picker that cannot list"
+        );
+
+        // The connection comes up with the same row still selected.
+        std::fs::remove_file(&path).expect("the broken file can go");
+        ::duckdb::Connection::open(&path)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
+            .expect("the database is created");
+        run_command(&workspace, cx, Command::Reconnect);
+        assert_eq!(profile_state(&workspace, cx, "e2e"), "connected");
+        assert_eq!(offered(cx), (true, true, true));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn filtering_a_connection_that_is_not_open_says_so_and_opens_nothing(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let path = seed_ducks_file();
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        let node = crate::sidebar::SelectedNode {
+            profile: "ducks".into(),
+            database: None,
+            kind: crate::sidebar::NodeKind::Connection,
+            name: "Ducks".into(),
+            schema: None,
+            leaf: None,
+        };
+        let front = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_node_action(
+                &node,
+                crate::sidebar::NodeAction::FilterDatabases,
+                window,
+                cx,
+            );
+            let profile = workspace.profile().expect("a profile is in front");
+            (profile.id.clone(), profile.session.notice.clone())
+        });
+        assert_eq!(
+            front,
+            (
+                "ducks".to_string(),
+                Some("The connection is not open.".to_string())
+            ),
+            "the request brought Ducks to the front, whose connect has not landed"
+        );
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn every_mode_change_reaches_the_sessions_opened_for_other_databases(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = duckdb_with_other_attached(cx);
