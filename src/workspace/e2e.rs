@@ -21362,6 +21362,83 @@ fn open_once_released(
     })
 }
 
+/// How many connections [`counting_opener`] has been asked for.
+static AGENT_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An [`agent_read::Opener`](super::agent_read::Opener) that counts the opens it
+/// is asked for before making one as the lane would.
+fn counting_opener(
+    executor: &gpui::BackgroundExecutor,
+    config: crate::db::ConnectionConfig,
+    _: String,
+) -> gpui::Task<Result<(crate::db::Connection, Vec<String>), crate::db::DbError>> {
+    AGENT_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let waiting = executor.clone();
+    executor.spawn(async move {
+        super::spawn_blocking(&waiting, move || {
+            Ok((crate::db::Connection::open_for_agent(config)?, Vec::new()))
+        })
+        .await
+    })
+}
+
+#[gpui::test]
+fn an_agent_read_on_an_idle_closed_profile_is_refused_until_the_profile_reconnects(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::Ordering;
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "idle_timeout_minutes = 1");
+        cx.executor().allow_parking();
+
+        // A profile the user never connected is not an idle one: the state
+        // alone refuses nothing.
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(
+            answer.status,
+            crate::agent::Status::Executed,
+            "{}",
+            answer.text
+        );
+
+        connect_profile(&workspace, cx, "orders");
+        tick(cx, 60);
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+        workspace.update(cx, |workspace, _| {
+            let profile = workspace.profile_mut().expect("in front");
+            profile.behaviour.idle_timeout = None;
+            workspace.agent.opener = Some(counting_opener);
+        });
+        AGENT_OPENS.store(0, Ordering::SeqCst);
+
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(
+            answer.status,
+            crate::agent::Status::Failed,
+            "{}",
+            answer.text
+        );
+        assert_eq!(AGENT_OPENS.load(Ordering::SeqCst), 0, "nothing was opened");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.agent.lanes.contains_key("orders"));
+        });
+
+        connect_profile(&workspace, cx, "orders");
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(
+            answer.status,
+            crate::agent::Status::Executed,
+            "{}",
+            answer.text
+        );
+        assert_eq!(AGENT_OPENS.load(Ordering::SeqCst), 1);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn an_agent_call_in_flight_defers_the_idle_close(cx: &mut TestAppContext) {
     use std::sync::atomic::Ordering;
