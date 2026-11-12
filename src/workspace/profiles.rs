@@ -3663,6 +3663,50 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_edited_zone_or_property_that_fails_its_check_is_not_restored() {
+        use crate::db::Properties;
+
+        let restored_server = |extra: &str| {
+            let text = format!(
+                "[[profiles]]\nid = 'a'\nname = 'A'\nhost = 'h'\ndatabase = 'd'\n\
+                 user = 'u'\nengine = 'postgres'\n{extra}"
+            );
+            restored(&text)[0]
+                .1
+                .server()
+                .expect("a server engine")
+                .clone()
+        };
+
+        let zone = restored_server("time_zone = \"Europe/Paris'; RESET ALL\"\n");
+        assert_eq!(zone.time_zone, None);
+        let options = restored_server("driver_properties = [['options', '-c x=1']]\n");
+        assert_eq!(options.properties, Properties::default());
+
+        let kept = restored_server(
+            "time_zone = 'Europe/Paris'\ndriver_properties = [['application_name', 'billing']]\n",
+        );
+        assert_eq!(kept.time_zone.as_deref(), Some("Europe/Paris"));
+        assert_eq!(kept.properties.application_name.as_deref(), Some("billing"));
+
+        let (_, _, refusal) = stored_session_settings(
+            &store::decode_profiles(
+                "[[profiles]]\nid = 'a'\nname = 'A'\nhost = 'h'\ndatabase = 'd'\nuser = 'u'\ntime_zone = \"x'y\"\n\
+                 driver_properties = [['options', 'z']]\n",
+                &[],
+            )
+            .expect("loads")
+            .profiles[0],
+            Engine::Postgres,
+        );
+        let refusal = refusal.expect("both refusals are reported");
+        assert!(
+            refusal.contains("x'y") && refusal.contains("`options`"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
     fn only_a_postgres_profile_restores_the_service_it_names() {
         let profile = |engine: &str| {
             format!(
