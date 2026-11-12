@@ -917,6 +917,7 @@ pub(crate) struct Placeholders {
     pub(crate) database: &'static str,
     pub(crate) user: &'static str,
     pub(crate) path: &'static str,
+    pub(crate) startup_script: &'static str,
 }
 
 /// Read against `ConnectionConfig::server`, `account` and
@@ -947,6 +948,7 @@ pub(crate) fn placeholders(target: Target) -> Placeholders {
             hints.user
         },
         path: hints.path,
+        startup_script: hints.startup_script,
     }
 }
 
@@ -1379,6 +1381,39 @@ mod tests {
             !plugin.takes_startup_script(),
             "a plugin owns its process, whatever dialect it speaks"
         );
+    }
+
+    #[test]
+    fn the_startup_script_placeholder_is_written_in_each_engines_own_dialect() {
+        use crate::db::Hints;
+        use crate::sql::{Mode, startup_statements};
+
+        let postgres = placeholders(Target::built_in(Engine::Postgres)).startup_script;
+        assert_eq!(postgres, "SET search_path TO app, public;");
+        for engine in Engine::ALL {
+            let target = Target::built_in(engine);
+            if !target.takes_startup_script() {
+                continue;
+            }
+            let example = placeholders(target).startup_script;
+            assert!(!example.is_empty(), "{engine:?}");
+            if engine != Engine::Postgres {
+                assert_ne!(example, postgres, "{engine:?} shows Postgres's example");
+            }
+            if example != Hints::DEFAULT.startup_script {
+                assert!(
+                    startup_statements(engine, Mode::ReadOnly, &[], example).is_ok(),
+                    "{engine:?}: {example}"
+                );
+            }
+        }
+        for engine in [Engine::Sqlite, Engine::Turso] {
+            assert_eq!(
+                placeholders(Target::built_in(engine)).startup_script,
+                Hints::DEFAULT.startup_script,
+                "{engine:?} has no statement Read-only admits"
+            );
+        }
     }
 
     #[test]
