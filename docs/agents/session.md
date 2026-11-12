@@ -434,7 +434,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   (`src/workspace/timers.rs`). Keep-alive is the first: `Profile.keep_alive_task`
   holds a `background_executor().timer`, replaced to re-arm and dropped to
   cancel, and it is re-armed after each round lands rather than repeating. It
-  is off unless the profile sets `keep_alive_seconds` (minimum 10), so a
+  is off unless the profile sets `keep_alive_seconds` (10 to 3600; the form refuses
+  outside it and a stored value outside it restores as off), so a
   profile that never asked arms nothing. A round pings every session in
   `Profile::sessions_to_hold` through `spawn_blocking`, each by `try_lock`, so a
   session a statement holds is skipped and never waited on; it is skipped whole
@@ -451,7 +452,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `advance_clock` also runs every task that is ready, so a test that needs a
   call still in flight when a timer fires holds it open on something that
   only the clock or the test releases, never on the scheduler's order.
-  The idle close (`idle_timeout_minutes`, `Profile.idle_task`) is the second:
+  The idle close (`idle_timeout_minutes`, 1 to 1440 by the same rule,
+  `Profile.idle_task`) is the second:
   it shares `disconnect`'s state change (`close_sessions`) but keeps the tabs,
   the buffers and the profile's place in front, and drops the agent's lane
   (`self.agent.lanes`) with it so nothing of the agent's stays open on the
