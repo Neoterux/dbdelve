@@ -2042,6 +2042,7 @@ impl Workspace {
         // paints the same sentence twice in the same red.
         let Some(connection) = profile.connection() else {
             profile.catalog = CatalogState::Failed("Not connected.".into());
+            profile.reread_after_load = false;
             self.refresh_explorer(id, cx);
             self.catalog_landed(id, cx);
             return;
