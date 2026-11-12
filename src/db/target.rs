@@ -6,8 +6,8 @@
 use super::plugin::Plugin;
 use super::spec::{Abilities, SessionTimeZone};
 use super::{
-    DbError, Engine, Fields, RelationKind, ServerConfig, Syntax, clickhouse, duckdb, external,
-    mssql, postgres, redis, turso,
+    DbError, Engine, Fields, Property, RelationKind, ServerConfig, Syntax, clickhouse, duckdb,
+    external, mssql, postgres, redis, turso,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +119,15 @@ impl Target {
     /// process is its own.
     pub fn takes_startup_script(self) -> bool {
         self.driver == Driver::BuiltIn && self.engine.spec().takes_startup_script
+    }
+
+    /// The driver properties a profile can set: DBDelve's own driver maps each
+    /// to the one field it names, and a plugin's process takes none.
+    pub fn driver_properties(self) -> &'static [Property] {
+        match self.driver {
+            Driver::BuiltIn => self.engine.spec().driver_properties,
+            Driver::Plugin(_) => &[],
+        }
     }
 
     /// Whether a profile can carry a session time zone: DBDelve's own driver

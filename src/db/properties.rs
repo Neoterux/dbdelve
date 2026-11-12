@@ -101,6 +101,33 @@ impl Properties {
         Ok(properties)
     }
 
+    /// What `text` sets on `engine`: one `key = value` per line, blank lines
+    /// skipped, split at the first `=` so a value may hold one. A line with no
+    /// `=` is refused by its number, then the pairs go through [`Self::parse`].
+    pub fn from_lines(engine: Engine, text: &str) -> Result<Self, String> {
+        let mut pairs = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!("Driver property line {} has no `=`.", index + 1));
+            };
+            pairs.push((key.trim().to_string(), value.trim().to_string()));
+        }
+        Self::parse(engine, &pairs)
+    }
+
+    /// The set values as [`Self::from_lines`] reads them, in [`Self::stored`]'s
+    /// order.
+    pub fn lines(&self) -> String {
+        self.stored()
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The set values as `profiles.toml` writes them, in the order an engine's
     /// list gives, whatever order they were written in, so saving an unchanged
     /// profile changes no byte.

@@ -84,9 +84,9 @@ pub(crate) struct ConnectionForm {
     /// The session time zone, where `Target::takes_time_zone`. Blank is none.
     /// Kept, not read, under any other target, as another engine's fields are.
     pub(crate) time_zone: Entity<InputState>,
-    /// The profile's driver properties, which the form does not show yet and
-    /// keeps as they were, so a save changes none.
-    pub(crate) properties: Properties,
+    /// The profile's driver properties, one `key = value` per line, where
+    /// `Target::driver_properties` is not empty.
+    pub(crate) properties: Entity<TextareaState>,
     /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
     /// unlike the credential fields it is drawn whichever engine is selected.
     pub(crate) statement_timeout: Entity<InputState>,
@@ -338,6 +338,15 @@ impl ConnectionForm {
                 .placeholder("UTC")
                 .default_value(value(server.and_then(|server| server.time_zone.as_deref())))
         });
+        let properties = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .placeholder("application_name = billing")
+        });
+        if let Some(server) = server {
+            let lines = server.properties.lines();
+            properties.update(cx, |input, cx| input.set_value(lines, window, cx));
+        }
         let statement_timeout = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("No limit")
@@ -414,9 +423,7 @@ impl ConnectionForm {
             srv: mongo.is_some_and(|mongo| mongo.srv),
             login_database: mongo.and_then(|mongo| mongo.login_database.clone()),
             time_zone,
-            properties: server
-                .map(|server| server.properties.clone())
-                .unwrap_or_default(),
+            properties,
             statement_timeout,
             depth: Depth::default(),
             startup_script,
@@ -794,7 +801,7 @@ impl ConnectionForm {
             schema: None,
             read_only: false,
             time_zone: typed_time_zone(self.target(), &read(&self.time_zone))?,
-            properties: self.properties.clone(),
+            properties: typed_driver_properties(self.target(), &self.properties.read(cx).value())?,
         };
         // A blank Host beside a service is whatever the service names, which
         // may be a socket directory; connect checks the Host it resolves to.
@@ -1113,6 +1120,16 @@ fn typed_time_zone(target: Target, text: &str) -> Result<Option<String>, String>
     }
     check_time_zone(zone)?;
     Ok(Some(zone.to_string()))
+}
+
+/// What the Driver properties row says, where `target` draws it: only a key
+/// the target lists is taken, and one it does not is refused by name. Text left
+/// in the row under a target that lists none is not read.
+fn typed_driver_properties(target: Target, text: &str) -> Result<Properties, String> {
+    if target.driver_properties().is_empty() {
+        return Ok(Properties::default());
+    }
+    Properties::from_lines(target.engine, text)
 }
 
 /// Blank is the default port.
