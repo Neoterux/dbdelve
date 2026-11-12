@@ -3776,6 +3776,53 @@ open_objects = []
     }
 
     #[test]
+    fn the_time_zone_and_driver_properties_round_trip_before_ssh() {
+        let mut profile = a_stored_profile();
+        profile.time_zone = Some("Europe/Paris".into());
+        profile.driver_properties = vec![
+            ("application_name".into(), "billing".into()),
+            ("connect_timeout".into(), "5".into()),
+        ];
+        profile.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            ..Default::default()
+        });
+        let text = written_alone(profile.clone());
+        let tunnel = text.find("[profiles.ssh]").expect("the tunnel is written");
+        for key in ["time_zone = ", "driver_properties = "] {
+            let at = text.find(key).expect("the key is written");
+            assert!(
+                at < tunnel,
+                "TOML cannot emit a scalar after a table, so {key} comes before `ssh`:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("driver_properties = [[\"application_name\", \"billing\"]"),
+            "an inline array of pairs, never a table:\n{text}"
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        assert_eq!(decoded.profiles[0].time_zone, profile.time_zone);
+        assert_eq!(
+            decoded.profiles[0].driver_properties,
+            profile.driver_properties
+        );
+        assert_eq!(
+            written_alone(decoded.profiles[0].clone()),
+            text,
+            "saving what was saved changes nothing"
+        );
+
+        let bare = written_alone(a_stored_profile());
+        assert!(
+            !bare.contains("time_zone") && !bare.contains("driver_properties"),
+            "a profile with neither is written as it always was:\n{bare}"
+        );
+        let golden = include_str!("testdata/every-engine.resaved.toml");
+        assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
+        assert!(!golden.contains("time_zone") && !golden.contains("driver_properties"));
+    }
+
+    #[test]
     fn a_profile_without_folders_or_pins_is_written_as_it_always_was() {
         let text = written_alone(a_stored_profile());
         assert!(

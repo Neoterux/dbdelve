@@ -3571,6 +3571,57 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_time_zone_and_driver_properties_reach_the_config() {
+        use crate::db::Properties;
+
+        let profile = |engine: &str, extra: &str| {
+            format!(
+                "[[profiles]]\nid = 'a'\nname = 'A'\nhost = 'h'\ndatabase = 'd'\n\
+                 user = 'u'\nengine = '{engine}'\n{extra}"
+            )
+        };
+        let both = "time_zone = 'Europe/Paris'\n\
+            driver_properties = [['connect_timeout', '5'], ['application_name', 'billing']]\n";
+        let restored_server = |text: &str| {
+            let configs = restored(text);
+            configs[0].1.server().expect("a server engine").clone()
+        };
+
+        let postgres = restored_server(&profile("postgres", both));
+        assert_eq!(postgres.time_zone.as_deref(), Some("Europe/Paris"));
+        assert_eq!(
+            postgres.properties,
+            Properties {
+                application_name: Some("billing".into()),
+                connect_timeout: Some(5),
+            }
+        );
+        assert_eq!(
+            postgres.properties.stored(),
+            vec![
+                ("application_name".to_string(), "billing".to_string()),
+                ("connect_timeout".to_string(), "5".to_string()),
+            ],
+            "the list's order, not the file's"
+        );
+
+        let sql_server = restored_server(&profile("sqlserver", both));
+        assert_eq!(
+            sql_server.time_zone, None,
+            "SQL Server has no time-zone row"
+        );
+        assert_eq!(
+            sql_server.properties,
+            Properties::default(),
+            "connect_timeout is not on its list, so the whole list is refused"
+        );
+
+        let bare = restored_server(&profile("postgres", ""));
+        assert_eq!(bare.time_zone, None);
+        assert_eq!(bare.properties, Properties::default());
+    }
+
+    #[test]
     fn only_a_postgres_profile_restores_the_service_it_names() {
         let profile = |engine: &str| {
             format!(
