@@ -2783,14 +2783,14 @@ impl Connection {
         match self {
             Self::Postgres(connection) => connection.ping(),
             Self::MySql(connection) => connection.ping(),
-            Self::SqlServer(_)
-            | Self::Sqlite(_)
+            Self::SqlServer(connection) => connection.ping(),
+            Self::Redis(connection) => connection.ping(),
+            Self::Sqlite(_)
             | Self::Turso(_)
             | Self::DuckDb(_)
             | Self::Snowflake(_)
             | Self::ClickHouse(_)
             | Self::MongoDb(_)
-            | Self::Redis(_)
             | Self::External(_) => Ok(()),
         }
     }

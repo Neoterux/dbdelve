@@ -282,6 +282,35 @@ impl Connection {
         })
     }
 
+    /// One `PING` on the session. A command holding it is the session in use,
+    /// so the ping is skipped, never queued behind it; a session not dialled
+    /// is left alone, and so is one with a `MULTI` open, where the `PING`
+    /// would be queued into the user's transaction instead of answered. A
+    /// ping that does not come back whole takes the session with it, as any
+    /// command does (`send`).
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut held = match self.session.try_lock() {
+            Ok(held) => held,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            // A panic mid-command leaves nothing a later command would not
+            // find out, which is how `lock` treats it too.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        let Some(live) = held.as_mut() else {
+            return Ok(());
+        };
+        if live.multi {
+            return Ok(());
+        }
+        let Err(error) = ::redis::cmd("PING").query::<String>(&mut live.client) else {
+            return Ok(());
+        };
+        if error.is_io_error() || error.is_unrecoverable_error() || !live.client.is_open() {
+            *held = None;
+        }
+        Err(plain_error(message(&error)))
+    }
+
     /// `CLIENT KILL ID` over a connection of its own, because the session
     /// being stopped is busy holding the mutex. It ends the session, not just
     /// the command, which Redis has no other way to stop; the next command
