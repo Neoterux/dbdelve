@@ -2446,6 +2446,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires the compose databases"]
+    fn live_a_keep_alive_ping_answers_and_never_waits_on_a_busy_session() {
+        let connection = Connection::open(&live_config()).expect("the connection opens");
+        assert!(connection.ping().is_ok(), "an idle session answers");
+
+        // A statement holds the client for as long as it runs; the round
+        // skips that session rather than queue behind it.
+        let busy = connection.client.lock().expect("nothing else holds it");
+        let started = Instant::now();
+        assert!(connection.ping().is_ok(), "a busy session is skipped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and the skip does not wait"
+        );
+        drop(busy);
+
+        let pid = cell(&connection, "SELECT pg_backend_pid()").expect("the pid is read");
+        Connection::open(&live_config())
+            .expect("a second connection opens")
+            .query(
+                &format!("SELECT pg_terminate_backend({pid})"),
+                Fetch::default(),
+            )
+            .expect("the terminate runs");
+        assert!(connection.ping().is_err(), "a terminated session is lost");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
     fn live_a_script_cannot_lift_the_side_sessions_bound() {
         let scripted = Connection::open(&live_config())
             .and_then(|connection| {

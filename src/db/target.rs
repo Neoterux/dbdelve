@@ -411,6 +411,25 @@ mod tests {
     }
 
     #[test]
+    fn keep_alive_is_offered_where_a_session_stays_open() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                Target::built_in(engine).keeps_alive(),
+                engine == Engine::Postgres,
+                "{engine:?}"
+            );
+        }
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: Driver::Plugin(odbc()),
+        };
+        assert!(
+            !plugin.keeps_alive(),
+            "a plugin's process keeps its own session"
+        );
+    }
+
+    #[test]
     fn plugin_targets_write_rows_only_in_a_proven_dialect_and_nothing_else() {
         let plugin = odbc();
         // Every engine, not only the dialects a plugin is offered: the clamp
