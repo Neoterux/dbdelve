@@ -201,10 +201,14 @@ impl Shown {
     /// carries. An empty list means nothing matched, which is the caller's cue
     /// to send no statement.
     ///
-    /// ponytail: a database that matches but holds no table or view is
-    /// in neither number, since the catalog is read from the tables view; the
-    /// upgrade is counting from the database listing, which would change the
-    /// unfiltered number Phase 7 draws.
+    /// Both numbers are drawn from `listed`, whichever listing the caller
+    /// passes. ClickHouse's and MySQL's `catalog` pass `catalog_databases`, the
+    /// databases the catalog draws, so a database holding nothing the catalog
+    /// reads is in neither number, as it is in no unfiltered count, and the
+    /// shown and the hidden add up to the unfiltered tree's count. MySQL's
+    /// `matched`, which `routines`, `sequences` and `sizes` call, passes the
+    /// server's whole `SCHEMATA` listing and uses only the names, never the
+    /// hidden count.
     pub fn matched_databases(
         &self,
         listed: &Databases,
