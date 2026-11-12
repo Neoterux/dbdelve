@@ -12181,4 +12181,71 @@ mod tests {
             );
         }
     }
+
+    /// A startup script is judged by the gate every statement is, one unit at
+    /// a time under the profile's mode, and refused whole: a refusal runs none
+    /// of it, and what it says never repeats the script.
+    #[test]
+    fn a_startup_script_is_gated_like_any_statement() {
+        let read_only =
+            |engine, script: &str| startup_statements(engine, Mode::ReadOnly, &[], script);
+        let full = |script: &str| startup_statements(Engine::Postgres, Mode::Full, &[], script);
+
+        assert_eq!(
+            read_only(Engine::Postgres, "SET search_path TO app, public"),
+            Ok(vec!["SET search_path TO app, public".to_string()])
+        );
+        let two = read_only(Engine::Postgres, "SET a = 1;\nSET b = 2")
+            .expect("two settings are two units");
+        assert_eq!(two.len(), 2);
+        assert!(
+            two[0].starts_with("SET a = 1") && two[1] == "SET b = 2",
+            "{two:?}"
+        );
+
+        assert_eq!(read_only(Engine::Postgres, "   \n"), Ok(vec![]));
+        for script in [
+            "-- nothing\n/* here */",
+            "SELEC nonsense ??",
+            "SET GLOBAL x = 1;;;;( ",
+        ] {
+            let refused = read_only(Engine::Postgres, script).expect_err(script);
+            assert!(refused.starts_with("The startup script"), "{refused}");
+        }
+        let write = read_only(Engine::MySql, "SET GLOBAL x = 1").expect_err("a global needs more");
+        assert!(write.starts_with("The startup script"), "{write}");
+        assert!(!write.contains("GLOBAL"), "{write}");
+
+        for script in ["BEGIN", "BEGIN; SET search_path TO app; COMMIT"] {
+            let refused = full(script).expect_err(script);
+            assert!(refused.starts_with("The startup script"), "{refused}");
+            assert!(refused.contains("transaction"), "{refused}");
+        }
+
+        let dropped = full("DROP TABLE secret_table").expect_err("a drop asks first");
+        assert!(dropped.starts_with("The startup script"), "{dropped}");
+        assert!(!dropped.contains("secret_table"), "{dropped}");
+        assert!(
+            startup_statements(
+                Engine::Postgres,
+                Mode::Full,
+                &[Destructive::Drop],
+                "DROP TABLE secret_table"
+            )
+            .is_ok()
+        );
+
+        // A mix is refused whole, the permitted statement included.
+        let mixed = read_only(
+            Engine::Postgres,
+            "SELECT 1;\nDELETE FROM secret_table WHERE id = 1",
+        )
+        .expect_err("a write is not a read");
+        assert!(mixed.starts_with("The startup script"), "{mixed}");
+        assert!(!mixed.contains("secret_table"), "{mixed}");
+
+        let counted = startup_statements(Engine::SqlServer, Mode::Full, &[], "SELECT 1;\nGO 2")
+            .expect_err("a counted GO repeats its batch");
+        assert!(counted.starts_with("The startup script"), "{counted}");
+    }
 }
