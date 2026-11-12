@@ -19621,3 +19621,135 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
         quit(workspace, cx);
     });
 }
+
+/// What `PRAGMA cache_size` reads on `connection`, which a startup script can
+/// set and a fresh session never has.
+fn cache_size(connection: &crate::db::Connection) -> Option<String> {
+    let result = connection
+        .query(
+            "PRAGMA cache_size",
+            &CancelToken::default(),
+            Fetch::default(),
+        )
+        .expect("the pragma reads");
+    result.rows[0].get(0).map(str::to_string)
+}
+
+/// Activates the profile `id` and lets its connect settle.
+fn connect_profile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) {
+    workspace.update(cx, |workspace, cx| {
+        let index = workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .expect("the saved profile is restored");
+        workspace.activate(index, cx);
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_startup_script_runs_on_connect_and_on_every_session_beside_it(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);",
+            "",
+            &format!(
+                "{}{}",
+                sqlite_profile(
+                    "e2e",
+                    "E2E",
+                    "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = -4000\""
+                ),
+                sqlite_profile("plain", "Plain", "mode = \"full\""),
+            ),
+        );
+        connect_profile(&workspace, cx, "e2e");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "e2e")
+                .expect("the profile is listed");
+            assert!(matches!(profile.state, ProfileState::Connected(..)));
+            assert_eq!(
+                profile.behaviour.startup_script,
+                "PRAGMA cache_size = -4000"
+            );
+            let connection = profile.connection().expect("it connected");
+            assert_eq!(cache_size(&connection).as_deref(), Some("-4000"));
+            let apart = connection.apart().expect("a session beside it opens");
+            assert_eq!(cache_size(&apart).as_deref(), Some("-4000"));
+            assert_eq!(
+                profile.stored().startup_script.as_deref(),
+                Some("PRAGMA cache_size = -4000")
+            );
+            let plain = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "plain")
+                .expect("the profile is listed");
+            assert_eq!(plain.stored().startup_script, None);
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_startup_script_that_is_refused_or_errors_fails_the_connect(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);",
+            "",
+            &format!(
+                "{}{}",
+                sqlite_profile(
+                    "refused",
+                    "Refused",
+                    "mode = \"read-only\"\nstartup_script = \"SELECT 1;\\nDELETE FROM t\""
+                ),
+                sqlite_profile(
+                    "errors",
+                    "Errors",
+                    "mode = \"full\"\nstartup_script = \"SELECT * FROM missing_table\""
+                ),
+            ),
+        );
+        let failure = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str| {
+            workspace.read_with(cx, |workspace, _| {
+                match &workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .expect("the profile is listed")
+                    .state
+                {
+                    ProfileState::Failed(message) => message.clone(),
+                    _ => panic!("{id} did not fail"),
+                }
+            })
+        };
+        connect_profile(&workspace, cx, "refused");
+        let refused = failure(&workspace, cx, "refused");
+        assert!(refused.starts_with("The startup script"), "{refused}");
+        assert!(!refused.contains("DELETE FROM t"), "{refused}");
+
+        connect_profile(&workspace, cx, "errors");
+        let errors = failure(&workspace, cx, "errors");
+        assert!(errors.starts_with("The startup script failed"), "{errors}");
+        assert!(!errors.contains("SELECT * FROM"), "{errors}");
+
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        let rows: i64 = rusqlite::Connection::open(database)
+            .and_then(|connection| connection.query_row("SELECT count(*) FROM t", [], |r| r.get(0)))
+            .expect("the table reads");
+        assert_eq!(rows, 1, "no statement of the refused script ran");
+        quit(workspace, cx);
+    });
+}
