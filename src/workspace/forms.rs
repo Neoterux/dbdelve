@@ -667,40 +667,59 @@ impl Workspace {
         );
         behaviour
             .push(ui::option_row("Project", None, self.project_dropdown(cx), t).into_any_element());
+        // The same box for each row that is a whole number of seconds.
+        let seconds_box = |input: &Entity<InputState>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
+                .h(px(Control::Compact.height()))
+                .px(px(layout::SPACE_SM))
+                .rounded(px(layout::RADIUS_CONTROL))
+                .border_1()
+                .border_color(t.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(gpui_component::Sizable::small(bare(input))),
+                )
+                .child(
+                    div()
+                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                        .text_color(t.text_faint)
+                        .child("s"),
+                )
+        };
         // Every engine can stop a statement, and this is the only place a
         // profile has to say for how long.
         behaviour.push(
             ui::option_row(
                 "Statement timeout",
                 None,
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::SPACE_XS))
-                    .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
-                    .h(px(Control::Compact.height()))
-                    .px(px(layout::SPACE_SM))
-                    .rounded(px(layout::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(gpui_component::Sizable::small(bare(
-                                &form.statement_timeout,
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(layout::chrome(layout::TEXT_SM)))
-                            .text_color(t.text_faint)
-                            .child("s"),
-                    ),
+                seconds_box(&form.statement_timeout),
                 t,
             )
             .into_any_element(),
         );
+        // Asked of the target, so the engines that keep a session open gain the
+        // row by turning the fact on, with no change here.
+        if form.target().keeps_alive() {
+            behaviour.push(
+                ui::option_row(
+                    "Keep-alive",
+                    Some(
+                        "Pings the connection's open sessions this often so an idle cut-off \
+                         between here and the server does not close them. Off when blank."
+                            .into(),
+                    ),
+                    seconds_box(&form.keep_alive),
+                    t,
+                )
+                .into_any_element(),
+            );
+        }
         // Every target's connect runs the loads this chooses among.
         let depths = Depth::ALL.into_iter().enumerate().map(|(index, depth)| {
             ui::segmented_choice(
