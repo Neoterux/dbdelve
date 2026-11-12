@@ -587,7 +587,19 @@ fn connection_string(server: &ServerConfig) -> String {
     // Without this the driver waits out the OS SYN retry budget, so a host
     // that resolves but drops packets pins the UI in "Connecting…" for
     // minutes with no cancel.
-    parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
+    // The profile's own number replaces it, never adds a second key.
+    parts.push(format!(
+        "connect_timeout={}",
+        server
+            .properties
+            .connect_timeout
+            .map_or(CONNECT_TIMEOUT_SECONDS, u64::from)
+    ));
+    // Shown in `pg_stat_activity` for the session. Never in `options`, which
+    // carries the read-only hold.
+    if let Some(name) = &server.properties.application_name {
+        parts.push(format!("application_name={}", quote(name)));
+    }
     // A session default set once, here, rather than a `SET` prepended to the
     // user's submission -- see `ServerConfig::statement_timeout`. It rides in
     // as a startup option because `options` is the only channel libpq has for

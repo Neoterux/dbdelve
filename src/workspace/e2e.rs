@@ -8555,6 +8555,73 @@ fn the_time_zone_row_is_drawn_only_where_a_session_takes_one(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn the_driver_properties_row_is_drawn_only_where_the_engine_lists_some(cx: &mut TestAppContext) {
+    use crate::db::Target;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("orders", "Orders", ""));
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::NewConnection);
+        let pick = |engine, cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let form = workspace.form.as_mut().expect("the form is open");
+                form.set_target(Target::built_in(engine));
+                cx.notify();
+            });
+            settle(cx);
+        };
+        let read = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let form = workspace.form.as_ref().expect("the form is open");
+                form.config(cx).map(|(_, config)| {
+                    config
+                        .server()
+                        .map(|server| server.properties.stored())
+                        .unwrap_or_default()
+                })
+            })
+        };
+        let drawn =
+            |cx: &mut VisualTestContext| cx.debug_bounds("form-driver-properties").is_some();
+
+        pick(Engine::Postgres, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let form = workspace.form.as_ref().expect("the form is open");
+            form.host
+                .update(cx, |input, cx| input.set_value("db.example", window, cx));
+            form.user
+                .update(cx, |input, cx| input.set_value("me", window, cx));
+            form.properties.update(cx, |input, cx| {
+                input.set_value(
+                    "application_name = billing\nconnect_timeout = 5",
+                    window,
+                    cx,
+                )
+            });
+        });
+        settle(cx);
+        assert!(drawn(cx), "Postgres lists properties");
+        assert_eq!(
+            read(cx),
+            Ok(vec![
+                ("application_name".to_string(), "billing".to_string()),
+                ("connect_timeout".to_string(), "5".to_string()),
+            ])
+        );
+
+        // One key the engine does not list refuses the whole form, by name.
+        pick(Engine::SqlServer, cx);
+        assert!(drawn(cx), "SQL Server lists one");
+        let refused = read(cx).expect_err("SQL Server has no connect_timeout key");
+        assert!(refused.contains("`connect_timeout`"), "{refused}");
+
+        pick(Engine::DuckDb, cx);
+        assert!(!drawn(cx), "DuckDB lists none");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) =

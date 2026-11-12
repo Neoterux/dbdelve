@@ -589,6 +589,33 @@ impl Workspace {
             );
         }
 
+        let listed = form.target().driver_properties();
+        if !listed.is_empty() {
+            let keys = listed
+                .iter()
+                .map(|property| property.key())
+                .collect::<Vec<_>>()
+                .join(", ");
+            session.push(
+                ui::stacked_option_row(
+                    "Driver properties",
+                    Some(
+                        format!(
+                            "One key = value per line; only {keys} are taken. Applied to \
+                             every session of this connection, an agent's included."
+                        )
+                        .into(),
+                    ),
+                    div()
+                        .w_full()
+                        .child(Textarea::new(&form.properties).font_family(mono.clone())),
+                    t,
+                )
+                .debug_selector(|| "form-driver-properties".into())
+                .into_any_element(),
+            );
+        }
+
         let mut behaviour = Vec::new();
         // Only while creating: past that, `Workspace::set_mode` is the one
         // door a mode changes through, from the titlebar, and it pushes the
