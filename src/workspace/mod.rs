@@ -27,6 +27,7 @@ mod projects;
 mod queries;
 mod sidebar;
 mod tabs;
+mod timers;
 mod transactions;
 mod welcome;
 
@@ -258,6 +259,10 @@ pub(crate) struct Workspace {
     /// How many routine reads were started, counted as `size_reads` is.
     #[cfg(test)]
     pub(crate) routine_reads: usize,
+    /// How many keep-alive rounds pinged, which run on the blocking pool where
+    /// nothing can be counted.
+    #[cfg(test)]
+    pub(crate) pings: usize,
     /// Profiles on an engine this build cannot open, held as they were read
     /// and written back by `remember_profiles`; never restored.
     pub(crate) unavailable: Vec<store::UnavailableProfile>,
@@ -610,6 +615,8 @@ impl Workspace {
             size_reads: 0,
             #[cfg(test)]
             routine_reads: 0,
+            #[cfg(test)]
+            pings: 0,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
             connections: sidebar::ConnectionsSidebar::new(window, cx),

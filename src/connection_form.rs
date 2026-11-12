@@ -519,6 +519,7 @@ impl ConnectionForm {
                 true => self.startup_script.read(cx).value().to_string(),
                 false => String::new(),
             },
+            keep_alive: None,
         })
     }
 

@@ -20610,3 +20610,53 @@ fn a_failed_ping_stops_the_keep_alive_quietly(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_at_ten_seconds_or_more(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let postgres = |id: &str, extra: &str| {
+            format!(
+                "[[profiles]]\nid = {id:?}\nname = {id:?}\nhost = \"localhost\"\nport = 5432\n\
+                 database = \"app\"\nuser = \"app\"\nengine = \"postgres\"\n{extra}\n"
+            )
+        };
+        let profiles = [
+            postgres("kept", "keep_alive_seconds = 120"),
+            postgres("floor", "keep_alive_seconds = 10"),
+            postgres("low", "keep_alive_seconds = 9"),
+            postgres("none", ""),
+            sqlite_profile("file", "File", "keep_alive_seconds = 120"),
+        ]
+        .concat();
+        let (workspace, cx) = launch_with_profiles(cx, &profiles);
+        let restored: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            ["kept", "floor", "low", "none", "file"]
+                .map(|id| {
+                    let profile = workspace
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == id)
+                        .expect("the profile is restored");
+                    (
+                        profile.behaviour.keep_alive,
+                        profile.stored().keep_alive_seconds,
+                    )
+                })
+                .to_vec()
+        });
+        assert_eq!(
+            restored,
+            [
+                (Some(120), Some(120)),
+                (Some(10), Some(10)),
+                (None, None),
+                (None, None),
+                (None, None)
+            ]
+        );
+        quit(workspace, cx);
+    });
+}

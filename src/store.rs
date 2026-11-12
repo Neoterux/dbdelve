@@ -189,6 +189,13 @@ pub struct StoredProfile {
     /// it comes before `ssh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_script: Option<String>,
+    /// Seconds between pings of the sessions this profile holds open, so an
+    /// idle cut-off between here and the server does not close them. Absent is
+    /// off, which is every profile written before the setting existed; a value
+    /// under 10, or on an engine that keeps no session, reads as off. A scalar,
+    /// so it comes before `ssh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_seconds: Option<u32>,
     /// The session time zone this profile connects with: a name or an offset,
     /// checked when read. Absent leaves the server's own. A scalar, so it comes
     /// before `ssh`.
@@ -3374,6 +3381,7 @@ user = "shayan"
                 include_schemas: Vec::new(),
                 introspection_depth: None,
                 startup_script: None,
+                keep_alive_seconds: None,
                 time_zone: None,
                 driver_properties: Vec::new(),
                 ssh: None,
@@ -3438,6 +3446,7 @@ user = "shayan"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -3583,6 +3592,7 @@ open_objects = []
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -4226,6 +4236,7 @@ folder = "Hot"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -4315,6 +4326,7 @@ folder = "Hot"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -4390,6 +4402,7 @@ folder = "Hot"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -4513,6 +4526,7 @@ open_objects = []
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -4660,6 +4674,7 @@ open_objects = []
                     include_schemas: Vec::new(),
                     introspection_depth: None,
                     startup_script: None,
+                    keep_alive_seconds: None,
                     time_zone: None,
                     driver_properties: Vec::new(),
                     ssh: None,
@@ -4704,6 +4719,7 @@ open_objects = []
                     include_schemas: Vec::new(),
                     introspection_depth: None,
                     startup_script: None,
+                    keep_alive_seconds: None,
                     time_zone: None,
                     driver_properties: Vec::new(),
                     ssh: None,
@@ -5485,6 +5501,7 @@ open_objects = []
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -5865,6 +5882,7 @@ name = \"accounts\"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
@@ -5992,6 +6010,7 @@ name = \"accounts\"
             include_schemas: Vec::new(),
             introspection_depth: None,
             startup_script: None,
+            keep_alive_seconds: None,
             time_zone: None,
             driver_properties: Vec::new(),
             ssh: None,
