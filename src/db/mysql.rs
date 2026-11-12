@@ -411,10 +411,20 @@ fn base_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder 
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Connection attempts `open` has made on this thread. The compose
+    /// healthchecks connect every two seconds, so the server's own counters
+    /// cannot count one open's attempts.
+    static OPEN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Open a connection built from `options`, falling back to plaintext exactly
 /// where `sslmode=prefer` allows it. Shared by the query connection and the
 /// cancel connection so the fallback behaviour cannot drift between them.
 fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn, DbError> {
+    #[cfg(test)]
+    OPEN_ATTEMPTS.set(OPEN_ATTEMPTS.get() + 1);
     match Conn::new(options().ssl_opts(ssl_options(server))) {
         Ok(connection) => Ok(connection),
         // `prefer` is the one rung where a weaker connection is reachable, and
@@ -422,6 +432,8 @@ fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn
         // you can" in one attempt, so this is two — which is what libpq's own
         // `prefer` amounts to. No other mode falls back.
         Err(_) if server.sslmode == SslMode::Prefer => {
+            #[cfg(test)]
+            OPEN_ATTEMPTS.set(OPEN_ATTEMPTS.get() + 1);
             Conn::new(options().ssl_opts(None)).map_err(|error| connect_error(&error, server))
         }
         Err(error) => Err(connect_error(&error, server)),
@@ -1555,6 +1567,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires the compose databases"]
+    fn live_a_time_zone_the_server_refuses_fails_the_connect_in_one_attempt() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let with_zone = |zone: &str| ServerConfig {
+                sslmode: SslMode::Prefer,
+                time_zone: Some(zone.into()),
+                ..live_config(engine)
+            };
+            OPEN_ATTEMPTS.set(0);
+            let refused = connect(&with_zone("Nowhere/Invalid"), engine, None)
+                .err()
+                .unwrap_or_else(|| panic!("{engine:?} accepted a zone it does not know"));
+            assert!(
+                refused.message.contains("time zone"),
+                "{engine:?}: {}",
+                refused.message
+            );
+            assert_eq!(OPEN_ATTEMPTS.get(), 1, "{engine:?} retried after the zone");
+
+            // Control: a first attempt that completes TLS is one attempt, so a
+            // retry would have shown as two.
+            OPEN_ATTEMPTS.set(0);
+            connect(&with_zone("+02:00"), engine, None).expect("a valid zone connects");
+            assert_eq!(OPEN_ATTEMPTS.get(), 1, "{engine:?} did not complete TLS");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
     fn live_the_time_zone_reaches_every_session() {
         for engine in [Engine::MySql, Engine::MariaDb] {
             let config = ServerConfig {
@@ -2342,28 +2382,24 @@ ORDER BY 1, 2
     }
 
     #[test]
-    fn the_time_zone_follows_the_hold_and_the_timeout_in_init() {
+    fn init_carries_the_hold_and_the_timeout_and_never_the_time_zone() {
+        // The zone is user-typed text the server may refuse, and a refused
+        // init is retried in plaintext under `prefer`.
         let server = |time_zone: Option<&str>| ServerConfig {
             read_only: true,
             statement_timeout: 30,
             time_zone: time_zone.map(str::to_string),
             ..ServerConfig::default()
         };
+        let expected = [
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET SESSION max_execution_time = 30000",
+        ];
         assert_eq!(
             init_statements(&server(Some("Europe/Paris")), Engine::MySql),
-            [
-                "SET SESSION TRANSACTION READ ONLY",
-                "SET SESSION max_execution_time = 30000",
-                "SET time_zone = 'Europe/Paris'"
-            ]
+            expected
         );
-        assert_eq!(
-            init_statements(&server(None), Engine::MySql),
-            [
-                "SET SESSION TRANSACTION READ ONLY",
-                "SET SESSION max_execution_time = 30000"
-            ]
-        );
+        assert_eq!(init_statements(&server(None), Engine::MySql), expected);
     }
 
     #[test]
