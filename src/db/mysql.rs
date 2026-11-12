@@ -948,16 +948,18 @@ impl Connection {
         self.show_create("SEQUENCE", schema, name)
     }
 
-    /// On a connection of its own, as [`Self::cancel`] is, so opening every
-    /// table for its statistics never holds the mutex a user's query waits on.
-    /// The side connection is dropped on return.
+    /// The whole read, the database listing a filter needs included, runs on a
+    /// connection of its own, as [`Self::cancel`] does, so neither listing what
+    /// to read nor opening every table for its statistics holds the mutex a
+    /// user's query waits on. The side connection is dropped on return; a
+    /// filter that matches nothing still opens it, to list there.
     pub fn sizes(&self, shown: &Shown) -> Result<Sizes, DbError> {
-        let matched = self.matched(shown)?;
+        let side = self.side_session()?;
+        let matched = side.matched(shown)?;
         let names = matched.as_ref().map(|(names, _)| names.as_slice());
         if names.is_some_and(<[String]>::is_empty) {
             return Ok(Sizes::new());
         }
-        let side = self.side_session()?;
         assemble_sizes(side.internal_query(&sizes_sql(self.engine, names))?)
     }
 
