@@ -19989,6 +19989,10 @@ fn lowering_the_mode_below_the_script_reconnects_and_says_why(cx: &mut TestAppCo
             );
         });
         settle(cx);
+        // The file is checked a moment after it is opened.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        settle(cx);
         let before = generation_of(&workspace, cx, "busy");
         workspace.update(cx, |workspace, cx| {
             workspace.start_import(cx);

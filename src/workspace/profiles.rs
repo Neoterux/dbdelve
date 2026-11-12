@@ -3181,6 +3181,15 @@ enum ProjectChoice {
     New,
 }
 
+/// Whether the profile's startup script, which is not blank, is refused under
+/// `mode`: the same gate a connect applies, asked without opening anything.
+pub(super) fn script_refused(profile: &Profile, mode: Mode) -> bool {
+    let script = &profile.behaviour.startup_script;
+    !script.trim().is_empty()
+        && sql::startup_statements(profile.config.engine(), mode, &profile.confirmed, script)
+            .is_err()
+}
+
 /// Gates the profile's startup script under `mode` and runs it on `connection`,
 /// which is handed back with the statements kept for every session the driver
 /// opens beside it. A blank script returns it untouched. The same call at a
