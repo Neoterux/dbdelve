@@ -656,7 +656,7 @@ impl Workspace {
         self.list_names_for_picker(databases, schemas, window, cx);
     }
 
-    fn names_listed_for_picker(
+    pub(crate) fn names_listed_for_picker(
         &mut self,
         request: u64,
         databases: Option<Result<Databases, DbError>>,
