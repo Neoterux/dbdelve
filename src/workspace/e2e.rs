@@ -11457,6 +11457,15 @@ fn clickhouse_profile(port: u16) -> String {
     )
 }
 
+/// The columns a ClickHouse mock answers a relations read with.
+const RELATION_COLUMNS: [(&str, &str); 5] = [
+    ("schema_name", "String"),
+    ("relation_name", "String"),
+    ("relation_kind", "String"),
+    ("size_bytes", "Nullable(UInt64)"),
+    ("row_estimate", "Nullable(UInt64)"),
+];
+
 /// Answer a ClickHouse mock the way a server holding `analytics` and
 /// `dbdelve_dev` does: one table in each, and those two as the databases the
 /// tree draws. A read that names `dbdelve_dev` alone gets that one's table
@@ -11464,13 +11473,7 @@ fn clickhouse_profile(port: u16) -> String {
 fn route_clickhouse_catalog(mock: &crate::db::clickhouse_mock::Mock) {
     use crate::db::clickhouse_mock::Response;
 
-    let relations = [
-        ("schema_name", "String"),
-        ("relation_name", "String"),
-        ("relation_kind", "String"),
-        ("size_bytes", "Nullable(UInt64)"),
-        ("row_estimate", "Nullable(UInt64)"),
-    ];
+    let relations = RELATION_COLUMNS;
     let listing = [("name", "String"), ("is_current", "UInt8")];
     mock.on_statement(
         "relation_kind",
@@ -11743,6 +11746,122 @@ fn a_filter_saved_while_an_agent_call_runs_leaves_that_call_on_its_filter_and_th
         );
         workspace.update(cx, |workspace, _| workspace.agent.opener = None);
         *AGENT_MOCK.lock().expect("no one holds the mock") = None;
+        quit(workspace, cx);
+    });
+}
+
+/// `clicks` connected in front, its filter picker open on it with `nomatch*`
+/// typed into the database patterns and its databases listed.
+fn clicks_with_a_pattern_typed(
+    cx: &mut TestAppContext,
+) -> (
+    crate::db::clickhouse_mock::Mock,
+    Entity<Workspace>,
+    &mut VisualTestContext,
+) {
+    use super::filter_picker::Listing;
+
+    let (mock, workspace, cx) = launch_beside_a_clickhouse_mock(cx);
+    cx.executor().allow_parking();
+    connect_clicks(&workspace, cx);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_filter_picker("clicks", window, cx);
+    });
+    drive_until(cx, |cx| {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .filter_picker
+                .as_ref()
+                .is_some_and(|picker| matches!(picker.databases.listing, Listing::Loaded(_)))
+        })
+    });
+    settle(cx);
+    click_selector(cx, "filter-picker-patterns-databases");
+    cx.simulate_input("nomatch*");
+    settle(cx);
+    (mock, workspace, cx)
+}
+
+/// Start the first catalog read of `clicks` as a connect leaves it, and save
+/// the picker's filter in the same update.
+///
+/// No response is held: `spawn_blocking` runs each read inline on this thread
+/// inside `run_until_parked`, so a held one could never be released. The read
+/// is under way because it was started here and the scheduler has not run
+/// since, which the assert at the save shows.
+fn save_the_filter_during_the_first_read(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    during: impl FnOnce(&mut Workspace, &mut gpui::Window, &mut gpui::Context<Workspace>),
+) {
+    let (generation, _) = clicks_connection(workspace, cx);
+    workspace.update_in(cx, |workspace, window, cx| {
+        let profile = workspace.profile_mut().expect("clicks is in front");
+        profile.catalog = CatalogState::Loading;
+        workspace.load_catalog("clicks", generation, cx);
+        workspace.save_filter(cx);
+        let profile = workspace.profile().expect("clicks is in front");
+        assert_eq!(profile.include.databases, ["nomatch*"]);
+        assert!(profile.reread_after_load, "it waits for the read under way");
+        during(workspace, window, cx);
+    });
+}
+
+#[gpui::test]
+fn a_filter_saved_while_the_first_catalog_read_runs_is_not_left_waiting_when_that_read_fails(
+    cx: &mut TestAppContext,
+) {
+    use crate::db::clickhouse_mock::Response;
+
+    store::tests::with_home(|| {
+        let (mock, workspace, cx) = clicks_with_a_pattern_typed(cx);
+        mock.on_statement(
+            "relation_kind",
+            [
+                Response::error(500, 241, "MEMORY_LIMIT_EXCEEDED", "Memory limit exceeded"),
+                Response::rows(
+                    &RELATION_COLUMNS,
+                    &[&["dbdelve_dev", "orders", "table", "\\N", "\\N"]],
+                ),
+            ],
+        );
+        save_the_filter_during_the_first_read(&workspace, cx, |_, _, _| {});
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("clicks is in front");
+            assert!(
+                matches!(profile.catalog, CatalogState::Failed(_)),
+                "the first read failed"
+            );
+            assert!(
+                !profile.reread_after_load,
+                "a read that stored no catalog left the save waiting"
+            );
+        });
+
+        let before = mock.hits("relation_kind");
+        workspace.update(cx, |workspace, cx| workspace.refresh_schema(cx));
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("clicks is in front");
+                matches!(profile.catalog, CatalogState::Loaded(..)) && !profile.refreshing_schema()
+            })
+        });
+        settle(cx);
+        assert_eq!(
+            mock.hits("relation_kind"),
+            before + 1,
+            "the Refresh read once and nothing followed it"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .profile()
+                    .expect("clicks is in front")
+                    .reread_after_load
+            );
+        });
+        assert_eq!(own_catalog(&workspace, cx).0, ["dbdelve_dev"]);
         quit(workspace, cx);
     });
 }
