@@ -667,8 +667,8 @@ impl Workspace {
         );
         behaviour
             .push(ui::option_row("Project", None, self.project_dropdown(cx), t).into_any_element());
-        // The same box for each row that is a whole number of seconds.
-        let seconds_box = |input: &Entity<InputState>| {
+        // The same box for each row that is a whole number of a unit.
+        let number_box = |input: &Entity<InputState>, unit: &'static str| {
             div()
                 .flex()
                 .items_center()
@@ -689,7 +689,7 @@ impl Workspace {
                     div()
                         .text_size(px(layout::chrome(layout::TEXT_SM)))
                         .text_color(t.text_faint)
-                        .child("s"),
+                        .child(unit),
                 )
         };
         // Every engine can stop a statement, and this is the only place a
@@ -698,7 +698,7 @@ impl Workspace {
             ui::option_row(
                 "Statement timeout",
                 None,
-                seconds_box(&form.statement_timeout),
+                number_box(&form.statement_timeout, "s"),
                 t,
             )
             .into_any_element(),
@@ -714,12 +714,26 @@ impl Workspace {
                          between here and the server does not close them. Off when blank."
                             .into(),
                     ),
-                    seconds_box(&form.keep_alive),
+                    number_box(&form.keep_alive, "s"),
                     t,
                 )
                 .into_any_element(),
             );
         }
+        // Every engine's connection can be left unused, so every target draws it.
+        behaviour.push(
+            ui::option_row(
+                "Idle timeout",
+                Some(
+                    "Closes this connection's sessions and the agent's after this long without \
+                     use, never while work is unfinished. Off when blank."
+                        .into(),
+                ),
+                number_box(&form.idle_timeout, "min"),
+                t,
+            )
+            .into_any_element(),
+        );
         // Every target's connect runs the loads this chooses among.
         let depths = Depth::ALL.into_iter().enumerate().map(|(index, depth)| {
             ui::segmented_choice(

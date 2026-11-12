@@ -94,6 +94,7 @@ pub(crate) struct ConnectionForm {
     /// only under a target where `Target::keeps_alive`. Kept, not read, under
     /// any other.
     pub(crate) keep_alive: Entity<InputState>,
+    pub(crate) idle_timeout: Entity<InputState>,
     /// Which connect-time loads run, read on save for every target as the
     /// statement timeout is.
     pub(crate) depth: Depth,
@@ -366,6 +367,8 @@ impl ConnectionForm {
         statement_timeout.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
         let keep_alive = cx.new(|cx| InputState::new(window, cx).placeholder("120"));
         keep_alive.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
+        let idle_timeout = cx.new(|cx| InputState::new(window, cx).placeholder("30"));
+        idle_timeout.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
 
         let mut subscriptions = vec![cx.subscribe_in(
             &url,
@@ -432,6 +435,7 @@ impl ConnectionForm {
             properties,
             statement_timeout,
             keep_alive,
+            idle_timeout,
             depth: Depth::default(),
             startup_script,
             error: None,
@@ -484,6 +488,17 @@ impl ConnectionForm {
                 cx,
             );
         });
+        form.idle_timeout.update(cx, |input, cx| {
+            input.set_value(
+                profile
+                    .behaviour
+                    .idle_timeout
+                    .map(|minutes| minutes.to_string())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            );
+        });
         // No `form.mode` here: the mode dropdown draws only on a fresh form and
         // `save_profile` has no mode to take, so copying it in was a write
         // nothing ever read. The titlebar picker is where an existing
@@ -531,6 +546,17 @@ impl ConnectionForm {
                 cx,
             );
         });
+        form.idle_timeout.update(cx, |input, cx| {
+            input.set_value(
+                profile
+                    .behaviour
+                    .idle_timeout
+                    .map(|minutes| minutes.to_string())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            );
+        });
         form.mode = starting_mode(Some(profile.mode));
         form.shortcuts = profile.shortcuts.duplicated();
         form.name.update(cx, |input, cx| {
@@ -549,6 +575,7 @@ impl ConnectionForm {
                 false => String::new(),
             },
             keep_alive: typed_keep_alive(self.target(), &self.keep_alive.read(cx).value())?,
+            idle_timeout: typed_idle_timeout(&self.idle_timeout.read(cx).value())?,
         })
     }
 
@@ -1167,6 +1194,21 @@ fn typed_keep_alive(target: Target, text: &str) -> Result<Option<u32>, String> {
         _ => Err(format!(
             "Keep-alive must be a whole number of seconds, {MIN_KEEP_ALIVE} or more."
         )),
+    }
+}
+
+/// What the Idle timeout row says. Blank and 0 are off; anything else is whole
+/// minutes, and one that is not is the form's error. Read for every target,
+/// since every engine's connection can be left unused.
+fn typed_idle_timeout(text: &str) -> Result<Option<u32>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<u32>() {
+        Ok(0) => Ok(None),
+        Ok(minutes) => Ok(Some(minutes)),
+        Err(_) => Err("Idle timeout must be a whole number of minutes.".to_string()),
     }
 }
 

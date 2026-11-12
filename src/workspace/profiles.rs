@@ -289,8 +289,13 @@ impl Workspace {
                 keep_alive: stored
                     .keep_alive_seconds
                     .filter(|&seconds| keeps_alive && seconds >= MIN_KEEP_ALIVE),
+                // Every engine can be left idle; a 0 is the form's way of
+                // saying off, and a file can say it too.
+                idle_timeout: stored.idle_timeout_minutes.filter(|&minutes| minutes >= 1),
             },
             keep_alive_task: None,
+            last_activity: cx.background_executor().now(),
+            idle_task: None,
             confirmed: stored
                 .confirmed
                 .iter()
@@ -376,6 +381,8 @@ impl Workspace {
             // The form's value is applied by `save_form` once this returns.
             behaviour: Behaviour::default(),
             keep_alive_task: None,
+            last_activity: cx.background_executor().now(),
+            idle_task: None,
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
@@ -913,12 +920,18 @@ impl Workspace {
         let depth_changed = profile.behaviour.depth != behaviour.depth;
         let script_changed = profile.behaviour.startup_script != behaviour.startup_script;
         let keep_alive_changed = profile.behaviour.keep_alive != behaviour.keep_alive;
+        let idle_changed = profile.behaviour.idle_timeout != behaviour.idle_timeout;
         profile.behaviour = behaviour;
         self.remember_profiles(cx);
         if keep_alive_changed {
             // A new interval counts from now and a cleared one drops the timer;
             // neither touches the connection.
             self.arm_keep_alive(id, cx);
+        }
+        if idle_changed {
+            // Counted from the last use, so a longer timeout is not cut short
+            // by one that was shorter, and a cleared one drops the timer.
+            self.arm_idle(id, cx);
         }
         let profile = &mut self.profiles[index];
         if profile.connection().is_none() {
@@ -1444,6 +1457,40 @@ impl Workspace {
         })
     }
 
+    /// What closing a profile's connection changes in the profile itself, shared
+    /// by [`Self::disconnect`] and the idle close: the sessions go, an open
+    /// transaction with them, and every answer issued to the old generation
+    /// lands on one that is no longer the profile's and is dropped. Tabs and
+    /// buffers stay. Answers whether an open transaction was rolled back, which
+    /// only a disconnect the user asked for can meet.
+    pub(super) fn close_sessions(&mut self, index: usize) -> bool {
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let Some(profile) = self.profiles.get_mut(index) else {
+            return false;
+        };
+        let rolled_back = profile.in_transaction && profile.connection().is_some();
+        tracing::info!(
+            connection = crate::logging::connection_number(&profile.id),
+            engine = profile.config.target().label(),
+            was_connected = profile.connection().is_some(),
+            rolled_back,
+            "disconnected"
+        );
+        profile.generation = generation;
+        profile.drop_sessions();
+        profile.keep_alive_task = None;
+        profile.idle_task = None;
+        profile.state = ProfileState::Idle;
+        profile.in_transaction = false;
+        profile.transaction_statements.clear();
+        profile.session.auto_after_end = None;
+        profile.session_changed = false;
+        profile.session.clear_prompts();
+        mark_rows_stale(profile);
+        rolled_back
+    }
+
     /// Closes the connection in front and leads to the welcome surface. Its
     /// tabs and buffers stay for the next time it is picked, the rows on them
     /// stale; what goes is the session, and with it an open transaction.
@@ -1503,31 +1550,13 @@ impl Workspace {
             self.stop_run(Tab::Object(object), cx);
             self.cancel_count(object, cx);
         }
-        // A connect still on its way, and every answer issued to this one,
-        // land on a generation that is no longer the profile's and are dropped.
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        let Some(profile) = self.profile_mut() else {
+        let Some(index) = self.active else {
             return;
         };
-        let rolled_back = profile.in_transaction && profile.connection().is_some();
-        tracing::info!(
-            connection = crate::logging::connection_number(&profile.id),
-            engine = profile.config.target().label(),
-            was_connected = profile.connection().is_some(),
-            rolled_back,
-            "disconnected"
-        );
-        profile.generation = generation;
-        profile.drop_sessions();
-        profile.keep_alive_task = None;
-        profile.state = ProfileState::Idle;
-        profile.in_transaction = false;
-        profile.transaction_statements.clear();
-        profile.session.auto_after_end = None;
-        profile.session_changed = false;
-        profile.session.clear_prompts();
-        mark_rows_stale(profile);
+        let rolled_back = self.close_sessions(index);
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
         let name = profile.name.clone();
         self.active = None;
         self.remember_profiles(cx);
@@ -2014,6 +2043,7 @@ impl Workspace {
         profile.generation = generation;
         profile.drop_sessions();
         profile.keep_alive_task = None;
+        profile.idle_task = None;
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
         profile.transaction_statements.clear();
@@ -2169,7 +2199,9 @@ impl Workspace {
                     if unpicked.is_some() {
                         workspace.remember_profiles(cx);
                     }
+                    workspace.mark_activity(&id, cx);
                     workspace.arm_keep_alive(&id, cx);
+                    workspace.arm_idle(&id, cx);
                     workspace.load_catalog(&id, generation, cx);
                     workspace.load_import_columns(&id, cx);
                     workspace.reload_front_object(&id, cx);

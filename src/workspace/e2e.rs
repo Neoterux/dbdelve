@@ -20719,7 +20719,7 @@ fn idle_armed(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &st
 /// The app on one agent-visible SQLite profile `Orders`, connected, with
 /// `SELECT 1` typed and not run, and the agent's lane holding a connection of
 /// its own after one answered read.
-fn idle_orders<'a>(cx: &'a mut TestAppContext) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+fn idle_orders(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
     let (workspace, cx) = launch_with_profiles(
         cx,
         &sqlite_profile("orders", "Orders", "agent_visible = true"),

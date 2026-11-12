@@ -13,11 +13,11 @@
 
 use std::time::Duration;
 
-use gpui::Context;
+use gpui::{App, Context};
 
 use super::{Workspace, spawn_blocking};
 use crate::db::{Connection, DbError};
-use crate::session::ProfileState;
+use crate::session::{Profile, ProfileState};
 
 impl Workspace {
     /// Set the profile's keep-alive timer from its interval, replacing the one
@@ -115,4 +115,126 @@ impl Workspace {
             }
         }
     }
+
+    /// The user did something on this profile: the idle clock counts from now.
+    /// Nothing else is done, and the timer is not re-armed per event: when it
+    /// wakes it finds the moved deadline itself ([`Self::idle_due`]). Called for
+    /// the user's own work only, never for an agent call or a keep-alive ping,
+    /// which would hold an unattended connection open for ever.
+    pub(crate) fn mark_activity(&mut self, id: &str, cx: &App) {
+        let now = cx.background_executor().now();
+        if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
+            profile.last_activity = now;
+        }
+    }
+
+    /// Set the profile's idle timer from its timeout, replacing the one there:
+    /// it sleeps until the timeout after the last use, and a cleared timeout or
+    /// a profile with no connection drops it.
+    pub(crate) fn arm_idle(&mut self, id: &str, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
+            return;
+        };
+        let wait = idle_timeout(profile)
+            .map(|timeout| (profile.last_activity + timeout).saturating_duration_since(now));
+        self.arm_idle_after(id, wait, cx);
+    }
+
+    /// Sleep for `wait`, then check whether the profile is due to close; no
+    /// wait is no timer. Kept apart from [`Self::arm_idle`] because a wait
+    /// counted from the last use is already over once that is past, and a
+    /// re-arm that counted it again would fire at once, for ever.
+    fn arm_idle_after(&mut self, id: &str, wait: Option<Duration>, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) else {
+            return;
+        };
+        let generation = profile.generation;
+        let wait = wait.filter(|_| matches!(profile.state, ProfileState::Connected(_)));
+        profile.idle_task = wait.map(|wait| {
+            let id = id.to_string();
+            cx.spawn(async move |workspace, cx| {
+                cx.background_executor().timer(wait).await;
+                _ = workspace.update(cx, |workspace, cx| workspace.idle_due(&id, generation, cx));
+            })
+        });
+    }
+
+    /// The wait is over. A profile used since the timer was set is waited on
+    /// for the remainder, one with work unfinished for a whole timeout more,
+    /// and any other is closed.
+    pub(crate) fn idle_due(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id && profile.generation == generation)
+        else {
+            return;
+        };
+        let profile = &self.profiles[index];
+        let Some(timeout) = idle_timeout(profile) else {
+            self.profiles[index].idle_task = None;
+            return;
+        };
+        let deadline = profile.last_activity + timeout;
+        if now < deadline {
+            self.arm_idle_after(id, Some(deadline - now), cx);
+        } else if self.idle_blocked(index, cx) {
+            self.arm_idle_after(id, Some(timeout), cx);
+        } else {
+            self.close_idle(index, cx);
+        }
+    }
+
+    /// Whether the profile has something unfinished that closing would lose or
+    /// roll back, front or not. Asked at the deadline, so none of it is watched
+    /// for in between.
+    fn idle_blocked(&self, index: usize, _cx: &App) -> bool {
+        let Some(profile) = self.profiles.get(index) else {
+            return false;
+        };
+        // A call under way would put its connection back in the lane after it
+        // was dropped; one waiting would open a new one beside the close.
+        self.agent
+            .lanes
+            .get(&profile.id)
+            .is_some_and(|lane| lane.running.is_some() || !lane.waiting.is_empty())
+    }
+
+    /// Close the profile's sessions and the agent's cached connection to it.
+    /// Its tabs and buffers stay, and so does its place in front: the profile
+    /// is the same one with its connection gone, which the user reopens by
+    /// using it, so it says why instead of going quiet.
+    fn close_idle(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(minutes) = self
+            .profiles
+            .get(index)
+            .and_then(|profile| profile.behaviour.idle_timeout)
+        else {
+            return;
+        };
+        self.close_sessions(index);
+        let Some(profile) = self.profiles.get_mut(index) else {
+            return;
+        };
+        let id = profile.id.clone();
+        profile.session.notice = Some(format!(
+            "Disconnected after {minutes} {} without use.",
+            if minutes == 1 { "minute" } else { "minutes" }
+        ));
+        // Sessions first, then the lane: nothing of the agent's stays open on
+        // the server, and its next call opens one through the lane as ever.
+        self.agent.lanes.remove(&id);
+        self.rebuild_connections(cx);
+        cx.notify();
+    }
+}
+
+/// How long the profile may sit unused before it closes; `None` is never.
+fn idle_timeout(profile: &Profile) -> Option<Duration> {
+    profile
+        .behaviour
+        .idle_timeout
+        .map(|minutes| Duration::from_secs(u64::from(minutes) * 60))
 }
