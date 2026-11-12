@@ -234,6 +234,7 @@ What a change should pass locally:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test                      # unit tests; no database needed
+cargo clippy --all-targets --features uat -- -D warnings   # the UAT driver
 ```
 
 The `live_` tests are `#[ignore]`d and read their connection settings from the
@@ -245,6 +246,17 @@ split off the timing tests and the vendored renderer's tests.
 `src/workspace/e2e.rs` launches the app headless and drives it through the
 real keymap and focus path, so a change to keyboard or focus behaviour adds a
 test there. Its gotchas are in `docs/agents/session.md`.
+
+**Every UI change is driven in the real window before a person is asked to
+check it.** Build with `--features uat`, operate the change through `dbdelve
+drive` against the compose databases, confirm in the database whatever it
+writes, and report what the window showed (`docs/agents/uat-driver.md`). So
+the driver can always reach it, a new control, dialog or status text either
+paints its label as text or carries a `debug_selector`; a UI change the driver
+cannot operate is not finished. A manual UAT item goes to a person only for
+what the driver cannot judge: look and feel, OS-level input (window focus, the
+first click into an inactive window, drags between windows), and credentials
+the agent does not have.
 
 ## Platforms
 
@@ -347,6 +359,9 @@ Read the file a task touches before changing that area:
 - `docs/agents/plugins.md`: **plugins and the ODBC bridge**: the protocol,
   the manifest and discovery, stop vs drain, cancel and resets, the bridge's
   ODBC decisions, and what a plugin connection may not do.
+- `docs/agents/uat-driver.md`: **operating the real window from a shell**:
+  the `uat` build, `dbdelve drive` commands, and running a manual UAT
+  checkpoint without a person at the keyboard.
 - `docs/agents/shipping.md`: **bundling and releasing**: `dev/bundle.sh`, the
   dev and release variants, signing and the Keychain, where the ODBC bridge
   lands in each artifact, and cutting a release.

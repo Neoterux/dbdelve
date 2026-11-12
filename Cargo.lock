@@ -2130,6 +2130,7 @@ dependencies = [
  "icondata_core",
  "icondata_lu",
  "icondata_si",
+ "image",
  "insta",
  "jsonc-parser",
  "keyring",
@@ -3716,6 +3717,7 @@ dependencies = [
  "gpui-pre-linux",
  "gpui-pre-macos",
  "gpui-pre-web",
+ "gpui-pre-wgpu",
  "gpui-pre-windows",
 ]
 

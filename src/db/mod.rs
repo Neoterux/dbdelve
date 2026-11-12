@@ -59,7 +59,7 @@ pub use spec::{
     Truncate, TypedExplain,
 };
 pub use spec::{IdentityInsert, ReadOnlySession, UnreadableFloor};
-pub use target::{Driver, Target, cancel_cost, is_cancel};
+pub use target::{Driver, Levels, Target, cancel_cost, is_cancel};
 
 /// One run's claim on Cancel: [`Connection::query`] runs under it, and
 /// [`Connection::cancel`] stops only what ran under it.
@@ -116,6 +116,60 @@ impl CancelToken {
         running.asked = true;
         Some(connections)
     }
+}
+
+/// An error from putting a bound tab's database and schema back, which is
+/// dbdelve's own call and not the user's statement: no byte of their text is
+/// where it points, and it says nothing was sent.
+fn unplaced(error: DbError) -> DbError {
+    DbError {
+        message: format!(
+            "The statement was not sent: its tab's database and schema could not be set again. {}",
+            error.message
+        ),
+        position: None,
+    }
+}
+
+/// Runs `run`, handed a `held` for the statement to ask once it holds
+/// `connection`: `true` makes `connection` the one a Cancel on `cancel` (made
+/// by [`CancelToken::alongside`]) stops, `false` says the Cancel came first
+/// and the statement is dropped unsent. The connection is let go of when `run`
+/// ends.
+///
+/// A connection that is shared becomes the run's to stop only once this
+/// statement holds it; until then a Cancel just marks the run, and the
+/// statement is dropped unsent when its turn comes.
+// ponytail: it is let go of just after the connection is, so a Cancel in
+// between reaches whatever took the connection next. Closing that gap needs
+// the engine to clear it under its own lock.
+fn running_on<T>(
+    cancel: &CancelToken,
+    connection: &Connection,
+    run: impl FnOnce(&dyn Fn() -> bool) -> T,
+) -> T {
+    let slot = std::cell::Cell::new(None);
+    let hold = || {
+        let mut running = cancel
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if running.asked {
+            return false;
+        }
+        let alongside = running.alongside.get_or_insert_default();
+        alongside.push(Some(connection.clone()));
+        slot.set(Some(alongside.len() - 1));
+        true
+    };
+    let result = run(&hold);
+    if let Some(slot) = slot.get()
+        && let Ok(mut running) = cancel.0.lock()
+        && let Some(alongside) = &mut running.alongside
+    {
+        alongside[slot] = None;
+    }
+    result
 }
 
 /// Which engine a profile talks to.
@@ -546,6 +600,36 @@ impl Engine {
             // transaction (Db2 has no such statement), so none is driven.
             Self::Generic => None,
         }
+    }
+
+    /// Whether a `BEGIN` sent inside an open transaction commits it first.
+    ///
+    /// MySQL and MariaDB do: `START TRANSACTION` implicitly commits the
+    /// current transaction. Postgres warns and keeps the open one, Snowflake
+    /// ignores the second, SQL Server only raises its nesting count, and
+    /// SQLite, Turso and DuckDB refuse the `BEGIN`. Answering `false` where
+    /// unsure keeps statements listed rather than dropping them, which is the
+    /// safe side for the list of what the next `COMMIT` ends.
+    pub fn begin_ends_open_transaction(self) -> bool {
+        matches!(self, Self::MySql | Self::MariaDb)
+    }
+
+    /// Whether a `COMMIT` or `ROLLBACK` that failed with `message` left the
+    /// transaction open on the session, so a profile that read it as ended
+    /// should read it as open again.
+    ///
+    /// Only SQLite is known to: a `COMMIT` that meets `SQLITE_BUSY` or a
+    /// deferred foreign key keeps the transaction for a retry, unless the
+    /// failure is that none was active. Postgres, MySQL and DuckDB roll back
+    /// a transaction whose `COMMIT` fails, and for the others it is not
+    /// known. `false` is the safe answer: a profile reading "open" over a
+    /// session that is not offers a Roll Back for work already committed, and
+    /// cannot be cleared by a `COMMIT` that has nothing to end.
+    pub fn failed_end_keeps_transaction(self, message: &str) -> bool {
+        self == Self::Sqlite
+            && !message
+                .to_ascii_lowercase()
+                .contains("no transaction is active")
     }
 
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
@@ -1962,6 +2046,101 @@ impl Connection {
         }
     }
 
+    /// [`Connection::query`] on a session opened for a database
+    /// ([`Connection::on_database`]), for a tab bound to it: the session is put
+    /// back on the database it was opened for, and on `schema` where the
+    /// engine picks one, in the same acquisition of its lock as the statement.
+    /// Two tabs bound to different schemas of one database share a session,
+    /// and apply and run as two acquisitions would let one run in the other's
+    /// schema. The statement itself is never touched; the binding is applied
+    /// through the driver's own calls and no text of the user's carries it.
+    ///
+    /// Postgres, DuckDB, MySQL, MariaDB, Redis and ClickHouse apply it;
+    /// Snowflake sends the schema with the request. SQL Server and MongoDB run
+    /// the statement as [`Connection::query`] does: the first moves a session
+    /// a `USE` moved back before it returns (`held_to_database`), the second's
+    /// database is fixed for the session.
+    ///
+    /// `cancel` is made by [`CancelToken::alongside`]: a Cancel on it stops
+    /// this session only while this statement is what it is running, and a
+    /// statement still waiting behind another tab's is dropped unsent instead
+    /// of stopping that one.
+    pub fn query_bound(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        cancel: &CancelToken,
+        fetch: Fetch,
+    ) -> Result<QueryResult, DbError> {
+        running_on(cancel, self, |held| {
+            // SQL Server queues its own statements and counts a Cancel
+            // against that queue, so it is the connection that stops them;
+            // it only has to be told which one is running.
+            if matches!(self, Self::SqlServer(_)) && !held() {
+                return Err(plain_error("Cancelled before it was sent.".into()));
+            }
+            let fetch = Fetch {
+                held: Some(held),
+                ..fetch
+            };
+            match self {
+                Self::Postgres(connection) => connection.query_bound(schema, sql, fetch),
+                Self::MySql(connection) => connection.query_bound(sql, fetch),
+                Self::DuckDb(connection) => connection.query_bound(schema, sql, fetch),
+                Self::Redis(connection) => connection.query_bound(sql, fetch),
+                Self::Snowflake(connection) => connection.query_bound(schema, sql, cancel, fetch),
+                Self::ClickHouse(connection) => connection.query_bound(sql, cancel, fetch),
+                _ => self.query(sql, cancel, fetch),
+            }
+        })
+    }
+
+    /// [`Connection::generated`] for a tab bound to this session's database:
+    /// where that is [`Connection::query`] (Postgres, MySQL, MariaDB and
+    /// DuckDB) it is [`Connection::query_bound`], and Redis's is put back on
+    /// its database too. For every other engine nothing needs putting back: a
+    /// ClickHouse statement of dbdelve's goes out without the session and
+    /// names the database, a Snowflake request carries its database and is
+    /// sent no schema, a MongoDB statement names the database it reads, and
+    /// SQL Server moves a session a `USE` moved back before any run returns.
+    /// An edit applied from a bound tab's grid writes to the database the rows
+    /// came from, whichever way the session has been moved since.
+    pub fn generated_bound(
+        &self,
+        schema: Option<&str>,
+        sql: &str,
+        cancel: &CancelToken,
+        feed: Option<&Feed>,
+        limit: Option<usize>,
+    ) -> Result<QueryResult, DbError> {
+        match self {
+            Self::Postgres(_) | Self::MySql(_) | Self::DuckDb(_) => self.query_bound(
+                schema,
+                sql,
+                cancel,
+                Fetch {
+                    feed,
+                    limit,
+                    ..Fetch::default()
+                },
+            ),
+            // Registered in the token as `query_bound` does, or a Cancel on a
+            // bound run finds nothing to stop.
+            Self::Redis(connection) => running_on(cancel, self, |held| {
+                connection.generated_bound(
+                    sql,
+                    Fetch {
+                        feed,
+                        limit,
+                        held: Some(held),
+                        ..Fetch::default()
+                    },
+                )
+            }),
+            _ => self.generated(sql, cancel, feed, limit),
+        }
+    }
+
     /// [`Connection::query`] on a connection of its own, opened the way this
     /// one was (its tunnel and side session shared), so the statement runs
     /// beside whatever this one is running rather than queued behind it, and
@@ -2008,45 +2187,18 @@ impl Connection {
             }
             Err(_) => (self.clone(), true),
         };
-        let slot = std::cell::Cell::new(None);
-        // A shared connection becomes the run's to stop only once this
-        // statement holds it; until then a Cancel just marks the run, and
-        // the statement is dropped unsent when its turn comes.
-        // ponytail: it is let go of just after the connection is, so a Cancel
-        // in between reaches whatever took the connection next. Closing that
-        // gap needs the engine to clear it under its own lock.
-        let hold = || {
-            let mut running = cancel
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if running.asked {
-                return false;
-            }
-            let alongside = running.alongside.get_or_insert_default();
-            alongside.push(Some(connection.clone()));
-            slot.set(Some(alongside.len() - 1));
-            true
-        };
-        let result = match shared {
+        running_on(cancel, &connection, |hold| match shared {
             true => connection.query(
                 sql,
                 cancel,
                 Fetch {
-                    held: Some(&hold),
+                    held: Some(hold),
                     ..fetch
                 },
             ),
             false if hold() => connection.query(sql, cancel, fetch),
             false => Err(plain_error("Cancelled before it was sent.".into())),
-        };
-        if let Some(slot) = slot.get()
-            && let Ok(mut running) = cancel.0.lock()
-            && let Some(alongside) = &mut running.alongside
-        {
-            alongside[slot] = None;
-        }
-        result
+        })
     }
 
     /// A session of its own for an import, opened the way this one was, so a
@@ -2066,6 +2218,29 @@ impl Connection {
             Self::DuckDb(connection) => connection.alongside().map(Self::DuckDb),
             Self::Redis(connection) => connection.alongside().map(Self::Redis),
             Self::External(connection) => connection.apart().map(Self::External),
+        }
+    }
+
+    /// A session for the (connection, `database`) pair, which the connections
+    /// tree reads that database's catalog over and a tab bound to it will run
+    /// on. Built from this live connection -- its resolved password and its
+    /// tunnel -- and never from the profile's config, and sharing no mutable
+    /// state with it: moving the session's database moves nothing here. It
+    /// carries no read-only hold of its own; the caller applies it before the
+    /// session is stored (`set_read_only`).
+    pub fn on_database(&self, database: &str) -> Result<Self, DbError> {
+        match self {
+            Self::DuckDb(connection) => connection.on_database(database).map(Self::DuckDb),
+            Self::MySql(connection) => connection.on_database(database).map(Self::MySql),
+            Self::Redis(connection) => connection.on_database(database).map(Self::Redis),
+            Self::Snowflake(connection) => Ok(Self::Snowflake(connection.on_database(database))),
+            Self::MongoDb(connection) => Ok(Self::MongoDb(connection.on_database(database))),
+            Self::Postgres(connection) => connection.on_database(database).map(Self::Postgres),
+            Self::SqlServer(connection) => connection.on_database(database).map(Self::SqlServer),
+            Self::ClickHouse(connection) => connection.on_database(database).map(Self::ClickHouse),
+            Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Err(plain_error(
+                "This connection has no other database to open a session on.".into(),
+            )),
         }
     }
 
@@ -2183,17 +2358,38 @@ impl Connection {
         }
     }
 
-    /// The stored functions and procedures, as a catalog holding nothing else,
-    /// for [`Catalog::merge`] to fold into the one already on screen.
+    /// The stored functions and procedures, and the sequences of an engine
+    /// that lists them, as a catalog holding nothing else, for
+    /// [`Catalog::merge`] to fold into the one already on screen.
     pub fn routines(&self) -> Result<Catalog, DbError> {
         match self {
-            Self::Postgres(connection) => connection.routines(),
-            Self::MySql(connection) => connection.routines(),
-            Self::SqlServer(connection) => connection.routines(),
+            Self::Postgres(connection) => {
+                with_sequences(Engine::Postgres, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
+            Self::MySql(connection) => {
+                with_sequences(connection.engine(), connection.routines(), || {
+                    connection.sequences()
+                })
+            }
+            Self::SqlServer(connection) => {
+                with_sequences(Engine::SqlServer, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::Sqlite(connection) => connection.routines(),
             Self::Turso(connection) => connection.routines(),
-            Self::DuckDb(connection) => connection.routines(),
-            Self::Snowflake(connection) => connection.routines(),
+            Self::DuckDb(connection) => {
+                with_sequences(Engine::DuckDb, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
+            Self::Snowflake(connection) => {
+                with_sequences(Engine::Snowflake, connection.routines(), || {
+                    connection.sequences()
+                })
+            }
             Self::ClickHouse(_) => Ok(Catalog::default()),
             Self::MongoDb(connection) => connection.routines(),
             Self::Redis(_) | Self::External(_) => Ok(Catalog::default()),
@@ -2374,6 +2570,28 @@ impl Connection {
             Self::Redis(connection) => connection.ddl(schema, relation),
             Self::External(_) => Err(plain_error(
                 "Copy DDL is not offered through a plugin driver.".into(),
+            )),
+        }
+    }
+
+    /// The statement that would create the sequence `schema.name`, for
+    /// reading: nothing dbdelve does runs it, and no current value is read.
+    /// Apart from [`Self::ddl`], which takes a [`RelationKind`] a sequence is
+    /// not.
+    pub fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(connection) => connection.sequence_ddl(schema, name),
+            Self::MySql(connection) => connection.sequence_ddl(schema, name),
+            Self::SqlServer(connection) => connection.sequence_ddl(schema, name),
+            Self::DuckDb(connection) => connection.sequence_ddl(schema, name),
+            Self::Snowflake(connection) => connection.sequence_ddl(schema, name),
+            Self::Sqlite(_)
+            | Self::Turso(_)
+            | Self::ClickHouse(_)
+            | Self::MongoDb(_)
+            | Self::Redis(_)
+            | Self::External(_) => Err(plain_error(
+                "This connection lists no sequences to show a definition of.".into(),
             )),
         }
     }
@@ -2824,6 +3042,9 @@ pub struct Schema {
     pub name: String,
     pub relations: Vec<Relation>,
     pub routines: Vec<Routine>,
+    /// Names only, in the server's order. Read in the catalog's second half
+    /// with the routines, so [`Connection::catalog`] never carries any.
+    pub sequences: Vec<String>,
 }
 
 /// What a connection did with a picked database or schema that was not there
@@ -2873,8 +3094,9 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Fold a later half into this one: the routines of a schema already here
-    /// join it, and a schema that holds only routines is added in its place.
+    /// Fold a later half into this one: the routines and sequences of a schema
+    /// already here join it, and a schema that holds only those is added in its
+    /// place.
     ///
     /// Assembled by name rather than by position, because the two halves are
     /// separate queries and a schema can appear in either alone -- one holding
@@ -2891,7 +3113,26 @@ impl Catalog {
                 .iter_mut()
                 .find(|existing| existing.name == schema.name)
             {
-                Some(existing) => existing.routines = schema.routines,
+                Some(existing) => {
+                    existing.routines = schema.routines;
+                    existing.sequences = schema.sequences;
+                }
+                None => self.schemas.push(schema),
+            }
+        }
+    }
+
+    /// Put each schema's sequences on the schema of that name here, pushing a
+    /// schema it does not hold, so [`Self::merge`] later brings in one that
+    /// holds only sequences.
+    pub fn join_sequences(&mut self, sequences: Self) {
+        for schema in sequences.schemas {
+            match self
+                .schemas
+                .iter_mut()
+                .find(|existing| existing.name == schema.name)
+            {
+                Some(existing) => existing.sequences = schema.sequences,
                 None => self.schemas.push(schema),
             }
         }
@@ -3451,6 +3692,50 @@ impl std::fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+/// The second half of the catalog: the routines, with the sequences joined
+/// in where the engine lists them.
+///
+/// A failed sequence read lists none and keeps the routines. The catalogs that
+/// hold sequences are readable by every role on every engine that lists them,
+/// so what fails is a server that has none (SQL Server before 2012 has no
+/// `sys.sequences`), and an empty list is then the true one.
+fn with_sequences(
+    engine: Engine,
+    routines: Result<Catalog, DbError>,
+    sequences: impl FnOnce() -> Result<Catalog, DbError>,
+) -> Result<Catalog, DbError> {
+    let mut second = routines?;
+    if Target::built_in(engine).abilities().lists_sequences
+        && let Ok(sequences) = sequences()
+    {
+        second.join_sequences(sequences);
+    }
+    Ok(second)
+}
+
+/// Sequence rows, `schema_name` and `sequence_name`, grouped by schema in the
+/// order the server gave them, as a catalog holding nothing else.
+pub(super) fn assemble_sequences(result: QueryResult) -> Result<Catalog, DbError> {
+    let mut schemas = Vec::<Schema>::new();
+    for row in &result.rows {
+        let schema_name = required_cell(&result, row, "schema_name")?;
+        let name = required_cell(&result, row, "sequence_name")?.to_string();
+        match schemas.last_mut() {
+            Some(last) if last.name == schema_name => last.sequences.push(name),
+            _ => schemas.push(Schema {
+                name: schema_name.to_string(),
+                relations: Vec::new(),
+                routines: Vec::new(),
+                sequences: vec![name],
+            }),
+        }
+    }
+    Ok(Catalog {
+        schemas,
+        database: None,
+    })
+}
+
 pub(super) fn assemble_catalog(
     relations: QueryResult,
     routines: QueryResult,
@@ -3705,6 +3990,7 @@ fn schema<'a>(
         name: name.to_string(),
         relations: Vec::new(),
         routines: Vec::new(),
+        sequences: Vec::new(),
     })
 }
 
@@ -4126,6 +4412,49 @@ pub(super) fn fill_placeholders(template: &str, schema: &str, relation: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_mysql_and_mariadb_commit_an_open_transaction_at_a_begin() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert!(engine.begin_ends_open_transaction(), "{engine:?}");
+        }
+        for engine in [
+            Engine::Postgres,
+            Engine::Sqlite,
+            Engine::Turso,
+            Engine::DuckDb,
+            Engine::SqlServer,
+        ] {
+            assert!(!engine.begin_ends_open_transaction(), "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn only_sqlite_keeps_a_transaction_whose_end_failed_and_not_when_none_was_active() {
+        assert!(Engine::Sqlite.failed_end_keeps_transaction("database is locked"));
+        assert!(
+            !Engine::Sqlite
+                .failed_end_keeps_transaction("cannot commit - no transaction is active")
+        );
+        assert!(
+            !Engine::Sqlite
+                .failed_end_keeps_transaction("cannot rollback - no transaction is active")
+        );
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Turso,
+            Engine::DuckDb,
+            Engine::SqlServer,
+            Engine::Snowflake,
+        ] {
+            assert!(
+                !engine.failed_end_keeps_transaction("could not commit"),
+                "{engine:?}"
+            );
+        }
+    }
 
     #[test]
     fn placeholders_are_filled_in_one_pass() {
@@ -5139,6 +5468,108 @@ mod tests {
         assert_eq!(read_only_statement(Engine::Snowflake, false), None);
     }
 
+    #[test]
+    fn merging_the_second_half_brings_its_sequences_with_its_routines() {
+        let mut screen = Catalog {
+            schemas: vec![schema("main", &["t"], &[])],
+            database: None,
+        };
+        let mut second = schema("main", &[], &["f"]);
+        second.sequences = vec!["s".to_string()];
+        screen.merge(Catalog {
+            schemas: vec![second],
+            database: None,
+        });
+
+        let main = &screen.schemas[0];
+        assert_eq!(main.relations.len(), 1);
+        assert_eq!(main.relations[0].name, "t");
+        assert_eq!(main.routines.len(), 1);
+        assert_eq!(main.routines[0].name, "f");
+        assert_eq!(main.sequences, ["s"]);
+    }
+
+    #[test]
+    fn the_sequences_join_the_routines_where_the_engine_lists_them() {
+        let routines = Ok(Catalog {
+            schemas: vec![schema("main", &[], &["f"])],
+            database: None,
+        });
+        let mut read = schema("main", &[], &[]);
+        read.sequences = vec!["a".to_string(), "b".to_string()];
+        let mut other = schema("other", &[], &[]);
+        other.sequences = vec!["n".to_string()];
+        let second = with_sequences(Engine::DuckDb, routines, || {
+            Ok(Catalog {
+                schemas: vec![read, other],
+                database: None,
+            })
+        })
+        .expect("the second half is read");
+
+        assert_eq!(second.schemas[0].routines.len(), 1);
+        assert_eq!(second.schemas[0].sequences, ["a", "b"]);
+        // A schema holding only sequences is pushed, so it can be listed.
+        assert_eq!(second.schemas[1].name, "other");
+        assert_eq!(second.schemas[1].sequences, ["n"]);
+    }
+
+    #[test]
+    fn a_failed_sequence_read_leaves_the_routines() {
+        let routines = Ok(Catalog {
+            schemas: vec![schema("main", &[], &["f"])],
+            database: None,
+        });
+        let second = with_sequences(Engine::DuckDb, routines, || {
+            Err(plain_error("no sequence catalog".to_string()))
+        })
+        .expect("the routines survive a failed sequence read");
+
+        assert_eq!(second.schemas.len(), 1);
+        assert_eq!(second.schemas[0].routines.len(), 1);
+        assert!(second.schemas[0].sequences.is_empty());
+    }
+
+    #[test]
+    fn sequences_are_read_only_where_the_engine_lists_them() {
+        let routines = Ok(Catalog::default());
+        let second = with_sequences(Engine::Sqlite, routines, || {
+            panic!("SQLite has no sequence catalog to read")
+        })
+        .expect("nothing was read");
+        assert!(second.schemas.is_empty());
+    }
+
+    #[test]
+    fn only_the_engines_that_have_sequences_list_them() {
+        let plugin: &'static plugin::Plugin = Box::leak(Box::new(plugin::Plugin {
+            id: "odbc".into(),
+            name: "ODBC".into(),
+            version: "1".into(),
+            executable: "dbdelve-odbc".into(),
+        }));
+        for engine in Engine::ALL {
+            let lists = matches!(
+                engine,
+                Engine::Postgres
+                    | Engine::SqlServer
+                    | Engine::Snowflake
+                    | Engine::DuckDb
+                    | Engine::MariaDb
+            );
+            assert_eq!(
+                Target::built_in(engine).abilities().lists_sequences,
+                lists,
+                "{engine:?}"
+            );
+            let through_a_plugin = Target {
+                engine,
+                driver: Driver::Plugin(plugin),
+            };
+            assert!(!through_a_plugin.abilities().lists_sequences, "{engine:?}");
+        }
+    }
+
     fn schema(name: &str, relations: &[&str], routines: &[&str]) -> Schema {
         Schema {
             name: name.to_string(),
@@ -5163,6 +5594,7 @@ mod tests {
                     definition: String::new(),
                 })
                 .collect(),
+            sequences: Vec::new(),
         }
     }
 

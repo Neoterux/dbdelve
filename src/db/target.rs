@@ -16,6 +16,32 @@ pub enum Driver {
     Plugin(&'static Plugin),
 }
 
+/// The levels the connections tree draws under a connection, from what the
+/// target's catalog holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Levels {
+    /// No databases to switch between: the schemas, or the objects, sit
+    /// directly under the connection.
+    Flat,
+    /// The catalog lists every database as a schema, so each schema row is a
+    /// database.
+    DatabaseIsSchema,
+    /// A database, then the schemas of that database under it.
+    DatabaseThenSchema,
+    /// A database whose one schema is the database itself, so the one row is
+    /// the database and holds its objects.
+    DatabaseHoldsObjects,
+}
+
+impl Levels {
+    /// Whether the databases of the server other than the connection's own
+    /// are rows of the tree, each opened over a session of its own. Where the
+    /// catalog lists them as schemas it already holds them.
+    pub fn lists_other_databases(self) -> bool {
+        matches!(self, Self::DatabaseThenSchema | Self::DatabaseHoldsObjects)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub engine: Engine,
@@ -218,6 +244,22 @@ impl Target {
     pub fn catalog_is_per_database(self) -> bool {
         let abilities = self.abilities();
         abilities.switches_database && !abilities.catalog_lists_databases
+    }
+
+    /// The levels the connections tree draws under a connection of this
+    /// target, one pure function of its abilities.
+    pub fn levels(self) -> Levels {
+        let abilities = self.abilities();
+        match (
+            abilities.switches_database,
+            abilities.catalog_lists_databases,
+            abilities.one_schema_per_database,
+        ) {
+            (false, ..) => Levels::Flat,
+            (true, true, _) => Levels::DatabaseIsSchema,
+            (true, false, true) => Levels::DatabaseHoldsObjects,
+            (true, false, false) => Levels::DatabaseThenSchema,
+        }
     }
 
     /// Whether the row count the catalog carries for a table is exact rather
@@ -462,6 +504,27 @@ mod tests {
                 assert_eq!(Target::built_in(engine).fields(), engine.fields());
                 assert_ne!(engine.fields(), Fields::ConnectionString, "{engine:?}");
             }
+        }
+    }
+
+    #[test]
+    fn each_target_has_the_levels_its_abilities_give() {
+        for engine in Engine::ALL {
+            let levels = match engine {
+                Engine::Postgres | Engine::SqlServer | Engine::Snowflake | Engine::DuckDb => {
+                    Levels::DatabaseThenSchema
+                }
+                Engine::MySql | Engine::MariaDb | Engine::ClickHouse => Levels::DatabaseIsSchema,
+                Engine::MongoDb | Engine::Redis => Levels::DatabaseHoldsObjects,
+                Engine::Sqlite | Engine::Turso | Engine::Generic => Levels::Flat,
+            };
+            assert_eq!(Target::built_in(engine).levels(), levels, "{engine:?}");
+            // A plugin has none of the abilities whatever dialect it speaks.
+            let plugin = Target {
+                engine,
+                driver: Driver::Plugin(odbc()),
+            };
+            assert_eq!(plugin.levels(), Levels::Flat, "{engine:?}");
         }
     }
 }

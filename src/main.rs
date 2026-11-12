@@ -6,6 +6,9 @@ mod agent;
 mod completion;
 mod connection_form;
 mod db;
+mod diagram;
+#[cfg(feature = "uat")]
+mod drive;
 mod explain;
 mod explorer;
 mod export;
@@ -22,6 +25,7 @@ mod result_grid;
 mod scroller;
 mod session;
 mod settings_panel;
+mod sidebar;
 mod sql;
 #[cfg(test)]
 mod sql_snapshots;
@@ -208,6 +212,10 @@ fn main() {
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
         std::process::exit(agent::shim::run());
     }
+    #[cfg(feature = "uat")]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "drive") {
+        std::process::exit(drive::client(std::env::args().skip(2).collect()));
+    }
     logging::install_panic_log();
     logging::install();
     // Manifests only, ahead of the profiles that name them: no plugin process
@@ -310,11 +318,14 @@ fn main() {
 
             // Root must be the window's first layer or dialog and notification
             // layers panic when they look for it.
-            cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(plugins, window, cx));
-                cx.new(|cx| Root::new(workspace, window, cx))
-            })
-            .expect("failed to open window");
+            let _window = cx
+                .open_window(options, |window, cx| {
+                    let workspace = cx.new(|cx| Workspace::new(plugins, window, cx));
+                    cx.new(|cx| Root::new(workspace, window, cx))
+                })
+                .expect("failed to open window");
+            #[cfg(feature = "uat")]
+            drive::serve_if_asked(_window.into(), cx);
 
             // dbdelve has one window and no way to open a second: with it closed the
             // Dock icon is inert and the menu offers only Quit, which is an
