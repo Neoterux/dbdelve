@@ -2603,6 +2603,56 @@ fn resaving_an_unchanged_filter_leaves_the_file_byte_identical(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn a_save_past_the_cap_keeps_the_first_500_entries_in_the_profile_and_the_file(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        // 500 is `db::include::ENTRIES_CAP`, which is not reachable from here;
+        // the `from_stored` equality below is what ties it to the load path.
+        let patterns: Vec<String> = (0..507).map(|number| format!("zz{number:03}*")).collect();
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace.filter_picker.as_mut().expect("the picker is up");
+            picker.databases.patterns = patterns.clone();
+            cx.notify();
+        });
+        workspace.update(cx, |workspace, cx| workspace.save_filter(cx));
+        settle(cx);
+
+        let profile_include = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profile()
+                .expect("the connection is in front")
+                .include
+                .clone()
+        });
+        assert_eq!(profile_include.databases, patterns[..500]);
+        let saved = store::peek_profiles(&[]).expect("profiles.toml reads back");
+        let saved = saved
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "e2e")
+            .expect("the profile was saved");
+        assert_eq!(saved.include_databases, profile_include.databases);
+        assert_eq!(
+            crate::db::Include::from_stored(
+                saved.include_databases.clone(),
+                saved.include_schemas.clone()
+            ),
+            profile_include,
+            "what the next launch loads is what Save kept"
+        );
+
+        open_the_picker_from_the_menu(&workspace, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert!(!picker.can_save(), "the list is the one saved");
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_long_database_list_scrolls_inside_the_picker(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
