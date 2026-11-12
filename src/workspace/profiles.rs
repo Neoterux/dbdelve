@@ -3398,9 +3398,12 @@ fn stored_session_settings(
     engine: Engine,
 ) -> (Option<String>, Properties, Option<String>) {
     let mut refused = Vec::new();
+    // The check trims, and a hand-edited file can carry whitespace the form
+    // never would: keep the text that was checked, so it is the text sent.
     let time_zone = stored
         .time_zone
-        .clone()
+        .as_deref()
+        .map(|zone| zone.trim().to_string())
         .filter(|_| Target::built_in(engine).takes_time_zone())
         .filter(|zone| match check_time_zone(zone) {
             Ok(()) => true,
