@@ -173,6 +173,14 @@ impl Workspace {
             return;
         };
         let profile = &self.profiles[index];
+        if !matches!(profile.state, ProfileState::Connected(_)) {
+            // A session lost since the timer was set is found and reported on
+            // the next use. Closing it here would replace that report with a
+            // sentence about time, which is not what happened, and would turn a
+            // failed profile into one that reconnects on Run without saying so.
+            self.profiles[index].idle_task = None;
+            return;
+        }
         let Some(timeout) = idle_timeout(profile) else {
             self.profiles[index].idle_task = None;
             return;
