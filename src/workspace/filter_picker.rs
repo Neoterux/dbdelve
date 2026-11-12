@@ -1293,6 +1293,44 @@ mod tests {
         );
     }
 
+    /// The tree draws a schema that holds only a sequence once its routines
+    /// are merged in; the picker's list has to hold it too, or there is no row
+    /// to tick and the total falls short of the connection row's.
+    #[test]
+    fn the_picker_lists_a_schema_that_holds_only_a_sequence_as_the_tree_draws_it() {
+        use crate::db::{
+            CancelToken, Connection, ConnectionConfig, DUCKDB_IN_MEMORY, Engine, Fetch,
+        };
+
+        let connection =
+            Connection::open(ConnectionConfig::duckdb(DUCKDB_IN_MEMORY.to_string(), 0)).unwrap();
+        for statement in [
+            "CREATE TABLE t (id INTEGER)",
+            "CREATE SCHEMA only_seq",
+            "CREATE SEQUENCE only_seq.s",
+        ] {
+            connection
+                .query(statement, &CancelToken::default(), Fetch::default())
+                .unwrap();
+        }
+
+        let (databases, schemas) =
+            read_names_for_picker(connection.clone(), Engine::DuckDb, false, false, true);
+
+        assert!(databases.is_none());
+        let listed = schemas.expect("asked for").expect("should list");
+        let mut drawn = connection.catalog(&Shown::everything()).unwrap();
+        drawn.merge(connection.routines(&Shown::everything()).unwrap());
+        let drawn: Vec<String> = drawn
+            .schemas
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(listed.contains(&"main".to_string()));
+        assert!(listed.contains(&"only_seq".to_string()));
+        assert_eq!(listed, drawn);
+    }
+
     #[test]
     fn only_a_database_then_schema_target_lists_schemas() {
         assert!(lists_schemas(Levels::DatabaseThenSchema));
