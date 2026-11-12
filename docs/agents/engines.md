@@ -872,3 +872,39 @@ Decided, and not to be re-litigated:
   it names a built-in (`EngineSpec::dbms_names`), suggests that dialect, one
   click to take it; a dialect that also has a built-in driver says the built-in
   can edit rows.
+
+## Agent connections
+
+An agent reads through a connection of its own, never the user's. What it
+carries, engine by engine:
+
+- **A statement timeout, always.** `AGENT_TIMEOUT` (30 seconds), or the
+  profile's own when that is lower; a profile with none gets the 30. What it
+  bounds is what `ServerConfig::statement_timeout` says for the engine: on
+  MySQL it bounds only read-only `SELECT`s, which is all an agent sends; SQLite
+  and DuckDB stop a statement with a wall-clock interrupt, which counts time
+  spent blocked on a lock as readily as time spent scanning; a Redis timeout
+  closes the session, with anything it held, and the next call reopens one.
+- **File engines are opened read-only by the engine.** SQLite and DuckDB open
+  with the engine's read-only flag, and Turso takes `PRAGMA query_only`, so a
+  write the gate misjudged still cannot change the file.
+- **Every server session opened for an agent starts read-only.** On Postgres,
+  MySQL and MariaDB the hold rides in the connection's config
+  (`with_read_only_hold`), so the side session `sizes()` reads through and the
+  sessions that cancel a statement carry it from their first statement. SQL
+  Server, Snowflake and Redis take no session setting, and ClickHouse carries
+  the hold on each request; `sql::agent_gate` holds what the agent sends there.
+  MongoDB has no such setting either and is held by the gate alone; its
+  `sizes()` runs DBDelve's fixed `$collStats` aggregation on the agent's own
+  client and opens no other session.
+- **DuckDB is opened per call and dropped when the call ends.** A second DuckDB
+  instance's view of a file is frozen at open, so a kept one would read a copy
+  that goes stale as the user commits. Databases attached to the user's
+  instance are not attached on the agent's, so agents cannot see them, and an
+  in-memory profile is refused: it exists only inside the user's own instance.
+- **A SQLite file not in WAL mode makes a commit wait for an agent's read.** A
+  reader holds off the writer's commit lock until it ends, so the user's commit
+  can wait and then fail with `database is locked`. A file in WAL mode does
+  not. The visibility dialog states this for any SQLite file whose header does
+  not say WAL (`sqlite::journal_is_wal`), read once when the dialog opens.
+  Turso does not block commits.

@@ -2311,6 +2311,7 @@ mod tests {
                 statement_timeout: 0,
                 ssh: None,
                 schema: None,
+                read_only: false,
             }
         );
         let error = config_from_url("mssql://someone@db.example.test/db?encrypt=true").unwrap_err();

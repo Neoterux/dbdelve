@@ -228,6 +228,7 @@ actions!(
         CloseTab,
         ToggleSidebar,
         DisconnectAgents,
+        ShowAgentActivity,
         ToggleResults,
         ToggleRowPanel,
         ToggleRowEdit,

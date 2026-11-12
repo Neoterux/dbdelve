@@ -9,7 +9,7 @@
 
 use super::{check, fragment, visible};
 use crate::{
-    db::{Engine, Syntax},
+    db::{Engine, ExplainMode, Syntax},
     sql::{self, AgentVerdict, Mode},
 };
 
@@ -863,6 +863,104 @@ fn agent_gate_corpus_for_egress() {
         }
     }
     check("agent_gate_egress", &out);
+}
+
+/// What an agent's `explain_query` composes around: a case name, the statement
+/// it wraps, and what the gate owes the composition. SQL engines.
+const EXPLAIN_SQL_KINDS: &[(&str, &str, Owed)] = &[
+    ("read", "SELECT a FROM t", Owed::Run),
+    ("update", "UPDATE t SET a = 1 WHERE id = 1", Owed::NotRun),
+    ("delete", "DELETE FROM t WHERE id = 1", Owed::Refused),
+    (
+        "writable cte",
+        "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d",
+        Owed::NotRun,
+    ),
+];
+
+/// The same on MongoDB, whose plan is a suffix on the cursor.
+const EXPLAIN_MONGO_KINDS: &[(&str, &str, Owed)] = &[
+    ("read", "db.c.find({a: 1})", Owed::Run),
+    (
+        "update",
+        "db.c.updateOne({a: 1}, {$set: {a: 2}})",
+        Owed::NotRun,
+    ),
+    ("delete", "db.c.deleteMany({a: 1})", Owed::Refused),
+    (
+        "merge aggregate",
+        r#"db.c.aggregate([{$match: {a: 1}}, {$merge: {into: "x"}}])"#,
+        Owed::NotRun,
+    ),
+    (
+        "where find",
+        r#"db.c.find({$where: "this.a > 1"})"#,
+        Owed::NotRun,
+    ),
+];
+
+/// What the gate owes the explain of a statement, in every mode.
+#[derive(Clone, Copy)]
+enum Owed {
+    Run,
+    /// Anything but `Run`: a write waits for the human or is refused.
+    NotRun,
+    Refused,
+}
+
+#[test]
+fn agent_gate_corpus_for_composed_explains() {
+    let mut out = String::new();
+    let mut mongo_suffixes = [false; 2];
+    for engine in Engine::ALL {
+        let kinds = match engine.syntax() {
+            Syntax::Sql => EXPLAIN_SQL_KINDS,
+            Syntax::Mongo => EXPLAIN_MONGO_KINDS,
+            Syntax::Redis => &[],
+        };
+        for mode in ExplainMode::ALL {
+            for (kind, sql, owed) in kinds {
+                // The composition `explain_query` makes, never a hand-written EXPLAIN.
+                let Some(text) = engine.explain(mode, sql) else {
+                    fragment(&mut out, engine, &format!("{mode:?} of {kind}"), None);
+                    continue;
+                };
+                fragment(
+                    &mut out,
+                    engine,
+                    &format!("{mode:?} of {kind}: {}", visible(&text)),
+                    Some(&answers(engine, &text)),
+                );
+                for gate_mode in Mode::ALL {
+                    let verdict = sql::agent_gate(engine, &text, gate_mode);
+                    let context = format!("{engine:?} {gate_mode:?} {mode:?} of {kind}: {text:?}");
+                    match (owed, mode) {
+                        (Owed::Run, _) => assert_eq!(verdict, AgentVerdict::Run, "{context}"),
+                        // A plain plan executes nothing, so the plan of a write is
+                        // judged as the plan it is (`agent_gate_sql.snap` pins
+                        // `plain explain of a delete` as a run); only ANALYZE runs it.
+                        (_, ExplainMode::Plan) => {}
+                        (Owed::NotRun, ExplainMode::Analyze) => {
+                            assert_ne!(verdict, AgentVerdict::Run, "{context}")
+                        }
+                        (Owed::Refused, ExplainMode::Analyze) => {
+                            assert!(matches!(verdict, AgentVerdict::Refuse(_)), "{context}")
+                        }
+                    }
+                }
+                if engine.syntax() == Syntax::Mongo {
+                    mongo_suffixes[0] |= text.contains(r#".explain("queryPlanner")"#);
+                    mongo_suffixes[1] |= text.contains(r#".explain("executionStats")"#);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mongo_suffixes,
+        [true, true],
+        "MongoDB's two explain suffixes are both composed"
+    );
+    check("agent_gate_explain", &out);
 }
 
 /// Every cell of the corpus, SQL and not, and the egress cells.

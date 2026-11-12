@@ -732,6 +732,19 @@ impl Engine {
         }
     }
 
+    /// What an agent is told about a catalog whose shape is DBDelve's own and
+    /// not the server's. Static, so it names nothing of any profile. Redis has
+    /// no schemas or tables: the preview maps each database to a schema and
+    /// its keyspace to one relation.
+    pub fn agent_catalog_note(self) -> Option<&'static str> {
+        match self.syntax() {
+            Syntax::Redis => Some(
+                "This is DBDelve's preview shape of Redis: each database is a schema holding the relation `keys`, with the columns key, type, ttl and value. Keys are read with commands.",
+            ),
+            Syntax::Sql | Syntax::Mongo => None,
+        }
+    }
+
     /// Why a statement `sql::classify` cannot read is refused in Read-only,
     /// finishing "dbdelve can't parse this, and …".
     pub fn unreadable_reason(self) -> &'static str {
@@ -1024,6 +1037,7 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
         // Same reason: a URL has nowhere to say it either.
         ssh: None,
         schema: None,
+        read_only: false,
     })
 }
 
@@ -1104,6 +1118,11 @@ pub struct ServerConfig {
     /// [`Target::picks_schema`]. None leaves the server's
     /// `search_path` alone.
     pub schema: Option<String>,
+    /// Hold every session opened from this config to reads from its first
+    /// statement. A flag for an agent's connection, set only by
+    /// [`ConnectionConfig::with_read_only_hold`]: it is never stored, and a
+    /// user's own connection never carries it.
+    pub read_only: bool,
 }
 
 impl ServerConfig {
@@ -1171,6 +1190,41 @@ impl ConnectionConfig {
             database: String::new(),
             schema: None,
         }
+    }
+
+    /// Whether this is a DuckDB database that lives only inside the user's own
+    /// instance: a blank path or [`DUCKDB_IN_MEMORY`].
+    fn is_duckdb_in_memory(&self) -> bool {
+        matches!(self, Self::DuckDb { path, .. }
+            if matches!(path.trim(), "" | DUCKDB_IN_MEMORY))
+    }
+
+    /// Whether an agent's connection is opened for each call and dropped when
+    /// it ends, rather than kept: true only for a DuckDB file. A second DuckDB
+    /// instance's view of the file is frozen at open, so a kept one would read
+    /// a copy that goes stale as the user commits.
+    pub fn agent_opens_per_call(&self) -> bool {
+        matches!(self, Self::DuckDb { .. }) && !self.is_duckdb_in_memory()
+    }
+
+    /// Why an agent may not read this profile at all, when it may not: an
+    /// in-memory DuckDB database exists only inside the user's own instance,
+    /// so an agent's connection would open an empty one and read it as the
+    /// user's. Asked before anything opens.
+    pub fn agent_refusal(&self) -> Option<&'static str> {
+        self.is_duckdb_in_memory().then_some(
+            "This connection is an in-memory DuckDB database, which has no separate connection an agent can read.",
+        )
+    }
+
+    /// Whether an agent's read of this connection can make the user's commit
+    /// wait: a SQLite file not in WAL mode, where a reader holds off the
+    /// writer's commit lock until it ends. Turso does not (probed), and no
+    /// other engine shares a file lock with its readers. A file whose header
+    /// cannot be read counts as rollback, SQLite's default. Reads the file's
+    /// header, so it is asked once when a dialog opens.
+    pub fn agent_read_can_block_commits(&self) -> bool {
+        matches!(self, Self::Sqlite { path, .. } if sqlite::journal_is_wal(path) != Some(true))
     }
 
     pub fn engine(&self) -> Engine {
@@ -1413,6 +1467,118 @@ impl ConnectionConfig {
         }
     }
 
+    /// `self` with its statement timeout set to `seconds`, 0 for none. The
+    /// setter beside [`Self::statement_timeout`], for a caller that opens a
+    /// connection under a bound of its own.
+    #[must_use]
+    pub fn with_statement_timeout(mut self, seconds: u32) -> Self {
+        match &mut self {
+            Self::Postgres(PostgresConfig { server, .. })
+            | Self::MySql(server)
+            | Self::MariaDb(server)
+            | Self::SqlServer(server)
+            | Self::ClickHouse(server)
+            | Self::Redis(server) => server.statement_timeout = seconds,
+            Self::MongoDb(mongo) => mongo.server.statement_timeout = seconds,
+            Self::Sqlite {
+                statement_timeout, ..
+            }
+            | Self::Turso {
+                statement_timeout, ..
+            }
+            | Self::DuckDb {
+                statement_timeout, ..
+            } => *statement_timeout = seconds,
+            Self::Snowflake(account) => account.statement_timeout = seconds,
+            Self::External(external) => external.statement_timeout = seconds,
+        }
+        self
+    }
+
+    /// `self` with the read-only hold set where a session takes one: every
+    /// Postgres, MySQL and MariaDB session opened from the result starts
+    /// read-only, the side and cancel sessions a connection opens for itself
+    /// included. Nothing else changes in any config. The other server engines
+    /// take no session setting (`read_only_statement` answers none) or carry
+    /// the hold on each request, and a file engine is opened read-only by
+    /// [`Connection::open_for_agent`]; none has a flag to set.
+    #[must_use]
+    pub fn with_read_only_hold(mut self) -> Self {
+        if let Self::Postgres(PostgresConfig { server, .. })
+        | Self::MySql(server)
+        | Self::MariaDb(server) = &mut self
+        {
+            server.read_only = true;
+        }
+        self
+    }
+
+    /// The strings an error bound for an agent must never carry (D-26): the
+    /// hosts, ports as text, users, file paths as stored and home-expanded, the
+    /// tunnel's own, an external connection string, and the password when there
+    /// is one. Blanks are left out. [`Self::endpoint`] is the same string for
+    /// every built-in engine as `listed_endpoint`, so one call covers both.
+    ///
+    /// A Postgres profile on a service reads the service file here, so this is
+    /// asked on a background thread and never on the window's.
+    pub fn identifying_text(&self) -> Vec<String> {
+        let mut found = Identifying::default();
+        match self {
+            Self::Postgres(postgres) => {
+                found.server(&postgres.server);
+                // What a service file and the `PG*` variables fill in is what
+                // the connection is made with, so it is what an error may echo.
+                // Read here as `open_agent` reads it, on a background thread.
+                //
+                // ponytail: a password found in `.pgpass` is not here: that
+                // lookup is private to the driver's connect. The upgrade is
+                // the driver handing back what it resolved.
+                if let Ok(resolved) = postgres.resolved() {
+                    found.server(&resolved);
+                }
+                found.name(&self.endpoint());
+            }
+            Self::MySql(server)
+            | Self::MariaDb(server)
+            | Self::SqlServer(server)
+            | Self::ClickHouse(server)
+            | Self::Redis(server) => {
+                found.server(server);
+                found.name(&self.endpoint());
+            }
+            Self::MongoDb(mongo) => {
+                found.server(&mongo.server);
+                found.name(&self.endpoint());
+            }
+            Self::Sqlite { path, .. } | Self::Turso { path, .. } => found.path(path),
+            Self::DuckDb { path, .. } if path == DUCKDB_IN_MEMORY => {}
+            Self::DuckDb { path, .. } => found.path(path),
+            Self::Snowflake(account) => {
+                found.name(&account.account);
+                found.name(&account.host());
+                found.name(&account.user);
+                found.path(&account.private_key);
+            }
+            Self::External(external) => {
+                found.name(&external.connection);
+                found.connection_string(&external.connection);
+                found.name(&external.user);
+                found.name(&external.password);
+            }
+        }
+        if let Some(tunnel) = self.ssh() {
+            found.name(&tunnel.host);
+            if let Some(port) = tunnel.port {
+                found.name(&port.to_string());
+            }
+            found.name(&tunnel.user);
+            if let Some(identity) = &tunnel.identity_file {
+                found.path(identity);
+            }
+        }
+        found.0
+    }
+
     /// Whether replacing `self` with `edited` has to be reconnected for.
     ///
     /// A blank password in `edited` is not a change: the edit form never shows
@@ -1463,6 +1629,111 @@ impl ConnectionConfig {
                 format!("{} · {}", self.endpoint(), target.label())
             }
             (Driver::Plugin(_), _) => target.label(),
+        }
+    }
+}
+
+/// What [`ConnectionConfig::identifying_text`] has collected: no blank, no repeat.
+#[derive(Default)]
+struct Identifying(Vec<String>);
+
+impl Identifying {
+    fn name(&mut self, text: &str) {
+        if !text.trim().is_empty() && !self.0.iter().any(|seen| seen == text) {
+            self.0.push(text.to_string());
+        }
+    }
+
+    /// A path as written and as the file is opened, `~` expanded.
+    fn path(&mut self, text: &str) {
+        self.name(text);
+        self.name(&crate::store::home_expanded(text).to_string_lossy());
+    }
+
+    /// The values of the keys that say where a connection string goes or who
+    /// goes there, as a driver may echo them one at a time. Not every value:
+    /// `Encrypt=yes` would hide every "yes" in every error.
+    ///
+    /// ponytail: a value in braces that holds a `;` is cut at it, and a key
+    /// this list does not know is not read. The upgrade is the plugin saying
+    /// which parts of its string are identifying.
+    fn connection_string(&mut self, text: &str) {
+        const IDENTIFYING: [&str; 18] = [
+            "server",
+            "host",
+            "hostname",
+            "address",
+            "addr",
+            "network address",
+            "data source",
+            "port",
+            "uid",
+            "user",
+            "user id",
+            "username",
+            "pwd",
+            "password",
+            "database",
+            "dbq",
+            "dsn",
+            "initial catalog",
+        ];
+        for part in text.split(';') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            if !IDENTIFYING.contains(&key.as_str()) {
+                continue;
+            }
+            let value = value.trim().trim_matches(['{', '}']).trim();
+            self.name(value);
+            // SQL Server spells a server `tcp:host,port`: a driver may name
+            // just the host, as it does for a seed list. A password or a user
+            // is one value, commas and all.
+            if !matches!(
+                key.as_str(),
+                "server"
+                    | "host"
+                    | "hostname"
+                    | "address"
+                    | "addr"
+                    | "network address"
+                    | "data source"
+            ) {
+                continue;
+            }
+            for piece in value.split(',') {
+                let piece = piece.trim();
+                let piece = match piece.split_once(':') {
+                    Some((protocol, host))
+                        if matches!(
+                            protocol.to_ascii_lowercase().as_str(),
+                            "tcp" | "np" | "lpc"
+                        ) =>
+                    {
+                        host
+                    }
+                    _ => piece,
+                };
+                self.name(piece);
+            }
+        }
+    }
+
+    fn server(&mut self, server: &ServerConfig) {
+        self.name(&server.host);
+        // A seed list names each server on its own in what a driver says.
+        for seed in server.host.split(',') {
+            self.name(seed.trim());
+        }
+        if let Some(port) = server.port {
+            self.name(&port.to_string());
+        }
+        self.name(&server.user);
+        self.name(&server.password);
+        if let Some(root) = &server.root_certificate {
+            self.path(root);
         }
     }
 }
@@ -1531,6 +1802,52 @@ impl Connection {
                 external::Connection::open(&external).map(Self::External)
             }
         }
+    }
+
+    /// Open the connection an agent reads through, held to reads: SQLite and
+    /// DuckDB are opened read-only by the engine itself, Turso takes
+    /// `PRAGMA query_only` (its read-only open is shared process-wide, see
+    /// [`turso::Connection::open_query_only`]), and every engine then takes
+    /// [`Connection::set_read_only`].
+    ///
+    /// A file database has no session to hold -- `set_read_only` sends it
+    /// nothing -- so the open is what keeps a write from it, and a statement
+    /// the gate misjudged still cannot change the file. This is defence in
+    /// depth behind `sql::agent_gate`, as `set_read_only`'s own comment says.
+    ///
+    /// A server engine is opened from [`ConnectionConfig::with_read_only_hold`],
+    /// so every session opened from that config -- the side session
+    /// `sizes()` reads through and the sessions that cancel a statement
+    /// included -- starts read-only on Postgres, MySQL and MariaDB. SQL
+    /// Server, Snowflake, MongoDB and Redis take no session setting, so
+    /// `sql::agent_gate` holds every statement the agent sends to reads there;
+    /// MongoDB's `sizes()` runs DBDelve's fixed `$collStats` aggregation on
+    /// the agent's own client and opens no other session. ClickHouse carries
+    /// the hold on each request.
+    pub fn open_for_agent(config: ConnectionConfig) -> Result<Self, DbError> {
+        let connection = match config {
+            ConnectionConfig::Sqlite {
+                path,
+                statement_timeout,
+            } => sqlite::Connection::open_read_only(&path, statement_timeout).map(Self::Sqlite),
+            ConnectionConfig::Turso {
+                path,
+                statement_timeout,
+            } => turso::Connection::open_query_only(&path, statement_timeout).map(Self::Turso),
+            ConnectionConfig::DuckDb {
+                path,
+                statement_timeout,
+                database,
+                schema,
+            } => duckdb::Connection::open_read_only(&path, statement_timeout).map(|connection| {
+                Self::DuckDb(
+                    connection.opened_on(Some(database).filter(|name| !name.is_empty()), schema),
+                )
+            }),
+            config => Self::open(config.with_read_only_hold()),
+        }?;
+        connection.set_read_only(true)?;
+        Ok(connection)
     }
 
     /// Run one statement verbatim.
@@ -3581,9 +3898,289 @@ pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<std:
     command.spawn()
 }
 
+/// What an agent's connection to a file database does while the user's own
+/// stays open on the same file: `config` is the file, `user` the connection the
+/// user holds, with one committed row in `t`. The agent's connection reads that
+/// row, a write on it is refused and leaves one row. Answers the refusal.
+#[cfg(test)]
+pub(crate) fn assert_agent_open_reads_and_refuses_a_write(
+    config: ConnectionConfig,
+    user: &Connection,
+) -> String {
+    let count = |connection: &Connection| {
+        connection
+            .query(
+                "SELECT count(*) FROM t",
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("a count")
+            .rows[0]
+            .get(0)
+            .expect("a cell")
+            .to_string()
+    };
+    let agent = Connection::open_for_agent(config).expect("the agent's connection opens");
+    assert_eq!(count(&agent), "1");
+    let refusal = agent
+        .query(
+            "INSERT INTO t VALUES (2)",
+            &CancelToken::default(),
+            Fetch::default(),
+        )
+        .expect_err("the engine refuses the write");
+    assert_eq!(count(&agent), "1");
+    assert_eq!(count(user), "1");
+    refusal.message
+}
+
+/// One config of every shape, each with no statement timeout, for the tests
+/// that must reach every arm of a match on [`ConnectionConfig`].
+#[cfg(test)]
+pub(crate) fn every_shape() -> Vec<ConnectionConfig> {
+    vec![
+        ConnectionConfig::postgres(ServerConfig::default()),
+        ConnectionConfig::MySql(ServerConfig::default()),
+        ConnectionConfig::MariaDb(ServerConfig::default()),
+        ConnectionConfig::SqlServer(ServerConfig::default()),
+        ConnectionConfig::Sqlite {
+            path: "/tmp/a.db".into(),
+            statement_timeout: 0,
+        },
+        ConnectionConfig::Turso {
+            path: "/tmp/b.db".into(),
+            statement_timeout: 0,
+        },
+        ConnectionConfig::DuckDb {
+            path: "/tmp/c.duckdb".into(),
+            statement_timeout: 0,
+            database: String::new(),
+            schema: None,
+        },
+        ConnectionConfig::Snowflake(SnowflakeConfig::default()),
+        ConnectionConfig::ClickHouse(ServerConfig::default()),
+        ConnectionConfig::MongoDb(MongoConfig::default()),
+        ConnectionConfig::Redis(ServerConfig::default()),
+        ConnectionConfig::External(ExternalConfig {
+            plugin: crate::store::tests::odbc_plugin(),
+            speaks: Engine::Generic,
+            connection: "DSN=x".into(),
+            user: String::new(),
+            password: String::new(),
+            statement_timeout: 0,
+            ssh: None,
+        }),
+    ]
+}
+
+/// `template` with `{schema}` and `{relation}` replaced by the two literals,
+/// each already quoted for its engine.
+///
+/// One pass over the template, not a replace per placeholder: a schema that is
+/// itself named `{relation}` would otherwise have the relation spliced into
+/// the quotes the schema was just given. Any other brace word is left as written.
+pub(super) fn fill_placeholders(template: &str, schema: &str, relation: &str) -> String {
+    let mut sql = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        sql.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let (placeholder, value) = if rest.starts_with("{schema}") {
+            ("{schema}", schema)
+        } else if rest.starts_with("{relation}") {
+            ("{relation}", relation)
+        } else {
+            sql.push('{');
+            rest = &rest[1..];
+            continue;
+        };
+        sql.push_str(value);
+        rest = &rest[placeholder.len()..];
+    }
+    sql.push_str(rest);
+    sql
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholders_are_filled_in_one_pass() {
+        assert_eq!(
+            fill_placeholders("{schema}.{relation} {x}", "'{relation}'", "'a''b'"),
+            "'{relation}'.'a''b' {x}"
+        );
+        assert_eq!(fill_placeholders("SELECT 1", "'s'", "'r'"), "SELECT 1");
+        assert_eq!(fill_placeholders("{ {schema}", "'s'", "'r'"), "{ 's'");
+    }
+
+    #[test]
+    fn the_agent_timeout_is_set_on_every_kind_of_connection() {
+        let shapes = every_shape();
+        assert_eq!(shapes.len(), 12, "a variant was added without a shape here");
+        for config in shapes {
+            let engine = config.engine();
+            let bounded = config.clone().with_statement_timeout(17);
+            assert_eq!(bounded.statement_timeout(), 17, "{engine:?}");
+            // Setting it back leaves the config as it was, so nothing else moved.
+            assert_eq!(bounded.with_statement_timeout(0), config, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn the_read_only_hold_is_set_only_where_a_session_takes_one() {
+        for config in every_shape() {
+            let engine = config.engine();
+            let mut held = config.clone().with_read_only_hold();
+            let takes_one = matches!(engine, Engine::Postgres | Engine::MySql | Engine::MariaDb);
+            if let Some(server) = held.server() {
+                assert_eq!(server.read_only, takes_one, "{engine:?}");
+            }
+            if let Some(server) = held.server_mut() {
+                server.read_only = false;
+            }
+            // Every other field, and every other shape, is as it was.
+            assert_eq!(held, config, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn identifying_text_names_every_host_port_user_path_and_password() {
+        let configs = crate::workspace::restored(include_str!("../testdata/every-engine.toml"));
+        let wanted = |id: &str| -> Vec<String> {
+            let (_, config) = configs.iter().find(|(name, _)| name == id).expect(id);
+            config.identifying_text()
+        };
+        let expanded = crate::store::home_expanded("~/.ssh/id_ed25519")
+            .to_string_lossy()
+            .into_owned();
+        for (id, strings) in [
+            ("pg", vec!["db.internal", "5432", "ada", "/certs/ca.pem"]),
+            (
+                "pg",
+                vec![
+                    "bastion.internal",
+                    "2222",
+                    "jump",
+                    "~/.ssh/id_ed25519",
+                    &expanded,
+                ],
+            ),
+            ("alias", vec!["localhost", "postgres"]),
+            ("mysql", vec!["mysql.internal", "3306", "root"]),
+            ("maria", vec!["127.0.0.1", "3307", "dbdelve"]),
+            ("lite", vec!["/Users/ada/data/app.sqlite"]),
+            ("turso", vec!["/Users/ada/data/edge.db"]),
+            ("duck", vec!["/Users/ada/data/lake.duckdb"]),
+            (
+                "snow",
+                vec![
+                    "acme-prod",
+                    "acme-prod.snowflakecomputing.com",
+                    "ADA",
+                    "/Users/ada/.ssh/snowflake.p8",
+                ],
+            ),
+            (
+                "mssql",
+                vec!["sql.internal", "1433", "sa", "/certs/mssql.pem"],
+            ),
+            ("mongo", vec!["cluster0.example.net", "ada"]),
+            ("redis", vec!["cache.internal", "6379", "default"]),
+            ("clk", vec!["ch.internal", "8443", "ada", "/certs/ch.pem"]),
+            ("clk", vec!["bastion.internal", "jump"]),
+        ] {
+            let found = wanted(id);
+            for string in strings {
+                assert!(found.iter().any(|seen| seen == string), "{id}: {string}");
+            }
+        }
+        for (id, config) in &configs {
+            let found = config.identifying_text();
+            assert!(found.iter().all(|text| !text.trim().is_empty()), "{id}");
+            let mut once = found.clone();
+            once.sort();
+            once.dedup();
+            assert_eq!(once.len(), found.len(), "{id} repeats a string");
+        }
+        let (_, mut config) = configs
+            .into_iter()
+            .find(|(id, _)| id == "pg")
+            .expect("the fixture has a Postgres profile");
+        assert!(!config.identifying_text().iter().any(|text| text == "pw"));
+        *config.password_mut().expect("Postgres has a password") = "pw".into();
+        assert!(config.identifying_text().iter().any(|text| text == "pw"));
+    }
+
+    #[test]
+    fn identifying_text_of_a_connection_string_holds_where_and_who_but_not_the_switches() {
+        let config = ConnectionConfig::External(ExternalConfig {
+            plugin: crate::store::tests::odbc_plugin(),
+            speaks: Engine::Generic,
+            connection: "Driver={ODBC Driver 18};Server=tcp:db.internal,1433;UID=svc;PWD={p w};\
+                         Encrypt=yes;Database=ledger"
+                .into(),
+            user: String::new(),
+            password: String::new(),
+            statement_timeout: 0,
+            ssh: None,
+        });
+        let found = config.identifying_text();
+        for string in [
+            "tcp:db.internal,1433",
+            "db.internal",
+            "1433",
+            "svc",
+            "p w",
+            "ledger",
+        ] {
+            assert!(found.iter().any(|seen| seen == string), "{string}");
+        }
+        for string in ["yes", "ODBC Driver 18", "Encrypt"] {
+            assert!(!found.iter().any(|seen| seen == string), "{string}");
+        }
+    }
+
+    #[test]
+    fn identifying_text_of_a_postgres_service_holds_what_the_service_supplies() {
+        use std::io::Write;
+
+        crate::store::tests::with_home(|| {
+            let home = std::env::var("HOME").expect("the test home is set");
+            let file = std::path::Path::new(&home).join(".pg_service.conf");
+            std::fs::File::create(&file)
+                .and_then(|mut file| {
+                    file.write_all(
+                        b"[agent]\nhost=svc.internal\nuser=svc_user\npassword=svc_pw\n\
+                          sslmode=verify-full\nsslrootcert=/certs/svc-root.pem\n",
+                    )
+                })
+                .expect("the service file is written");
+            let config = ConnectionConfig::Postgres(PostgresConfig {
+                server: ServerConfig::default(),
+                service: Some("agent".into()),
+            });
+            let found = config.identifying_text();
+            // The service's own settings come before any `PG*` variable, as in
+            // libpq, so the environment of the machine running this changes none.
+            for wanted in ["svc.internal", "svc_user", "svc_pw", "/certs/svc-root.pem"] {
+                assert!(found.iter().any(|seen| seen == wanted), "{wanted}");
+            }
+        });
+    }
+
+    #[test]
+    fn identifying_text_of_every_shape_holds_nothing_blank() {
+        for config in every_shape() {
+            assert!(
+                config
+                    .identifying_text()
+                    .iter()
+                    .all(|text| !text.trim().is_empty())
+            );
+        }
+    }
 
     #[test]
     fn a_bounded_feed_holds_a_push_past_its_bound_until_rows_are_taken() {
@@ -5015,6 +5612,17 @@ mod tests {
     }
 
     #[test]
+    fn only_redis_has_an_agent_catalog_note() {
+        for engine in Engine::ALL {
+            let note = engine.agent_catalog_note();
+            assert_eq!(note.is_some(), engine == Engine::Redis, "{engine:?}");
+        }
+        let note = Engine::Redis.agent_catalog_note().expect("Redis has one");
+        assert!(note.contains("`keys`") && note.contains("read with commands"));
+        assert!(!note.contains('\n'));
+    }
+
+    #[test]
     fn only_postgres_and_mysql_hold_read_only() {
         assert!(Engine::Postgres.holds_read_only());
         assert!(Engine::MySql.holds_read_only());
@@ -5122,6 +5730,40 @@ mod tests {
                 "{engine:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_duckdb_file_is_opened_per_call_and_only_in_memory_is_refused() {
+        let in_memory = |path: &str| ConnectionConfig::duckdb(path.to_string(), 0);
+        let mut per_call = vec![];
+        let mut refused = vec![];
+        for config in every_shape().into_iter().chain([
+            in_memory(""),
+            in_memory("  "),
+            in_memory(DUCKDB_IN_MEMORY),
+        ]) {
+            let name = format!(
+                "{:?} {}",
+                config.engine(),
+                config.identifying_text().join(",")
+            );
+            if config.agent_opens_per_call() {
+                per_call.push(name.clone());
+            }
+            if config.agent_refusal().is_some() {
+                refused.push(name);
+            }
+        }
+        assert_eq!(per_call, ["DuckDb /tmp/c.duckdb"]);
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        assert!(refused.iter().all(|name| name.starts_with("DuckDb")));
+        assert_eq!(
+            in_memory(DUCKDB_IN_MEMORY).agent_refusal(),
+            Some(
+                "This connection is an in-memory DuckDB database, which has no separate connection an agent can read."
+            )
+        );
+        assert!(!in_memory("").agent_opens_per_call());
     }
 
     #[test]

@@ -331,10 +331,6 @@ pub struct SqlSpec {
     /// `denied_functions` because that list raises the human path's verdict
     /// (Phase 1 D-05), and DBDelve's own CSV, Excel, Parquet and JSON opens
     /// and a user's own read of a file are reads and stay so.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     pub egress_functions: &'static [&'static str],
     /// The engine's built-in functions that change nothing: one name per line
     /// under `#` comment lines, from a file in `src/db/functions/`, matched
@@ -353,10 +349,6 @@ pub struct SqlSpec {
     /// approval on any statement of such an engine that holds a path-shaped
     /// string, since no function name marks the read. Read only by the agent
     /// path (`sql::agent_gate`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the agent tools (Phase 4) are the first caller")
-    )]
     pub bare_path_reads: bool,
     /// Session settings that change nothing a Read-only profile protects, so
     /// setting one stays a read: navigation and comfort. Every other setting a

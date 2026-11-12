@@ -825,6 +825,10 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // Drawn over the connection form, so it closes before the form does.
+        if self.form.is_some() && self.close_agent_audit(cx) {
+            return;
+        }
         if self.form.is_some() {
             self.form = None;
             self.refocus_front();
@@ -841,7 +845,9 @@ impl Workspace {
         // of them in that order, one at a time. The palette stays first so
         // that picking a font from inside settings closes the font list and
         // leaves the panel it was opened from standing. An agent's ping is
-        // drawn behind every dialog, so it backs out last, and only denies.
+        // drawn behind every dialog, so it backs out last, and only denies;
+        // the activity dialog is drawn over the ping, so it goes first of the
+        // two.
         if self.cancel_stale_edit(cx) {
             return;
         }
@@ -875,6 +881,9 @@ impl Workspace {
             return;
         }
         if self.close_apply_review(cx) {
+            return;
+        }
+        if self.close_agent_audit(cx) {
             return;
         }
         if self.deny_front_ping(cx) {

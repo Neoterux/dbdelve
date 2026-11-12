@@ -1,6 +1,6 @@
 //! The frames a call is made of: newline-delimited JSON, one object per line,
-//! at most [`FRAME_LIMIT`] bytes. A connection opens with one [`Hello`] and is
-//! answered with one `Reply` line.
+//! at most [`FRAME_LIMIT`] bytes, or [`REPLY_LIMIT`] for the answer. A
+//! connection opens with one [`Hello`] and is answered with one `Reply` line.
 
 use std::io::{self, BufRead, Read};
 
@@ -10,12 +10,20 @@ use super::tools::Tool;
 
 /// The version the first frame must carry. A frame from another one is
 /// refused rather than read as if it meant what this build's frames mean.
-pub(super) const PROTOCOL_VERSION: u32 = 1;
+pub(super) const PROTOCOL_VERSION: u32 = 2;
 
-// ponytail: a first frame is a tool name and a profile name, so 64 KiB is far
-// beyond it; the cap is what stops a connection from making the app buffer
-// without end.
+// ponytail: a first frame is a tool name, a profile name and now an agent's
+// statement, so 64 KiB is beyond any statement worth reading back as rows; the
+// cap is what stops a connection from making the app buffer without end.
 pub(super) const FRAME_LIMIT: u64 = 64 * 1024;
+
+// ponytail: an answer is the app's text under `RESULT_BUDGET`, and JSON writes
+// each `"` and `\` as two bytes, so the worst case is twice the text plus the
+// frame's own keys; the assert below is what keeps the two numbers honest. A
+// request keeps `FRAME_LIMIT`: only the answer carries rows.
+pub(super) const REPLY_LIMIT: u64 = 256 * 1024;
+
+const _: () = assert!(2 * super::result::RESULT_BUDGET as u64 + 4096 <= REPLY_LIMIT);
 
 /// The first frame of a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +34,14 @@ pub(super) enum Hello {
         tool: Tool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sql: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        analyze: Option<bool>,
     },
     /// An agent is attached. Asks nothing, and ends when the connection does.
     Presence { v: u32 },
@@ -84,14 +100,18 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::agent::{Reply, Status};
+    use crate::agent::{Reply, Status, tests::frame};
 
     #[test]
     fn a_call_frame_and_an_answer_read_back_as_written() {
         let hello = Hello::Call {
             v: PROTOCOL_VERSION,
-            tool: Tool::ListConnections,
-            connection: None,
+            tool: Tool::ExecuteSql,
+            connection: Some("Orders".to_string()),
+            sql: Some("SELECT 1".to_string()),
+            schema: None,
+            table: None,
+            analyze: None,
         };
         let line = encode(&hello);
         assert!(line.ends_with('\n'));
@@ -119,6 +139,7 @@ mod tests {
             Status::Cancelled,
             Status::Expired,
             Status::AppNotRunning,
+            Status::Failed,
         ]
         .map(|status| serde_json::to_string(&status).expect("a status serializes"))
         .into();
@@ -130,31 +151,60 @@ mod tests {
                 "\"refused_by_gate\"",
                 "\"cancelled\"",
                 "\"expired\"",
-                "\"app_not_running\""
+                "\"app_not_running\"",
+                "\"failed\""
             ]
         );
     }
 
     #[test]
     fn a_frame_with_an_unknown_field_or_another_version_is_refused() {
-        for frame in [
-            r#"{"v":1,"kind":"call","tool":"list_connections","extra":1}"#,
-            r#"{"v":2,"kind":"call","tool":"list_connections"}"#,
-            r#"{"v":1,"kind":"shout","tool":"list_connections"}"#,
-            r#"{"v":1,"kind":"call","tool":"drop_everything"}"#,
-            "",
-            "not json",
+        let call = |fields: &str| frame(&format!(r#""kind":"call",{fields}"#));
+        for text in [
+            call(r#""tool":"list_connections","extra":1"#),
+            r#"{"v":1,"kind":"call","tool":"list_connections"}"#.to_string(),
+            r#"{"v":3,"kind":"call","tool":"list_connections"}"#.to_string(),
+            frame(r#""kind":"shout","tool":"list_connections""#),
+            call(r#""tool":"drop_everything""#),
+            String::new(),
+            "not json".to_string(),
         ] {
-            assert!(decode_hello(frame).is_err(), "{frame:?} was accepted");
+            assert!(decode_hello(&text).is_err(), "{text:?} was accepted");
         }
-        assert!(decode_hello(r#"{"v":1,"kind":"call","tool":"list_connections"}"#).is_ok());
-        assert!(decode_hello(r#"{"v":1,"kind":"presence"}"#).is_ok());
+        assert!(decode_hello(&call(r#""tool":"list_connections""#)).is_ok());
+        assert!(decode_hello(&frame(r#""kind":"presence""#)).is_ok());
         assert!(decode_hello(r#"{"v":3,"kind":"presence"}"#).is_err());
+        assert_eq!(
+            decode_hello(&call(
+                r#""tool":"execute_sql","connection":"Orders","sql":"SELECT 1""#
+            )),
+            Ok(Hello::Call {
+                v: PROTOCOL_VERSION,
+                tool: Tool::ExecuteSql,
+                connection: Some("Orders".to_string()),
+                sql: Some("SELECT 1".to_string()),
+                schema: None,
+                table: None,
+                analyze: None,
+            })
+        );
 
         let mut long = Cursor::new(vec![b'a'; FRAME_LIMIT as usize + 10]);
         let error = read_frame(&mut long, FRAME_LIMIT).expect_err("a frame with no end is refused");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let mut empty = Cursor::new(Vec::new());
         assert!(matches!(read_frame(&mut empty, FRAME_LIMIT), Ok(None)));
+    }
+
+    #[test]
+    fn the_largest_reply_fits_the_reply_limit() {
+        let text: String = (0..crate::agent::result::RESULT_BUDGET)
+            .map(|at| if at % 2 == 0 { '"' } else { '\\' })
+            .collect();
+        let line = encode(&Reply {
+            status: Status::Executed,
+            text,
+        });
+        assert!(line.len() as u64 <= REPLY_LIMIT, "{}", line.len());
     }
 }

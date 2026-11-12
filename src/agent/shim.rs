@@ -42,7 +42,7 @@ use tokio::{
 };
 
 #[cfg(unix)]
-use super::{Reply, Status, tools::Tool, wire};
+use super::{CallArgs, Reply, Status, tools::Tool, wire};
 
 /// What an agent is told when it cannot reach the app. The shim cannot tell an
 /// app that is closed from one with its agent access off, so it says both.
@@ -160,8 +160,7 @@ impl Shim {
     /// answers it.
     async fn carry(
         &self,
-        tool: Tool,
-        connection: Option<String>,
+        hello: String,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = match &self.socket {
@@ -174,11 +173,6 @@ impl Shim {
                 return Ok(answer(Status::AppNotRunning, &failed_connect_text(&error)));
             }
         };
-        let hello = wire::encode(&wire::Hello::Call {
-            v: wire::PROTOCOL_VERSION,
-            tool,
-            connection,
-        });
         if stream.write_all(hello.as_bytes()).await.is_err() {
             return Ok(closed_without_answering());
         }
@@ -252,34 +246,165 @@ impl ServerHandler for Shim {
     ) -> Result<CallToolResponse, ErrorData> {
         // Resolved before anything is opened: a call that is not one reaches
         // no socket, presence included.
-        let (tool, connection) = resolve(&request)?;
+        let (tool, connection, args) = resolve(&request)?;
+        // Encoded before anything is opened, because the app drops a first
+        // frame past its limit and the agent would be told the app had closed.
+        let hello = wire::encode(&wire::Hello::Call {
+            v: wire::PROTOCOL_VERSION,
+            tool,
+            connection,
+            sql: args.sql,
+            schema: args.schema,
+            table: args.table,
+            analyze: args.analyze,
+        });
+        if hello.len() as u64 > wire::FRAME_LIMIT {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "The call is {} bytes once encoded; DBDelve reads a call of at most {}.",
+                    hello.len(),
+                    wire::FRAME_LIMIT
+                ),
+                None,
+            ));
+        }
         if let Ok(path) = &self.socket {
             Self::ensure_presence(path, &self.presence).await;
         }
-        Ok(self.carry(tool, connection, &context).await?.into())
+        Ok(self.carry(hello, &context).await?.into())
     }
 }
 
-/// The tool a request names and the connection it gives, or why the request is
-/// not one. An unknown tool or an argument the tool does not take is a protocol
+/// The tool a request names, the connection it gives and the other arguments it
+/// carries, or why the request is not one. An unknown tool or an argument the tool does not take is a protocol
 /// error answered here, not a tool result, and it never reaches the app.
 #[cfg(unix)]
-fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>), ErrorData> {
+fn resolve(request: &CallToolRequestParams) -> Result<(Tool, Option<String>, CallArgs), ErrorData> {
     let tool = Tool::from_name(&request.name).ok_or_else(|| {
         ErrorData::invalid_params(format!("There is no tool named `{}`.", request.name), None)
     })?;
     let none = JsonObject::new();
     let arguments = request.arguments.as_ref().unwrap_or(&none);
     match tool {
-        Tool::ListConnections if arguments.is_empty() => Ok((tool, None)),
+        Tool::ListConnections if arguments.is_empty() => Ok((tool, None, CallArgs::default())),
         Tool::ListConnections => Err(ErrorData::invalid_params(
             "`list_connections` takes no arguments.",
             None,
         )),
         Tool::Ping => match (arguments.len(), arguments.get("connection")) {
-            (1, Some(serde_json::Value::String(name))) => Ok((tool, Some(name.clone()))),
+            (1, Some(serde_json::Value::String(name))) => {
+                Ok((tool, Some(name.clone()), CallArgs::default()))
+            }
             _ => Err(ErrorData::invalid_params(
                 "`ping` takes one string argument, `connection`.",
+                None,
+            )),
+        },
+        Tool::ListSchemas => match (arguments.len(), arguments.get("connection")) {
+            (1, Some(serde_json::Value::String(name))) => {
+                Ok((tool, Some(name.clone()), CallArgs::default()))
+            }
+            _ => Err(ErrorData::invalid_params(
+                "`list_schemas` takes one string argument, `connection`.",
+                None,
+            )),
+        },
+        Tool::ListTables => match (
+            arguments.len(),
+            arguments.get("connection"),
+            arguments.get("schema"),
+        ) {
+            (2, Some(serde_json::Value::String(name)), Some(serde_json::Value::String(schema))) => {
+                Ok((
+                    tool,
+                    Some(name.clone()),
+                    CallArgs {
+                        schema: Some(schema.clone()),
+                        ..CallArgs::default()
+                    },
+                ))
+            }
+            _ => Err(ErrorData::invalid_params(
+                "`list_tables` takes two string arguments, `connection` and `schema`.",
+                None,
+            )),
+        },
+        Tool::DescribeTable => match (
+            arguments.len(),
+            arguments.get("connection"),
+            arguments.get("schema"),
+            arguments.get("table"),
+        ) {
+            (
+                3,
+                Some(serde_json::Value::String(name)),
+                Some(serde_json::Value::String(schema)),
+                Some(serde_json::Value::String(table)),
+            ) => Ok((
+                tool,
+                Some(name.clone()),
+                CallArgs {
+                    schema: Some(schema.clone()),
+                    table: Some(table.clone()),
+                    ..CallArgs::default()
+                },
+            )),
+            _ => Err(ErrorData::invalid_params(
+                "`describe_table` takes three string arguments, `connection`, `schema` and `table`.",
+                None,
+            )),
+        },
+        Tool::ExplainQuery => {
+            // `analyze` is the one optional argument: absent, or a boolean.
+            let analyze = match arguments.get("analyze") {
+                None => Some(None),
+                Some(serde_json::Value::Bool(asked)) => Some(Some(*asked)),
+                Some(_) => None,
+            };
+            let others = arguments.len() - usize::from(arguments.contains_key("analyze"));
+            match (
+                others,
+                arguments.get("connection"),
+                arguments.get("sql"),
+                analyze,
+            ) {
+                (
+                    2,
+                    Some(serde_json::Value::String(name)),
+                    Some(serde_json::Value::String(sql)),
+                    Some(analyze),
+                ) => Ok((
+                    tool,
+                    Some(name.clone()),
+                    CallArgs {
+                        sql: Some(sql.clone()),
+                        analyze,
+                        ..CallArgs::default()
+                    },
+                )),
+                _ => Err(ErrorData::invalid_params(
+                    "`explain_query` takes two string arguments, `connection` and `sql`, and an optional boolean, `analyze`.",
+                    None,
+                )),
+            }
+        }
+        Tool::ExecuteSql => match (
+            arguments.len(),
+            arguments.get("connection"),
+            arguments.get("sql"),
+        ) {
+            (2, Some(serde_json::Value::String(name)), Some(serde_json::Value::String(sql))) => {
+                Ok((
+                    tool,
+                    Some(name.clone()),
+                    CallArgs {
+                        sql: Some(sql.clone()),
+                        ..CallArgs::default()
+                    },
+                ))
+            }
+            _ => Err(ErrorData::invalid_params(
+                "`execute_sql` takes two string arguments, `connection` and `sql`.",
                 None,
             )),
         },
@@ -326,12 +451,13 @@ fn failed_connect_text(error: &std::io::Error) -> String {
 }
 
 /// The one answer line a call gets, read without holding the runtime: a line
-/// is at most the frame limit, and one that does not end in a newline, or does
-/// not decode, is no answer.
+/// is at most the reply limit, which is wider than a request's because an
+/// answer carries rows, and one that does not end in a newline, or does not
+/// decode, is no answer.
 #[cfg(unix)]
 async fn read_reply(stream: &mut UnixStream) -> Option<Reply> {
     let mut line = Vec::new();
-    let mut reader = BufReader::new(stream.take(wire::FRAME_LIMIT));
+    let mut reader = BufReader::new(stream.take(wire::REPLY_LIMIT));
     reader.read_until(b'\n', &mut line).await.ok()?;
     if line.pop() != Some(b'\n') {
         return None;
@@ -840,7 +966,18 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             );
             let listed = client.request("tools/list", json!({})).await;
-            assert_eq!(listed_names(&listed), ["list_connections", "ping"]);
+            assert_eq!(
+                listed_names(&listed),
+                [
+                    "list_connections",
+                    "list_schemas",
+                    "list_tables",
+                    "describe_table",
+                    "execute_sql",
+                    "explain_query",
+                    "ping"
+                ]
+            );
         });
     }
 
@@ -865,7 +1002,18 @@ mod tests {
             let listed = client
                 .request("tools/list", json!({"_meta": modern_meta()}))
                 .await;
-            assert_eq!(listed_names(&listed), ["list_connections", "ping"]);
+            assert_eq!(
+                listed_names(&listed),
+                [
+                    "list_connections",
+                    "list_schemas",
+                    "list_tables",
+                    "describe_table",
+                    "execute_sql",
+                    "explain_query",
+                    "ping"
+                ]
+            );
         });
     }
 
@@ -892,6 +1040,19 @@ mod tests {
                 client.initialize().await;
                 for (tool, arguments) in [
                     ("list_connections", json!({})),
+                    ("list_schemas", json!({"connection": "Orders"})),
+                    (
+                        "list_tables",
+                        json!({"connection": "Orders", "schema": "main"}),
+                    ),
+                    (
+                        "describe_table",
+                        json!({"connection": "Orders", "schema": "main", "table": "t"}),
+                    ),
+                    (
+                        "explain_query",
+                        json!({"connection": "Orders", "sql": "SELECT 1"}),
+                    ),
                     ("ping", json!({"connection": "Orders"})),
                 ] {
                     let answered = client.call(tool, arguments).await;
@@ -925,6 +1086,23 @@ mod tests {
                 heard
                     .iter()
                     .any(|seen| matches!(seen, Seen::Call(_, Tool::ListConnections)))
+            );
+        });
+    }
+
+    #[test]
+    fn a_reply_past_the_old_frame_limit_arrives_whole() {
+        let mut text = "truncated: none (1 rows)\n".to_string();
+        text.push_str(&"x".repeat(100_000 - text.len()));
+        let app = App::answering(executed(&text));
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            let answered = client.call("list_connections", json!({})).await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            assert_eq!(
+                answered["result"]["content"][0]["text"],
+                format!("status: executed\n{text}")
             );
         });
     }
@@ -1134,6 +1312,282 @@ mod tests {
             let heard = app.collect(Duration::from_millis(300), |_| false).await;
             assert_eq!(called(&heard), 0, "{heard:?}");
         });
+    }
+
+    #[test]
+    fn a_statement_too_long_for_a_frame_is_refused_before_any_connection() {
+        let app = App::answering(executed("[]"));
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(app.path.clone())));
+            client.initialize().await;
+            // The second is short enough to look fine and is widened past the
+            // limit by JSON writing each control character as six bytes.
+            for sql in ["x".repeat(70_000), "\u{1}".repeat(16_000)] {
+                let answered = client
+                    .call("execute_sql", json!({"connection": "Orders", "sql": sql}))
+                    .await;
+                assert_eq!(answered["error"]["code"], -32602, "{answered}");
+                let message = answered["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains("65536"), "{message}");
+            }
+            let heard = app.collect(Duration::from_millis(300), |_| false).await;
+            assert_eq!(called(&heard), 0, "{heard:?}");
+            // The idle presence opens on its own; a refused call adds none.
+            assert!(opened(&heard) <= 1, "{heard:?}");
+        });
+    }
+
+    #[test]
+    fn execute_sql_takes_a_connection_and_a_statement_and_nothing_else() {
+        // The app side reads the frame as the wire carries it, so the test
+        // sees what the shim wrote and not what it meant to.
+        let path = short_socket_path();
+        std::fs::create_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the directory is made");
+        let listener = UnixListener::bind(&path).expect("the socket binds");
+        let (frames, written) = mpsc::channel();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() && line.contains("\"call\"")
+                {
+                    let _ = frames.send(line);
+                    let _ = stream.write_all(b"{\"status\":\"executed\",\"text\":\"ok\"}\n");
+                }
+            }
+        });
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(path.clone())));
+            client.initialize().await;
+            for arguments in [
+                json!({"connection": "Orders"}),
+                json!({"sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": 3}),
+                json!({"connection": 3, "sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "limit": 5}),
+            ] {
+                let answered = client.call("execute_sql", arguments.clone()).await;
+                assert_eq!(answered["error"]["code"], -32602, "{arguments}: {answered}");
+            }
+            assert!(
+                written.try_recv().is_err(),
+                "an invalid call reached the socket"
+            );
+
+            let answered = client
+                .call(
+                    "execute_sql",
+                    json!({"connection": "Orders", "sql": "SELECT 1"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "execute_sql");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["sql"], "SELECT 1");
+        });
+        let _ = std::fs::remove_dir_all(path.parent().expect("the path has a directory"));
+    }
+
+    #[test]
+    fn each_catalog_tool_takes_only_its_own_arguments() {
+        // The app side reads the frame as the wire carries it, so the test
+        // sees what the shim wrote and not what it meant to.
+        let path = short_socket_path();
+        std::fs::create_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the directory is made");
+        let listener = UnixListener::bind(&path).expect("the socket binds");
+        let (frames, written) = mpsc::channel();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() && line.contains("\"call\"")
+                {
+                    let _ = frames.send(line);
+                    let _ = stream.write_all(b"{\"status\":\"executed\",\"text\":\"ok\"}\n");
+                }
+            }
+        });
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(path.clone())));
+            client.initialize().await;
+            for (tool, arguments) in [
+                ("list_schemas", json!({})),
+                ("list_schemas", json!({"connection": 3})),
+                (
+                    "list_schemas",
+                    json!({"connection": "Orders", "schema": "main"}),
+                ),
+                ("list_tables", json!({"connection": "Orders"})),
+                ("list_tables", json!({"schema": "main"})),
+                ("list_tables", json!({"connection": "Orders", "schema": 3})),
+                ("list_tables", json!({"connection": 3, "schema": "main"})),
+                (
+                    "list_tables",
+                    json!({"connection": "Orders", "schema": "main", "limit": 5}),
+                ),
+                ("describe_table", json!({})),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "table": "t"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": 3}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": 3, "schema": "main", "table": "t"}),
+                ),
+                (
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": "t", "limit": 5}),
+                ),
+            ] {
+                let answered = client.call(tool, arguments.clone()).await;
+                assert_eq!(
+                    answered["error"]["code"], -32602,
+                    "{tool} {arguments}: {answered}"
+                );
+            }
+            assert!(
+                written.try_recv().is_err(),
+                "an invalid call reached the socket"
+            );
+
+            let answered = client
+                .call("list_schemas", json!({"connection": "Orders"}))
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "list_schemas");
+            assert_eq!(frame["connection"], "Orders");
+            assert!(frame.get("schema").is_none(), "{frame}");
+
+            let answered = client
+                .call(
+                    "list_tables",
+                    json!({"connection": "Orders", "schema": "main"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "list_tables");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["schema"], "main");
+            assert!(frame.get("table").is_none(), "{frame}");
+
+            let answered = client
+                .call(
+                    "describe_table",
+                    json!({"connection": "Orders", "schema": "main", "table": "t"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "describe_table");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["schema"], "main");
+            assert_eq!(frame["table"], "t");
+        });
+        let _ = std::fs::remove_dir_all(path.parent().expect("the path has a directory"));
+    }
+
+    #[test]
+    fn explain_query_takes_a_statement_and_an_optional_analyze_flag() {
+        let path = short_socket_path();
+        std::fs::create_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the directory is made");
+        let listener = UnixListener::bind(&path).expect("the socket binds");
+        let (frames, written) = mpsc::channel();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() && line.contains("\"call\"")
+                {
+                    let _ = frames.send(line);
+                    let _ = stream.write_all(b"{\"status\":\"executed\",\"text\":\"ok\"}\n");
+                }
+            }
+        });
+        block_on(async {
+            let mut client = Client::serve(Shim::new(Ok(path.clone())));
+            client.initialize().await;
+            for arguments in [
+                json!({}),
+                json!({"connection": "Orders"}),
+                json!({"sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": 3}),
+                json!({"connection": 3, "sql": "SELECT 1"}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "analyze": "yes"}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "analyze": 1}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "analyze": null}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "limit": 5}),
+                json!({"connection": "Orders", "sql": "SELECT 1", "analyze": true, "limit": 5}),
+            ] {
+                let answered = client.call("explain_query", arguments.clone()).await;
+                assert_eq!(answered["error"]["code"], -32602, "{arguments}: {answered}");
+            }
+            assert!(
+                written.try_recv().is_err(),
+                "an invalid call reached the socket"
+            );
+
+            let answered = client
+                .call(
+                    "explain_query",
+                    json!({"connection": "Orders", "sql": "SELECT 1"}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["tool"], "explain_query");
+            assert_eq!(frame["connection"], "Orders");
+            assert_eq!(frame["sql"], "SELECT 1");
+            assert!(frame.get("analyze").is_none(), "{frame}");
+
+            let answered = client
+                .call(
+                    "explain_query",
+                    json!({"connection": "Orders", "sql": "SELECT 1", "analyze": true}),
+                )
+                .await;
+            assert_eq!(answered["result"]["isError"], false, "{answered}");
+            let frame = written
+                .recv_timeout(PATIENCE)
+                .expect("the call reaches the app");
+            let frame: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+            assert_eq!(frame["analyze"], true, "{frame}");
+        });
+        let _ = std::fs::remove_dir_all(path.parent().expect("the path has a directory"));
     }
 
     #[test]

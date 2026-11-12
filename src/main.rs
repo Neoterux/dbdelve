@@ -184,6 +184,7 @@ fn connection_config_from(
         statement_timeout: 0,
         ssh: None,
         schema: None,
+        read_only: false,
     })))
 }
 

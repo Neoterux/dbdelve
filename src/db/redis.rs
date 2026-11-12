@@ -128,6 +128,7 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
         statement_timeout: 0,
         ssh: None,
         schema: None,
+        read_only: false,
     })
 }
 
