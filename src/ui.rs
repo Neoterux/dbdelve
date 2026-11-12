@@ -983,6 +983,10 @@ pub(crate) fn button_inked(
         .child(inked_label(label, size, ink))
 }
 
+pub(crate) fn quiet_ink(t: Theme, _live: bool) -> Srgb {
+    Tone::Quiet.ink(t)
+}
+
 /// A button that is only its icon, so it is square and reads as an
 /// affordance beside the thing it acts on rather than as a control of its own.
 pub(crate) fn icon_button(
@@ -1945,5 +1949,15 @@ mod tests {
         assert_eq!(human_bytes(999), "999 B");
         assert_eq!(human_bytes(578_923), "578.9 KB");
         assert_eq!(human_bytes(1_500_000), "1.5 MB");
+    }
+
+    #[test]
+    fn a_quiet_label_that_cannot_act_reads_apart_from_one_that_can_on_every_theme() {
+        for theme in theme::Theme::built_in() {
+            let t = theme.for_popup();
+            assert_eq!(quiet_ink(t, true), Tone::Quiet.ink(t));
+            assert_eq!(quiet_ink(t, false), t.text_faint);
+            assert_ne!(quiet_ink(t, false), quiet_ink(t, true));
+        }
     }
 }
