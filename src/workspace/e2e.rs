@@ -21461,7 +21461,8 @@ fn an_approved_write_on_an_idle_closed_profile_is_refused_and_runs_nothing(
         approve_front(cx);
 
         let answer = answer_of(cx, &answers);
-        assert_eq!(answer.status, Status::Failed, "{}", answer.text);
+        assert_eq!(answer.status, Status::Failed);
+        assert_eq!(answer.text, super::agent_read::CONNECTION_IDLE);
         assert!(writes_running(&workspace, cx).is_empty());
         assert_eq!(email_of(1).as_deref(), Some("a@x"), "the row is unchanged");
         #[cfg(unix)]
