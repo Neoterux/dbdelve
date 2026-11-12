@@ -49,6 +49,7 @@ pub use duckdb::IN_MEMORY as DUCKDB_IN_MEMORY;
 pub use external::ExternalConfig;
 #[cfg(test)]
 pub(crate) use external::echo;
+pub(crate) use include::same_name;
 pub use include::{Include, Shown};
 pub use plugin::Plugin;
 

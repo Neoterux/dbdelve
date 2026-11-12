@@ -240,7 +240,9 @@ fn lowered(text: &str) -> impl Iterator<Item = char> {
     text.chars().flat_map(char::to_lowercase)
 }
 
-fn same_name(a: &str, b: &str) -> bool {
+/// Whether two names are one as the filter reads them, ignoring case by
+/// Unicode simple lowercase of each character.
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
     lowered(a).eq(lowered(b))
 }
 
