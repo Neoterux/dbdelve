@@ -18,7 +18,7 @@
 //! read and nothing else here has to know how a `Catalog` is built.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -384,7 +384,7 @@ fn base_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder 
         Some(dial) => (dial.ip().to_string(), dial.port()),
         None => (server.host.clone(), server.port.unwrap_or(DEFAULT_PORT)),
     };
-    OptsBuilder::new()
+    let options = OptsBuilder::new()
         .ip_or_hostname(Some(host))
         .tcp_port(port)
         // A loopback address would otherwise have the driver ask the server
@@ -396,7 +396,19 @@ fn base_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder 
         // Offered only when there is one. An empty password is not the
         // same as no password, and IAM auth relies on the latter.
         .pass((!server.password.is_empty()).then(|| server.password.clone()))
-        .tcp_connect_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)))
+        .tcp_connect_timeout(Some(Duration::from_secs(
+            server
+                .properties
+                .connect_timeout
+                .map_or(CONNECT_TIMEOUT_SECONDS, u64::from),
+        )));
+    // Set only when the profile names one: unset, the driver sends its own
+    // `program_name`, as it did before the property existed. Never through
+    // `init`, which carries the read-only hold.
+    match &server.properties.application_name {
+        Some(name) => options.connect_attrs(Some(HashMap::from([("program_name", name.as_str())]))),
+        None => options,
+    }
 }
 
 /// Open a connection built from `options`, falling back to plaintext exactly
@@ -1611,7 +1623,9 @@ mod tests {
                 assert_eq!(read.rows[0].get(0), Some("1"));
                 continue;
             }
-            let attribute = "SELECT ATTR_VALUE FROM performance_schema.session_connect_attrs \
+            // The account's own view: the dev user may read it, where the table
+            // of every session needs a grant on `performance_schema`.
+            let attribute = "SELECT ATTR_VALUE FROM performance_schema.session_account_connect_attrs \
                 WHERE PROCESSLIST_ID = CONNECTION_ID() AND ATTR_NAME = 'program_name'";
             let result = main
                 .query(attribute, Fetch::default())
@@ -2223,7 +2237,11 @@ ORDER BY 1, 2
         assert_eq!(set.get_tcp_connect_timeout(), Some(Duration::from_secs(5)));
         // Nothing set is as it was: the driver's own attributes, a ten-second dial.
         let bare = opts(crate::db::Properties::default());
-        assert_eq!(bare.get_connect_attrs(), None);
+        assert!(
+            bare.get_connect_attrs()
+                .is_none_or(|attrs| !attrs.contains_key("program_name")),
+            "DBDelve names no program of its own"
+        );
         assert_eq!(
             bare.get_tcp_connect_timeout(),
             Some(Duration::from_secs(10))
