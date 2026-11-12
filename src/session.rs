@@ -1962,6 +1962,17 @@ impl Depth {
 /// its own rather than a keep-alive, and a hand-edited file could set a storm.
 pub(crate) const MIN_KEEP_ALIVE: u32 = 10;
 
+/// The most seconds between keep-alive pings. Every cut-off a ping answers (a
+/// load balancer, a pooler's idle limit) is under an hour, so past this the
+/// timer would not fire in any session a user keeps; the number was one of two
+/// in the phase with no ceiling at all.
+pub(crate) const MAX_KEEP_ALIVE: u32 = 3600;
+
+/// The most minutes an idle timeout may wait: a day. Past it the deadline is
+/// one a session left open would not reach, so the setting would be a timer
+/// that never fires.
+pub(crate) const MAX_IDLE_TIMEOUT: u32 = 1440;
+
 /// What a profile does with its connection rather than what the connection
 /// is, so changing it never reconnects.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
