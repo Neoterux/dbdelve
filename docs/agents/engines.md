@@ -233,6 +233,21 @@ Decided, and not to be re-litigated:
   session re-asserts its 2-second bound after it. Behind PgBouncer in
   transaction pooling only tracked parameters survive between statements, so a
   script's other `SET`s do not, and `search_path` does only from Postgres 18.
+- **A profile's session time zone is applied inside `src/db/` on every session
+  opened from its config, an agent's read and approved-write connections
+  included** (`db::time_zone_statement`, `SqlSpec::session_time_zone`). Postgres
+  runs `SET TIME ZONE '<zone>'` after the connect, as a `SET` and never a startup
+  option, which poolers refuse, and before the schema pick and the startup
+  script, so a script's own `SET TIME ZONE` wins; behind PgBouncer `TimeZone` is
+  a tracked parameter and survives. MySQL and MariaDB run `SET time_zone = '<zone>'`
+  in `init`, after the read-only hold and the timeout. ClickHouse sends the
+  `session_timezone` setting with every request, a zone the server already has
+  is not sent, and a user who may not change it while the server's differs fails
+  the connect in the server's words, as the timeout does. DuckDB has no row: this
+  build has no `icu`, and `SET TimeZone` would try to download it. Snowflake has
+  none: the grid renders `timestamp_ltz` in UTC whatever the session says. The
+  zone is checked by `check_time_zone` in the form and at restore, so it cannot
+  end the literal it is spliced into.
 - **SQL Server's Cancel closes the connection** (a read stopped at the row
   limit does not: that is `SET ROWCOUNT`). tiberius cannot send TDS's
   attention signal, and `KILL` needs `ALTER ANY CONNECTION`, which an ordinary
