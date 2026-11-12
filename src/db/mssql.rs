@@ -2387,6 +2387,54 @@ mod tests {
         config_from_url(&url).expect("dbdelve_MSSQL_URL should parse")
     }
 
+    #[test]
+    fn a_blank_application_name_keeps_dbdelve() {
+        let named = |application_name: Option<&str>| {
+            application_name_of(&ServerConfig {
+                properties: crate::db::Properties {
+                    application_name: application_name.map(str::to_string),
+                    connect_timeout: None,
+                },
+                ..ServerConfig::default()
+            })
+            .to_string()
+        };
+        assert_eq!(named(None), "DBDelve");
+        assert_eq!(named(Some("billing")), "billing");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_driver_properties_reach_the_server() {
+        let name = |connection: &Connection| {
+            let result = connection
+                .query("SELECT APP_NAME()", Fetch::default())
+                .expect("the name reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        assert_eq!(name(&live()).as_deref(), Some("DBDelve"));
+        let config = ServerConfig {
+            properties: crate::db::Properties {
+                application_name: Some("billing app".into()),
+                connect_timeout: None,
+            },
+            ..live_config()
+        };
+        let main = Connection::open(&config).expect("the connection opens");
+        assert_eq!(name(&main).as_deref(), Some("billing app"));
+        let agent =
+            crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::SqlServer(config))
+                .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SELECT APP_NAME()",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), Some("billing app"));
+    }
+
     fn live() -> Connection {
         Connection::open(&live_config()).expect("connection should open")
     }
