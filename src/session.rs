@@ -9,7 +9,13 @@
 //! These were plain types at the crate root. They moved out whole; nothing
 //! changed but their visibility.
 
-use std::{collections::HashMap, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+};
 
 use gpui::{App, AppContext, Context, Entity, SharedString, Window};
 use gpui_component::{
@@ -23,7 +29,8 @@ use crate::{
     Workspace, completion,
     db::{
         CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine,
-        ExplainMode, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax, Target,
+        ExplainMode, Levels, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax,
+        Target,
     },
     explain::{self, Plan, analysis::Analysis},
     explorer::{
@@ -35,6 +42,7 @@ use crate::{
     },
     import_rows, result_grid,
     result_grid::{InsertTarget, NewValue, ResultGrid},
+    sidebar::OPEN_ROWS_CAP,
     sql::{self, Destructive, Mode, SortKey, Verdict},
     store,
     structure_grid::StructureGrid,
@@ -70,6 +78,13 @@ pub(crate) struct Profile {
     /// queue's reads would not see. Read off what was sent, not asked of the
     /// server; cleared by a `COMMIT` or `ROLLBACK`, and on connect.
     pub(crate) in_transaction: bool,
+    /// Every statement the next `COMMIT` or `ROLLBACK` on the connection's own
+    /// session ends: the user's statements from tabs that are not bound, and
+    /// dbdelve's edits applied on that session, but never dbdelve's reads, for
+    /// the Auto prompt to list. Held in memory only and never written to the
+    /// history file, `profiles.toml` or any log, since it is SQL text that
+    /// ends with its session. Emptied with [`Profile::in_transaction`].
+    pub(crate) transaction_statements: Vec<String>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
     /// `BEGIN` into the buffer where they can read it -- never onto the wire
@@ -86,6 +101,19 @@ pub(crate) struct Profile {
     pub(crate) schema_refresh: Option<u64>,
     /// What the server listed the last time Select Database asked.
     pub(crate) databases: Databases,
+    /// The session opened for each other database of the server, by name,
+    /// for the connections tree to read its catalog over. Never the profile's
+    /// own connection, and dropped with it.
+    pub(crate) bound: HashMap<String, BoundSession>,
+    /// The databases whose session a statement of the user's has left a
+    /// transaction open on, read off what was sent as [`Profile::in_transaction`]
+    /// is, and gone with the session when it is lost or dropped. A session is
+    /// shared by every tab bound to its database, so a write of dbdelve's from
+    /// another tab would run inside it ([`Profile::bound_write_refusal`]).
+    pub(crate) bound_transactions: HashSet<String>,
+    /// What each other database's catalog has got to, by name. A database
+    /// with no entry has not been asked for.
+    pub(crate) database_catalogs: HashMap<String, CatalogState>,
     /// Whether the connection opened on another database than the one the
     /// tabs were opened on, because the picked one was no longer there. What
     /// is left of that database goes on the next frame, which has the window
@@ -93,6 +121,12 @@ pub(crate) struct Profile {
     pub(crate) left_database: bool,
     /// The explorer's folders and pins.
     pub(crate) shortcuts: Shortcuts,
+    /// The rows of the connections tree this profile has open, and the rows
+    /// of it that are selected, by row id: what `profiles.toml` holds between
+    /// runs. Complex mode only. A row listed here whose subtree has not
+    /// loaded waits for it; the tree owns a row once it holds it.
+    pub(crate) open_rows: Vec<String>,
+    pub(crate) selected_rows: Vec<String>,
     pub(crate) session: Session,
 }
 
@@ -114,6 +148,48 @@ fn shortcut_database(
 }
 
 impl Profile {
+    /// Keeps `sql`, which was just sent on the connection's own session, in
+    /// [`Profile::transaction_statements`] when the next `COMMIT` or
+    /// `ROLLBACK` will end it. `transaction` is what `sql::Leaves` says the
+    /// submission does to the transaction: `Some(false)` ends one and empties
+    /// the record, `Some(true)` leaves one open and starts the record again
+    /// with what this submission runs after its last end when the open
+    /// transaction really ended, and
+    /// `None` appends only while one is open. Called before [`Profile::in_transaction`] is
+    /// updated for the same submission, because it reads whether a
+    /// transaction was open before it.
+    pub(crate) fn record_sent(&mut self, sql: &str, transaction: Option<bool>) {
+        match transaction {
+            Some(false) => self.transaction_statements.clear(),
+            // The record must hold everything the next COMMIT ends, so it
+            // restarts only when the open transaction really ended: none was
+            // open, this submission ends one before opening the next, or the
+            // engine commits at a BEGIN. Where that cannot be told, it
+            // appends: a list showing a statement already committed is wrong
+            // on the safe side, and one dropping a statement still to be
+            // committed is not.
+            Some(true) => {
+                let engine = self.config.engine();
+                if crate::sql::ends_transaction(engine, sql) {
+                    // Only what follows the last end belongs to the new
+                    // transaction: the `COMMIT;` Manual sends ahead of its
+                    // `BEGIN;` closed the one before.
+                    let rest = crate::sql::after_last_end(engine, sql);
+                    self.transaction_statements = match rest.is_empty() {
+                        true => Vec::new(),
+                        false => vec![rest.to_string()],
+                    };
+                } else if !self.in_transaction || engine.begin_ends_open_transaction() {
+                    self.transaction_statements = vec![sql.to_string()];
+                } else {
+                    self.transaction_statements.push(sql.to_string());
+                }
+            }
+            None if self.in_transaction => self.transaction_statements.push(sql.to_string()),
+            None => {}
+        }
+    }
+
     /// Why a queue of reads on this connection runs in turn rather than at
     /// once, said to the user when one does.
     pub(crate) fn in_turn(&self) -> Option<&'static str> {
@@ -175,6 +251,8 @@ impl Profile {
     /// does not list.
     pub(crate) fn front_row(&self) -> Option<String> {
         match self.session.active_object() {
+            // Listed under its own database, not under the connection's.
+            Some(tab) if tab.database.is_some() => None,
             Some(tab) => match &self.catalog {
                 CatalogState::Loaded(catalog, _) => {
                     crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)
@@ -190,8 +268,178 @@ impl Profile {
         }
     }
 
+    /// How far the catalog an object of `database` is looked up in has got:
+    /// the one read for that database, or the profile's own when there is
+    /// none. A database nothing has asked for is still loading.
+    pub(crate) fn catalog_state_of(&self, database: Option<&str>) -> &CatalogState {
+        static NOT_READ: CatalogState = CatalogState::Loading;
+        match database {
+            Some(database) => self.database_catalogs.get(database).unwrap_or(&NOT_READ),
+            None => &self.catalog,
+        }
+    }
+
+    /// The loaded catalog behind [`Profile::catalog_state_of`], if it is.
+    pub(crate) fn catalog_of(&self, database: Option<&str>) -> Option<&Catalog> {
+        match self.catalog_state_of(database) {
+            CatalogState::Loaded(catalog, _) => Some(catalog),
+            _ => None,
+        }
+    }
+
+    /// The row of the object tab in front when it is of another database,
+    /// with that database, found in the catalog read for it.
+    pub(crate) fn front_row_elsewhere(&self) -> Option<(&str, String)> {
+        let tab = self.session.active_object()?;
+        let database = tab.database.as_deref()?;
+        match self.database_catalogs.get(database)? {
+            CatalogState::Loaded(catalog, _) => {
+                let row = crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)?;
+                Some((database, row))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn refreshing_schema(&self) -> bool {
         self.schema_refresh == Some(self.generation)
+    }
+
+    /// Every connection of this profile a read-only hold has to reach: its
+    /// own, then each session open for another database. A session still
+    /// opening is not here; its landing applies the hold itself.
+    pub(crate) fn sessions_to_hold(&self) -> Vec<Connection> {
+        self.connection()
+            .into_iter()
+            .chain(self.bound.values().filter_map(|session| match session {
+                BoundSession::Open(connection) => Some((**connection).clone()),
+                BoundSession::Opening => None,
+            }))
+            .collect()
+    }
+
+    /// Let go of every session opened for another database, and what was read
+    /// over them: the connection they were opened from has ended or been
+    /// replaced, and a landing issued to it is dropped by its generation.
+    ///
+    /// ponytail: a session lives as long as its connection and ends with
+    /// nothing else, so a server with many databases expanded holds one
+    /// session each until it disconnects. The upgrade is to close one when
+    /// the last tab bound to it is gone and its row is folded.
+    pub(crate) fn drop_sessions(&mut self) {
+        self.bound.clear();
+        self.bound_transactions.clear();
+        self.database_catalogs.clear();
+    }
+
+    /// Why an edit under `binding` is not sent: a transaction a tab's own
+    /// statement opened is still open on the session of its database, which
+    /// every tab bound to the database shares, and the edit would run inside
+    /// it and read back as applied while nothing has committed it.
+    pub(crate) fn bound_write_refusal(&self, binding: &Binding) -> Option<String> {
+        self.bound_transactions
+            .contains(&binding.database)
+            .then(|| {
+                format!(
+                    "Not sent: a transaction is open on the session of {}, and the change would run inside it.",
+                    binding.database
+                )
+            })
+    }
+
+    /// Why an edit of dbdelve's is not sent on the connection's own session.
+    ///
+    /// A transaction of the user's is open and the batch brackets itself
+    /// (`sql::update_batch` on MySQL, MariaDB, SQLite and SQL Server), so its
+    /// `COMMIT` would end the user's -- and on MySQL and MariaDB its opening
+    /// `START TRANSACTION` would commit it first. A single statement carries
+    /// no bracket and joins the transaction, as the user's own would.
+    ///
+    /// Or none is open and the batch was written to join one
+    /// (`sql::update_batch_joining`): its statements would each commit on
+    /// their own, and a failure on row N would leave rows 1..N-1 committed,
+    /// the outcome the brackets exist to rule out.
+    pub(crate) fn own_write_refusal(&self, sql: &str) -> Option<String> {
+        let engine = self.config.engine();
+        let ends = crate::sql::ends_transaction(engine, sql);
+        if self.in_transaction && ends {
+            return Some(
+                "Not sent: a transaction is open on this connection, and the batch of edits \
+                 would end it with a COMMIT of its own."
+                    .into(),
+            );
+        }
+        // A batch opening with its own bracket is one the parse above could
+        // not read the end of, not one written to join.
+        let bracketed = engine
+            .transaction_start()
+            .is_none_or(|opening| sql.trim_start().starts_with(opening));
+        let several = crate::sql::Buffer::for_engine(engine, sql)
+            .statements()
+            .len()
+            > 1;
+        (!self.in_transaction && !ends && !bracketed && several).then(|| {
+            "Not sent: no transaction is open on this connection, and the batch of edits \
+             was written to join one."
+                .into()
+        })
+    }
+
+    /// The connection a Cancel for `tab` is sent over: the session its
+    /// statement runs on, which for a bound tab is not the profile's own. What
+    /// MongoDB keeps of a running statement, and ClickHouse's fallback, is on
+    /// that session and nowhere else.
+    pub(crate) fn connection_to_stop(&self, tab: Tab) -> Option<Connection> {
+        self.connection_for(tab).existing().cloned()
+    }
+
+    /// Where a run of `tab` goes. See [`Profile::route`].
+    pub(crate) fn connection_for(&self, tab: Tab) -> Routed {
+        self.route(self.binding_of(tab))
+    }
+
+    /// The binding `tab` runs under: a bound query tab's own, or, for an
+    /// object tab of another database, that database alone -- its statements
+    /// name their schema, so there is none to pick.
+    pub(crate) fn binding_of(&self, tab: Tab) -> Option<Binding> {
+        match tab {
+            Tab::Query(query) => self.session.query_tab(query)?.binding.clone(),
+            Tab::Object(object) => self
+                .session
+                .objects
+                .iter()
+                .find(|tab| tab.id == object)?
+                .database
+                .clone()
+                .map(|database| Binding {
+                    database,
+                    schema: None,
+                }),
+        }
+    }
+
+    /// The connection a run under `binding` goes to: the profile's own when
+    /// there is none, else the session open for its database, else what is
+    /// needed to open one. The one place a tab's database picks a session.
+    pub(crate) fn route(&self, binding: Option<Binding>) -> Routed {
+        let Some(own) = self.connection() else {
+            return Routed::Unavailable;
+        };
+        let Some(binding) = binding else {
+            return Routed::Own(own);
+        };
+        match self.bound.get(&binding.database) {
+            Some(BoundSession::Open(session)) => Routed::Bound {
+                session: (**session).clone(),
+                schema: binding.schema,
+            },
+            _ => Routed::Open {
+                from: own,
+                database: binding.database,
+                schema: binding.schema,
+                read_only: self.mode == Mode::ReadOnly,
+            },
+        }
     }
 
     pub(crate) fn connection(&self) -> Option<Connection> {
@@ -296,6 +544,13 @@ impl Profile {
             // property of its tab now. Kept on the stored shape only so a
             // profile written by an older build still loads with its buffer.
             open_query: None,
+            open_rows: self.open_rows.iter().take(OPEN_ROWS_CAP).cloned().collect(),
+            selected_rows: self
+                .selected_rows
+                .iter()
+                .take(OPEN_ROWS_CAP)
+                .cloned()
+                .collect(),
             ssh: self.config.ssh().cloned(),
             open_queries: self
                 .session
@@ -474,6 +729,13 @@ pub(crate) struct Session {
     /// The tab a close is asking about, because it holds cell edits nobody
     /// has applied.
     pub(crate) pending_discard: Option<PendingDiscard>,
+    /// The question turning auto-commit back on asks while a transaction is
+    /// open: commit it, roll it back, or leave it.
+    pub(crate) auto_commit_prompt: Option<AutoCommitPrompt>,
+    /// The tab the Auto dialog's COMMIT or ROLLBACK is running in. Auto is
+    /// read only once that statement lands, because the switch is not
+    /// allowed to say Auto over a transaction the server still holds.
+    pub(crate) auto_after_end: Option<Tab>,
     pub(crate) notice: Option<String>,
     /// What a statement's run cost beyond its result (`QueryResult::notice`),
     /// said only while the tab it ran on is in front, under any `notice`.
@@ -622,6 +884,9 @@ pub(crate) struct InsertField {
 
 /// Rows on their way into a table.
 pub(crate) struct ImportDialog {
+    /// The database the table is in, `None` for the connection's own: the
+    /// columns are read, and the rows written, on that database's session.
+    pub(crate) database: Option<String>,
     pub(crate) schema: String,
     pub(crate) table: String,
     /// The table's columns, read for the dialog alone.
@@ -654,6 +919,27 @@ pub(crate) struct ImportDialog {
     /// The file column a jump or the "Map a column" link pointed at.
     pub(crate) focused_mapping: Option<usize>,
     pub(crate) mapping_scroll: gpui::ScrollHandle,
+}
+
+impl ImportDialog {
+    /// The table as the dialog names it: with its database when that is not
+    /// the connection's own, where `public.t` of two databases would read the
+    /// same.
+    pub(crate) fn target_name(&self) -> String {
+        match &self.database {
+            Some(database) => format!("{database}.{}.{}", self.schema, self.table),
+            None => format!("{}.{}", self.schema, self.table),
+        }
+    }
+
+    /// Where the import runs: on the session of its table's database, when
+    /// that is not the connection's own.
+    pub(crate) fn binding(&self) -> Option<Binding> {
+        self.database.clone().map(|database| Binding {
+            database,
+            schema: None,
+        })
+    }
 }
 
 /// Where an import's rows were read from.
@@ -757,6 +1043,9 @@ pub(crate) struct PendingExport {
 pub(crate) struct Refetch {
     pub(crate) sql: String,
     pub(crate) generated: bool,
+    /// The database a relation tab of another database fetches from, which
+    /// the connection of its own is opened on; `None` for the profile's own.
+    pub(crate) binding: Option<Binding>,
 }
 
 /// An export of every row, running on a connection of its own.
@@ -912,6 +1201,8 @@ impl Session {
             query_rename: None,
             query_rename_needs_focus: false,
             pending_discard: None,
+            auto_commit_prompt: None,
+            auto_after_end: None,
             notice,
             tab_notice: None,
             apply_review: None,
@@ -944,6 +1235,12 @@ impl Session {
 
     pub(crate) fn query_tab_mut(&mut self, id: u64) -> Option<&mut QueryTab> {
         self.queries.iter_mut().find(|tab| tab.id == id)
+    }
+
+    /// Whether `tab` is a query tab bound to a database, whose statements run
+    /// on that database's session and never beside one another.
+    pub(crate) fn is_bound(&self, tab: Tab) -> bool {
+        matches!(tab, Tab::Query(id) if self.query_tab(id).is_some_and(|tab| tab.binding.is_some()))
     }
 
     /// Put away the new-row form and the review a closed tab, query or
@@ -1309,6 +1606,7 @@ impl Session {
         self.query_rename = None;
         self.query_rename_needs_focus = false;
         self.pending_discard = None;
+        self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;
         // A stopped statement must not survive a tab or profile switch and get
@@ -1366,6 +1664,12 @@ pub(crate) struct PendingDiscard {
     pub(crate) deleting: Option<String>,
 }
 
+/// The question Auto asks while a transaction is open, and whether its list
+/// of the statements that transaction has run is open.
+pub(crate) struct AutoCommitPrompt {
+    pub(crate) statements_shown: bool,
+}
+
 /// What takes focus when a surface comes to the front. A buffer, a field and a
 /// grid are all focusable and no two of them share a type.
 pub(crate) enum Focus {
@@ -1387,6 +1691,157 @@ pub(crate) enum CatalogState {
     /// The relations, and how far the routines behind them have got.
     Loaded(Catalog, Routines),
     Failed(String),
+}
+
+/// Where a tab's reads and writes go, as [`Profile::connection_for`] finds
+/// it. Resolved on the blocking pool, because opening a session is not
+/// something to wait on from the frame.
+pub(crate) enum Routed {
+    /// The profile's own connection: the tab is not bound.
+    Own(Connection),
+    /// The session already open for the tab's database.
+    Bound {
+        session: Connection,
+        schema: Option<String>,
+    },
+    /// No session is open for the tab's database: one is opened from `from`
+    /// ([`Connection::on_database`]), held to reads when `read_only`.
+    Open {
+        from: Connection,
+        database: String,
+        schema: Option<String>,
+        read_only: bool,
+    },
+    /// The profile has no live connection to run on.
+    Unavailable,
+}
+
+impl Routed {
+    /// The connection to run on, with the schema a bound tab runs in. Opens
+    /// the session when there is none, and so may take as long as a connect.
+    pub(crate) fn resolve(self) -> Result<(Connection, Option<String>), DbError> {
+        match self {
+            Self::Own(connection) => Ok((connection, None)),
+            Self::Bound { session, schema } => Ok((session, schema)),
+            Self::Open {
+                from,
+                database,
+                schema,
+                read_only,
+            } => {
+                let session = from.on_database(&database)?;
+                // Only Read-only asks the server for anything, as at connect:
+                // a session that fails to take the hold is dropped, not run
+                // on looking held.
+                if read_only {
+                    session.set_read_only(true)?;
+                }
+                Ok((session, schema))
+            }
+            Self::Unavailable => Err(DbError {
+                message: "The connection is not open.".into(),
+                position: None,
+            }),
+        }
+    }
+
+    /// Whether there is a connection to run on, now or once a session opens.
+    pub(crate) fn is_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+
+    /// A connection that exists now to ask something of, such as a statement
+    /// to stop: the session of a bound tab, else the profile's own.
+    pub(crate) fn existing(&self) -> Option<&Connection> {
+        match self {
+            Self::Own(connection)
+            | Self::Bound {
+                session: connection,
+                ..
+            } => Some(connection),
+            Self::Open { from, .. } => Some(from),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+/// A session for one (profile, database) pair other than the profile's own.
+pub(crate) enum BoundSession {
+    /// Being opened on the blocking pool. Holds the database's place, so a
+    /// second expand does not open a second session.
+    Opening,
+    // Boxed, as `ProfileState::Connected` is: a server connection is far
+    // larger than the place-holder.
+    Open(Box<Connection>),
+}
+
+/// What Toggle Auto-commit, Commit and Roll Back answer on a bound tab, and
+/// send nothing: they act on the connection's own session, which is not the
+/// one the tab runs on.
+// ponytail: a bound session is auto-commit unless a statement of the user's
+// opens a transaction on it, which every tab bound to its database shares, so
+// there is no transaction of the tab's for these to act on and an edit is
+// refused while one is open (`Profile::bound_write_refusal`); the upgrade is
+// a session of the tab's own.
+pub(crate) const BOUND_TRANSACTION: &str = "Transaction controls act on the connection's own session, and this tab runs on its database's own session.";
+
+/// Where a query tab opened with New Query Here runs: a database of its
+/// connection's server, and where the engine picks one, a schema in it. Both
+/// as the server listed them, handed to the driver unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) database: String,
+    pub(crate) schema: Option<String>,
+}
+
+impl Binding {
+    /// The database, or `database.schema`: how a notice and a chip name where
+    /// the tab runs.
+    pub(crate) fn label(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{}.{schema}", self.database),
+            None => self.database.clone(),
+        }
+    }
+
+    /// The binding for a tab opened on `database` and `schema`, or `None`
+    /// where there is nothing to bind: a target that switches no database, and
+    /// a blank name, which is the login default and so the profile's own
+    /// session. The schema is kept only where the target picks one.
+    pub(crate) fn for_target(
+        target: Target,
+        database: Option<&str>,
+        schema: Option<&str>,
+    ) -> Option<Self> {
+        let database = database.filter(|database| !database.is_empty())?;
+        if !target.switches_database() {
+            return None;
+        }
+        Some(Self {
+            database: database.to_string(),
+            schema: schema
+                .filter(|schema| !schema.is_empty() && target.picks_schema())
+                .map(str::to_string),
+        })
+    }
+
+    /// The binding for a tab opened on the schema row `row` of a connection
+    /// whose tree shape is `target`'s, under `database` where the row sits
+    /// under one. Where the catalog lists databases as schemas, or a
+    /// database's one schema is the database, the row is the database.
+    pub(crate) fn for_schema_row(
+        target: Target,
+        database: Option<&str>,
+        row: &str,
+    ) -> Option<Self> {
+        match target.levels() {
+            Levels::Flat => None,
+            Levels::DatabaseIsSchema | Levels::DatabaseHoldsObjects => {
+                Self::for_target(target, Some(row), None)
+            }
+            Levels::DatabaseThenSchema => Self::for_target(target, database, Some(row)),
+        }
+    }
 }
 
 /// The second half of a loaded catalog. A catalog whose routines are not
@@ -1661,6 +2116,14 @@ pub(crate) struct QueryTab {
     /// tab must not resize another's. Not persisted -- a fresh tab always
     /// starts at the built-in default.
     pub(crate) row_panel_split: Entity<ResizableState>,
+    /// The database, and where the engine picks one the schema, this tab was
+    /// opened for with New Query Here, or `None` for a tab that runs on the
+    /// profile's own session. Kept for good: running the tab puts its
+    /// session back here, and never moves the profile's own database or
+    /// schema.
+    ///
+    /// ponytail: not stored, so a relaunch restores the tab unbound.
+    pub(crate) binding: Option<Binding>,
 }
 
 /// A plan, and what it is a plan of.
@@ -2295,6 +2758,17 @@ impl QueryTab {
             row_panel_editing: false,
             row_panel_filter: Default::default(),
             row_panel_split: cx.new(|_| ResizableState::default()),
+            // Kept as written, and handed to the driver as data on the first
+            // run: a database the server no longer has fails that run with the
+            // open's own words, and the tab stays bound to it.
+            binding: stored
+                .database
+                .clone()
+                .filter(|database| !database.is_empty())
+                .map(|database| Binding {
+                    database,
+                    schema: stored.schema.clone().filter(|schema| !schema.is_empty()),
+                }),
         };
         (tab, notice)
     }
@@ -2310,6 +2784,14 @@ impl QueryTab {
                 .queue
                 .as_ref()
                 .map_or(self.queued_results, |queue| queue.done.len()),
+            database: self
+                .binding
+                .as_ref()
+                .map(|binding| binding.database.clone()),
+            schema: self
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.schema.clone()),
         }
     }
 }
@@ -2323,6 +2805,11 @@ pub(crate) struct ObjectTab {
     /// is the only thing that tells two overloads of one function apart.
     pub(crate) name: String,
     pub(crate) kind: ObjectKind,
+    /// The database of the connection's server this tab's object is in, as the
+    /// server listed it, or `None` for the connection's own. Every read and
+    /// write the tab makes runs on that database's session
+    /// ([`Profile::connection_for`]).
+    pub(crate) database: Option<String>,
     pub(crate) body: ObjectBody,
 }
 
@@ -2361,6 +2848,7 @@ impl ObjectTab {
 
     pub(crate) fn stored(&self, engine: Engine) -> store::StoredObject {
         store::StoredObject {
+            database: self.database.clone(),
             schema: self.schema.clone(),
             name: self.name.clone(),
             filter: self.filter().to_string(),
@@ -2377,7 +2865,8 @@ impl ObjectTab {
             structure: matches!(self.body, ObjectBody::Structure { .. }),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
-                ObjectKind::Routine(_) => RelationKind::default(),
+                // A sequence opens no tab, so this is never stored.
+                ObjectKind::Routine(_) | ObjectKind::Sequence => RelationKind::default(),
             },
             active: false,
         }
@@ -2482,18 +2971,25 @@ impl OpenedObject {
 }
 
 /// The tab an object would reuse, if it has one. Dedup is on
-/// `(schema, name, filter)` rather than `(schema, name)` (spec §6.3), so
-/// `customers` and `customers WHERE id = 42` are two tabs. Fed an iterator
+/// `(database, schema, name, filter)` rather than `(schema, name)` (spec
+/// §6.3), so `customers` and `customers WHERE id = 42` are two tabs, and
+/// `main.t` under two databases of one server is two. Fed an iterator
 /// rather than a session, so the invariant has a test that needs no window.
 pub(crate) fn matching_tab<'a>(
-    open: impl Iterator<Item = (u64, &'a str, &'a str, &'a str)>,
+    open: impl Iterator<Item = (u64, Option<&'a str>, &'a str, &'a str, &'a str)>,
+    database: Option<&str>,
     schema: &str,
     name: &str,
     filter: &str,
 ) -> Option<u64> {
-    open.filter(|(_, candidate_schema, candidate_name, candidate_filter)| {
-        *candidate_schema == schema && *candidate_name == name && *candidate_filter == filter
-    })
+    open.filter(
+        |(_, candidate_database, candidate_schema, candidate_name, candidate_filter)| {
+            *candidate_database == database
+                && *candidate_schema == schema
+                && *candidate_name == name
+                && *candidate_filter == filter
+        },
+    )
     .map(|(id, ..)| id)
     .next()
 }
@@ -2928,7 +3424,7 @@ pub(crate) fn write_grids(profile: &Profile, cx: &App) {
         }
         let _ = store::write_grid(
             &profile.id,
-            &store::object_grid_key(&tab.schema, &tab.name, filter),
+            &store::object_grid_key_in(tab.database.as_deref(), &tab.schema, &tab.name, filter),
             &store::StoredGrid {
                 limit: Some(limit.unwrap_or(0)),
                 filter: filter.clone(),
@@ -2987,6 +3483,78 @@ mod tests {
             rows_affected: None,
             messages: Vec::new(),
         }
+    }
+
+    fn binding(database: &str, schema: Option<&str>) -> Binding {
+        Binding {
+            database: database.into(),
+            schema: schema.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_a_database_or_a_picked_schema_makes_a_binding() {
+        let target = Target::built_in;
+        assert_eq!(
+            Binding::for_target(target(Engine::Sqlite), Some("main"), None),
+            None,
+            "SQLite switches no database"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some(""), None),
+            None,
+            "a blank name is the login default, which is the profile's own session"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), None, Some("s")),
+            None,
+            "a schema alone names no database"
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some("d"), Some("s")),
+            Some(binding("d", Some("s")))
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::Postgres), Some("d"), None),
+            Some(binding("d", None))
+        );
+        assert_eq!(
+            Binding::for_target(target(Engine::SqlServer), Some("d"), Some("s")),
+            Some(binding("d", None)),
+            "SQL Server picks no schema, so none is kept"
+        );
+    }
+
+    #[test]
+    fn a_schema_row_binds_by_the_levels_of_its_connection() {
+        let target = Target::built_in;
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::MySql), None, "shop"),
+            Some(binding("shop", None)),
+            "MySQL lists a database as a schema"
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Redis), None, "db3"),
+            Some(binding("db3", None))
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Postgres), Some("app"), "billing"),
+            Some(binding("app", Some("billing")))
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Postgres), None, "billing"),
+            None,
+            "a schema whose database is not known binds nothing"
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::Sqlite), None, "main"),
+            None
+        );
+        assert_eq!(
+            Binding::for_schema_row(target(Engine::MySql), None, ""),
+            None,
+            "a blank row is never a database"
+        );
     }
 
     #[test]
@@ -3166,7 +3734,7 @@ mod tests {
                 members: vec![
                     entry(None, None, Some("table")),
                     entry(None, None, Some("view")),
-                    entry(None, None, Some("sequence")),
+                    entry(None, None, Some("trigger")),
                     entry(Some("daily"), None, None),
                 ],
             },
@@ -3912,16 +4480,17 @@ mod tests {
     #[test]
     fn one_relation_and_one_filter_is_one_tab() {
         let open = [
-            (7u64, "public", "customers", ""),
-            (9u64, "public", "customers", r#""id" = '42'"#),
+            (7u64, None, "public", "customers", ""),
+            (9u64, None, "public", "customers", r#""id" = '42'"#),
         ];
         assert_eq!(
-            matching_tab(open.iter().copied(), "public", "customers", ""),
+            matching_tab(open.iter().copied(), None, "public", "customers", ""),
             Some(7)
         );
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "public",
                 "customers",
                 r#""id" = '42'"#
@@ -3931,13 +4500,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tabs_identity_includes_its_database() {
+        let open = [
+            (7u64, Some("other"), "main", "t", ""),
+            (9u64, None, "main", "t", ""),
+        ];
+        assert_eq!(
+            matching_tab(open.iter().copied(), Some("other"), "main", "t", ""),
+            Some(7)
+        );
+        assert_eq!(
+            matching_tab(open.iter().copied(), None, "main", "t", ""),
+            Some(9),
+            "no database matches only a tab with none"
+        );
+        assert_eq!(
+            matching_tab(open.iter().copied(), Some("third"), "main", "t", ""),
+            None
+        );
+        assert_eq!(
+            matching_tab(open[..1].iter().copied(), None, "main", "t", ""),
+            None,
+            "a tab of another database is not the profile's own"
+        );
+    }
+
+    #[test]
     fn a_filtered_relation_does_not_take_over_the_unfiltered_tab() {
         // The invariant this tier changes: following a key cannot clobber what
         // the relation's own tab was showing.
-        let open = [(7u64, "public", "customers", "")];
+        let open = [(7u64, None, "public", "customers", "")];
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "public",
                 "customers",
                 r#""id" = '42'"#
@@ -3948,10 +4544,11 @@ mod tests {
 
     #[test]
     fn two_schemas_can_hold_a_relation_of_the_same_name_and_filter() {
-        let open = [(7u64, "public", "customers", r#""id" = '42'"#)];
+        let open = [(7u64, None, "public", "customers", r#""id" = '42'"#)];
         assert_eq!(
             matching_tab(
                 open.iter().copied(),
+                None,
                 "archive",
                 "customers",
                 r#""id" = '42'"#
@@ -4018,6 +4615,8 @@ mod tests {
                 name: Some("daily".into()),
                 active: true,
                 queued_results: 0,
+                database: None,
+                schema: None,
             };
             assert_eq!(stored_text("dev", &open), Ok(Some("SELECT 1".to_string())));
 
@@ -4205,6 +4804,8 @@ mod tests {
                     name: None,
                     active: false,
                     queued_results: 0,
+                    database: None,
+                    schema: None,
                 })
                 .collect::<Vec<_>>()
         };

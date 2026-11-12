@@ -1052,6 +1052,10 @@ pub(crate) struct Frame {
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_records: Vec<(String, Bounds<Pixels>)>,
+    // dbdelve patch: every line of text painted this frame, with where it
+    // landed, for the UAT driver (`src/drive.rs`) to read the window back.
+    #[cfg(any(test, feature = "test-support"))]
+    debug_text_records: Vec<(SharedString, Bounds<Pixels>)>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1074,6 +1078,9 @@ pub(crate) struct PaintIndex {
     scene_index: usize,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
+    // dbdelve patch: see `Frame::debug_text_records`.
+    #[cfg(any(test, feature = "test-support"))]
+    debug_text_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
@@ -1109,6 +1116,8 @@ impl Frame {
             debug_bounds: FxHashMap::default(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_records: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_text_records: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             next_inspector_instance_ids: FxHashMap::default(),
@@ -1138,6 +1147,7 @@ impl Frame {
         {
             self.debug_bounds.clear();
             self.debug_bounds_records.clear();
+            self.debug_text_records.clear();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2873,6 +2883,32 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// dbdelve patch: every debug selector the last frame drew, in paint order,
+    /// with its bounds in window coordinates.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_selectors(&self) -> &[(String, Bounds<Pixels>)] {
+        &self.rendered_frame.debug_bounds_records
+    }
+
+    /// dbdelve patch: every line of text the last frame painted, in paint
+    /// order, with the part of it left visible by its content mask.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_text(&self) -> &[(SharedString, Bounds<Pixels>)] {
+        &self.rendered_frame.debug_text_records
+    }
+
+    /// dbdelve patch: note a line of text being painted at `bounds`, clipped to
+    /// the content mask in force; a line clipped away entirely is not noted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_debug_text(&mut self, text: &SharedString, bounds: Bounds<Pixels>) {
+        let visible = bounds.intersect(&self.content_mask().bounds);
+        if !text.trim().is_empty() && visible.size.width > px(0.) && visible.size.height > px(0.) {
+            self.next_frame
+                .debug_text_records
+                .push((text.clone(), visible));
+        }
+    }
+
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
@@ -4049,6 +4085,8 @@ impl Window {
             scene_index: self.next_frame.scene.len(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_text_index: self.next_frame.debug_text_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -4067,6 +4105,12 @@ impl Window {
             self.next_frame
                 .record_debug_bounds(selector.clone(), *bounds);
         }
+        // dbdelve patch: cached elements' text, as their selectors above.
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.debug_text_records.extend_from_slice(
+            &self.rendered_frame.debug_text_records
+                [range.start.debug_text_index..range.end.debug_text_index],
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]

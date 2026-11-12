@@ -391,6 +391,16 @@ gpui_platform = { version = "=0.3.9", package = "gpui-pre-platform", features = 
     "wayland",
 ] }
 
+# Writes the UAT driver's screenshots. Already in the graph through gpui;
+# pinned to the locked version, PNG only.
+image = { version = "=0.25.10", default-features = false, features = ["png"], optional = true }
+
+[features]
+# The UAT driver (`src/drive.rs`): lets an agent operate the real window for a
+# manual UAT checkpoint. Debug builds only; never in a release. test-support
+# makes GPUI record element bounds and read a frame back as an image.
+uat = ["gpui/test-support", "gpui_platform/test-support", "dep:image"]
+
 [dev-dependencies]
 # Headless keyboard regressions exercise GPUI's real focus and action dispatch.
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
@@ -438,7 +448,9 @@ winresource = "=0.1.31"
 # gpui-pre itself is vendored for a backdrop blur ported from zui, the gpui fork
 # behind Zeron: `Window::paint_backdrop_blur` and the `backdrop_blur` style,
 # which frost whatever a popover is painted over. The scene records the blur
-# regions and every renderer (Metal, DirectX, wgpu) draws them. Every change is
+# regions and every renderer (Metal, DirectX, wgpu) draws them. It also records,
+# under `test-support` only, each painted line of text and hands the frame's
+# debug selectors out, for the UAT driver (`src/drive.rs`). Every change is
 # marked `dbdelve patch`, in gpui-pre and its renderer crates alike; re-apply
 # them on a gpui bump.
 # The vendored wgpu renderer is a member only so CI can run its tests, and the

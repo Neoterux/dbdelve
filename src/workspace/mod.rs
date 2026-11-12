@@ -24,6 +24,7 @@ mod objects;
 mod profiles;
 mod projects;
 mod queries;
+mod sidebar;
 mod tabs;
 mod transactions;
 mod welcome;
@@ -44,6 +45,9 @@ use crate::actions::{DisconnectAgents, ShowAgentActivity};
 use crate::connection_form::{Origin, password_to_persist};
 use crate::session::{catalog_relation, write_buffer, write_grids};
 use crate::settings_panel::{SettingMatch, SettingsTab, filter_settings, render_settings_panel};
+use crate::sidebar::{
+    Density, ListingScope, ViewMode, effective_listing_scope, effective_view_mode,
+};
 use crate::sql::{Mode, appended_statement, remember_statement, update_batch};
 use crate::theme::{install_fonts, install_theme, restored_fonts, restored_theme};
 use crate::*;
@@ -90,6 +94,18 @@ pub(crate) struct Settings {
     /// Keybinding overrides, keyed by action id. Applied to the keymap on
     /// the next launch -- see `src/keybindings.rs`.
     pub(crate) custom_keybindings: HashMap<String, String>,
+    /// Which sidebar is drawn: the tree of the connection in front, or every
+    /// connection under its project.
+    pub(crate) view_mode: ViewMode,
+    /// Which connections that sidebar lists: every project's, or only those
+    /// of the project in front.
+    pub(crate) listing_scope: ListingScope,
+    /// How tall the connections tree's rows are.
+    pub(crate) density: Density,
+    /// Whether the connections tree's rows show their host.
+    pub(crate) show_host: bool,
+    /// Whether either tree shows sizes, and whether any is read.
+    pub(crate) show_sizes: bool,
 }
 
 impl Settings {
@@ -125,6 +141,11 @@ impl Default for Settings {
             verbose_logging: false,
             welcomed: false,
             custom_keybindings: HashMap::new(),
+            view_mode: ViewMode::default(),
+            listing_scope: ListingScope::default(),
+            density: Density::default(),
+            show_host: true,
+            show_sizes: true,
         }
     }
 }
@@ -220,6 +241,19 @@ pub(crate) struct PendingImport {
 
 pub(crate) struct Workspace {
     pub(crate) profiles: Vec<Profile>,
+    /// How many connections each mode change's read-only hold was handed to,
+    /// in order: what the tests ask of the fan-out, which runs on the
+    /// blocking pool where nothing can be counted.
+    #[cfg(test)]
+    pub(crate) held: Vec<usize>,
+    /// The database each session opened for another database was issued for,
+    /// in order: a landing that opens again is a second entry.
+    #[cfg(test)]
+    pub(crate) opened: Vec<String>,
+    /// How many size reads were started, which run on the blocking pool where
+    /// nothing can be counted.
+    #[cfg(test)]
+    pub(crate) size_reads: usize,
     /// Profiles on an engine this build cannot open, held as they were read
     /// and written back by `remember_profiles`; never restored.
     pub(crate) unavailable: Vec<store::UnavailableProfile>,
@@ -368,6 +402,13 @@ pub(crate) struct Workspace {
     /// Whether the `Agent activity` dialog is up. Only the popover's item
     /// opens it and only its own close and `escape` end it.
     pub(crate) agent_audit_open: bool,
+    /// The `Show DDL` dialog: one object's definition, read-only. Only the
+    /// relation menu's Show DDL opens it and only its own Close and `escape`
+    /// end it.
+    pub(crate) ddl_view: Option<DdlView>,
+    /// Numbers each Show DDL read, so an answer that comes back after the
+    /// dialog was closed, or put up for another object, is not drawn.
+    pub(crate) last_ddl_request: u64,
     /// The opacity field in the settings panel. Kept here rather than built
     /// with the card, because an input is state the user is part-way through
     /// typing into and a fresh one every frame would swallow the keystroke.
@@ -378,6 +419,8 @@ pub(crate) struct Workspace {
     /// Around the sidebar's tree, whose own handle the library keeps to
     /// itself: what tells an `escape` in the tree from one anywhere else.
     pub(crate) explorer_focus: FocusHandle,
+    /// Complex mode's tree: every connection under its project.
+    pub(crate) connections: sidebar::ConnectionsSidebar,
     /// The dialogs' own, so `enter` answers the one in front instead of
     /// editing the buffer or the grid it covers.
     pub(crate) dialog_focus: FocusHandle,
@@ -542,10 +585,19 @@ impl Workspace {
             agent_visibility_prompt: None,
             agent_visibility_blocks_commits: false,
             agent_audit_open: false,
+            ddl_view: None,
+            last_ddl_request: 0,
             agent: agent::AgentState::default(),
             opacity_input,
+            #[cfg(test)]
+            held: Vec::new(),
+            #[cfg(test)]
+            opened: Vec::new(),
+            #[cfg(test)]
+            size_reads: 0,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
+            connections: sidebar::ConnectionsSidebar::new(window, cx),
             dialog_focus: cx.focus_handle(),
             dialog_in_front: std::cell::Cell::default(),
             dialog_choice: std::cell::Cell::default(),
@@ -646,6 +698,14 @@ impl Workspace {
                     .custom_keybindings
                     .clone()
                     .unwrap_or_default();
+                workspace.settings.view_mode =
+                    ViewMode::from_slug(stored_settings.view_mode.as_deref());
+                workspace.settings.listing_scope =
+                    ListingScope::from_slug(stored_settings.listing_scope.as_deref());
+                workspace.settings.density =
+                    Density::from_slug(stored_settings.sidebar_density.as_deref());
+                workspace.settings.show_host = stored_settings.sidebar_show_host.unwrap_or(true);
+                workspace.settings.show_sizes = stored_settings.sidebar_show_sizes.unwrap_or(true);
                 // Ahead of the restore, which must not prune grids an
                 // unavailable profile under the same id still owns.
                 workspace.unavailable = unavailable;
@@ -718,6 +778,10 @@ impl Workspace {
                 workspace.form = Some(form);
             }
         }
+
+        // A connection nothing connects at launch gets no other rebuild, and
+        // the tree would sit empty over profiles that are all there.
+        workspace.rebuild_connections(cx);
 
         // After the environment's form, which takes the notice over the
         // welcome surface when there is one.
@@ -1922,7 +1986,7 @@ impl Render for Workspace {
             let insert = engine.syntax() == db::Syntax::Sql
                 && matches!(structure, StructureState::Loaded(loaded) if !loaded.columns.is_empty());
             Some((
-                connected.then(|| (tab.schema.clone(), tab.name.clone(), kind)),
+                connected.then(|| (tab.schema.clone(), tab.name.clone(), kind, tab.database.clone())),
                 insert,
             ))
         });
@@ -1967,6 +2031,11 @@ impl Render for Workspace {
                 .px(px(layout::SPACE_MD))
                 .bg(t.data_glass())
                 .children(inline_status)
+                // The control ends a transaction, so it takes its room before
+                // either side shares the rest. One that overflows its group is
+                // painted under whatever comes after it, and that element
+                // takes the click.
+                .children(transaction)
                 .child(
                     div()
                         .flex_1()
@@ -1974,7 +2043,6 @@ impl Render for Workspace {
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
-                        .children(transaction)
                         .children(view_sorting)
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
@@ -2005,10 +2073,18 @@ impl Render for Workspace {
                 // Each control appears only when it does something. A pair
                 // of buttons that do nothing is a pair to read past --
                 // see `apply_edits` for its `cmd+s` binding.
+                //
+                // Its box holds its content, because a `justify_end` group
+                // narrower than its controls spills them leftward over paging
+                // and the transaction control.
+                //
+                // ponytail: below the width that fits the control, paging and
+                // this cluster, the bar runs off its right edge and the
+                // rightmost controls are out of reach. The upgrade is an
+                // overflow menu for the cluster.
                 .child(
                     div()
                         .flex_1()
-                        .min_w_0()
                         .justify_end()
                         .flex()
                         .items_center()
@@ -2076,7 +2152,7 @@ impl Render for Workspace {
                                 .flex()
                                 .items_center()
                                 .gap(px(layout::SPACE_SM))
-                                .children(ddl.map(|(schema, relation, kind)| {
+                                .children(ddl.map(|(schema, relation, kind, database)| {
                                     button(
                                         "copy-create",
                                         "Copy CREATE",
@@ -2086,10 +2162,14 @@ impl Render for Workspace {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
-                                            let (schema, relation) =
-                                                (schema.clone(), relation.clone());
+                                            let (schema, relation, database) = (
+                                                schema.clone(),
+                                                relation.clone(),
+                                                database.clone(),
+                                            );
                                             _ = ddl_workspace.update(cx, |workspace, cx| {
-                                                workspace.copy_ddl(schema, relation, kind, cx);
+                                                workspace
+                                                    .copy_ddl(database, schema, relation, kind, cx);
                                             });
                                         },
                                     )
@@ -2199,6 +2279,9 @@ impl Render for Workspace {
             .flex_col()
             .child(div().flex_1().min_h_0().child(views::render_main_content(
                 profile,
+                &self.profiles,
+                self.view_mode(),
+                self.settings.color_titlebar,
                 self.editor_size(),
                 (self.chrome_zoom, self.editor_zoom, self.grid_zoom),
                 &self.row_panel,
@@ -2241,12 +2324,14 @@ impl Render for Workspace {
                                 .size_full()
                                 .flex()
                                 .flex_col()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .child(self.render_explorer(profile, cx)),
-                                )
+                                .child(div().flex_1().min_h_0().child(match self.view_mode() {
+                                    ViewMode::Complex => {
+                                        self.render_connections(cx).into_any_element()
+                                    }
+                                    ViewMode::Simple => {
+                                        self.render_explorer(profile, cx).into_any_element()
+                                    }
+                                }))
                                 .child(
                                     div()
                                         .h(px(layout::chrome(layout::STATUS_HEIGHT)))
@@ -2470,10 +2555,12 @@ impl Render for Workspace {
                     // already answering, and `escape` reaches it last.
                     ("agent-approval", self.render_agent_approval(cx)),
                     ("agent-audit", self.render_agent_audit(cx)),
+                    ("show-ddl", self.render_show_ddl(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
                     ("delete", self.render_delete_confirmation(cx)),
                     ("discard", self.render_discard_confirmation(cx)),
+                    ("end-transaction", self.render_end_transaction(cx)),
                     ("agent-visibility", self.render_agent_visibility(cx)),
                     ("pending-export", self.render_pending_export(cx)),
                     ("pending-run", self.render_pending_run(cx)),
@@ -2487,6 +2574,59 @@ impl Render for Workspace {
             .children(self.palette.clone())
             .children(self.render_reference_popup(cx))
     }
+}
+
+/// What the `Show DDL` dialog shows, and which object it was asked about: the
+/// answer lands only while the view still names the same request.
+pub(crate) struct DdlView {
+    /// The connection the object belongs to, by id; of several, the one acted
+    /// on last.
+    pub(crate) profile: String,
+    /// The object's database when it is not the connection's own.
+    pub(crate) database: Option<String>,
+    pub(crate) schema: String,
+    pub(crate) name: String,
+    /// What a relation is, `None` for an object with no columns, and for
+    /// several objects: only one relation is offered a [`DiagramState`] to
+    /// toggle to.
+    pub(crate) kind: Option<RelationKind>,
+    /// One definition for one object, one per object for several.
+    pub(crate) sections: Vec<DdlSection>,
+    /// Read the first time it is chosen, not with the definition.
+    pub(crate) diagram: Option<DiagramState>,
+    pub(crate) showing_diagram: bool,
+    pub(crate) request: u64,
+}
+
+impl DdlView {
+    /// What the dialog's header says: the object's, or how many it lists.
+    pub(crate) fn heading(&self) -> String {
+        match self.sections.as_slice() {
+            [only] => only.title.clone(),
+            sections => format!("{} definitions", sections.len()),
+        }
+    }
+}
+
+/// One object's definition in the dialog, under its name.
+pub(crate) struct DdlSection {
+    pub(crate) title: String,
+    pub(crate) text: DdlText,
+}
+
+/// The diagram as the dialog has it.
+pub(crate) enum DiagramState {
+    Loading,
+    Ready(crate::diagram::Diagram),
+    Failed(String),
+}
+
+/// The definition as the dialog has it.
+pub(crate) enum DdlText {
+    Loading,
+    /// Empty when the server returned no definition.
+    Ready(String),
+    Failed(String),
 }
 
 /// A relation a reference arrow lists, by its index into the structure's

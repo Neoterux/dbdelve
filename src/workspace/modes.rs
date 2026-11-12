@@ -29,7 +29,10 @@ impl Workspace {
         // The server-side backstop behind the gate this door already guards --
         // see `Connection::set_read_only`. `query` blocks on the connection
         // mutex, so it goes to the background executor rather than running
-        // here, same as `cancel_query` (queries.rs).
+        // here, same as `cancel_query` (queries.rs). It reaches every session
+        // the profile holds, not only its own connection: one opened for
+        // another database is as able to run a statement, and takes the hold
+        // from its first moment (`open_database`).
         //
         // ponytail: nothing orders these tasks against each other, so flipping
         // modes faster than a round trip can land them out of order and leave
@@ -37,28 +40,34 @@ impl Workspace {
         // stale backstop: where `Engine::holds_read_only`, the gate runs a
         // statement it cannot read in Read-only on the strength of this hold.
         // Stamp each task with a per-profile counter and drop the stale ones.
-        // A connect under way has no connection here at all; its landing
+        // The sessions opened for other databases have the same ceiling. A
+        // connect under way has no connection here at all; its landing
         // checks the mode again (`begin_connect`).
-        let Some(connection) = self.profile().and_then(Profile::connection) else {
-            return;
-        };
+        let connections = self
+            .profile()
+            .map(Profile::sessions_to_hold)
+            .unwrap_or_default();
+        #[cfg(test)]
+        self.held.push(connections.len());
         let entering_read_only = mode == Mode::ReadOnly;
-        let read_only_task = spawn_blocking(cx.background_executor(), move || {
-            connection.set_read_only(entering_read_only)
-        });
-        cx.spawn(async move |workspace, cx| {
-            if let Err(error) = read_only_task.await {
-                // Only entering Read-only is worth a notice: a failure here
-                // leaves the user believing they have protection they don't.
-                // Leaving Read-only on a failed statement leaves the server
-                // still held to reads -- more than asked for, not less -- so
-                // that direction fails silently on purpose.
-                if entering_read_only {
-                    _ = workspace.update(cx, |workspace, cx| workspace.note(error.message, cx));
+        for connection in connections {
+            let read_only_task = spawn_blocking(cx.background_executor(), move || {
+                connection.set_read_only(entering_read_only)
+            });
+            cx.spawn(async move |workspace, cx| {
+                if let Err(error) = read_only_task.await {
+                    // Only entering Read-only is worth a notice: a failure here
+                    // leaves the user believing they have protection they don't.
+                    // Leaving Read-only on a failed statement leaves the server
+                    // still held to reads -- more than asked for, not less -- so
+                    // that direction fails silently on purpose.
+                    if entering_read_only {
+                        _ = workspace.update(cx, |workspace, cx| workspace.note(error.message, cx));
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
     }
 
     /// Whether this connection may do `mode`-level work, raising the prompt
