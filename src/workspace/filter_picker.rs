@@ -391,15 +391,15 @@ impl FilterPicker {
     }
 
     /// What Save writes: each section's entries, and for a list with no
-    /// section the one the profile held.
+    /// section the one the profile held, written as a file is read (trimmed,
+    /// blanks dropped, at most `ENTRIES_CAP` each) so the profile, the file
+    /// and the next load agree.
     fn written(&self) -> Include {
-        Include {
-            databases: self.databases.entries(),
-            schemas: self
-                .schemas
-                .as_ref()
-                .map_or_else(|| self.saved.schemas.clone(), PickerSection::entries),
-        }
+        let schemas = self
+            .schemas
+            .as_ref()
+            .map_or_else(|| self.saved.schemas.clone(), PickerSection::entries);
+        Include::from_stored(self.databases.entries(), schemas)
     }
 
     /// Nothing to write while a section is still being read, or when the lists
