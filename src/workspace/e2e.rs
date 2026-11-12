@@ -2571,6 +2571,100 @@ fn a_listing_that_lands_after_the_picker_closed_changes_nothing(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn a_listing_from_an_earlier_open_that_lands_after_the_picker_was_put_up_again_changes_nothing(
+    cx: &mut TestAppContext,
+) {
+    use super::filter_picker::Listing;
+    use crate::db::{Databases, clickhouse_mock::Response};
+
+    store::tests::with_home(|| {
+        let (mock, workspace, cx) = launch_beside_a_clickhouse_mock(cx);
+        cx.executor().allow_parking();
+        connect_clicks(&workspace, cx);
+        let listed = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .filter_picker_in_front()
+                    .map(|picker| picker.databases.listing.clone())
+            })
+        };
+        let names = |names: &[&str]| {
+            Some(Listing::Loaded(
+                names.iter().map(ToString::to_string).collect(),
+            ))
+        };
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_filter_picker("clicks", window, cx);
+        });
+        drive_until(cx, |cx| {
+            matches!(listed(&workspace, cx), Some(Listing::Loaded(_)))
+        });
+        assert_eq!(listed(&workspace, cx), names(&["analytics", "dbdelve_dev"]));
+        let stale = workspace.read_with(cx, |workspace, _| workspace.last_filter_request);
+
+        // The server now has a third database, which only a read made after
+        // this point can bring back.
+        mock.on_statement(
+            "SELECT DISTINCT database",
+            [Response::rows(
+                &[("name", "String"), ("is_current", "UInt8")],
+                &[
+                    &["analytics", "0"],
+                    &["dbdelve_dev", "1"],
+                    &["reports", "0"],
+                ],
+            )],
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_filter_picker(cx);
+            workspace.open_filter_picker("clicks", window, cx);
+        });
+        drive_until(cx, |cx| {
+            matches!(listed(&workspace, cx), Some(Listing::Loaded(_)))
+        });
+        let three = names(&["analytics", "dbdelve_dev", "reports"]);
+        assert_eq!(listed(&workspace, cx), three);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.last_filter_request, stale + 1);
+        });
+
+        // The first open's answer lands now, under the number it was issued.
+        // It is handed to the landing rather than left to a second real read:
+        // in the test executor `spawn_blocking` runs each read inline and the
+        // scheduler picks among ready tasks at random, so with two reads in
+        // flight the test cannot set which lands last, and the request check
+        // decides anything only when the earlier one lands after the later.
+        // Calling it with the earlier number is that order on every run, and
+        // once the call returns there is nothing left to wait for.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.names_listed_for_picker(
+                stale,
+                Some(Ok(Databases {
+                    names: vec!["analytics".to_string(), "dbdelve_dev".to_string()],
+                    current: Some("dbdelve_dev".to_string()),
+                    left_out: 0,
+                })),
+                None,
+                window,
+                cx,
+            );
+            assert!(workspace.filter_picker_in_front().is_some());
+            let listing = workspace
+                .filter_picker_in_front()
+                .map(|picker| picker.databases.listing.clone());
+            assert_eq!(
+                listing, three,
+                "the earlier read's names replaced the later's"
+            );
+        });
+        settle(cx);
+        assert_eq!(listed(&workspace, cx), three);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn resaving_an_unchanged_filter_leaves_the_file_byte_identical(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_duckdb(
