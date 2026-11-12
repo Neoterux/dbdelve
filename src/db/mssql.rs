@@ -2519,12 +2519,7 @@ mod tests {
                 database: "dbdelve_test".into(),
                 user: "person@example.com".into(),
                 password: "pa ss".into(),
-                sslmode: SslMode::default(),
-                root_certificate: None,
-                statement_timeout: 0,
-                ssh: None,
-                schema: None,
-                read_only: false,
+                ..ServerConfig::default()
             }
         );
         let error = config_from_url("mssql://someone@db.example.test/db?encrypt=true").unwrap_err();
