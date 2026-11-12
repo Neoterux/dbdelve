@@ -467,7 +467,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   own work moves it (`mark_activity`: a statement's start and landing in
   `execute_unchecked`, `run_routed`, the catalog reads, a connect landing);
   agent calls and keep-alive pings never do. The timer sleeps to the deadline
-  and checks it then, so use moves it with no re-arm per event. The deadline
+  and checks it then, so use moves it with no re-arm per event, and the deadline
+  closes only a connected profile: one whose session was lost keeps its failure
+  and drops the timer, as `keep_alive_due` does. The deadline
   passing does not close a profile that has work unfinished, front or not
   (`idle_blocked`): a transaction, a bound session's transaction, a running
   statement, a queue awaiting or holding statements, an import into it, an
