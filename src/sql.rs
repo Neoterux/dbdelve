@@ -5393,6 +5393,68 @@ pub(crate) fn gate(verdict: &Verdict, mode: Mode, confirmed: &[Destructive]) -> 
         .map(Stop::Confirm)
 }
 
+/// The statements of a profile's startup script, judged as the statements of
+/// any other submission are, or why the script may not run. Called at the
+/// form's save and again at every connect, under the profile's mode as it
+/// stands, so a script written under one mode and a profile since lowered
+/// does not run on trust.
+///
+/// All of it or none of it: every unit passes [`gate`] under `mode`, and the
+/// whole leaves no transaction open, which a session that replays the script
+/// on every connection it opens could not close. No dialog is raised -- a
+/// script has no one to ask -- so a statement the gate would stop at a
+/// confirmation fails the script the same way one it refuses does. A blank
+/// script is no script and returns no statements; one holding only comments
+/// is refused, as it was written to do something.
+///
+/// The messages say what the gate found and never repeat the script.
+pub(crate) fn startup_statements(
+    engine: Engine,
+    mode: Mode,
+    confirmed: &[Destructive],
+    script: &str,
+) -> Result<Vec<String>, String> {
+    if script.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let refused = |reason: String| format!("The startup script was not run: {reason}");
+    batch_counts(engine, script).map_err(refused)?;
+    let units: Vec<String> = queued_statements(engine, script, None)
+        .into_iter()
+        .map(|range| script[range].to_string())
+        .collect();
+    if units.is_empty() {
+        return Err("The startup script holds no statement.".into());
+    }
+    for unit in &units {
+        match gate(&classify(engine, unit), mode, confirmed) {
+            None => {}
+            Some(Stop::Upgrade(needed)) => {
+                return Err(refused(format!(
+                    "it holds a statement that needs {}, and this connection is {}.",
+                    needed.label(),
+                    mode.label()
+                )));
+            }
+            Some(Stop::Confirm(kind)) => {
+                return Err(refused(format!(
+                    "it holds a {} statement, which this connection asks about first.",
+                    kind.label()
+                )));
+            }
+            Some(Stop::RunOnce) => {
+                return Err(refused(
+                    "DBDelve could not read one of its statements.".into(),
+                ));
+            }
+        }
+    }
+    if leaves(engine, script).transaction == Some(true) || transaction_uncertain(engine, script) {
+        return Err(refused("it would leave a transaction open.".into()));
+    }
+    Ok(units)
+}
+
 /// `sql` laid out over several lines: the same tokens, indented. Refused when
 /// the buffer holds a dollar-quoted body, which this cannot reflow safely.
 ///
@@ -12195,11 +12257,14 @@ mod tests {
             read_only(Engine::Postgres, "SET search_path TO app, public"),
             Ok(vec!["SET search_path TO app, public".to_string()])
         );
-        let two = read_only(Engine::Postgres, "SET a = 1;\nSET b = 2")
-            .expect("two settings are two units");
+        let two = read_only(
+            Engine::Postgres,
+            "SET search_path TO a;\nSET search_path TO b",
+        )
+        .expect("two settings are two units");
         assert_eq!(two.len(), 2);
         assert!(
-            two[0].starts_with("SET a = 1") && two[1] == "SET b = 2",
+            two[0].starts_with("SET search_path TO a") && two[1] == "SET search_path TO b",
             "{two:?}"
         );
 

@@ -88,6 +88,10 @@ pub struct Connection {
     path: Option<String>,
     /// Opened with `SQLITE_OPEN_READ_ONLY`, which [`Self::alongside`] keeps.
     read_only: bool,
+    /// The statements the profile's gated startup script came to, replayed on
+    /// every session opened beside this one. Empty on every connection an
+    /// agent opens, which never passes through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 impl Connection {
@@ -125,6 +129,7 @@ impl Connection {
     fn wrap(connection: rusqlite::Connection, statement_timeout: u32, read_only: bool) -> Self {
         Self {
             read_only,
+            startup: Arc::default(),
             interrupt: Arc::new(connection.get_interrupt_handle()),
             statement_timeout: (statement_timeout > 0)
                 .then(|| Duration::from_secs(u64::from(statement_timeout))),
@@ -143,11 +148,28 @@ impl Connection {
             plain_error("An in-memory database cannot be opened a second time.".into())
         })?;
         let connection = open_file(std::path::Path::new(path), self.read_only)?;
-        Ok(Self {
+        let beside = Self {
             interrupt: Arc::new(connection.get_interrupt_handle()),
             connection: Arc::new(Mutex::new(connection)),
             ..self.clone()
-        })
+        };
+        beside.replay()?;
+        Ok(beside)
+    }
+
+    /// Runs `statements` now, in the order written, and keeps them for every
+    /// session [`Self::alongside`] opens. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        self.startup = statements.into();
+        self.replay()?;
+        Ok(self)
+    }
+
+    /// The startup statements on this session, rows discarded.
+    fn replay(&self) -> Result<(), DbError> {
+        self.startup
+            .iter()
+            .try_for_each(|statement| self.internal_query(statement).map(|_| ()))
     }
 
     /// Interrupting is local and immediate: there is no server to ask, so

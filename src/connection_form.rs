@@ -86,6 +86,9 @@ pub(crate) struct ConnectionForm {
     /// Which connect-time loads run, read on save for every target as the
     /// statement timeout is.
     pub(crate) depth: Depth,
+    /// The script the profile carries, kept as it was until the form has a row
+    /// to write it in.
+    pub(crate) startup_script: String,
     /// An input to focus once it has been mounted.
     ///
     /// A picker can unmount the field the user was typing in, and a window with
@@ -394,6 +397,7 @@ impl ConnectionForm {
             login_database: mongo.and_then(|mongo| mongo.login_database.clone()),
             statement_timeout,
             depth: Depth::default(),
+            startup_script: String::new(),
             error: None,
             test: None,
             notice: None,
@@ -430,6 +434,7 @@ impl ConnectionForm {
         form.editing = Some(profile.id.clone());
         form.color = profile.color;
         form.depth = profile.behaviour.depth;
+        form.startup_script = profile.behaviour.startup_script.clone();
         // No `form.mode` here: the mode dropdown draws only on a fresh form and
         // `save_profile` has no mode to take, so copying it in was a write
         // nothing ever read. The titlebar picker is where an existing
@@ -463,6 +468,7 @@ impl ConnectionForm {
         let mut form = Self::new(Some(&config), window, cx);
         form.color = profile.color;
         form.depth = profile.behaviour.depth;
+        form.startup_script = profile.behaviour.startup_script.clone();
         form.mode = starting_mode(Some(profile.mode));
         form.shortcuts = profile.shortcuts.duplicated();
         form.name.update(cx, |input, cx| {
@@ -474,7 +480,10 @@ impl ConnectionForm {
     /// What the profile does with its connection, as the form has it. Applied
     /// by `Workspace::set_behaviour` after the profile is saved.
     pub(crate) fn behaviour(&self, _cx: &App) -> Result<Behaviour, String> {
-        Ok(Behaviour { depth: self.depth })
+        Ok(Behaviour {
+            depth: self.depth,
+            startup_script: self.startup_script.clone(),
+        })
     }
 
     pub(crate) fn config(&self, cx: &App) -> Result<(String, ConnectionConfig), String> {

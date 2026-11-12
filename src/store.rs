@@ -183,6 +183,12 @@ pub struct StoredProfile {
     /// costs this one field and nothing else. A scalar, so it comes before `ssh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introspection_depth: Option<String>,
+    /// User SQL run on connect and on every session beside it, gated first.
+    /// Plain text like the query history, not a secret store; a hand-edited
+    /// one is judged at every connect, never trusted from disk. A scalar, so
+    /// it comes before `ssh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_script: Option<String>,
     /// The SSH tunnel this profile dials through, or absent for a direct
     /// connection -- which is every profile written before tunnels existed. A
     /// table, so it has to come after every scalar above. Nothing secret is in
@@ -3356,6 +3362,7 @@ user = "shayan"
                 include_databases: Vec::new(),
                 include_schemas: Vec::new(),
                 introspection_depth: None,
+                startup_script: None,
                 ssh: None,
                 open_queries: Vec::new(),
                 open_objects: Vec::new(),
@@ -3417,6 +3424,7 @@ user = "shayan"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![
@@ -3559,6 +3567,7 @@ open_objects = []
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
@@ -4080,6 +4089,7 @@ folder = "Hot"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4166,6 +4176,7 @@ folder = "Hot"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4238,6 +4249,7 @@ folder = "Hot"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: Vec::new(),
@@ -4358,6 +4370,7 @@ open_objects = []
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -4502,6 +4515,7 @@ open_objects = []
                     include_databases: Vec::new(),
                     include_schemas: Vec::new(),
                     introspection_depth: None,
+                    startup_script: None,
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -4543,6 +4557,7 @@ open_objects = []
                     include_databases: Vec::new(),
                     include_schemas: Vec::new(),
                     introspection_depth: None,
+                    startup_script: None,
                     ssh: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -5321,6 +5336,7 @@ open_objects = []
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: vec![
                 StoredQueryTab {
@@ -5698,6 +5714,7 @@ name = \"accounts\"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![
@@ -5822,6 +5839,7 @@ name = \"accounts\"
             include_databases: Vec::new(),
             include_schemas: Vec::new(),
             introspection_depth: None,
+            startup_script: None,
             ssh: None,
             open_queries: Vec::new(),
             open_objects: vec![object],

@@ -267,6 +267,7 @@ impl Workspace {
                     .as_deref()
                     .and_then(Depth::from_slug)
                     .unwrap_or_default(),
+                startup_script: stored.startup_script.unwrap_or_default(),
             },
             confirmed: stored
                 .confirmed
@@ -1959,6 +1960,9 @@ impl Workspace {
         let id = profile.id.clone();
         let mut config = profile.config.clone();
         let mode = profile.mode;
+        let confirmed = profile.confirmed.clone();
+        let script = profile.behaviour.startup_script.clone();
+        let engine_of = config.engine();
         // The sidebar draws the tree whenever there are saved queries, so the
         // old catalog's rows have to leave it with the catalog.
         self.refresh_explorer(&id, cx);
@@ -2016,6 +2020,12 @@ impl Workspace {
                         .set_read_only(true)
                         .map_err(|error| failed("read-only hold", error.message))?;
                 }
+                // The replays the driver makes on later sessions run before
+                // `query_alongside`, `open_database` and `Routed::resolve` apply
+                // the hold. That is safe because every replayed statement passed
+                // the gate under the profile's current mode (D-07).
+                let connection = run_startup(connection, engine_of, mode, &confirmed, &script)
+                    .map_err(|message| failed("startup script", message))?;
                 connection.warm();
                 let elapsed = started.elapsed();
                 tracing::info!(connection = number, engine, ?elapsed, "connected");
@@ -3129,6 +3139,27 @@ enum ProjectChoice {
     /// An existing project, or `None` for No project.
     In(Option<String>),
     New,
+}
+
+/// Gates the profile's startup script under `mode` and runs it on `connection`,
+/// which is handed back with the statements kept for every session the driver
+/// opens beside it. A blank script returns it untouched. The same call at a
+/// connect and in Test connection, so a pass there is a promise about the
+/// connect. The messages never quote the script.
+fn run_startup(
+    connection: Connection,
+    engine: Engine,
+    mode: Mode,
+    confirmed: &[Destructive],
+    script: &str,
+) -> Result<Connection, String> {
+    let statements = sql::startup_statements(engine, mode, confirmed, script)?;
+    if statements.is_empty() {
+        return Ok(connection);
+    }
+    connection
+        .with_startup(statements)
+        .map_err(|error| format!("The startup script failed: {}", error.message))
 }
 
 /// The connection a stored profile describes and any notice it opens with, or,
