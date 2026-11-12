@@ -18,9 +18,9 @@
 //! read and nothing else here has to know how a `Catalog` is built.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use ::mysql::consts::{ColumnFlags, ColumnType};
@@ -384,7 +384,7 @@ fn base_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder 
         Some(dial) => (dial.ip().to_string(), dial.port()),
         None => (server.host.clone(), server.port.unwrap_or(DEFAULT_PORT)),
     };
-    OptsBuilder::new()
+    let options = OptsBuilder::new()
         .ip_or_hostname(Some(host))
         .tcp_port(port)
         // A loopback address would otherwise have the driver ask the server
@@ -396,13 +396,35 @@ fn base_options(server: &ServerConfig, dial: Option<SocketAddr>) -> OptsBuilder 
         // Offered only when there is one. An empty password is not the
         // same as no password, and IAM auth relies on the latter.
         .pass((!server.password.is_empty()).then(|| server.password.clone()))
-        .tcp_connect_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)))
+        .tcp_connect_timeout(Some(Duration::from_secs(
+            server
+                .properties
+                .connect_timeout
+                .map_or(CONNECT_TIMEOUT_SECONDS, u64::from),
+        )));
+    // Set only when the profile names one: unset, the driver sends its own
+    // `program_name`, as it did before the property existed. Never through
+    // `init`, which carries the read-only hold.
+    match &server.properties.application_name {
+        Some(name) => options.connect_attrs(Some(HashMap::from([("program_name", name.as_str())]))),
+        None => options,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Connection attempts `open` has made on this thread. The compose
+    /// healthchecks connect every two seconds, so the server's own counters
+    /// cannot count one open's attempts.
+    static OPEN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Open a connection built from `options`, falling back to plaintext exactly
 /// where `sslmode=prefer` allows it. Shared by the query connection and the
 /// cancel connection so the fallback behaviour cannot drift between them.
 fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn, DbError> {
+    #[cfg(test)]
+    OPEN_ATTEMPTS.set(OPEN_ATTEMPTS.get() + 1);
     match Conn::new(options().ssl_opts(ssl_options(server))) {
         Ok(connection) => Ok(connection),
         // `prefer` is the one rung where a weaker connection is reachable, and
@@ -410,6 +432,8 @@ fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn
         // you can" in one attempt, so this is two — which is what libpq's own
         // `prefer` amounts to. No other mode falls back.
         Err(_) if server.sslmode == SslMode::Prefer => {
+            #[cfg(test)]
+            OPEN_ATTEMPTS.set(OPEN_ATTEMPTS.get() + 1);
             Conn::new(options().ssl_opts(None)).map_err(|error| connect_error(&error, server))
         }
         Err(error) => Err(connect_error(&error, server)),
@@ -426,6 +450,11 @@ fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn
 /// milliseconds and MariaDB's `max_statement_time` seconds, and a server too
 /// old to know the variable fails the connect here rather than the statement
 /// later.
+///
+/// Only DBDelve's fixed session defaults, never the time zone: that is
+/// user-typed text the server may refuse when its tz tables are not loaded,
+/// and a failing init is retried without TLS under `sslmode=prefer`, the
+/// hazard [`replay`]'s comment names. [`connect`] sends it after `open`.
 fn init_statements(server: &ServerConfig, engine: Engine) -> Vec<String> {
     let mut init = Vec::new();
     if server.read_only {
@@ -457,10 +486,20 @@ fn connect(
     dial: Option<SocketAddr>,
 ) -> Result<Conn, DbError> {
     let init = init_statements(server, engine);
-    open(server, || match init.is_empty() {
+    let mut connection = open(server, || match init.is_empty() {
         true => base_options(server, dial),
         false => base_options(server, dial).init(init.clone()),
-    })
+    })?;
+    // Before the callers' script replay, so a zone the script sets wins. Its
+    // refusal is a statement error here and never reaches `open`'s fallback.
+    if let Some(statement) = server
+        .time_zone
+        .as_deref()
+        .and_then(|zone| super::time_zone_statement(engine, zone))
+    {
+        replay(&mut connection, &[statement])?;
+    }
+    Ok(connection)
 }
 
 /// The throwaway connection a cancel opens: the same fields, but bounded end
@@ -508,6 +547,22 @@ pub struct Connection {
     /// this one is busy reading its rows. Opened the first time it is needed
     /// and kept, so a run does not pay for a connect.
     side: Arc<Mutex<Option<Conn>>>,
+    /// The statements the profile's gated startup script came to, replayed by
+    /// [`Self::alongside`] and [`Self::on_database`] on every session opened
+    /// for the user. Empty in every open: an agent's opens never pass through
+    /// [`Self::with_startup`].
+    startup: Arc<[String]>,
+}
+
+/// The profile's startup statements on `connection`, in the order written.
+/// Ordinary statements after the connect and never the driver's `init`: a
+/// failing `init` is retried without TLS under `sslmode=prefer`, and the
+/// script is the user's text, which has no business causing that.
+fn replay(connection: &mut Conn, startup: &[String]) -> Result<(), DbError> {
+    startup
+        .iter()
+        .try_for_each(|statement| connection.query_drop(statement))
+        .map_err(|error| query_error(&error))
 }
 
 impl Connection {
@@ -526,8 +581,24 @@ impl Connection {
                 connection: Arc::new(Mutex::new(connection)),
                 tunnel,
                 side: Arc::default(),
+                startup: Arc::default(),
             })
         })
+    }
+
+    /// Runs `statements` now on this session and keeps them for every session
+    /// opened beside it. The first error stops the rest. Cancel and `KILL`
+    /// sessions never run them.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        replay(
+            &mut *self.connection.lock().map_err(|_| DbError {
+                message: "The connection is unavailable after an earlier internal failure.".into(),
+                position: None,
+            })?,
+            &statements,
+        )?;
+        self.startup = statements.into();
+        Ok(self)
     }
 
     pub fn engine(&self) -> Engine {
@@ -537,7 +608,8 @@ impl Connection {
     /// A second session, for a statement to run on beside this one's; see
     /// [`super::Connection::query_alongside`]. It shares the side session.
     pub fn alongside(&self) -> Result<Self, DbError> {
-        let connection = connect(&self.server, self.engine, self.dial()?)?;
+        let mut connection = connect(&self.server, self.engine, self.dial()?)?;
+        replay(&mut connection, &self.startup)?;
         Ok(Self {
             connection_id: connection.connection_id(),
             connection: Arc::new(Mutex::new(connection)),
@@ -557,7 +629,8 @@ impl Connection {
             database: database.to_string(),
             ..self.server.clone()
         };
-        let connection = connect(&server, self.engine, self.dial()?)?;
+        let mut connection = connect(&server, self.engine, self.dial()?)?;
+        replay(&mut connection, &self.startup)?;
         Ok(Self {
             connection_id: connection.connection_id(),
             server,
@@ -574,6 +647,24 @@ impl Connection {
         self.connection
             .lock()
             .map_or(true, |mut connection| connection.ping().is_err())
+    }
+
+    /// One `COM_PING` on the session. A statement holding the connection is
+    /// the session in use, so the ping is skipped, never queued behind it; a
+    /// poisoned lock is a session every later statement would fail on, as
+    /// [`Connection::is_lost`] counts it.
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut connection = match self.connection.try_lock() {
+            Ok(connection) => connection,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(DbError {
+                    message: "The connection is closed.".into(),
+                    position: None,
+                });
+            }
+        };
+        connection.ping().map_err(|error| query_error(&error))
     }
 
     fn dial(&self) -> Result<Option<SocketAddr>, DbError> {
@@ -976,6 +1067,8 @@ impl Connection {
             connection: Arc::new(Mutex::new(connection)),
             tunnel: self.tunnel.clone(),
             side: Arc::default(),
+            // Reads of DBDelve's own, never a statement of the user's.
+            startup: Arc::default(),
         })
     }
 
@@ -1428,6 +1521,191 @@ mod tests {
         .expect("connection should open")
     }
 
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_startup_script_holds_on_every_user_session() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                ..live_config(engine)
+            };
+            let count = |connection: &Connection| {
+                let result = connection
+                    .query("SELECT @dbdelve_n", Fetch::default())
+                    .expect("the variable reads");
+                result.rows[0].get(0).map(str::to_string)
+            };
+            let script = || vec!["SET @dbdelve_n = COALESCE(@dbdelve_n, 0) + 1".to_string()];
+            let scripted = Connection::open(&config, engine)
+                .and_then(|connection| connection.with_startup(script()))
+                .expect("the script runs");
+            assert_eq!(count(&scripted).as_deref(), Some("1"), "{engine:?}");
+            let beside = scripted.alongside().expect("a session beside it opens");
+            assert_eq!(count(&beside).as_deref(), Some("1"), "{engine:?}");
+            let other = scripted
+                .on_database("dbdelve_archive")
+                .expect("a session opens");
+            assert_eq!(count(&other).as_deref(), Some("1"), "{engine:?}");
+            assert_eq!(count(&scripted).as_deref(), Some("1"), "{engine:?}");
+
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            let read = agent
+                .query(
+                    "SELECT @dbdelve_n",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), None, "{engine:?}");
+
+            let Err(error) = Connection::open(&config, engine).and_then(|connection| {
+                connection.with_startup(vec!["SELECT * FROM no_such_table".into()])
+            }) else {
+                panic!("{engine:?}: a failing script should fail the open");
+            };
+            assert!(error.message.contains("no_such_table"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_time_zone_the_server_refuses_fails_the_connect_in_one_attempt() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let with_zone = |zone: &str| ServerConfig {
+                sslmode: SslMode::Prefer,
+                time_zone: Some(zone.into()),
+                ..live_config(engine)
+            };
+            OPEN_ATTEMPTS.set(0);
+            let refused = connect(&with_zone("Nowhere/Invalid"), engine, None)
+                .err()
+                .unwrap_or_else(|| panic!("{engine:?} accepted a zone it does not know"));
+            assert!(
+                refused.message.contains("time zone"),
+                "{engine:?}: {}",
+                refused.message
+            );
+            assert_eq!(OPEN_ATTEMPTS.get(), 1, "{engine:?} retried after the zone");
+
+            // Control: a first attempt that completes TLS is one attempt, so a
+            // retry would have shown as two.
+            OPEN_ATTEMPTS.set(0);
+            connect(&with_zone("+02:00"), engine, None).expect("a valid zone connects");
+            assert_eq!(OPEN_ATTEMPTS.get(), 1, "{engine:?} did not complete TLS");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_time_zone_reaches_every_session() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                time_zone: Some("+02:00".into()),
+                ..live_config(engine)
+            };
+            let zone = |connection: &Connection| {
+                let result = connection
+                    .query("SELECT @@session.time_zone", Fetch::default())
+                    .expect("the variable reads");
+                result.rows[0].get(0).map(str::to_string)
+            };
+            let main = Connection::open(&config, engine).expect("the connection opens");
+            assert_eq!(zone(&main).as_deref(), Some("+02:00"), "{engine:?}");
+            let beside = main.alongside().expect("a session beside it opens");
+            assert_eq!(zone(&beside).as_deref(), Some("+02:00"), "{engine:?}");
+            let other = main
+                .on_database("dbdelve_archive")
+                .expect("a session opens");
+            assert_eq!(zone(&other).as_deref(), Some("+02:00"), "{engine:?}");
+
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            let read = agent
+                .query(
+                    "SELECT @@session.time_zone",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), Some("+02:00"), "{engine:?}");
+
+            // Without one the session is the server's own.
+            let bare = Connection::open(
+                &ServerConfig {
+                    time_zone: None,
+                    ..config
+                },
+                engine,
+            )
+            .expect("the connection opens");
+            assert_eq!(zone(&bare).as_deref(), Some("SYSTEM"), "{engine:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_driver_properties_reach_the_server() {
+        let properties = crate::db::Properties {
+            application_name: Some("billing app".into()),
+            connect_timeout: Some(5),
+        };
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                properties: properties.clone(),
+                ..live_config(engine)
+            };
+            let main = Connection::open(&config, engine).expect("the connection opens");
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            if engine == Engine::MariaDb {
+                // The dev image leaves `performance_schema` off, so the attribute
+                // is not readable back; the connect and an answer are what shows
+                // the options were accepted.
+                let result = main
+                    .query("SELECT 1", Fetch::default())
+                    .expect("the session answers");
+                assert_eq!(result.rows[0].get(0), Some("1"));
+                let read = agent
+                    .query(
+                        "SELECT 1",
+                        &crate::db::CancelToken::default(),
+                        Fetch::default(),
+                    )
+                    .expect("the agent reads");
+                assert_eq!(read.rows[0].get(0), Some("1"));
+                continue;
+            }
+            // The account's own view: the dev user may read it, where the table
+            // of every session needs a grant on `performance_schema`.
+            let attribute = "SELECT ATTR_VALUE FROM performance_schema.session_account_connect_attrs \
+                WHERE PROCESSLIST_ID = CONNECTION_ID() AND ATTR_NAME = 'program_name'";
+            let result = main
+                .query(attribute, Fetch::default())
+                .expect("the attribute reads");
+            assert_eq!(result.rows[0].get(0), Some("billing app"));
+            let read = agent
+                .query(
+                    attribute,
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), Some("billing app"));
+        }
+    }
+
     /// The compose database as the bastion sees it, by service name and the
     /// port inside the network.
     fn live_tunnelled() -> ServerConfig {
@@ -1826,12 +2104,7 @@ ORDER BY 1, 2
                 // contain anything a URL can encode.
                 user: "person@example.com".into(),
                 password: "pa ss".into(),
-                sslmode: SslMode::default(),
-                root_certificate: None,
-                statement_timeout: 0,
-                ssh: None,
-                schema: None,
-                read_only: false,
+                ..ServerConfig::default()
             }
         );
         assert_eq!(
@@ -2004,6 +2277,44 @@ ORDER BY 1, 2
     }
 
     #[test]
+    fn driver_properties_ride_the_options() {
+        let opts = |properties| -> ::mysql::Opts {
+            base_options(
+                &ServerConfig {
+                    properties,
+                    ..ServerConfig::default()
+                },
+                None,
+            )
+            .into()
+        };
+        let set = opts(crate::db::Properties {
+            application_name: Some("billing".into()),
+            connect_timeout: Some(5),
+        });
+        assert_eq!(
+            set.get_connect_attrs()
+                .and_then(|attrs| attrs.get("program_name"))
+                .map(String::as_str),
+            Some("billing")
+        );
+        assert_eq!(set.get_tcp_connect_timeout(), Some(Duration::from_secs(5)));
+        // Nothing set is as it was: the driver's own attributes, a ten-second dial.
+        let bare = opts(crate::db::Properties::default());
+        assert!(
+            bare.get_connect_attrs()
+                .is_none_or(|attrs| !attrs.contains_key("program_name")),
+            "DBDelve names no program of its own"
+        );
+        assert_eq!(
+            bare.get_tcp_connect_timeout(),
+            Some(Duration::from_secs(10))
+        );
+        // The channel the hold rides is not touched.
+        assert!(set.get_init().is_empty());
+    }
+
+    #[test]
     fn verify_full_through_a_tunnel_is_refused_before_ssh_starts() {
         let server = ServerConfig {
             host: "db.example.test".into(),
@@ -2074,6 +2385,27 @@ ORDER BY 1, 2
             init_statements(&server(false, 30), Engine::MariaDb),
             ["SET SESSION max_statement_time = 30"]
         );
+    }
+
+    #[test]
+    fn init_carries_the_hold_and_the_timeout_and_never_the_time_zone() {
+        // The zone is user-typed text the server may refuse, and a refused
+        // init is retried in plaintext under `prefer`.
+        let server = |time_zone: Option<&str>| ServerConfig {
+            read_only: true,
+            statement_timeout: 30,
+            time_zone: time_zone.map(str::to_string),
+            ..ServerConfig::default()
+        };
+        let expected = [
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET SESSION max_execution_time = 30000",
+        ];
+        assert_eq!(
+            init_statements(&server(Some("Europe/Paris")), Engine::MySql),
+            expected
+        );
+        assert_eq!(init_statements(&server(None), Engine::MySql), expected);
     }
 
     #[test]
@@ -2425,6 +2757,43 @@ ORDER BY 1, 2
                 .is_err()
         );
         assert!(connection.is_lost());
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_keep_alive_ping_answers_and_never_waits_on_a_busy_session() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let connection = live(engine);
+            assert!(
+                connection.ping().is_ok(),
+                "{engine:?}: an idle session answers"
+            );
+
+            // A statement holds the connection for as long as it runs; the
+            // round skips that session rather than queue behind it.
+            let busy = connection.connection.lock().expect("nothing else holds it");
+            let started = Instant::now();
+            assert!(
+                connection.ping().is_ok(),
+                "{engine:?}: a busy session is skipped"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{engine:?}: and the skip does not wait"
+            );
+            drop(busy);
+
+            live(engine)
+                .query(
+                    &format!("KILL {}", connection.connection_id),
+                    Fetch::default(),
+                )
+                .expect("the kill runs");
+            assert!(
+                connection.ping().is_err(),
+                "{engine:?}: a killed session is lost"
+            );
+        }
     }
 
     fn live_a_cancel_stops_a_running_statement_without_closing_the_session(engine: Engine) {

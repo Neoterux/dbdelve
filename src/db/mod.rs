@@ -33,6 +33,7 @@ mod mysql;
 pub(crate) mod odbc_string;
 pub(crate) mod plugin;
 mod postgres;
+mod properties;
 mod redis;
 mod snowflake;
 mod spec;
@@ -52,6 +53,7 @@ pub(crate) use external::echo;
 pub(crate) use include::same_name;
 pub use include::{Include, Shown};
 pub use plugin::Plugin;
+pub use properties::{Properties, Property};
 
 pub use mongo::MongoConfig;
 pub use postgres::PostgresConfig;
@@ -63,7 +65,7 @@ pub use spec::{
     ParserDialect, RegexMatch, SelectTop, SkipDuplicates, SqlSpec, StatementSplit, SubstringMatch,
     Truncate, TypedExplain,
 };
-pub use spec::{IdentityInsert, ReadOnlySession, UnreadableFloor};
+pub use spec::{IdentityInsert, ReadOnlySession, SessionTimeZone, UnreadableFloor};
 pub use target::{Driver, Levels, Target, cancel_cost, is_cancel};
 
 /// One run's claim on Cancel: [`Connection::query`] runs under it, and
@@ -1147,6 +1149,8 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
         ssh: None,
         schema: None,
         read_only: false,
+        time_zone: None,
+        properties: Properties::default(),
     })
 }
 
@@ -1236,6 +1240,42 @@ pub struct ServerConfig {
     /// [`ConnectionConfig::with_read_only_hold`]: it is never stored, and a
     /// user's own connection never carries it.
     pub read_only: bool,
+    /// The session time zone, where [`Target::takes_time_zone`]. Applied by
+    /// each engine module as a session default, never spliced into the user's
+    /// submission, and None sends nothing, so the server's own zone stands.
+    pub time_zone: Option<String>,
+    /// The driver settings the profile set, each mapped by the engine module
+    /// onto the one driver field it names. Config, so every connection opened
+    /// from it carries them, an agent's included.
+    pub properties: Properties,
+}
+
+/// The longest a session time zone may be.
+const TIME_ZONE_CAP: usize = 64;
+
+/// Whether `zone` may be sent as a session time zone: a name (`Europe/Paris`,
+/// `Etc/GMT+5`, `UTC`) or an offset (`+05:30`), which is letters, digits and
+/// `_ / + - :`. Nothing else is admitted, so no quote or backslash can end the
+/// literal it is written into.
+pub fn check_time_zone(zone: &str) -> Result<(), String> {
+    let zone = zone.trim();
+    if zone.is_empty() {
+        return Err("The time zone is blank.".to_string());
+    }
+    if zone.chars().count() > TIME_ZONE_CAP {
+        return Err(format!(
+            "The time zone is longer than {TIME_ZONE_CAP} characters."
+        ));
+    }
+    if let Some(bad) = zone
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | '-' | ':')))
+    {
+        return Err(format!(
+            "The time zone `{zone}` holds `{bad}`, which a time zone name does not."
+        ));
+    }
+    Ok(())
 }
 
 impl ServerConfig {
@@ -2249,6 +2289,28 @@ impl Connection {
         }
     }
 
+    /// Runs the profile's gated startup `statements` now, on this session, and
+    /// keeps them for every session the driver opens beside it. Only the live
+    /// connection a user works on is handed them: the agent openers take a
+    /// [`ConnectionConfig`] alone, which holds no script.
+    ///
+    /// An engine without a carrier is handed none; it refuses a non-empty list
+    /// rather than drop it, so a script is never silently skipped.
+    pub fn with_startup(self, statements: Vec<String>) -> Result<Self, DbError> {
+        match self {
+            Self::Sqlite(connection) => connection.with_startup(statements).map(Self::Sqlite),
+            Self::Postgres(connection) => connection.with_startup(statements).map(Self::Postgres),
+            Self::MySql(connection) => connection.with_startup(statements).map(Self::MySql),
+            Self::SqlServer(connection) => connection.with_startup(statements).map(Self::SqlServer),
+            Self::Turso(connection) => connection.with_startup(statements).map(Self::Turso),
+            Self::DuckDb(connection) => connection.with_startup(statements).map(Self::DuckDb),
+            other if statements.is_empty() => Ok(other),
+            _ => Err(plain_error(
+                "This connection runs no startup script.".into(),
+            )),
+        }
+    }
+
     /// Open now what the first run would otherwise wait on opening.
     pub fn warm(&self) {
         if let Self::Postgres(connection) = self {
@@ -2709,6 +2771,27 @@ impl Connection {
             | Self::ClickHouse(_)
             | Self::MongoDb(_)
             | Self::Redis(_) => false,
+        }
+    }
+
+    /// One round trip on this session, so an idle cut-off between here and the
+    /// server does not close it. Returns at once, sending nothing, when a
+    /// statement holds the session, and is a no-op on an engine with no
+    /// long-lived session to keep (`Target::keeps_alive`). The error is a
+    /// session that did not answer.
+    pub fn ping(&self) -> Result<(), DbError> {
+        match self {
+            Self::Postgres(connection) => connection.ping(),
+            Self::MySql(connection) => connection.ping(),
+            Self::SqlServer(connection) => connection.ping(),
+            Self::Redis(connection) => connection.ping(),
+            Self::Sqlite(_)
+            | Self::Turso(_)
+            | Self::DuckDb(_)
+            | Self::Snowflake(_)
+            | Self::ClickHouse(_)
+            | Self::MongoDb(_)
+            | Self::External(_) => Ok(()),
         }
     }
 
@@ -4167,6 +4250,23 @@ fn lock_wait_statement(engine: Engine, seconds: u32) -> Option<String> {
     }
 }
 
+/// The statement that sets this session's time zone, or `None` where the
+/// engine has no session statement for it: ClickHouse sends the zone as a
+/// setting on each request instead, and the rest take none from a profile.
+///
+/// `zone` has passed [`check_time_zone`] -- the form and the restore both ask
+/// it -- and is quoted here as well, so a zone that slipped past still cannot
+/// end the literal.
+fn time_zone_statement(engine: Engine, zone: &str) -> Option<String> {
+    let spec = engine.spec();
+    let literal = spec.quote_literal(zone);
+    match spec.sql.session_time_zone {
+        SessionTimeZone::SetTimeZone => Some(format!("SET TIME ZONE {literal}")),
+        SessionTimeZone::TimeZoneVariable => Some(format!("SET time_zone = {literal}")),
+        SessionTimeZone::None | SessionTimeZone::RequestSetting => None,
+    }
+}
+
 /// Shared with `postgres::tests`, which exercises `assemble`'s type-matching
 /// against the same synthetic result shape.
 #[cfg(test)]
@@ -4468,6 +4568,29 @@ pub(super) fn fill_placeholders(template: &str, schema: &str, relation: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_zone_with_a_quote_is_refused() {
+        for zone in [
+            "UTC",
+            "SYSTEM",
+            "Europe/Paris",
+            "America/Port-au-Prince",
+            "Etc/GMT+5",
+            "+05:30",
+        ] {
+            assert_eq!(check_time_zone(zone), Ok(()), "{zone}");
+        }
+        let long = "a".repeat(65);
+        for zone in ["Europe/Paris'", "a b", "UTC;", r"a\b", long.as_str()] {
+            let message = check_time_zone(zone).expect_err(zone);
+            assert!(
+                message.contains(zone) || message.contains("64"),
+                "names the value or the limit: {message}"
+            );
+        }
+        assert!(check_time_zone("").is_err() && check_time_zone("   ").is_err());
+    }
 
     #[test]
     fn only_mysql_and_mariadb_commit_an_open_transaction_at_a_begin() {
@@ -6569,5 +6692,80 @@ mod tests {
             }
         }
         crate::sql_snapshots::check("spellings_read_only", &out);
+    }
+
+    /// Only the engines whose session takes a time zone by a statement have
+    /// one; ClickHouse sends it on each request instead, so it has none here.
+    #[test]
+    fn time_zone_statements_are_recorded_per_engine() {
+        for engine in Engine::ALL {
+            let expected = match engine {
+                Engine::Postgres => Some("SET TIME ZONE 'Europe/Paris'"),
+                Engine::MySql | Engine::MariaDb => Some("SET time_zone = 'Europe/Paris'"),
+                _ => None,
+            };
+            assert_eq!(
+                time_zone_statement(engine, "Europe/Paris").as_deref(),
+                expected,
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// The script is the user's session's: every session the driver opens
+    /// beside theirs replays it, and an agent's connections, opened from the
+    /// config alone, never see it.
+    #[test]
+    fn a_startup_script_replays_on_every_user_session_and_never_on_an_agents() {
+        let directory =
+            std::env::temp_dir().join(format!("dbdelve-startup-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is creatable");
+        let path = directory.join("startup.db");
+        rusqlite::Connection::open(&path).expect("the file is creatable");
+        let config = ConnectionConfig::Sqlite {
+            path: path.display().to_string(),
+            statement_timeout: 0,
+        };
+        let cache_size = |connection: &Connection| {
+            let result = connection
+                .query(
+                    "PRAGMA cache_size",
+                    &CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the pragma reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+
+        let plain = Connection::open(config.clone()).expect("it opens");
+        let default = cache_size(&plain);
+        assert_ne!(default.as_deref(), Some("4000"));
+        let unchanged = Connection::open(config.clone())
+            .and_then(|connection| connection.with_startup(vec![]))
+            .expect("an empty script runs nothing");
+        assert_eq!(cache_size(&unchanged), default);
+
+        let scripted = Connection::open(config.clone())
+            .and_then(|connection| connection.with_startup(vec!["PRAGMA cache_size = 4000".into()]))
+            .expect("the script runs");
+        assert_eq!(cache_size(&scripted).as_deref(), Some("4000"));
+        let apart = scripted.apart().expect("a session beside it opens");
+        assert_eq!(cache_size(&apart).as_deref(), Some("4000"));
+        let beside = scripted
+            .query_alongside(
+                "PRAGMA cache_size",
+                &CancelToken::default(),
+                Fetch::default(),
+                false,
+            )
+            .expect("a statement runs beside it");
+        assert_eq!(beside.rows[0].get(0), Some("4000"));
+
+        let agent = Connection::open_for_agent(config.clone()).expect("the agent's opens");
+        assert_eq!(cache_size(&agent), default);
+        let write = Connection::open_for_approved_write(config, 5).expect("the write opens");
+        assert_eq!(cache_size(&write), default);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

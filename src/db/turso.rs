@@ -22,6 +22,11 @@ pub struct Connection {
     connect: Arc<dyn Fn() -> Result<Arc<TursoConnection>, TursoError> + Send + Sync>,
     connection: Arc<TursoConnection>,
     running: Arc<Mutex<()>>,
+    /// The statements the profile's gated startup script came to, replayed on
+    /// every session opened beside this one. The `connect` closure above is
+    /// built before any script exists and holds none; agent opens never pass
+    /// through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 impl Connection {
@@ -103,16 +108,34 @@ impl Connection {
             connection: connect()?,
             connect,
             running: Arc::new(Mutex::new(())),
+            startup: Arc::default(),
         })
     }
 
     pub fn alongside(&self) -> Result<Self, DbError> {
         let connection = (self.connect)().map_err(|error| plain_error(error.to_string()))?;
-        Ok(Self {
+        let beside = Self {
             connection,
             running: Arc::new(Mutex::new(())),
             ..self.clone()
-        })
+        };
+        beside.replay()?;
+        Ok(beside)
+    }
+
+    /// Runs `statements` now, in the order written, and keeps them for every
+    /// session [`Self::alongside`] opens. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        self.startup = statements.into();
+        self.replay()?;
+        Ok(self)
+    }
+
+    /// The startup statements on this session, rows discarded.
+    fn replay(&self) -> Result<(), DbError> {
+        self.startup
+            .iter()
+            .try_for_each(|statement| self.internal_query(statement).map(|_| ()))
     }
 
     pub fn cancel(&self) -> Result<(), DbError> {
@@ -727,6 +750,55 @@ mod tests {
             .unwrap();
         release.join().unwrap();
         assert_eq!(count(&waiter), "2");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `cache_size` is per connection, so a session that never ran the script
+    /// reads its default and one that did reads the script's value.
+    #[test]
+    fn a_startup_script_replays_beside_the_connection_and_never_on_an_agents() {
+        let dir =
+            std::env::temp_dir().join(format!("dbdelve-turso-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("startup.db").to_string_lossy().into_owned();
+        let cache_size = |connection: &Connection| {
+            let result = connection
+                .query("PRAGMA cache_size", Fetch::default())
+                .expect("the pragma reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        let plain = Connection::open_at(&path, None, 0).unwrap();
+        let default = cache_size(&plain);
+        assert_ne!(default.as_deref(), Some("4000"));
+
+        let scripted = Connection::open(&path, 0)
+            .unwrap()
+            .with_startup(vec!["PRAGMA cache_size = 4000".into()])
+            .expect("the script runs");
+        assert_eq!(cache_size(&scripted).as_deref(), Some("4000"));
+        let beside = scripted.alongside().unwrap();
+        assert_eq!(cache_size(&beside).as_deref(), Some("4000"));
+        assert_eq!(
+            cache_size(&plain),
+            default,
+            "the script is the session's own"
+        );
+
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::Turso {
+            path,
+            statement_timeout: 0,
+        })
+        .unwrap();
+        let read = agent
+            .query(
+                "PRAGMA cache_size",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .unwrap();
+        assert_eq!(read.rows[0].get(0).map(str::to_string), default);
+        drop((agent, scripted, beside, plain));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

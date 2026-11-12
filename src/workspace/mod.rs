@@ -27,6 +27,7 @@ mod projects;
 mod queries;
 mod sidebar;
 mod tabs;
+mod timers;
 mod transactions;
 mod welcome;
 
@@ -255,6 +256,13 @@ pub(crate) struct Workspace {
     /// nothing can be counted.
     #[cfg(test)]
     pub(crate) size_reads: usize,
+    /// How many routine reads were started, counted as `size_reads` is.
+    #[cfg(test)]
+    pub(crate) routine_reads: usize,
+    /// How many keep-alive rounds pinged, which run on the blocking pool where
+    /// nothing can be counted.
+    #[cfg(test)]
+    pub(crate) pings: usize,
     /// Profiles on an engine this build cannot open, held as they were read
     /// and written back by `remember_profiles`; never restored.
     pub(crate) unavailable: Vec<store::UnavailableProfile>,
@@ -605,6 +613,10 @@ impl Workspace {
             opened: Vec::new(),
             #[cfg(test)]
             size_reads: 0,
+            #[cfg(test)]
+            routine_reads: 0,
+            #[cfg(test)]
+            pings: 0,
             focus: cx.focus_handle(),
             explorer_focus: cx.focus_handle(),
             connections: sidebar::ConnectionsSidebar::new(window, cx),
@@ -1692,6 +1704,7 @@ impl Render for Workspace {
                 .children(self.palette.clone());
         };
         let failed = matches!(profile.state, ProfileState::Failed(_));
+        let idle = matches!(profile.state, ProfileState::Idle);
         let status = match &profile.state {
             ProfileState::Idle => "Connection is idle.".to_string(),
             ProfileState::Connecting => format!("Connecting to {}…", profile.config.endpoint()),
@@ -1955,10 +1968,11 @@ impl Render for Workspace {
                     .text_color(if failed { t.danger } else { t.text_muted })
                     .child(status),
             )
-            .when(failed, |group| {
+            .when(failed || idle, |group| {
                 group.child(
                     div()
                         .flex_shrink_0()
+                        .debug_selector(|| "reconnect-button".into())
                         .child(ui::reconnect_button("reconnect", t)),
                 )
             });
