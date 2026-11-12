@@ -676,16 +676,46 @@ fn set_search_path(client: &mut Client, schema: &str) -> Result<(), DbError> {
     }
 }
 
-/// The session's own `search_path` again, as the role, database or server set
-/// it: where a session opened with no schema picked starts.
-fn reset_search_path(client: &mut Client) -> Result<(), DbError> {
-    let reset = "RESET search_path";
+/// What puts a session back on the `search_path` a bound run with no schema
+/// expects: the one it held once its startup script ran, or the one the role,
+/// database or server gave it where no script ran. The captured text is the
+/// server's own stored value, which it already accepted, so it is set back
+/// verbatim. No transaction guard, as `RESET` carried none: a bound no-schema
+/// transaction must keep running.
+fn put_back_search_path_sql(after_startup: Option<&str>) -> String {
+    match after_startup {
+        None => "RESET search_path".into(),
+        Some(path) => {
+            let path = path.replace('\\', r"\\").replace('\'', "''");
+            format!("SELECT pg_catalog.set_config('search_path', E'{path}', false)")
+        }
+    }
+}
+
+fn put_back_search_path(client: &mut Client, after_startup: Option<&str>) -> Result<(), DbError> {
+    let put_back = put_back_search_path_sql(after_startup);
     let Client { client, driver, .. } = client;
     driver
-        .block_on(client.simple_query(reset))
+        .block_on(client.simple_query(&put_back))
         .and_then(|done| done)
         .map(|_| ())
-        .map_err(|error| query_error(&error, reset))
+        .map_err(|error| query_error(&error, &put_back))
+}
+
+/// The `search_path` `client` holds now, for putting a session back on what a
+/// startup script left. A failed read fails the open like the script's own
+/// error: a connect never promises a `search_path` it cannot put back.
+fn read_search_path(client: &mut Client) -> Result<Option<String>, DbError> {
+    let read = "SELECT pg_catalog.current_setting('search_path')";
+    let Client { client, driver, .. } = client;
+    let messages = driver
+        .block_on(client.simple_query(read))
+        .and_then(|done| done)
+        .map_err(|error| query_error(&error, read))?;
+    Ok(messages.into_iter().find_map(|message| match message {
+        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+        _ => None,
+    }))
 }
 
 /// The server's own name, which TLS verifies, dialled at the tunnel's address
@@ -961,6 +991,10 @@ pub struct Connection {
     /// [`Self::connect`] on every session opened for the user. Empty in every
     /// open: an agent's opens never pass through [`Self::with_startup`].
     startup: Arc<[String]>,
+    /// The `search_path` this session held once its startup script ran on it.
+    /// A bound run that picks no schema puts the session back on it. `None`
+    /// where no script ran, and `RESET` does the job there.
+    after_startup_search_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1091,6 +1125,10 @@ impl Connection {
         }
         // After the schema pick, so a `search_path` the script sets wins.
         replay(&mut client, startup)?;
+        let after_startup_search_path = match startup.is_empty() {
+            true => None,
+            false => read_search_path(&mut client)?,
+        };
 
         Ok(Self {
             cancel: client.client.cancel_token(),
@@ -1103,19 +1141,24 @@ impl Connection {
             route,
             server: Arc::new(Mutex::new(server.clone())),
             startup: startup.into(),
+            after_startup_search_path,
         })
     }
 
     /// Runs `statements` now on this session and keeps them for every session
     /// this connection opens from here on. The first error stops the rest.
     pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
-        replay(
-            &mut *self.client.lock().map_err(|_| DbError {
-                message: "The connection is unavailable after an earlier internal failure.".into(),
-                position: None,
-            })?,
-            &statements,
-        )?;
+        let mut client = self.client.lock().map_err(|_| DbError {
+            message: "The connection is unavailable after an earlier internal failure.".into(),
+            position: None,
+        })?;
+        replay(&mut client, &statements)?;
+        let after_startup = match statements.is_empty() {
+            true => None,
+            false => read_search_path(&mut client)?,
+        };
+        drop(client);
+        self.after_startup_search_path = after_startup;
         self.startup = statements.into();
         // One opened before the script was known has not run it.
         if let Ok(mut side) = self.side.lock() {
@@ -1299,8 +1342,9 @@ impl Connection {
     }
 
     /// [`Self::query`] for a tab bound to this session's database: `schema`
-    /// goes first on the `search_path`, or the session's own default is put
-    /// back where the tab binds none, before the statement and under the lock
+    /// goes first on the `search_path`, or the session is put back on the one
+    /// it held after its startup script ran (its own default where it ran
+    /// none) where the tab binds none, before the statement and under the lock
     /// that runs it. A statement of another tab, or one of the user's own,
     /// may have moved it since, and two tabs bound to different schemas of one
     /// database share this session, so applying and running as two
@@ -1352,7 +1396,10 @@ impl Connection {
         fetch.hold()?;
         match bound {
             Some(Some(schema)) => set_search_path(&mut client, schema).map_err(super::unplaced)?,
-            Some(None) => reset_search_path(&mut client).map_err(super::unplaced)?,
+            Some(None) => {
+                put_back_search_path(&mut client, self.after_startup_search_path.as_deref())
+                    .map_err(super::unplaced)?
+            }
             None => {}
         }
 
