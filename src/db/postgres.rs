@@ -2210,6 +2210,105 @@ mod tests {
         }
     }
 
+    /// A counter the script bumps, so a session that ran it twice reads 2.
+    const STARTUP_COUNT: &str = "SELECT current_setting('dbdelve.n', true)";
+
+    fn startup_script() -> Vec<String> {
+        vec![
+            "SELECT set_config('dbdelve.n', \
+             (COALESCE(NULLIF(current_setting('dbdelve.n', true), ''), '0')::int + 1)::text, false)"
+                .into(),
+            "SET search_path TO pg_catalog".into(),
+        ]
+    }
+
+    fn cell(connection: &Connection, sql: &str) -> Option<String> {
+        let result = connection
+            .query(sql, Fetch::default())
+            .expect("the statement runs");
+        result.rows[0].get(0).map(str::to_string)
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_startup_script_holds_on_every_user_session() {
+        let scripted = Connection::open(&live_config())
+            .and_then(|connection| connection.with_startup(startup_script()))
+            .expect("the script runs");
+        assert_eq!(cell(&scripted, STARTUP_COUNT).as_deref(), Some("1"));
+        let beside = scripted.alongside().expect("a session beside it opens");
+        assert_eq!(cell(&beside, STARTUP_COUNT).as_deref(), Some("1"));
+        assert_eq!(
+            cell(&beside, "SHOW search_path").as_deref(),
+            Some("pg_catalog")
+        );
+        let database = scripted.current_database().to_string();
+        let other = scripted.on_database(&database).expect("a session opens");
+        assert_eq!(cell(&other, STARTUP_COUNT).as_deref(), Some("1"));
+        let side = scripted
+            .aside(Duration::from_secs(10), |side| {
+                Some(cell(side, STARTUP_COUNT))
+            })
+            .expect("the side session opens");
+        assert_eq!(side.as_deref(), Some("1"));
+        let sizes = scripted.side_session().expect("a session opens");
+        assert_eq!(cell(&sizes, STARTUP_COUNT).as_deref(), Some("1"));
+        // A reused session is not replayed again.
+        assert_eq!(cell(&scripted, STARTUP_COUNT).as_deref(), Some("1"));
+
+        // The schema is picked first, so the script's own `search_path` wins.
+        let picked = ServerConfig {
+            schema: Some("public".into()),
+            ..live_config()
+        };
+        let scripted = Connection::open(&picked)
+            .and_then(|connection| connection.with_startup(startup_script()))
+            .expect("the script runs");
+        assert_eq!(
+            cell(&scripted, "SHOW search_path").as_deref(),
+            Some("pg_catalog")
+        );
+        let beside = scripted.alongside().expect("a session beside it opens");
+        assert_eq!(
+            cell(&beside, "SHOW search_path").as_deref(),
+            Some("pg_catalog")
+        );
+
+        // An agent's connection is built from the config alone.
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::postgres(
+            live_config(),
+        ))
+        .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                STARTUP_COUNT,
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), None);
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_script_cannot_lift_the_side_sessions_bound() {
+        let scripted = Connection::open(&live_config())
+            .and_then(|connection| {
+                connection.with_startup(vec!["SET statement_timeout = 0".into()])
+            })
+            .expect("the script runs");
+        assert_eq!(
+            cell(&scripted, "SHOW statement_timeout").as_deref(),
+            Some("0")
+        );
+        let side = scripted
+            .aside(Duration::from_secs(10), |side| {
+                Some(cell(side, "SHOW statement_timeout"))
+            })
+            .expect("the side session opens");
+        assert_eq!(side.as_deref(), Some("2s"));
+    }
+
     #[test]
     fn a_composed_sequence_quotes_names_whatever_they_hold() {
         let parts = SequenceParts {
