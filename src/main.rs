@@ -33,6 +33,7 @@ mod workspace;
 
 mod icons;
 mod keybindings;
+mod logging;
 mod theme;
 mod tls;
 mod ui;
@@ -56,17 +57,18 @@ use gpui_component::{
 
 use actions::{
     AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CommitTransaction,
-    CopyCell, CopyPlan, CopyResults, CopyRow, CopyRows, CopySelection, CustomRowLimit, CycleMode,
-    DeleteRow, DiscardEdits, EditCell, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen,
-    GoToColumn, HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, LimitTarget,
-    MenuImportRowsFromClipboard, Minimize, MoveTabLeft, MoveTabRight, NewConnection, NewProject,
-    NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult, NextTab, OpenReference,
-    OpenSettings, PreviousEdit, PreviousPage, PreviousProfile, PreviousResult, PreviousTab, Quit,
-    RefreshConnection, RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations,
-    ResetEditorZoom, RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase,
-    SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator,
-    SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor,
-    ShowMessages, ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
+    CopyCell, CopyDiagnostics, CopyPlan, CopyResults, CopyRow, CopyRows, CopySelection,
+    CustomRowLimit, CycleMode, DeleteRow, DiscardEdits, Disconnect, EditCell, ExplainQuery,
+    FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn, ImportConnections,
+    ImportRows, ImportRowsFromClipboard, LimitTarget, MenuImportRowsFromClipboard, Minimize,
+    MoveTabLeft, MoveTabRight, NewConnection, NewProject, NewQuery, NewRow, NextEdit, NextPage,
+    NextProfile, NextResult, NextTab, OpenLogsFolder, OpenReference, OpenSettings, PreviousEdit,
+    PreviousPage, PreviousProfile, PreviousResult, PreviousTab, Quit, RefreshConnection,
+    RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom,
+    RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
+    SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw,
+    SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowMessages,
+    ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
     ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn,
     ToggleResults, ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn,
     ZoomEditorOut,
@@ -106,7 +108,19 @@ use workspace::Workspace;
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
 
 fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, String> {
+    #[cfg(test)]
+    if IGNORE_ENVIRONMENT.get() {
+        return Ok(None);
+    }
     connection_config_from(&|name| std::env::var(name).ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that needs the welcome surface where CI's live job sets
+    /// `PG*`. Per thread, as each test is, since the environment is the
+    /// process's and other tests read it.
+    pub(crate) static IGNORE_ENVIRONMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`connection_config_from_environment`] with its variables handed in, since
@@ -188,85 +202,14 @@ fn connection_config_from(
     })))
 }
 
-/// Where a panic goes when nobody is watching stderr. A `.app` is spawned by
-/// launchd, so a panic message lands in the unified log and the abort that
-/// follows writes an `.ips` trace that does not carry it -- every stranger's
-/// bug report would read "it closed" with nothing to read after it. Installed
-/// first thing in `main`, because the deaths hardest to guess at from outside
-/// are the ones before a window exists.
-///
-/// ponytail: one appended file, never rotated. A few kilobytes per crash; if
-/// that ever becomes a real number, truncate on open past some size.
-fn install_panic_log() {
-    let Some(directory) = panic_log_directory() else {
-        return;
-    };
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Nothing in here may panic: a panic inside the hook aborts with less
-        // to read than the one it was called for. Hence every result dropped
-        // rather than unwrapped.
-        use std::io::Write as _;
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or_default();
-        if std::fs::create_dir_all(&directory).is_ok()
-            && let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join("panic.log"))
-        {
-            let _ = writeln!(
-                file,
-                "--- {at} (unix seconds)\n{info}\n{}",
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
-        previous(info);
-    }));
-}
-
-/// A crash log is state, not cache. macOS uses `Logs`, Linux the XDG state
-/// directory — a cache cleaner is entitled to delete anything in the other
-/// one. Windows uses LocalAppData for the same reason: it stays on this machine.
-fn panic_log_directory() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-        Some(PathBuf::from(home).join("Library/Logs/dbdelve"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let root = std::env::var_os("LOCALAPPDATA")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .filter(|value| !value.is_empty())
-                    .map(|profile| PathBuf::from(profile).join("AppData").join("Local"))
-            })?;
-        Some(root.join("dbdelve"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-        Some(
-            match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-                Some(state_home) => PathBuf::from(state_home).join("dbdelve"),
-                None => PathBuf::from(home).join(".local/state/dbdelve"),
-            },
-        )
-    }
-}
-
 fn main() {
     // The agent shim speaks MCP on stdio and must never open a window or reach
     // GPUI, on any OS, so it is decided before anything else starts.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
         std::process::exit(agent::shim::run());
     }
-    install_panic_log();
+    logging::install_panic_log();
+    logging::install();
     // Manifests only, ahead of the profiles that name them: no plugin process
     // starts until one of its connections opens.
     let plugins = db::plugin::discover();
@@ -441,6 +384,8 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
                 MenuItem::action("Save Query", SaveQuery),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
+                MenuItem::separator(),
+                MenuItem::action("Disconnect", Disconnect),
             ])
             .collect(),
         },
@@ -477,6 +422,14 @@ pub(crate) fn app_menus(imports_rows: bool) -> Vec<Menu> {
         disabled: false,
         items: vec![MenuItem::action("Minimize", Minimize)],
     }))
+    .chain([Menu {
+        name: "Help".into(),
+        disabled: false,
+        items: vec![
+            MenuItem::action("Copy Diagnostics", CopyDiagnostics),
+            MenuItem::action("Open Logs Folder", OpenLogsFolder),
+        ],
+    }])
     .collect()
 }
 

@@ -77,7 +77,11 @@
 
 use std::fmt;
 
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::{
+    ast::Statement,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer},
+};
 
 use crate::db::Engine;
 
@@ -308,6 +312,67 @@ pub(crate) fn agent_gate(engine: Engine, sql: &str, mode: Mode) -> AgentVerdict 
     AgentVerdict::Run
 }
 
+/// What an approvable statement does, which is what the approval says first.
+/// The three kinds are gate steps 9, 10 and 11, one to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalKind {
+    /// It writes (step 9).
+    Write,
+    /// It reads a file, a URL, a program or another server (step 10).
+    EgressRead,
+    /// It calls a function its engine does not list, which may write (step 11).
+    UnlistedCall,
+}
+
+/// The kind of a statement [`agent_gate`] approved with `verdict`. It asks the
+/// predicates step 10 asks rather than restating them, so what the dialog says
+/// cannot contradict the gate: a write is the step-9 verdict at Read-write, and
+/// of the reads the gate approves the ones that are not egress are the ones
+/// that call an unlisted function.
+pub(crate) fn approval_kind(engine: Engine, sql: &str, verdict: &Verdict) -> ApprovalKind {
+    if verdict.mode == Mode::ReadWrite {
+        ApprovalKind::Write
+    } else if super::calls_listed(engine, sql, engine.spec().sql.egress_functions, &[])
+        || reads_a_bare_path(engine, sql)
+    {
+        ApprovalKind::EgressRead
+    } else {
+        ApprovalKind::UnlistedCall
+    }
+}
+
+/// The statements `sql` parses to on `engine`, or none where it is not SQL or
+/// does not parse. The typed parse decides, as the gate's does, so a word in a
+/// comment or a string literal cannot stand in for the statement.
+fn typed_statements(engine: Engine, sql: &str) -> Vec<Statement> {
+    dialect(engine)
+        .and_then(|dialect| Parser::parse_sql(dialect.as_ref(), sql).ok())
+        .unwrap_or_default()
+}
+
+/// Whether `sql` is a Postgres `CREATE INDEX CONCURRENTLY`. Only Postgres
+/// leaves an invalid index behind when a concurrent build stops, which is what
+/// the answer to a stopped write tells the agent about.
+pub(crate) fn creates_index_concurrently(engine: Engine, sql: &str) -> bool {
+    engine == Engine::Postgres
+        && typed_statements(engine, sql).iter().any(
+            |statement| matches!(statement, Statement::CreateIndex(index) if index.concurrently),
+        )
+}
+
+/// Whether the server's row count for `sql` is the rows it changed. A count of
+/// zero is also what a command with no row count reports (see
+/// [`crate::db::QueryResult::rows_affected`]), so it means "no rows" only for
+/// these two statements. `DELETE` and `MERGE` would count too, and are not
+/// listed because [`agent_gate`] approves neither: every `DELETE` is refused,
+/// and a `MERGE` needs Full.
+pub(crate) fn counts_rows(engine: Engine, sql: &str) -> bool {
+    matches!(
+        typed_statements(engine, sql).as_slice(),
+        [Statement::Insert(_) | Statement::Update(_)]
+    )
+}
+
 /// Whether `sql`, on an engine that reads a quoted string in a table position
 /// as a file or a URL (`SELECT * FROM 'data.csv'`), holds a string literal or a
 /// `"`-quoted word with a `.`, `/` or `\` in it. False on every other engine.
@@ -442,6 +507,162 @@ mod tests {
                 expected,
                 "{engine:?} {mode:?}: {text}"
             );
+        }
+    }
+
+    /// Each approvable statement the dialog has to name, with the kind it is.
+    const APPROVABLE: &[(Engine, Mode, &str, ApprovalKind)] = &[
+        (
+            Engine::Postgres,
+            Mode::ReadWrite,
+            "UPDATE t SET a = 1",
+            ApprovalKind::Write,
+        ),
+        (
+            Engine::Sqlite,
+            Mode::ReadWrite,
+            "INSERT INTO t VALUES (1)",
+            ApprovalKind::Write,
+        ),
+        (
+            Engine::Postgres,
+            Mode::ReadOnly,
+            "SELECT * FROM pg_read_file('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::MySql,
+            Mode::ReadOnly,
+            "SELECT * FROM load_file('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::DuckDb,
+            Mode::ReadOnly,
+            "SELECT * FROM 'data.csv'",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::DuckDb,
+            Mode::ReadOnly,
+            "SELECT * FROM glob('x')",
+            ApprovalKind::EgressRead,
+        ),
+        (
+            Engine::Postgres,
+            Mode::ReadWrite,
+            "SELECT my_udf(a) FROM t",
+            ApprovalKind::UnlistedCall,
+        ),
+        (
+            Engine::Sqlite,
+            Mode::ReadWrite,
+            "SELECT my_udf(1)",
+            ApprovalKind::UnlistedCall,
+        ),
+    ];
+
+    #[test]
+    fn approval_kind_names_what_each_approvable_statement_does() {
+        for &(engine, mode, sql, kind) in APPROVABLE {
+            let AgentVerdict::Approve(verdict, _) = agent_gate(engine, sql, mode) else {
+                panic!("{engine:?} {mode:?} {sql}: the gate does not approve it");
+            };
+            assert_eq!(
+                approval_kind(engine, sql, &verdict),
+                kind,
+                "{engine:?} {mode:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_kind_never_contradicts_the_gate() {
+        let corpus = APPROVABLE
+            .iter()
+            .map(|&(_, _, sql, _)| sql)
+            .chain(["CREATE INDEX i ON t (a)"]);
+        for sql in corpus {
+            for engine in Engine::ALL {
+                for mode in Mode::ALL {
+                    if let AgentVerdict::Approve(verdict, _) = agent_gate(engine, sql, mode) {
+                        assert_eq!(
+                            approval_kind(engine, sql, &verdict) == ApprovalKind::Write,
+                            verdict.mode == Mode::ReadWrite,
+                            "{engine:?} {mode:?}: {sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn creates_index_concurrently_reads_the_parse() {
+        for sql in [
+            "CREATE INDEX CONCURRENTLY i ON t (a)",
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS i ON t (a)",
+        ] {
+            assert!(creates_index_concurrently(Engine::Postgres, sql), "{sql}");
+        }
+        for sql in [
+            "CREATE INDEX i ON t (a)",
+            "/* CONCURRENTLY */ CREATE INDEX i ON t (a)",
+            "SELECT 'CREATE INDEX CONCURRENTLY i ON t (a)'",
+            "CREATE INDEX CONCURRENTLY (",
+        ] {
+            assert!(!creates_index_concurrently(Engine::Postgres, sql), "{sql}");
+        }
+        for (engine, sql) in [
+            (Engine::MySql, "CREATE INDEX CONCURRENTLY i ON t (a)"),
+            (Engine::Sqlite, "CREATE INDEX CONCURRENTLY i ON t (a)"),
+            (Engine::MongoDb, "db.t.createIndex({a: 1})"),
+            (Engine::Redis, "SET k v"),
+        ] {
+            assert!(
+                !creates_index_concurrently(engine, sql),
+                "{engine:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_rows_only_for_statements_that_change_rows() {
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::Sqlite,
+            Engine::DuckDb,
+        ] {
+            for sql in ["INSERT INTO t VALUES (1)", "UPDATE t SET a = 1"] {
+                assert!(counts_rows(engine, sql), "{engine:?}: {sql}");
+            }
+        }
+        // Not counted because no agent can run them: every `DELETE` is refused,
+        // and a `MERGE` needs Full, which an agent is refused too.
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                for sql in [
+                    "DELETE FROM t WHERE a = 1",
+                    "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE",
+                ] {
+                    assert!(
+                        matches!(agent_gate(engine, sql, mode), AgentVerdict::Refuse(_)),
+                        "{engine:?} {mode:?}: {sql}"
+                    );
+                }
+            }
+        }
+        for (engine, sql) in [
+            (Engine::Postgres, "CREATE INDEX i ON t (a)"),
+            (Engine::Postgres, "CREATE TABLE u (a int)"),
+            (Engine::Postgres, "ALTER TABLE t ADD COLUMN b int"),
+            (Engine::Postgres, "SELECT 1"),
+            (Engine::Postgres, "UPDATE ("),
+            (Engine::MongoDb, "db.t.insertOne({a: 1})"),
+            (Engine::Redis, "SET k v"),
+        ] {
+            assert!(!counts_rows(engine, sql), "{engine:?}: {sql}");
         }
     }
 

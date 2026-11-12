@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::agent::{AuditVerdict, CallFacts, elapsed_ms};
+use super::agent::{AuditVerdict, CallFacts, Decision, audited_error, elapsed_ms};
 use super::*;
 use crate::{
     agent::{CallId, Reply, Status, result, result::Total, tools::Tool},
@@ -193,10 +193,12 @@ impl Resolved {
     }
 }
 
-/// Said for a statement that needs the user's approval: it is not run for an
-/// agent, and no connection is opened for it.
-pub(crate) const NEEDS_APPROVAL: &str =
-    "statements that need the user's approval are not run for agents";
+/// Said for an `explain_query` of a statement that needs the user's approval:
+/// the plan tool runs reads only, so an `EXPLAIN ANALYZE` of a write never goes
+/// through approval and no connection is opened for it. `execute_sql` holds such
+/// a statement for the person instead.
+pub(crate) const NOT_EXPLAINED: &str =
+    "a statement that needs the user's approval is not run by explain_query";
 
 /// The agent's calls on one profile, and the connection of its own they share.
 ///
@@ -236,6 +238,9 @@ pub(crate) struct Running {
     sql: Option<String>,
     /// When the call reached the window, for the audit's elapsed time.
     arrived: Instant,
+    /// The approval a person gave the statement, which the audit says instead
+    /// of that the gate let it run.
+    approved: Option<Approved>,
     /// What stops the statement on the server when the call ends early.
     cancel: CancelToken,
     /// The connection the statement runs on, held here as soon as it exists so
@@ -270,25 +275,21 @@ pub(crate) struct Waiting {
 /// What a waiting call will do once its lane is free.
 #[derive(Clone)]
 pub(crate) enum AgentWork {
+    /// A statement. `approved` is what a person's approval of it left, for a
+    /// read the gate held for them; a read the gate let run has none.
     Query {
         sql: String,
+        approved: Option<Approved>,
     },
     /// The agent connection's catalog: its schemas, or with `schema` the
     /// relations of that one. DBDelve reads it through the driver and sends no
     /// statement of its own for it.
-    Catalog {
-        schema: Option<String>,
-    },
+    Catalog { schema: Option<String> },
     /// One relation's definition, read through the driver like the catalog.
-    Structure {
-        schema: String,
-        table: String,
-    },
+    Structure { schema: String, table: String },
     /// The engine's EXPLAIN of the agent's statement, already composed and
     /// already judged by the gate as this exact text.
-    Explain {
-        statement: String,
-    },
+    Explain { statement: String },
 }
 
 impl AgentWork {
@@ -302,10 +303,18 @@ impl AgentWork {
         }
     }
 
+    /// The approval this work ran under, if a person gave one.
+    fn approved(&self) -> Option<Approved> {
+        match self {
+            AgentWork::Query { approved, .. } => approved.clone(),
+            _ => None,
+        }
+    }
+
     /// The statement the audit records, for the work that sends one.
     fn sql(&self) -> Option<String> {
         match self {
-            AgentWork::Query { sql } => Some(sql.clone()),
+            AgentWork::Query { sql, .. } => Some(sql.clone()),
             AgentWork::Explain { statement } => Some(statement.clone()),
             AgentWork::Catalog { .. } | AgentWork::Structure { .. } => None,
         }
@@ -325,22 +334,42 @@ pub(super) struct Ended {
     /// How many rows went back and how many there were, when it was answered
     /// with a result.
     pub(super) rows: Option<(usize, Total)>,
-    /// The full error of a read that failed, which the agent was not given.
+    /// What the audit keeps of the error of a read that failed:
+    /// [`audited_error`] of what the agent was given.
     pub(super) error: Option<String>,
+}
+
+/// What a person's approval leaves on a read that ran after it: the verdict the
+/// dialog showed, and the engine the audit file names.
+#[derive(Clone)]
+pub(crate) struct Approved {
+    pub(crate) verdict: AuditVerdict,
+    pub(crate) engine: Engine,
 }
 
 /// What a read that ended records of itself: for a statement, that the gate
 /// let it run and what it sent; for a catalog call, which has no statement
 /// and so no verdict, nothing of either. Then how long it took, and what
 /// `ended` adds.
-fn facts_of(sql: Option<String>, arrived: Instant, ended: Ended) -> CallFacts {
+fn facts_of(
+    sql: Option<String>,
+    approved: Option<Approved>,
+    arrived: Instant,
+    ended: Ended,
+) -> CallFacts {
     CallFacts {
-        verdict: sql.is_some().then_some(AuditVerdict::Run),
+        verdict: match &approved {
+            Some(approved) => Some(approved.verdict.clone()),
+            None => sql.is_some().then_some(AuditVerdict::Run),
+        },
+        decision: approved.as_ref().map(|_| Decision::Approved),
+        engine: approved.map(|approved| approved.engine),
         sql,
         shown: ended.rows.map(|(shown, _)| shown),
         total: ended.rows.map(|(_, total)| total),
         elapsed_ms: elapsed_ms(arrived),
         error: ended.error,
+        ..CallFacts::default()
     }
 }
 
@@ -403,7 +432,7 @@ struct Listing {
 
 /// One result set as the agent reads it. A Postgres spatial cell is rendered
 /// first, as an export renders it, so hex EWKB never spends the agent's tokens.
-fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
+pub(super) fn table_of(engine: Engine, result: &QueryResult) -> result::Table {
     // Only the cells that wait on their type are copied out and replaced; the
     // rest are read where they stand.
     let rendered: HashMap<(usize, usize), String> = db::render(db::unrendered(engine, result))
@@ -480,7 +509,17 @@ impl Workspace {
         arrived: Instant,
         cx: &mut Context<Self>,
     ) {
-        self.run_agent_work(id, profile, AgentWork::Query { sql }, reply, arrived, cx);
+        self.run_agent_work(
+            id,
+            profile,
+            AgentWork::Query {
+                sql,
+                approved: None,
+            },
+            reply,
+            arrived,
+            cx,
+        );
     }
 
     /// Take work for `profile`'s lane, on the same terms as
@@ -610,6 +649,11 @@ impl Workspace {
         let engine = config.engine();
         let cancel = CancelToken::default();
         let sent = work.sql();
+        let approved = work.approved();
+        if approved.is_none() {
+            self.agent
+                .note_started(id, tool, &profile_name, engine, sent.as_deref(), arrived);
+        }
 
         // Called here and not in the task, so what opens is decided when the
         // call starts.
@@ -686,6 +730,7 @@ impl Workspace {
                 reply,
                 sql: sent,
                 arrived,
+                approved,
                 cancel,
                 connection: None,
                 _work: task,
@@ -739,7 +784,12 @@ impl Workspace {
         let (status, text) = match ran {
             Ran::NotOpened(error) => {
                 lane.connection = None;
-                ended.error = Some(error.message);
+                // What the open's error must not name, as the config the lane
+                // opened from says; the keychain's password is never in it.
+                ended.error = Some(audited_error(&scrubbed(
+                    &error.message,
+                    &lane.opened_from.identifying_text(),
+                )));
                 (Status::Failed, OPEN_FAILED.to_string())
             }
             Ran::Done {
@@ -791,7 +841,7 @@ impl Workspace {
                 // reopen after a failed statement.
                 lane.connection = None;
                 let text = scrubbed(&error.message, &hidden);
-                ended.error = Some(error.message);
+                ended.error = Some(audited_error(&text));
                 (Status::Failed, text)
             }
         };
@@ -842,7 +892,12 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, std::mem::take(&mut ended)),
+                    facts_of(
+                        running.sql,
+                        running.approved,
+                        running.arrived,
+                        std::mem::take(&mut ended),
+                    ),
                     stop.filter(|_| early),
                 ));
             }
@@ -855,6 +910,7 @@ impl Workspace {
                 waiting.reply,
                 facts_of(
                     waiting.work.sql(),
+                    waiting.work.approved(),
                     waiting.arrived,
                     std::mem::take(&mut ended),
                 ),
@@ -906,7 +962,12 @@ impl Workspace {
                     running.tool,
                     running.profile_name,
                     running.reply,
-                    facts_of(running.sql, running.arrived, Ended::default()),
+                    facts_of(
+                        running.sql,
+                        running.approved,
+                        running.arrived,
+                        Ended::default(),
+                    ),
                 )
             })
             .into_iter()
@@ -916,7 +977,12 @@ impl Workspace {
                     waiting.tool,
                     waiting.profile_name,
                     waiting.reply,
-                    facts_of(waiting.work.sql(), waiting.arrived, Ended::default()),
+                    facts_of(
+                        waiting.work.sql(),
+                        waiting.work.approved(),
+                        waiting.arrived,
+                        Ended::default(),
+                    ),
                 )
             }));
         for (id, tool, name, reply, facts) in ended {
@@ -975,7 +1041,7 @@ fn run_work(
     engine: Engine,
 ) -> Ran {
     match work {
-        AgentWork::Query { sql } => read_on(connection, hidden, &sql, cancel, engine),
+        AgentWork::Query { sql, .. } => read_on(connection, hidden, &sql, cancel, engine),
         AgentWork::Catalog { schema } => list_on(
             connection,
             hidden,
@@ -1223,7 +1289,7 @@ pub(crate) fn explain_statement(
     // What an approval would show is not for the agent.
     let text = match &verdict {
         AgentVerdict::Run => return Ok(composed),
-        AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
+        AgentVerdict::Approve(..) => NOT_EXPLAINED.to_string(),
         AgentVerdict::Refuse(reason) => reason.to_string(),
     };
     Err(Declined {
@@ -1408,6 +1474,32 @@ mod tests {
     use super::*;
     use crate::db::{ColumnDefinition, ForeignKey, Index, NamedDefinition};
 
+    #[test]
+    fn an_approved_read_is_not_audited_as_a_plain_read() {
+        let sql = || Some("SELECT 1".to_string());
+        let plain = facts_of(sql(), None, Instant::now(), Ended::default());
+        assert_eq!(plain.verdict, Some(AuditVerdict::Run));
+        assert_eq!(plain.decision, None);
+
+        let approved = Approved {
+            verdict: AuditVerdict::Approve {
+                mode: Mode::ReadOnly,
+                expiry: None,
+            },
+            engine: Engine::DuckDb,
+        };
+        let facts = facts_of(sql(), Some(approved), Instant::now(), Ended::default());
+        assert_eq!(
+            facts.verdict,
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadOnly,
+                expiry: None
+            })
+        );
+        assert_eq!(facts.decision, Some(Decision::Approved));
+        assert_eq!(facts.engine, Some(Engine::DuckDb));
+    }
+
     fn relation(
         name: &str,
         kind: RelationKind,
@@ -1458,7 +1550,11 @@ mod tests {
         }
         let held = explain_statement(Engine::Postgres, "UPDATE t SET a = 1", true, Mode::Full)
             .expect_err("a person approves it first");
-        assert_eq!(held.text, NEEDS_APPROVAL);
+        assert_eq!(held.text, NOT_EXPLAINED);
+        assert_eq!(
+            NOT_EXPLAINED,
+            "a statement that needs the user's approval is not run by explain_query"
+        );
     }
 
     #[test]
@@ -1476,7 +1572,7 @@ mod tests {
         )
         .expect_err("an analyzed update waits for a person");
         assert_eq!(held.status, Status::RefusedByGate);
-        assert_eq!(held.text, NEEDS_APPROVAL);
+        assert_eq!(held.text, NOT_EXPLAINED);
 
         let removed = explain_statement(Engine::Postgres, "DELETE FROM t WHERE id = 1", true, mode)
             .expect_err("an analyzed delete is refused");

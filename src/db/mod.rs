@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::tls::SslMode;
 
+mod builtins;
 mod clickhouse;
 #[cfg(test)]
 mod conformance;
@@ -40,6 +41,7 @@ mod target;
 mod turso;
 mod xlsx;
 
+pub use builtins::{Builtin, BuiltinKind};
 pub use duckdb::IN_MEMORY as DUCKDB_IN_MEMORY;
 pub use external::ExternalConfig;
 #[cfg(test)]
@@ -696,6 +698,17 @@ impl Engine {
         self.spec().sql.count_all.aggregate()
     }
 
+    /// Whether this engine's statement timeout is DBDelve's own timer around
+    /// the driver call, rather than a bound the server keeps. A statement
+    /// stopped that way is only no longer waited for: the server may still
+    /// apply it. MongoDB and Redis are such engines. Postgres, MySQL,
+    /// MariaDB, ClickHouse and Snowflake cancel on the server; SQL Server
+    /// closes the connection, which rolls the statement back; the file engines
+    /// interrupt the statement in the driver; a plugin's driver owns its own.
+    pub fn times_out_on_the_client(self) -> bool {
+        matches!(self, Self::MongoDb | Self::Redis)
+    }
+
     /// Whether the server holds a Read-only session to reads -- the backstop
     /// `read_only_statement` sets. Without one, a statement `sql::classify`
     /// cannot read has nothing behind it that would stop a write, so the gate
@@ -854,6 +867,12 @@ impl Engine {
         self.spec().sql.literal_offsets
     }
 
+    /// The functions and value expressions this dialect has built in, as it
+    /// spells them.
+    pub fn builtins(self) -> &'static [Builtin] {
+        self.spec().sql.builtins
+    }
+
     /// Whether a backslash in a single-quoted literal escapes the character
     /// after it.
     #[cfg(test)]
@@ -903,11 +922,12 @@ impl Engine {
     }
 
     /// Whether a cell whose type is known as each of `types` -- none, where
-    /// no driver named one -- holds what an edit of it would write back: on an
-    /// engine that edits rows at all, not bytes ([`Engine::is_binary_type`]),
-    /// and on Redis only text that is the whole of its value, never the start
-    /// of a long one, a collection's size or the spelling of bytes that are
-    /// not text.
+    /// no driver named one -- holds what an edit of it would write back: not
+    /// bytes ([`Engine::is_binary_type`]), and on Redis only text that is the
+    /// whole of its value, never the start of a long one, a collection's size
+    /// or the spelling of bytes that are not text. Whether rows are written
+    /// back at all is the target's to say ([`Target::edits_rows`]): Generic
+    /// SQL edits nothing built in and does through a plugin.
     pub fn writes_back<'a>(self, types: impl IntoIterator<Item = &'a str>) -> bool {
         self.spec().writes_back(types)
     }
@@ -1058,6 +1078,10 @@ pub struct SshTunnel {
     /// keys and agent only.
     #[serde(default)]
     pub identity_file: Option<String>,
+    /// The OS user `sudo` opens a Unix socket as on the SSH host, for peer
+    /// authentication. None, or blank, opens it as the SSH user.
+    #[serde(default)]
+    pub run_as: Option<String>,
 }
 
 impl SshTunnel {
@@ -1173,6 +1197,9 @@ pub enum ConnectionConfig {
     External(ExternalConfig),
 }
 
+/// What an agent is told when its write is aimed at a DuckDB database.
+pub const DUCKDB_WRITE_REFUSED: &str = "An agent's write is not run on a DuckDB database: a write from a second connection to the file is lost.";
+
 impl ConnectionConfig {
     /// A Postgres profile that names no connection service.
     pub fn postgres(server: ServerConfig) -> Self {
@@ -1215,6 +1242,29 @@ impl ConnectionConfig {
         self.is_duckdb_in_memory().then_some(
             "This connection is an in-memory DuckDB database, which has no separate connection an agent can read.",
         )
+    }
+
+    /// Whether the agent's read connection to this profile is held to reads by
+    /// the database itself: a file engine's is opened read-only, and a server
+    /// session is held where [`Engine::holds_read_only`]. On SQL Server,
+    /// Snowflake, MongoDB and Redis nothing on the server does, and
+    /// `sql::agent_gate` is all that holds what an agent sends there.
+    pub fn agent_reads_are_held(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite { .. } | Self::Turso { .. } | Self::DuckDb { .. }
+        ) || self.engine().holds_read_only()
+    }
+
+    /// Why an agent's approved write may not run on this profile, when it may
+    /// not: DuckDB, file or in-memory. A write from a second connection to the
+    /// file succeeds and is then lost -- the probe found a second writable
+    /// instance in one process silently dropping the agent's write -- and a
+    /// second process is refused by the file lock. The user's own instance is
+    /// never shared with the agent (Phase 5 D-23), so there is no connection a
+    /// write could ride on instead. Asked before anything is shown or opened.
+    pub fn agent_write_refusal(&self) -> Option<&'static str> {
+        matches!(self, Self::DuckDb { .. }).then_some(DUCKDB_WRITE_REFUSED)
     }
 
     /// Whether an agent's read of this connection can make the user's commit
@@ -1572,6 +1622,9 @@ impl ConnectionConfig {
                 found.name(&port.to_string());
             }
             found.name(&tunnel.user);
+            if let Some(run_as) = &tunnel.run_as {
+                found.name(run_as);
+            }
             if let Some(identity) = &tunnel.identity_file {
                 found.path(identity);
             }
@@ -1850,6 +1903,30 @@ impl Connection {
         Ok(connection)
     }
 
+    /// Open the connection an approved agent write runs on. A named seam so
+    /// every agent open stays greppable: it adds no read-only hold, so a file
+    /// engine opens writable and a server session starts as the profile's own.
+    /// A DuckDB config is refused before anything is opened or created, the
+    /// second line of defence behind [`ConnectionConfig::agent_write_refusal`]
+    /// being asked at arrival.
+    ///
+    /// The connection is for one call and is dropped with it, never kept: a
+    /// session change the statement makes must die with it. It waits at most
+    /// `lock_wait` seconds for a lock where the engine says so
+    /// ([`Connection::set_lock_wait`]); a session that will not take that is
+    /// not one an approved write runs on, so the open fails.
+    pub fn open_for_approved_write(
+        config: ConnectionConfig,
+        lock_wait: u32,
+    ) -> Result<Self, DbError> {
+        if let Some(refusal) = config.agent_write_refusal() {
+            return Err(plain_error(refusal.to_string()));
+        }
+        let connection = Self::open(config)?;
+        connection.set_lock_wait(lock_wait)?;
+        Ok(connection)
+    }
+
     /// Run one statement verbatim.
     ///
     /// The SQL is never rewritten — no limit injected, no reformatting. A
@@ -2006,6 +2083,8 @@ impl Connection {
     /// where a write that changed nothing, a `RENAMENX` onto a name that is
     /// taken, is an error rather than a `0`. And Snowflake, which sends it
     /// without the active schema, a field only the user's statements carry.
+    /// And a plugin, which runs a batch of writes as one transaction of its
+    /// driver's, each statement changing exactly one row or none saved.
     ///
     /// A `feed` takes its rows as they arrive, as for [`Connection::query`];
     /// the statement carries its own `LIMIT`, so nothing else of [`Fetch`]
@@ -2054,13 +2133,21 @@ impl Connection {
                     ..Fetch::default()
                 },
             ),
+            Self::External(connection) => connection.generated(
+                sql,
+                cancel,
+                Fetch {
+                    feed,
+                    limit,
+                    ..Fetch::default()
+                },
+            ),
             Self::Postgres(_)
             | Self::MySql(_)
             | Self::Sqlite(_)
             | Self::Turso(_)
             | Self::DuckDb(_)
-            | Self::MongoDb(_)
-            | Self::External(_) => self.query(
+            | Self::MongoDb(_) => self.query(
                 sql,
                 cancel,
                 Fetch {
@@ -2392,6 +2479,22 @@ impl Connection {
             return Ok(());
         };
         self.query(statement, &CancelToken::default(), Fetch::default())
+            .map(|_| ())
+    }
+
+    /// Bound how long this session waits for a lock, where the engine has a
+    /// session setting for it ([`lock_wait_statement`]). A plugin connection
+    /// and every other engine are left as they are.
+    pub fn set_lock_wait(&self, seconds: u32) -> Result<(), DbError> {
+        let engine = match self {
+            Self::Postgres(_) => Engine::Postgres,
+            Self::MySql(connection) => connection.engine(),
+            _ => return Ok(()),
+        };
+        let Some(statement) = lock_wait_statement(engine, seconds) else {
+            return Ok(());
+        };
+        self.query(&statement, &CancelToken::default(), Fetch::default())
             .map(|_| ())
     }
 
@@ -3700,6 +3803,25 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
         (ReadOnlySession::None, _) => None,
         // Carried by each request's settings, not set on the session.
         (ReadOnlySession::PerRequest, _) => None,
+    }
+}
+
+/// The statement that bounds how long this session waits for a lock, or
+/// `None` where the engine has no session setting for it. On MySQL and
+/// MariaDB that is two settings: `lock_wait_timeout` bounds a metadata lock
+/// (DDL, `LOCK TABLES`) and `innodb_lock_wait_timeout` a row lock.
+///
+/// A statement DBDelve sends on its own connection, as
+/// [`read_only_statement`] is, and not a [`ServerConfig`] field: a field would
+/// reach every struct literal and every stored profile for a setting only the
+/// agent's writable session carries.
+fn lock_wait_statement(engine: Engine, seconds: u32) -> Option<String> {
+    match engine {
+        Engine::Postgres => Some(format!("SET lock_timeout = '{seconds}s'")),
+        Engine::MySql | Engine::MariaDb => Some(format!(
+            "SET SESSION lock_wait_timeout = {seconds}, innodb_lock_wait_timeout = {seconds}"
+        )),
+        _ => None,
     }
 }
 
@@ -5764,6 +5886,86 @@ mod tests {
             )
         );
         assert!(!in_memory("").agent_opens_per_call());
+    }
+
+    #[test]
+    fn an_agent_read_is_held_by_the_database_where_a_file_opens_read_only_or_a_session_holds() {
+        for config in every_shape() {
+            let engine = config.engine();
+            let expected = !matches!(
+                engine,
+                Engine::SqlServer
+                    | Engine::Snowflake
+                    | Engine::MongoDb
+                    | Engine::Redis
+                    | Engine::Generic
+            );
+            assert_eq!(config.agent_reads_are_held(), expected, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn only_duckdb_refuses_an_agent_write() {
+        let in_memory = ConnectionConfig::duckdb(DUCKDB_IN_MEMORY.to_string(), 0);
+        for config in every_shape().into_iter().chain([in_memory]) {
+            let expected = (config.engine() == Engine::DuckDb).then_some(DUCKDB_WRITE_REFUSED);
+            assert_eq!(
+                config.agent_write_refusal(),
+                expected,
+                "{:?}",
+                config.engine()
+            );
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "dbdelve-agent-write-refusal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is creatable");
+        let path = directory.join("never.duckdb");
+        let refused = Connection::open_for_approved_write(
+            ConnectionConfig::duckdb(path.display().to_string(), 0),
+            30,
+        );
+        match refused {
+            Ok(_) => panic!("a DuckDB write connection was opened"),
+            Err(error) => assert_eq!(error.message, DUCKDB_WRITE_REFUSED),
+        }
+        assert!(
+            !path.exists(),
+            "the refusal came after the file was created"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn only_client_timed_engines_say_a_write_may_still_land() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                engine.times_out_on_the_client(),
+                matches!(engine, Engine::MongoDb | Engine::Redis),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lock_wait_is_spelt_per_engine() {
+        for engine in Engine::ALL {
+            let expected = match engine {
+                Engine::Postgres => Some("SET lock_timeout = '30s'"),
+                Engine::MySql | Engine::MariaDb => {
+                    Some("SET SESSION lock_wait_timeout = 30, innodb_lock_wait_timeout = 30")
+                }
+                _ => None,
+            };
+            assert_eq!(
+                lock_wait_statement(engine, 30).as_deref(),
+                expected,
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]

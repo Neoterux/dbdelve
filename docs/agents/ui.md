@@ -153,7 +153,9 @@ curves, and hover states are instant. These things move:
   One wall clock (`Entrance`) drives every piece rather than an element-keyed
   animation each: the surface asks for the next frame only until
   `entrance_ms` has passed and then asks for nothing. It starts when the
-  surface comes on screen, never on a re-render, and `reduce_motion` skips it.
+  surface comes on screen, never on a re-render, so it plays again, without
+  the greeting, when Disconnect brings the surface back; `reduce_motion`
+  skips it.
   The URL field's engine logo fades in once over 160ms, keyed by the engine.
   Neither repeats, so neither is the redraw hazard in `AGENTS.md`.
 - **The connection form's card** (`workspace/forms.rs`) rises in on the same
@@ -163,6 +165,20 @@ curves, and hover states are instant. These things move:
   at `form_entrance_ms`, and `reduce_motion` skips it. Its SSH rows settle in
   once over 220ms when the tunnel is switched on (`revealed`, keyed by the
   row, so they replay only on remounting). Neither repeats.
+
+- **The approval surface moves nothing.** An agent's approval dialog has no
+  animation, no smooth scroll and no countdown: the statement is read where it
+  stands, and a timer that counted down on screen would be a clock to beat.
+  The statement block's scrollbar is always drawn, never faded in, and on a
+  window too short for the whole card the block gives up its height first so
+  Deny and Approve stay on screen.
+  Approve's arm is a one-shot timer (`ARM_DELAY`), not an animation, and ends
+  in one redraw, which takes Approve's label from the faint ink to the quiet
+  one: the library's disabled style dims only a fill, and a ghost has none. The dialog asks the OS for attention once per call, when it is
+  first drawn (`Window::request_attention`): a single dock bounce or taskbar
+  flash that never takes focus from another application and never raises the
+  window, and nothing at all on Wayland, where the mark's waiting count is the
+  signal.
 
 Anything else that moves needs raising first, and a second repeating animation
 means building the shared throttled clock and moving both onto it.

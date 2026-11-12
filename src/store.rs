@@ -496,6 +496,8 @@ pub struct StoredSettings {
     pub client_sort: Option<bool>,
     #[serde(default)]
     pub qualify_completions: Option<bool>,
+    #[serde(default)]
+    pub verbose_logging: Option<bool>,
     /// Whether the first-run greeting has played. Absent in a file written
     /// before there was one.
     #[serde(default)]
@@ -1889,16 +1891,15 @@ pub(crate) fn theme_directory() -> Result<PathBuf, String> {
     Ok(dbdelve_directory()?.join("themes"))
 }
 
-/// Zed's own themes directory, as Zed's `paths::themes_dir` places it. On
-/// macOS that is `~/.config/zed` whatever `XDG_CONFIG_HOME` says.
-pub(crate) fn zed_theme_directory() -> Result<PathBuf, String> {
+/// Zed's native themes directory, then its Flatpak's on Linux.
+pub(crate) fn zed_theme_directories() -> Result<Vec<PathBuf>, String> {
     #[cfg(target_os = "macos")]
     {
-        Ok(home()?.join(".config/zed/themes"))
+        Ok(vec![home()?.join(".config/zed/themes")])
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(data_root()?.join("Zed").join("themes"))
+        Ok(vec![data_root()?.join("Zed").join("themes")])
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1906,14 +1907,21 @@ pub(crate) fn zed_theme_directory() -> Result<PathBuf, String> {
             Some(config_home) => PathBuf::from(config_home),
             None => home()?.join(".config"),
         };
-        Ok(config.join("zed").join("themes"))
+        let directories = std::iter::once(config.join("zed").join("themes"));
+        #[cfg(target_os = "linux")]
+        let directories = directories.chain(
+            home()
+                .ok()
+                .map(|home| home.join(".var/app/dev.zed.Zed/config/zed/themes")),
+        );
+        Ok(directories.collect())
     }
 }
 
 /// Where Zed installs extensions, each one a directory that may carry a
 /// `themes/` of its own. Unlike the config, Windows keeps these under the local
 /// profile rather than the roaming one.
-pub(crate) fn zed_extension_directory() -> Result<PathBuf, String> {
+pub(crate) fn zed_extension_directories() -> Result<Vec<PathBuf>, String> {
     #[cfg(target_os = "macos")]
     let root = data_root()?.join("Zed");
     #[cfg(target_os = "windows")]
@@ -1924,7 +1932,14 @@ pub(crate) fn zed_extension_directory() -> Result<PathBuf, String> {
     .join("Zed");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let root = data_root()?.join("zed");
-    Ok(root.join("extensions").join("installed"))
+    let directories = std::iter::once(root.join("extensions").join("installed"));
+    #[cfg(target_os = "linux")]
+    let directories = directories.chain(
+        home()
+            .ok()
+            .map(|home| home.join(".var/app/dev.zed.Zed/data/zed/extensions/installed")),
+    );
+    Ok(directories.collect())
 }
 
 /// Where a private key another client kept in its own store is written, since
@@ -1989,6 +2004,125 @@ fn secure(path: &Path) -> Result<(), String> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Where what an agent's approved statements did is recorded, beside
+/// `profiles.toml`.
+#[cfg(unix)]
+pub(crate) const AGENT_AUDIT_FILE: &str = "agent-audit.jsonl";
+
+// ponytail: the audit is rewritten to its newest `AUDIT_KEEP` lines once it
+// passes `AUDIT_SLACK`, so a rewrite comes once per two thousand appends, and
+// the line count is read from the file once and then kept, so an append never
+// reads it. The upgrade is a size bound or rotation, if a user's audit ever
+// needs to reach further back. Two windows appending to one file would each
+// count their own appends and one's rewrite could drop the other's newest lines.
+#[cfg(unix)]
+pub(crate) const AUDIT_KEEP: usize = 2_000;
+#[cfg(unix)]
+pub(crate) const AUDIT_SLACK: usize = 4_000;
+
+/// The record of agent calls: append-only, one JSON object per line, never a
+/// row value.
+///
+/// Unix only, as the bridge that feeds it is: on Windows nothing reads it, and
+/// CI's Windows clippy denies dead code.
+#[cfg(unix)]
+#[derive(Default)]
+pub(crate) struct AuditLog {
+    /// How many lines the file holds, read from it by the first append and
+    /// kept from then on; `None` until then, and again after a write that
+    /// failed, which may have left the end of the file cut.
+    lines: Option<usize>,
+}
+
+#[cfg(unix)]
+impl AuditLog {
+    /// Append `line`, which must hold no newline, as one line of the file.
+    ///
+    /// Created `0600` and kept there. The line and its newline go out in a
+    /// single `write_all`: two writes could leave a line without its end. A
+    /// file whose last line a crash left without one is ended first, so the
+    /// two never run together, and the cut line stays where it is: lines are
+    /// never parsed or rewritten here, only counted.
+    ///
+    /// Once the file passes [`AUDIT_SLACK`] lines it is rewritten to its
+    /// newest [`AUDIT_KEEP`]. They are kept verbatim and never merged the way
+    /// the history's are: a call's `started` line must stay a line of its own
+    /// beside its `outcome`, since the pair is the proof that a statement was
+    /// sent before it was answered.
+    ///
+    /// ponytail: the cut is by count, so a call still running when the file is
+    /// rewritten (an approved write may run ten minutes) can lose its `started`
+    /// line and keep its `outcome`, which still names the call, its statement
+    /// and its decision. The upgrade is moving the cut back to the first line
+    /// no earlier unmatched `started` line precedes.
+    pub(crate) fn append(&mut self, line: &str) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = dbdelve_directory()?;
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+        let path = directory.join(AGENT_AUDIT_FILE);
+        let (mut lines, cut) = match self.lines {
+            Some(lines) => (lines, false),
+            None => match fs::read(&path) {
+                Ok(bytes) => {
+                    let cut = bytes.last().is_some_and(|last| *last != b'\n');
+                    let ended = bytes.iter().filter(|byte| **byte == b'\n').count();
+                    (ended + usize::from(cut), cut)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (0, false),
+                Err(error) => {
+                    return Err(format!("Could not read {}: {error}", path.display()));
+                }
+            },
+        };
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+        // A file that existed before with looser bits keeps none of them.
+        secure(&path)?;
+        let mut text = String::with_capacity(line.len() + 2);
+        if cut {
+            text.push('\n');
+        }
+        text.push_str(line);
+        text.push('\n');
+        if let Err(error) = file.write_all(text.as_bytes()) {
+            self.lines = None;
+            return Err(format!("Could not write {}: {error}", path.display()));
+        }
+        lines += 1;
+        if lines > AUDIT_SLACK
+            && let Some(kept) = keep_newest_audit_lines(&path)
+        {
+            lines = kept;
+        }
+        self.lines = Some(lines);
+        Ok(())
+    }
+}
+
+/// Rewrite the audit to its newest [`AUDIT_KEEP`] lines, through
+/// [`write_file`] so a rewrite that fails halfway leaves the file as it was.
+/// Answers how many lines it holds now, or `None` when the rewrite did not
+/// happen: the file is still correct to read, it just keeps its length, and
+/// the next append tries again.
+///
+/// The text is read lossily: only a line cut by a crash can end in half a
+/// character, and it is not a line anything reads.
+#[cfg(unix)]
+fn keep_newest_audit_lines(path: &Path) -> Option<usize> {
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let kept = &lines[lines.len().saturating_sub(AUDIT_KEEP)..];
+    write_file(path, &kept.concat()).ok()?;
+    Some(kept.len())
 }
 
 #[cfg(test)]
@@ -2692,6 +2826,150 @@ user = ""
         assert_eq!(expanded_against("~/app.db", None), Path::new("~/app.db"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_is_created_private_and_one_line_per_append() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            let path = dbdelve_directory()
+                .expect("the test home has a data directory")
+                .join(AGENT_AUDIT_FILE);
+            let mode = |path: &Path| {
+                fs::metadata(path)
+                    .expect("the file exists")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+
+            let mut log = AuditLog::default();
+            log.append(r#"{"a":1}"#).expect("the first line is written");
+            log.append(r#"{"b":"x\ny"}"#)
+                .expect("the second line is written");
+            let text = fs::read_to_string(&path).expect("the file is readable");
+            assert_eq!(text.lines().count(), 2, "{text:?}");
+            for line in text.lines() {
+                serde_json::from_str::<serde_json::Value>(line).expect("a line is JSON");
+            }
+            assert_eq!(mode(&path), 0o600);
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                .expect("the mode is settable");
+            log.append(r#"{"c":3}"#).expect("the third line is written");
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(
+                fs::read_to_string(&path)
+                    .expect("the file is readable")
+                    .lines()
+                    .count(),
+                3
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    fn audit_path() -> PathBuf {
+        dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join(AGENT_AUDIT_FILE)
+    }
+
+    #[cfg(unix)]
+    fn audit_text() -> String {
+        fs::read_to_string(audit_path()).expect("the audit is readable")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_keeps_its_newest_lines_once_past_its_slack() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            let mut log = AuditLog::default();
+            for n in 0..=AUDIT_SLACK {
+                log.append(&format!(r#"{{"n":{n}}}"#))
+                    .expect("a line is written");
+            }
+            let kept: Vec<String> = (AUDIT_SLACK + 1 - AUDIT_KEEP..=AUDIT_SLACK)
+                .map(|n| format!(r#"{{"n":{n}}}"#))
+                .collect();
+            let text = audit_text();
+            let lines: Vec<_> = text.lines().collect();
+            assert_eq!(lines.len(), AUDIT_KEEP);
+            // Not `assert_eq!`: its failure would print two thousand lines.
+            assert!(lines == kept, "the newest lines, in order and verbatim");
+            assert_eq!(
+                fs::metadata(audit_path())
+                    .expect("the file exists")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let beside = fs::read_dir(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is readable")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("agent-audit"))
+                .collect::<Vec<_>>();
+            assert_eq!(beside, [AGENT_AUDIT_FILE]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_counts_an_existing_file_once() {
+        with_home(|| {
+            let full: String = (0..AUDIT_SLACK)
+                .map(|n| format!("{{\"n\":{n}}}\n"))
+                .collect();
+            fs::create_dir_all(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is creatable");
+            fs::write(audit_path(), full).expect("the file is writable");
+
+            let mut log = AuditLog::default();
+            log.append(r#"{"last":1}"#).expect("a line is written");
+            let text = audit_text();
+            assert_eq!(text.lines().count(), AUDIT_KEEP, "compacted on that append");
+            assert_eq!(text.lines().last(), Some(r#"{"last":1}"#));
+
+            log.append(r#"{"last":2}"#).expect("a line is written");
+            assert_eq!(
+                audit_text().lines().count(),
+                AUDIT_KEEP + 1,
+                "the count was kept and the file not read again"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_ends_a_cut_line_before_the_next() {
+        with_home(|| {
+            fs::create_dir_all(audit_path().parent().expect("the file has a directory"))
+                .expect("the directory is creatable");
+            fs::write(audit_path(), "{\"v\":1,\"id\":").expect("the file is writable");
+
+            AuditLog::default()
+                .append(r#"{"v":1,"id":2}"#)
+                .expect("a line is written");
+            assert_eq!(audit_text(), "{\"v\":1,\"id\":\n{\"v\":1,\"id\":2}\n");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_audit_starts_a_missing_file() {
+        with_home(|| {
+            assert!(!audit_path().exists());
+            AuditLog::default()
+                .append(r#"{"v":1}"#)
+                .expect("a line is written");
+            assert_eq!(audit_text(), "{\"v\":1}\n");
+        });
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn a_tilde_and_backslash_is_the_home_directory_on_windows() {
@@ -3261,6 +3539,7 @@ folder = "Hot"
                 port: None,
                 user: "tunnel".into(),
                 identity_file: None,
+                run_as: None,
             }),
             open_objects: vec![StoredObject {
                 schema: "public".into(),
@@ -3292,6 +3571,7 @@ folder = "Hot"
                 port: Some(2222),
                 user: "tunnel".into(),
                 identity_file: Some("/home/dbdelve/.ssh/id_ed25519".into()),
+                run_as: Some("postgres".into()),
             }),
             ..a_stored_profile()
         };
@@ -3317,6 +3597,7 @@ folder = "Hot"
                 port: None,
                 user: String::new(),
                 identity_file: None,
+                run_as: None,
             }),
             ..a_stored_profile()
         };
@@ -3332,6 +3613,8 @@ folder = "Hot"
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);
+        // So a tunnel without Run as saves as it did before the field existed.
+        assert!(!text.contains("run_as"), "{text}");
     }
 
     #[test]
@@ -3769,6 +4052,7 @@ open_objects = []
                 color_titlebar: Some(false),
                 client_sort: Some(true),
                 qualify_completions: Some(true),
+                verbose_logging: Some(true),
                 welcomed: Some(true),
                 agent_access: Some(true),
                 custom_keybindings: Some(HashMap::from([(

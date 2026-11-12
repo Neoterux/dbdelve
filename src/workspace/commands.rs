@@ -4,10 +4,95 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
-use crate::actions::{FocusSidebar, ToggleResults, ToggleResultsFocus};
+use crate::actions::{
+    CopyDiagnostics, FocusSidebar, OpenLogsFolder, ToggleResults, ToggleResultsFocus,
+};
 use crate::keybindings;
+use crate::ui::Status;
 
 impl Workspace {
+    /// Help > Open Logs Folder: the diagnostic log and `panic.log`, in the
+    /// system's file manager.
+    pub(crate) fn open_logs_folder(
+        &mut self,
+        _: &OpenLogsFolder,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = crate::logging::directory() else {
+            self.help_notice(
+                Status::Failed,
+                "There is no logs folder: the home directory is not set.".into(),
+                cx,
+            );
+            return;
+        };
+        // Made first: a log that never opened left no folder, and the file
+        // manager opens nothing for one that is not there.
+        match std::fs::create_dir_all(&directory) {
+            Ok(()) => cx.open_with_system(&directory),
+            Err(error) => self.help_notice(
+                Status::Failed,
+                format!("Could not open {}: {error}", directory.display()),
+                cx,
+            ),
+        }
+    }
+
+    /// Help > Copy Diagnostics: what a bug report needs, as a block to paste
+    /// into the issue.
+    pub(crate) fn copy_diagnostics(
+        &mut self,
+        _: &CopyDiagnostics,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(crate::logging::diagnostics(
+            &self.plugins,
+        )));
+        self.help_notice(
+            Status::Idle,
+            "Diagnostics copied. Remove anything sensitive before posting.".into(),
+            cx,
+        );
+    }
+
+    /// The Help commands answer from the connection form too, which hides the
+    /// status bar `note` writes to, so there the answer goes in the form's
+    /// footer for a few seconds instead.
+    fn help_notice(&mut self, status: Status, message: String, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.form else {
+            if status == Status::Failed {
+                self.note(message, cx);
+            } else {
+                self.confirm(message, cx);
+            }
+            return;
+        };
+        form.notice = Some((status, message.clone()));
+        let opened = form.opened;
+        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(3))
+                .await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                // Only this form's, and only while no later notice replaced it.
+                if let Some(form) = &mut workspace.form
+                    && form.opened == opened
+                    && form
+                        .notice
+                        .as_ref()
+                        .is_some_and(|(_, notice)| *notice == message)
+                {
+                    form.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn fuzzy_open(
         &mut self,
         _: &FuzzyOpen,
@@ -161,11 +246,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // With no connection to open, the palette opens only on what the
-        // welcome surface can use; any search reaches the connections this
-        // build cannot open, so they can be removed.
+        // With no connection in front, the palette opens only on what the
+        // welcome surface can use, and on the connections to pick from or,
+        // those this build cannot open, to remove.
+        let (profiles, unavailable) = (!self.profiles.is_empty(), !self.unavailable.is_empty());
         let mode = if self.profile().is_none() {
-            crate::palette::without_a_connection(mode, !self.unavailable.is_empty()).unwrap_or(mode)
+            crate::palette::without_a_connection(mode, profiles, unavailable).unwrap_or(mode)
         } else {
             mode
         };
@@ -200,7 +286,7 @@ impl Workspace {
         self.end_theme_preview(window, cx);
         let picks_theme = matches!(mode, PaletteMode::Theme(_) | PaletteMode::ImportTheme(..));
         let before_any_connection =
-            crate::palette::without_a_connection(mode, !self.unavailable.is_empty()).is_some();
+            crate::palette::without_a_connection(mode, profiles, unavailable).is_some();
         if stroke == Some(Stroke::Close) || (self.profile().is_none() && !before_any_connection) {
             self.close_palette(window, cx);
             return;
@@ -653,6 +739,7 @@ impl Workspace {
             Command::CopyResults(format) => self.copy_results_as(format, cx),
             Command::SwitchProfile(index) => self.activate(index, cx),
             Command::SwitchConnection => self.open_connections(window, cx),
+            Command::Disconnect => self.disconnect(&Disconnect, window, cx),
             Command::ConnectionActions(index) => {
                 self.open_palette(PaletteMode::ConnectionActions(index), window, cx)
             }
@@ -712,7 +799,11 @@ impl Workspace {
                 self.clear_notice();
                 self.refresh_schema(cx);
             }
-            Command::Reconnect => self.reconnect(self.active, cx),
+            Command::Reconnect => {
+                if let Some(index) = self.active {
+                    self.reconnect(index, cx);
+                }
+            }
             Command::SelectTheme => self.select_theme(&SelectTheme, window, cx),
             Command::SelectDatabase => self.select_database(&SelectDatabase, window, cx),
             Command::SetDatabase(name) => self.set_database(name, window, cx),
@@ -755,6 +846,8 @@ impl Workspace {
             Command::ResetConfirmations => {
                 self.reset_confirmations(&ResetConfirmations, window, cx)
             }
+            Command::OpenLogsFolder => self.open_logs_folder(&OpenLogsFolder, window, cx),
+            Command::CopyDiagnostics => self.copy_diagnostics(&CopyDiagnostics, window, cx),
             Command::HideColumn => self.hide_column(&HideColumn, window, cx),
             Command::TogglePinColumn => self.toggle_pin_column(&TogglePinColumn, window, cx),
             Command::ShowAllColumns => self.show_all_columns(&ShowAllColumns, window, cx),

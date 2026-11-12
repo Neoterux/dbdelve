@@ -6,11 +6,13 @@
 
 mod agent;
 mod agent_read;
+mod agent_write;
 mod commands;
 #[cfg(test)]
 mod e2e;
 mod editing;
 mod exports;
+use exports::ExportMenu;
 mod files;
 mod filters;
 mod folders;
@@ -29,11 +31,7 @@ mod welcome;
 use std::collections::{HashMap, HashSet};
 
 use crate::export::ClipboardFormat;
-use gpui_component::{
-    ActiveTheme, Sizable,
-    button::{ButtonCustomVariant, ButtonVariants, DropdownButton},
-    menu::{DropdownMenu, PopupMenuItem},
-};
+use gpui_component::menu::DropdownMenu;
 
 pub(crate) use import_dialog::PreviewGrid;
 #[cfg(test)]
@@ -84,6 +82,9 @@ pub(crate) struct Settings {
     /// Whether completing a relation writes it as `schema.relation`, for
     /// databases whose search path does not reach every schema.
     pub(crate) qualify_completions: bool,
+    /// Whether the diagnostic log takes DBDelve's debug lines and other
+    /// crates' info, applied as it changes (`logging::set_verbose`).
+    pub(crate) verbose_logging: bool,
     /// Whether the first-run greeting has played on the welcome surface.
     pub(crate) welcomed: bool,
     /// Keybinding overrides, keyed by action id. Applied to the keymap on
@@ -121,6 +122,7 @@ impl Default for Settings {
             color_titlebar: true,
             client_sort: false,
             qualify_completions: false,
+            verbose_logging: false,
             welcomed: false,
             custom_keybindings: HashMap::new(),
         }
@@ -224,7 +226,9 @@ pub(crate) struct Workspace {
     /// Discovered once in `main`, before the profiles that name them load.
     pub(crate) plugins: Vec<&'static crate::db::Plugin>,
     pub(crate) settings: Settings,
-    pub(crate) active: usize,
+    /// The profile in front, by index; `None` is the welcome surface, which
+    /// Disconnect leads back to with connections still listed on it.
+    pub(crate) active: Option<usize>,
     pub(crate) form: Option<ConnectionForm>,
     /// Whether the menu bar last set lists Import Rows.
     menu_imports_rows: bool,
@@ -384,6 +388,14 @@ pub(crate) struct Workspace {
     pub(crate) dialog_choice: std::cell::Cell<usize>,
     /// What held the keyboard when the first dialog went up.
     pub(crate) focus_before_dialog: std::cell::RefCell<Option<FocusHandle>>,
+    /// The source statement the approval dialog was last drawn from, by call,
+    /// so Approve can refuse a call that was never drawn or whose statement is
+    /// not the one drawn (GATE-10). Written by the render through `&self`.
+    pub(crate) approval_shown: std::cell::RefCell<Option<(crate::agent::CallId, String)>>,
+    /// Where the approval's statement block is scrolled, by call, so the next
+    /// call opens at its first line and the scrollbar reads the same offset.
+    pub(crate) approval_scroll:
+        std::cell::RefCell<Option<(crate::agent::CallId, gpui::ScrollHandle)>>,
     /// See [`Workspace::welcome_project_focus`].
     pub(crate) welcome_project_focus: std::cell::RefCell<Vec<FocusHandle>>,
     pub(crate) newer_release: Option<update::Release>,
@@ -466,7 +478,7 @@ impl Workspace {
             unavailable: Vec::new(),
             plugins,
             settings: Settings::default(),
-            active: 0,
+            active: None,
             form: None,
             menu_imports_rows: false,
             import_requests: 0,
@@ -538,6 +550,8 @@ impl Workspace {
             dialog_in_front: std::cell::Cell::default(),
             dialog_choice: std::cell::Cell::default(),
             focus_before_dialog: std::cell::RefCell::default(),
+            approval_shown: std::cell::RefCell::default(),
+            approval_scroll: std::cell::RefCell::default(),
             welcome_project_focus: std::cell::RefCell::default(),
             newer_release: None,
         };
@@ -621,6 +635,9 @@ impl Workspace {
                 workspace.settings.client_sort = stored_settings.client_sort.unwrap_or(false);
                 workspace.settings.qualify_completions =
                     stored_settings.qualify_completions.unwrap_or(false);
+                workspace.settings.verbose_logging =
+                    stored_settings.verbose_logging.unwrap_or(false);
+                crate::logging::set_verbose(workspace.settings.verbose_logging);
                 workspace.settings.welcomed = welcome::welcomed(
                     stored_settings.welcomed,
                     !profiles.is_empty() || !unavailable.is_empty(),
@@ -635,17 +652,15 @@ impl Workspace {
                 for stored in profiles {
                     workspace.restore_profile(stored, window, cx);
                 }
-                // Where the last session was left. An id that no longer names a
-                // profile leaves the first one in front, which is where an
-                // install with no history starts anyway.
-                if let Some(id) = active
-                    && let Some(index) = workspace
+                // Where the last session was left. With no `active` it was
+                // left on the welcome surface, and starts there connecting
+                // nothing.
+                workspace.active = active.and_then(|id| {
+                    workspace
                         .profiles
                         .iter()
                         .position(|profile| profile.id == id)
-                {
-                    workspace.active = index;
-                }
+                });
                 let live = workspace
                     .profiles
                     .iter()
@@ -677,7 +692,7 @@ impl Workspace {
                         && profile.config.server().map(|server| server.user.as_str())
                             == config.server().map(|server| server.user.as_str())
                 });
-                workspace.active = match existing {
+                workspace.active = Some(match existing {
                     Some(index) => index,
                     None => {
                         let name = default_profile_name(&config);
@@ -691,7 +706,7 @@ impl Workspace {
                             cx,
                         )
                     }
-                };
+                });
                 // The environment picked the profile, so it is the one to come
                 // back to next launch -- when there may be no environment.
                 workspace.remember_profiles(cx);
@@ -817,11 +832,11 @@ impl Workspace {
     }
 
     pub(crate) fn profile(&self) -> Option<&Profile> {
-        self.profiles.get(self.active)
+        self.profiles.get(self.active?)
     }
 
     pub(crate) fn profile_mut(&mut self) -> Option<&mut Profile> {
-        self.profiles.get_mut(self.active)
+        self.profiles.get_mut(self.active?)
     }
 
     /// The engine every statement dbdelve generates is written for. With no
@@ -1087,6 +1102,16 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn set_verbose_logging(&mut self, verbose: bool, cx: &mut Context<Self>) {
+        if self.settings.verbose_logging == verbose {
+            return;
+        }
+        self.settings.verbose_logging = verbose;
+        crate::logging::set_verbose(verbose);
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_color_titlebar(&mut self, color: bool, cx: &mut Context<Self>) {
         if self.settings.color_titlebar == color {
             return;
@@ -1281,6 +1306,9 @@ fn agent_log_label(entry: &agent::LogEntry, now: u64) -> String {
     if entry.requester_gone {
         line.push_str(" \u{b7} no requester");
     }
+    if entry.decision == Some(agent::Decision::Approved) {
+        line.push_str(" \u{b7} approved");
+    }
     line
 }
 
@@ -1307,7 +1335,7 @@ impl Render for Workspace {
         // The name field is the welcome surface's, and whatever replaces that
         // surface ends here, so this is the one place it is put away --
         // before the focus handoff below.
-        if !(self.profiles.is_empty() && self.form.is_none()) {
+        if self.profile().is_some() || self.form.is_some() {
             self.drop_project_name();
         }
         // Every way the connection form opens ends here too. Its branch below
@@ -1423,7 +1451,7 @@ impl Render for Workspace {
         // checked against the last frame, where the field that just closed
         // still sat inside this same floor.
         if self.form.is_none()
-            && self.profiles.is_empty()
+            && self.profile().is_none()
             && std::mem::take(&mut self.welcome_needs_focus)
         {
             self.welcome_url.focus_handle(cx).focus(window, cx);
@@ -1505,6 +1533,8 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::zoom_editor_out))
                 .on_action(cx.listener(Self::reset_editor_zoom))
                 .on_action(cx.listener(Self::previous_profile))
+                .on_action(cx.listener(Self::open_logs_folder))
+                .on_action(cx.listener(Self::copy_diagnostics))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
                 .child(titlebar(
@@ -1523,9 +1553,9 @@ impl Render for Workspace {
                 .children(self.dialog_layer(
                     [
                         // First, so it is drawn behind every other dialog: an
-                        // agent's unsolicited ping never covers one the user
+                        // agent's unsolicited approval never covers one the user
                         // is already answering.
-                        ("agent-ping", self.render_agent_ping(cx)),
+                        ("agent-approval", self.render_agent_approval(cx)),
                         ("agent-audit", self.render_agent_audit(cx)),
                         ("import-choice", self.render_import_choice(cx)),
                     ],
@@ -1553,9 +1583,12 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::new_project))
                 .on_action(cx.listener(Self::import_from))
                 .on_action(cx.listener(Self::open_settings))
+                .on_action(cx.listener(Self::open_logs_folder))
+                .on_action(cx.listener(Self::copy_diagnostics))
                 .on_action(cx.listener(Self::fuzzy_open))
                 .on_action(cx.listener(Self::command_palette))
                 .on_action(cx.listener(Self::search_everything))
+                .on_action(cx.listener(Self::switch_connection))
                 .on_action(cx.listener(Self::set_default_row_limit_action))
                 .on_action(cx.listener(Self::custom_row_limit))
                 .on_action(cx.listener(Self::zoom_editor_in))
@@ -1571,7 +1604,12 @@ impl Render for Workspace {
                 .child(self.beside_settings(self.render_welcome(window, cx).into_any_element(), cx))
                 .children(self.dialog_layer(
                     [
+                        // Home lists the connections, so an agent's call on a
+                        // visible one and the visibility dialog its row opens
+                        // both arrive here as well as in front of a profile.
+                        ("agent-approval", self.render_agent_approval(cx)),
                         ("agent-audit", self.render_agent_audit(cx)),
+                        ("agent-visibility", self.render_agent_visibility(cx)),
                         ("import-choice", self.render_import_choice(cx)),
                     ],
                     window,
@@ -1892,11 +1930,7 @@ impl Render for Workspace {
         let discard_workspace = apply_workspace.clone();
         let previous_workspace = apply_workspace.clone();
         let next_workspace = apply_workspace.clone();
-        let copy_workspace = apply_workspace.clone();
         let copy_menu_workspace = apply_workspace.clone();
-        let csv_workspace = apply_workspace.clone();
-        let json_workspace = apply_workspace.clone();
-        let sql_workspace = apply_workspace.clone();
         let refresh_workspace = apply_workspace.clone();
         let ddl_workspace = apply_workspace.clone();
         let insert_workspace = apply_workspace.clone();
@@ -2022,95 +2056,21 @@ impl Render for Workspace {
                         // fetched, not the values on screen, and the review
                         // controls need the room.
                         .children(show_result_actions.then(|| {
-                            let hover = gpui::Background::from(cx.theme().tokens.accent)
-                                .opacity(if cx.theme().mode.is_dark() { 0.5 } else { 1. });
-                            let copy = button(
-                                "copy-results",
-                                "Copy Results",
-                                Tone::Quiet,
-                                Control::Compact,
-                                t,
-                            )
-                            .debug_selector(|| "copy-results".into())
-                            .on_click(move |_, _, cx| {
-                                _ = copy_workspace.update(cx, |workspace, cx| {
-                                    workspace.copy_results_as(ClipboardFormat::Tsv, cx);
-                                });
-                            });
-                            let copy = DropdownButton::new("copy-results-dropdown")
-                                .button(copy)
-                                // Paint one hover behind both halves, at the same strength as Import.
-                                .custom(
-                                    ButtonCustomVariant::new(cx).active(t.element_active.into()),
+                            let export = ExportMenu {
+                                workspace: copy_menu_workspace.clone(),
+                                sql: engine.syntax() == db::Syntax::Sql,
+                            };
+                            button("export-results", "Export", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "export-results".into())
+                                .child(
+                                    icon(icon::CHEVRON_DOWN)
+                                        .size(px(layout::chrome(layout::ICON_SIZE)))
+                                        .text_color(t.text_faint),
                                 )
-                                .with_size(px(Control::Compact.height()))
-                                .menu_accessibility_label("Copy results as…")
-                                .dropdown_menu(move |menu, _, _| {
-                                    ClipboardFormat::ALL.into_iter().fold(menu, |menu, format| {
-                                        let workspace = copy_menu_workspace.clone();
-                                        menu.item(PopupMenuItem::new(format.label()).on_click(
-                                            move |_, _, cx| {
-                                                _ = workspace.update(cx, |workspace, cx| {
-                                                    workspace.copy_results_as(format, cx);
-                                                });
-                                            },
-                                        ))
-                                    })
-                                });
-                            div()
-                                .id("copy-results-control")
-                                .debug_selector(|| "copy-results-format".into())
-                                .rounded(px(layout::RADIUS_CONTROL))
-                                .hover(move |style| style.bg(hover))
-                                .child(copy)
-                        }))
-                        // Named, not one button over a menu: the choice is
-                        // between a few things, and a control that opens
-                        // another control to ask which is a click spent on
-                        // nothing. It also puts the format on screen, which
-                        // a lone "Export" left to the file extension.
-                        .children(show_result_actions.then(|| {
-                            button("export-csv", "Export CSV", Tone::Quiet, Control::Compact, t)
-                                .on_click(move |_, _, cx| {
-                                    _ = csv_workspace.update(cx, |workspace, cx| {
-                                        workspace.export_results(FileAs::Rows(Format::Csv), cx);
-                                    });
+                                .dropdown_menu(move |menu, window, cx| {
+                                    export.build(menu, window, cx)
                                 })
                         }))
-                        .children(show_result_actions.then(|| {
-                            button(
-                                "export-json",
-                                "Export JSON",
-                                Tone::Quiet,
-                                Control::Compact,
-                                t,
-                            )
-                            .on_click(move |_, _, cx| {
-                                _ = json_workspace.update(cx, |workspace, cx| {
-                                    workspace.export_results(FileAs::Rows(Format::Json), cx);
-                                });
-                            })
-                        }))
-                        .children(
-                            (show_result_actions && engine.syntax() == db::Syntax::Sql).then(
-                                || {
-                                    button(
-                                        "export-sql",
-                                        "Export SQL",
-                                        Tone::Quiet,
-                                        Control::Compact,
-                                        t,
-                                    )
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            _ = sql_workspace.update(cx, |workspace, cx| {
-                                                workspace.export_results(FileAs::Inserts, cx);
-                                            });
-                                        },
-                                    )
-                                },
-                            ),
-                        )
                         .children(structure_copies.map(|(ddl, insert)| {
                             div()
                                 .flex()
@@ -2351,11 +2311,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::commit_transaction))
             .on_action(cx.listener(Self::rollback_transaction))
             .on_action(cx.listener(Self::switch_connection))
+            .on_action(cx.listener(Self::disconnect))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::disconnect_agents_action))
             .on_action(cx.listener(Self::show_agent_activity_action))
             .on_action(cx.listener(Self::focus_sidebar))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_logs_folder))
+            .on_action(cx.listener(Self::copy_diagnostics))
             // Unregistered under the import dialog, which stops only the
             // mouse: these act on the tab it covers, out of sight, and their
             // menu items grey out with them.
@@ -2503,9 +2466,9 @@ impl Render for Workspace {
             .children(self.dialog_layer(
                 [
                     // First, so it is drawn behind every other dialog: an
-                    // agent's unsolicited ping never covers one the user is
+                    // agent's unsolicited approval never covers one the user is
                     // already answering, and `escape` reaches it last.
-                    ("agent-ping", self.render_agent_ping(cx)),
+                    ("agent-approval", self.render_agent_approval(cx)),
                     ("agent-audit", self.render_agent_audit(cx)),
                     ("apply-review", self.render_apply_review(cx)),
                     ("import-rows", self.render_import_rows(window, cx)),
