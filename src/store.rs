@@ -3675,6 +3675,61 @@ open_objects = []
     }
 
     #[test]
+    fn the_introspection_depth_round_trips_before_ssh_and_an_unknown_slug_reads_as_sizes() {
+        use crate::session::Depth;
+        let mut profile = a_stored_profile();
+        profile.introspection_depth = Some("relations".into());
+        profile.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            ..Default::default()
+        });
+        let text = written_alone(profile.clone());
+        let depth = text
+            .find("introspection_depth = \"relations\"")
+            .expect("the depth is written");
+        let tunnel = text.find("[profiles.ssh]").expect("and the tunnel");
+        assert!(
+            depth < tunnel,
+            "TOML cannot emit a scalar after a table, so it comes before `ssh`:\n{text}"
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        assert_eq!(
+            decoded.profiles[0].introspection_depth,
+            profile.introspection_depth
+        );
+        assert_eq!(
+            written_alone(decoded.profiles[0].clone()),
+            text,
+            "saving what was saved changes nothing"
+        );
+
+        let bare = written_alone(a_stored_profile());
+        assert!(
+            !bare.contains("introspection_depth"),
+            "a profile at the default is written as it always was:\n{bare}"
+        );
+        let old = decode_profiles(&bare, &[]).expect("an older file loads");
+        assert_eq!(old.profiles[0].introspection_depth, None);
+
+        // A slug a newer build wrote costs this one field and nothing else.
+        let newer = text.replace("\"relations\"", "\"everything\"");
+        let decoded = decode_profiles(&newer, &[]).expect("the profile still loads");
+        assert_eq!(decoded.profiles[0].name, "Dev");
+        let read = decoded.profiles[0]
+            .introspection_depth
+            .as_deref()
+            .and_then(Depth::from_slug);
+        assert_eq!(read.unwrap_or_default(), Depth::Sizes);
+
+        let golden = include_str!("testdata/every-engine.resaved.toml");
+        assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
+        assert!(
+            !golden.contains("introspection_depth"),
+            "the fixtures hold no such key"
+        );
+    }
+
+    #[test]
     fn a_profile_without_folders_or_pins_is_written_as_it_always_was() {
         let text = written_alone(a_stored_profile());
         assert!(
