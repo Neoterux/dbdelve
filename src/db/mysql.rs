@@ -1574,6 +1574,60 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_driver_properties_reach_the_server() {
+        let properties = crate::db::Properties {
+            application_name: Some("billing app".into()),
+            connect_timeout: Some(5),
+        };
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                properties: properties.clone(),
+                ..live_config(engine)
+            };
+            let main = Connection::open(&config, engine).expect("the connection opens");
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            if engine == Engine::MariaDb {
+                // The dev image leaves `performance_schema` off, so the attribute
+                // is not readable back; the connect and an answer are what shows
+                // the options were accepted.
+                let result = main
+                    .query("SELECT 1", Fetch::default())
+                    .expect("the session answers");
+                assert_eq!(result.rows[0].get(0), Some("1"));
+                let read = agent
+                    .query(
+                        "SELECT 1",
+                        &crate::db::CancelToken::default(),
+                        Fetch::default(),
+                    )
+                    .expect("the agent reads");
+                assert_eq!(read.rows[0].get(0), Some("1"));
+                continue;
+            }
+            let attribute = "SELECT ATTR_VALUE FROM performance_schema.session_connect_attrs \
+                WHERE PROCESSLIST_ID = CONNECTION_ID() AND ATTR_NAME = 'program_name'";
+            let result = main
+                .query(attribute, Fetch::default())
+                .expect("the attribute reads");
+            assert_eq!(result.rows[0].get(0), Some("billing app"));
+            let read = agent
+                .query(
+                    attribute,
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), Some("billing app"));
+        }
+    }
+
     /// The compose database as the bastion sees it, by service name and the
     /// port inside the network.
     fn live_tunnelled() -> ServerConfig {
@@ -2142,6 +2196,40 @@ ORDER BY 1, 2
         assert_eq!(opts.get_ip_or_hostname(), "127.0.0.1");
         assert_eq!(opts.get_tcp_port(), 40000);
         assert!(!opts.get_prefer_socket());
+    }
+
+    #[test]
+    fn driver_properties_ride_the_options() {
+        let opts = |properties| -> ::mysql::Opts {
+            base_options(
+                &ServerConfig {
+                    properties,
+                    ..ServerConfig::default()
+                },
+                None,
+            )
+            .into()
+        };
+        let set = opts(crate::db::Properties {
+            application_name: Some("billing".into()),
+            connect_timeout: Some(5),
+        });
+        assert_eq!(
+            set.get_connect_attrs()
+                .and_then(|attrs| attrs.get("program_name"))
+                .map(String::as_str),
+            Some("billing")
+        );
+        assert_eq!(set.get_tcp_connect_timeout(), Some(Duration::from_secs(5)));
+        // Nothing set is as it was: the driver's own attributes, a ten-second dial.
+        let bare = opts(crate::db::Properties::default());
+        assert_eq!(bare.get_connect_attrs(), None);
+        assert_eq!(
+            bare.get_tcp_connect_timeout(),
+            Some(Duration::from_secs(10))
+        );
+        // The channel the hold rides is not touched.
+        assert!(set.get_init().is_empty());
     }
 
     #[test]

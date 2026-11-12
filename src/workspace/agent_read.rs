@@ -2165,6 +2165,53 @@ mod tests {
         }
     }
 
+    /// `config` with the profile's time zone and driver properties set, where
+    /// its engine keeps a server config at all.
+    fn with_session_settings(mut config: ConnectionConfig) -> ConnectionConfig {
+        if let Some(server) = config.server_mut() {
+            server.time_zone = Some("Europe/Paris".into());
+            server.properties = crate::db::Properties {
+                application_name: Some("billing".into()),
+                connect_timeout: Some(5),
+            };
+        }
+        config
+    }
+
+    #[test]
+    fn the_agents_configs_keep_driver_properties() {
+        for config in crate::db::every_shape() {
+            let profile = with_session_settings(config);
+            let Some(set) = profile.server().map(|server| server.properties.clone()) else {
+                continue;
+            };
+            for agent in [
+                agent_config(&profile),
+                crate::workspace::agent_write::agent_write_config(&profile),
+            ] {
+                let kept = agent.server().map(|server| server.properties.clone());
+                assert_eq!(kept, Some(set.clone()), "{:?}", profile.engine());
+            }
+        }
+    }
+
+    #[test]
+    fn the_agents_configs_keep_the_time_zone() {
+        for config in crate::db::every_shape() {
+            let profile = with_session_settings(config);
+            let Some(zone) = profile.server().map(|server| server.time_zone.clone()) else {
+                continue;
+            };
+            for agent in [
+                agent_config(&profile),
+                crate::workspace::agent_write::agent_write_config(&profile),
+            ] {
+                let kept = agent.server().map(|server| server.time_zone.clone());
+                assert_eq!(kept, Some(zone.clone()), "{:?}", profile.engine());
+            }
+        }
+    }
+
     /// Whether `text` holds `name` bounded by anything but a name character,
     /// in any ASCII case.
     fn stands_whole(text: &str, name: &str) -> bool {

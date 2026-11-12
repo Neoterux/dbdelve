@@ -2418,6 +2418,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires the compose databases"]
+    fn live_driver_properties_reach_the_server() {
+        let config = ServerConfig {
+            properties: Properties {
+                application_name: Some("o'brien app".to_string()),
+                connect_timeout: Some(5),
+            },
+            ..live_config()
+        };
+        let main = Connection::open(&config).expect("the connection opens");
+        assert_eq!(
+            cell(&main, "SHOW application_name").as_deref(),
+            Some("o'brien app")
+        );
+        let agent =
+            crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::postgres(config))
+                .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SHOW application_name",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), Some("o'brien app"));
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
     fn live_a_script_cannot_lift_the_side_sessions_bound() {
         let scripted = Connection::open(&live_config())
             .and_then(|connection| {
