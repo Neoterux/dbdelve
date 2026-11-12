@@ -6656,6 +6656,24 @@ mod tests {
         crate::sql_snapshots::check("spellings_read_only", &out);
     }
 
+    /// Only the engines whose session takes a time zone by a statement have
+    /// one; ClickHouse sends it on each request instead, so it has none here.
+    #[test]
+    fn time_zone_statements_are_recorded_per_engine() {
+        for engine in Engine::ALL {
+            let expected = match engine {
+                Engine::Postgres => Some("SET TIME ZONE 'Europe/Paris'"),
+                Engine::MySql | Engine::MariaDb => Some("SET time_zone = 'Europe/Paris'"),
+                _ => None,
+            };
+            assert_eq!(
+                time_zone_statement(engine, "Europe/Paris").as_deref(),
+                expected,
+                "{engine:?}"
+            );
+        }
+    }
+
     /// The script is the user's session's: every session the driver opens
     /// beside theirs replays it, and an agent's connections, opened from the
     /// config alone, never see it.

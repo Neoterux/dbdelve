@@ -1252,6 +1252,32 @@ mod tests {
     }
 
     #[test]
+    fn the_time_zone_row_is_asked_of_the_target() {
+        let postgres = Target::built_in(Engine::Postgres);
+        assert_eq!(
+            typed_time_zone(postgres, " Europe/Paris "),
+            Ok(Some("Europe/Paris".to_string()))
+        );
+        assert!(typed_time_zone(postgres, "Europe/Paris'").is_err());
+        assert_eq!(typed_time_zone(postgres, "  "), Ok(None));
+        for engine in Engine::ALL {
+            let takes = matches!(
+                engine,
+                Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::ClickHouse
+            );
+            assert_eq!(
+                Target::built_in(engine).takes_time_zone(),
+                takes,
+                "{engine:?}"
+            );
+        }
+        // Not read where the row is not drawn, so text left in it by another
+        // engine neither fails the save nor is stored.
+        let sql_server = Target::built_in(Engine::SqlServer);
+        assert_eq!(typed_time_zone(sql_server, "Europe/Paris'"), Ok(None));
+    }
+
+    #[test]
     fn the_active_schema_stays_only_on_the_engine_and_database_it_was_picked_on() {
         let postgres = |database: &str| {
             ConnectionConfig::postgres(ServerConfig {

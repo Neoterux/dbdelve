@@ -2358,6 +2358,45 @@ mod tests {
 
     #[test]
     #[ignore = "requires the compose databases"]
+    fn live_the_time_zone_reaches_every_session() {
+        let paris = ServerConfig {
+            time_zone: Some("Europe/Paris".into()),
+            ..live_config()
+        };
+        let main = Connection::open(&paris).expect("the connection opens");
+        let zone = |connection: &Connection| cell(connection, "SHOW timezone");
+        assert_eq!(zone(&main).as_deref(), Some("Europe/Paris"));
+        let beside = main.alongside().expect("a session beside it opens");
+        assert_eq!(zone(&beside).as_deref(), Some("Europe/Paris"));
+        let database = main.current_database().to_string();
+        let other = main.on_database(&database).expect("a session opens");
+        assert_eq!(zone(&other).as_deref(), Some("Europe/Paris"));
+        let side = main
+            .aside(Duration::from_secs(10), |side| Some(zone(side)))
+            .expect("the side session opens");
+        assert_eq!(side.as_deref(), Some("Europe/Paris"));
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::postgres(
+            paris.clone(),
+        ))
+        .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SHOW timezone",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), Some("Europe/Paris"));
+
+        // Set before the script, so the script's own zone wins.
+        let scripted = Connection::open(&paris)
+            .and_then(|connection| connection.with_startup(vec!["SET TIME ZONE 'UTC'".into()]))
+            .expect("the script runs");
+        assert_eq!(zone(&scripted).as_deref(), Some("UTC"));
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
     fn live_a_script_cannot_lift_the_side_sessions_bound() {
         let scripted = Connection::open(&live_config())
             .and_then(|connection| {

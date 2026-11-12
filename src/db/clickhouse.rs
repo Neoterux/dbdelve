@@ -4410,6 +4410,36 @@ mod live {
 
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
+    fn live_the_time_zone_rides_every_request() {
+        let zone = |connection: &Connection| {
+            ran(connection, "SELECT timezone()").rows[0]
+                .iter()
+                .next()
+                .flatten()
+                .map(str::to_string)
+        };
+        let config = ServerConfig {
+            time_zone: Some("Asia/Tokyo".into()),
+            ..live_config()
+        };
+        let main = Connection::open(&config).expect("connection should open");
+        assert_eq!(zone(&main).as_deref(), Some("Asia/Tokyo"));
+        let other = main.on_database("system").expect("a session should open");
+        assert_eq!(zone(&other).as_deref(), Some("Asia/Tokyo"));
+        let agent = crate::db::Connection::open_for_agent(ConnectionConfig::ClickHouse(config))
+            .expect("the agent's connection should open");
+        let read = agent
+            .query(
+                "SELECT timezone()",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), Some("Asia/Tokyo"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_CLICKHOUSE_URL"]
     fn live_a_session_on_another_database_is_on_it() {
         let profile = live();
         let session = profile
