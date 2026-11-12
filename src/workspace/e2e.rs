@@ -11259,75 +11259,302 @@ fn an_agent_lists_only_the_schemas_the_filter_shows_and_says_how_many(cx: &mut T
     });
 }
 
+/// One `[[profiles]]` table of a ClickHouse profile `Clicks` (id `clicks`) on
+/// a mock's `port`, visible to the agent, as `profiles.toml` spells one.
+fn clickhouse_profile(port: u16) -> String {
+    format!(
+        "[[profiles]]\nid = \"clicks\"\nname = \"Clicks\"\nhost = \"127.0.0.1\"\nport = {port}\n\
+         database = \"dbdelve_dev\"\nuser = \"me@example.com\"\nengine = \"clickhouse\"\n\
+         sslmode = \"disable\"\nagent_visible = true\n"
+    )
+}
+
+/// Answer a ClickHouse mock the way a server holding `analytics` and
+/// `dbdelve_dev` does: one table in each, and those two as the databases the
+/// tree draws. A read that names `dbdelve_dev` alone gets that one's table
+/// only, as a server answering the `IN` list a filter writes does.
+fn route_clickhouse_catalog(mock: &crate::db::clickhouse_mock::Mock) {
+    use crate::db::clickhouse_mock::Response;
+
+    let relations = [
+        ("schema_name", "String"),
+        ("relation_name", "String"),
+        ("relation_kind", "String"),
+        ("size_bytes", "Nullable(UInt64)"),
+        ("row_estimate", "Nullable(UInt64)"),
+    ];
+    let listing = [("name", "String"), ("is_current", "UInt8")];
+    mock.on_statement(
+        "relation_kind",
+        [Response::rows(
+            &relations,
+            &[
+                &["analytics", "events", "table", "\\N", "\\N"],
+                &["dbdelve_dev", "orders", "table", "\\N", "\\N"],
+            ],
+        )],
+    );
+    mock.on_statement(
+        "database IN ('dbdelve_dev')",
+        [Response::rows(
+            &relations,
+            &[&["dbdelve_dev", "orders", "table", "\\N", "\\N"]],
+        )],
+    );
+    for statement in ["SELECT DISTINCT database", "FROM system.databases"] {
+        mock.on_statement(
+            statement,
+            [Response::rows(
+                &listing,
+                &[&["analytics", "0"], &["dbdelve_dev", "1"]],
+            )],
+        );
+    }
+}
+
+/// The app launched with an SQLite profile in front and a ClickHouse profile
+/// `clicks` idle beside it, on a mock server that answers its catalog.
+///
+/// The SQLite one is first because the launch connects only the profile it
+/// puts in front, and the ClickHouse one must not be connected before
+/// [`connect_clicks`] has filled its password slot.
+fn launch_beside_a_clickhouse_mock(
+    cx: &mut TestAppContext,
+) -> (
+    crate::db::clickhouse_mock::Mock,
+    Entity<Workspace>,
+    &mut VisualTestContext,
+) {
+    crate::IGNORE_ENVIRONMENT.set(true);
+    let mock = crate::db::clickhouse_mock::Mock::start();
+    // Opened and dropped at once: what it leaves on the mock is the routes of
+    // the open handshake, which 08-10's opener for tests above `src/db/`
+    // installs and the app's own open then finds.
+    drop(mock.connection());
+    route_clickhouse_catalog(&mock);
+    let port = mock.server().port.expect("the mock listens on a port");
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        &[
+            sqlite_profile("orders", "Orders", ""),
+            clickhouse_profile(port),
+        ]
+        .concat(),
+    );
+    (mock, workspace, cx)
+}
+
+fn clicks_connection_is_open(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "clicks")
+            .is_some_and(|profile| profile.connection().is_some())
+    })
+}
+
+/// Bring `clicks` to the front and wait until its connection is open.
+fn connect_clicks(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, _| {
+        let profile = workspace
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == "clicks")
+            .expect("the profile was restored");
+        // A password slot that holds something is never looked up in the OS
+        // keychain (the connect path here and `agent_read::open_agent`), which
+        // a headless Linux CI may not have and a test must not touch.
+        *profile
+            .config
+            .password_mut()
+            .expect("a server profile has a password slot") = "unused".to_string();
+    });
+    activate_by_id(workspace, cx, "clicks");
+    drive_until(cx, |cx| clicks_connection_is_open(workspace, cx));
+    settle(cx);
+}
+
+/// The mock the agent's lane opens on, apart from the mock under the user's
+/// own connection, so what it counts is only the agent's. The opener is a
+/// `fn` pointer and captures nothing, so it reads this.
+static AGENT_MOCK: std::sync::Mutex<Option<crate::db::clickhouse_mock::Mock>> =
+    std::sync::Mutex::new(None);
+
+/// How many statements containing `statement` the agent's mock has received.
+fn agent_hits(statement: &str) -> usize {
+    AGENT_MOCK
+        .lock()
+        .expect("nothing panics holding the mock")
+        .as_ref()
+        .expect("the test installed the agent's mock")
+        .hits(statement)
+}
+
+/// An [`agent_read::Opener`](super::agent_read::Opener) that opens a
+/// connection on [`AGENT_MOCK`] whatever profile asked. Each open runs the
+/// handshake there, so that mock's `system.settings` count is the number of
+/// times a lane opened.
+fn open_agent_on_the_mock(
+    executor: &gpui::BackgroundExecutor,
+    _: crate::db::ConnectionConfig,
+    _: String,
+) -> gpui::Task<Result<(crate::db::Connection, Vec<String>), crate::db::DbError>> {
+    super::spawn_blocking(executor, || {
+        let guard = AGENT_MOCK.lock().expect("nothing panics holding the mock");
+        let mock = guard.as_ref().expect("the test installed the agent's mock");
+        Ok((mock.connection(), Vec::new()))
+    })
+}
+
+/// The generation and config of the profile `clicks`, which only a
+/// reconnect or an edit of the connection moves.
+fn clicks_connection(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> (u64, crate::db::ConnectionConfig) {
+    workspace.read_with(cx, |workspace, _| {
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "clicks")
+            .expect("the profile was restored");
+        (profile.generation, profile.config.clone())
+    })
+}
+
 #[gpui::test]
-fn a_filter_saved_between_two_agent_calls_applies_to_the_second_without_reopening_the_lane(
+fn a_filter_saved_while_an_agent_call_runs_leaves_that_call_on_its_filter_and_the_next_on_the_new_one_without_reopening_the_lane(
     cx: &mut TestAppContext,
 ) {
-    use crate::{
-        agent::{Status, tools::Tool},
-        db::Include,
-    };
+    use super::filter_picker::Listing;
+    use crate::agent::{CallArgs, Status, tools::Tool};
 
     store::tests::with_home(|| {
-        let path = seed_ducks_file();
-        let (workspace, cx) = agent_duckdb(cx, &path);
+        let (_user, workspace, cx) = launch_beside_a_clickhouse_mock(cx);
         cx.executor().allow_parking();
+        connect_clicks(&workspace, cx);
+        let agent = crate::db::clickhouse_mock::Mock::start();
+        route_clickhouse_catalog(&agent);
+        *AGENT_MOCK.lock().expect("no one holds the mock") = Some(agent);
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(open_agent_on_the_mock);
+        });
+        let (generation, config) = clicks_connection(&workspace, cx);
 
-        let before = ducks_catalog_call(&workspace, cx, Tool::ListSchemas, None, None);
-        assert_eq!(before.status, Status::Executed, "{}", before.text);
-        assert!(
-            before.text.ends_with("\n[\"extra\"]\n[\"main\"]\n"),
-            "{}",
-            before.text
-        );
-        assert!(!before.text.contains("Showing"), "{}", before.text);
-        let ducks = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_filter_picker("clicks", window, cx);
+        });
+        drive_until(cx, |cx| {
             workspace.read_with(cx, |workspace, _| {
-                let profile = workspace
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == "ducks")
-                    .expect("the profile was restored");
-                (profile.generation, profile.config.clone())
+                workspace
+                    .filter_picker
+                    .as_ref()
+                    .is_some_and(|picker| matches!(picker.databases.listing, Listing::Loaded(_)))
             })
-        };
-        let (generation, config) = ducks(&workspace, cx);
+        });
+        settle(cx);
+        click_selector(cx, "filter-picker-patterns-databases");
+        cx.simulate_input("nomatch*");
+        settle(cx);
 
+        // No response is held and nothing parks between the call and the
+        // save: `spawn_blocking` runs each read inline on this thread, so a
+        // held one could never be released. The call is in flight because the
+        // scheduler has not run since it arrived, which the two asserts at the
+        // save show.
+        let (_, first) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ListSchemas,
+            Some("Clicks"),
+            CallArgs::default(),
+        );
         workspace.update(cx, |workspace, cx| {
+            let lane = workspace
+                .agent
+                .lanes
+                .get("clicks")
+                .expect("the call has a lane");
+            assert!(lane.running.is_some(), "the call is under way");
+            assert_eq!(
+                agent_hits("relation_kind"),
+                0,
+                "its statement has not been sent"
+            );
+            workspace.save_filter(cx);
             let profile = workspace
                 .profiles
-                .iter_mut()
-                .find(|profile| profile.id == "ducks")
+                .iter()
+                .find(|profile| profile.id == "clicks")
                 .expect("the profile was restored");
-            profile.include = Include::from_stored(Vec::new(), vec!["main".to_string()]);
-            workspace.remember_profiles(cx);
+            assert_eq!(profile.include.databases, ["nomatch*"]);
         });
-
-        let after = ducks_catalog_call(&workspace, cx, Tool::ListSchemas, None, None);
-        assert_eq!(after.status, Status::Executed, "{}", after.text);
-        assert!(after.text.ends_with("\n[\"main\"]\n"), "{}", after.text);
+        let first = answer_of(cx, &first);
+        assert_eq!(first.status, Status::Executed, "{}", first.text);
         assert!(
-            after.text.contains("Showing 1 of 2 schemas."),
+            first
+                .text
+                .ends_with("\n[\"analytics\"]\n[\"dbdelve_dev\"]\n"),
             "{}",
-            after.text
+            first.text
         );
-        assert_eq!(
-            ducks(&workspace, cx),
-            (generation, config.clone()),
-            "the save moved the profile's connection"
+        assert!(
+            !first.text.contains("Showing"),
+            "the call that started before the save answered on the new filter: {}",
+            first.text
         );
-        // A DuckDB file's lane opens per call and goes once its queue empties,
-        // so it need not survive between the calls; what keeps an edit from
-        // reopening one is that the include is no part of the config.
-        workspace.read_with(cx, |workspace, _| {
-            assert!(
+        let held = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
                 workspace
                     .agent
                     .lanes
-                    .get("ducks")
-                    .is_none_or(|lane| lane.opened_from == config)
-            );
-        });
+                    .get("clicks")
+                    .map(|lane| (lane.connection.is_some(), lane.opened_from.clone()))
+            })
+        };
+        assert_eq!(
+            held(&workspace, cx),
+            Some((true, config.clone())),
+            "the lane keeps its connection"
+        );
+
+        let (_, second) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ListSchemas,
+            Some("Clicks"),
+            CallArgs::default(),
+        );
+        let second = answer_of(cx, &second);
+        assert_eq!(second.status, Status::Executed, "{}", second.text);
+        assert!(
+            second.text.ends_with("\n[\"dbdelve_dev\"]\n"),
+            "{}",
+            second.text
+        );
+        assert!(
+            second.text.contains("Showing 1 of 2 databases."),
+            "{}",
+            second.text
+        );
+        assert_eq!(
+            agent_hits("system.settings"),
+            1,
+            "one open served both calls"
+        );
+        assert_eq!(
+            held(&workspace, cx),
+            Some((true, config.clone())),
+            "the lane still holds the connection it opened"
+        );
+        assert_eq!(
+            clicks_connection(&workspace, cx),
+            (generation, config),
+            "the save moved the profile's connection"
+        );
+        workspace.update(cx, |workspace, _| workspace.agent.opener = None);
+        *AGENT_MOCK.lock().expect("no one holds the mock") = None;
         quit(workspace, cx);
     });
 }
