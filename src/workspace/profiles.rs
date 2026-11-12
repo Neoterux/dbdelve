@@ -229,6 +229,7 @@ impl Workspace {
         if read_as_postgres && stored.agent_visible {
             self.agent.visibility_choices.insert(id.clone());
         }
+        let takes_script = config.target().takes_startup_script();
         self.profiles.push(Profile {
             id: stored.id,
             name: stored.name,
@@ -267,7 +268,12 @@ impl Workspace {
                     .as_deref()
                     .and_then(Depth::from_slug)
                     .unwrap_or_default(),
-                startup_script: stored.startup_script.unwrap_or_default(),
+                // An engine with no row has no way to show or change it, and
+                // nothing would run it.
+                startup_script: stored
+                    .startup_script
+                    .filter(|_| takes_script)
+                    .unwrap_or_default(),
             },
             confirmed: stored
                 .confirmed
@@ -798,6 +804,26 @@ impl Workspace {
                 return;
             }
         };
+        // As Test connection and every connect will judge it: under the mode
+        // the profile has, which for a new one is the form's.
+        let (script_mode, script_confirmed) = editing
+            .as_deref()
+            .and_then(|id| self.profiles.iter().find(|profile| profile.id == id))
+            .map_or((mode, Vec::new()), |profile| {
+                (profile.mode, profile.confirmed.clone())
+            });
+        if let Err(error) = sql::startup_statements(
+            config.engine(),
+            script_mode,
+            &script_confirmed,
+            &behaviour.startup_script,
+        ) {
+            if let Some(form) = &mut self.form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
         if let Some(editing) = editing.as_deref()
             && let Some(profile) = self.profiles.iter().find(|profile| profile.id == editing)
         {
@@ -909,11 +935,24 @@ impl Workspace {
                 return;
             }
         };
+        let behaviour = match form.behaviour(cx) {
+            Ok(behaviour) => behaviour,
+            Err(error) => {
+                form.error = Some(error);
+                form.test = None;
+                cx.notify();
+                return;
+            }
+        };
         let editing = form.editing.clone();
-        let mode = editing
+        let (mode, confirmed) = editing
             .as_ref()
             .and_then(|id| self.profiles.iter().find(|profile| &profile.id == id))
-            .map_or(form.mode, |profile| profile.mode);
+            .map_or((form.mode, Vec::new()), |profile| {
+                (profile.mode, profile.confirmed.clone())
+            });
+        let script = behaviour.startup_script;
+        let speaks = config.engine();
         form.error = None;
 
         let engine = config.target().label();
@@ -935,6 +974,7 @@ impl Workspace {
                         .set_read_only(true)
                         .map_err(|error| error.message)?;
                 }
+                let connection = run_startup(connection, speaks, mode, &confirmed, &script)?;
                 Ok::<_, String>(Reported::of(&connection))
             })();
             let elapsed = started.elapsed();
