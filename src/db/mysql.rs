@@ -1826,12 +1826,7 @@ ORDER BY 1, 2
                 // contain anything a URL can encode.
                 user: "person@example.com".into(),
                 password: "pa ss".into(),
-                sslmode: SslMode::default(),
-                root_certificate: None,
-                statement_timeout: 0,
-                ssh: None,
-                schema: None,
-                read_only: false,
+                ..ServerConfig::default()
             }
         );
         assert_eq!(
