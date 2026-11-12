@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::net::{Shutdown, SocketAddr};
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
@@ -2446,6 +2446,38 @@ mod tests {
 
     fn live() -> Connection {
         Connection::open(&live_config()).expect("connection should open")
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_keep_alive_ping_answers_and_never_waits_on_a_busy_session() {
+        let connection = live();
+        assert!(connection.ping().is_ok(), "an idle session answers");
+
+        // A statement holds the session for as long as it runs; the round
+        // skips it rather than queue behind it.
+        let busy = connection.session.lock().expect("nothing else holds it");
+        let started = Instant::now();
+        assert!(connection.ping().is_ok(), "a busy session is skipped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and the skip does not wait"
+        );
+        drop(busy);
+
+        let unopened = connection.alongside();
+        assert!(
+            unopened.ping().is_ok(),
+            "a session never logged in is left alone"
+        );
+        assert!(
+            unopened
+                .session
+                .lock()
+                .expect("nothing else holds it")
+                .is_none(),
+            "and the ping did not log it in"
+        );
     }
 
     #[test]

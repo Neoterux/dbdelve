@@ -22,7 +22,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use ::redis::{
@@ -2478,6 +2478,40 @@ mod tests {
 
     fn live() -> Connection {
         Connection::open(&live_config()).expect("connection should open")
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_keep_alive_ping_answers_and_skips_an_open_multi() {
+        const KEY: &str = "live:keep:alive";
+        let connection = live();
+        ran(&connection, &format!("DEL {KEY}"));
+        assert!(connection.ping().is_ok(), "an idle session answers");
+
+        // A command holds the session for as long as it runs; the round
+        // skips it rather than queue behind it.
+        let busy = lock(&connection.session);
+        let started = Instant::now();
+        assert!(connection.ping().is_ok(), "a busy session is skipped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and the skip does not wait"
+        );
+        drop(busy);
+
+        // The ping sends nothing inside the user's MULTI: a PING queued there
+        // would be one more command EXEC ran, and its reply one more element.
+        ran(&connection, "MULTI");
+        assert!(connection.ping().is_ok(), "an open MULTI is skipped");
+        ran(&connection, &format!("SET {KEY} 1"));
+        let exec = ran(&connection, "EXEC");
+        assert_eq!(
+            exec.rows.len(),
+            1,
+            "EXEC ran only what was queued before it: {:?}",
+            cells(&exec)
+        );
+        ran(&connection, &format!("DEL {KEY}"));
     }
 
     fn ran(connection: &Connection, text: &str) -> QueryResult {
