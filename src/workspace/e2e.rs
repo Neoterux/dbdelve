@@ -11730,10 +11730,15 @@ fn an_agent_lists_only_the_schemas_the_filter_shows_and_says_how_many(cx: &mut T
 /// One `[[profiles]]` table of a ClickHouse profile `Clicks` (id `clicks`) on
 /// a mock's `port`, visible to the agent, as `profiles.toml` spells one.
 fn clickhouse_profile(port: u16) -> String {
+    clickhouse_profile_with(port, "")
+}
+
+/// [`clickhouse_profile`] with `extra` keys appended to its table.
+fn clickhouse_profile_with(port: u16, extra: &str) -> String {
     format!(
         "[[profiles]]\nid = \"clicks\"\nname = \"Clicks\"\nhost = \"127.0.0.1\"\nport = {port}\n\
          database = \"dbdelve_dev\"\nuser = \"me@example.com\"\nengine = \"clickhouse\"\n\
-         sslmode = \"disable\"\nagent_visible = true\n"
+         sslmode = \"disable\"\nagent_visible = true\n{extra}"
     )
 }
 
@@ -11796,6 +11801,19 @@ fn launch_beside_a_clickhouse_mock(
     Entity<Workspace>,
     &mut VisualTestContext,
 ) {
+    launch_beside_a_clickhouse_mock_with(cx, "")
+}
+
+/// [`launch_beside_a_clickhouse_mock`] with `extra` keys in the ClickHouse
+/// profile's table.
+fn launch_beside_a_clickhouse_mock_with<'a>(
+    cx: &'a mut TestAppContext,
+    extra: &str,
+) -> (
+    crate::db::clickhouse_mock::Mock,
+    Entity<Workspace>,
+    &'a mut VisualTestContext,
+) {
     crate::IGNORE_ENVIRONMENT.set(true);
     let mock = crate::db::clickhouse_mock::Mock::start();
     // Opened and dropped at once: what it leaves on the mock is the routes of
@@ -11808,11 +11826,75 @@ fn launch_beside_a_clickhouse_mock(
         cx,
         &[
             sqlite_profile("orders", "Orders", ""),
-            clickhouse_profile(port),
+            clickhouse_profile_with(port, extra),
         ]
         .concat(),
     );
     (mock, workspace, cx)
+}
+
+#[gpui::test]
+fn a_clickhouse_time_zone_rides_every_request_the_agents_included(cx: &mut TestAppContext) {
+    use crate::db::Connection;
+
+    store::tests::with_home(|| {
+        let (mock, workspace, cx) =
+            launch_beside_a_clickhouse_mock_with(cx, "time_zone = \"Europe/Paris\"\n");
+        cx.executor().allow_parking();
+        let launched = mock.requests().len();
+        connect_clicks(&workspace, cx);
+
+        let (_, config) = clicks_connection(&workspace, cx);
+        assert_eq!(
+            config
+                .server()
+                .and_then(|server| server.time_zone.as_deref()),
+            Some("Europe/Paris")
+        );
+        let stored = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "clicks")
+                .expect("the profile was restored")
+                .stored()
+        });
+        assert_eq!(stored.time_zone.as_deref(), Some("Europe/Paris"));
+
+        // The user's connection: the validation the connect ends on, and the
+        // catalog read after it. The facts read before them is the only
+        // request that carries no setting.
+        let own = mock.requests().split_off(launched);
+        let carried = |statement: &str| {
+            own.iter()
+                .filter(|request| request.statement.contains(statement))
+                .map(|request| request.param("session_timezone").map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(carried("SELECT 1"), [Some("Europe/Paris".to_string())]);
+        let catalog = carried("relation_kind");
+        assert!(!catalog.is_empty(), "the catalog was read");
+        assert!(
+            catalog
+                .iter()
+                .all(|zone| zone.as_deref() == Some("Europe/Paris"))
+        );
+
+        // The agent's read connection and its approved write's.
+        let opened = mock.requests().len();
+        Connection::open_for_agent(super::agent_read::agent_config(&config))
+            .expect("the read connection opens");
+        Connection::open_for_approved_write(super::agent_write::agent_write_config(&config), 5)
+            .expect("the write connection opens");
+        let agents = mock.requests().split_off(opened);
+        let validations: Vec<_> = agents
+            .iter()
+            .filter(|request| request.statement.contains("SELECT 1"))
+            .map(|request| request.param("session_timezone"))
+            .collect();
+        assert_eq!(validations, [Some("Europe/Paris"), Some("Europe/Paris")]);
+        quit(workspace, cx);
+    });
 }
 
 fn clicks_connection_is_open(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {

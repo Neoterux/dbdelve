@@ -2386,6 +2386,23 @@ ORDER BY database, name"#;
     }
 
     #[test]
+    fn a_readonly_user_whose_zone_differs_fails_the_connect_in_the_servers_words() {
+        let mock = Mock::start();
+        mock.readonly(&["session_timezone"]);
+        let server = ServerConfig {
+            time_zone: Some("Europe/Paris".into()),
+            ..profile(&mock)
+        };
+        let error = open_with(&mock, reader("0"), &server).err().unwrap();
+        assert_eq!(
+            error.message,
+            "Cannot modify 'session_timezone' setting in readonly mode. (READONLY)"
+        );
+        let [validation] = sent(&mock, VALIDATION_SQL).try_into().unwrap();
+        assert_eq!(validation.param("session_timezone"), Some("Europe/Paris"));
+    }
+
+    #[test]
     fn a_null_spelling_that_cannot_be_changed_back_fails_the_connect() {
         let mock = Mock::start();
         let facts = settings(&[
@@ -2400,9 +2417,9 @@ ORDER BY database, name"#;
         );
     }
 
-    fn decided(statement_timeout: u32, rows: &[[&str; 3]]) -> Vec<&'static str> {
+    fn read_of(rows: &[[&str; 3]]) -> QueryResult {
         let mut builder = RowBuilder::default();
-        let read = QueryResult {
+        QueryResult {
             columns: FACTS_COLUMNS
                 .iter()
                 .map(|(name, _)| Column {
@@ -2421,13 +2438,35 @@ ORDER BY database, name"#;
                 })
                 .collect(),
             ..QueryResult::default()
-        };
-        facts(&read, statement_timeout)
+        }
+    }
+
+    fn decided(statement_timeout: u32, rows: &[[&str; 3]]) -> Vec<&'static str> {
+        let read = read_of(rows);
+        facts(&read, statement_timeout, None)
             .unwrap()
             .settings
             .into_iter()
             .map(|(name, _)| name)
             .collect()
+    }
+
+    #[test]
+    fn a_time_zone_already_in_force_is_not_sent() {
+        let zone = |asked: Option<&str>, in_force: &str| {
+            let read = read_of(&[["session_timezone", in_force, "0"]]);
+            facts(&read, 0, asked)
+                .unwrap()
+                .settings
+                .into_iter()
+                .find(|(name, _)| *name == "session_timezone")
+        };
+        assert_eq!(zone(Some("Europe/Paris"), "Europe/Paris"), None);
+        assert_eq!(
+            zone(Some("UTC"), "Europe/Paris"),
+            Some(("session_timezone", "UTC".to_string()))
+        );
+        assert_eq!(zone(None, "Europe/Paris"), None);
     }
 
     #[test]
