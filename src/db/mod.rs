@@ -2259,6 +2259,8 @@ impl Connection {
     pub fn with_startup(self, statements: Vec<String>) -> Result<Self, DbError> {
         match self {
             Self::Sqlite(connection) => connection.with_startup(statements).map(Self::Sqlite),
+            Self::Turso(connection) => connection.with_startup(statements).map(Self::Turso),
+            Self::DuckDb(connection) => connection.with_startup(statements).map(Self::DuckDb),
             other if statements.is_empty() => Ok(other),
             _ => Err(plain_error(
                 "This connection runs no startup script.".into(),

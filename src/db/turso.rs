@@ -22,6 +22,11 @@ pub struct Connection {
     connect: Arc<dyn Fn() -> Result<Arc<TursoConnection>, TursoError> + Send + Sync>,
     connection: Arc<TursoConnection>,
     running: Arc<Mutex<()>>,
+    /// The statements the profile's gated startup script came to, replayed on
+    /// every session opened beside this one. The `connect` closure above is
+    /// built before any script exists and holds none; agent opens never pass
+    /// through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 impl Connection {
@@ -103,16 +108,34 @@ impl Connection {
             connection: connect()?,
             connect,
             running: Arc::new(Mutex::new(())),
+            startup: Arc::default(),
         })
     }
 
     pub fn alongside(&self) -> Result<Self, DbError> {
         let connection = (self.connect)().map_err(|error| plain_error(error.to_string()))?;
-        Ok(Self {
+        let beside = Self {
             connection,
             running: Arc::new(Mutex::new(())),
             ..self.clone()
-        })
+        };
+        beside.replay()?;
+        Ok(beside)
+    }
+
+    /// Runs `statements` now, in the order written, and keeps them for every
+    /// session [`Self::alongside`] opens. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        self.startup = statements.into();
+        self.replay()?;
+        Ok(self)
+    }
+
+    /// The startup statements on this session, rows discarded.
+    fn replay(&self) -> Result<(), DbError> {
+        self.startup
+            .iter()
+            .try_for_each(|statement| self.internal_query(statement).map(|_| ()))
     }
 
     pub fn cancel(&self) -> Result<(), DbError> {
