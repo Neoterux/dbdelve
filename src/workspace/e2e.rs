@@ -11867,6 +11867,44 @@ fn a_filter_saved_while_the_first_catalog_read_runs_is_not_left_waiting_when_tha
 }
 
 #[gpui::test]
+fn a_connect_that_fails_leaves_no_saved_filter_waiting(cx: &mut TestAppContext) {
+    use crate::db::clickhouse_mock::Response;
+
+    store::tests::with_home(|| {
+        let (mock, workspace, cx) = clicks_with_a_pattern_typed(cx);
+        mock.on_statement(
+            "system.settings",
+            [Response::error(
+                500,
+                497,
+                "ACCESS_DENIED",
+                "Not enough privileges",
+            )],
+        );
+        // The reconnect bumps the generation, so the read started a moment
+        // before belongs to the old one and its landing is dropped.
+        save_the_filter_during_the_first_read(&workspace, cx, |workspace, window, cx| {
+            workspace.run_command(Command::Reconnect, window, cx);
+        });
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("clicks is in front");
+                profile.connection().is_none() && matches!(profile.catalog, CatalogState::Failed(_))
+            })
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("clicks is in front");
+            assert!(
+                !profile.reread_after_load,
+                "a connect that failed left the save waiting"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
     cx: &mut TestAppContext,
 ) {
