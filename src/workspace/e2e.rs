@@ -20834,3 +20834,398 @@ fn a_stored_idle_timeout_of_zero_restores_as_off(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// `id`'s last use, and the scheduler's clock now.
+fn idle_clock(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: &str,
+) -> (std::time::Instant, std::time::Instant) {
+    let now = cx.update(|_, cx| cx.background_executor().now());
+    let last = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile is listed")
+            .last_activity
+    });
+    (last, now)
+}
+
+/// Moves the clock `seconds` and lets every timer that came due run.
+fn tick(cx: &mut VisualTestContext, seconds: u64) {
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(seconds));
+    cx.run_until_parked();
+}
+
+/// Makes the work `set` says on `back`, lets a timeout and more pass, and holds
+/// that it stayed connected and set its timer again, then ends the work with
+/// `clear`.
+///
+/// The work is made before the clock moves, so that the timer finds it there
+/// whichever task the scheduler runs first.
+fn held_open_by(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    label: &str,
+    set: impl FnOnce(&mut crate::session::Profile, &mut gpui::Context<Workspace>),
+    clear: impl FnOnce(&mut crate::session::Profile, &mut gpui::Context<Workspace>),
+) {
+    let back = |workspace: &mut Workspace| {
+        workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.id == "back")
+            .expect("the profile is listed")
+    };
+    workspace.update(cx, |workspace, cx| {
+        let index = back(workspace);
+        set(&mut workspace.profiles[index], cx);
+    });
+    tick(cx, 61);
+    let (last, now) = idle_clock(workspace, cx, "back");
+    assert!(
+        now >= last + std::time::Duration::from_secs(60),
+        "{label}: the deadline has passed"
+    );
+    assert_eq!(state_of(workspace, cx, "back"), "connected", "{label}");
+    assert!(idle_armed(workspace, cx, "back"), "{label}: set again");
+    workspace.update(cx, |workspace, cx| {
+        let index = back(workspace);
+        clear(&mut workspace.profiles[index], cx);
+    });
+}
+
+#[gpui::test]
+fn idle_disconnect_waits_for_unfinished_work(cx: &mut TestAppContext) {
+    use crate::session::{Exporting, QueryState, Queue};
+
+    store::tests::with_home(|| {
+        let profiles = [
+            sqlite_profile("front", "Front", ""),
+            sqlite_profile("back", "Back", "idle_timeout_minutes = 1"),
+        ]
+        .concat();
+        let (workspace, cx) = launch_connections(cx, ORDERS_SCHEMA, "", &profiles);
+        cx.executor().allow_parking();
+        connect_profile(&workspace, cx, "back");
+        run_in_front(&workspace, cx, "SELECT * FROM t");
+        connect_profile(&workspace, cx, "front");
+        assert_eq!(state_of(&workspace, cx, "back"), "connected");
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.profile().map(|profile| profile.id.as_str()),
+                Some("front"),
+                "the profile under test is not in front"
+            );
+        });
+
+        held_open_by(
+            &workspace,
+            cx,
+            "a transaction",
+            |profile, _| profile.in_transaction = true,
+            |profile, _| profile.in_transaction = false,
+        );
+        held_open_by(
+            &workspace,
+            cx,
+            "a bound session's transaction",
+            |profile, _| {
+                profile.bound_transactions.insert("other".to_string());
+            },
+            |profile, _| profile.bound_transactions.clear(),
+        );
+        held_open_by(
+            &workspace,
+            cx,
+            "a statement running",
+            |profile, _| {
+                profile.session.queries[0].query = QueryState::Running {
+                    started: std::time::Instant::now(),
+                    cancelling: None,
+                    cancel: crate::db::CancelToken::default(),
+                };
+            },
+            |profile, _| profile.session.queries[0].query = QueryState::Idle,
+        );
+        let queue = |awaiting: bool, remaining: Vec<std::ops::Range<usize>>| Queue {
+            sql: "SELECT 1; SELECT 2".to_string(),
+            remaining,
+            done: Vec::new(),
+            showing: 0,
+            awaiting,
+            spare: Vec::new(),
+        };
+        held_open_by(
+            &workspace,
+            cx,
+            "a queue awaiting a statement",
+            |profile, _| profile.session.queries[0].queue = Some(queue(true, Vec::new())),
+            |profile, _| profile.session.queries[0].queue = None,
+        );
+        held_open_by(
+            &workspace,
+            cx,
+            "a queue with statements left",
+            |profile, _| profile.session.queries[0].queue = Some(queue(false, vec![9..18])),
+            |profile, _| profile.session.queries[0].queue = None,
+        );
+        held_open_by(
+            &workspace,
+            cx,
+            "an export running",
+            |profile, _| {
+                profile.session.exporting = Some(Exporting {
+                    file: "out.csv".to_string(),
+                    started: std::time::Instant::now(),
+                    progress: Default::default(),
+                });
+            },
+            |profile, _| profile.session.exporting = None,
+        );
+        let grid = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "back")
+                .expect("the profile is listed")
+                .session
+                .queries[0]
+                .results
+                .clone()
+        });
+        held_open_by(
+            &workspace,
+            cx,
+            "a cell edit nobody applied",
+            |_, cx| {
+                grid.update(cx, |grid, _| {
+                    assert!(grid.delegate_mut().set_pending(
+                        0,
+                        1,
+                        crate::result_grid::NewValue::Value("edited".into())
+                    ));
+                });
+            },
+            |_, cx| grid.update(cx, |grid, _| grid.delegate_mut().discard_pending()),
+        );
+
+        // An import into it, which holds its own session, started while it was
+        // in front.
+        connect_profile(&workspace, cx, "back");
+        let file = store::dbdelve_directory().unwrap().join("rows.csv");
+        std::fs::write(&file, "id\n9\n").unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_import_file(
+                "back".into(),
+                None,
+                "main".into(),
+                "t".into(),
+                file,
+                window,
+                cx,
+            );
+        });
+        settle(cx);
+        tick(cx, 1);
+        settle(cx);
+        // The import's own task is let run with the dialog set aside, so that
+        // it lands on nothing and leaves the dialog running for ever.
+        let dialog = workspace.update(cx, |workspace, cx| {
+            workspace.start_import(cx);
+            assert!(workspace.running_import_into("back").is_some());
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "back")
+                .expect("the profile is listed");
+            workspace.profiles[index].session.import_rows.take()
+        });
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "back")
+                .expect("the profile is listed");
+            workspace.profiles[index].session.import_rows = dialog;
+            assert!(workspace.running_import_into("back").is_some());
+            workspace.activate(0, cx);
+        });
+        held_open_by(
+            &workspace,
+            cx,
+            "an import running into it",
+            |_, _| {},
+            |_, _| {},
+        );
+        held_open_by(
+            &workspace,
+            cx,
+            "an import running into it, a timeout later",
+            |_, _| {},
+            |profile, _| profile.session.import_rows = None,
+        );
+
+        // Nothing left unfinished: the import's landing is let run first, and
+        // the next deadline closes it.
+        settle(cx);
+        tick(cx, 61);
+        assert_eq!(state_of(&workspace, cx, "back"), "idle");
+        assert_eq!(state_of(&workspace, cx, "front"), "connected");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn only_the_users_work_moves_the_idle_deadline(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "idle_timeout_minutes = 1"),
+        );
+        connect_profile(&workspace, cx, "orders");
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+
+        tick(cx, 40);
+        run_in_front(&workspace, cx, "SELECT 1");
+        tick(cx, 21);
+        assert_eq!(
+            state_of(&workspace, cx, "orders"),
+            "connected",
+            "a statement at 40 s moves the deadline past 61 s"
+        );
+        tick(cx, 40);
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle", "and to 100 s");
+
+        // A keep-alive beside it: its pings are not use, and a statement is.
+        connect_profile(&workspace, cx, "orders");
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_behaviour(
+                "orders",
+                crate::session::Behaviour {
+                    keep_alive: Some(10),
+                    idle_timeout: Some(1),
+                    ..crate::session::Behaviour::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        tick(cx, 25);
+        run_in_front(&workspace, cx, "SELECT 1");
+        let pinged = workspace.read_with(cx, |workspace, _| workspace.pings);
+        assert!(pinged >= 2, "{pinged} pings by 25 s");
+        tick(cx, 30);
+        tick(cx, 29);
+        assert_eq!(
+            state_of(&workspace, cx, "orders"),
+            "connected",
+            "60 s of pings are not use: the deadline is 60 s after the statement"
+        );
+        tick(cx, 2);
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("in front");
+            assert!(
+                profile.keep_alive_task.is_none(),
+                "the keep-alive goes with the close"
+            );
+            assert!(workspace.pings > pinged, "and pinged until then");
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// Holds the agent's connection from opening until a test says so.
+static HOLD_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An [`agent_read::Opener`](super::agent_read::Opener) that opens the agent's
+/// connection to the profile only once [`HOLD_OPEN`] is clear, looking every
+/// second.
+fn open_once_released(
+    executor: &gpui::BackgroundExecutor,
+    config: crate::db::ConnectionConfig,
+    _: String,
+) -> gpui::Task<Result<(crate::db::Connection, Vec<String>), crate::db::DbError>> {
+    let waiting = executor.clone();
+    executor.spawn(async move {
+        while HOLD_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+            waiting.timer(std::time::Duration::from_secs(1)).await;
+        }
+        super::spawn_blocking(&waiting, move || {
+            Ok((crate::db::Connection::open_for_agent(config)?, Vec::new()))
+        })
+        .await
+    })
+}
+
+#[gpui::test]
+fn an_agent_call_in_flight_defers_the_idle_close(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        cx.executor().allow_parking();
+        connect_profile(&workspace, cx, "orders");
+        HOLD_OPEN.store(true, Ordering::SeqCst);
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(open_once_released);
+        });
+        save_idle_timeout(&workspace, cx, "orders", "1");
+        let last = idle_clock(&workspace, cx, "orders").0;
+
+        // The call is under way at the deadline: its connection is still
+        // opening, and would be cached in the lane once the profile had let it
+        // go.
+        tick(cx, 10);
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 2");
+        tick(cx, 51);
+        assert_eq!(
+            state_of(&workspace, cx, "orders"),
+            "connected",
+            "a call under way defers the close"
+        );
+        assert!(idle_armed(&workspace, cx, "orders"));
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("the lane stays");
+            assert!(lane.running.is_some());
+        });
+
+        HOLD_OPEN.store(false, Ordering::SeqCst);
+        tick(cx, 2);
+        let answer = answer_of(cx, &answers);
+        assert_eq!(
+            answer.status,
+            crate::agent::Status::Executed,
+            "{}",
+            answer.text
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("the lane stays");
+            assert!(lane.connection.is_some(), "the call cached its connection");
+        });
+        assert_eq!(
+            idle_clock(&workspace, cx, "orders").0,
+            last,
+            "the call's landing is not the user's use"
+        );
+
+        tick(cx, 60);
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+        tick(cx, 120);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.agent.lanes.contains_key("orders"),
+                "the close took the lane and nothing put a connection back"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
