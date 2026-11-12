@@ -2490,9 +2490,9 @@ impl Connection {
     /// change the unfiltered count.
     pub fn catalog_databases(&self, engine: Engine) -> Result<Databases, DbError> {
         match self {
+            Self::MySql(connection) => connection.catalog_databases(),
             Self::ClickHouse(connection) => connection.catalog_databases(),
             Self::Postgres(_)
-            | Self::MySql(_)
             | Self::SqlServer(_)
             | Self::Sqlite(_)
             | Self::Turso(_)

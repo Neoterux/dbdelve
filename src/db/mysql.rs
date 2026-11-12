@@ -65,6 +65,27 @@ SELECT SCHEMA_NAME AS name, SCHEMA_NAME = DATABASE() AS is_current
 FROM information_schema.SCHEMATA
 ORDER BY SCHEMA_NAME";
 
+// The databases the unfiltered tree draws: what `RELATIONS_SQL`, `ROUTINES_SQL`
+// and, on MariaDB, `SEQUENCES_SQL` return, by those readers' own predicates. A
+// database holding only a routine or a sequence is drawn after `Catalog::merge`,
+// so it is counted here, and one holding nothing is drawn by no read. MySQL has
+// no `SEQUENCE` table type, so that predicate matches nothing there.
+const CATALOG_DATABASES_SQL: &str = "
+SELECT name, name = DATABASE() AS is_current
+FROM (
+    SELECT TABLE_SCHEMA AS name
+    FROM information_schema.TABLES
+    WHERE TABLE_SCHEMA NOT IN {system}
+      AND TABLE_TYPE IN ('BASE TABLE', 'VIEW', 'SEQUENCE')
+    UNION
+    SELECT ROUTINE_SCHEMA
+    FROM information_schema.ROUTINES
+    WHERE ROUTINE_SCHEMA NOT IN {system}
+      AND ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')
+) AS held
+ORDER BY name
+";
+
 const RELATIONS_SQL: &str = "
 SELECT TABLE_SCHEMA AS schema_name,
        TABLE_NAME AS relation_name,
@@ -149,6 +170,10 @@ fn only_clause(engine: Engine, column: &str, names: Option<&[String]>) -> String
         .map(|name| engine.quote_literal(name))
         .collect::<Vec<_>>();
     format!("\n  AND {column} IN ({})", quoted.join(", "))
+}
+
+fn catalog_databases_sql() -> String {
+    CATALOG_DATABASES_SQL.replace("{system}", SYSTEM_SCHEMAS)
 }
 
 fn relations_sql(engine: Engine, names: Option<&[String]>) -> String {
@@ -845,10 +870,20 @@ impl Connection {
         assemble_databases(&self.internal_query(DATABASES_SQL)?)
     }
 
-    /// The server's databases the filter matches, and how many it left out, or
-    /// `None` for a read that is not narrowed. Listed here, in the read's own
-    /// closure, so the statement it feeds carries only names the server just
-    /// gave.
+    /// The databases the catalog draws, the server's own left out: what the
+    /// unfiltered tree shows, so a filtered catalog counts its hidden ones on
+    /// the same basis and the filter picker lists exactly these.
+    pub fn catalog_databases(&self) -> Result<super::Databases, DbError> {
+        assemble_databases(&self.internal_query(&catalog_databases_sql())?)
+    }
+
+    /// The server's databases the filter matches, or `None` for a read that is
+    /// not narrowed. Listed here, in the read's own closure, so the statement
+    /// it feeds carries only names the server just gave. Its callers
+    /// (`routines`, `sequences` and `sizes`) use only the names, never the
+    /// hidden count, and a `SCHEMATA` name holding nothing adds no row, so the
+    /// lighter full listing serves and the heavier one stays off the read
+    /// `sizes` makes on the main connection.
     fn matched(&self, shown: &Shown) -> Result<Option<(Vec<String>, usize)>, DbError> {
         if !shown.narrows_catalog() {
             return Ok(None);
@@ -856,8 +891,14 @@ impl Connection {
         Ok(shown.matched_databases(&self.databases()?, self.engine))
     }
 
+    /// The listing is [`Self::catalog_databases`], so the `left_out` returned
+    /// is on the unfiltered tree's basis.
     pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
-        let matched = self.matched(shown)?;
+        let matched = if shown.narrows_catalog() {
+            shown.matched_databases(&self.catalog_databases()?, self.engine)
+        } else {
+            None
+        };
         let names = matched.as_ref().map(|(names, _)| names.as_slice());
         let left_out = matched.as_ref().map_or(0, |(_, left_out)| *left_out);
         if names.is_some_and(<[String]>::is_empty) {
