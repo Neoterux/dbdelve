@@ -4,7 +4,7 @@
 //! dialect DBDelve knows has few of them, whatever that dialect could do.
 
 use super::plugin::Plugin;
-use super::spec::Abilities;
+use super::spec::{Abilities, SessionTimeZone};
 use super::{
     DbError, Engine, Fields, RelationKind, ServerConfig, Syntax, clickhouse, duckdb, external,
     mssql, postgres, redis, turso,
@@ -119,6 +119,13 @@ impl Target {
     /// process is its own.
     pub fn takes_startup_script(self) -> bool {
         self.driver == Driver::BuiltIn && self.engine.spec().takes_startup_script
+    }
+
+    /// Whether a profile can carry a session time zone: DBDelve's own driver
+    /// sets it as a default of each session, and a plugin's process is its own.
+    pub fn takes_time_zone(self) -> bool {
+        self.driver == Driver::BuiltIn
+            && self.engine.spec().sql.session_time_zone != SessionTimeZone::None
     }
 
     /// Whether a profile's SSH tunnel may end at a Unix socket on the SSH host,

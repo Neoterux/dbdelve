@@ -7,8 +7,8 @@
 //! existing strategies is one more value here and its driver.
 
 use super::{
-    Builtin, ColumnDefinition, Fields, RelationKind, Syntax, builtins, clickhouse, duckdb, mongo,
-    mssql, mysql, postgres, redis,
+    Builtin, ColumnDefinition, Fields, Property, RelationKind, Syntax, builtins, clickhouse,
+    duckdb, mongo, mssql, mysql, postgres, redis,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +40,10 @@ pub struct EngineSpec {
     /// A profile may carry a startup script, which its driver replays on every
     /// session it opens for the user.
     pub takes_startup_script: bool,
+    /// The driver settings a profile may set on this engine, each mapped in
+    /// the engine's own module. Never anything that carries the read-only
+    /// hold, TLS or credentials: those have fields with their own gates.
+    pub driver_properties: &'static [Property],
     pub resolves_srv: bool,
     pub system_databases: &'static [&'static str],
     /// Exact type names read as bytes beyond the families every engine shares.
@@ -308,6 +312,8 @@ pub struct SqlSpec {
     pub regex: RegexMatch,
     pub substring: SubstringMatch,
     pub read_only_session: ReadOnlySession,
+    /// How a session time zone is spelled to this engine, never the text.
+    pub session_time_zone: SessionTimeZone,
     pub unreadable_floor: UnreadableFloor,
     /// The table engines a `CREATE TABLE … ENGINE =` may name and stay a
     /// write: those that keep their rows in the database. Any other engine
@@ -402,6 +408,7 @@ impl SqlSpec {
         regex: RegexMatch::None,
         substring: SubstringMatch::Like,
         read_only_session: ReadOnlySession::None,
+        session_time_zone: SessionTimeZone::None,
         unreadable_floor: UnreadableFloor::None,
         local_table_engines: None,
         stateless_requests: false,
@@ -721,6 +728,18 @@ pub enum ReadOnlySession {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTimeZone {
+    /// The engine has no session time zone a profile can set.
+    None,
+    /// `SET TIME ZONE '…'`.
+    SetTimeZone,
+    /// `SET time_zone = '…'`.
+    TimeZoneVariable,
+    /// Sent as a setting on each request rather than on a session.
+    RequestSetting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnreadableFloor {
     /// A statement the parser cannot read is `Unreadable` and nothing more.
     None,
@@ -826,6 +845,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: true,
     takes_startup_script: true,
+    driver_properties: &[Property::ApplicationName, Property::ConnectTimeout],
     resolves_srv: false,
     // `postgres` is an ordinary database people work in.
     system_databases: &[],
@@ -852,6 +872,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::PostgreSql,
         regex: RegexMatch::Tilde,
         read_only_session: ReadOnlySession::DefaultTransaction,
+        session_time_zone: SessionTimeZone::SetTimeZone,
         // The armed `default_transaction_read_only` stops none of these, and
         // `set_config` turns it off. Reading a file the role may read is not
         // here: that is a read, and how DBDelve opens its own files.
@@ -1105,6 +1126,7 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[Property::ApplicationName, Property::ConnectTimeout],
     resolves_srv: false,
     system_databases: &["information_schema", "mysql", "performance_schema", "sys"],
     binary_types: &[],
@@ -1132,6 +1154,7 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpLike,
         read_only_session: ReadOnlySession::SessionTransaction,
+        session_time_zone: SessionTimeZone::TimeZoneVariable,
         // The armed read-only transaction stops none of the named-lock calls.
         // No sequences, so no `nextval`.
         denied_functions: &["get_lock", "release_lock", "release_all_locks"],
@@ -1200,6 +1223,7 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[Property::ApplicationName, Property::ConnectTimeout],
     resolves_srv: false,
     system_databases: &["information_schema", "mysql", "performance_schema", "sys"],
     binary_types: &[],
@@ -1226,6 +1250,7 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
         parser_dialect: ParserDialect::MySql,
         regex: RegexMatch::RegexpInstr,
         read_only_session: ReadOnlySession::SessionTransaction,
+        session_time_zone: SessionTimeZone::TimeZoneVariable,
         // The armed read-only transaction stops none of the named-lock calls;
         // it does refuse a sequence advance, but a held session is not the
         // boundary.
@@ -1300,6 +1325,7 @@ pub(crate) const SQLITE: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
@@ -1365,6 +1391,7 @@ pub(crate) const TURSO: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
@@ -1417,6 +1444,7 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
@@ -1577,6 +1605,7 @@ pub(crate) const SNOWFLAKE: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: false,
+    driver_properties: &[],
     resolves_srv: false,
     // The account usage share every account has. `SNOWFLAKE_SAMPLE_DATA` is a
     // share too, but one people query.
@@ -1678,6 +1707,7 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: true,
+    driver_properties: &[Property::ApplicationName],
     resolves_srv: false,
     system_databases: &["master", "tempdb", "model", "msdb"],
     // `image` is the legacy binary type here; elsewhere it is a name anyone
@@ -1795,6 +1825,7 @@ pub(crate) const MONGODB: EngineSpec = EngineSpec {
     takes_options: true,
     takes_service: false,
     takes_startup_script: false,
+    driver_properties: &[],
     resolves_srv: true,
     system_databases: &["admin", "local", "config"],
     binary_types: &["bindata"],
@@ -1839,6 +1870,7 @@ pub(crate) const REDIS: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: false,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],
@@ -1885,6 +1917,7 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: false,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &["system", "INFORMATION_SCHEMA", "information_schema"],
     binary_types: &[],
@@ -1930,6 +1963,7 @@ pub(crate) const CLICKHOUSE: EngineSpec = EngineSpec {
         materialized_view: MaterializedViewDrop::View,
         parser_dialect: ParserDialect::ClickHouse,
         read_only_session: ReadOnlySession::PerRequest,
+        session_time_zone: SessionTimeZone::RequestSetting,
         unreadable_floor: UnreadableFloor::FirstKeyword,
         local_table_engines: Some(&[
             "MergeTree",
@@ -2116,6 +2150,7 @@ pub(crate) const GENERIC: EngineSpec = EngineSpec {
     takes_options: false,
     takes_service: false,
     takes_startup_script: false,
+    driver_properties: &[],
     resolves_srv: false,
     system_databases: &[],
     binary_types: &[],

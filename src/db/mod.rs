@@ -33,6 +33,7 @@ mod mysql;
 pub(crate) mod odbc_string;
 pub(crate) mod plugin;
 mod postgres;
+mod properties;
 mod redis;
 mod snowflake;
 mod spec;
@@ -52,6 +53,7 @@ pub(crate) use external::echo;
 pub(crate) use include::same_name;
 pub use include::{Include, Shown};
 pub use plugin::Plugin;
+pub use properties::{Properties, Property};
 
 pub use mongo::MongoConfig;
 pub use postgres::PostgresConfig;
@@ -1147,6 +1149,8 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
         ssh: None,
         schema: None,
         read_only: false,
+        time_zone: None,
+        properties: Properties::default(),
     })
 }
 
@@ -1236,6 +1240,42 @@ pub struct ServerConfig {
     /// [`ConnectionConfig::with_read_only_hold`]: it is never stored, and a
     /// user's own connection never carries it.
     pub read_only: bool,
+    /// The session time zone, where [`Target::takes_time_zone`]. Applied by
+    /// each engine module as a session default, never spliced into the user's
+    /// submission, and None sends nothing, so the server's own zone stands.
+    pub time_zone: Option<String>,
+    /// The driver settings the profile set, each mapped by the engine module
+    /// onto the one driver field it names. Config, so every connection opened
+    /// from it carries them, an agent's included.
+    pub properties: Properties,
+}
+
+/// The longest a session time zone may be.
+const TIME_ZONE_CAP: usize = 64;
+
+/// Whether `zone` may be sent as a session time zone: a name (`Europe/Paris`,
+/// `Etc/GMT+5`, `UTC`) or an offset (`+05:30`), which is letters, digits and
+/// `_ / + - :`. Nothing else is admitted, so no quote or backslash can end the
+/// literal it is written into.
+pub fn check_time_zone(zone: &str) -> Result<(), String> {
+    let zone = zone.trim();
+    if zone.is_empty() {
+        return Err("The time zone is blank.".to_string());
+    }
+    if zone.chars().count() > TIME_ZONE_CAP {
+        return Err(format!(
+            "The time zone is longer than {TIME_ZONE_CAP} characters."
+        ));
+    }
+    if let Some(bad) = zone
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | '-' | ':')))
+    {
+        return Err(format!(
+            "The time zone `{zone}` holds `{bad}`, which a time zone name does not."
+        ));
+    }
+    Ok(())
 }
 
 impl ServerConfig {

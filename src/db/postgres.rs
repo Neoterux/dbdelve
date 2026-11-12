@@ -18,7 +18,7 @@ use crate::tls;
 
 use super::ssh::{self, Bridged, SocketBridge, Tunnel, tunnelled};
 use super::{
-    Catalog, Column, DbError, EditTarget, Engine, Feed, Fetch, QueryResult, Reference,
+    Catalog, Column, DbError, EditTarget, Engine, Feed, Fetch, Properties, QueryResult, Reference,
     RelationKind, Row, RowBuilder, ServerConfig, Sizes, Stopped, Structure, assemble_catalog,
     assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
     assemble_sizes, assemble_structure, create_table, non_utf8_error, optional_cell, plain_error,
@@ -556,6 +556,8 @@ pub fn config_from_url(url: &str) -> Result<PostgresConfig, String> {
             ssh: None,
             schema: None,
             read_only: false,
+            time_zone: None,
+            properties: Properties::default(),
         },
         service,
     })
@@ -2247,6 +2249,8 @@ mod tests {
             ssh: None,
             schema: None,
             read_only: false,
+            time_zone: None,
+            properties: Properties::default(),
         }
     }
 
@@ -2268,6 +2272,8 @@ mod tests {
             ssh: None,
             schema: None,
             read_only: false,
+            time_zone: None,
+            properties: Properties::default(),
         }
     }
 
@@ -3192,6 +3198,8 @@ mod tests {
                     ssh: None,
                     schema: None,
                     read_only: false,
+                    time_zone: None,
+                    properties: Properties::default(),
                 },
                 service: None,
             }

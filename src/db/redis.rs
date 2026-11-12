@@ -33,8 +33,8 @@ use ::redis::{
 use super::ssh::{Tunnel, tunnelled};
 use super::{
     Catalog, Cell, Column, ColumnDefinition, DbError, EditTarget, Fetch, NamedDefinition,
-    QueryResult, Relation, RelationKind, Row, RowBuilder, Schema, ServerConfig, SslMode, Stopped,
-    Structure, plain_error,
+    Properties, QueryResult, Relation, RelationKind, Row, RowBuilder, Schema, ServerConfig,
+    SslMode, Stopped, Structure, plain_error,
 };
 use crate::redis_cmd::browse::PREVIEWED;
 use crate::redis_cmd::{self, Command, edit};
@@ -129,6 +129,8 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
         ssh: None,
         schema: None,
         read_only: false,
+        time_zone: None,
+        properties: Properties::default(),
     })
 }
 

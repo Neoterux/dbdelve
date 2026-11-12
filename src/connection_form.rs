@@ -16,7 +16,8 @@ use crate::{
     Workspace,
     db::{
         ConnectionConfig, Driver, Engine, ExternalConfig, Fields, MongoConfig, Plugin,
-        PostgresConfig, ServerConfig, SnowflakeConfig, SshTunnel, SslMode, Target, odbc_string,
+        PostgresConfig, Properties, ServerConfig, SnowflakeConfig, SshTunnel, SslMode, Target,
+        odbc_string,
     },
     explorer::Shortcuts,
     session::{Behaviour, Depth, Profile},
@@ -80,6 +81,10 @@ pub(crate) struct ConnectionForm {
     /// The profile's login database, which the form does not show and keeps
     /// as it was.
     pub(crate) login_database: Option<String>,
+    /// The profile's session time zone and driver properties, which the form
+    /// does not show yet and keeps as they were, so a save changes neither.
+    pub(crate) time_zone: Option<String>,
+    pub(crate) properties: Properties,
     /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
     /// unlike the credential fields it is drawn whichever engine is selected.
     pub(crate) statement_timeout: Entity<InputState>,
@@ -401,6 +406,10 @@ impl ConnectionForm {
             service,
             srv: mongo.is_some_and(|mongo| mongo.srv),
             login_database: mongo.and_then(|mongo| mongo.login_database.clone()),
+            time_zone: server.and_then(|server| server.time_zone.clone()),
+            properties: server
+                .map(|server| server.properties.clone())
+                .unwrap_or_default(),
             statement_timeout,
             depth: Depth::default(),
             startup_script,
@@ -777,6 +786,8 @@ impl ConnectionForm {
             ssh: self.ssh_tunnel(cx)?,
             schema: None,
             read_only: false,
+            time_zone: self.time_zone.clone(),
+            properties: self.properties.clone(),
         };
         // A blank Host beside a service is whatever the service names, which
         // may be a socket directory; connect checks the Host it resolves to.
@@ -1565,6 +1576,8 @@ mod tests {
             ssh: None,
             schema: None,
             read_only: false,
+            time_zone: None,
+            properties: Properties::default(),
         };
         let typed = ConnectionConfig::postgres(server("hunter2"));
         assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));
