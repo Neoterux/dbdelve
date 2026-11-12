@@ -4849,4 +4849,15 @@ mod tests {
         assert_eq!(next_query_id(1, &tabs(&[0, 4])), 5);
         assert_eq!(next_query_id(0, &tabs(&[])), 0);
     }
+
+    #[test]
+    fn depth_levels_are_ordered_and_default_to_today() {
+        assert!(Depth::Relations < Depth::Routines);
+        assert!(Depth::Routines < Depth::Sizes);
+        assert_eq!(Depth::default(), Depth::Sizes);
+        for depth in Depth::ALL {
+            assert_eq!(Depth::from_slug(depth.slug()), Some(depth));
+        }
+        assert_eq!(Depth::from_slug("everything"), None);
+    }
 }
