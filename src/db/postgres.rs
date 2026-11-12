@@ -2579,6 +2579,40 @@ mod tests {
     }
 
     #[test]
+    fn stored_driver_properties_reach_the_connection_string() {
+        let config = ServerConfig {
+            properties: Properties {
+                application_name: Some("o'brien app".to_string()),
+                connect_timeout: Some(5),
+            },
+            ..config()
+        };
+        let string = connection_string(&config);
+        assert!(
+            string.contains(&format!("application_name={}", quote("o'brien app"))),
+            "{string}"
+        );
+        assert!(string.contains("connect_timeout=5"), "{string}");
+        assert!(!string.contains("connect_timeout=10"), "{string}");
+        assert_eq!(string.matches("connect_timeout=").count(), 1, "{string}");
+        // The hold's channel is the `options` parameter, and no property rides it.
+        assert!(!string.contains("options="), "{string}");
+    }
+
+    #[test]
+    fn no_driver_property_leaves_the_connection_string_as_it_was() {
+        let config = ServerConfig {
+            properties: Properties::default(),
+            ..config()
+        };
+        assert_eq!(
+            connection_string(&config),
+            "host='db.example.test' dbname='dbdelve_test' user='someone' port=8432 \
+             sslmode=prefer connect_timeout=10"
+        );
+    }
+
+    #[test]
     fn statement_timeout_rides_in_as_a_startup_option_in_milliseconds() {
         let config = ServerConfig {
             statement_timeout: 30,

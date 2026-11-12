@@ -238,4 +238,29 @@ mod tests {
         assert_eq!(keys, ["application_name", "connect_timeout"]);
         assert_eq!(Properties::default().stored(), []);
     }
+
+    #[test]
+    fn lines_are_read_and_written_back() {
+        let text = "\n  connect_timeout =  5 \n\napplication_name=o'brien = app\n";
+        let parsed = Properties::from_lines(Engine::Postgres, text).expect("both are listed");
+        assert_eq!(parsed.application_name.as_deref(), Some("o'brien = app"));
+        assert_eq!(parsed.connect_timeout, Some(5));
+        let written = parsed.lines();
+        assert_eq!(
+            written,
+            "application_name = o'brien = app\nconnect_timeout = 5"
+        );
+        assert_eq!(
+            Properties::from_lines(Engine::Postgres, &written),
+            Ok(parsed)
+        );
+        assert_eq!(Properties::default().lines(), "");
+        assert_eq!(
+            Properties::from_lines(Engine::Postgres, "  \n\n"),
+            Ok(Properties::default())
+        );
+        let message = Properties::from_lines(Engine::Postgres, "connect_timeout = 5\n\nfoo")
+            .expect_err("no `=`");
+        assert!(message.contains("line 3"), "{message}");
+    }
 }
