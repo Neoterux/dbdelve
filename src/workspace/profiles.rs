@@ -3739,6 +3739,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_time_zone_reaches_the_config_without_its_surrounding_whitespace() {
+        let zone_of = |zone: &str| {
+            let text = format!(
+                "[[profiles]]\nid = 'a'\nname = 'A'\nhost = 'h'\ndatabase = 'd'\n\
+                 user = 'u'\nengine = 'postgres'\ntime_zone = \"{zone}\"\n"
+            );
+            let configs = restored(&text);
+            configs[0]
+                .1
+                .server()
+                .expect("a server engine")
+                .time_zone
+                .clone()
+        };
+        assert_eq!(
+            zone_of(" Europe/Paris\\n"),
+            Some("Europe/Paris".to_string())
+        );
+        assert_eq!(
+            zone_of(" \\t "),
+            None,
+            "a zone that is only whitespace is blank"
+        );
+    }
+
+    #[test]
     fn a_hand_edited_zone_or_property_that_fails_its_check_is_not_restored() {
         use crate::db::Properties;
 
