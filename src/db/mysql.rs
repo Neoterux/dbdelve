@@ -1723,6 +1723,76 @@ ORDER BY 1, 2
         }
     }
 
+    /// A filter makes the sizes read list databases first; that listing must
+    /// not queue on the user's connection behind a statement holding it.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_filtered_sizes_read_answers_while_a_statement_holds_the_users_connection() {
+        use crate::db::{Include, Levels};
+
+        /// How long the user's statement holds the connection.
+        const HELD_FOR: Duration = Duration::from_secs(10);
+        /// How long the sizes read may take; well under `HELD_FOR`.
+        const ANSWER_WITHIN: Duration = Duration::from_secs(5);
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let connection = live(engine);
+            let observer = live(engine);
+            let id = connection.connection_id;
+            let sleeper = connection.clone();
+            let holding = std::thread::spawn(move || {
+                let _ = sleeper.query(
+                    &format!("SELECT SLEEP({})", HELD_FOR.as_secs()),
+                    Fetch::default(),
+                );
+            });
+
+            // The processlist, not a fixed sleep, says the statement is running.
+            let polled = Instant::now();
+            loop {
+                let running = observer
+                    .query(
+                        &format!(
+                            "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                             WHERE ID = {id} AND COMMAND = 'Query'"
+                        ),
+                        Fetch::default(),
+                    )
+                    .expect("the processlist should read");
+                if running.rows != vec![vec![Some("0".into())]] {
+                    break;
+                }
+                assert!(
+                    polled.elapsed() < Duration::from_secs(5),
+                    "{engine:?}: the user's statement never started"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let archive = Include {
+                databases: vec!["dbdelve_arch*".into()],
+                ..Include::default()
+            }
+            .resolve(Levels::DatabaseIsSchema, None, None);
+            let started = Instant::now();
+            let sizes = connection.sizes(&archive);
+            let elapsed = started.elapsed();
+            let still_holding = !holding.is_finished();
+
+            observer
+                .query(&format!("KILL QUERY {id}"), Fetch::default())
+                .expect("the sleeping statement should be killed");
+            holding.join().expect("the sleeping statement should end");
+
+            assert!(sizes.is_ok(), "{engine:?}: {sizes:?}");
+            assert!(
+                elapsed < ANSWER_WITHIN,
+                "{engine:?}: sizes waited {elapsed:?} on the user's connection"
+            );
+            assert!(still_holding, "{engine:?}: the user's statement had ended");
+        }
+    }
+
     fn probed(columns: &[(Option<&str>, Option<&str>)]) -> Vec<ProbedColumn> {
         columns
             .iter()
