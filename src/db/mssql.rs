@@ -465,6 +465,15 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
 
 type Tds = Client<Compat<TcpStream>>;
 
+/// The name the server shows for this login: the profile's, else `DBDelve`.
+fn application_name_of(server: &ServerConfig) -> &str {
+    server
+        .properties
+        .application_name
+        .as_deref()
+        .unwrap_or("DBDelve")
+}
+
 /// dbdelve's five rungs as tiberius's two settings.
 ///
 /// tiberius builds its own rustls configuration and offers three trusts:
@@ -486,7 +495,7 @@ fn config(server: &ServerConfig, encryption: EncryptionLevel) -> Config {
     if !server.database.is_empty() {
         config.database(&server.database);
     }
-    config.application_name("DBDelve");
+    config.application_name(application_name_of(server));
     // Sent as typed, blank included: cloud IAM issues a token or nothing.
     config.authentication(AuthMethod::sql_server(&server.user, &server.password));
     config.encryption(encryption);

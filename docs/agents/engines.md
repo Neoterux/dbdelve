@@ -248,6 +248,18 @@ Decided, and not to be re-litigated:
   none: the grid renders `timestamp_ltz` in UTC whatever the session says. The
   zone is checked by `check_time_zone` in the form and at restore, so it cannot
   end the literal it is spliced into.
+- **Driver properties are a closed list per engine, mapped inside each driver
+  module and carried by an agent's read and approved-write connections**
+  (`Properties`, `EngineSpec::driver_properties`). Postgres takes
+  `application_name` and `connect_timeout` in the libpq string, the name through
+  `quote()`; MySQL and MariaDB take them as the `program_name` connect attribute
+  and the dial timeout; SQL Server takes `application_name` alone. The list is
+  closed on purpose: a free key could carry Postgres `options` or MySQL `init`,
+  which hold the agent's connection read-only, or weaken TLS, so a key off the
+  list is refused by name and no property reaches those channels. MongoDB keeps
+  its free-form `options` field, outside this list. On MariaDB's dev image
+  `performance_schema` is off, so the attribute is accepted but not readable
+  back.
 - **SQL Server's Cancel closes the connection** (a read stopped at the row
   limit does not: that is `SET ROWCOUNT`). tiberius cannot send TDS's
   attention signal, and `KILL` needs `ALTER ANY CONNECTION`, which an ordinary
