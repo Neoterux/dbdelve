@@ -2669,7 +2669,14 @@ fn each_depth_level_reads_only_its_loads(cx: &mut TestAppContext) {
         });
         let set = |depth: Depth, workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
             workspace.update(cx, |workspace, cx| {
-                workspace.set_behaviour("e2e", Behaviour { depth }, cx);
+                workspace.set_behaviour(
+                    "e2e",
+                    Behaviour {
+                        depth,
+                        ..Behaviour::default()
+                    },
+                    cx,
+                );
             });
             settle(cx);
         };
@@ -2732,6 +2739,7 @@ fn a_depth_saved_while_the_catalog_loads_is_read_once_it_lands(cx: &mut TestAppC
                 &id,
                 Behaviour {
                     depth: Depth::Relations,
+                    ..Behaviour::default()
                 },
                 cx,
             );
@@ -19661,7 +19669,7 @@ fn a_startup_script_runs_on_connect_and_on_every_session_beside_it(cx: &mut Test
                 sqlite_profile(
                     "e2e",
                     "E2E",
-                    "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = -4000\""
+                    "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = 4000\""
                 ),
                 sqlite_profile("plain", "Plain", "mode = \"full\""),
             ),
@@ -19673,18 +19681,18 @@ fn a_startup_script_runs_on_connect_and_on_every_session_beside_it(cx: &mut Test
                 .iter()
                 .find(|profile| profile.id == "e2e")
                 .expect("the profile is listed");
+            if let ProfileState::Failed(message) = &profile.state {
+                panic!("{message}");
+            }
             assert!(matches!(profile.state, ProfileState::Connected(..)));
-            assert_eq!(
-                profile.behaviour.startup_script,
-                "PRAGMA cache_size = -4000"
-            );
+            assert_eq!(profile.behaviour.startup_script, "PRAGMA cache_size = 4000");
             let connection = profile.connection().expect("it connected");
-            assert_eq!(cache_size(&connection).as_deref(), Some("-4000"));
+            assert_eq!(cache_size(&connection).as_deref(), Some("4000"));
             let apart = connection.apart().expect("a session beside it opens");
-            assert_eq!(cache_size(&apart).as_deref(), Some("-4000"));
+            assert_eq!(cache_size(&apart).as_deref(), Some("4000"));
             assert_eq!(
                 profile.stored().startup_script.as_deref(),
-                Some("PRAGMA cache_size = -4000")
+                Some("PRAGMA cache_size = 4000")
             );
             let plain = workspace
                 .profiles
