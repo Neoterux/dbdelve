@@ -1221,6 +1221,52 @@ fn field_box(
 mod tests {
     use super::*;
 
+    /// The picker's own blocking read, off the window, against a server whose
+    /// `system.databases` lists more than the tree draws.
+    #[test]
+    fn the_picker_lists_the_databases_the_clickhouse_tree_draws_not_the_servers_list() {
+        use crate::db::Engine;
+        use crate::db::clickhouse_mock::{Mock, Response};
+
+        let mock = Mock::start();
+        let connection = mock.connection();
+        let columns = [("name", "String"), ("is_current", "UInt8")];
+        mock.on_statement(
+            "SELECT DISTINCT database",
+            [Response::rows(
+                &columns,
+                &[&["analytics", "0"], &["dbdelve_dev", "1"]],
+            )],
+        );
+        mock.on_statement(
+            "FROM system.databases",
+            [Response::rows(
+                &columns,
+                &[
+                    &["INFORMATION_SCHEMA", "0"],
+                    &["analytics", "0"],
+                    &["dbdelve_dev", "1"],
+                    &["default", "0"],
+                    &["information_schema", "0"],
+                    &["system", "0"],
+                ],
+            )],
+        );
+
+        let (databases, schemas) =
+            read_names_for_picker(connection, Engine::ClickHouse, false, true, false);
+
+        let databases = databases.expect("asked for").expect("should list");
+        assert_eq!(databases.names, ["analytics", "dbdelve_dev"]);
+        assert_eq!(databases.current.as_deref(), Some("dbdelve_dev"));
+        assert!(schemas.is_none());
+        assert!(
+            mock.requests()
+                .iter()
+                .all(|request| !request.statement.contains("FROM system.databases"))
+        );
+    }
+
     #[test]
     fn only_a_database_then_schema_target_lists_schemas() {
         assert!(lists_schemas(Levels::DatabaseThenSchema));
