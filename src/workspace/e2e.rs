@@ -20805,20 +20805,44 @@ fn an_idle_profile_is_closed_with_its_tabs_kept(cx: &mut TestAppContext) {
     });
 }
 
-/// The app on one SQLite profile `Idle` that has closed for want of use, in
-/// front with its query tab holding `text`, its idle timer disarmed so nothing
-/// that waits afterwards can close it again.
-fn gone_idle<'a>(
+/// The app on one SQLite profile `Orders`, connected, over a database `schema`
+/// has been run against, that closes after a minute without use.
+fn closing_after_a_minute<'a>(
     cx: &'a mut TestAppContext,
-    text: &str,
+    schema: &str,
 ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
-    let (workspace, cx) = launch_with_profiles(
+    let (workspace, cx) = launch_connections(
         cx,
+        schema,
+        "",
         &sqlite_profile("orders", "Orders", "idle_timeout_minutes = 1"),
     );
     cx.executor().allow_parking();
     connect_profile(&workspace, cx, "orders");
     assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+    (workspace, cx)
+}
+
+/// Lets a minute pass over `closing_after_a_minute`'s profile, which closes,
+/// and disarms its timer so nothing that waits afterwards can close it again.
+fn let_it_go_idle(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(60));
+    cx.run_until_parked();
+    assert_eq!(state_of(workspace, cx, "orders"), "idle");
+    workspace.update(cx, |workspace, _| {
+        if let Some(profile) = workspace.profile_mut() {
+            profile.behaviour.idle_timeout = None;
+        }
+    });
+}
+
+/// `closing_after_a_minute` gone idle, in front with its query tab holding `text`.
+fn gone_idle<'a>(
+    cx: &'a mut TestAppContext,
+    text: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = closing_after_a_minute(cx, "");
     cx.update(|window, cx| {
         let editor = workspace
             .read(cx)
@@ -20829,15 +20853,7 @@ fn gone_idle<'a>(
             .clone();
         editor.update(cx, |input, cx| input.set_value(text, window, cx));
     });
-    cx.executor()
-        .advance_clock(std::time::Duration::from_secs(60));
-    cx.run_until_parked();
-    assert_eq!(state_of(&workspace, cx, "orders"), "idle");
-    workspace.update(cx, |workspace, _| {
-        if let Some(profile) = workspace.profile_mut() {
-            profile.behaviour.idle_timeout = None;
-        }
-    });
+    let_it_go_idle(&workspace, cx);
     (workspace, cx)
 }
 
@@ -20913,6 +20929,75 @@ fn gone_idle_again(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
     });
     settle(cx);
     assert_eq!(state_of(workspace, cx, "orders"), "idle");
+}
+
+#[gpui::test]
+fn an_idle_profile_shows_the_reconnect_button(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = closing_after_a_minute(cx, "");
+        settle(cx);
+        assert!(
+            cx.debug_bounds("reconnect-button").is_none(),
+            "a connected profile offers none"
+        );
+
+        let_it_go_idle(&workspace, cx);
+        settle(cx);
+        assert!(
+            cx.debug_bounds("reconnect-button").is_some(),
+            "an idle one does"
+        );
+
+        click_selector(cx, "reconnect-button");
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+        assert!(cx.debug_bounds("reconnect-button").is_none());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_relation_visited_on_an_idle_profile_reconnects_first(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) =
+            closing_after_a_minute(cx, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);");
+        let id = workspace.update_in(cx, |workspace, window, cx| {
+            let opened = crate::session::OpenedObject::Relation {
+                schema: "main".into(),
+                name: "t".into(),
+                kind: Default::default(),
+                filter: String::new(),
+                filters: Vec::new(),
+            };
+            let id = workspace
+                .open_object(opened, None, window, cx)
+                .expect("the relation opens");
+            workspace.activate_tab(Tab::Object(id), window, cx);
+            id
+        });
+        settle(cx);
+        assert_eq!(
+            front_object_database_and_cell(&workspace, cx),
+            Some((None, Some("7".into())))
+        );
+
+        let_it_go_idle(&workspace, cx);
+        // In one update, so the connect it starts cannot land between.
+        workspace.update(cx, |workspace, cx| {
+            workspace.load_relation(id, cx);
+            assert!(matches!(
+                workspace.profile().map(|profile| &profile.state),
+                Some(ProfileState::Connecting)
+            ));
+        });
+        settle(cx);
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+        assert_eq!(
+            front_object_database_and_cell(&workspace, cx),
+            Some((None, Some("7".into()))),
+            "the landing loaded the relation"
+        );
+        quit(workspace, cx);
+    });
 }
 
 #[gpui::test]
