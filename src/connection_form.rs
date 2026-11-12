@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_timeout_that_is_not_a_whole_number_of_minutes_is_refused() {
+    fn an_idle_timeout_that_is_not_a_whole_number_of_minutes_up_to_a_day_is_refused() {
         assert_eq!(typed_idle_timeout(""), Ok(None));
         assert_eq!(typed_idle_timeout("  "), Ok(None));
         assert_eq!(typed_idle_timeout("0"), Ok(None), "0 reads as off");
@@ -1431,10 +1431,14 @@ mod tests {
         }
         assert_eq!(typed_idle_timeout("1"), Ok(Some(1)));
         assert_eq!(typed_idle_timeout(" 30 "), Ok(Some(30)));
+        assert_eq!(typed_idle_timeout("1440"), Ok(Some(1440)), "a day is kept");
+        let error = typed_idle_timeout("1441").expect_err("past a day");
+        assert!(error.starts_with("Idle timeout"), "{error}");
+        assert!(error.contains("1440"), "{error}");
     }
 
     #[test]
-    fn a_keep_alive_that_is_not_a_whole_number_of_ten_or_more_seconds_is_refused() {
+    fn a_keep_alive_that_is_not_a_whole_number_of_seconds_from_ten_to_an_hour_is_refused() {
         let postgres = Target::built_in(Engine::Postgres);
         assert_eq!(typed_keep_alive(postgres, ""), Ok(None));
         assert_eq!(typed_keep_alive(postgres, "  "), Ok(None));
@@ -1445,6 +1449,14 @@ mod tests {
         }
         assert_eq!(typed_keep_alive(postgres, "10"), Ok(Some(10)));
         assert_eq!(typed_keep_alive(postgres, " 120 "), Ok(Some(120)));
+        assert_eq!(
+            typed_keep_alive(postgres, "3600"),
+            Ok(Some(3600)),
+            "an hour is kept"
+        );
+        let error = typed_keep_alive(postgres, "3601").expect_err("past an hour");
+        assert!(error.starts_with("Keep-alive"), "{error}");
+        assert!(error.contains("10") && error.contains("3600"), "{error}");
         // Not read where the row is not drawn, so text left in it by another
         // engine neither fails the save nor is stored.
         let sqlite = Target::built_in(Engine::Sqlite);

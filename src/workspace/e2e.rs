@@ -20612,7 +20612,7 @@ fn a_failed_ping_stops_the_keep_alive_quietly(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_at_ten_seconds_or_more(
+fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_from_ten_seconds_to_an_hour(
     cx: &mut TestAppContext,
 ) {
     store::tests::with_home(|| {
@@ -20627,13 +20627,15 @@ fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_at_ten_second
             postgres("kept", "keep_alive_seconds = 120"),
             postgres("floor", "keep_alive_seconds = 10"),
             postgres("low", "keep_alive_seconds = 9"),
+            postgres("ceiling", "keep_alive_seconds = 3600"),
+            postgres("high", "keep_alive_seconds = 3601"),
             postgres("none", ""),
             sqlite_profile("file", "File", "keep_alive_seconds = 120"),
         ]
         .concat();
         let (workspace, cx) = launch_with_profiles(cx, &profiles);
         let restored: Vec<_> = workspace.read_with(cx, |workspace, _| {
-            ["kept", "floor", "low", "none", "file"]
+            ["kept", "floor", "low", "ceiling", "high", "none", "file"]
                 .map(|id| {
                     let profile = workspace
                         .profiles
@@ -20652,6 +20654,8 @@ fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_at_ten_second
             [
                 (Some(120), Some(120)),
                 (Some(10), Some(10)),
+                (None, None),
+                (Some(3600), Some(3600)),
                 (None, None),
                 (None, None),
                 (None, None)
@@ -21001,17 +21005,19 @@ fn a_relation_visited_on_an_idle_profile_reconnects_first(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn a_stored_idle_timeout_of_zero_restores_as_off(cx: &mut TestAppContext) {
+fn a_stored_idle_timeout_of_zero_or_past_a_day_restores_as_off(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let profiles = [
             sqlite_profile("on", "On", "idle_timeout_minutes = 15"),
             sqlite_profile("zero", "Zero", "idle_timeout_minutes = 0"),
+            sqlite_profile("day", "Day", "idle_timeout_minutes = 1440"),
+            sqlite_profile("long", "Long", "idle_timeout_minutes = 1441"),
             sqlite_profile("none", "None", ""),
         ]
         .concat();
         let (workspace, cx) = launch_with_profiles(cx, &profiles);
         let restored: Vec<_> = workspace.read_with(cx, |workspace, _| {
-            ["on", "zero", "none"]
+            ["on", "zero", "day", "long", "none"]
                 .map(|id| {
                     let profile = workspace
                         .profiles
@@ -21025,7 +21031,16 @@ fn a_stored_idle_timeout_of_zero_restores_as_off(cx: &mut TestAppContext) {
                 })
                 .to_vec()
         });
-        assert_eq!(restored, [(Some(15), Some(15)), (None, None), (None, None)]);
+        assert_eq!(
+            restored,
+            [
+                (Some(15), Some(15)),
+                (None, None),
+                (Some(1440), Some(1440)),
+                (None, None),
+                (None, None)
+            ]
+        );
         quit(workspace, cx);
     });
 }
