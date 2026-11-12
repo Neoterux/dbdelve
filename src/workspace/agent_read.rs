@@ -1806,11 +1806,7 @@ mod tests {
             // The compose database speaks no TLS, and this test is the one
             // place a plaintext connection is the point.
             sslmode: crate::db::SslMode::Disable,
-            root_certificate: None,
-            statement_timeout: 0,
-            ssh: None,
-            schema: None,
-            read_only: false,
+            ..crate::db::ServerConfig::default()
         });
         Connection::open_for_agent(config).expect("the compose Postgres opens for the agent")
     }
