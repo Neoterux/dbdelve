@@ -3739,6 +3739,43 @@ open_objects = []
     }
 
     #[test]
+    fn the_startup_script_round_trips_before_ssh() {
+        let mut profile = a_stored_profile();
+        profile.startup_script =
+            Some("SET search_path TO app, public;\nSET TIME ZONE 'UTC';".into());
+        profile.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            ..Default::default()
+        });
+        let text = written_alone(profile.clone());
+        let script = text.find("startup_script").expect("the script is written");
+        let tunnel = text.find("[profiles.ssh]").expect("and the tunnel");
+        assert!(
+            script < tunnel,
+            "TOML cannot emit a scalar after a table, so it comes before `ssh`:\n{text}"
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        assert_eq!(
+            decoded.profiles[0].startup_script, profile.startup_script,
+            "a script comes back byte for byte"
+        );
+        assert_eq!(
+            written_alone(decoded.profiles[0].clone()),
+            text,
+            "saving what was saved changes nothing"
+        );
+
+        let bare = written_alone(a_stored_profile());
+        assert!(
+            !bare.contains("startup_script"),
+            "a profile with none is written as it always was:\n{bare}"
+        );
+        let golden = include_str!("testdata/every-engine.resaved.toml");
+        assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
+        assert!(!golden.contains("startup_script"));
+    }
+
+    #[test]
     fn a_profile_without_folders_or_pins_is_written_as_it_always_was() {
         let text = written_alone(a_stored_profile());
         assert!(

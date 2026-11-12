@@ -1197,6 +1197,37 @@ mod tests {
     }
 
     #[test]
+    fn session_rows_are_asked_of_the_target() {
+        use crate::db::{Driver, Engine, Target};
+
+        for engine in Engine::ALL {
+            let takes = matches!(
+                engine,
+                Engine::Postgres
+                    | Engine::MySql
+                    | Engine::MariaDb
+                    | Engine::SqlServer
+                    | Engine::Sqlite
+                    | Engine::Turso
+                    | Engine::DuckDb
+            );
+            assert_eq!(
+                Target::built_in(engine).takes_startup_script(),
+                takes,
+                "{engine:?}"
+            );
+        }
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: Driver::Plugin(crate::store::tests::odbc_plugin()),
+        };
+        assert!(
+            !plugin.takes_startup_script(),
+            "a plugin owns its process, whatever dialect it speaks"
+        );
+    }
+
+    #[test]
     fn the_active_schema_stays_only_on_the_engine_and_database_it_was_picked_on() {
         let postgres = |database: &str| {
             ConnectionConfig::postgres(ServerConfig {
