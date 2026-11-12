@@ -1332,6 +1332,25 @@ mod tests {
     }
 
     #[test]
+    fn a_keep_alive_that_is_not_a_whole_number_of_ten_or_more_seconds_is_refused() {
+        let postgres = Target::built_in(Engine::Postgres);
+        assert_eq!(typed_keep_alive(postgres, ""), Ok(None));
+        assert_eq!(typed_keep_alive(postgres, "  "), Ok(None));
+        assert_eq!(typed_keep_alive(postgres, "0"), Ok(None), "0 reads as off");
+        for refused in ["9", "ten", "-1", "1.5", "4294967296"] {
+            let error = typed_keep_alive(postgres, refused).expect_err(refused);
+            assert!(error.starts_with("Keep-alive"), "{refused}: {error}");
+        }
+        assert_eq!(typed_keep_alive(postgres, "10"), Ok(Some(10)));
+        assert_eq!(typed_keep_alive(postgres, " 120 "), Ok(Some(120)));
+        // Not read where the row is not drawn, so text left in it by another
+        // engine neither fails the save nor is stored.
+        let sqlite = Target::built_in(Engine::Sqlite);
+        assert_eq!(typed_keep_alive(sqlite, "9"), Ok(None));
+        assert_eq!(typed_keep_alive(sqlite, "120"), Ok(None));
+    }
+
+    #[test]
     fn the_time_zone_row_is_asked_of_the_target() {
         let postgres = Target::built_in(Engine::Postgres);
         assert_eq!(
