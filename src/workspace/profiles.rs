@@ -320,6 +320,7 @@ impl Workspace {
             keep_alive_task: None,
             last_activity: cx.background_executor().now(),
             idle_task: None,
+            idle_closed: false,
             confirmed: stored
                 .confirmed
                 .iter()
@@ -407,6 +408,7 @@ impl Workspace {
             keep_alive_task: None,
             last_activity: cx.background_executor().now(),
             idle_task: None,
+            idle_closed: false,
             confirmed: Vec::new(),
             confirmed_stale: false,
             generation: 0,
@@ -2055,6 +2057,7 @@ impl Workspace {
         profile.drop_sessions();
         profile.keep_alive_task = None;
         profile.idle_task = None;
+        profile.idle_closed = false;
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
         profile.transaction_statements.clear();

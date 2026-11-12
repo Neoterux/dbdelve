@@ -94,6 +94,11 @@ pub(crate) fn agent_config(config: &ConnectionConfig) -> ConnectionConfig {
 pub(crate) const OPEN_FAILED: &str =
     "DBDelve could not open the agent's connection to this database.";
 
+/// Said when an agent call reaches a profile the idle timeout closed. States
+/// what happened and what holds; the agent opens nothing until the user
+/// connects the profile again.
+pub(crate) const CONNECTION_IDLE: &str = "The connection is idle: DBDelve closed it after it went unused, and it stays closed until it is connected again in the DBDelve window.";
+
 // ponytail: Claude Code trims an error result past about 11,000 characters, so
 // a statement's error is cut well before that. The upgrade is a setting.
 pub(crate) const ERROR_CAP: usize = 4_000;
@@ -573,6 +578,33 @@ impl Workspace {
                     verdict: work
                         .sql()
                         .map(|_| AuditVerdict::Refuse(refusal.to_string())),
+                    sql: work.sql(),
+                    elapsed_ms: elapsed_ms(arrived),
+                    ..CallFacts::default()
+                },
+            );
+            return;
+        }
+        if self
+            .profiles
+            .iter()
+            .any(|profile| profile.id == profile_id && profile.idle_closed)
+        {
+            // Before a lane exists, so nothing opens: the idle close's refusal
+            // holds for every call that enters here -- reads, catalog tools,
+            // the plan tool and a Read-only approval -- until the user
+            // connects the profile again.
+            self.agent_answered(
+                id,
+                work.tool(),
+                Some(profile_name),
+                None,
+                &reply,
+                Reply {
+                    status: Status::Failed,
+                    text: CONNECTION_IDLE.to_string(),
+                },
+                CallFacts {
                     sql: work.sql(),
                     elapsed_ms: elapsed_ms(arrived),
                     ..CallFacts::default()

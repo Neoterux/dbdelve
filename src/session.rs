@@ -86,6 +86,14 @@ pub(crate) struct Profile {
     /// the timeout. Dropping it cancels the close, which is how a disconnect, a
     /// connect and a changed timeout end the old one.
     pub(crate) idle_task: Option<gpui::Task<()>>,
+    /// Whether the idle timeout closed this connection and nothing has
+    /// connected it since: set by the close, cleared by the next connect. While
+    /// it is set an agent call opens nothing for this profile, so a server
+    /// session the user's setting closed is not reopened behind their back.
+    /// Runtime only and never stored. Not [`ProfileState::Idle`], which also
+    /// covers a profile never connected or disconnected by hand, and whose
+    /// agent reads are answered as ever.
+    pub(crate) idle_closed: bool,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
