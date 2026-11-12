@@ -20660,3 +20660,177 @@ fn a_stored_keep_alive_is_kept_only_where_a_session_stays_open_and_at_ten_second
         quit(workspace, cx);
     });
 }
+
+/// Where `id`'s connection stands, by name.
+fn state_of(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> &'static str {
+    use crate::session::ProfileState;
+    workspace.read_with(cx, |workspace, _| {
+        match workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile is listed")
+            .state
+        {
+            ProfileState::Idle => "idle",
+            ProfileState::Connecting => "connecting",
+            ProfileState::Connected(_) => "connected",
+            ProfileState::Failed(_) => "failed",
+        }
+    })
+}
+
+/// Saves `id`'s edit form with the Idle timeout row reading `minutes`.
+fn save_idle_timeout(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: &str,
+    minutes: &str,
+) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        let index = workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .expect("the profile is listed");
+        workspace.edit_profile(index, window, cx);
+        let form = workspace.form.as_mut().expect("the edit form is open");
+        form.idle_timeout.update(cx, |input, cx| {
+            input.set_value(minutes.to_string(), window, cx)
+        });
+        workspace.submit_connection(&SubmitConnection, window, cx);
+    });
+    settle(cx);
+}
+
+/// `id`'s idle task is set.
+fn idle_armed(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile is listed")
+            .idle_task
+            .is_some()
+    })
+}
+
+/// The app on one agent-visible SQLite profile `Orders`, connected, with
+/// `SELECT 1` typed and not run, and the agent's lane holding a connection of
+/// its own after one answered read.
+fn idle_orders<'a>(cx: &'a mut TestAppContext) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        &sqlite_profile("orders", "Orders", "agent_visible = true"),
+    );
+    cx.executor().allow_parking();
+    connect_profile(&workspace, cx, "orders");
+    assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+    cx.update(|window, cx| {
+        let editor = workspace
+            .read(cx)
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .expect("a connected profile opens on a query tab")
+            .editor
+            .clone();
+        editor.update(cx, |input, cx| input.set_value("SELECT 1", window, cx));
+    });
+    let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+    let answer = answer_of(cx, &answers);
+    assert_eq!(
+        answer.status,
+        crate::agent::Status::Executed,
+        "{}",
+        answer.text
+    );
+    workspace.read_with(cx, |workspace, _| {
+        let lane = workspace.agent.lanes.get("orders").expect("a lane");
+        assert!(lane.connection.is_some(), "the read left its connection");
+    });
+    (workspace, cx)
+}
+
+#[gpui::test]
+fn an_idle_profile_is_closed_with_its_tabs_kept(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    store::tests::with_home(|| {
+        let (workspace, cx) = idle_orders(cx);
+        let (generation, active) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.profile().expect("in front").generation,
+                workspace.active,
+            )
+        });
+
+        save_idle_timeout(&workspace, cx, "orders", "1");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("in front");
+            assert_eq!(profile.behaviour.idle_timeout, Some(1));
+            assert_eq!(profile.generation, generation, "nothing reconnected");
+            assert_eq!(profile.stored().idle_timeout_minutes, Some(1));
+        });
+        assert!(idle_armed(&workspace, cx, "orders"));
+
+        cx.executor().advance_clock(Duration::from_secs(59));
+        cx.run_until_parked();
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+
+        assert_eq!(buffer(&workspace, cx), "SELECT 1", "the tab is kept");
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.active, active, "the profile stays in front");
+            let profile = workspace.profile().expect("in front");
+            assert!(profile.generation > generation);
+            assert!(
+                profile
+                    .session
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("without use")),
+                "{:?}",
+                profile.session.notice
+            );
+            assert!(profile.bound.is_empty());
+            assert!(profile.idle_task.is_none() && profile.keep_alive_task.is_none());
+            assert!(
+                !workspace.agent.lanes.contains_key("orders"),
+                "the agent's connection went with it"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_stored_idle_timeout_of_zero_restores_as_off(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let profiles = [
+            sqlite_profile("on", "On", "idle_timeout_minutes = 15"),
+            sqlite_profile("zero", "Zero", "idle_timeout_minutes = 0"),
+            sqlite_profile("none", "None", ""),
+        ]
+        .concat();
+        let (workspace, cx) = launch_with_profiles(cx, &profiles);
+        let restored: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            ["on", "zero", "none"]
+                .map(|id| {
+                    let profile = workspace
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == id)
+                        .expect("the profile is restored");
+                    (
+                        profile.behaviour.idle_timeout,
+                        profile.stored().idle_timeout_minutes,
+                    )
+                })
+                .to_vec()
+        });
+        assert_eq!(restored, [(Some(15), Some(15)), (None, None), (None, None)]);
+        quit(workspace, cx);
+    });
+}

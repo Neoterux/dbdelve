@@ -1379,6 +1379,19 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_timeout_that_is_not_a_whole_number_of_minutes_is_refused() {
+        assert_eq!(typed_idle_timeout(""), Ok(None));
+        assert_eq!(typed_idle_timeout("  "), Ok(None));
+        assert_eq!(typed_idle_timeout("0"), Ok(None), "0 reads as off");
+        for refused in ["half", "-5", "1.5", "4294967296"] {
+            let error = typed_idle_timeout(refused).expect_err(refused);
+            assert!(error.starts_with("Idle timeout"), "{refused}: {error}");
+        }
+        assert_eq!(typed_idle_timeout("1"), Ok(Some(1)));
+        assert_eq!(typed_idle_timeout(" 30 "), Ok(Some(30)));
+    }
+
+    #[test]
     fn a_keep_alive_that_is_not_a_whole_number_of_ten_or_more_seconds_is_refused() {
         let postgres = Target::built_in(Engine::Postgres);
         assert_eq!(typed_keep_alive(postgres, ""), Ok(None));
