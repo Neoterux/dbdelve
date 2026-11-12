@@ -21440,6 +21440,48 @@ fn an_agent_read_on_an_idle_closed_profile_is_refused_until_the_profile_reconnec
 }
 
 #[gpui::test]
+fn an_approved_write_on_an_idle_closed_profile_is_refused_and_runs_nothing(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::Status;
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            ORDERS_SCHEMA,
+            "mode = \"read-write\"\nidle_timeout_minutes = 1",
+        );
+        cx.executor().allow_parking();
+        connect_profile(&workspace, cx, "orders");
+
+        // The dialog is up when the minute passes: a pending approval does not
+        // hold the close off.
+        let (id, answers) = inject_update(&workspace, cx, Some("Orders"));
+        tick(cx, 60);
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+        approve_front(cx);
+
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::Failed, "{}", answer.text);
+        assert!(writes_running(&workspace, cx).is_empty());
+        assert_eq!(email_of(1).as_deref(), Some("a@x"), "the row is unchanged");
+        #[cfg(unix)]
+        {
+            let lines = audit_of(id);
+            assert!(
+                lines.iter().all(|line| line["phase"] != "started"),
+                "nothing was started: {lines:?}"
+            );
+            let outcome = lines.last().expect("the call was audited");
+            assert_eq!(outcome["status"], "failed");
+            assert_eq!(outcome["decision"], "approved", "{outcome}");
+        }
+        #[cfg(not(unix))]
+        let _ = id;
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn an_agent_call_in_flight_defers_the_idle_close(cx: &mut TestAppContext) {
     use std::sync::atomic::Ordering;
     store::tests::with_home(|| {
