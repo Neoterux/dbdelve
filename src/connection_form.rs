@@ -17,7 +17,7 @@ use crate::{
     db::{
         ConnectionConfig, Driver, Engine, ExternalConfig, Fields, MongoConfig, Plugin,
         PostgresConfig, Properties, ServerConfig, SnowflakeConfig, SshTunnel, SslMode, Target,
-        odbc_string,
+        check_time_zone, odbc_string,
     },
     explorer::Shortcuts,
     session::{Behaviour, Depth, Profile},
@@ -81,9 +81,11 @@ pub(crate) struct ConnectionForm {
     /// The profile's login database, which the form does not show and keeps
     /// as it was.
     pub(crate) login_database: Option<String>,
-    /// The profile's session time zone and driver properties, which the form
-    /// does not show yet and keeps as they were, so a save changes neither.
-    pub(crate) time_zone: Option<String>,
+    /// The session time zone, where `Target::takes_time_zone`. Blank is none.
+    /// Kept, not read, under any other target, as another engine's fields are.
+    pub(crate) time_zone: Entity<InputState>,
+    /// The profile's driver properties, which the form does not show yet and
+    /// keeps as they were, so a save changes none.
     pub(crate) properties: Properties,
     /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
     /// unlike the credential fields it is drawn whichever engine is selected.
@@ -331,6 +333,11 @@ impl ConnectionForm {
                 .default_value(value(config.and_then(ConnectionConfig::service)))
         });
         let project_name = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
+        let time_zone = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("UTC")
+                .default_value(value(server.and_then(|server| server.time_zone.as_deref())))
+        });
         let statement_timeout = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("No limit")
@@ -406,7 +413,7 @@ impl ConnectionForm {
             service,
             srv: mongo.is_some_and(|mongo| mongo.srv),
             login_database: mongo.and_then(|mongo| mongo.login_database.clone()),
-            time_zone: server.and_then(|server| server.time_zone.clone()),
+            time_zone,
             properties: server
                 .map(|server| server.properties.clone())
                 .unwrap_or_default(),
@@ -786,7 +793,7 @@ impl ConnectionForm {
             ssh: self.ssh_tunnel(cx)?,
             schema: None,
             read_only: false,
-            time_zone: self.time_zone.clone(),
+            time_zone: typed_time_zone(self.target(), &read(&self.time_zone))?,
             properties: self.properties.clone(),
         };
         // A blank Host beside a service is whatever the service names, which
@@ -1093,6 +1100,19 @@ fn ssh_tunnel(
         identity_file,
         run_as: Some(run_as).filter(|user| takes_run_as && !user.is_empty()),
     }))
+}
+
+/// What the Time zone row says, where `target` draws it. Blank is none, and a
+/// zone that fails [`check_time_zone`] is the form's error, since it is spliced
+/// into a statement on every session. Text left in the row under a target that
+/// takes none is not read.
+fn typed_time_zone(target: Target, text: &str) -> Result<Option<String>, String> {
+    let zone = text.trim();
+    if !target.takes_time_zone() || zone.is_empty() {
+        return Ok(None);
+    }
+    check_time_zone(zone)?;
+    Ok(Some(zone.to_string()))
 }
 
 /// Blank is the default port.

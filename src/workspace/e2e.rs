@@ -8499,6 +8499,62 @@ fn the_kill_switch_answers_its_chord_on_every_surface(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_time_zone_row_is_drawn_only_where_a_session_takes_one(cx: &mut TestAppContext) {
+    use crate::db::Target;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("orders", "Orders", ""));
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::NewConnection);
+        let pick = |engine, cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                let form = workspace.form.as_mut().expect("the form is open");
+                form.set_target(Target::built_in(engine));
+                cx.notify();
+            });
+            settle(cx);
+        };
+        let zone_in = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let form = workspace.form.as_ref().expect("the form is open");
+                let (_, config) = form.config(cx).expect("the form reads");
+                config.server().and_then(|server| server.time_zone.clone())
+            })
+        };
+        let drawn = |cx: &mut VisualTestContext| cx.debug_bounds("form-time-zone").is_some();
+
+        pick(Engine::Postgres, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let form = workspace.form.as_ref().expect("the form is open");
+            form.host
+                .update(cx, |input, cx| input.set_value("db.example", window, cx));
+            form.user
+                .update(cx, |input, cx| input.set_value("me", window, cx));
+            form.time_zone.update(cx, |input, cx| {
+                input.set_value(" Europe/Paris ", window, cx)
+            });
+        });
+        settle(cx);
+        assert!(drawn(cx), "Postgres takes a zone");
+        assert_eq!(zone_in(cx).as_deref(), Some("Europe/Paris"));
+
+        for engine in [Engine::MySql, Engine::MariaDb, Engine::ClickHouse] {
+            pick(engine, cx);
+            assert!(drawn(cx), "{engine:?} takes a zone");
+            assert_eq!(zone_in(cx).as_deref(), Some("Europe/Paris"), "{engine:?}");
+        }
+        // The text stays in the row for the next engine that takes one, but is
+        // read by none that does not.
+        pick(Engine::SqlServer, cx);
+        assert!(!drawn(cx), "SQL Server takes none");
+        assert_eq!(zone_in(cx), None);
+        pick(Engine::DuckDb, cx);
+        assert!(!drawn(cx), "DuckDB takes none");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_click_on_an_empty_table_takes_the_keyboard_for_a_paste(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) =
