@@ -1,8 +1,11 @@
 //! The filter picker: a dialog that edits one profile's include list.
 //!
-//! On open it reads the server's databases, and the own database's schemas
-//! where the target has both levels, unfiltered whatever the tree shows, so a
-//! name the filter hides can be ticked again. Save writes the profile's lists
+//! On open it reads, unfiltered, the databases the tree draws
+//! (`Connection::catalog_databases`), and the own database's schemas where the
+//! target has both levels, whatever the tree shows, so a name the filter hides
+//! can be ticked again. Where the catalog lists databases as schemas that leaves
+//! out the system databases and any holding nothing, so the preview's total is
+//! the connection row's. Save writes the profile's lists
 //! and reads the catalog again; it never reconnects, because the lists are not
 //! part of the connection. Which sections exist comes from `Target::levels()`,
 //! never from the engine.
@@ -491,6 +494,44 @@ fn drawn(names: &[String], search: &str) -> Vec<(usize, Vec<Range<usize>>)> {
     rows
 }
 
+/// What [`read_names_for_picker`] brings back: the databases and the schema
+/// names, each present only when it was asked for.
+type PickerNames = (
+    Option<Result<Databases, DbError>>,
+    Option<Result<Vec<String>, DbError>>,
+);
+
+/// The blocking read the picker sends on open and on retry, run off the UI
+/// thread so a test can drive it without a window. The databases are the ones
+/// the tree draws (`Connection::catalog_databases`), so the picker's total is
+/// the connection row's; the schemas are the whole catalog's.
+fn read_names_for_picker(
+    connection: Connection,
+    engine: Engine,
+    in_transaction: bool,
+    databases: bool,
+    schemas: bool,
+) -> PickerNames {
+    let databases = databases.then(|| connection.catalog_databases(engine));
+    let schemas = schemas.then(|| {
+        // A failed read inside the user's transaction fails the
+        // transaction on Postgres, so it is read on another session.
+        let reader = match in_transaction {
+            true => connection.apart()?,
+            false => connection.clone(),
+        };
+        let catalog = reader.catalog(&Shown::everything())?;
+        Ok::<_, DbError>(
+            catalog
+                .schemas
+                .into_iter()
+                .map(|schema| schema.name)
+                .collect::<Vec<_>>(),
+        )
+    });
+    (databases, schemas)
+}
+
 impl Workspace {
     /// Put the picker up over `profile`, which must be connected and have
     /// databases to choose between, and read the server's databases for it,
@@ -534,10 +575,12 @@ impl Workspace {
         self.list_names_for_picker(true, wants_schemas, window, cx);
     }
 
-    /// Read the names of the lists asked for, unfiltered: every database and
-    /// schema, not the shown ones, since the names the tree holds are only
-    /// what the filter lets through. A new `request` number goes with it, so
-    /// what an earlier read brings back is dropped.
+    /// Read the names of the lists asked for, unfiltered, since the names the
+    /// tree holds are only what the filter lets through: the databases the
+    /// tree draws, which leaves out the server's own and any holding nothing
+    /// where the catalog lists databases as schemas, and every schema. A new
+    /// `request` number goes with it, so what an earlier read brings back is
+    /// dropped.
     fn list_names_for_picker(
         &mut self,
         databases: bool,
@@ -572,24 +615,7 @@ impl Workspace {
         }
         cx.notify();
         let fetch = spawn_blocking(cx.background_executor(), move || {
-            let databases = databases.then(|| connection.databases(engine, &Shown::everything()));
-            let schemas = schemas.then(|| {
-                // A failed read inside the user's transaction fails the
-                // transaction on Postgres, so it is read on another session.
-                let reader = match in_transaction {
-                    true => connection.apart()?,
-                    false => connection.clone(),
-                };
-                let catalog = reader.catalog(&Shown::everything())?;
-                Ok::<_, DbError>(
-                    catalog
-                        .schemas
-                        .into_iter()
-                        .map(|schema| schema.name)
-                        .collect::<Vec<_>>(),
-                )
-            });
-            (databases, schemas)
+            read_names_for_picker(connection, engine, in_transaction, databases, schemas)
         });
         cx.spawn_in(window, async move |workspace, cx| {
             let (databases, schemas) = fetch.await;

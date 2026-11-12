@@ -10,7 +10,7 @@
 mod edit;
 mod http;
 #[cfg(test)]
-mod mock;
+pub(crate) mod mock;
 mod tsv;
 
 use std::collections::HashMap;
@@ -81,6 +81,25 @@ const SESSION_ENDED: &str = "The server ended the session after it sat idle; USE
 const DATABASES_SQL: &str = "
 SELECT name, name = currentDatabase() AS is_current
 FROM system.databases
+ORDER BY name";
+
+/// The databases [`RELATIONS_SQL`] draws when nothing is filtered, by its own
+/// predicates, so a filtered catalog's `left_out` and the filter picker's list
+/// count what the unfiltered tree counts. `system.databases` also lists an
+/// empty database (`default` on a fresh server) the tree never draws. The inner
+/// select keeps the column name `database` and names it `name` only outside:
+/// ClickHouse resolves a select alias before a column of the same name, so
+/// aliasing it inside would make the `.inner` predicate read the database's
+/// name.
+const CATALOG_DATABASES_SQL: &str = "
+SELECT database AS name, database = currentDatabase() AS is_current
+FROM (
+    SELECT DISTINCT database
+    FROM system.tables
+    WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+        AND NOT is_temporary
+        AND NOT startsWith(name, '.inner')
+)
 ORDER BY name";
 
 /// `total_bytes` and `total_rows` are what the server keeps for the table, so
@@ -767,11 +786,13 @@ impl Connection {
 
     /// Only the matched databases are asked about; the listing is read here,
     /// in the read's own closure, so the statement carries names the server
-    /// just gave. ClickHouse would accept an empty `IN`, but a match of nothing
-    /// sends no statement on any engine.
+    /// just gave. The listing is [`Self::catalog_databases`], the databases the
+    /// catalog draws, so the `left_out` returned is on the tree's basis. A match
+    /// of nothing sends no statement on any engine, though ClickHouse would
+    /// accept an empty `IN`.
     pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
         let matched = if shown.narrows_catalog() {
-            shown.matched_databases(&self.databases()?, Engine::ClickHouse)
+            shown.matched_databases(&self.catalog_databases()?, Engine::ClickHouse)
         } else {
             None
         };
@@ -792,6 +813,12 @@ impl Connection {
 
     pub fn databases(&self) -> Result<Databases, DbError> {
         assemble_databases(&self.internal_query(DATABASES_SQL)?)
+    }
+
+    /// The databases holding something the catalog reads, the server's own
+    /// left out: what the unfiltered tree draws.
+    pub fn catalog_databases(&self) -> Result<Databases, DbError> {
+        assemble_databases(&self.internal_query(CATALOG_DATABASES_SQL)?)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
@@ -1905,7 +1932,7 @@ ORDER BY database, name"#;
         Connection::open(server)
     }
 
-    fn open(mock: &Mock) -> Connection {
+    pub(super) fn open(mock: &Mock) -> Connection {
         open_with(mock, writer(), &profile(mock)).unwrap()
     }
 
