@@ -10,6 +10,8 @@ use gpui::{
 use gpui_component::{Root, input::InputState};
 
 use super::Workspace;
+#[cfg(unix)]
+use crate::agent::tests::frame;
 use crate::{
     actions::{CancelQuery, ImportRowsFromClipboard, SubmitConnection},
     connection_form::ConnectionForm,
@@ -3372,6 +3374,36 @@ fn making_a_profile_visible_goes_through_the_dialog_that_opens_on_cancel(cx: &mu
 }
 
 #[gpui::test]
+fn the_visibility_dialog_names_the_commit_wait_only_for_a_rollback_journal_file(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("only", "Only", ""));
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        let blocks = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            run_command(workspace, cx, Command::ShowToAgents(0));
+            let blocks =
+                workspace.read_with(cx, |workspace, _| workspace.agent_visibility_blocks_commits);
+            workspace.update(cx, |workspace, _| workspace.agent_visibility_prompt = None);
+            blocks
+        };
+
+        rusqlite::Connection::open(&database)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER);"))
+            .expect("the schema must apply");
+        assert!(blocks(&workspace, cx));
+
+        rusqlite::Connection::open(&database)
+            .and_then(|connection| connection.execute_batch("PRAGMA journal_mode = WAL;"))
+            .expect("the journal mode must change");
+        assert!(!blocks(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn hiding_a_profile_takes_one_action_and_no_dialog(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) =
@@ -3601,7 +3633,7 @@ fn an_agent_lists_the_visible_connections_by_name_and_engine_over_the_socket(
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let client = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| client.is_finished());
         let answer = client.join().expect("the client thread finished");
 
@@ -3655,7 +3687,7 @@ fn the_window_holds_a_presence_for_as_long_as_the_connection_is_open(cx: &mut Te
 
         let mut stream =
             std::os::unix::net::UnixStream::connect(&path).expect("the socket accepts a client");
-        std::io::Write::write_all(&mut stream, b"{\"v\":1,\"kind\":\"presence\"}\n")
+        std::io::Write::write_all(&mut stream, format!("{}\n", presence()).as_bytes())
             .expect("the frame is written");
         drive_until(cx, |cx| open(cx) == 1);
         drop(stream);
@@ -3679,6 +3711,26 @@ fn inject_call(
     crate::agent::CallId,
     std::sync::mpsc::Receiver<crate::agent::Reply>,
 ) {
+    inject_call_with(
+        workspace,
+        cx,
+        tool,
+        connection,
+        crate::agent::CallArgs::default(),
+    )
+}
+
+/// [`inject_call`] for a call that carries arguments beyond its connection.
+fn inject_call_with(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tool: crate::agent::tools::Tool,
+    connection: Option<&str>,
+    args: crate::agent::CallArgs,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = crate::agent::CallId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let (reply, answers) = std::sync::mpsc::sync_channel(1);
@@ -3686,10 +3738,75 @@ fn inject_call(
         id,
         tool,
         connection: connection.map(str::to_string),
+        args,
         reply,
     };
     workspace.update(cx, |workspace, cx| workspace.on_agent_message(call, cx));
     (id, answers)
+}
+
+/// An `execute_sql` call for `Orders` carrying `sql`, injected.
+fn inject_sql(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: &str,
+    sql: &str,
+) -> std::sync::mpsc::Receiver<crate::agent::Reply> {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some(connection),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            ..Default::default()
+        },
+    )
+    .1
+}
+
+/// The app launched on a visible SQLite profile `Orders` (id `orders`) holding
+/// a database `schema` has been run against, and a hidden one `Secret` on the
+/// same file. `extra` is more scalar keys for `Orders`, such as its mode. The
+/// profile is never connected: the file is written before anything opens it.
+fn agent_sqlite<'a>(
+    cx: &'a mut TestAppContext,
+    schema: &str,
+    extra: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        // The app connects the first profile at launch, and `Orders` is to be
+        // one the user never connected.
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            sqlite_profile(
+                "orders",
+                "Orders",
+                &format!("agent_visible = true\n{extra}"),
+            ),
+        ]
+        .concat(),
+    );
+    let database = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(&database)
+        .and_then(|connection| connection.execute_batch(schema))
+        .expect("the schema must apply");
+    (workspace, cx)
+}
+
+const ORDERS_SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
+     INSERT INTO t VALUES (1, 'a@x'), (2, NULL), (3, 'c@x');";
+
+fn rows_in_orders() -> i64 {
+    let database = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(database)
+        .and_then(|connection| connection.query_row("SELECT count(*) FROM t", [], |row| row.get(0)))
+        .expect("the table is readable")
 }
 
 fn pending_calls(
@@ -3800,7 +3917,8 @@ fn hanging_up_one_ping_cancels_only_that_ping(cx: &mut TestAppContext) {
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let ping = b"{\"v\":1,\"kind\":\"call\",\"tool\":\"ping\",\"connection\":\"Orders\"}\n";
+        let ping = format!("{}\n", ping_orders());
+        let ping = ping.as_bytes();
         let connect = || {
             let mut stream = UnixStream::connect(&path).expect("the socket accepts a client");
             stream.write_all(ping).expect("the frame is written");
@@ -3916,7 +4034,9 @@ fn copying_the_registration_puts_the_line_on_the_clipboard_and_says_so(cx: &mut 
 }
 
 #[cfg(unix)]
-const PING_ORDERS: &str = r#"{"v":1,"kind":"call","tool":"ping","connection":"Orders"}"#;
+fn ping_orders() -> String {
+    frame(r#""kind":"call","tool":"ping","connection":"Orders""#)
+}
 
 #[cfg(unix)]
 #[gpui::test]
@@ -3956,7 +4076,7 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
         workspace.update(cx, |workspace, cx| workspace.set_color_titlebar(false, cx));
         assert_eq!(saved_agent_access(), Some(true));
 
-        let listed = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let listed = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| listed.is_finished());
         let reply: Reply = serde_json::from_str(
             listed
@@ -3968,7 +4088,7 @@ fn turning_agent_access_on_listens_and_turning_it_off_leaves_nothing_listening(
         assert_eq!(reply.status, Status::Executed);
         assert!(reply.text.contains("Orders"), "{}", reply.text);
 
-        let ping = raw_call(&path, PING_ORDERS);
+        let ping = raw_call(&path, &ping_orders());
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
 
         run_command(&workspace, cx, Command::DisconnectAgents);
@@ -4209,7 +4329,9 @@ fn the_kill_switch_holds_across_two_windows_of_the_same_variant(cx: &mut TestApp
 }
 
 #[cfg(unix)]
-const PRESENCE: &str = r#"{"v":1,"kind":"presence"}"#;
+fn presence() -> String {
+    frame(r#""kind":"presence""#)
+}
 
 #[cfg(unix)]
 const REJECTED: &str = r#"{"status":"rejected","text":"Agent access was turned off in DBDelve."}"#;
@@ -4226,9 +4348,12 @@ fn the_kill_switch_rejects_every_pending_call_before_it_closes_the_socket(cx: &m
         run_command(&workspace, cx, Command::TurnOnAgentAccess);
         let path = crate::agent::socket_path().expect("the test home gives a socket path");
 
-        let pings = [raw_call(&path, PING_ORDERS), raw_call(&path, PING_ORDERS)];
+        let pings = [
+            raw_call(&path, &ping_orders()),
+            raw_call(&path, &ping_orders()),
+        ];
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 2);
-        let presence = raw_call(&path, PRESENCE);
+        let presence = raw_call(&path, &presence());
         drive_until(cx, |cx| {
             workspace.read_with(cx, |workspace, _| workspace.agent.presence.len() == 1)
         });
@@ -5247,12 +5372,31 @@ fn every_finished_call_is_logged_once_and_the_log_is_capped(cx: &mut TestAppCont
         for _ in 0..25 {
             inject_call(&workspace, cx, Tool::ListConnections, None);
         }
+        // Thirty entries are held; one fewer than the cap evicts nothing, and
+        // the oldest, `listed`, is still the last of them.
+        for _ in 0..(super::agent::AUDIT_CAP - 1 - 5 - 25) {
+            inject_call(&workspace, cx, Tool::ListConnections, None);
+        }
         let log = agent_log(&workspace, cx);
-        assert_eq!(log.len(), super::agent::LOG_CAP);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP - 1);
+        assert_eq!(log.last().map(|entry| entry.id), Some(listed));
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP);
+        assert_eq!(log.last().map(|entry| entry.id), Some(listed));
+        // The next call is the one that evicts, and it evicts the oldest.
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), super::agent::AUDIT_CAP);
+        assert!(log.iter().all(|entry| entry.id != listed));
         let mut ids: Vec<_> = log.iter().map(|entry| entry.id.0).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), super::agent::LOG_CAP, "a call was logged twice");
+        assert_eq!(
+            ids.len(),
+            super::agent::AUDIT_CAP,
+            "a call was logged twice"
+        );
         quit(workspace, cx);
     });
 }
@@ -5320,7 +5464,7 @@ fn an_approval_after_its_caller_hung_up_is_logged_as_having_no_requester(cx: &mu
 
         let mut client = UnixStream::connect(&path).expect("the socket accepts a client");
         client
-            .write_all(format!("{PING_ORDERS}\n").as_bytes())
+            .write_all(format!("{}\n", ping_orders()).as_bytes())
             .expect("the frame is written");
         drive_until(cx, |cx| pending_calls(&workspace, cx).len() == 1);
         let id = pending_calls(&workspace, cx)[0];
@@ -5371,6 +5515,12 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         asked: Some("Nope".to_string()),
         status: Status::RefusedByGate,
         requester_gone: false,
+        verdict: None,
+        sql: None,
+        shown: None,
+        total: None,
+        elapsed_ms: 0,
+        error: None,
     };
     assert_eq!(
         agent_log_label(&entry, 1_000_000 + 125_000),
@@ -5397,6 +5547,246 @@ fn a_log_line_reads_age_tool_name_code_and_whether_anyone_was_waiting() {
         agent_log_label(&entry, 1_000_000),
         "moments ago \u{b7} list_connections \u{b7} executed"
     );
+}
+
+#[gpui::test]
+fn every_agent_call_is_audited_with_its_verdict_and_never_its_rows(cx: &mut TestAppContext) {
+    use crate::agent::{Status, result::Total, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('secret-cell-value');",
+            "",
+        );
+        cx.executor().allow_parking();
+        let sql = "SELECT v FROM t";
+        let (id, answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some(sql.to_string()),
+                ..Default::default()
+            },
+        );
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        assert!(reply.text.contains("secret-cell-value"), "{}", reply.text);
+        inject_call(&workspace, cx, Tool::ListConnections, None);
+
+        let log = agent_log(&workspace, cx);
+        let read = log
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("the read is audited");
+        assert_eq!(read.tool, Tool::ExecuteSql);
+        assert_eq!(read.resolved.as_deref(), Some("Orders"));
+        assert_eq!(read.status, Status::Executed);
+        assert_eq!(read.verdict, Some(super::agent::AuditVerdict::Run));
+        assert_eq!(read.sql.as_deref(), Some(sql));
+        assert_eq!((read.shown, read.total), (Some(1), Some(Total::Exact(1))));
+        assert!(!read.capped());
+        assert_eq!(read.error, None);
+        for entry in &log {
+            assert!(
+                !format!("{entry:?}").contains("secret-cell-value"),
+                "a row value reached the audit: {entry:?}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refused_or_approval_needing_call_is_audited_with_its_reason(cx: &mut TestAppContext) {
+    use super::agent::AuditVerdict;
+    use crate::{actions::ShowAgentActivity, agent::Status, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let insert = "INSERT INTO t VALUES (9, 'z')";
+        let drop = "DROP TABLE t";
+        inject_sql(&workspace, cx, "Orders", insert);
+        inject_sql(&workspace, cx, "Orders", drop);
+        cx.run_until_parked();
+
+        let log = agent_log(&workspace, cx);
+        let refusal = "DROP is refused for agent statements";
+        // Newest first: the DROP, then the INSERT.
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            (log[0].status, log[0].verdict.clone(), log[0].sql.as_deref()),
+            (
+                Status::RefusedByGate,
+                Some(AuditVerdict::Refuse(refusal.to_string())),
+                Some(drop)
+            )
+        );
+        assert_eq!(
+            (log[1].status, log[1].verdict.clone(), log[1].sql.as_deref()),
+            (
+                Status::RefusedByGate,
+                Some(AuditVerdict::Approve {
+                    mode: Mode::ReadWrite,
+                    expiry: None
+                }),
+                Some(insert)
+            )
+        );
+        for entry in &log {
+            assert_eq!((entry.shown, entry.total), (None, None), "{entry:?}");
+        }
+
+        assert_eq!(
+            log[0].verdict.as_ref().map(|v| v.line()),
+            Some(format!("Refused: {refusal}"))
+        );
+        assert_eq!(
+            log[1].verdict.as_ref().map(|v| v.line()).as_deref(),
+            Some("Needs approval at Read-write")
+        );
+        // The dialog draws both entries with their statements.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(cx.debug_bounds("agent-audit-sql").is_some());
+        quit(workspace, cx);
+    });
+}
+
+#[test]
+fn an_entry_is_capped_when_the_agent_was_given_fewer_rows_than_there_were() {
+    use super::agent::LogEntry;
+    use crate::agent::{CallId, Status, result::Total, tools::Tool};
+
+    let entry = LogEntry {
+        at: 0,
+        id: CallId(1),
+        tool: Tool::ExecuteSql,
+        resolved: None,
+        asked: None,
+        status: Status::Executed,
+        requester_gone: false,
+        verdict: None,
+        sql: None,
+        shown: Some(100),
+        total: Some(Total::Exact(100)),
+        elapsed_ms: 0,
+        error: None,
+    };
+    assert!(!entry.capped());
+    let more = LogEntry {
+        total: Some(Total::Exact(101)),
+        ..entry.clone()
+    };
+    assert!(more.capped());
+    let stopped = LogEntry {
+        total: Some(Total::AtLeast(100)),
+        ..entry.clone()
+    };
+    assert!(stopped.capped());
+    let none = LogEntry {
+        shown: None,
+        total: None,
+        ..entry
+    };
+    assert!(!none.capped());
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn the_agent_audit_opens_from_the_popover_and_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use crate::{actions::ShowAgentActivity, agent::Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| workspace.activate(0, cx));
+        settle(cx);
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        // What the popover's item dispatches.
+        let open = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.dispatch_action(Box::new(ShowAgentActivity), cx));
+            settle(cx);
+        };
+        open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(dialog_has_keyboard(&workspace, cx));
+        assert!(
+            cx.debug_bounds("agent-audit-empty").is_some(),
+            "an empty audit says so"
+        );
+        press(cx, "escape");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        let sql = "SELECT id FROM t";
+        let answers = inject_sql(&workspace, cx, "Orders", sql);
+        assert_eq!(answer_of(cx, &answers).status, Status::Executed);
+        settle(cx);
+        open(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("agent-audit"));
+        assert!(cx.debug_bounds("agent-audit-empty").is_none());
+        assert!(
+            cx.debug_bounds("agent-audit-sql").is_some(),
+            "the statement is drawn"
+        );
+        assert_eq!(
+            agent_log(&workspace, cx)[0].sql.as_deref(),
+            Some(sql),
+            "what is drawn is what the agent sent"
+        );
+        // Its one button closes it too.
+        press(cx, "enter");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert!(editor_has_keyboard(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_audit_lists_calls_newest_first_by_when_they_ended(cx: &mut TestAppContext) {
+    use std::time::Instant;
+
+    use crate::agent::{Inbound, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &sqlite_profile("orders", "Orders", "agent_visible = true"),
+        );
+        let began = Instant::now();
+        let (first, _first_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        let (second, _second_answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        let (third, _third_answers) = inject_call(&workspace, cx, Tool::Ping, Some("Orders"));
+        workspace.update(cx, |workspace, cx| workspace.deny_ping(third, cx));
+        let ended: Vec<_> = agent_log(&workspace, cx)
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ended, [third, second, first]);
+
+        // A hangup for a call that is over adds nothing and moves nothing.
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        let after: Vec<_> = agent_log(&workspace, cx)
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(after, ended);
+
+        let waited = began.elapsed().as_millis() as u64;
+        for entry in agent_log(&workspace, cx) {
+            assert!(entry.elapsed_ms <= waited, "{entry:?} after {waited} ms");
+        }
+        quit(workspace, cx);
+    });
 }
 
 #[cfg(unix)]
@@ -5597,7 +5987,7 @@ fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_cho
                 workspace.start_bridge_at(path.clone(), cx)
             })
             .expect("the socket binds");
-        let client = raw_call(&path, r#"{"v":1,"kind":"call","tool":"list_connections"}"#);
+        let client = raw_call(&path, &frame(r#""kind":"call","tool":"list_connections""#));
         drive_until(cx, |_| client.is_finished());
         let answer = client.join().expect("the client thread finished");
         let reply: Reply = serde_json::from_str(answer.trim_end()).expect("one answer frame");
@@ -5624,4 +6014,2132 @@ fn another_windows_visibility_is_answered_and_kept_and_only_this_windows_own_cho
         quit(workspace, cx);
         let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
     });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_reads_rows_through_the_shim_on_a_connection_of_its_own(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let untouched = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                (
+                    matches!(orders.state, ProfileState::Idle),
+                    orders.session.queries.len(),
+                    orders.session.objects.len(),
+                )
+            })
+        };
+        let before = untouched(cx);
+        assert!(before.0, "the user never connected Orders");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "execute_sql",
+            serde_json::json!({
+                "connection": "Orders",
+                "sql": "SELECT id, email FROM t ORDER BY id",
+            }),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        assert!(
+            text.starts_with("status: executed\ntruncated: none (3 rows)\ncolumns: "),
+            "{text}"
+        );
+        assert!(text.contains("[\"1\","), "{text}");
+        assert!(text.contains("null]"), "{text}");
+
+        assert_eq!(
+            untouched(cx),
+            before,
+            "the agent's read moved the user's profile"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.calls.is_empty(), "a read asks nobody");
+            assert_eq!(workspace.agent.lanes.len(), 1);
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let lane = workspace
+                .agent
+                .lanes
+                .get("orders")
+                .expect("the read opened a lane for Orders");
+            assert!(lane.opened_from == orders.config);
+        });
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_walks_a_catalog_through_the_shim(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        session::ProfileState,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE a (id INTEGER PRIMARY KEY);\
+             CREATE TABLE b (id INTEGER PRIMARY KEY);\
+             CREATE VIEW v AS SELECT id FROM a;",
+            "",
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let untouched = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                (
+                    matches!(orders.state, ProfileState::Idle),
+                    orders.session.queries.len(),
+                    orders.session.objects.len(),
+                )
+            })
+        };
+        let before = untouched(cx);
+        assert!(before.0, "the user never connected Orders");
+        let mut call = |tool: &str, arguments: serde_json::Value| {
+            let shim =
+                crate::agent::shim::testing::call_through_the_shim(path.clone(), tool, arguments);
+            drive_until(cx, |_| shim.is_finished());
+            let result = shim.join().expect("the shim's thread ends");
+            (
+                result["isError"] == true,
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("a result carries text")
+                    .to_string(),
+            )
+        };
+
+        let (failed, schemas) = call("list_schemas", serde_json::json!({"connection": "Orders"}));
+        assert!(!failed, "{schemas}");
+        assert!(
+            schemas.starts_with("status: executed\ntruncated: none (1 row)\ncolumns: "),
+            "{schemas}"
+        );
+        assert!(schemas.ends_with("\n[\"main\"]\n"), "{schemas}");
+
+        let (failed, tables) = call(
+            "list_tables",
+            serde_json::json!({"connection": "Orders", "schema": "main"}),
+        );
+        assert!(!failed, "{tables}");
+        assert!(
+            tables.starts_with("status: executed\ntruncated: none (3 rows)\ncolumns: "),
+            "{tables}"
+        );
+        let rows: Vec<&str> = tables
+            .lines()
+            .filter(|line| line.starts_with("[\""))
+            .collect();
+        assert_eq!(rows.len(), 3, "{tables}");
+        assert!(rows[0].starts_with("[\"a\",\"table\",null,"), "{tables}");
+        assert!(rows[1].starts_with("[\"b\",\"table\",null,"), "{tables}");
+        assert!(rows[2].starts_with("[\"v\",\"view\",null,"), "{tables}");
+
+        let (failed, missing) = call(
+            "list_tables",
+            serde_json::json!({"connection": "Orders", "schema": "nope"}),
+        );
+        assert!(failed, "{missing}");
+        assert_eq!(
+            missing,
+            format!("status: failed\n{}", super::agent_read::NO_SUCH_SCHEMA)
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [
+                (Tool::ListTables, Status::Failed),
+                (Tool::ListTables, Status::Executed),
+                (Tool::ListSchemas, Status::Executed),
+            ]
+        );
+        for entry in &log {
+            assert!(entry.verdict.is_none() && entry.sql.is_none(), "{entry:?}");
+        }
+        assert_eq!(log[1].shown, Some(3));
+        assert_eq!(log[2].shown, Some(1));
+
+        assert_eq!(
+            untouched(cx),
+            before,
+            "the agent's catalog read moved the user's profile"
+        );
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+const DESCRIBED_SCHEMA: &str = "CREATE TABLE teams (id INTEGER PRIMARY KEY);\
+     CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT NOT NULL DEFAULT 'x', \
+     team INTEGER REFERENCES teams(id));\
+     CREATE UNIQUE INDEX t_email ON t (email);";
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_describes_a_table_through_the_shim(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        session::ProfileState,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, DESCRIBED_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "describe_table",
+            serde_json::json!({"connection": "Orders", "schema": "main", "table": "t"}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        assert!(text.starts_with("status: executed\ntruncated: "), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let after = |label: &str| {
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with(&format!("{label}: ")))
+                .unwrap_or_else(|| panic!("no `{label}` table in {text}"));
+            &lines[at + 1..]
+        };
+        let columns = after("columns");
+        assert_eq!(columns[0], "[\"id\",\"INTEGER\",\"false\",null]", "{text}");
+        assert_eq!(
+            columns[1], "[\"email\",\"TEXT\",\"false\",\"'x'\"]",
+            "{text}"
+        );
+        assert_eq!(columns[2], "[\"team\",\"INTEGER\",\"true\",null]", "{text}");
+        assert_eq!(after("primary_key")[0], "[\"id\"]", "{text}");
+        assert_eq!(
+            after("foreign_keys")[0],
+            "[\"team\",\"main\",\"teams\",\"id\"]",
+            "{text}"
+        );
+        assert!(
+            after("indexes")
+                .iter()
+                .any(|line| line.starts_with("[\"t_email\",\"unique\",")),
+            "{text}"
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [(Tool::DescribeTable, Status::Executed)]
+        );
+        assert!(
+            log[0].verdict.is_none() && log[0].sql.is_none(),
+            "{:?}",
+            log[0]
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            assert!(
+                matches!(orders.state, ProfileState::Idle),
+                "the agent's describe moved the user's profile"
+            );
+        });
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_describes_a_table_and_an_unknown_name_reads_as_missing(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, DESCRIBED_SCHEMA, "");
+        cx.executor().allow_parking();
+        let mut describe = |schema: &str, table: &str| {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                Tool::DescribeTable,
+                Some("Orders"),
+                CallArgs {
+                    schema: Some(schema.to_string()),
+                    table: Some(table.to_string()),
+                    ..CallArgs::default()
+                },
+            );
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the call answered")
+        };
+
+        let held = describe("main", "t");
+        assert_eq!(held.status, Status::Executed, "{}", held.text);
+        for (schema, table) in [
+            ("main", "nope"),
+            ("other", "t"),
+            ("MAIN", "t"),
+            ("main", "T"),
+        ] {
+            let missing = describe(schema, table);
+            assert_eq!(missing.status, Status::Failed, "{schema}.{table}");
+            assert_eq!(
+                missing.text,
+                super::agent_read::NOT_IN_CATALOG,
+                "{schema}.{table}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_catalog_call_for_a_hidden_or_unknown_connection_is_refused_and_opens_nothing(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for (tool, name) in [
+            (Tool::ListSchemas, "Secret"),
+            (Tool::ListTables, "Secret"),
+            (Tool::ListSchemas, "Nope"),
+        ] {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                tool,
+                Some(name),
+                crate::agent::CallArgs {
+                    schema: Some("main".to_string()),
+                    ..Default::default()
+                },
+            );
+            let reply = answers.try_recv().expect("a refusal is answered at once");
+            assert_eq!(
+                reply.status,
+                Status::RefusedByGate,
+                "{name}: {}",
+                reply.text
+            );
+        }
+        workspace.read_with(cx, |workspace, _| assert!(workspace.agent.lanes.is_empty()));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_read_keeps_the_first_rows_and_runs_as_written(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150) \
+             INSERT INTO t (id) SELECT i FROM n;",
+            "",
+        );
+        cx.executor().allow_parking();
+        let mut read = |sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the read answered")
+        };
+
+        let long = read("SELECT id FROM t ORDER BY id");
+        assert_eq!(long.status, Status::Executed, "{}", long.text);
+        assert!(
+            long.text
+                .starts_with("truncated: 100 of at least 100 rows shown (row cap)\ncolumns: "),
+            "{}",
+            long.text
+        );
+        let row_lines = |text: &str| text.lines().filter(|line| line.starts_with("[\"")).count();
+        assert_eq!(row_lines(&long.text), 100, "{}", long.text);
+
+        let limited = read("SELECT id FROM t ORDER BY id LIMIT 3");
+        assert_eq!(limited.status, Status::Executed, "{}", limited.text);
+        assert!(
+            limited.text.starts_with("truncated: none (3 rows)\n"),
+            "{}",
+            limited.text
+        );
+        assert_eq!(row_lines(&limited.text), 3, "{}", limited.text);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_statement_that_needs_approval_is_refused_and_never_reaches_the_server(
+    cx: &mut TestAppContext,
+) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "mode = \"read-write\"");
+        let answers = inject_sql(&workspace, cx, "Orders", "INSERT INTO t VALUES (9, 'z')");
+        cx.run_until_parked();
+        let reply = answers.try_recv().expect("the gate answers at once");
+        assert_eq!(reply.status, Status::RefusedByGate);
+        assert_eq!(reply.text, super::agent_read::NEEDS_APPROVAL);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+            assert!(workspace.agent.calls.is_empty());
+        });
+        assert_eq!(rows_in_orders(), 3);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refused_statement_answers_the_reason_it_was_refused(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for (connection, sql, reason) in [
+            (
+                "Orders",
+                "DROP TABLE t",
+                "DROP is refused for agent statements",
+            ),
+            ("Orders", "SELECT 1; SELECT 2", "more than one statement"),
+            (
+                "Secret",
+                "SELECT 1",
+                "no agent-visible connection has that name",
+            ),
+        ] {
+            let answers = inject_sql(&workspace, cx, connection, sql);
+            cx.run_until_parked();
+            let reply = answers.try_recv().expect("the gate answers at once");
+            assert_eq!(reply.status, Status::RefusedByGate, "{sql}");
+            assert_eq!(reply.text, reason, "{sql}");
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+        });
+        assert_eq!(rows_in_orders(), 3);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_empty_statement_is_refused_without_opening_a_connection(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        for sql in ["", "   "] {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            cx.run_until_parked();
+            let reply = answers.try_recv().expect("the gate answers at once");
+            assert_eq!(reply.status, Status::RefusedByGate, "{sql:?}");
+            assert_eq!(reply.text, "there is no statement to run", "{sql:?}");
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "a connection was opened");
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// Whether `text` holds `name` with a character outside a name on each side.
+fn names_whole(text: &str, name: &str) -> bool {
+    let in_a_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(in_a_name)
+            && !text[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(in_a_name)
+    })
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_failed_statement_answers_the_servers_words_without_the_path(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let socket = crate::agent::socket_path().expect("the test home gives a socket path");
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        let ask = |cx: &mut VisualTestContext, sql: String| {
+            let shim = crate::agent::shim::testing::call_through_the_shim(
+                socket.clone(),
+                "execute_sql",
+                serde_json::json!({ "connection": "Orders", "sql": sql }),
+            );
+            drive_until(cx, |_| shim.is_finished());
+            let result = shim.join().expect("the shim's thread ends");
+            result["content"][0]["text"]
+                .as_str()
+                .expect("a result carries text")
+                .to_string()
+        };
+
+        // The agent names the database file itself, so the server's message
+        // repeats it.
+        let failed = ask(cx, format!("SELECT * FROM \"{database}\""));
+        assert!(failed.starts_with("status: failed"), "{failed}");
+        assert!(failed.contains("no such table"), "{failed}");
+        assert!(failed.contains("[hidden]"), "{failed}");
+        assert!(!names_whole(&failed, &database), "{failed}");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.agent.lanes.contains_key("orders"));
+        });
+
+        let fresh = ask(cx, "SELECT 1".to_string());
+        assert!(fresh.starts_with("status: executed"), "{fresh}");
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_connection_that_will_not_open_answers_a_fixed_sentence(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        // A directory where the database file was: nothing can open it.
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        std::fs::remove_file(&database).expect("the database file is there");
+        std::fs::create_dir(&database).expect("a directory takes its place");
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        let mut reply = None;
+        drive_until(cx, |_| {
+            reply = reply.take().or_else(|| answers.try_recv().ok());
+            reply.is_some()
+        });
+        let reply = reply.expect("the call answered");
+        assert_eq!(reply.status, Status::Failed);
+        assert_eq!(reply.text, super::agent_read::OPEN_FAILED);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty());
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_failed_call_keeps_its_full_error_in_the_audit_only(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db");
+        let read = |cx: &mut VisualTestContext, sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the call answered")
+        };
+
+        // The statement names the file, so the server's words repeat it.
+        let named = format!("SELECT * FROM \"{}\"", database.display());
+        let failed = read(cx, &named);
+        assert_eq!(failed.status, Status::Failed, "{}", failed.text);
+        assert!(
+            !names_whole(&failed.text, &database.display().to_string()),
+            "{}",
+            failed.text
+        );
+        let missing = read(cx, "SELECT * FROM missing");
+        assert_eq!(missing.status, Status::Failed, "{}", missing.text);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log[0].sql.as_deref(), Some("SELECT * FROM missing"));
+        let error = log[0].error.as_deref().expect("the failure is audited");
+        assert!(error.contains("no such table: missing"), "{error}");
+        let error = log[1].error.as_deref().expect("the failure is audited");
+        assert!(error.contains("no such table"), "{error}");
+        assert!(
+            error.contains(&database.display().to_string()),
+            "the audit keeps the path: {error}"
+        );
+
+        // A directory where the database file was: nothing can open it.
+        std::fs::remove_file(&database).expect("the database file is there");
+        std::fs::create_dir(&database).expect("a directory takes its place");
+        let reply = read(cx, "SELECT 1");
+        assert_eq!(reply.status, Status::Failed);
+        assert_eq!(reply.text, super::agent_read::OPEN_FAILED);
+        let log = agent_log(&workspace, cx);
+        let opened = log[0]
+            .error
+            .as_deref()
+            .expect("the open failure is audited");
+        assert!(
+            opened.contains(&database.display().to_string()),
+            "the audit keeps the full open error: {opened}"
+        );
+        for entry in &log {
+            assert_eq!(entry.status, Status::Failed);
+        }
+        assert!(
+            !reply.text.contains(opened),
+            "the full error reached the agent: {}",
+            reply.text
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_long_statement_is_clipped_in_the_audit_on_a_character_boundary(cx: &mut TestAppContext) {
+    use super::agent::{AUDIT_SQL_CAP, SQL_CLIPPED};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let sql = format!("SELECT '{}'", "\u{2026}".repeat(5000));
+        let answers = inject_sql(&workspace, cx, "Orders", &sql);
+        let mut reply = None;
+        drive_until(cx, |_| {
+            reply = reply.take().or_else(|| answers.try_recv().ok());
+            reply.is_some()
+        });
+        let log = agent_log(&workspace, cx);
+        let kept = log[0].sql.as_deref().expect("the statement is audited");
+        assert_eq!(
+            kept.chars().count(),
+            AUDIT_SQL_CAP + SQL_CLIPPED.chars().count()
+        );
+        assert!(kept.ends_with(SQL_CLIPPED));
+        assert!(sql.starts_with(&kept[..kept.len() - SQL_CLIPPED.len()]));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_read_that_outlasts_the_agent_timeout_is_stopped(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "statement_timeout = 1");
+        cx.executor().allow_parking();
+        let database = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        // Real time: the connection's own timer interrupts the statement.
+        let read = |cx: &mut VisualTestContext, sql: &str| {
+            let answers = inject_sql(&workspace, cx, "Orders", sql);
+            let mut reply = None;
+            drive_until(cx, |_| {
+                reply = reply.take().or_else(|| answers.try_recv().ok());
+                reply.is_some()
+            });
+            reply.expect("the read answered")
+        };
+
+        let started = std::time::Instant::now();
+        let runaway = read(
+            cx,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+             SELECT count(*) FROM n",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the runaway ran {:?}",
+            started.elapsed()
+        );
+        assert_eq!(runaway.status, Status::Failed, "{}", runaway.text);
+        assert!(!names_whole(&runaway.text, &database), "{}", runaway.text);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.agent.lanes.contains_key("orders"));
+        });
+
+        let fresh = read(cx, "SELECT 1");
+        assert_eq!(fresh.status, Status::Executed, "{}", fresh.text);
+        quit(workspace, cx);
+    });
+}
+
+/// What an injected read answered, waiting on the executor for it.
+fn answer_of(
+    cx: &mut VisualTestContext,
+    answers: &std::sync::mpsc::Receiver<crate::agent::Reply>,
+) -> crate::agent::Reply {
+    let mut reply = None;
+    drive_until(cx, |_| {
+        reply = reply.take().or_else(|| answers.try_recv().ok());
+        reply.is_some()
+    });
+    reply.expect("the call answered")
+}
+
+/// The statuses the log holds for `id`.
+fn logged(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: crate::agent::CallId,
+) -> Vec<crate::agent::Status> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .agent
+            .log
+            .iter()
+            .filter(|entry| entry.id == id)
+            .map(|entry| entry.status)
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn calls_on_one_profile_run_one_at_a_time_in_arrival_order(cx: &mut TestAppContext) {
+    use crate::agent::{Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let sql = |sql: &str| crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            ..Default::default()
+        };
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            sql("SELECT 1"),
+        );
+        let (second, second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            Tool::ExecuteSql,
+            Some("Orders"),
+            sql("SELECT 2"),
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert_eq!(lane.running.as_ref().map(|running| running.id), Some(first));
+            assert_eq!(
+                lane.waiting
+                    .iter()
+                    .map(|waiting| waiting.id)
+                    .collect::<Vec<_>>(),
+                [second]
+            );
+        });
+
+        let one = answer_of(cx, &first_answers);
+        let two = answer_of(cx, &second_answers);
+        assert_eq!(one.status, Status::Executed, "{}", one.text);
+        assert_eq!(two.status, Status::Executed, "{}", two.text);
+        assert!(one.text.contains("[\"1\"]"), "{}", one.text);
+        assert!(two.text.contains("[\"2\"]"), "{}", two.text);
+        // Newest first: the second ended after the first.
+        workspace.read_with(cx, |workspace, _| {
+            let ended: Vec<_> = workspace.agent.log.iter().map(|entry| entry.id).collect();
+            assert_eq!(ended, [second, first]);
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.running.is_none() && lane.waiting.is_empty());
+            assert!(lane.connection.is_some());
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// `agent_sqlite`'s two profiles with a DuckDB profile `Ducks`, visible to the
+/// agent, on a file of its own. Answers the file's path.
+fn agent_duckdb<'a>(
+    cx: &'a mut TestAppContext,
+    path: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    launch_with_profiles(
+        cx,
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            format!(
+                "[[profiles]]\nid = \"ducks\"\nname = \"Ducks\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"duckdb\"\npath = {path:?}\nagent_visible = true\n"
+            ),
+        ]
+        .concat(),
+    )
+}
+
+#[gpui::test]
+fn an_agent_read_on_a_duckdb_file_sees_the_latest_commit(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("ducks.duckdb").display().to_string();
+        // The user's own instance, held open for the whole test.
+        let user = ::duckdb::Connection::open(&path).expect("the file opens");
+        user.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)")
+            .expect("the schema applies");
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        cx.executor().allow_parking();
+
+        let count = |cx: &mut VisualTestContext| {
+            let answers = inject_sql(&workspace, cx, "Ducks", "SELECT count(*) FROM t");
+            let answer = answer_of(cx, &answers);
+            assert_eq!(answer.status, Status::Executed, "{}", answer.text);
+            workspace.read_with(cx, |workspace, _| {
+                let lane = workspace.agent.lanes.get("ducks");
+                assert!(
+                    lane.is_none_or(|lane| lane.connection.is_none()),
+                    "a DuckDB read keeps no connection"
+                );
+            });
+            answer.text
+        };
+        let first = count(cx);
+        assert!(first.contains("[\"1\"]"), "{first}");
+        user.execute_batch("INSERT INTO t VALUES (2)")
+            .expect("the user commits a row");
+        let second = count(cx);
+        assert!(second.contains("[\"2\"]"), "{second}");
+        drop(user);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_read_on_an_in_memory_duckdb_profile_is_refused_by_name(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_duckdb(cx, "");
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Ducks", "SELECT 1");
+        let answer = answer_of(cx, &answers);
+        assert_eq!(answer.status, Status::RefusedByGate, "{}", answer.text);
+        assert_eq!(
+            answer.text,
+            "This connection is an in-memory DuckDB database, which has no separate connection an agent can read."
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty(), "nothing was opened");
+            let entry = workspace.agent.log.front().expect("the refusal is logged");
+            assert_eq!(entry.status, Status::RefusedByGate);
+            assert_eq!(entry.resolved.as_deref(), Some("Ducks"));
+            assert!(
+                matches!(&entry.verdict, Some(crate::workspace::agent::AuditVerdict::Refuse(reason)) if reason.contains("in-memory DuckDB")),
+                "{:?}",
+                entry.verdict
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hanging_up_a_waiting_read_never_starts_it(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 1".to_string()),
+                ..Default::default()
+            },
+        );
+        let (second, second_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 2".to_string()),
+                ..Default::default()
+            },
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: second }, cx)
+        });
+        assert_eq!(
+            second_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected),
+            "nothing is sent to a caller that hung up"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.waiting.is_empty());
+            assert_eq!(lane.running.as_ref().map(|running| running.id), Some(first));
+        });
+
+        let one = answer_of(cx, &first_answers);
+        assert_eq!(one.status, Status::Executed, "{}", one.text);
+        cx.run_until_parked();
+        assert_eq!(logged(&workspace, cx, second), [Status::Cancelled]);
+        assert_eq!(logged(&workspace, cx, first), [Status::Executed]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn hanging_up_a_running_read_cancels_it_and_frees_the_lane(cx: &mut TestAppContext) {
+    use std::sync::mpsc::TryRecvError;
+
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (first, first_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 1".to_string()),
+                ..Default::default()
+            },
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.agent.lanes.get("orders").is_none_or(|lane| {
+                    lane.running.is_none() && lane.waiting.is_empty() && lane.connection.is_none()
+                }),
+                "the read's lane still holds it"
+            );
+        });
+
+        // The read's late result changes nothing.
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(
+            first_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected)
+        );
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+
+        let (_, next_answers) = inject_call_with(
+            &workspace,
+            cx,
+            crate::agent::tools::Tool::ExecuteSql,
+            Some("Orders"),
+            crate::agent::CallArgs {
+                sql: Some("SELECT 3".to_string()),
+                ..Default::default()
+            },
+        );
+        let next = answer_of(cx, &next_answers);
+        assert_eq!(next.status, Status::Executed, "{}", next.text);
+        assert!(next.text.contains("[\"3\"]"), "{}", next.text);
+        quit(workspace, cx);
+    });
+}
+
+/// Whether the read running on `profile_id`'s lane holds the connection a
+/// cancel would be sent to, stepping the scheduler one task at a time until it
+/// does or the read has answered. The test scheduler runs a statement inline,
+/// so a statement that is still running cannot be waited on here; what can be
+/// shown is that the connection is reachable before the statement is sent.
+fn connection_is_held_before_the_statement_runs(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    profile_id: &str,
+    answers: &std::sync::mpsc::Receiver<crate::agent::Reply>,
+) -> bool {
+    loop {
+        let held = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .agent
+                .lanes
+                .get(profile_id)
+                .and_then(|lane| lane.running.as_ref())
+                .is_some_and(|running| running.holds_connection())
+        });
+        if held {
+            return true;
+        }
+        if answers.try_recv().is_ok() || !cx.executor().tick() {
+            return false;
+        }
+    }
+}
+
+#[gpui::test]
+fn the_first_read_of_a_lane_can_be_cancelled_on_the_connection_it_opened(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.connection.is_none(), "the lane starts cold");
+        });
+        assert!(
+            connection_is_held_before_the_statement_runs(&workspace, cx, "orders", &answers),
+            "a hangup, the deadline, a hide or the kill switch would have no connection to cancel on"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_duckdb_read_can_be_cancelled_on_the_connection_it_opened(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().expect("the test home has a data directory");
+        std::fs::create_dir_all(&directory).expect("the data directory must be creatable");
+        let path = directory.join("ducks.duckdb").display().to_string();
+        ::duckdb::Connection::open(&path)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t (id INTEGER)"))
+            .expect("the schema applies");
+        let (workspace, cx) = agent_duckdb(cx, &path);
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Ducks", "SELECT count(*) FROM t");
+        assert!(
+            connection_is_held_before_the_statement_runs(&workspace, cx, "ducks", &answers),
+            "a DuckDB lane keeps no connection, so only the running call can hand one to a cancel"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// How many times, and as which backend, [`open_live_postgres`] opened.
+static LIVE_OPENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LIVE_BACKEND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The compose Postgres from the `PG*` variables, as the live tests reach it.
+fn live_postgres() -> crate::db::ConnectionConfig {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    crate::db::ConnectionConfig::postgres(crate::db::ServerConfig {
+        host: var("PGHOST"),
+        port: std::env::var("PGPORT")
+            .ok()
+            .map(|port| port.parse().expect("PGPORT must be a number")),
+        database: var("PGDATABASE"),
+        user: var("PGUSER"),
+        password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        sslmode: crate::db::SslMode::Disable,
+        ..crate::db::ServerConfig::default()
+    })
+}
+
+/// An [`agent_read::Opener`](super::agent_read::Opener) that opens the live
+/// Postgres whatever profile asked, and remembers which backend it got.
+fn open_live_postgres(
+    executor: &gpui::BackgroundExecutor,
+    _: crate::db::ConnectionConfig,
+    _: String,
+) -> gpui::Task<Result<(crate::db::Connection, Vec<String>), crate::db::DbError>> {
+    use std::sync::atomic::Ordering;
+
+    super::spawn_blocking(executor, || {
+        let connection = crate::db::Connection::open_for_agent(live_postgres())?;
+        let backend = connection.query(
+            "SELECT pg_backend_pid()",
+            &crate::db::CancelToken::default(),
+            crate::db::Fetch::default(),
+        )?;
+        let backend = backend.rows[0].get(0).unwrap_or_default().parse();
+        LIVE_BACKEND.store(backend.unwrap_or_default(), Ordering::SeqCst);
+        LIVE_OPENS.fetch_add(1, Ordering::SeqCst);
+        Ok((connection, Vec::new()))
+    })
+}
+
+#[gpui::test]
+#[ignore = "requires the compose databases"]
+fn live_a_read_reopens_the_session_a_server_dropped_while_the_lane_was_idle(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::Ordering;
+
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(open_live_postgres);
+        });
+        LIVE_OPENS.store(0, Ordering::SeqCst);
+
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        let first = answer_of(cx, &answers);
+        assert_eq!(first.status, Status::Executed, "{}", first.text);
+        assert_eq!(LIVE_OPENS.load(Ordering::SeqCst), 1);
+
+        // The server ends the session while nobody is using it.
+        let other = crate::db::Connection::open(live_postgres()).expect("a second session opens");
+        other
+            .query(
+                &format!(
+                    "SELECT pg_terminate_backend({})",
+                    LIVE_BACKEND.load(Ordering::SeqCst)
+                ),
+                &crate::db::CancelToken::default(),
+                crate::db::Fetch::default(),
+            )
+            .expect("the backend is terminated");
+
+        let (_, answers) = inject_orders_read(&workspace, cx, "SELECT 2");
+        let second = answer_of(cx, &answers);
+        assert_eq!(second.status, Status::Executed, "{}", second.text);
+        assert!(second.text.contains("[\"2\"]"), "{}", second.text);
+        assert_eq!(LIVE_OPENS.load(Ordering::SeqCst), 2, "one reopen");
+        quit(workspace, cx);
+    });
+}
+
+/// An `execute_sql` call on `Orders` carrying `sql`, injected, with its id.
+fn inject_orders_read(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some("Orders"),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+#[gpui::test]
+fn a_hung_open_ends_its_call_at_the_deadline_and_frees_the_lane(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent_read::CALL_DEADLINE;
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(|executor, _, _| executor.spawn(std::future::pending()));
+        });
+        let (first, first_answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        let (_, second_answers) = inject_orders_read(&workspace, cx, "SELECT 2");
+
+        cx.executor()
+            .advance_clock(CALL_DEADLINE - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(first_answers.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(second_answers.try_recv().err(), Some(TryRecvError::Empty));
+
+        workspace.update(cx, |workspace, _| workspace.agent.opener = None);
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let one = answer_of(cx, &first_answers);
+        assert_eq!(one.status, Status::Failed);
+        assert_eq!(one.text, "The call did not finish within 60 seconds.");
+        assert_eq!(logged(&workspace, cx, first), [Status::Failed]);
+
+        let two = answer_of(cx, &second_answers);
+        assert_eq!(two.status, Status::Executed, "{}", two.text);
+        assert!(two.text.contains("[\"2\"]"), "{}", two.text);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_deadline_and_a_hangup_on_the_same_call_end_it_once(cx: &mut TestAppContext) {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    use super::agent_read::CALL_DEADLINE;
+    use crate::agent::{Inbound, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, _| {
+            workspace.agent.opener = Some(|executor, _, _| executor.spawn(std::future::pending()));
+        });
+        let (first, first_answers) = inject_orders_read(&workspace, cx, "SELECT 1");
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_agent_message(Inbound::Hangup { id: first }, cx)
+        });
+        cx.executor()
+            .advance_clock(CALL_DEADLINE + Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(logged(&workspace, cx, first), [Status::Cancelled]);
+        assert_eq!(
+            first_answers.try_recv().err(),
+            Some(TryRecvError::Disconnected),
+            "nothing is sent after the hangup"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_running_read_is_neither_a_ping_nor_a_waiting_call(cx: &mut TestAppContext) {
+    use crate::{agent::Status, ui::AgentMark};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, ORDERS_SCHEMA, "");
+        cx.executor().allow_parking();
+        let path = crate::agent::tests::short_socket_path();
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.start_bridge_at(path.clone(), cx)
+            })
+            .expect("the socket binds");
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.running.is_some(), "the read is running");
+            assert!(workspace.front_ping().is_none());
+            assert!(workspace.agent.calls.is_empty());
+        });
+        assert_eq!(
+            agent_mark_state(&workspace, cx),
+            Some(AgentMark::Connected { waiting: 0 })
+        );
+        // A frame with the read still running: no dialog goes up for it.
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(front_dialog(&workspace, cx), None);
+
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(agent_mark_state(&workspace, cx), Some(AgentMark::Listening));
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+        let _ = std::fs::remove_dir_all(path.parent().expect("the socket has a directory"));
+    });
+}
+
+/// An `execute_sql` call on `connection`, injected, with its id.
+fn inject_read(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection: &str,
+    sql: &str,
+) -> (
+    crate::agent::CallId,
+    std::sync::mpsc::Receiver<crate::agent::Reply>,
+) {
+    inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExecuteSql,
+        Some(connection),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+/// The app launched on visible `Orders` and `Billing` over one database that
+/// `schema` has been run against. Neither is connected for the user.
+fn orders_and_billing<'a>(
+    cx: &'a mut TestAppContext,
+    schema: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let visible = "agent_visible = true";
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        &[
+            sqlite_profile("secret", "Secret", ""),
+            sqlite_profile("orders", "Orders", visible),
+            sqlite_profile("billing", "Billing", visible),
+        ]
+        .concat(),
+    );
+    rusqlite::Connection::open(
+        store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db"),
+    )
+    .and_then(|connection| connection.execute_batch(schema))
+    .expect("the schema must apply");
+    (workspace, cx)
+}
+
+fn no_lane_for(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> bool {
+    workspace.read_with(cx, |workspace, _| !workspace.agent.lanes.contains_key(id))
+}
+
+#[gpui::test]
+fn hiding_or_removing_a_profile_ends_its_reads_and_drops_its_connection(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (running, running_answers) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        let (waiting, waiting_answers) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        let (_, billing_answers) = inject_read(&workspace, cx, "Billing", "SELECT 3");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_agent_visible("orders", false, cx)
+        });
+        assert_eq!(running_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(waiting_answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "orders"));
+        assert_eq!(
+            logged(&workspace, cx, running),
+            [crate::agent::Status::Rejected]
+        );
+        assert_eq!(
+            logged(&workspace, cx, waiting),
+            [crate::agent::Status::Rejected]
+        );
+        // Billing is another profile's lane, and it answers as it would have.
+        let billing = answer_of(cx, &billing_answers);
+        assert_eq!(
+            billing.status,
+            crate::agent::Status::Executed,
+            "{}",
+            billing.text
+        );
+        assert!(running_answers.try_recv().is_err(), "answered twice");
+        cx.run_until_parked();
+        assert!(no_lane_for(&workspace, cx, "orders"));
+
+        // Removal reaches a lane that has its connection, too.
+        let (first, first_answers) = inject_read(&workspace, cx, "Billing", "SELECT 4");
+        let (second, second_answers) = inject_read(&workspace, cx, "Billing", "SELECT 5");
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "billing")
+                .expect("Billing is in the list");
+            workspace.remove_profile(index, cx)
+        });
+        assert_eq!(first_answers.try_recv().ok(), Some(swept()));
+        assert_eq!(second_answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "billing"));
+        assert_eq!(logged(&workspace, cx, first).len(), 1);
+        assert_eq!(logged(&workspace, cx, second).len(), 1);
+        cx.run_until_parked();
+        assert!(first_answers.try_recv().is_err(), "answered twice");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_hide_adopted_from_another_window_ends_the_running_read(cx: &mut TestAppContext) {
+    use crate::agent::tools::Tool;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (id, answers) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .agent
+                    .lanes
+                    .get("orders")
+                    .is_some_and(|lane| lane.running.is_some())
+            );
+        });
+
+        // Another window hides Orders: only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        let text = text.replacen("agent_visible = true\n", "", 1);
+        std::fs::write(&file, text).expect("profiles.toml is written");
+        assert!(!saved_visible("orders"));
+
+        let (_, listed) = inject_call(&workspace, cx, Tool::ListConnections, None);
+        assert!(listed.try_recv().is_ok());
+        assert_eq!(answers.try_recv().ok(), Some(swept()));
+        assert!(no_lane_for(&workspace, cx, "orders"));
+        assert_eq!(logged(&workspace, cx, id), [crate::agent::Status::Rejected]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_read_after_a_hide_saved_by_another_window_is_refused_at_once(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (_, first) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        assert_eq!(answer_of(cx, &first).status, Status::Executed);
+
+        // Another window hides Orders: only the file says so.
+        let file = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml");
+        let text = std::fs::read_to_string(&file).expect("profiles.toml reads");
+        std::fs::write(&file, text.replacen("agent_visible = true\n", "", 1))
+            .expect("profiles.toml is written");
+
+        // The file changed, so the very next read takes the hide on.
+        let (_, second) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        let second = answer_of(cx, &second);
+        assert_eq!(second.status, Status::RefusedByGate, "{}", second.text);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_kill_switch_ends_every_running_read(cx: &mut TestAppContext) {
+    use crate::agent::{Reply, Status};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = orders_and_billing(cx, ORDERS_SCHEMA);
+        cx.executor().allow_parking();
+        let (_, orders) = inject_read(&workspace, cx, "Orders", "SELECT 1");
+        let (_, waiting) = inject_read(&workspace, cx, "Orders", "SELECT 2");
+        let (_, billing) = inject_read(&workspace, cx, "Billing", "SELECT 3");
+
+        workspace.update(cx, |workspace, cx| workspace.disconnect_agents(cx));
+        let turned_off = Reply {
+            status: Status::Rejected,
+            text: "Agent access was turned off in DBDelve.".to_string(),
+        };
+        for answers in [&orders, &waiting, &billing] {
+            assert_eq!(answers.try_recv().ok(), Some(turned_off.clone()));
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.agent.lanes.is_empty());
+        });
+        cx.run_until_parked();
+        for answers in [&orders, &waiting, &billing] {
+            assert!(answers.try_recv().is_err(), "answered twice");
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_profile_whose_connection_changed_is_reopened_for_the_next_read(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('one');",
+            "",
+        );
+        cx.executor().allow_parking();
+        let other = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("other.db");
+        rusqlite::Connection::open(&other)
+            .and_then(|connection| {
+                connection.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('two');")
+            })
+            .expect("the second file is written");
+
+        let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT v FROM t");
+        let first = answer_of(cx, &answers);
+        assert!(first.text.contains("[\"one\"]"), "{}", first.text);
+
+        // The connection changes in place, with no hide.
+        workspace.update(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let crate::db::ConnectionConfig::Sqlite { path, .. } = &mut orders.config else {
+                panic!("Orders is a SQLite profile");
+            };
+            *path = other.display().to_string();
+        });
+        let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT v FROM t");
+        let second = answer_of(cx, &answers);
+        assert!(second.text.contains("[\"two\"]"), "{}", second.text);
+        workspace.read_with(cx, |workspace, _| {
+            let orders = workspace
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "orders")
+                .expect("the profile was restored");
+            let lane = workspace.agent.lanes.get("orders").expect("a lane");
+            assert!(lane.opened_from == orders.config);
+            assert!(lane.connection.is_some());
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_agent_read_leaves_the_users_open_transaction_alone(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "PRAGMA journal_mode=wal; CREATE TABLE t (id INTEGER); \
+             INSERT INTO t VALUES (1), (2);",
+            "mode = \"read-write\"",
+        );
+        cx.executor().allow_parking();
+        workspace.update(cx, |workspace, cx| {
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "orders")
+                .expect("Orders is in the list");
+            workspace.activate(index, cx);
+        });
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .is_some_and(|profile| matches!(profile.state, ProfileState::Connected(_)))
+            })
+        });
+
+        let run = |cx: &mut VisualTestContext, sql: &str| {
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(sql);
+            cx.simulate_keystrokes("secondary-enter");
+            settle(cx);
+        };
+        run(cx, "BEGIN");
+        run(cx, "INSERT INTO t VALUES (3)");
+        let user = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("Orders is in front");
+                (
+                    profile.in_transaction,
+                    profile.generation,
+                    matches!(profile.state, ProfileState::Connected(_)),
+                )
+            })
+        };
+        let before = user(cx);
+        assert!(before.0, "the user's transaction is open");
+
+        let count = |cx: &mut VisualTestContext| {
+            let (_, answers) = inject_read(&workspace, cx, "Orders", "SELECT count(*) FROM t");
+            answer_of(cx, &answers)
+        };
+        let seen = count(cx);
+        assert_eq!(seen.status, crate::agent::Status::Executed, "{}", seen.text);
+        assert!(
+            seen.text.contains("[\"2\"]"),
+            "only committed rows: {}",
+            seen.text
+        );
+        assert_eq!(
+            user(cx),
+            before,
+            "the agent's read moved the user's session"
+        );
+
+        run(cx, "COMMIT");
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { .. } => {}
+            QueryState::Failed(error) => panic!("the commit failed: {error}"),
+            _ => panic!("the commit never completed"),
+        });
+        assert!(!user(cx).0, "the commit closed the transaction");
+        let after = count(cx);
+        assert!(after.text.contains("[\"3\"]"), "{}", after.text);
+        quit(workspace, cx);
+    });
+}
+
+const EXPLAINED_SCHEMA: &str = "CREATE TABLE a (id INTEGER PRIMARY KEY);\
+     CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, x INTEGER);\
+     CREATE INDEX b_x ON b (x);";
+
+const EXPLAINED_QUERY: &str = "SELECT * FROM a JOIN b ON a.id = b.a_id WHERE b.x = 1";
+
+/// An `explain_query` call for `Orders`, injected, and its answer.
+fn explain_call(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+    analyze: Option<bool>,
+) -> crate::agent::Reply {
+    let (_, answers) = inject_call_with(
+        workspace,
+        cx,
+        crate::agent::tools::Tool::ExplainQuery,
+        Some("Orders"),
+        crate::agent::CallArgs {
+            sql: Some(sql.to_string()),
+            analyze,
+            ..Default::default()
+        },
+    );
+    answer_of(cx, &answers)
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn an_agent_explains_a_query_and_reads_findings_first(cx: &mut TestAppContext) {
+    use crate::{
+        agent::{Status, tools::Tool},
+        workspace::agent::AuditVerdict,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, EXPLAINED_SCHEMA, "");
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let path = crate::agent::socket_path().expect("the test home gives a socket path");
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            path,
+            "explain_query",
+            serde_json::json!({"connection": "Orders", "sql": EXPLAINED_QUERY}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        let body = text
+            .strip_prefix("status: executed\n")
+            .unwrap_or_else(|| panic!("not executed: {text}"));
+        let lines: Vec<&str> = body.lines().collect();
+        let at = |start: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(start))
+                .unwrap_or_else(|| panic!("no `{start}` line in {text}"))
+        };
+        let (truncated, plan, findings, tree) = (
+            at("truncated:"),
+            at("plan: engine=sqlite analyzed=no"),
+            at("findings"),
+            at("tree:"),
+        );
+        assert!(
+            truncated < plan && plan < findings && findings < tree,
+            "{text}"
+        );
+        assert!(
+            lines[tree..].iter().any(|line| line.contains("n0")),
+            "{text}"
+        );
+
+        let log = agent_log(&workspace, cx);
+        assert_eq!(
+            log.iter()
+                .map(|entry| (entry.tool, entry.status))
+                .collect::<Vec<_>>(),
+            [(Tool::ExplainQuery, Status::Executed)]
+        );
+        let sql = log[0]
+            .sql
+            .as_deref()
+            .expect("the audit holds the statement");
+        assert!(sql.starts_with("EXPLAIN QUERY PLAN SELECT"), "{sql}");
+        assert_eq!(log[0].verdict, Some(AuditVerdict::Run));
+        assert!(log[0].error.is_none(), "{:?}", log[0]);
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_plain_plan_of_an_update_changes_nothing(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\
+             INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+            "mode = \"read-write\"",
+        );
+        let values = || -> Vec<String> {
+            let database = store::dbdelve_directory()
+                .expect("the test home has a data directory")
+                .join("e2e.db");
+            let connection = rusqlite::Connection::open(database).expect("the database opens");
+            let mut statement = connection
+                .prepare("SELECT v FROM t ORDER BY id")
+                .expect("the table is readable");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("the rows read")
+                .collect::<Result<_, _>>()
+                .expect("every value is text")
+        };
+        let before = values();
+        let reply = explain_call(&workspace, cx, "UPDATE t SET v = 'changed'", None);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        assert!(reply.text.contains("tree:"), "{}", reply.text);
+        assert_eq!(values(), before, "a plain plan changed the table");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_omitted_analyze_explains_exactly_as_false(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, EXPLAINED_SCHEMA, "");
+        let omitted = explain_call(&workspace, cx, EXPLAINED_QUERY, None);
+        let asked_false = explain_call(&workspace, cx, EXPLAINED_QUERY, Some(false));
+        assert_eq!(
+            omitted.status,
+            crate::agent::Status::Executed,
+            "{}",
+            omitted.text
+        );
+        assert_eq!(omitted.status, asked_false.status);
+        assert_eq!(omitted.text, asked_false.text);
+        let log = agent_log(&workspace, cx);
+        assert_eq!(log.len(), 2);
+        assert!(log[0].sql.is_some());
+        assert_eq!(log[0].sql, log[1].sql);
+        quit(workspace, cx);
+    });
+}
+
+/// Whether `text` holds `name` as a whole token in any ASCII case: a token
+/// character is one of `[A-Za-z0-9_]`, and `name` is not part of a longer run of
+/// them. Written here rather than borrowed from the scrub so the test does not
+/// trust the code it checks.
+fn names_whole_any_case(text: &str, name: &str) -> bool {
+    let in_a_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let (text, name) = (text.to_ascii_lowercase(), name.to_ascii_lowercase());
+    text.match_indices(&name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(in_a_name)
+            && !text[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(in_a_name)
+    })
+}
+
+/// `profiles.toml` as another window would leave it with profile `id` saved
+/// as agent-visible or not.
+fn save_visibility_as_another_window(id: &str, visible: bool) {
+    let file = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("profiles.toml");
+    let mut saved: toml::Table = std::fs::read_to_string(&file)
+        .expect("profiles.toml reads")
+        .parse()
+        .expect("profiles.toml parses");
+    let profile = saved["profiles"]
+        .as_array_mut()
+        .expect("profiles are an array")
+        .iter_mut()
+        .find(|profile| profile["id"].as_str() == Some(id))
+        .and_then(toml::Value::as_table_mut)
+        .expect("the profile is saved");
+    if visible {
+        profile.insert("agent_visible".into(), true.into());
+    } else {
+        profile.remove("agent_visible");
+    }
+    std::fs::write(
+        &file,
+        toml::to_string(&saved).expect("profiles.toml serializes"),
+    )
+    .expect("profiles.toml is written");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn list_connections_names_each_engine_by_name_and_engine_only(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let fixture = include_str!("../testdata/every-engine.toml");
+        let configs = super::restored(fixture);
+        let mut stored: toml::Table = fixture.parse().expect("the fixture parses");
+        let mut profiles = stored
+            .remove("profiles")
+            .and_then(|profiles| match profiles {
+                toml::Value::Array(profiles) => Some(profiles),
+                _ => None,
+            })
+            .expect("the fixture holds profiles");
+        // What the agent should be told about each profile, taken from the
+        // fixture and the config the window restores from it.
+        let mut expected = Vec::new();
+        let mut identifying = Vec::new();
+        for profile in &mut profiles {
+            let table = profile.as_table_mut().expect("a profile is a table");
+            table.insert("agent_visible".into(), true.into());
+            let id = table["id"].as_str().expect("a profile has an id");
+            let config = &configs
+                .iter()
+                .find(|(restored, _)| restored == id)
+                .expect("every profile restores")
+                .1;
+            identifying.extend(config.identifying_text());
+            expected.push(serde_json::json!({
+                "name": table["name"].as_str().expect("a profile has a name"),
+                "engine": config.engine().as_str(),
+            }));
+        }
+        assert!(expected.len() >= 13, "the fixture shrank: {expected:?}");
+        assert!(
+            identifying.iter().any(|text| text == "sa"),
+            "SQL Server's two-letter user is among what is scanned for"
+        );
+        let only_profiles = toml::Table::from_iter([("profiles".to_string(), profiles.into())]);
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &toml::to_string(&only_profiles).expect("the profiles serialize"),
+        );
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::TurnOnAgentAccess);
+        let socket = crate::agent::socket_path().expect("the test home gives a socket path");
+
+        let shim = crate::agent::shim::testing::call_through_the_shim(
+            socket,
+            "list_connections",
+            serde_json::json!({}),
+        );
+        drive_until(cx, |_| shim.is_finished());
+        let result = shim.join().expect("the shim's thread ends");
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a result carries text");
+        let body = text
+            .strip_prefix(&format!("status: {}\n", Status::Executed.as_str()))
+            .unwrap_or_else(|| panic!("not executed: {text}"));
+
+        let listed: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(body).expect("the body is an array of objects");
+        assert_eq!(listed.len(), expected.len(), "{body}");
+        for (entry, wanted) in listed.iter().zip(&expected) {
+            let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["engine", "name"], "{entry:?}");
+            assert_eq!(&serde_json::Value::Object(entry.clone()), wanted);
+        }
+
+        // With the values the agent is meant to get taken out, nothing about
+        // where a database is, or how to get in, is left to find.
+        let mut left = body.to_string();
+        for wanted in &expected {
+            for key in ["name", "engine"] {
+                let value = serde_json::to_string(&wanted[key]).expect("a string serializes");
+                left = left.replacen(&value, "", 1);
+            }
+        }
+        assert_eq!(
+            left,
+            format!(
+                "[{}]",
+                vec![r#"{"name":,"engine":}"#; expected.len()].join(",")
+            )
+        );
+        for text in &identifying {
+            assert!(!names_whole_any_case(&left, text), "{text:?} in {left}");
+        }
+
+        workspace.update(cx, |workspace, _| workspace.agent.bridge.take());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn list_connections_reads_empty_byte_exact_and_after_a_hide_elsewhere(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Status, tools::Tool};
+
+    store::tests::with_home(|| {
+        let name = "Ünï \"q\"";
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("odd", name, ""));
+        cx.executor().allow_parking();
+        let listed = |cx: &mut VisualTestContext| {
+            let (_, answers) = inject_call(&workspace, cx, Tool::ListConnections, None);
+            answer_of(cx, &answers)
+        };
+
+        let none = listed(cx);
+        assert_eq!((none.status, none.text.as_str()), (Status::Executed, "[]"));
+
+        // Another window shows it.
+        save_visibility_as_another_window("odd", true);
+        let shown = listed(cx);
+        assert_eq!(shown.status, Status::Executed);
+        assert_eq!(shown.text, r#"[{"name":"Ünï \"q\"","engine":"sqlite"}]"#);
+
+        let schemas = |cx: &mut VisualTestContext, asked: &str| {
+            let (_, answers) = inject_call_with(
+                &workspace,
+                cx,
+                Tool::ListSchemas,
+                Some(asked),
+                CallArgs::default(),
+            );
+            answer_of(cx, &answers)
+        };
+        let found = schemas(cx, name);
+        assert_eq!(found.status, Status::Executed, "{}", found.text);
+        for spelling in [
+            "ünï \"q\"",
+            "ÜNÏ \"Q\"",
+            " Ünï \"q\"",
+            "Ünï \"q\" ",
+            // The same letters, composed the other way.
+            "U\u{308}ni\u{308} \"q\"",
+        ] {
+            let refused = schemas(cx, spelling);
+            assert_eq!(refused.status, Status::RefusedByGate, "{spelling:?}");
+            assert_eq!(
+                refused.text, "no agent-visible connection has that name",
+                "{spelling:?}"
+            );
+        }
+
+        // Another window hides it again before the next call.
+        save_visibility_as_another_window("odd", false);
+        let hidden = listed(cx);
+        assert_eq!(
+            (hidden.status, hidden.text.as_str()),
+            (Status::Executed, "[]")
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.profiles[0].agent_visible);
+        });
+        quit(workspace, cx);
+    });
+}
+
+const MOVED_SCHEMA: &str = "CREATE TABLE a (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\
+     CREATE UNIQUE INDEX a_email ON a (email);\
+     CREATE VIEW v AS SELECT id FROM a;\
+     INSERT INTO a VALUES (1, 'x@y'), (2, 'z@y');";
+
+#[gpui::test]
+fn no_reply_dbdelve_writes_depends_on_where_the_file_is(cx: &mut TestAppContext) {
+    use crate::agent::{CallArgs, Reply, tools::Tool};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = agent_sqlite(cx, MOVED_SCHEMA, "");
+        cx.executor().allow_parking();
+        let home = store::dbdelve_directory().expect("the test home has a data directory");
+        let first = home.join("e2e.db");
+        // Another directory with another name, holding the same bytes.
+        let elsewhere = home.join("moved-away-from-here");
+        std::fs::create_dir(&elsewhere).expect("the directory is made");
+        let second = elsewhere.join("orders-copy.sqlite");
+        std::fs::copy(&first, &second).expect("the database is copied");
+
+        // The agent names the file in one statement, so the server's own
+        // message repeats it.
+        let calls = |path: &str| -> Vec<(Tool, CallArgs)> {
+            let args = |schema: Option<&str>, table: Option<&str>, sql: Option<&str>| CallArgs {
+                schema: schema.map(str::to_string),
+                table: table.map(str::to_string),
+                sql: sql.map(str::to_string),
+                ..CallArgs::default()
+            };
+            vec![
+                (Tool::ListConnections, args(None, None, None)),
+                (Tool::ListSchemas, args(None, None, None)),
+                (Tool::ListTables, args(Some("main"), None, None)),
+                (Tool::ListTables, args(Some("nope"), None, None)),
+                (Tool::DescribeTable, args(Some("main"), Some("a"), None)),
+                (Tool::DescribeTable, args(Some("main"), Some("nope"), None)),
+                (
+                    Tool::ExecuteSql,
+                    args(None, None, Some("SELECT id, email FROM a ORDER BY id")),
+                ),
+                (
+                    Tool::ExecuteSql,
+                    args(None, None, Some(&format!("SELECT * FROM \"{path}\""))),
+                ),
+                (
+                    Tool::ExplainQuery,
+                    args(None, None, Some("SELECT * FROM a WHERE email = 'x'")),
+                ),
+            ]
+        };
+        let mut ask = |path: &std::path::Path| -> Vec<Reply> {
+            workspace.update(cx, |workspace, _| {
+                let orders = workspace
+                    .profiles
+                    .iter_mut()
+                    .find(|profile| profile.id == "orders")
+                    .expect("the profile was restored");
+                let crate::db::ConnectionConfig::Sqlite { path: stored, .. } = &mut orders.config
+                else {
+                    panic!("Orders is a SQLite profile");
+                };
+                *stored = path.display().to_string();
+            });
+            calls(&path.display().to_string())
+                .into_iter()
+                .map(|(tool, args)| {
+                    let connection = (tool != Tool::ListConnections).then_some("Orders");
+                    let (_, answers) = inject_call_with(&workspace, cx, tool, connection, args);
+                    answer_of(cx, &answers)
+                })
+                .collect()
+        };
+        let there = ask(&first);
+        let here = ask(&second);
+
+        assert_eq!(there.len(), here.len());
+        let stored_and_expanded = |path: &std::path::Path| {
+            let stored = path.display().to_string();
+            let expanded = store::home_expanded(&stored).display().to_string();
+            [stored, expanded]
+        };
+        let paths: Vec<String> = [&first, &second]
+            .into_iter()
+            .flat_map(|path| stored_and_expanded(path))
+            .collect();
+        for (at, (a, b)) in there.iter().zip(&here).enumerate() {
+            assert_eq!(a, b, "call {at} answered differently for the moved file");
+            for path in &paths {
+                assert!(
+                    !names_whole_any_case(&a.text, path),
+                    "call {at} names {path}: {}",
+                    a.text
+                );
+                assert!(
+                    !names_whole_any_case(&b.text, path),
+                    "call {at} names {path}: {}",
+                    b.text
+                );
+            }
+        }
+        // The replies were real answers, not two matching refusals.
+        let statuses: Vec<_> = there.iter().map(|reply| reply.status).collect();
+        use crate::agent::Status::{Executed, Failed};
+        assert_eq!(
+            statuses,
+            [
+                Executed, Executed, Executed, Failed, Executed, Failed, Executed, Failed, Executed
+            ],
+            "{there:#?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_the_agents_statement_selects_is_returned_as_is(cx: &mut TestAppContext) {
+    use crate::agent::Status;
+
+    store::tests::with_home(|| {
+        let own_path = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("e2e.db")
+            .display()
+            .to_string();
+        let (workspace, cx) = agent_sqlite(
+            cx,
+            &format!("CREATE TABLE t (note TEXT); INSERT INTO t VALUES ('{own_path}');"),
+            "",
+        );
+        cx.executor().allow_parking();
+        let answers = inject_sql(&workspace, cx, "Orders", "SELECT note FROM t");
+        let reply = answer_of(cx, &answers);
+        assert_eq!(reply.status, Status::Executed, "{}", reply.text);
+        // The database's own data, so DBDelve leaves it exactly as stored.
+        let row = serde_json::to_string(&[&own_path]).expect("a row serializes");
+        assert!(
+            reply.text.lines().any(|line| line == row),
+            "{row} is not a line of {}",
+            reply.text
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// D-26: a reply builder is handed what the database holds, never what a
+/// profile says about where it is or how to get in.
+#[test]
+fn no_reply_builder_takes_a_connection_config_or_a_profile() {
+    let source = include_str!("agent_read.rs");
+    for builder in [
+        "schemas_text",
+        "tables_text",
+        "structure_text",
+        "plan_reply",
+    ] {
+        let start = source
+            .find(&format!("fn {builder}("))
+            .unwrap_or_else(|| panic!("{builder} is gone from agent_read.rs"));
+        let signature = &source[start..start + source[start..].find('{').expect("a body")];
+        for held in ["ConnectionConfig", "Profile"] {
+            assert!(!signature.contains(held), "{builder} takes {held}");
+        }
+    }
 }

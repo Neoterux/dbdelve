@@ -31,7 +31,7 @@ use duckdb::arrow::compute::cast;
 use duckdb::arrow::datatypes::{DataType, Field, FieldRef};
 use duckdb::arrow::error::ArrowError;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
-use duckdb::{Config, InterruptHandle};
+use duckdb::{AccessMode, Config, InterruptHandle};
 use num_bigint::BigUint;
 
 use crate::sql::Projected;
@@ -105,8 +105,24 @@ struct Pick {
 
 impl Connection {
     pub fn open(path: &str, statement_timeout: u32) -> Result<Self, DbError> {
+        Self::open_with(path, statement_timeout, false)
+    }
+
+    /// Opened by the engine for reads only (`access_mode` `READ_ONLY`): DuckDB
+    /// refuses a write on it. A database in memory has no file to open a second
+    /// time, so it is refused here.
+    pub fn open_read_only(path: &str, statement_timeout: u32) -> Result<Self, DbError> {
+        Self::open_with(path, statement_timeout, true)
+    }
+
+    fn open_with(path: &str, statement_timeout: u32, read_only: bool) -> Result<Self, DbError> {
         let connection = match path.trim() {
-            "" | IN_MEMORY => duckdb::Connection::open_in_memory_with_flags(config()?)
+            "" | IN_MEMORY if read_only => {
+                return Err(plain_error(
+                    "A database in memory cannot be opened read-only.".into(),
+                ));
+            }
+            "" | IN_MEMORY => duckdb::Connection::open_in_memory_with_flags(config(false)?)
                 .map_err(|error| plain_error(error.to_string()))?,
             path => {
                 let path = crate::store::home_expanded(path);
@@ -119,7 +135,7 @@ impl Connection {
                         path.display()
                     )));
                 }
-                duckdb::Connection::open_with_flags(&path, config()?).map_err(|error| {
+                duckdb::Connection::open_with_flags(&path, config(read_only)?).map_err(|error| {
                     plain_error(format!("Cannot open {}: {error}", path.display()))
                 })?
             }
@@ -520,10 +536,16 @@ impl Connection {
 /// with the type's name rather than squeezed into the nearest Arrow type,
 /// where a `UHUGEINT` wraps into a negative `DECIMAL(38,0)` and a `HUGEINT`
 /// cannot be told from a decimal. [`printable`] reads the tags.
-fn config() -> Result<Config, DbError> {
-    Config::default()
+fn config(read_only: bool) -> Result<Config, DbError> {
+    let config = Config::default()
         .with("arrow_lossless_conversion", "true")
-        .map_err(|error| plain_error(error.to_string()))
+        .map_err(|error| plain_error(error.to_string()))?;
+    if read_only {
+        return config
+            .access_mode(AccessMode::ReadOnly)
+            .map_err(|error| plain_error(error.to_string()));
+    }
+    Ok(config)
 }
 
 fn lock(
@@ -2653,6 +2675,28 @@ mod tests {
             Engine::DuckDb,
             "main",
         );
+    }
+
+    #[test]
+    fn an_agent_open_reads_committed_rows_and_refuses_a_write() {
+        let dir = std::env::temp_dir().join(format!("dbdelve-duckdb-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.duckdb");
+        drop(::duckdb::Connection::open(&path).expect("the scratch database is created"));
+        let path = path.to_string_lossy().into_owned();
+        let user = Connection::open(&path, 0).unwrap();
+        user.query(
+            "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)",
+            Fetch::default(),
+        )
+        .unwrap();
+        let user = crate::db::Connection::DuckDb(user);
+        crate::db::assert_agent_open_reads_and_refuses_a_write(
+            crate::db::ConnectionConfig::duckdb(path, 0),
+            &user,
+        );
+        drop(user);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     struct ScratchDir(std::path::PathBuf);

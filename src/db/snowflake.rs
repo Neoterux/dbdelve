@@ -1056,8 +1056,6 @@ impl Connection {
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
-        let literal = |value: &str| Engine::Snowflake.quote_literal(value);
-
         // `INFORMATION_SCHEMA` names a constraint and its type but has no view
         // of the columns in it, so the keys come from `SHOW`.
         //
@@ -1074,9 +1072,7 @@ impl Connection {
         let database = self.config.stored_database();
         let within = Engine::Snowflake.qualified(&database, schema);
         let [columns, primary, unique, imported] = self.at_once([
-            COLUMNS_SQL
-                .replace("{schema}", &literal(schema))
-                .replace("{relation}", &literal(relation)),
+            structure_sql(COLUMNS_SQL, schema, relation),
             format!("SHOW PRIMARY KEYS IN SCHEMA {within}"),
             format!("SHOW UNIQUE KEYS IN SCHEMA {within}"),
             format!("SHOW IMPORTED KEYS IN SCHEMA {within}"),
@@ -1256,6 +1252,15 @@ fn appended(mut first: QueryResult, second: QueryResult) -> Result<QueryResult, 
     Ok(first)
 }
 
+/// A relation name is user data and can contain a quote.
+fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
+    super::fill_placeholders(
+        template,
+        &Engine::Snowflake.quote_literal(schema),
+        &Engine::Snowflake.quote_literal(relation),
+    )
+}
+
 /// The type is spelled the way a result column's is, lower case with its
 /// precision, so a relation reads the same in its Structure tab and its grid.
 const COLUMNS_SQL: &str = r#"
@@ -1385,6 +1390,18 @@ mod mock;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_schema_named_like_a_placeholder_is_not_substituted_into() {
+        assert_eq!(
+            structure_sql(
+                "WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {relation}",
+                "{relation}",
+                "a'b",
+            ),
+            "WHERE TABLE_SCHEMA = '{relation}' AND TABLE_NAME = 'a''b'"
+        );
+    }
 
     /// Throwaway keys that protect nothing, generated for these tests with
     /// `openssl genpkey -algorithm RSA`.

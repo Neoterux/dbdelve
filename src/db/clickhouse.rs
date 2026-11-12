@@ -1214,25 +1214,11 @@ impl Connection {
 /// limit the first set is drained to its end and counted, never kept, or for
 /// a read that may stop there, left unread for the caller to `KILL`.
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
-    let mut sql = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        sql.push_str(&rest[..start]);
-        rest = &rest[start..];
-        let (placeholder, value) = if rest.starts_with("{schema}") {
-            ("{schema}", schema)
-        } else if rest.starts_with("{relation}") {
-            ("{relation}", relation)
-        } else {
-            sql.push('{');
-            rest = &rest[1..];
-            continue;
-        };
-        sql.push_str(&Engine::ClickHouse.quote_literal(value));
-        rest = &rest[placeholder.len()..];
-    }
-    sql.push_str(rest);
-    sql
+    super::fill_placeholders(
+        template,
+        &Engine::ClickHouse.quote_literal(schema),
+        &Engine::ClickHouse.quote_literal(relation),
+    )
 }
 
 /// The first words of the statements that only read.
@@ -1580,6 +1566,18 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn a_schema_named_like_a_placeholder_is_not_substituted_into() {
+        assert_eq!(
+            structure_sql(
+                "WHERE database = {schema} AND table = {relation}",
+                "{relation}",
+                "a'b",
+            ),
+            "WHERE database = '{relation}' AND table = 'a''b'"
+        );
+    }
 
     const FACTS_COLUMNS: [(&str, &str); 4] = [
         ("version", "String"),

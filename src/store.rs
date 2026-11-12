@@ -696,6 +696,13 @@ pub fn load_profiles(plugins: &[&'static Plugin]) -> Result<ProfileList, LoadFai
 
 /// The profile file without `load_profiles`' moving it aside on a failure,
 /// for a read that only peeks, ahead of the one that reports.
+/// When `profiles.toml` last changed and its length, or `None` when it cannot
+/// be read: [`peek_profiles`] can answer differently only once this does.
+pub fn profiles_stamp() -> Option<(std::time::SystemTime, u64)> {
+    let meta = fs::metadata(dbdelve_directory().ok()?.join(PROFILES_FILE)).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 pub fn peek_profiles(plugins: &[&'static Plugin]) -> Option<ProfileList> {
     read_profiles(&dbdelve_directory().ok()?.join(PROFILES_FILE), plugins).ok()
 }

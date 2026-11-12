@@ -10,10 +10,14 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
 
+use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
 use super::*;
-use crate::agent::{CallId, EXPIRY, Inbound, Reply, Status, tools::Tool};
+use crate::{
+    agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
+    sql::{AgentVerdict, agent_gate},
+};
 
 /// What the agent bridge holds while it is running.
 #[derive(Default)]
@@ -24,8 +28,9 @@ pub(crate) struct AgentState {
     /// The presence connections open now: agents attached, whether or not they
     /// have asked anything.
     pub(crate) presence: Vec<crate::agent::ConnId>,
-    /// The calls waiting on an answer, found by their id and never by their
-    /// place in this list.
+    /// The calls waiting on an answer from a person, found by their id and
+    /// never by their place in this list. Reads are not here: they wait for
+    /// nobody, and live in their [`agent_read::Lane`].
     pub(crate) calls: Vec<PendingCall>,
     /// What this window's own access action decided and no save has written
     /// yet: `true` from turning access on, `false` from the kill switch. Set
@@ -36,18 +41,90 @@ pub(crate) struct AgentState {
     /// save has written yet. Every other profile's flag is the file's: see
     /// [`Workspace::adopt_saved_visibility`].
     pub(crate) visibility_choices: HashSet<String>,
-    /// The calls that have ended, newest first, at most [`LOG_CAP`].
+    /// The calls that have ended, newest first, at most [`AUDIT_CAP`].
     pub(crate) log: VecDeque<LogEntry>,
+    /// [`store::profiles_stamp`] as [`Workspace::adopt_saved_visibility`] last
+    /// found it, taken before that read.
+    pub(crate) visibility_stamp: Option<(std::time::SystemTime, u64)>,
+    /// The agent's own connections, by profile id: never the user's.
+    pub(crate) lanes: HashMap<String, agent_read::Lane>,
+    /// What opens an agent's connection; `None` is the real open. Tests put
+    /// one here to stand in for an open that never returns.
+    pub(crate) opener: Option<agent_read::Opener>,
 }
 
-// ponytail: the log is this session's own and keeps the last twenty calls,
-// because it is read by clicking the mark and a longer list is not read.
-// Phase 5 (READ-10, APPR-12) turns it into the audit, which is kept.
-pub(crate) const LOG_CAP: usize = 20;
+// ponytail: the audit is this session's own and keeps the last five hundred
+// calls, in memory only, because it is read in a dialog and a longer list is
+// not read. Phase 6's persisted record of approvals (APPR-12) is the upgrade:
+// it is what outlives the window.
+pub(crate) const AUDIT_CAP: usize = 500;
 
-/// One call that ended. Names, a code and a time, and nothing the call carried:
-/// no row, no statement, no host, user or path. Held in memory and gone with
-/// the window.
+/// How many characters of an agent's own statement an audit entry keeps.
+pub(super) const AUDIT_SQL_CAP: usize = 4096;
+
+/// What an entry's SQL ends with once it was cut at [`AUDIT_SQL_CAP`].
+pub(super) const SQL_CLIPPED: &str = " [clipped]";
+
+/// What was decided about a statement before it ran, as the audit says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuditVerdict {
+    /// The gate let it through and it ran on the agent's own connection.
+    Run,
+    /// The gate held it for a person: the lowest mode that lets it run, and the
+    /// expiry text of a statement that schedules a removal.
+    Approve { mode: Mode, expiry: Option<String> },
+    /// The gate refused it, for this reason.
+    Refuse(String),
+}
+
+impl AuditVerdict {
+    /// The line the Agent activity dialog shows for it.
+    pub(crate) fn line(&self) -> String {
+        match self {
+            Self::Run => "Ran".to_string(),
+            Self::Approve {
+                mode,
+                expiry: Some(expiry),
+            } => format!("Needs approval at {}. {expiry}", mode.label()),
+            Self::Approve { mode, expiry: None } => {
+                format!("Needs approval at {}", mode.label())
+            }
+            Self::Refuse(reason) => format!("Refused: {reason}"),
+        }
+    }
+
+    /// What the audit says of a gate verdict that held or refused a statement;
+    /// `None` for `Run`, which the read itself gives its verdict.
+    fn held_by(verdict: AgentVerdict) -> Option<Self> {
+        match verdict {
+            AgentVerdict::Run => None,
+            AgentVerdict::Approve(verdict, expiry) => Some(Self::Approve {
+                mode: verdict.mode,
+                expiry: expiry.map(|expiry| expiry.to_string()),
+            }),
+            AgentVerdict::Refuse(reason) => Some(Self::Refuse(reason.to_string())),
+        }
+    }
+}
+
+/// What a call knew about itself at its end, beyond who made it and how it
+/// ended. A call that has none of these, such as a ping, takes the default.
+#[derive(Default)]
+pub(crate) struct CallFacts {
+    pub(crate) verdict: Option<AuditVerdict>,
+    /// The statement exactly as the agent sent it.
+    pub(crate) sql: Option<String>,
+    /// How many rows went back to the agent, and how many there were.
+    pub(crate) shown: Option<usize>,
+    pub(crate) total: Option<Total>,
+    /// Whole milliseconds from the call's arrival to its end.
+    pub(crate) elapsed_ms: u64,
+    pub(crate) error: Option<String>,
+}
+
+/// One call that ended: its names, its code, its time and what the agent sent.
+/// Never a row: the audit shows that a read happened and how much came back,
+/// not what was in it. Held in memory and gone with the window.
 #[derive(Clone, Debug)]
 pub(crate) struct LogEntry {
     /// Unix milliseconds when the call ended, as the palette's history keeps
@@ -64,6 +141,28 @@ pub(crate) struct LogEntry {
     pub(crate) status: Status,
     /// The answer could not be delivered, because its caller had already gone.
     pub(crate) requester_gone: bool,
+    /// `None` for the tools that carry no statement.
+    pub(crate) verdict: Option<AuditVerdict>,
+    /// The agent's statement, cut at [`AUDIT_SQL_CAP`] characters.
+    pub(crate) sql: Option<String>,
+    pub(crate) shown: Option<usize>,
+    pub(crate) total: Option<Total>,
+    pub(crate) elapsed_ms: u64,
+    /// The error of a call that failed, which the agent was not given, cut at
+    /// [`AUDIT_SQL_CAP`] characters.
+    pub(crate) error: Option<String>,
+}
+
+impl LogEntry {
+    /// Whether the agent was given fewer rows than there were, or than the
+    /// statement could have returned.
+    pub(crate) fn capped(&self) -> bool {
+        match (self.shown, self.total) {
+            (_, Some(Total::AtLeast(_))) => true,
+            (Some(shown), Some(Total::Exact(total))) => total > shown,
+            _ => false,
+        }
+    }
 }
 
 /// How many characters of an agent's own text the log keeps.
@@ -75,16 +174,24 @@ pub(crate) fn unix_millis() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
+/// Whole milliseconds since `arrived`, truncated.
+pub(crate) fn elapsed_ms(arrived: Instant) -> u64 {
+    arrived.elapsed().as_millis() as u64
+}
+
 impl AgentState {
     /// Write one ended call at the front of the log. Called once per call, from
-    /// the places that answer it.
-    fn record(
+    /// the places that answer it. Entries are ordered by insertion and never by
+    /// their time, so two calls that end in the same millisecond keep the order
+    /// they ended in.
+    pub(super) fn record(
         &mut self,
         id: CallId,
         tool: Tool,
         resolved: Option<String>,
         asked: Option<&str>,
         status: Status,
+        facts: CallFacts,
     ) {
         self.log.push_front(LogEntry {
             at: unix_millis(),
@@ -99,9 +206,26 @@ impl AgentState {
             }),
             status,
             requester_gone: false,
+            verdict: facts.verdict,
+            sql: facts.sql.map(clipped),
+            shown: facts.shown,
+            total: facts.total,
+            elapsed_ms: facts.elapsed_ms,
+            error: facts.error.map(clipped),
         });
-        self.log.truncate(LOG_CAP);
+        self.log.truncate(AUDIT_CAP);
     }
+}
+
+/// `text` cut at [`AUDIT_SQL_CAP`] characters, on a character boundary: a
+/// statement, or an error that may echo one. The dialog draws every entry on
+/// every frame.
+fn clipped(mut text: String) -> String {
+    if let Some((cut, _)) = text.char_indices().nth(AUDIT_SQL_CAP) {
+        text.truncate(cut);
+        text.push_str(SQL_CLIPPED);
+    }
+    text
 }
 
 /// A call that has been accepted and not yet finished. Dropping it without
@@ -117,6 +241,8 @@ pub(crate) struct PendingCall {
     /// it after the profile is gone.
     profile_name: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
+    /// When the call reached [`Workspace::on_agent_message`].
+    arrived: Instant,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
     _expiry: gpui::Task<()>,
@@ -132,7 +258,7 @@ const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDel
 
 /// What every call waiting on a profile is told when it is hidden or removed.
 /// One sentence for both, so the agent cannot tell which happened.
-const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
+pub(super) const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
 /// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
@@ -193,8 +319,14 @@ pub(crate) fn ping_prompt(name: &str) -> String {
 /// no server anything: the hold is what the engine is built to do while the
 /// profile is Read-only, not what a live role allows. The sentence about a call
 /// to a function DBDelve does not list is what `agent_gate` answers such a call
-/// in that mode, and is left out where the gate refuses it.
-pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
+/// in that mode, and is left out where the gate refuses it. `read_can_block_commits`
+/// is [`db::ConnectionConfig::agent_read_can_block_commits`], read by the caller
+/// so this stays pure.
+pub(crate) fn visibility_facts(
+    engine: Engine,
+    mode: Mode,
+    read_can_block_commits: bool,
+) -> Vec<String> {
     let mut facts = vec![
         format!("This connection's access level is {}.", mode.label()),
         engine.read_only_hold().to_string(),
@@ -212,6 +344,13 @@ pub(crate) fn visibility_facts(engine: Engine, mode: Mode) -> Vec<String> {
                 .push("Calls to functions DBDelve does not list run without approval.".to_string());
         }
     }
+    if read_can_block_commits {
+        facts.push(
+            "An agent's read in progress can make your commit on this file wait, and then fail \
+             with \"database is locked\"."
+                .to_string(),
+        );
+    }
     facts
 }
 
@@ -224,6 +363,7 @@ impl Workspace {
         let Some(profile) = self.profiles.get(index) else {
             return;
         };
+        self.agent_visibility_blocks_commits = profile.config.agent_read_can_block_commits();
         self.agent_visibility_prompt = Some(profile.id.clone());
         cx.notify();
     }
@@ -256,6 +396,23 @@ impl Workspace {
         drawn
     }
 
+    /// Put up the `Agent activity` dialog. Changes nothing but what is drawn.
+    pub(crate) fn show_agent_activity(&mut self, cx: &mut Context<Self>) {
+        self.agent_audit_open = true;
+        cx.notify();
+    }
+
+    /// Close the dialog and hand the keyboard back. Answers whether it was
+    /// open, so `escape` is only spent on a dialog that was drawn.
+    pub(crate) fn close_agent_audit(&mut self, cx: &mut Context<Self>) -> bool {
+        if !std::mem::take(&mut self.agent_audit_open) {
+            return false;
+        }
+        self.refocus_front();
+        cx.notify();
+        true
+    }
+
     /// Make a profile visible to agents or hide it. Keyed by id, never by
     /// index: ids can repeat in a hand-edited file, and the first one wins as
     /// everywhere else in `profiles.rs`.
@@ -284,7 +441,8 @@ impl Workspace {
     }
 
     /// Answer every call waiting on this profile `rejected`, oldest first, each
-    /// once. Calls waiting on any other profile are left as they are.
+    /// once, and end its reads, running and waiting, and drop its agent
+    /// connection. Calls on any other profile are left as they are.
     pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let waiting: Vec<CallId> = self
             .agent
@@ -296,6 +454,7 @@ impl Workspace {
         for id in waiting {
             self.finish_call(id, Status::Rejected, NO_LONGER_AVAILABLE.to_string(), cx);
         }
+        self.end_lane(profile_id, Status::Rejected, NO_LONGER_AVAILABLE, cx);
     }
 
     /// The call the ping dialog is about: the oldest one whose profile is still
@@ -418,6 +577,8 @@ impl Workspace {
     /// ponytail: the read and the write that follows are not one step across
     /// processes, as for `agent_access`; the upgrade is the same lock.
     pub(crate) fn adopt_saved_visibility(&mut self, cx: &mut Context<Self>) {
+        // Taken before the read, so a save landing during it reads as a change.
+        self.agent.visibility_stamp = store::profiles_stamp();
         let Some(saved) = store::peek_profiles(&self.plugins) else {
             return;
         };
@@ -437,6 +598,22 @@ impl Workspace {
         }
         for id in hidden {
             self.reject_calls_for(&id, cx);
+        }
+    }
+
+    /// [`Workspace::adopt_saved_visibility`] for a call that runs a statement
+    /// or reads a catalog, which can come many at once: the file is read and
+    /// parsed again only when its modified time or length moved, so a hide
+    /// saved by another window is never missed and an unchanged file costs one
+    /// `stat` on the window's thread.
+    ///
+    /// ponytail: a save that keeps the length within the file system's time
+    /// resolution reads as unchanged; that resolution is nanoseconds on APFS
+    /// and ext4 and 100 ns on NTFS, and a visibility flip changes the length.
+    fn adopt_saved_visibility_for_read(&mut self, cx: &mut Context<Self>) {
+        let stamp = store::profiles_stamp();
+        if stamp.is_none() || stamp != self.agent.visibility_stamp {
+            self.adopt_saved_visibility(cx);
         }
     }
 
@@ -468,7 +645,8 @@ impl Workspace {
     /// The kill switch: nothing an agent started stays open, and nothing
     /// listens until the user turns access on again. In order:
     ///
-    /// 1. Every pending call is answered `rejected`. This comes first and runs
+    /// 1. Every pending call and every read, running or waiting, is answered
+    ///    `rejected` and every agent connection is dropped. This comes first and runs
     ///    with or without a bridge, because dropping the bridge never closes a
     ///    call's connection: each call's writer thread sends its frame and then
     ///    closes its own socket, so a waiting client reads a whole answer and
@@ -488,6 +666,10 @@ impl Workspace {
         for id in pending {
             self.finish_call(id, Status::Rejected, TURNED_OFF.to_string(), cx);
         }
+        let lanes: Vec<String> = self.agent.lanes.keys().cloned().collect();
+        for profile_id in lanes {
+            self.end_lane(&profile_id, Status::Rejected, TURNED_OFF, cx);
+        }
         let was_serving = self.agent.bridge.is_some();
         self.drop_bridge();
         if was_serving || self.saved_agent_access() == Some(true) {
@@ -505,7 +687,10 @@ impl Workspace {
     /// calls waiting, while an agent is attached or a call waits.
     pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
         self.agent.bridge.as_ref()?;
-        let attached = !self.agent.presence.is_empty() || !self.agent.calls.is_empty();
+        // A read in flight is an agent attached, though nobody is asked.
+        let attached = !self.agent.presence.is_empty()
+            || !self.agent.calls.is_empty()
+            || self.agent.lanes.values().any(|lane| lane.running.is_some());
         Some(if attached {
             ui::AgentMark::Connected {
                 waiting: self.agent.calls.len(),
@@ -518,6 +703,7 @@ impl Workspace {
     /// What an agent asked for. Opens no connection and starts no database
     /// work: the answer is read from the profile list as it stands.
     pub(crate) fn on_agent_message(&mut self, message: Inbound, cx: &mut Context<Self>) {
+        let arrived = Instant::now();
         match message {
             Inbound::PresenceOpened { conn } => {
                 self.agent.presence.push(conn);
@@ -543,21 +729,214 @@ impl Workspace {
                         engine: profile.config.engine().as_str(),
                     })
                     .collect();
-                let text = serde_json::to_string(&visible)
-                    .expect("names and engine spellings always serialize");
+                // Names and engine spellings always serialize; an empty list
+                // is what the impossible case would say.
+                let text = serde_json::to_string(&visible).unwrap_or_else(|_| "[]".to_string());
                 // The caller may have hung up, and then nobody reads this.
                 let _ = reply.send(Reply {
                     status: Status::Executed,
                     text,
                 });
-                self.agent
-                    .record(id, Tool::ListConnections, None, None, Status::Executed);
+                self.agent.record(
+                    id,
+                    Tool::ListConnections,
+                    None,
+                    None,
+                    Status::Executed,
+                    CallFacts {
+                        elapsed_ms: elapsed_ms(arrived),
+                        ..CallFacts::default()
+                    },
+                );
+            }
+            Inbound::Call {
+                tool: Tool::ExecuteSql,
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility_for_read(cx);
+                let found = match connection.as_deref() {
+                    Some(name) => self
+                        .agent_profile(name)
+                        .map(|profile| (Resolved::of(profile), profile.mode)),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let (resolved, mode) = match found {
+                    Ok(found) => found,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            Tool::ExecuteSql,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The schema requires a statement, so only an injected call
+                // has none; it is the empty statement.
+                let sql = args.sql.unwrap_or_default();
+                let engine = resolved.config.engine();
+                let verdict = agent_gate(engine, &sql, mode);
+                // The verdict's contents are what an approval will show,
+                // which agents do not get.
+                let refused = match &verdict {
+                    AgentVerdict::Run => {
+                        self.run_agent_sql(id, resolved, sql, reply, arrived, cx);
+                        return;
+                    }
+                    AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
+                    AgentVerdict::Refuse(reason) => reason.to_string(),
+                };
+                self.agent_answered(
+                    id,
+                    Tool::ExecuteSql,
+                    Some(resolved.name),
+                    None,
+                    &reply,
+                    Reply {
+                        status: Status::RefusedByGate,
+                        text: refused,
+                    },
+                    CallFacts {
+                        verdict: AuditVerdict::held_by(verdict),
+                        sql: Some(sql),
+                        elapsed_ms: elapsed_ms(arrived),
+                        ..CallFacts::default()
+                    },
+                );
+            }
+            Inbound::Call {
+                tool: Tool::ExplainQuery,
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility_for_read(cx);
+                let found = match connection.as_deref() {
+                    Some(name) => self
+                        .agent_profile(name)
+                        .map(|profile| (Resolved::of(profile), profile.mode)),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let (resolved, mode) = match found {
+                    Ok(found) => found,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            Tool::ExplainQuery,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The schema requires a statement, so only an injected call
+                // has none; it is the empty statement.
+                let sql = args.sql.unwrap_or_default();
+                let engine = resolved.config.engine();
+                match explain_statement(engine, &sql, args.analyze.unwrap_or(false), mode) {
+                    Ok(statement) => self.run_agent_work(
+                        id,
+                        resolved,
+                        AgentWork::Explain { statement },
+                        reply,
+                        arrived,
+                        cx,
+                    ),
+                    Err(declined) => self.agent_answered(
+                        id,
+                        Tool::ExplainQuery,
+                        Some(resolved.name),
+                        None,
+                        &reply,
+                        Reply {
+                            status: declined.status,
+                            text: declined.text,
+                        },
+                        CallFacts {
+                            verdict: declined.verdict.and_then(AuditVerdict::held_by),
+                            sql: declined.sql,
+                            elapsed_ms: elapsed_ms(arrived),
+                            ..CallFacts::default()
+                        },
+                    ),
+                }
+            }
+            Inbound::Call {
+                tool: tool @ (Tool::ListSchemas | Tool::ListTables | Tool::DescribeTable),
+                id,
+                connection,
+                args,
+                reply,
+            } => {
+                self.adopt_saved_visibility_for_read(cx);
+                let resolved = match connection.as_deref() {
+                    Some(name) => self.agent_profile(name).map(Resolved::of),
+                    None => Err(AgentLookup::NotAvailable),
+                };
+                let resolved = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(lookup) => {
+                        self.agent_answered(
+                            id,
+                            tool,
+                            None,
+                            connection.as_deref(),
+                            &reply,
+                            Reply {
+                                status: Status::RefusedByGate,
+                                text: lookup.to_string(),
+                            },
+                            CallFacts {
+                                elapsed_ms: elapsed_ms(arrived),
+                                ..CallFacts::default()
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The names are required by the tools that take them, so only
+                // an injected call lacks one; it names nothing the catalog holds.
+                let work = match tool {
+                    Tool::DescribeTable => AgentWork::Structure {
+                        schema: args.schema.unwrap_or_default(),
+                        table: args.table.unwrap_or_default(),
+                    },
+                    Tool::ListTables => AgentWork::Catalog {
+                        schema: Some(args.schema.unwrap_or_default()),
+                    },
+                    _ => AgentWork::Catalog { schema: None },
+                };
+                self.run_agent_work(id, resolved, work, reply, arrived, cx);
             }
             Inbound::Call {
                 tool: Tool::Ping,
                 id,
                 connection,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility(cx);
                 let found = match connection.as_deref() {
@@ -580,6 +959,7 @@ impl Workspace {
                             None,
                             connection.as_deref(),
                             Status::RefusedByGate,
+                            CallFacts::default(),
                         );
                         return;
                     }
@@ -596,6 +976,7 @@ impl Workspace {
                     tool: Tool::Ping,
                     profile_name,
                     reply,
+                    arrived,
                     _expiry: expiry,
                 });
                 cx.notify();
@@ -612,10 +993,35 @@ impl Workspace {
         }
     }
 
+    /// Answer a read call at once and log it: the end of a call that never
+    /// waits for anyone. `resolved` is the profile's own name, `asked` what the
+    /// agent called a connection that resolved to nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's identity, its two names, both halves of the answer and its facts are each one thing; a struct of them would be built once per call to be taken apart at once"
+    )]
+    pub(super) fn agent_answered(
+        &mut self,
+        id: CallId,
+        tool: Tool,
+        resolved: Option<String>,
+        asked: Option<&str>,
+        reply: &SyncSender<Reply>,
+        answer: Reply,
+        facts: CallFacts,
+    ) {
+        let status = answer.status;
+        // The caller may have hung up, and then nobody reads this.
+        let _ = reply.send(answer);
+        self.agent.record(id, tool, resolved, asked, status, facts);
+    }
+
     /// The one door every call ends through: answered, expired or hung up.
     /// It removes the call by id before it replies, so two things ending the
-    /// same call at once produce one outcome and at most one reply. Answers
-    /// whether there was such a call.
+    /// same call at once produce one outcome and at most one reply. It looks
+    /// among the pings first and then among the reads of every lane
+    /// ([`Workspace::finish_read`]), where a running read is cancelled on the
+    /// server. Answers whether there was such a call.
     ///
     /// A `Cancelled` call is dropped without a reply, because its caller has
     /// gone and nobody would read one.
@@ -627,7 +1033,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
-            return false;
+            return self.finish_read(id, status, text, true, Default::default(), cx);
         };
         let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
@@ -637,8 +1043,17 @@ impl Workspace {
         }
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
-        self.agent
-            .record(id, call.tool, Some(call.profile_name), None, status);
+        self.agent.record(
+            id,
+            call.tool,
+            Some(call.profile_name),
+            None,
+            status,
+            CallFacts {
+                elapsed_ms: elapsed_ms(call.arrived),
+                ..CallFacts::default()
+            },
+        );
         if was_in_front {
             // The dialog took the keyboard when it went up and goes away with
             // the call, by whichever route the call ended.
@@ -675,10 +1090,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_audit_entry_keeps_a_cut_of_a_long_error_as_it_does_of_a_long_statement() {
+        let mut state = AgentState::default();
+        let long = "e".repeat(AUDIT_SQL_CAP * 3);
+        state.record(
+            CallId(1),
+            Tool::ExecuteSql,
+            None,
+            None,
+            Status::Failed,
+            CallFacts {
+                sql: Some(long.clone()),
+                error: Some(long),
+                ..CallFacts::default()
+            },
+        );
+        let entry = state.log.front().expect("the call is logged");
+        for kept in [entry.sql.as_deref(), entry.error.as_deref()] {
+            let kept = kept.expect("kept");
+            assert_eq!(kept.chars().count(), AUDIT_SQL_CAP + SQL_CLIPPED.len());
+            assert!(kept.ends_with(SQL_CLIPPED));
+        }
+    }
+
+    #[test]
     fn the_dialog_states_the_engines_hold_and_that_rows_leave_the_machine() {
         for engine in Engine::ALL {
             for mode in Mode::ALL {
-                let facts = visibility_facts(engine, mode);
+                let facts = visibility_facts(engine, mode, false);
                 assert!(facts.iter().any(|fact| fact == engine.read_only_hold()));
                 assert!(
                     facts
@@ -710,7 +1149,7 @@ mod tests {
                     AgentVerdict::Approve(..) => (Some(WAITS), RUNS),
                     AgentVerdict::Refuse(_) => (None, ""),
                 };
-                let facts = visibility_facts(engine, mode);
+                let facts = visibility_facts(engine, mode, false);
                 let count = |sentence: &str| facts.iter().filter(|fact| *fact == sentence).count();
                 match stated {
                     Some(stated) => {
@@ -727,6 +1166,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_dialog_states_the_commit_wait_only_when_a_read_can_block_it() {
+        const WAIT: &str = "An agent's read in progress can make your commit on this file wait, \
+                            and then fail with \"database is locked\".";
+        for engine in Engine::ALL {
+            for mode in Mode::ALL {
+                let count = |facts: &[String]| facts.iter().filter(|fact| *fact == WAIT).count();
+                let blocked = visibility_facts(engine, mode, true);
+                assert_eq!(count(&blocked), 1, "{engine:?} {mode:?}: {blocked:?}");
+                let free = visibility_facts(engine, mode, false);
+                assert_eq!(count(&free), 0, "{engine:?} {mode:?}: {free:?}");
+                for fact in blocked.iter().chain(&free) {
+                    for word in ["yet", "Phase", "MCP", "try", "should", "upgrade"] {
+                        assert!(!fact.contains(word), "{engine:?} {mode:?}: {fact}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_approval_with_an_expiry_is_audited_with_its_text() {
+        use crate::sql::{Expiry, Verdict};
+
+        let verdict = Verdict {
+            mode: Mode::ReadWrite,
+            destructive: Vec::new(),
+        };
+        assert_eq!(
+            AuditVerdict::held_by(AgentVerdict::Approve(verdict.clone(), Some(Expiry::Key))),
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadWrite,
+                expiry: Some(Expiry::Key.to_string()),
+            })
+        );
+        assert_eq!(
+            AuditVerdict::held_by(AgentVerdict::Approve(verdict, None)),
+            Some(AuditVerdict::Approve {
+                mode: Mode::ReadWrite,
+                expiry: None,
+            })
+        );
+        assert_eq!(AuditVerdict::held_by(AgentVerdict::Run), None);
     }
 
     #[test]
