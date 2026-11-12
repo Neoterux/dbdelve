@@ -1231,6 +1231,27 @@ impl Connection {
             .map_or(true, |client| client.client.is_closed())
     }
 
+    /// One `SELECT 1` on the session. A statement holding the client is the
+    /// session in use, so the ping is skipped, never queued behind it; a
+    /// poisoned lock is a session every later statement would fail on, as
+    /// [`Connection::is_lost`] counts it.
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut client = match self.client.try_lock() {
+            Ok(client) => client,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(plain_error("The connection is closed.".into()));
+            }
+        };
+        let ping = "SELECT 1";
+        let Client { client, driver, .. } = &mut *client;
+        driver
+            .block_on(client.simple_query(ping))
+            .and_then(|done| done)
+            .map(|_| ())
+            .map_err(|error| query_error(&error, ping))
+    }
+
     /// Cancellation is advisory and racy by the driver's own admission: the
     /// server reports nothing about whether the request landed, and it may
     /// arrive after the statement has already finished. So `Ok` here means the
