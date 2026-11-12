@@ -230,6 +230,9 @@ pub struct ExplorerTree {
     pub highlights: HashMap<String, Vec<Range<usize>>>,
     /// What each row in a folder or the Pinned group stands for, by row id.
     pub shortcuts: HashMap<String, Shortcut>,
+    /// What the include filter dropped from the catalog this tree was built
+    /// from, so a count can say how many of how many it shows.
+    pub left_out: usize,
 }
 
 impl ExplorerTree {
@@ -239,6 +242,7 @@ impl ExplorerTree {
         self.leaves.extend(other.leaves);
         self.highlights.extend(other.highlights);
         self.shortcuts.extend(other.shortcuts);
+        self.left_out += other.left_out;
     }
 }
 
@@ -416,6 +420,7 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
         leaves: builder.leaves,
         highlights: builder.highlights,
         shortcuts: HashMap::new(),
+        left_out: catalog.left_out,
     }
 }
 
@@ -446,6 +451,7 @@ pub fn queries(names: &[String], filter: &str) -> ExplorerTree {
         leaves: HashMap::new(),
         highlights: builder.highlights,
         shortcuts: HashMap::new(),
+        left_out: 0,
     }
 }
 
@@ -1020,6 +1026,7 @@ pub fn shortcuts(
         leaves: build.builder.leaves,
         highlights: build.builder.highlights,
         shortcuts: build.rows,
+        left_out: 0,
     }
 }
 
@@ -1570,6 +1577,7 @@ mod tests {
                 },
             ],
             database: None,
+            ..Default::default()
         }
     }
 
@@ -1616,6 +1624,7 @@ mod tests {
                 sequences: Vec::new(),
             }],
             database: None,
+            ..Default::default()
         }
     }
 
@@ -2486,8 +2495,12 @@ mod tests {
                 Fetch::default(),
             )
             .unwrap();
-        let mut catalog = connection.catalog().unwrap();
-        catalog.merge(connection.routines().unwrap());
+        let mut catalog = connection.catalog(&crate::db::Shown::everything()).unwrap();
+        catalog.merge(
+            connection
+                .routines(&crate::db::Shown::everything())
+                .unwrap(),
+        );
 
         let tree = tree(&catalog, "");
         let ids = row_ids(&tree.items);
@@ -2994,6 +3007,30 @@ mod tests {
             })
         );
         assert_eq!(land(&hot_c, folder), None);
+    }
+
+    #[test]
+    fn extending_a_tree_carries_what_the_filter_left_out() {
+        let narrowed = Catalog {
+            left_out: 3,
+            ..catalog()
+        };
+        let built = super::tree(&narrowed, "");
+        assert_eq!(built.left_out, 3);
+
+        let mut after_queries = super::queries(&["q".to_string()], "");
+        after_queries.extend(built);
+        assert_eq!(after_queries.left_out, 3);
+
+        let mut after_shortcuts = super::shortcuts(
+            &Shortcuts::default(),
+            Some(&narrowed),
+            &[],
+            &ShortcutDatabase::On("dev".into()),
+            "",
+        );
+        after_shortcuts.extend(super::tree(&narrowed, ""));
+        assert_eq!(after_shortcuts.left_out, 3);
     }
 
     #[test]

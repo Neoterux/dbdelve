@@ -29,8 +29,8 @@ use crate::{
     Workspace, completion,
     db::{
         CancelToken, Catalog, Connection, ConnectionConfig, Databases, DbError, Engine,
-        ExplainMode, Levels, QueryResult, Relation, RelationKind, Routine, Row, Structure, Syntax,
-        Target,
+        ExplainMode, Include, Levels, QueryResult, Relation, RelationKind, Routine, Row, Shown,
+        Structure, Syntax, Target,
     },
     explain::{self, Plan, analysis::Analysis},
     explorer::{
@@ -66,6 +66,9 @@ pub(crate) struct Profile {
     /// exists before its owner says otherwise. Read from `profiles.toml` only
     /// at load, and written only by `Workspace::set_agent_visible`.
     pub(crate) agent_visible: bool,
+    /// What the connections tree and the agent lane show of the server. Not
+    /// part of `config`: changing it never reconnects.
+    pub(crate) include: Include,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
@@ -99,6 +102,10 @@ pub(crate) struct Profile {
     /// cleared, so a reconnect that drops the refresh's answer takes the
     /// refresh with it.
     pub(crate) schema_refresh: Option<u64>,
+    /// Whether a filter was saved while a read of the catalog was under way,
+    /// which a refresh would have declined to start: the landing of that read
+    /// clears this and reads again with the saved filter.
+    pub(crate) reread_after_load: bool,
     /// What the server listed the last time Select Database asked.
     pub(crate) databases: Databases,
     /// The session opened for each other database of the server, by name,
@@ -232,6 +239,16 @@ impl Profile {
             .or_else(|| connection?.spelled_database().map(str::to_string))
             .or_else(|| self.config.database_name())
             .or_else(|| connection?.current_database().map(str::to_string))
+    }
+
+    /// The include lists as they apply to this connection now, owned so a
+    /// read on a background thread can narrow its answer with them.
+    pub(crate) fn shown(&self) -> Shown {
+        self.include.resolve(
+            self.config.target().levels(),
+            self.active_database().as_deref(),
+            self.active_schema(),
+        )
     }
 
     /// The database a folder or a pin names its objects by, where the
@@ -442,6 +459,15 @@ impl Profile {
         }
     }
 
+    /// Whether Filter Databases is offered for this profile, in the node menu
+    /// and the palette alike: its target has databases to choose between, and
+    /// its connection is open to list them. Omitted otherwise, never drawn
+    /// disabled.
+    pub(crate) fn offers_filter(&self) -> bool {
+        matches!(self.state, ProfileState::Connected(_))
+            && self.config.target().levels() != Levels::Flat
+    }
+
     pub(crate) fn connection(&self) -> Option<Connection> {
         match &self.state {
             ProfileState::Connected(connection) => Some((**connection).clone()),
@@ -533,6 +559,8 @@ impl Profile {
             color: self.color.map(|color| color.slug().to_string()),
             mode: Some(self.mode.slug().to_string()),
             agent_visible: self.agent_visible,
+            include_databases: self.include.databases.clone(),
+            include_schemas: self.include.schemas.clone(),
             confirmed: self
                 .confirmed
                 .iter()

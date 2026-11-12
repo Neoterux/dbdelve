@@ -1017,3 +1017,23 @@ carries, engine by engine:
   not. The visibility dialog states this for any SQLite file whose header does
   not say WAL (`sqlite::journal_is_wal`), read once when the dialog opens.
   Turso does not block commits.
+- **The catalog tools follow the profile's include filter, which is
+  not an access boundary.** `list_schemas`, `list_tables` and `describe_table`
+  read the catalog through the profile's `include` lists (`Resolved::include`,
+  carried by each call as `AgentWork::{Catalog, Structure}` and resolved
+  against the agent connection's own database and schema). The filter is no
+  part of the connection's config, so an edit applies on the next call and
+  never reopens the lane. A hidden schema or table answers exactly as a
+  missing one (`NO_SUCH_SCHEMA`, `NOT_IN_CATALOG`), so the reply says nothing
+  about what the filter hides. `list_schemas` alone adds
+  `Showing N of M schemas.` (`databases` where the catalog lists databases)
+  when the filter left something out, and says that `execute_sql` can still
+  read the rest; MongoDB and Redis read their own database only, which is
+  always shown, so they carry no such line. The filter changes what is
+  listed, not what can be reached: `execute_sql` and `explain_query` still
+  read hidden databases and schemas, and Phase 3's agent-visible flag stays
+  the only boundary. This narrows Phase 7 D-14 ("nothing here changes what
+  the agent reaches") for the catalog tools only; what the agent can run is
+  unchanged. The dialog's sentence says the same. On MySQL, MariaDB and
+  ClickHouse the filter reaches the catalog read as the matched server-listed
+  names, never as the user's patterns.

@@ -26,6 +26,7 @@ mod clickhouse;
 mod conformance;
 mod duckdb;
 mod external;
+mod include;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -42,10 +43,14 @@ mod turso;
 mod xlsx;
 
 pub use builtins::{Builtin, BuiltinKind};
+#[cfg(test)]
+pub(crate) use clickhouse::mock as clickhouse_mock;
 pub use duckdb::IN_MEMORY as DUCKDB_IN_MEMORY;
 pub use external::ExternalConfig;
 #[cfg(test)]
 pub(crate) use external::echo;
+pub(crate) use include::same_name;
+pub use include::{Include, Shown};
 pub use plugin::Plugin;
 
 pub use mongo::MongoConfig;
@@ -2342,35 +2347,41 @@ impl Connection {
     /// that there were none, with the tables already in hand after two. The
     /// explorer is worth more open and incomplete than closed and correct, so
     /// what arrives first is shown first.
-    pub fn catalog(&self) -> Result<Catalog, DbError> {
-        match self {
+    ///
+    /// Less the schemas `shown` leaves out, dropped before anything stores the
+    /// catalog.
+    pub fn catalog(&self, shown: &Shown) -> Result<Catalog, DbError> {
+        let catalog = match self {
             Self::Postgres(connection) => connection.catalog(),
-            Self::MySql(connection) => connection.catalog(),
+            Self::MySql(connection) => connection.catalog(shown),
             Self::SqlServer(connection) => connection.catalog(),
             Self::Sqlite(connection) => connection.catalog(),
             Self::Turso(connection) => connection.catalog(),
             Self::DuckDb(connection) => connection.catalog(),
             Self::Snowflake(connection) => connection.catalog(),
-            Self::ClickHouse(connection) => connection.catalog(),
+            Self::ClickHouse(connection) => connection.catalog(shown),
             Self::MongoDb(connection) => connection.catalog(),
             Self::Redis(connection) => connection.catalog(),
             Self::External(connection) => connection.catalog(),
-        }
+        }?;
+        Ok(shown.narrow_catalog(catalog))
     }
 
     /// The stored functions and procedures, and the sequences of an engine
     /// that lists them, as a catalog holding nothing else, for
-    /// [`Catalog::merge`] to fold into the one already on screen.
-    pub fn routines(&self) -> Result<Catalog, DbError> {
-        match self {
+    /// [`Catalog::merge`] to fold into the one already on screen, less the
+    /// schemas `shown` leaves out: one holding only a sequence would otherwise
+    /// come back through the merge.
+    pub fn routines(&self, shown: &Shown) -> Result<Catalog, DbError> {
+        let routines = match self {
             Self::Postgres(connection) => {
                 with_sequences(Engine::Postgres, connection.routines(), || {
                     connection.sequences()
                 })
             }
             Self::MySql(connection) => {
-                with_sequences(connection.engine(), connection.routines(), || {
-                    connection.sequences()
+                with_sequences(connection.engine(), connection.routines(shown), || {
+                    connection.sequences(shown)
                 })
             }
             Self::SqlServer(connection) => {
@@ -2393,7 +2404,8 @@ impl Connection {
             Self::ClickHouse(_) => Ok(Catalog::default()),
             Self::MongoDb(connection) => connection.routines(),
             Self::Redis(_) | Self::External(_) => Ok(Catalog::default()),
-        }
+        }?;
+        Ok(shown.narrow_routines(routines))
     }
 
     /// Each table's on-disk bytes and row estimate, for [`Catalog::set_sizes`]
@@ -2405,10 +2417,14 @@ impl Connection {
     /// profile waits for. Engines whose catalog already carries sizes (SQL
     /// Server's catalog views, a column Snowflake returns anyway) return none
     /// here, as does SQLite, which keeps none.
-    pub fn sizes(&self) -> Result<Sizes, DbError> {
-        match self {
+    ///
+    /// ponytail: Postgres still measures every relation of the database before
+    /// the schemas `shown` leaves out are dropped. The ceiling is a very large
+    /// database; the upgrade is the same per-engine push-down the catalog's.
+    pub fn sizes(&self, shown: &Shown) -> Result<Sizes, DbError> {
+        let sizes = match self {
             Self::Postgres(connection) => connection.sizes(),
-            Self::MySql(connection) => connection.sizes(),
+            Self::MySql(connection) => connection.sizes(shown),
             Self::MongoDb(connection) => connection.sizes(),
             Self::SqlServer(_)
             | Self::Sqlite(_)
@@ -2418,7 +2434,8 @@ impl Connection {
             | Self::ClickHouse(_)
             | Self::Redis(_)
             | Self::External(_) => Ok(Sizes::new()),
-        }
+        }?;
+        Ok(shown.narrow_sizes(sizes))
     }
 
     /// The foreign keys of other relations that point at this one, for the
@@ -2441,9 +2458,10 @@ impl Connection {
         }
     }
 
-    /// The databases on the server, for a profile to be moved onto one. Empty
-    /// where [`Target::switches_database`] is false.
-    pub fn databases(&self, engine: Engine) -> Result<Databases, DbError> {
+    /// The databases on the server, for a profile to be moved onto one, less
+    /// those `shown` leaves out. Empty where [`Target::switches_database`] is
+    /// false.
+    pub fn databases(&self, engine: Engine, shown: &Shown) -> Result<Databases, DbError> {
         let mut databases = match self {
             Self::Postgres(connection) => connection.databases(),
             Self::MySql(connection) => connection.databases(),
@@ -2456,7 +2474,35 @@ impl Connection {
             Self::Sqlite(_) | Self::Turso(_) | Self::External(_) => Ok(Databases::default()),
         }?;
         databases.system_last(engine);
-        Ok(databases)
+        Ok(shown.narrow_databases(databases))
+    }
+
+    /// The databases the connections tree draws when nothing is filtered,
+    /// which the filter picker lists and a filtered catalog counts against.
+    /// Where the catalog lists databases as schemas, these are the ones
+    /// holding something it reads, the server's own left out. Elsewhere they
+    /// are every database [`Self::databases`] lists, unnarrowed.
+    ///
+    /// ponytail: where the catalog lists databases as schemas, an empty
+    /// database is not listed, since the tree draws none, so the picker's total
+    /// stays the connection row's and the database cannot be ticked before it
+    /// holds something, though a name typed in the pattern field still covers
+    /// it. The upgrade is drawing empty databases in the tree, which would
+    /// change the unfiltered count.
+    pub fn catalog_databases(&self, engine: Engine) -> Result<Databases, DbError> {
+        match self {
+            Self::MySql(connection) => connection.catalog_databases(),
+            Self::ClickHouse(connection) => connection.catalog_databases(),
+            Self::Postgres(_)
+            | Self::SqlServer(_)
+            | Self::Sqlite(_)
+            | Self::Turso(_)
+            | Self::DuckDb(_)
+            | Self::Snowflake(_)
+            | Self::MongoDb(_)
+            | Self::Redis(_)
+            | Self::External(_) => self.databases(engine, &Shown::everything()),
+        }
     }
 
     /// Make `schema` the first place unqualified names resolve in every
@@ -3064,6 +3110,10 @@ pub struct Databases {
     pub names: Vec<String>,
     /// The one this connection is in. MySQL can be in none.
     pub current: Option<String>,
+    /// How many names the include filter left out of `names`. Set only by
+    /// [`Shown::narrow_databases`], so zero is also what an unfiltered read
+    /// says.
+    pub left_out: usize,
 }
 
 impl Databases {
@@ -3091,6 +3141,10 @@ pub struct Catalog {
     /// move the session it is read on off the one the profile picked:
     /// DuckDB's `USE`. None where the profile says which.
     pub database: Option<String>,
+    /// How many schemas, or databases where the catalog lists databases as
+    /// schemas, the include filter dropped. Set only by the narrowing, so
+    /// [`Catalog::merge`] and [`Catalog::set_sizes`] leave it alone.
+    pub left_out: usize,
 }
 
 impl Catalog {
@@ -3733,6 +3787,7 @@ pub(super) fn assemble_sequences(result: QueryResult) -> Result<Catalog, DbError
     Ok(Catalog {
         schemas,
         database: None,
+        ..Default::default()
     })
 }
 
@@ -3786,6 +3841,7 @@ pub(super) fn assemble_catalog(
     Ok(Catalog {
         schemas: schemas.into_values().collect(),
         database: None,
+        ..Default::default()
     })
 }
 
@@ -4668,6 +4724,7 @@ mod tests {
             let mut databases = Databases {
                 names: names.iter().map(|name| (*name).to_string()).collect(),
                 current: None,
+                left_out: 0,
             };
             databases.system_last(engine);
             databases.names
@@ -5473,12 +5530,14 @@ mod tests {
         let mut screen = Catalog {
             schemas: vec![schema("main", &["t"], &[])],
             database: None,
+            ..Default::default()
         };
         let mut second = schema("main", &[], &["f"]);
         second.sequences = vec!["s".to_string()];
         screen.merge(Catalog {
             schemas: vec![second],
             database: None,
+            ..Default::default()
         });
 
         let main = &screen.schemas[0];
@@ -5494,6 +5553,7 @@ mod tests {
         let routines = Ok(Catalog {
             schemas: vec![schema("main", &[], &["f"])],
             database: None,
+            ..Default::default()
         });
         let mut read = schema("main", &[], &[]);
         read.sequences = vec!["a".to_string(), "b".to_string()];
@@ -5503,6 +5563,7 @@ mod tests {
             Ok(Catalog {
                 schemas: vec![read, other],
                 database: None,
+                ..Default::default()
             })
         })
         .expect("the second half is read");
@@ -5519,6 +5580,7 @@ mod tests {
         let routines = Ok(Catalog {
             schemas: vec![schema("main", &[], &["f"])],
             database: None,
+            ..Default::default()
         });
         let second = with_sequences(Engine::DuckDb, routines, || {
             Err(plain_error("no sequence catalog".to_string()))
@@ -5606,6 +5668,7 @@ mod tests {
                 schema("public", &["accounts"], &[]),
             ],
             database: None,
+            ..Default::default()
         };
         catalog.merge(Catalog {
             schemas: vec![
@@ -5615,6 +5678,7 @@ mod tests {
                 schema("audit", &[], &["trail"]),
             ],
             database: None,
+            ..Default::default()
         });
 
         let named = |name: &str| {
