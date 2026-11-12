@@ -10,6 +10,9 @@ introduce limits.
 
 Ideas and discussion on [Discord](https://discord.gg/7PegWzwqCm).
 
+Like DBDelve? [Support its development](https://www.patreon.com/cw/ShayanAbbas1).
+Support is voluntary and does not provide any additional benefits.
+
 
 ![DBDelve in Gruvbox Dark Glass: a SELECT on the events table in the editor and its result grid below](assets/screenshots/query-dark.png)
 
@@ -42,8 +45,9 @@ until the quarantine flag is cleared.
 **Linux** (x86_64 or aarch64): `yay -S dbdelve-bin` from the AUR, or the
 tarball or AppImage from [the latest release][releases].
 
-**Windows** (x86_64): unzip the zip from [the latest release][releases] and run
-`dbdelve.exe`.
+**Windows** (x86_64): run the installer from [the latest release][releases],
+or unzip the zip and run `dbdelve.exe`. The installer asks for AppData (just
+for you) or Program Files (all users).
 
 Updating, the `.dmg`, Linux requirements, building from source and where your
 data lives are all in [docs/install.md](docs/install.md).
@@ -55,8 +59,11 @@ data lives are all in [docs/install.md](docs/install.md).
 Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB, Snowflake, SQL Server, MongoDB,
 Redis (and Valkey, KeyDB, Dragonfly) and ClickHouse.
 
-Other databases, such as IBM Db2, are reachable through the bundled ODBC
-bridge, with the database's own ODBC driver installed. Grid editing is off, and
+Any other database with an ODBC driver is reachable through the bundled ODBC
+bridge, with that driver installed: IBM Db2, Oracle, SAP HANA, SAP ASE
+(Sybase), Informix, Teradata, Vertica, Exasol, Firebird, Amazon Redshift,
+Google BigQuery, Databricks, Apache Hive, Trino and Presto, Dremio,
+InterSystems IRIS, Microsoft Access and more. Grid editing is off, and
 statements you type run under the connection's mode. See
 [Connecting through ODBC](docs/odbc.md).
 
@@ -74,7 +81,7 @@ statements you type run under the connection's mode. See
 - **Bring your connections with you.** Import every saved connection,
   passwords and SSH settings included, from DBeaver, or TablePlus on macOS.
 - **Organize your connections into projects,** and jump to any of them from
-  the palette.
+  the palette, or disconnect back to a home screen that lists them all.
 
   ![The palette scoped to connections, grouped into two projects, with the current connection marked](assets/screenshots/projects.png)
 
@@ -120,6 +127,10 @@ statements you type run under the connection's mode. See
 
 - **Your SSH, not a reimplementation.** Tunnels run through your own `ssh`, so
   your config, agent and hardware keys just work.
+  For Postgres, a Host that is a directory (`/var/run/postgresql`) reaches that
+  Unix socket on the SSH host, optionally as another user (Run as); the server
+  needs `socat`, and passwordless `sudo` for it when Run as is set. TLS modes
+  other than `disable` and `prefer` are refused there.
 
 Free and open source, nothing behind a paywall, and no telemetry: the only
 request DBDelve makes on its own is an update check, which you can turn off.
@@ -140,6 +151,15 @@ runs each (2026-10-11, M1 Pro, 32 GB):
 \* The whole 1M-row table pulled into memory on purpose, with the row limit
 off. Method and full results in [BENCHMARKS.md](BENCHMARKS.md).
 
+## Logs and bug reports
+
+DBDelve keeps a diagnostic log on your machine and never sends it anywhere. To
+attach it to an issue, use **Help → Copy Diagnostics** and paste; **Help → Open
+Logs Folder** shows the files. If the default log doesn't show the problem, turn
+on **Verbose logging** in Settings and reproduce it.
+
+Read a log before you post it and remove anything sensitive. A verbose one can
+hold hostnames, database names and anything a database driver logs.
 
 ## License
 

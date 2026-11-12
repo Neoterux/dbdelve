@@ -10,13 +10,20 @@
 //! thread has handed it over. Everything a call does happens here, on the
 //! foreground, reached only through [`Workspace::on_agent_message`].
 
-use std::{collections::VecDeque, sync::mpsc::SyncSender, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::SyncSender,
+    time::{Duration, Instant},
+};
 
-use super::agent_read::{self, AgentWork, NEEDS_APPROVAL, Resolved, explain_statement};
+use super::agent_read::{self, AgentWork, Approved, Resolved, explain_statement};
+use super::agent_write;
 use super::*;
 use crate::{
     agent::{CallId, EXPIRY, Inbound, Reply, Status, result::Total, tools::Tool},
-    sql::{AgentVerdict, agent_gate},
+    db::ConnectionConfig,
+    sql::{AgentVerdict, ApprovalKind, agent_gate, approval_kind, creates_index_concurrently},
+    ui::size_fact,
 };
 
 /// What the agent bridge holds while it is running.
@@ -51,12 +58,52 @@ pub(crate) struct AgentState {
     /// What opens an agent's connection; `None` is the real open. Tests put
     /// one here to stand in for an open that never returns.
     pub(crate) opener: Option<agent_read::Opener>,
+    /// What runs an approved write; `None` is [`agent_write::open_for_write`].
+    /// Tests put one here to hold a write running.
+    pub(crate) write_runner: Option<agent_write::WriteRunner>,
+    /// The approved writes running now, found by their id. Each holds no
+    /// connection and no way to cancel it: see [`agent_write`].
+    pub(crate) writes: Vec<agent_write::Writing>,
+    /// The call whose Approve is live: the approval in front, once
+    /// [`ARM_DELAY`] has passed since it was shown. At most one.
+    pub(crate) armed: Option<CallId>,
+    /// The approval [`Workspace::reveal_approval`] last started the arm for.
+    pub(crate) revealed: Option<CallId>,
+    /// The last call whose reveal asked the OS for the person's attention. Calls
+    /// are shown oldest first and ids rise, so a call that never asked is one
+    /// other than this.
+    pub(crate) attended: Option<CallId>,
+    /// The one-shot timer that sets `armed`. Replaced, and so cancelled, each
+    /// time the dialog in front is revealed.
+    _arming: Option<gpui::Task<()>>,
+    /// Unix milliseconds when this window's bridge started, or 0 when none
+    /// has: with a call's id, what pairs the lines of the audit file. A call's
+    /// id is the counter of its connection, which starts again each run.
+    pub(crate) session: u64,
+    /// The file approved statements are recorded in.
+    #[cfg(unix)]
+    audit: store::AuditLog,
 }
 
-// ponytail: the audit is this session's own and keeps the last five hundred
-// calls, in memory only, because it is read in a dialog and a longer list is
-// not read. Phase 6's persisted record of approvals (APPR-12) is the upgrade:
-// it is what outlives the window.
+// ponytail: the wait between an approval being shown and its Approve working,
+// a decision and not a setting: long enough that a click or keystroke already
+// in flight when the dialog appeared cannot land on an Approve that did not
+// exist when it began. The upgrade is a setting.
+pub(crate) const ARM_DELAY: Duration = Duration::from_millis(1500);
+
+/// What an approval that was approved is told when the line that says it is
+/// about to run could not be written. Nothing was opened.
+pub(super) const NOT_RECORDED: &str =
+    "DBDelve could not record the statement before running it, so it was not run.";
+
+/// What an approval that was approved is told when the statement, the
+/// connection or the profile's access level is not what it was when the person
+/// was shown it. Nothing was opened.
+pub(super) const CHANGED_SINCE_SHOWN: &str = "The statement, the connection or its access level changed after it was shown, so it was not run.";
+
+// ponytail: the list the Agent activity dialog reads is this session's own and
+// keeps the last five hundred calls, in memory only, because a longer list is
+// not read. `agent-audit.jsonl` is what outlives the window.
 pub(crate) const AUDIT_CAP: usize = 500;
 
 /// How many characters of an agent's own statement an audit entry keeps.
@@ -108,7 +155,8 @@ impl AuditVerdict {
 }
 
 /// What a call knew about itself at its end, beyond who made it and how it
-/// ended. A call that has none of these, such as a ping, takes the default.
+/// ended. A call that has none of these, such as a catalog listing, takes the
+/// default.
 #[derive(Default)]
 pub(crate) struct CallFacts {
     pub(crate) verdict: Option<AuditVerdict>,
@@ -119,7 +167,65 @@ pub(crate) struct CallFacts {
     pub(crate) total: Option<Total>,
     /// Whole milliseconds from the call's arrival to its end.
     pub(crate) elapsed_ms: u64,
+    /// What the server said of a call that failed, as [`audited_error`] keeps
+    /// it, with any sentence of DBDelve's own after it.
     pub(crate) error: Option<String>,
+    /// The caller hung up before the call ended.
+    pub(crate) requester_gone: bool,
+    /// What the person decided about a statement that waited for them. It also
+    /// keeps the audit file's statement whole.
+    pub(crate) decision: Option<Decision>,
+    /// The engine of the profile the call was about, for the audit file.
+    pub(crate) engine: Option<Engine>,
+}
+
+/// What a person did with a statement that waited for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Decision {
+    Approved,
+    Rejected,
+    Expired,
+}
+
+/// One line of `agent-audit.jsonl`, the record of every call an agent made. It
+/// names the statement, who decided when a person did, and how the call ended, and
+/// never a row value: what the database held does not belong in a file kept
+/// for longer than a session. An error is kept as [`audited_error`] has it,
+/// for that reason; a value a server writes unquoted in its own words is the
+/// one kind the cut cannot tell apart. `v` leads so a later shape can be told
+/// apart.
+/// JSON escapes every newline, so text an agent sent cannot start a line.
+#[derive(serde::Serialize)]
+pub(super) struct AuditLine<'a> {
+    v: u8,
+    session: u64,
+    id: u64,
+    at: u64,
+    /// `started` before a statement is sent, `outcome` once the call ended.
+    phase: &'static str,
+    tool: Tool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<Decision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<Status>,
+    requester_gone: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shown: Option<usize>,
+    elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    /// The statement whole when a person approved it, and cut at
+    /// [`AUDIT_SQL_CAP`] characters otherwise: clipping the record of what a
+    /// person approved would defeat it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql: Option<&'a str>,
 }
 
 /// One call that ended: its names, its code, its time and what the agent sent.
@@ -148,9 +254,11 @@ pub(crate) struct LogEntry {
     pub(crate) shown: Option<usize>,
     pub(crate) total: Option<Total>,
     pub(crate) elapsed_ms: u64,
-    /// The error of a call that failed, which the agent was not given, cut at
+    /// The error of a call that failed, as [`CallFacts::error`] has it, cut at
     /// [`AUDIT_SQL_CAP`] characters.
     pub(crate) error: Option<String>,
+    /// What the person decided, for a call that waited for one.
+    pub(crate) decision: Option<Decision>,
 }
 
 impl LogEntry {
@@ -193,6 +301,47 @@ impl AgentState {
         status: Status,
         facts: CallFacts,
     ) {
+        // What the in-memory log keeps of the statement and of an error that
+        // may echo it, cut so the dialog stays cheap to draw.
+        let cut_sql = facts.sql.clone().map(clipped);
+        let cut_error = facts.error.clone().map(clipped);
+        // The one place an outcome line is written, so the file and the log say
+        // the same of every call, whether it waited or not. A call that waited
+        // for a person keeps its statement whole, since cutting the record of
+        // what was approved would defeat it; a plain read keeps the cut.
+        let waited = facts.decision.is_some();
+        let line = AuditLine {
+            v: 1,
+            session: self.session,
+            id: id.0,
+            at: unix_millis(),
+            phase: "outcome",
+            tool,
+            profile: resolved.as_deref(),
+            engine: facts.engine.map(Engine::as_str),
+            verdict: facts.verdict.as_ref().map(AuditVerdict::line),
+            decision: facts.decision,
+            status: Some(status),
+            requester_gone: facts.requester_gone,
+            shown: facts.shown,
+            elapsed_ms: facts.elapsed_ms,
+            error: if waited {
+                facts.error.as_deref()
+            } else {
+                cut_error.as_deref()
+            },
+            sql: if waited {
+                facts.sql.as_deref()
+            } else {
+                cut_sql.as_deref()
+            },
+        };
+        if let Err(error) = self.persist(&line) {
+            // The call has ended and nothing can un-run it, so the only thing
+            // left to do is say that its record is missing. The error names
+            // the file and never the statement.
+            eprintln!("{error}");
+        }
         self.log.push_front(LogEntry {
             at: unix_millis(),
             id,
@@ -205,15 +354,71 @@ impl AgentState {
                     .collect()
             }),
             status,
-            requester_gone: false,
+            requester_gone: facts.requester_gone,
             verdict: facts.verdict,
-            sql: facts.sql.map(clipped),
+            sql: cut_sql,
             shown: facts.shown,
             total: facts.total,
             elapsed_ms: facts.elapsed_ms,
-            error: facts.error.map(clipped),
+            error: cut_error,
+            decision: facts.decision,
         });
         self.log.truncate(AUDIT_CAP);
+    }
+}
+
+impl AgentState {
+    /// Write the `started` line of a call that is about to run on a lane and
+    /// that no person approved (an approved one has its own, written before it
+    /// was handed on). Not fail-closed: a read changes nothing, so one whose
+    /// line could not be written still runs, and the failure names the file and
+    /// never the statement.
+    pub(super) fn note_started(
+        &mut self,
+        id: CallId,
+        tool: Tool,
+        profile: &str,
+        engine: Engine,
+        sql: Option<&str>,
+        arrived: Instant,
+    ) {
+        let cut = sql.map(|sql| clipped(sql.to_string()));
+        let line = AuditLine {
+            v: 1,
+            session: self.session,
+            id: id.0,
+            at: unix_millis(),
+            phase: "started",
+            tool,
+            profile: Some(profile),
+            engine: Some(engine.as_str()),
+            verdict: sql.map(|_| AuditVerdict::Run.line()),
+            decision: None,
+            status: None,
+            requester_gone: false,
+            shown: None,
+            elapsed_ms: elapsed_ms(arrived),
+            error: None,
+            sql: cut.as_deref(),
+        };
+        if let Err(error) = self.persist(&line) {
+            eprintln!("{error}");
+        }
+    }
+
+    /// Write one line to the audit file. The one door to it, so the writes of
+    /// the two phases cannot disagree about the file.
+    #[cfg(unix)]
+    pub(super) fn persist(&mut self, line: &AuditLine) -> Result<(), String> {
+        let json = serde_json::to_string(line)
+            .map_err(|error| format!("Could not encode the audit line: {error}"))?;
+        self.audit.append(&json)
+    }
+
+    /// No agent call reaches a window here: the bridge listens only on Unix.
+    #[cfg(not(unix))]
+    pub(super) fn persist(&mut self, _line: &AuditLine) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -228,6 +433,36 @@ fn clipped(mut text: String) -> String {
     text
 }
 
+/// What the audit keeps of what a server said about a call that failed: its
+/// first line, up to where it starts to quote or bracket something, with `…`
+/// in place of the rest. That is where a server puts a value it names, and the
+/// value may be a row's: Postgres's `DETAIL` (`Failing row contains (…)`) is a
+/// later line, MySQL writes `Duplicate entry '…'`, SQL Server `(…)`, MongoDB
+/// `{ … }`, and a read that casts a column quotes the column's value. A quote
+/// between two letters is an apostrophe. `server_text` is already
+/// [`agent_read::scrubbed`], so a host or a user written unquoted is gone too.
+pub(crate) fn audited_error(server_text: &str) -> String {
+    let line = server_text.lines().next().unwrap_or_default();
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let letter = |at: Option<&(usize, char)>| at.is_some_and(|(_, c)| c.is_alphabetic());
+    let cut = chars.iter().enumerate().find_map(|(index, &(at, c))| {
+        let opens = match c {
+            // Not `[`: the scrubber's own `[hidden]` is written with it.
+            '"' | '`' | '(' | '{' => true,
+            '\'' => {
+                !(letter(index.checked_sub(1).and_then(|before| chars.get(before)))
+                    && letter(chars.get(index + 1)))
+            }
+            _ => false,
+        };
+        opens.then_some(at)
+    });
+    match cut {
+        Some(at) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
+}
+
 /// A call that has been accepted and not yet finished. Dropping it without
 /// replying closes the caller's connection with no answer.
 pub(crate) struct PendingCall {
@@ -236,16 +471,38 @@ pub(crate) struct PendingCall {
     /// dialog and the sweeps read the profile by this id, so a rename or a
     /// second profile of the same name cannot change which one a call is about.
     pub(crate) profile_id: String,
-    pub(crate) tool: Tool,
     /// The profile's own name when the call resolved, kept so the log can name
     /// it after the profile is gone.
     profile_name: String,
     reply: std::sync::mpsc::SyncSender<Reply>,
     /// When the call reached [`Workspace::on_agent_message`].
     arrived: Instant,
+    /// What the person is asked to approve: the statement the gate held.
+    pub(crate) approval: Approval,
     /// Ends the call as `expired` when it fires. Dropped with the call, which
     /// is what cancels it.
     _expiry: gpui::Task<()>,
+}
+
+/// The statement a held call asks to run, with what the gate and the profile
+/// said of it when it arrived. `sql` is exactly what the agent sent: what the
+/// dialog draws and what runs, never a copy that was cleaned for the screen.
+pub(crate) struct Approval {
+    pub(crate) sql: String,
+    /// The gate's answer at arrival, which the re-gate at Approve must
+    /// reproduce.
+    pub(crate) verdict: AgentVerdict,
+    /// The profile's config at arrival, compared with the current one at
+    /// Approve.
+    pub(crate) config: ConnectionConfig,
+    /// Whether the statement holds the profile's SQLite file against the
+    /// user's own readers and writers while it runs, read once when the call
+    /// arrived.
+    pub(crate) locks_the_file: bool,
+    /// Set by the socket's hangup watcher the moment the caller leaves, before
+    /// the window hears of it. Read at Approve, so a click that lands in that
+    /// gap starts nothing.
+    pub(crate) gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What a pending call is told when the kill switch ends it.
@@ -260,13 +517,17 @@ const STILL_SERVED_ELSEWHERE: &str = "Agent access was turned off. Another DBDel
 /// One sentence for both, so the agent cannot tell which happened.
 pub(super) const NO_LONGER_AVAILABLE: &str = "The connection is no longer available to agents.";
 
-/// What an unanswered ping is told. The wait it names is [`EXPIRY`] itself.
+/// What an unanswered approval is told. The wait it names is [`EXPIRY`] itself.
 fn expired_text() -> String {
     format!(
-        "Nobody answered the ping in DBDelve within {} minutes.",
+        "Nobody answered the approval in DBDelve within {} minutes; the statement was not run.",
         EXPIRY.as_secs() / 60
     )
 }
+
+/// What a denied call is told: the person read the statement and said no, and
+/// nothing ran.
+const DENIED: &str = "The statement was denied in DBDelve and was not run.";
 
 /// A running bridge. Neither field is read: holding them is the point.
 pub(crate) struct Bridge {
@@ -302,16 +563,6 @@ impl std::fmt::Display for AgentLookup {
             Self::Ambiguous => "more than one agent-visible connection has that name",
         })
     }
-}
-
-/// What the ping dialog says: the connection by its own name, that this is a
-/// test, and that approving touches nothing. The name is the profile's, as its
-/// owner spelt it, never text the agent sent.
-pub(crate) fn ping_prompt(name: &str) -> String {
-    format!(
-        "An agent asks you to answer a test for {name}. Approving answers the agent; it runs \
-         nothing on the database."
-    )
 }
 
 /// What the visibility dialog tells the owner about this engine and mode, one
@@ -351,6 +602,76 @@ pub(crate) fn visibility_facts(
                 .to_string(),
         );
     }
+    facts
+}
+
+/// What the approval says of where the statement runs.
+pub(crate) const OWN_CONNECTION: &str = "Runs on DBDelve's own connection, not yours.";
+/// What the approval says of a concurrent index build.
+pub(crate) const INVALID_INDEX: &str =
+    "A concurrent index build that stops can leave an invalid index of that name on the server.";
+const LOCKS_THE_FILE: &str =
+    "While it runs it locks the file, and your own reads and writes on it wait.";
+/// What the approval says of a read that runs where the database holds the
+/// agent's connection to reads, and of one where nothing does.
+pub(crate) const HELD_TO_READS: &str = "It runs on a read-only connection.";
+pub(crate) const NOT_HELD_TO_READS: &str = "Nothing on the server holds it to reads.";
+
+/// What DBDelve itself says of a statement it holds for approval, ahead of the
+/// statement: the access level the profile has and the one the statement needs,
+/// what kind of statement it is, any expiry it schedules or invalid index it
+/// can leave, whose connection it runs on, and its size. Pure, so opening the
+/// dialog asks no server anything, and every sentence is DBDelve's: the
+/// statement is never formatted into one, because the agent wrote it.
+/// `locks_the_file` is [`Approval::locks_the_file`], and `reads_held`
+/// [`ConnectionConfig::agent_reads_are_held`] of the profile: a read the gate
+/// holds runs on the agent's read connection, and what holds that connection
+/// to reads is the engine's.
+pub(crate) fn approval_facts(
+    engine: Engine,
+    mode: Mode,
+    verdict: &AgentVerdict,
+    sql: &str,
+    locks_the_file: bool,
+    reads_held: bool,
+) -> Vec<String> {
+    // Only a held statement has an approval; nothing else is described.
+    let AgentVerdict::Approve(held, expiry) = verdict else {
+        return Vec::new();
+    };
+    let kind = approval_kind(engine, sql, held);
+    let mut facts = vec![
+        format!(
+            "This connection's access level is {}; the statement needs {}.",
+            mode.label(),
+            held.mode.label()
+        ),
+        match kind {
+            ApprovalKind::Write => "It changes data.",
+            ApprovalKind::EgressRead => "It reads a file, a URL or another server.",
+            ApprovalKind::UnlistedCall => "It calls a function DBDelve does not list.",
+        }
+        .to_string(),
+    ];
+    if kind != ApprovalKind::Write {
+        facts.push(
+            if reads_held {
+                HELD_TO_READS
+            } else {
+                NOT_HELD_TO_READS
+            }
+            .to_string(),
+        );
+    }
+    facts.extend(expiry.map(|expiry| expiry.to_string()));
+    if creates_index_concurrently(engine, sql) {
+        facts.push(INVALID_INDEX.to_string());
+    }
+    if locks_the_file && kind == ApprovalKind::Write {
+        facts.push(LOCKS_THE_FILE.to_string());
+    }
+    facts.push(OWN_CONNECTION.to_string());
+    facts.push(size_fact(sql));
     facts
 }
 
@@ -442,7 +763,9 @@ impl Workspace {
 
     /// Answer every call waiting on this profile `rejected`, oldest first, each
     /// once, and end its reads, running and waiting, and drop its agent
-    /// connection. Calls on any other profile are left as they are.
+    /// connection. Calls on any other profile are left as they are, and so is
+    /// an approved write already running on this one: it finishes and is
+    /// audited (D-16).
     pub(crate) fn reject_calls_for(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let waiting: Vec<CallId> = self
             .agent
@@ -457,10 +780,10 @@ impl Workspace {
         self.end_lane(profile_id, Status::Rejected, NO_LONGER_AVAILABLE, cx);
     }
 
-    /// The call the ping dialog is about: the oldest one whose profile is still
+    /// The call the approval dialog is about: the oldest one whose profile is still
     /// in the list. A call whose profile has gone is swept with it, so the
     /// filter only guards the moment between the two.
-    pub(crate) fn front_ping(&self) -> Option<&PendingCall> {
+    pub(crate) fn front_approval(&self) -> Option<&PendingCall> {
         self.agent.calls.iter().find(|call| {
             self.profiles
                 .iter()
@@ -468,34 +791,267 @@ impl Workspace {
         })
     }
 
-    /// The dialog's Approve. Answers the agent and nothing else: no connection
-    /// is opened and nothing runs.
-    pub(crate) fn approve_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
-        self.finish_call(
-            id,
-            Status::Executed,
-            "The ping was approved in DBDelve.".to_string(),
-            cx,
-        );
-    }
-
     /// The dialog's Deny, for a call named by id.
-    pub(crate) fn deny_ping(&mut self, id: CallId, cx: &mut Context<Self>) {
-        self.finish_call(
-            id,
-            Status::Rejected,
-            "The ping was denied in DBDelve.".to_string(),
-            cx,
-        );
+    pub(crate) fn deny_call(&mut self, id: CallId, cx: &mut Context<Self>) {
+        self.finish_call(id, Status::Rejected, DENIED.to_string(), cx);
     }
 
-    /// Deny whichever ping the dialog in front is about. Answers whether there
+    /// The call the dialog in front is about.
+    pub(crate) fn front_approval_id(&self) -> Option<CallId> {
+        self.front_approval().map(|call| call.id)
+    }
+
+    /// The timer that ends a call nobody answered as `expired`. Dropping it
+    /// with the call is what cancels it.
+    fn expiry_of(&self, id: CallId, cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(EXPIRY).await;
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.finish_call(id, Status::Expired, expired_text(), cx)
+            });
+        })
+    }
+
+    /// The approval in front has just been drawn, as the dialog in front: its
+    /// Approve is dead until [`ARM_DELAY`] has passed from now. Called one frame
+    /// after the dialog is raised or the front call changes, so it counts from
+    /// what the person can see and never from the call's arrival.
+    ///
+    /// The first time a call is revealed it also asks the OS to draw the
+    /// person's attention to the window, once. That is a request and nothing
+    /// more: it never takes focus from another application and never raises
+    /// the window (PITFALLS P-09). On Wayland it does nothing, and the agent
+    /// mark's waiting count is the signal.
+    pub(crate) fn reveal_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.front_approval_id() else {
+            return;
+        };
+        self.agent.revealed = Some(id);
+        self.agent.armed = None;
+        if self.agent.attended != Some(id) {
+            self.agent.attended = Some(id);
+            window.request_attention();
+        }
+        // Replacing the old timer cancels it.
+        self.agent._arming = Some(cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(ARM_DELAY).await;
+            _ = workspace.update(cx, |workspace, cx| {
+                // Only while the approval is what the person is looking at: a
+                // dialog or the palette over it that they are reading is not
+                // the approval being shown, and it is revealed again when that
+                // closes.
+                if workspace.front_approval_id() == Some(id)
+                    && workspace.dialog_in_front.get() == Some("agent-approval")
+                    && workspace.palette.is_none()
+                {
+                    workspace.agent.armed = Some(id);
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The dialog's Approve for a held statement. Does nothing until the call is
+    /// armed. Then the call is taken out of the waiting list, and ended as
+    /// `cancelled`, unrun and unrecorded as started, when its caller has already
+    /// left, even if the window has not heard so. Otherwise it is checked in
+    /// this order: its profile, found by id and still visible to agents
+    /// (`rejected` otherwise); the statement, which must be byte for byte the
+    /// source the dialog was last drawn from for this call, so a call never
+    /// drawn is refused; and the gate's judgment of it now,
+    /// which must come out as it did when it arrived, on the config it arrived
+    /// with. A difference in the last two answers `refused_by_gate`. Only then
+    /// is the `started` line written and the write started, on a connection of
+    /// its own, with the very `String` the dialog was drawn from.
+    pub(crate) fn approve_call(&mut self, id: CallId, cx: &mut Context<Self>) {
+        if self.agent.armed != Some(id) {
+            return;
+        }
+        // A hide saved by another window since this call arrived: the answer
+        // is this call's own rejection, found below as no call at all.
+        self.adopt_saved_visibility_for_read(cx);
+        let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
+            return;
+        };
+        let was_in_front = self.front_approval().is_some_and(|front| front.id == id);
+        // Dropping the call's expiry with the rest of it.
+        let call = self.agent.calls.remove(index);
+        let PendingCall {
+            profile_id,
+            profile_name,
+            reply,
+            arrived,
+            approval,
+            ..
+        } = call;
+        let engine = approval.config.engine();
+        // Before anything is started. The caller may have left in the moment
+        // before the window heard of it; its call then ends as cancelled, with
+        // nothing recorded as started and nothing opened. A write that has
+        // started is never stopped (see [`agent_write`]), so this is the last
+        // point where the caller leaving changes what runs.
+        if approval.gone.load(std::sync::atomic::Ordering::Acquire) {
+            self.agent.record(
+                id,
+                Tool::ExecuteSql,
+                Some(profile_name),
+                None,
+                Status::Cancelled,
+                CallFacts {
+                    verdict: AuditVerdict::held_by(approval.verdict),
+                    sql: Some(approval.sql),
+                    elapsed_ms: elapsed_ms(arrived),
+                    requester_gone: true,
+                    // The person did click Approve; the call is what ended.
+                    decision: Some(Decision::Approved),
+                    engine: Some(engine),
+                    ..CallFacts::default()
+                },
+            );
+            // Nobody would read a reply, and dropping the sender unsent is how
+            // a cancelled call ends.
+            drop(reply);
+            self.finish_approval(was_in_front, cx);
+            return;
+        }
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id && profile.agent_visible);
+        let held = AuditVerdict::held_by(approval.verdict.clone());
+        let (status, text, error) = match profile {
+            None => (Status::Rejected, NO_LONGER_AVAILABLE, None),
+            // Byte for byte the source the dialog was drawn from for this
+            // call: no normalising, folding or trimming (GATE-10).
+            Some(_)
+                if !self
+                    .approval_shown
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(shown, sql)| *shown == id && *sql == approval.sql) =>
+            {
+                (Status::RefusedByGate, CHANGED_SINCE_SHOWN, None)
+            }
+            Some(profile)
+                if agent_gate(profile.config.engine(), &approval.sql, profile.mode)
+                    != approval.verdict
+                    || profile.config != approval.config =>
+            {
+                (Status::RefusedByGate, CHANGED_SINCE_SHOWN, None)
+            }
+            Some(_) => {
+                // Before anything is opened: a write that cannot be recorded
+                // is not run, so the file never lacks a statement the server
+                // may have received.
+                let started = AuditLine {
+                    v: 1,
+                    session: self.agent.session,
+                    id: id.0,
+                    at: unix_millis(),
+                    phase: "started",
+                    tool: Tool::ExecuteSql,
+                    profile: Some(&profile_name),
+                    engine: Some(engine.as_str()),
+                    verdict: held.as_ref().map(AuditVerdict::line),
+                    decision: Some(Decision::Approved),
+                    status: None,
+                    requester_gone: false,
+                    shown: None,
+                    elapsed_ms: elapsed_ms(arrived),
+                    error: None,
+                    sql: Some(&approval.sql),
+                };
+                match self.agent.persist(&started) {
+                    // No decision on the failure: the statement was never
+                    // started, and its outcome line meets the same file.
+                    Err(error) => (Status::Failed, NOT_RECORDED, Some(error)),
+                    Ok(()) => {
+                        match held {
+                            // What the person read runs on the profile's
+                            // read-only lane, which a write fails against.
+                            Some(
+                                verdict @ AuditVerdict::Approve {
+                                    mode: Mode::ReadOnly,
+                                    ..
+                                },
+                            ) => self.run_agent_work(
+                                id,
+                                Resolved {
+                                    id: profile_id,
+                                    name: profile_name,
+                                    config: approval.config,
+                                },
+                                AgentWork::Query {
+                                    sql: approval.sql,
+                                    approved: Some(Approved { verdict, engine }),
+                                },
+                                reply,
+                                arrived,
+                                cx,
+                            ),
+                            held => self.start_write(
+                                id,
+                                profile_id,
+                                profile_name,
+                                approval.config,
+                                approval.sql,
+                                held,
+                                reply,
+                                arrived,
+                                approval.gone,
+                                cx,
+                            ),
+                        }
+                        self.finish_approval(was_in_front, cx);
+                        return;
+                    }
+                }
+            }
+        };
+        // The person did click Approve; what the answer says is that it did not
+        // run. A failure to record has no decision (see above).
+        let decision = (status != Status::Failed).then_some(Decision::Approved);
+        self.agent_answered(
+            id,
+            Tool::ExecuteSql,
+            Some(profile_name),
+            None,
+            &reply,
+            Reply {
+                status,
+                text: text.to_string(),
+            },
+            CallFacts {
+                verdict: held,
+                sql: Some(approval.sql),
+                elapsed_ms: elapsed_ms(arrived),
+                error,
+                decision,
+                engine: Some(engine),
+                ..CallFacts::default()
+            },
+        );
+        self.finish_approval(was_in_front, cx);
+    }
+
+    /// What every end of an approval does after the call left the list: the
+    /// arm is spent, and the keyboard goes back if the dialog that took it went.
+    fn finish_approval(&mut self, was_in_front: bool, cx: &mut Context<Self>) {
+        self.agent.armed = None;
+        if was_in_front {
+            self.refocus_front();
+        }
+        cx.notify();
+    }
+
+    /// Deny whichever call the dialog in front is about. Answers whether there
     /// was one, so `escape` is only spent on a dialog that was drawn.
-    pub(crate) fn deny_front_ping(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.front_ping().map(|call| call.id) else {
+    pub(crate) fn deny_front_approval(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.front_approval().map(|call| call.id) else {
             return false;
         };
-        self.deny_ping(id, cx);
+        self.deny_call(id, cx);
         true
     }
 
@@ -531,6 +1087,7 @@ impl Workspace {
                 }
             }
         });
+        self.agent.session = unix_millis();
         self.agent.bridge = Some(Bridge {
             _listener: listener,
             _pump: pump,
@@ -637,6 +1194,12 @@ impl Workspace {
     /// Stop listening and forget who was attached. Dropping the bridge stops
     /// the listener, removes the socket file and shuts every presence
     /// connection; it leaves the saved choice alone, so quitting keeps it.
+    ///
+    // ponytail: quitting while an approved write runs does not wait for it and
+    // asks nothing, so the write may be cut off with the process. Its `started`
+    // line is already in the audit file with no `outcome` line, which is the
+    // trace an interrupted call leaves. The upgrade is a confirmation on quit,
+    // which the owner declined (D-31).
     pub(crate) fn drop_bridge(&mut self) {
         self.agent.bridge = None;
         self.agent.presence.clear();
@@ -646,7 +1209,9 @@ impl Workspace {
     /// listens until the user turns access on again. In order:
     ///
     /// 1. Every pending call and every read, running or waiting, is answered
-    ///    `rejected` and every agent connection is dropped. This comes first and runs
+    ///    `rejected` and every agent connection is dropped. An approved write
+    ///    already running is not among them: it finishes and is audited, as
+    ///    nothing but its own result ends it (D-16). This comes first and runs
     ///    with or without a bridge, because dropping the bridge never closes a
     ///    call's connection: each call's writer thread sends its frame and then
     ///    closes its own socket, so a waiting client reads a whole answer and
@@ -687,9 +1252,11 @@ impl Workspace {
     /// calls waiting, while an agent is attached or a call waits.
     pub(crate) fn agent_mark_state(&self) -> Option<ui::AgentMark> {
         self.agent.bridge.as_ref()?;
-        // A read in flight is an agent attached, though nobody is asked.
+        // A read or an approved write in flight is an agent attached, though
+        // nobody is asked.
         let attached = !self.agent.presence.is_empty()
             || !self.agent.calls.is_empty()
+            || !self.agent.writes.is_empty()
             || self.agent.lanes.values().any(|lane| lane.running.is_some());
         Some(if attached {
             ui::AgentMark::Connected {
@@ -755,6 +1322,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                gone,
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let found = match connection.as_deref() {
@@ -791,13 +1359,55 @@ impl Workspace {
                 let verdict = agent_gate(engine, &sql, mode);
                 // The verdict's contents are what an approval will show,
                 // which agents do not get.
-                let refused = match &verdict {
+                let (refused, audited) = match &verdict {
                     AgentVerdict::Run => {
                         self.run_agent_sql(id, resolved, sql, reply, arrived, cx);
                         return;
                     }
-                    AgentVerdict::Approve(..) => NEEDS_APPROVAL.to_string(),
-                    AgentVerdict::Refuse(reason) => reason.to_string(),
+                    // Everything the gate approves is held for a person, a
+                    // read of a file or a call it does not list included. A
+                    // statement is refused here, before there is a pending call
+                    // or a dialog to be shown, when nothing can run it for an
+                    // agent on this profile: no read on an in-memory DuckDB,
+                    // and no write on DuckDB at all.
+                    AgentVerdict::Approve(held, _) => {
+                        let write = held.mode == Mode::ReadWrite;
+                        let refusal = resolved
+                            .config
+                            .agent_refusal()
+                            .or_else(|| resolved.config.agent_write_refusal().filter(|_| write));
+                        match refusal {
+                            Some(refusal) => (
+                                refusal.to_string(),
+                                Some(AuditVerdict::Refuse(refusal.to_string())),
+                            ),
+                            None => {
+                                let expiry = self.expiry_of(id, cx);
+                                self.agent.calls.push(PendingCall {
+                                    id,
+                                    profile_id: resolved.id,
+                                    profile_name: resolved.name,
+                                    reply,
+                                    arrived,
+                                    approval: Approval {
+                                        sql,
+                                        verdict,
+                                        locks_the_file: resolved
+                                            .config
+                                            .agent_read_can_block_commits(),
+                                        config: resolved.config,
+                                        gone,
+                                    },
+                                    _expiry: expiry,
+                                });
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    }
+                    AgentVerdict::Refuse(reason) => {
+                        (reason.to_string(), AuditVerdict::held_by(verdict))
+                    }
                 };
                 self.agent_answered(
                     id,
@@ -810,7 +1420,7 @@ impl Workspace {
                         text: refused,
                     },
                     CallFacts {
-                        verdict: AuditVerdict::held_by(verdict),
+                        verdict: audited,
                         sql: Some(sql),
                         elapsed_ms: elapsed_ms(arrived),
                         ..CallFacts::default()
@@ -823,6 +1433,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let found = match connection.as_deref() {
@@ -890,6 +1501,7 @@ impl Workspace {
                 connection,
                 args,
                 reply,
+                ..
             } => {
                 self.adopt_saved_visibility_for_read(cx);
                 let resolved = match connection.as_deref() {
@@ -931,60 +1543,14 @@ impl Workspace {
                 };
                 self.run_agent_work(id, resolved, work, reply, arrived, cx);
             }
-            Inbound::Call {
-                tool: Tool::Ping,
-                id,
-                connection,
-                reply,
-                ..
-            } => {
-                self.adopt_saved_visibility(cx);
-                let found = match connection.as_deref() {
-                    Some(name) => self
-                        .agent_profile(name)
-                        .map(|profile| (profile.id.clone(), profile.name.clone())),
-                    None => Err(AgentLookup::NotAvailable),
-                };
-                let (profile_id, profile_name) = match found {
-                    Ok(found) => found,
-                    Err(lookup) => {
-                        // The caller may have hung up, and then nobody reads this.
-                        let _ = reply.send(Reply {
-                            status: Status::RefusedByGate,
-                            text: lookup.to_string(),
-                        });
-                        self.agent.record(
-                            id,
-                            Tool::Ping,
-                            None,
-                            connection.as_deref(),
-                            Status::RefusedByGate,
-                            CallFacts::default(),
-                        );
-                        return;
-                    }
-                };
-                let expiry = cx.spawn(async move |workspace, cx| {
-                    cx.background_executor().timer(EXPIRY).await;
-                    _ = workspace.update(cx, |workspace, cx| {
-                        workspace.finish_call(id, Status::Expired, expired_text(), cx)
-                    });
-                });
-                self.agent.calls.push(PendingCall {
-                    id,
-                    profile_id,
-                    tool: Tool::Ping,
-                    profile_name,
-                    reply,
-                    arrived,
-                    _expiry: expiry,
-                });
-                cx.notify();
-            }
             Inbound::Hangup { id } => {
                 self.finish_call(id, Status::Cancelled, String::new(), cx);
             }
             Inbound::Undelivered { id } => {
+                // Only the in-memory entry: the audit file is append-only and an
+                // outcome line already written is not rewritten. A write's own
+                // line says the caller was gone from the socket's flag, known
+                // before it was written.
                 if let Some(entry) = self.agent.log.iter_mut().find(|entry| entry.id == id) {
                     entry.requester_gone = true;
                     cx.notify();
@@ -1019,7 +1585,9 @@ impl Workspace {
     /// The one door every call ends through: answered, expired or hung up.
     /// It removes the call by id before it replies, so two things ending the
     /// same call at once produce one outcome and at most one reply. It looks
-    /// among the pings first and then among the reads of every lane
+    /// among the calls waiting on a person first (held statements),
+    /// then among the approved writes running, which a hangup is noted on and
+    /// nothing else ends, and last among the reads of every lane
     /// ([`Workspace::finish_read`]), where a running read is cancelled on the
     /// server. Answers whether there was such a call.
     ///
@@ -1033,27 +1601,50 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(index) = self.agent.calls.iter().position(|call| call.id == id) else {
+            // A running write ends by its own result alone: a hangup is noted
+            // for the audit and nothing else reaches it.
+            if let Some(write) = self.agent.writes.iter_mut().find(|write| write.id == id) {
+                write.requester_gone |= status == Status::Cancelled;
+                return true;
+            }
             return self.finish_read(id, status, text, true, Default::default(), cx);
         };
-        let was_in_front = self.front_ping().is_some_and(|front| front.id == id);
+        let was_in_front = self.front_approval().is_some_and(|front| front.id == id);
         let call = self.agent.calls.remove(index);
         if status != Status::Cancelled {
             // The caller may have hung up, and then nobody reads this.
             let _ = call.reply.send(Reply { status, text });
         }
+        // A held statement is audited with what it asked, so a denied, expired
+        // or hung-up approval says which statement it was.
+        let approval = call.approval;
+        // A hangup is no decision of the person's: its caller left.
+        let decision = match status {
+            Status::Rejected => Some(Decision::Rejected),
+            Status::Expired => Some(Decision::Expired),
+            _ => None,
+        };
+        let engine = approval.config.engine();
         // Past the early return above, so a hangup that arrives after the call
         // ended adds nothing: one entry per call, written here.
         self.agent.record(
             id,
-            call.tool,
+            Tool::ExecuteSql,
             Some(call.profile_name),
             None,
             status,
             CallFacts {
+                verdict: AuditVerdict::held_by(approval.verdict),
+                sql: Some(approval.sql),
                 elapsed_ms: elapsed_ms(call.arrived),
+                decision,
+                engine: Some(engine),
                 ..CallFacts::default()
             },
         );
+        if self.agent.armed == Some(id) {
+            self.agent.armed = None;
+        }
         if was_in_front {
             // The dialog took the keyboard when it went up and goes away with
             // the call, by whichever route the call ended.
@@ -1088,6 +1679,206 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn corpus() -> [&'static str; 6] {
+        [
+            "UPDATE t SET a = 'Approve me'",
+            "SELECT my_udf('Approve me')",
+            "SELECT * FROM 'Approve me.csv'",
+            "CREATE INDEX CONCURRENTLY approve_me ON t (a)",
+            "SET k v EX 10",
+            "SELECT pg_read_file('Approve me')",
+        ]
+    }
+
+    #[test]
+    fn the_approval_facts_are_dbdelves_own() {
+        use crate::sql::{ApprovalKind, approval_kind};
+
+        let mut seen = 0;
+        for engine in Engine::ALL {
+            for mode in crate::sql::Mode::ALL {
+                for sql in corpus() {
+                    let verdict = agent_gate(engine, sql, mode);
+                    let AgentVerdict::Approve(held, _) = &verdict else {
+                        continue;
+                    };
+                    seen += 1;
+                    let facts = approval_facts(engine, mode, &verdict, sql, true, true);
+                    let at = format!("{engine:?} {mode:?} {sql}");
+                    let count = |fact: &str| facts.iter().filter(|each| *each == fact).count();
+                    assert_eq!(count(OWN_CONNECTION), 1, "{at}: {facts:?}");
+                    assert_eq!(
+                        count(&format!(
+                            "This connection's access level is {}; the statement needs {}.",
+                            mode.label(),
+                            held.mode.label()
+                        )),
+                        1,
+                        "{at}: {facts:?}"
+                    );
+                    assert_eq!(count(&crate::ui::size_fact(sql)), 1, "{at}: {facts:?}");
+                    let kinds = [
+                        (ApprovalKind::Write, "It changes data."),
+                        (
+                            ApprovalKind::EgressRead,
+                            "It reads a file, a URL or another server.",
+                        ),
+                        (
+                            ApprovalKind::UnlistedCall,
+                            "It calls a function DBDelve does not list.",
+                        ),
+                    ];
+                    let kind = approval_kind(engine, sql, held);
+                    for (each, sentence) in kinds {
+                        assert_eq!(
+                            count(sentence),
+                            usize::from(each == kind),
+                            "{at}: {facts:?}"
+                        );
+                    }
+                    for fact in &facts {
+                        for own in ["Approve me", "approve_me"] {
+                            assert!(!fact.contains(own), "{at}: {fact}");
+                        }
+                        let lower = fact.to_lowercase();
+                        for word in ["yet", "phase", "mcp", "try", "should", "upgrade"] {
+                            assert!(!lower.contains(word), "{at}: {fact} says {word}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen > 20, "the corpus reached the approval {seen} times");
+    }
+
+    #[test]
+    fn the_approval_facts_add_only_what_the_statement_carries() {
+        use crate::sql::{Expiry, Mode};
+
+        let facts = |engine, sql: &str, locks| {
+            let verdict = agent_gate(engine, sql, Mode::ReadWrite);
+            assert!(matches!(verdict, AgentVerdict::Approve(..)), "{sql}");
+            approval_facts(engine, Mode::ReadWrite, &verdict, sql, locks, true)
+        };
+        let count =
+            |facts: &[String], fact: &str| facts.iter().filter(|each| *each == fact).count();
+
+        let plain = facts(Engine::Postgres, "UPDATE t SET a = 1", false);
+        assert_eq!(count(&plain, &Expiry::Key.to_string()), 0, "{plain:?}");
+        assert_eq!(count(&plain, &Expiry::Field.to_string()), 0, "{plain:?}");
+        assert_eq!(count(&plain, INVALID_INDEX), 0, "{plain:?}");
+        assert_eq!(count(&plain, "1 line, 18 bytes"), 1, "{plain:?}");
+
+        let index = facts(
+            Engine::Postgres,
+            "CREATE INDEX CONCURRENTLY i ON t (a)",
+            false,
+        );
+        assert_eq!(count(&index, INVALID_INDEX), 1, "{index:?}");
+
+        let expiring = facts(Engine::Redis, "SET k v EX 10", false);
+        assert_eq!(
+            count(&expiring, &Expiry::Key.to_string()),
+            1,
+            "{expiring:?}"
+        );
+
+        let lock = "While it runs it locks the file, and your own reads and writes on it wait.";
+        let write = facts(Engine::Sqlite, "UPDATE t SET a = 1", true);
+        assert_eq!(count(&write, lock), 1, "{write:?}");
+        let unlocked = facts(Engine::Sqlite, "UPDATE t SET a = 1", false);
+        assert_eq!(count(&unlocked, lock), 0, "{unlocked:?}");
+        let read = facts(Engine::DuckDb, "SELECT * FROM 'a.csv'", true);
+        assert_eq!(count(&read, lock), 0, "a read is no write: {read:?}");
+    }
+
+    #[test]
+    fn an_audited_error_keeps_the_servers_words_and_never_the_value_they_name() {
+        for (server, kept) in [
+            (
+                "duplicate key value violates unique constraint \"users_email_key\"\nKey (email)=(alice@example.com) already exists.",
+                "duplicate key value violates unique constraint …",
+            ),
+            (
+                "new row for relation \"t\" violates check constraint \"c\"\nFailing row contains (7, alice, s3cret).",
+                "new row for relation …",
+            ),
+            // A read that casts a column: the value is the row's.
+            (
+                "invalid input syntax for type integer: \"s3cret\"",
+                "invalid input syntax for type integer: …",
+            ),
+            (
+                "Duplicate entry 'alice@example.com' for key 'users.email'",
+                "Duplicate entry …",
+            ),
+            (
+                "Truncated incorrect DOUBLE value: 's3cret'",
+                "Truncated incorrect DOUBLE value: …",
+            ),
+            (
+                "Violation of UNIQUE KEY constraint 'UQ_email'. The duplicate key value is (alice@example.com).",
+                "Violation of UNIQUE KEY constraint …",
+            ),
+            (
+                "E11000 duplicate key error collection: app.users index: email_1 dup key: { email: \"alice@example.com\" }",
+                "E11000 duplicate key error collection: app.users index: email_1 dup key: …",
+            ),
+            (
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ),
+            // An apostrophe is not a quote.
+            (
+                "Can't connect to server on 'db.internal'",
+                "Can't connect to server on …",
+            ),
+            ("", ""),
+        ] {
+            assert_eq!(audited_error(server), kept, "{server}");
+        }
+    }
+
+    #[test]
+    fn an_approved_read_says_whether_the_database_holds_it_to_reads() {
+        for (engine, sql) in [
+            (Engine::SqlServer, "SELECT dbo.my_udf(1)"),
+            (Engine::Postgres, "SELECT my_udf(1)"),
+            (Engine::DuckDb, "SELECT * FROM 'a.csv'"),
+        ] {
+            let verdict = agent_gate(engine, sql, Mode::ReadWrite);
+            assert!(
+                matches!(verdict, AgentVerdict::Approve(..)),
+                "{engine:?} {sql}"
+            );
+            for held in [true, false] {
+                let facts = approval_facts(engine, Mode::ReadWrite, &verdict, sql, false, held);
+                let says = |fact: &str| facts.iter().any(|each| each == fact);
+                assert_eq!(says(HELD_TO_READS), held, "{engine:?} {held}: {facts:?}");
+                assert_eq!(
+                    says(NOT_HELD_TO_READS),
+                    !held,
+                    "{engine:?} {held}: {facts:?}"
+                );
+            }
+        }
+        let verdict = agent_gate(Engine::SqlServer, "UPDATE t SET a = 1", Mode::ReadWrite);
+        let write = approval_facts(
+            Engine::SqlServer,
+            Mode::ReadWrite,
+            &verdict,
+            "UPDATE t SET a = 1",
+            false,
+            false,
+        );
+        assert!(
+            !write
+                .iter()
+                .any(|fact| fact == HELD_TO_READS || fact == NOT_HELD_TO_READS),
+            "a write is not said to be held to reads: {write:?}"
+        );
+    }
 
     #[test]
     fn an_audit_entry_keeps_a_cut_of_a_long_error_as_it_does_of_a_long_statement() {
@@ -1214,16 +2005,16 @@ mod tests {
     }
 
     #[test]
-    fn the_ping_prompt_names_the_connection_and_runs_nothing() {
-        let prompt = ping_prompt("Reports");
-        assert!(prompt.contains("Reports"), "{prompt}");
-        assert!(prompt.contains("runs nothing"), "{prompt}");
-        for name in ["Orders", "a b", "x'y"] {
-            let prompt = ping_prompt(name);
-            assert!(prompt.contains(name), "{prompt}");
-            for word in ["SQL", "try", "should", "Phase", "MCP"] {
-                assert!(!prompt.contains(word), "{name}: {prompt}");
-            }
+    fn the_approval_texts_say_the_statement_was_not_run() {
+        for text in [DENIED.to_string(), expired_text()] {
+            assert!(text.contains("statement"), "{text}");
+            assert!(text.contains("not run"), "{text}");
+            assert!(text.contains("DBDelve"), "{text}");
         }
+        assert!(
+            expired_text().contains(&format!("{} minutes", EXPIRY.as_secs() / 60)),
+            "{}",
+            expired_text()
+        );
     }
 }

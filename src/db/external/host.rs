@@ -57,6 +57,10 @@ pub(super) struct Host {
     running: Mutex<Option<u64>>,
     /// A plugin said the session is gone while the process lives on.
     lost: AtomicBool,
+    /// Whether the statements sent have left a transaction open, as
+    /// `sql::leaves` reads them, the way the workspace tracks it for a
+    /// profile. Kept with the session, so a write on any path sees it.
+    pub(super) in_transaction: AtomicBool,
 }
 
 /// What the reader thread shares with the handle.
@@ -115,8 +119,8 @@ struct Process {
 impl Host {
     pub(super) fn start(plugin: &'static Plugin) -> Result<Arc<Self>, DbError> {
         let mut command = Command::new(&plugin.executable);
-        // The AppImage's bundled libstdc++ would otherwise shadow the one a vendor's
-        // C++ driver was built against.
+        // The AppImage's bundled libraries would otherwise shadow the ones a vendor's
+        // driver was built against.
         match original_ld_library_path(|name| std::env::var_os(name)) {
             Some(Some(value)) => {
                 command.env("LD_LIBRARY_PATH", value);
@@ -206,6 +210,7 @@ impl Host {
             session: Mutex::new(()),
             running: Mutex::new(None),
             lost: AtomicBool::new(false),
+            in_transaction: AtomicBool::new(false),
         }))
     }
 
@@ -218,8 +223,9 @@ impl Host {
     ) -> Result<(InFlight<'_>, Receiver<Routed>), DbError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, answers) = mpsc::channel();
-        let query = matches!(request, Request::Query { .. });
-        let credit = query.then_some(WINDOW as i64);
+        // A write is cancelled as a query is, and carries no rows to credit.
+        let query = matches!(request, Request::Query { .. } | Request::Write { .. });
+        let credit = matches!(request, Request::Query { .. }).then_some(WINDOW as i64);
         {
             let mut routing = lock(&self.shared.routing);
             if let Some(cause) = &routing.reset {

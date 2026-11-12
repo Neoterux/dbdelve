@@ -29,11 +29,18 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   is typed. Connection rows carry their engine's logo (in their colour when
   they have one), a status dot read as the row is drawn, and the one in
   front is marked current; an empty project holds one "New connection in…"
-  row. A profile on an engine this build lacks (`Workspace::unavailable`) is
+  row. While a profile is in front, "Disconnect from <name>" heads the tree
+  whatever is typed (`palette::disconnect_row`), and is never the row the
+  list opens on unless nothing else matches: its label holds the name of the
+  connection in front, and typing that name and `enter` must not close it.
+  A profile on an engine this build lacks (`Workspace::unavailable`) is
   listed in its project greyed, its reason as the hint, with no status dot
   and never under All; `enter` goes straight to the Remove confirmation, and
   with no supported profile ⌘⇧P opens this scope to reach them
-  (`palette::without_a_connection`). `enter` on a project's row folds or unfolds it
+  (`palette::without_a_connection`). With connections but none in front, the
+  scope opens over the welcome surface too, with the lists its rows put up,
+  and any search but Commands and All lands on it. `enter` on a project's
+  row folds or unfolds it
   (`Command::ToggleProject`, the one row the palette stays up for); what is
   folded is `Workspace::collapsed_projects`, by name, kept for the session,
   starting unfolded, and the project in front is unfolded whenever a palette
@@ -65,8 +72,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   palette's own field (`Mode::NameProject`, checked by
   `projects::project_name_refusal` as it is typed, and offering no row for a
   rename to the name it has). File → New Project (`NewProject`, no default
-  chord) opens that, or the welcome surface's name field while there is no
-  connection.
+  chord) opens that, or the welcome surface's name field while no
+  connection is in front.
 - **A profile is hidden from agents until its owner says otherwise.**
   `Profile::agent_visible` is false for every profile, including each one
   written before the flag existed, and `Workspace::set_agent_visible` is the
@@ -105,22 +112,56 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   a call is addressed by its `CallId`, never by its place in a list.
   `finish_call` removes the call by id before it replies, so a call ended by
   two things at once answers at most once, and it writes the call's one log
-  line, so a hangup that arrives after the answer adds nothing. The log is
-  this session's own (`AgentState::log`, at most `LOG_CAP`): names, a code and
-  a time, never a row or a statement, and never written to disk. The ping
-  dialog is the first entry of every `dialog_layer` list, so it is drawn
-  behind every dialog the user is already answering, and only a click on
-  Approve answers it `executed`; every key answers `rejected`. Hiding or
-  removing a profile rejects the calls waiting on it, and the kill switch
-  answers every pending call before it drops the bridge, so a waiting client
-  reads a whole answer and not a bare end. The titlebar mark has three states
-  and is the same in all three titlebars: nothing while no bridge runs, the
-  MCP logo dim while one listens alone, and lit with the count of waiting calls
-  once a shim is attached or a call waits. It carries the kill switch and the
-  log in a popover, and the popover exists only while the mark does: turning
-  access on is the palette's. Nothing in it animates. The ping dialog starts
-  below the titlebar, so while a ping waits the mark and its kill switch can
-  still be clicked; the keyboard stays with the dialog, where every key denies.
+  line, so a hangup that arrives after the answer adds nothing. A statement
+  that waits for a person is drawn in the approval dialog
+  (`agent-approval`): the first entry of every `dialog_layer` list, so it is
+  drawn behind every dialog the user is already answering, and below the
+  titlebar. Deny is its one ring stop and Approve is a single mouse click that
+  works only after it has been on screen for `ARM_DELAY`, uncovered by another
+  dialog or the palette, counted afresh each time it is shown again; every key
+  denies, so no keystroke already in flight can approve what the person has
+  not read.
+  Two records are kept of a call, for two readers. The Agent activity dialog
+  reads the in-memory log (`AgentState::log`, at most `AUDIT_CAP`), this
+  session's own: names, a code, a time, the statement cut at `AUDIT_SQL_CAP`
+  and never a row, and an approved call is labelled as one. What outlives the
+  window is `agent-audit.jsonl`, beside `profiles.toml` and one per storage
+  variant, `0600`: an `outcome` line for every call and a `started` line for
+  each call about to be sent to the server, a catalog listing's included, with
+  no statement (`AgentState::record`, `note_started`). An approved read's is
+  written at Approve, before it waits its turn on the lane, so one that a hide
+  or the kill switch ends while it waits has a `started` line and was never
+  sent. The two
+  are paired by `(session, id)` and appended in the order the window handled
+  them, never sorted by time. A statement a person approved is kept whole and
+  its `started` line is written before anything is opened, and a write that
+  cannot be recorded is not run; a plain read's statement is cut as it is in
+  memory and its `started` line is best effort. No line holds a row value: a
+  failed call keeps only the first line of the server's error, scrubbed and cut
+  where it starts to quote or bracket something (`agent::audited_error`), since
+  that is where a server puts the value it names, Postgres's `DETAIL` a line
+  later. The agent's answer keeps the whole scrubbed error. A value a server
+  writes unquoted in its own words is the one thing the cut cannot tell apart.
+  `store::AuditLog` counts the lines once and keeps the count, and past
+  `AUDIT_SLACK` lines rewrites the file to its newest `AUDIT_KEEP`, verbatim;
+  the cut is by count, so a call that runs across it can keep its `outcome` and
+  lose its `started` line.
+  A line a crash left without its end is ended before the next is written. A
+  hangup withdraws a call that is still waiting for approval, and an approved
+  write that is already running finishes. Quitting does not wait for one, and
+  its `started` line is the trace it leaves. Hiding or removing a profile
+  rejects the calls waiting on it, and the kill switch answers every pending
+  call before it drops the bridge, so a waiting client reads a whole answer and
+  not a bare end. The wire speaks version 3; a shim already running from an
+  older build keeps speaking version 2 until its agent restarts it, and is
+  refused. The titlebar mark has three states and is the same in all three
+  titlebars: nothing while no bridge runs, the MCP logo dim while one listens
+  alone, and lit with the count of waiting calls once a shim is attached or a
+  call waits. It carries the kill switch and the log in a popover, and the
+  popover exists only while the mark does: turning access on is the palette's.
+  Nothing in it animates. The approval dialog starts below the titlebar, so
+  while one waits the mark and its kill switch can still be clicked; the
+  keyboard stays with the dialog, where every key denies.
 - **One window serves agents, and the lock beside the socket says which.** The
   window that binds holds an exclusive `flock` on `agent/s.lock` for as long as
   it serves, and the kernel lets go of it if the process dies. A window that
@@ -130,14 +171,24 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   this: a socket with a full backlog refuses a connect as a stale one does. A
   connection's first frame must arrive whole within its time, not each read
   within it, so a peer sending a byte at a time is closed as a silent one is.
-- **No connection is a state, not a prompt.** With no profiles and no form
-  open, the window is the welcome surface (`Workspace::render_welcome`): New
-  project, New connection, each project with an Add connection of its own, and
-  a Theme row whose button opens the theme palette, so a first launch can
-  leave the opaque default before connecting anywhere. ⌘⇧P there opens
-  Commands on the surface's own verbs (`palette::welcome_items`: new
-  connection, data file, project, imports, themes, fonts, Settings), and
-  nothing that needs a connection is listed.
+- **No connection is a state, not a prompt.** With no profile in front
+  (`Workspace::active` is `None`) and no form open, the window is the welcome
+  surface (`Workspace::render_welcome`): New project, New connection, each
+  project with an Add connection of its own, and a Theme row whose button
+  opens the theme palette, so a first launch can leave the opaque default
+  before connecting anywhere. Once there are connections it is home: they are
+  listed first, ahead of the engines, grouped as the Connections scope groups
+  them (No project, then each project with its own hung beneath it), each
+  row the palette's (logo in its colour, name, endpoint, a status dot while
+  it is open in the background), and a click or `enter` on one activates it.
+  An agent's approval and the visibility dialog a row opens are drawn there
+  too, since the connections they are about are listed.
+  ⌘⇧P there opens Commands on the surface's own verbs
+  (`palette::welcome_items`: new connection, data file, project, imports,
+  themes, fonts, Settings), plus the connections, and nothing that needs a
+  connection in front is listed. `profiles.toml`'s `active` names the profile
+  in front; written without one, the next launch starts home and connects
+  nothing.
   Importing from DBeaver or TablePlus starts there too, or from the File menu
   and the palette once connections exist, never from over the connection form
   (its root does not answer `ImportConnections`, so nothing typed into it is
@@ -209,6 +260,23 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   a query's error, where the failure is already being read. `ui::status_dot` draws a
   profile's state the same way in the status bar and on each connection row in
   the palette.
+- **Disconnect closes the connection in front and leads home**
+  (`Workspace::disconnect`: the palette's Commands and Connections scopes,
+  File → Disconnect, and `disconnect`, unbound by default). Only that one:
+  others open in the background stay, as a switch leaves them. It is refused,
+  as Select Database is, while a grid of the profile holds unapplied cell
+  edits, an import runs into it, or an export of every row runs on it (home
+  has no status bar to cancel it from). Otherwise the buffers are written, an
+  import dialog not yet running is closed (its column lookup answers by file,
+  not generation), data files waiting on the connect are forgotten (their
+  statements stay in their tabs), every query and relation tab's run and
+  count are cancelled over the connection before it goes, since a task left
+  going holds a clone of it, the generation moves on so a connect or an
+  answer still out is dropped (`issued_to`), and the connection is dropped,
+  which rolls back an open transaction, said in the notice. Tabs, buffers and snapshots stay, the
+  relation tabs' rows marked stale, so picking it again opens where it was.
+  Editing an idle profile never opens it; the edited config is used when it
+  is next picked.
 - **Refresh keeps the session; only a dead one is replaced.**
   `RefreshConnection`, from `Cmd+Shift+R`, the palette and the titlebar's button
   alike, runs `Workspace::refresh_schema`: the relations and routines are read
@@ -525,10 +593,15 @@ The shape a change to the main pane has to fit (`session.rs`, with the
 ## Completion
 
 `src/completion.rs` offers the schemas, relations and routines the loaded
-catalog holds, the columns of the relations a statement actually names, and the
-keywords that carry a statement's shape. It is a `CompletionProvider`
-implementation and nothing else: the popup, its scroll and its keys all belong
-to gpui-component.
+catalog holds, the columns of the relations a statement actually names, the
+keywords that carry a statement's shape, and the dialect's built-in functions
+and values. It is a `CompletionProvider` implementation and nothing else: the
+popup, its scroll and its keys all belong to gpui-component.
+
+The built-ins are data, one table per dialect under `src/db/builtins/` read
+through `Engine::builtins`, offered wherever keywords are and never where a
+relation belongs; a keyword spelled like one is offered once, as the built-in,
+which writes a function up to its open parenthesis and a value bare.
 
 **Columns are not in the catalog, and must not be put there.** Fetching every
 column of every relation at connect is unbounded: on a large schema it is a
@@ -589,7 +662,8 @@ one waiting on a column ignores whatever is typed into it.
 
 - **Storage** is decided in `store.rs`: Application Support on macOS,
   `XDG_DATA_HOME` (or `~/.local/share`) on Linux, `APPDATA` on Windows. Crash
-  logs are state, not cache: `~/Library/Logs`, `XDG_STATE_HOME`, `LOCALAPPDATA`.
+  and diagnostic logs are state, not cache: `~/Library/Logs`, `XDG_STATE_HOME`,
+  `LOCALAPPDATA` (`logging::directory`).
   A `profiles.toml` that will not load, whether it would not read or would not
   parse, is moved aside to `profiles.toml.broken` before anything can save
   over it; if it cannot be moved, nothing is saved for the rest of the session

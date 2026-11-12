@@ -16,26 +16,23 @@ pub(crate) enum Tool {
     ListTables,
     /// Describes one relation the catalog holds: columns, keys and indexes.
     DescribeTable,
-    /// Runs one statement the gate lets an agent run without asking.
+    /// Runs one statement: a read at once, anything else once the user has
+    /// approved it in the window.
     ExecuteSql,
     /// Asks the database for the plan of one statement, without running it
     /// unless asked to measure it.
     ExplainQuery,
-    /// Asks the person at the window to answer: nothing runs for it, so it
-    /// only ever waits to be answered, to expire, or to be hung up.
-    Ping,
 }
 
 impl Tool {
     /// Every tool, in the order the agent is shown them.
-    pub(crate) const ALL: [Tool; 7] = [
+    pub(crate) const ALL: [Tool; 6] = [
         Tool::ListConnections,
         Tool::ListSchemas,
         Tool::ListTables,
         Tool::DescribeTable,
         Tool::ExecuteSql,
         Tool::ExplainQuery,
-        Tool::Ping,
     ];
 
     /// The name the agent calls it by: the spelling serde writes for it.
@@ -47,7 +44,6 @@ impl Tool {
             Tool::DescribeTable => "describe_table",
             Tool::ExecuteSql => "execute_sql",
             Tool::ExplainQuery => "explain_query",
-            Tool::Ping => "ping",
         }
     }
 
@@ -68,13 +64,10 @@ impl Tool {
                 "Describes one table or view of a named connection: its columns with type, nullability and default, its primary key, its foreign keys and its indexes."
             }
             Tool::ExecuteSql => {
-                "Runs one read statement on a named connection exactly as written and returns the first rows, header first. A statement that would change data is not run."
+                "Runs one statement on a named connection exactly as written; one statement per call. A read answers at once with the first rows, header first. A statement that changes data, reads a file or URL, or calls a function DBDelve does not list waits until the user approves or denies it in the DBDelve window, and the call returns when they answer. The status is one of executed, rejected, expired, refused_by_gate or failed. DELETE, DROP, TRUNCATE, most ALTER and more than one statement per call are refused."
             }
             Tool::ExplainQuery => {
-                "Returns the plan the database would use for one statement of a named connection, findings first and then the plan tree. With `analyze` true it runs the statement to measure it, which only a read may do; without it nothing is run."
-            }
-            Tool::Ping => {
-                "Asks the user, in the DBDelve window, to answer a test from the agent for one connection. Waits until the user answers. Opens no database connection and runs nothing."
+                "Returns the plan the database would use for one statement of a named connection, findings first and then the plan tree. With `analyze` true it runs the statement to measure it, which only a read may do; without it nothing is run. A statement that needs the user's approval is not run by this tool."
             }
         }
     }
@@ -118,10 +111,6 @@ impl Tool {
                     "analyze": { "type": "boolean" },
                 })
             }
-            Tool::Ping => {
-                schema.insert("required".to_string(), json!(["connection"]));
-                json!({ "connection": { "type": "string" } })
-            }
         };
         schema.insert("properties".to_string(), properties);
         schema.insert("additionalProperties".to_string(), json!(false));
@@ -143,14 +132,29 @@ mod tests {
     }
 
     #[test]
+    fn execute_sql_says_a_change_waits_for_the_user() {
+        let text = Tool::ExecuteSql.description();
+        for word in [
+            "approve",
+            "DBDelve window",
+            "executed",
+            "rejected",
+            "expired",
+            "refused_by_gate",
+        ] {
+            assert!(text.contains(word), "{word}: {text}");
+        }
+        assert!(!text.contains("is not run"), "{text}");
+    }
+
+    #[test]
     fn no_tool_takes_an_argument_it_does_not_name() {
         for tool in Tool::ALL {
             let schema = tool.input_schema();
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], false);
         }
-        assert_eq!(Tool::Ping.input_schema()["required"], json!(["connection"]));
-        assert_eq!(Tool::ALL.len(), 7);
+        assert_eq!(Tool::ALL.len(), 6);
         assert_eq!(
             Tool::ListSchemas.input_schema()["required"],
             json!(["connection"])
@@ -168,6 +172,15 @@ mod tests {
             json!({"type": "string"})
         );
         assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));
+        // The statement is the only text an agent supplies to an approval.
+        let mut named: Vec<_> = schema["properties"]
+            .as_object()
+            .expect("the properties are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["connection", "sql"]);
         let schema = Tool::ExplainQuery.input_schema();
         assert_eq!(schema["required"], json!(["connection", "sql"]));
         assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));

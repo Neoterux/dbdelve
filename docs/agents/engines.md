@@ -867,11 +867,12 @@ Decided, and not to be re-litigated:
   writes no `SUBSTR`; a user's past the value's length is Db2's error.
 - **An engine through ODBC is its built-in spec with the plugin's driver.** The
   form's SQL dialect picks the spec, so quoting, paging and the Read-only hold
-  are the dialect's own, while abilities are `Target`'s read-only tier
-  (`plugins.md`). After a Test the driver's `SQL_DBMS_NAME` is shown and, when
-  it names a built-in (`EngineSpec::dbms_names`), suggests that dialect, one
-  click to take it; a dialect that also has a built-in driver says the built-in
-  can edit rows.
+  are the dialect's own, while abilities are `Target`'s, for a plugin only
+  those proven through a real driver (`plugins.md`). After a Test the
+  driver's `SQL_DBMS_NAME` is shown and, when it names a built-in
+  (`EngineSpec::dbms_names`), suggests that dialect, one click to take it; a
+  dialect that also has a built-in driver says what the built-in does that
+  the plugin cannot.
 
 ## Agent connections
 
@@ -888,7 +889,7 @@ carries, engine by engine:
 - **File engines are opened read-only by the engine.** SQLite and DuckDB open
   with the engine's read-only flag, and Turso takes `PRAGMA query_only`, so a
   write the gate misjudged still cannot change the file.
-- **Every server session opened for an agent starts read-only.** On Postgres,
+- **Every server session opened for an agent's read starts read-only.** On Postgres,
   MySQL and MariaDB the hold rides in the connection's config
   (`with_read_only_hold`), so the side session `sizes()` reads through and the
   sessions that cancel a statement carry it from their first statement. SQL
@@ -897,6 +898,21 @@ carries, engine by engine:
   MongoDB has no such setting either and is held by the gate alone; its
   `sizes()` runs DBDelve's fixed `$collStats` aggregation on the agent's own
   client and opens no other session.
+- **An approved write opens its own writable connection for that call and
+  drops it.** It takes no read-only hold, so a server session starts as the
+  profile's own, and a session change the statement makes ends with the
+  connection. Its statement timeout is `WRITE_TIMEOUT` (600 seconds), or the
+  profile's when that is shorter. It waits at most `LOCK_WAIT` (30 seconds) for
+  a lock on Postgres (`lock_timeout`), and on MySQL and MariaDB for a row lock
+  (`innodb_lock_wait_timeout`) and a metadata lock (`lock_wait_timeout`); the
+  read lane's sessions do not carry that wait. On MySQL nothing bounds a
+  running DDL: `max_execution_time` bounds only a `SELECT`. Nothing cancels a
+  running approved write. A write stopped by a client-side timer, on MongoDB or
+  Redis once it has run its whole bound since it was sent, answers that the
+  outcome is not known (time spent on the keychain, a tunnel or the open is not
+  counted, and a write that never opened was never sent); a failed
+  Postgres `CREATE INDEX CONCURRENTLY` answers that an invalid index may remain.
+  A DuckDB write is refused.
 - **DuckDB is opened per call and dropped when the call ends.** A second DuckDB
   instance's view of a file is frozen at open, so a kept one would read a copy
   that goes stale as the user commits. Databases attached to the user's

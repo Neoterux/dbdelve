@@ -50,7 +50,7 @@ pub(crate) fn socket_is_live() -> bool {
 
 /// What the agent is told: `executed` is the app's, for a call it carried out;
 /// `refused_by_gate` is the app's, for a name that resolves to nothing visible
-/// or a bridge that is full; `expired` is the app's, for a ping nobody answered;
+/// or a bridge that is full; `expired` is the app's, for an approval nobody answered;
 /// `cancelled` is the app's, logged only, because the caller has already gone;
 /// `rejected` is the human's no, from the dialog or the kill switch;
 /// `app_not_running` is the shim's, for a connection that failed or closed
@@ -92,9 +92,9 @@ pub(crate) struct Reply {
     pub(crate) text: String,
 }
 
-// ponytail: the one fixed wait for a person to answer a ping. Phase 6 may tune
-// it, and it is not a setting: a call a person has walked away from has to end
-// by itself, and nothing here answers it for them.
+// ponytail: the one fixed wait for a person to answer an approval. It is not a
+// setting: a call a person has walked away from has to end by itself, and
+// nothing here answers it for them.
 pub(crate) const EXPIRY: Duration = Duration::from_secs(300);
 
 /// A call's identity: the connection it arrived on, which is also how it is
@@ -136,6 +136,9 @@ pub(crate) enum Inbound {
         connection: Option<String>,
         args: CallArgs,
         reply: std::sync::mpsc::SyncSender<Reply>,
+        /// Set by the hangup watcher before it sends `Hangup`, so the window
+        /// can know the caller left before it hears so.
+        gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// The caller closed its connection, so nobody is waiting for the call
     /// any more. Sent for every call, answered or not, so one that arrives

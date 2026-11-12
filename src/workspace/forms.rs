@@ -9,10 +9,12 @@ use gpui::{Animation, AnimationExt, Div, PathPromptOptions, StyledText, ease_out
 use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::spinner::Spinner;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable};
 
-use super::agent::{ping_prompt, visibility_facts};
+use super::agent::{approval_facts, visibility_facts};
 use super::folders::{DragLabel, DragShortcut};
 use super::welcome::{self, Part, Pose};
 use super::*;
@@ -23,10 +25,14 @@ use crate::explorer::{
     Landing, Member, PINNED_GROUP, Pin, QUERIES_GROUP, Shortcut, ShortcutDatabase, Shortcuts,
     is_schema_row, landing, relation_copies, saved_query,
 };
+use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
 use crate::session::PendingDelete;
 use crate::sql::{Destructive, Stop};
-use crate::ui::{Status, code_lines, raised_card, row_icon_tinted};
+use crate::ui::{
+    Status, button_inked, code_lines, code_lines_visible, dot, raised_card, row_icon_tinted,
+    size_fact,
+};
 
 impl Workspace {
     pub(crate) fn render_connection_form(
@@ -468,14 +474,18 @@ impl Workspace {
         if matches!(fields, Fields::Server | Fields::ConnectionString) {
             // Host and Port are the far end of the forward, which is easy to
             // read as this machine's view of the network.
+            let socket = form.target().reaches_socket_over_ssh();
+            let hint = if socket {
+                "Host and port are as the SSH host sees them: localhost is the SSH host \
+                 itself. A Host such as /var/run/postgresql is its Unix socket directory; \
+                 Run as is the OS user sudo opens the socket as, for peer authentication."
+            } else {
+                "Host and port are as the SSH host sees them: localhost is the SSH host itself."
+            };
             security.push(
                 ui::option_row(
                     "SSH tunnel",
-                    Some(
-                        "Host and port are as the SSH host sees them: localhost is the SSH host \
-                         itself."
-                            .into(),
-                    ),
+                    Some(hint.into()),
                     ui::switch("ssh-tunnel", form.ssh, t)
                         .on_click(cx.listener(Self::toggle_ssh_tunnel)),
                     t,
@@ -490,7 +500,7 @@ impl Workspace {
                               control: Input| {
                     nested_field_row(layout::SPACE_MD, id, label, input, control, t)
                 };
-                let rows = [
+                let mut rows = vec![
                     nested("ssh-host", "SSH host", &form.ssh_host, bare(&form.ssh_host))
                         .child(port_field(&form.ssh_port, t)),
                     nested("ssh-user", "SSH user", &form.ssh_user, bare(&form.ssh_user)),
@@ -507,6 +517,14 @@ impl Workspace {
                         cx,
                     )),
                 ];
+                if socket {
+                    rows.push(nested(
+                        "ssh-run-as",
+                        "Run as",
+                        &form.ssh_run_as,
+                        bare(&form.ssh_run_as),
+                    ));
+                }
                 security.extend(
                     rows.into_iter()
                         .enumerate()
@@ -629,22 +647,11 @@ impl Workspace {
     /// Test and what it last said, then the way out and the way in.
     fn render_form_footer(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let form = self.form.as_ref().expect("drawn only on the form");
-        let status = match (&form.error, &form.test) {
-            (Some(error), _) => Some((Status::Failed, one_line(error))),
-            (None, Some(ConnectionTest::Running(_))) => {
-                Some((Status::Connecting, "Testing connection…".to_string()))
-            }
-            (None, Some(ConnectionTest::Passed(reported))) => Some((
-                Status::Connected,
-                reported
-                    .as_ref()
-                    .map_or_else(|| "Connection succeeded.".to_string(), Reported::sentence),
-            )),
-            (None, Some(ConnectionTest::Failed(message))) => {
-                Some((Status::Failed, one_line(message)))
-            }
-            (None, None) => None,
-        };
+        let status = footer_status(
+            form.notice.as_ref(),
+            form.error.as_ref(),
+            form.test.as_ref(),
+        );
         let commit = if form.editing.is_some() {
             "Save"
         } else {
@@ -748,10 +755,18 @@ impl Workspace {
         };
         let engine = suggested_dialect(form.engine, reported)?;
         // Only the overlap with a built-in is worth a sentence: the built-in
-        // can edit rows, which nothing through a plugin can.
+        // does what a plugin speaking the same dialect cannot.
+        let through_plugin = Target {
+            engine,
+            ..form.target()
+        };
         let built_in = engine.has_built_in_driver().then(|| {
+            let more = match through_plugin.edits_rows() {
+                true => "imports rows and copies DDL",
+                false => "can edit rows",
+            };
             format!(
-                "DBDelve also has a built-in {} driver, which can edit rows.",
+                "DBDelve also has a built-in {} driver, which {more}.",
                 engine.label()
             )
             .into()
@@ -799,6 +814,7 @@ impl Workspace {
             &form.ssh_port,
             &form.ssh_user,
             &form.ssh_identity_file,
+            &form.ssh_run_as,
         ]
         .iter()
         .any(|input| input.focus_handle(cx).is_focused(window))
@@ -907,6 +923,52 @@ impl Workspace {
         if behind.is_none() && !self.dialog_focus.contains_focused(window, cx) {
             self.focus_before_dialog.replace(window.focused(cx));
         }
+        // The palette is drawn over every dialog without changing which one is
+        // in front, so an approval under it is not being shown either.
+        let covered = self.palette.is_some();
+        // An approval's Approve counts its wait from when the person can see the
+        // dialog: raised to the front, a different call come to the front, or
+        // the palette over it gone.
+        if front == Some("agent-approval")
+            && let Some(id) = self.front_approval_id()
+        {
+            if covered {
+                // Forgotten, so it is revealed afresh once the palette goes;
+                // the window still asks for attention once, as it may be
+                // behind another application.
+                if self.agent.revealed.is_some() || self.agent.attended != Some(id) {
+                    cx.on_next_frame(window, move |workspace, window, cx| {
+                        if workspace.agent.attended != Some(id) {
+                            workspace.reveal_approval(window, cx);
+                        }
+                        workspace.agent.revealed = None;
+                    });
+                }
+            } else if raised || self.agent.revealed != Some(id) {
+                cx.on_next_frame(window, |workspace, window, cx| {
+                    workspace.reveal_approval(window, cx)
+                });
+            }
+        }
+        // An Approve is live only while its own dialog is the one in front and
+        // nothing covers it: a dialog or the palette raised over it, or another
+        // call in front of it, ends the arm, so what is shown again is armed
+        // afresh.
+        if self.agent.armed.is_some()
+            && (covered
+                || front != Some("agent-approval")
+                || self.front_approval_id() != self.agent.armed)
+        {
+            cx.on_next_frame(window, |workspace, _, cx| {
+                if workspace.palette.is_some()
+                    || workspace.dialog_in_front.get() != Some("agent-approval")
+                    || workspace.front_approval_id() != workspace.agent.armed
+                {
+                    workspace.agent.armed = None;
+                    cx.notify();
+                }
+            });
+        }
         if raised {
             // Every dialog opens on its primary button, as a native one does,
             // except the one that widens what an agent may reach: it opens on
@@ -1000,7 +1062,7 @@ impl Workspace {
             }
             Some("import-rows") | None => 0,
             // Deny alone: Approve is click-only and never a stop.
-            Some("agent-ping") => 1,
+            Some("agent-approval") => 1,
             Some("agent-audit") => 1,
             Some(_) => 2 + checkbox,
         }
@@ -1133,8 +1195,8 @@ impl Workspace {
             ("pending-run", _) => self.cancel_pending_run(cx),
             ("agent-visibility", 0) => self.confirm_agent_visibility(cx),
             ("agent-visibility", _) => _ = self.cancel_agent_visibility(cx),
-            // Every index denies: no key approves a ping.
-            ("agent-ping", _) => _ = self.deny_front_ping(cx),
+            // Every index denies: no key approves an agent's call.
+            ("agent-approval", _) => _ = self.deny_front_approval(cx),
             ("agent-audit", _) => _ = self.close_agent_audit(cx),
             ("discard", 0) => self.confirm_discard_close(window, cx),
             ("discard", _) => _ = self.cancel_discard_close(cx),
@@ -1582,7 +1644,7 @@ impl Workspace {
     /// What agents did this session, newest first: one block per call with its
     /// tool, connection, verdict, row counts, time and statement, and the full
     /// error of a call that failed. Never a row. Drawn below the titlebar, as
-    /// the ping is, so the mark stays reachable.
+    /// an approval is, so the mark stays reachable.
     ///
     /// ponytail: every entry is laid out while the dialog is open. The upgrade
     /// is a virtual list, if five hundred entries ever prove slow.
@@ -1706,27 +1768,83 @@ impl Workspace {
         )
     }
 
-    /// What an agent's ping asks the human: a test for one connection, named by
-    /// the profile's own current name read by id, never by anything the agent
-    /// sent. Deny is the ring's only stop; Approve is a click and nothing else.
-    /// Nothing is drawn unless the oldest waiting call still has its profile.
-    pub(crate) fn render_agent_ping(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// What an agent asks to run: the connection by the profile's own name, the
+    /// facts the gate and the profile give, and the statement exactly as the
+    /// agent sent it, in a block that scrolls. Deny is the ring's only stop;
+    /// Approve is a click, off until [`agent::ARM_DELAY`] has passed since this
+    /// was drawn, and never a stop for a key. The profile is read by id, never
+    /// by anything the agent sent. Nothing is drawn unless the oldest waiting
+    /// call still has its profile.
+    pub(crate) fn render_agent_approval(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
-        let call = self.front_ping()?;
+        let call = self.front_approval()?;
         let id = call.id;
+        let approval = &call.approval;
         let profile = self
             .profiles
             .iter()
             .find(|profile| profile.id == call.profile_id)?;
+        let engine = profile.config.engine();
+        // What Approve will compare the pending statement with: the source
+        // string, never the marked text drawn from it. Written only on a
+        // change, so a frame costs one comparison.
+        {
+            let mut shown = self.approval_shown.borrow_mut();
+            if shown
+                .as_ref()
+                .is_none_or(|(shown_id, sql)| *shown_id != id || *sql != approval.sql)
+            {
+                *shown = Some((id, approval.sql.clone()));
+            }
+        }
+        // The block's scroll offset, fresh for each call.
+        let scroll = {
+            let mut kept = self.approval_scroll.borrow_mut();
+            match kept.as_ref() {
+                Some((kept_id, handle)) if *kept_id == id => handle.clone(),
+                _ => {
+                    let handle = gpui::ScrollHandle::new();
+                    *kept = Some((id, handle.clone()));
+                    handle
+                }
+            }
+        };
+        let code = fonts(cx).editor.clone();
+        let marker = approval_marker(t);
+        let lines = code_lines_visible(
+            &approval.sql,
+            engine.syntax(),
+            &cx.theme().highlight_theme,
+            marker,
+        );
+        let size = size_fact(&approval.sql);
+        // The size sits under the statement it counts, so it is not said twice.
+        let facts = approval_facts(
+            engine,
+            profile.mode,
+            &approval.verdict,
+            &approval.sql,
+            approval.locks_the_file,
+            approval.config.agent_reads_are_held(),
+        )
+        .into_iter()
+        .filter(|fact| *fact != size)
+        .map(|fact| div().child(fact));
+        // Everything on the card keeps its height but the statement block,
+        // which gives up its own down to nothing before the buttons leave a
+        // short window: they are the only way to answer.
+        let fixed = || div().flex_shrink_0();
+        let waiting = self.agent.calls.len().saturating_sub(1);
         let deny_workspace = cx.entity().downgrade();
         let approve_workspace = deny_workspace.clone();
+        let armed = self.agent.armed == Some(id);
 
         Some(
             div()
-                // Starts below the titlebar rather than over it: the agent
-                // mark's waiting count and its turn-off item must stay
-                // clickable while a ping waits, and the window controls live
-                // in that strip too.
+                // Below the titlebar rather than over it: the agent mark's
+                // waiting count and its turn-off item must stay clickable
+                // while an approval waits, and the window controls live in
+                // that strip too.
                 .absolute()
                 .top(px(layout::TITLEBAR_HEIGHT))
                 .left_0()
@@ -1736,32 +1854,116 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
+                .py(px(layout::SPACE_LG))
                 .child(
                     dialog(t)
-                        .child(section_label(t, "Agent"))
+                        .w(px(layout::APPROVAL_DIALOG_WIDTH))
+                        .max_w(gpui::relative(0.9))
+                        .max_h_full()
+                        .child(fixed().child(section_label(t, "Agent")))
                         .child(
-                            div()
+                            fixed()
+                                .flex()
+                                .gap(px(layout::SPACE_SM))
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
-                                .text_color(t.text)
-                                .child("Ping from an agent"),
+                                .child(div().text_color(t.text).child(profile.name.clone()))
+                                .child(div().text_color(t.text_muted).child(engine.label())),
                         )
                         .child(
-                            div()
+                            fixed()
+                                .debug_selector(|| "agent-approval-facts".into())
+                                .flex()
+                                .flex_col()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
-                                .child(ping_prompt(&profile.name)),
+                                .children(facts),
                         )
                         .child(
+                            fixed()
+                                .debug_selector(|| "agent-approval-label".into())
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child("Statement from the agent, exactly as sent"),
+                        )
+                        // Nothing on this surface moves on its own, so the block
+                        // has no smooth-scroll modifier and its scrollbar is
+                        // always drawn rather than faded in: a statement that
+                        // goes on below the fold shows that it does. One
+                        // element per line, so none is left out of a long
+                        // statement.
+                        .child(
                             div()
+                                .relative()
+                                .flex()
+                                .flex_col()
+                                .min_h(px(0.))
+                                .max_h(px(layout::APPROVAL_TEXT_MAX_HEIGHT))
+                                .child(
+                                    div()
+                                        .id("agent-approval-sql")
+                                        .debug_selector(|| "agent-approval-sql".into())
+                                        .track_scroll(&scroll)
+                                        .overflow_y_scroll()
+                                        .min_h(px(0.))
+                                        // Framed as every other statement on
+                                        // a modal is, so the agent's text is
+                                        // set apart from DBDelve's facts by
+                                        // more than its font.
+                                        .p(px(layout::SPACE_SM))
+                                        .rounded(px(layout::RADIUS_CONTROL))
+                                        .bg(t.surface)
+                                        .font_family(code)
+                                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                        .text_color(t.text)
+                                        .children(lines.into_iter().enumerate().map(
+                                            |(index, line)| {
+                                                div()
+                                                    .debug_selector(move || {
+                                                        format!("agent-approval-line-{index}")
+                                                    })
+                                                    .child(line)
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .debug_selector(|| "agent-approval-scrollbar".into())
+                                        .child(
+                                            Scrollbar::vertical(&scroll)
+                                                .id(("agent-approval-scrollbar", id.0))
+                                                .mode(ScrollbarMode::Always),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            fixed()
+                                .debug_selector(|| "agent-approval-size".into())
+                                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                .text_color(t.text_muted)
+                                .child(size),
+                        )
+                        .when(waiting > 0, |card| {
+                            card.child(
+                                fixed()
+                                    .debug_selector(|| "agent-approval-waiting".into())
+                                    .text_size(px(layout::chrome(layout::TEXT_SM)))
+                                    .text_color(t.text_muted)
+                                    .child(format!("{waiting} more waiting")),
+                            )
+                        })
+                        .child(
+                            fixed()
                                 .flex()
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
                                     self.choice(
-                                        "agent-ping",
+                                        "agent-approval",
                                         0,
                                         button(
-                                            "deny-agent-ping",
+                                            "deny-agent-approval",
                                             "Deny",
                                             Tone::Quiet,
                                             Control::Standard,
@@ -1770,7 +1972,7 @@ impl Workspace {
                                         .on_click(
                                             move |_, _, cx| {
                                                 _ = deny_workspace.update(cx, |workspace, cx| {
-                                                    workspace.deny_ping(id, cx);
+                                                    workspace.deny_call(id, cx);
                                                 });
                                             },
                                         ),
@@ -1781,28 +1983,34 @@ impl Workspace {
                                 // alone: a press that began on one call's button
                                 // cannot finish on the next call's.
                                 .child(
-                                    div().debug_selector(|| "agent-ping-approve".into()).child(
-                                        button(
-                                            format!("approve-ping-{}", id.0),
-                                            "Approve",
-                                            Tone::Quiet,
-                                            Control::Standard,
-                                            t,
-                                        )
-                                        // A key cannot move onto it, so a key
-                                        // cannot press it.
-                                        .tab_stop(false)
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                _ = approve_workspace.update(
-                                                    cx,
-                                                    |workspace, cx| {
-                                                        workspace.approve_ping(id, cx);
-                                                    },
-                                                );
-                                            },
+                                    div()
+                                        .debug_selector(|| "agent-approval-approve".into())
+                                        .child(
+                                            button_inked(
+                                                format!("approve-write-{}", id.0),
+                                                "Approve",
+                                                Tone::Quiet,
+                                                Control::Standard,
+                                                approve_ink(t, armed),
+                                            )
+                                            // A key cannot move onto it, so a key
+                                            // cannot press it.
+                                            .tab_stop(false)
+                                            .disabled(!armed)
+                                            .on_click(
+                                                move |event, _, cx| {
+                                                    if !approves(event) {
+                                                        return;
+                                                    }
+                                                    _ = approve_workspace.update(
+                                                        cx,
+                                                        |workspace, cx| {
+                                                            workspace.approve_call(id, cx);
+                                                        },
+                                                    );
+                                                },
+                                            ),
                                         ),
-                                    ),
                                 ),
                         ),
                 )
@@ -2787,6 +2995,7 @@ impl Workspace {
         let profile_id = profile.id.clone();
         let menu_leaves = leaves.clone();
         let menu_workspace = workspace.clone();
+        let syntax = profile.config.engine().syntax();
         let active_schema = profile.active_schema().map(gpui::SharedString::from);
         let menu_schema = active_schema.clone();
         let picks_schema = profile.config.target().picks_schema();
@@ -2841,18 +3050,23 @@ impl Workspace {
                         .as_ref()
                         .filter(|(row, _)| row.as_str() == id && cx.has_active_drag())
                         .map(|(_, after)| *after);
-                    let active = is_schema_row(entry.item().id.as_str())
-                        && active_schema.as_ref() == Some(&label);
+                    let schema_row = is_schema_row(id);
+                    let active = schema_row && active_schema.as_ref() == Some(&label);
                     let open = query
                         .as_ref()
                         .is_some_and(|name| open_queries.contains(name));
+                    let marker = match (active, open) {
+                        (true, _) => Some((t.accent, "Current schema")),
+                        (_, true) => Some((t.text_muted, "Open in a tab")),
+                        _ => None,
+                    };
                     let rename = renaming.as_ref().filter(|(row, ..)| row.as_str() == id);
                     let matched = highlights
                         .get(entry.item().id.as_str())
                         .map_or(&[][..], Vec::as_slice);
-                    // Three ranks, three weights: a schema owns the column, a
-                    // category only labels the run of objects under it, and the
-                    // objects themselves are what the eye is actually hunting for.
+                    // A schema is a row like any other, set apart by its icon
+                    // and a little weight; a category only labels the run of
+                    // objects under it, in the voice of the Queries group.
                     let (label, row) = match (leaf, entry.depth()) {
                         // Should be there and is not: greyed, and opens nothing.
                         _ if missing => (
@@ -2871,7 +3085,7 @@ impl Workspace {
                             highlighted(label, matched, t),
                             ListItem::new(index)
                                 .text_color(t.text)
-                                .font_weight(FontWeight::SEMIBOLD),
+                                .font_weight(FontWeight::MEDIUM),
                         ),
                         (None, _) => (
                             StyledText::new(label.to_uppercase()),
@@ -2893,15 +3107,20 @@ impl Workspace {
                                 ..
                             }),
                         ) => object_icon(object.kind),
-                        _ if query.is_some() || missing => icon::SAVED_QUERY,
-                        (None, Some(Shortcut::Folder(_)))
-                            if entry.is_folder() && entry.is_expanded() =>
-                        {
-                            icon::FOLDER_OPEN
-                        }
-                        (None, Some(Shortcut::Folder(_))) => icon::FOLDER,
+                        _ if query.is_some() || missing => saved_query_icon(syntax),
                         _ if entry.is_expanded() => icon::CHEVRON_DOWN,
                         _ => icon::CHEVRON_RIGHT,
+                    };
+                    let heading_icon = if id == QUERIES_GROUP {
+                        Some(queries_group_icon(syntax))
+                    } else if pinned_group {
+                        Some(icon::PIN)
+                    } else if schema_row {
+                        Some(icon::SCHEMA)
+                    } else if matches!(shortcut, Some(Shortcut::Folder(_))) {
+                        Some(icon::FOLDER)
+                    } else {
+                        None
                     };
                     let row = row
                         .mx(px(layout::SPACE_XS))
@@ -2926,6 +3145,7 @@ impl Workspace {
                                     }
                                     false => row_icon(t, row_icon_path).into_any_element(),
                                 })
+                                .when_some(heading_icon, |row, path| row.child(row_icon(t, path)))
                                 .child(match rename {
                                     Some((_, input, error)) => {
                                         rename_field(label, input, error.clone(), t)
@@ -2934,12 +3154,9 @@ impl Workspace {
                                     // first, which this is once anything is pinned:
                                     // the empty text keeps it a line tall rather
                                     // than an icon tall.
-                                    None if pinned_group => div()
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .child(row_icon(t, icon::PIN))
-                                        .child("\u{200B}"),
+                                    None if pinned_group => {
+                                        div().flex_1().flex().items_center().child("\u{200B}")
+                                    }
                                     None => div()
                                         .flex_1()
                                         .min_w_0()
@@ -2959,17 +3176,6 @@ impl Workspace {
                                             .child(schema),
                                     )
                                 })
-                                .when(rename.is_none() && (active || open), |row| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .whitespace_nowrap()
-                                            .text_color(t.text_faint)
-                                            .text_size(px(layout::chrome(layout::TEXT_XS)))
-                                            .font_weight(FontWeight::NORMAL)
-                                            .child(if open { "open" } else { "active" }),
-                                    )
-                                })
                                 .when_some(leaf.and_then(|leaf| leaf.size), |row, size| {
                                     row.child(
                                         div()
@@ -2980,6 +3186,28 @@ impl Workspace {
                                             .child(human_bytes(size)),
                                     )
                                 })
+                                // In a slot as wide as the icon column, so the
+                                // dot has something to hover and sits as far
+                                // in from the right edge as the icons do from
+                                // the left.
+                                .when_some(
+                                    marker.filter(|_| rename.is_none()),
+                                    |row, (fill, tip)| {
+                                        row.child(
+                                            div()
+                                                .id("explorer-marker")
+                                                .flex_none()
+                                                .size(px(layout::chrome(layout::ICON_SIZE)))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(dot(fill))
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(tip).build(window, cx)
+                                                }),
+                                        )
+                                    },
+                                )
                                 .when_some(line, |row, after| {
                                     // Out through `ListItem`'s own `py_1` to
                                     // the row's edge.
@@ -3832,4 +4060,138 @@ pub(super) fn explorer_drawn(profile: &Profile) -> bool {
     matches!(&profile.catalog, CatalogState::Loaded(catalog, _) if !catalog.schemas.is_empty())
         || !profile.session.saved_queries.is_empty()
         || profile.shortcuts != Shortcuts::default()
+}
+
+/// What the form's footer says beside Test: a Help command's notice while it
+/// lasts, then the form's error, then the last test.
+fn footer_status(
+    notice: Option<&(Status, String)>,
+    error: Option<&String>,
+    test: Option<&ConnectionTest>,
+) -> Option<(Status, String)> {
+    if let Some((status, message)) = notice {
+        return Some((*status, one_line(message)));
+    }
+    match (error, test) {
+        (Some(error), _) => Some((Status::Failed, one_line(error))),
+        (None, Some(ConnectionTest::Running(_))) => {
+            Some((Status::Connecting, "Testing connection…".to_string()))
+        }
+        (None, Some(ConnectionTest::Passed(reported))) => Some((
+            Status::Connected,
+            reported
+                .as_ref()
+                .map_or_else(|| "Connection succeeded.".to_string(), Reported::sentence),
+        )),
+        (None, Some(ConnectionTest::Failed(message))) => Some((Status::Failed, one_line(message))),
+        (None, None) => None,
+    }
+}
+
+/// How a `[U+XXXX]` marker in the approval's statement is drawn: DBDelve's own,
+/// on the accent so it cannot pass for the statement's text, in the ink every
+/// other label on the accent wears.
+fn approval_marker(t: Theme) -> gpui::HighlightStyle {
+    gpui::HighlightStyle {
+        color: Some(t.on_accent.into()),
+        background_color: Some(t.accent.into()),
+        ..Default::default()
+    }
+}
+
+/// The ink of Approve's label: the faint one until it arms, so the one redraw
+/// the arm causes is a change the person can see, and the quiet tone's once it
+/// has. A change of state, never a countdown (D-09).
+fn approve_ink(t: Theme, armed: bool) -> theme::color::Srgb {
+    if armed {
+        Tone::Quiet.ink(t)
+    } else {
+        t.text_faint
+    }
+}
+
+/// Whether a click is one Approve answers: a single mouse click that is not the
+/// one that brought the window forward. Refused, each for its own reason:
+/// - a double click, whose second press may land on a button that appeared
+///   under the pointer after the first;
+/// - the activating click, which was aimed at the window and not at Approve;
+/// - a key, which must never approve (the button is not a tab stop, and
+///   `enter` on the dialog is Deny);
+/// - a touch, which has no place on a desktop dialog.
+fn approves(event: &gpui::ClickEvent) -> bool {
+    matches!(event, gpui::ClickEvent::Mouse(_)) && event.click_count() == 1 && !event.first_focus()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_marker_wears_the_ink_drawn_on_the_accent() {
+        for theme in theme::Theme::built_in() {
+            let t = theme.for_popup();
+            let marker = approval_marker(t);
+            assert_eq!(marker.color, Some(t.on_accent.into()));
+            assert_eq!(marker.background_color, Some(t.accent.into()));
+        }
+    }
+
+    #[test]
+    fn approve_is_drawn_dimmer_until_it_arms_on_every_theme() {
+        for theme in theme::Theme::built_in() {
+            let t = theme.for_popup();
+            assert_eq!(approve_ink(t, true), Tone::Quiet.ink(t));
+            assert_ne!(approve_ink(t, false), approve_ink(t, true));
+        }
+    }
+
+    #[test]
+    fn approve_takes_only_a_single_ordinary_mouse_click() {
+        use gpui::{ClickEvent, MouseClickEvent, MouseDownEvent, MouseUpEvent};
+
+        let mouse = |count, first_mouse| {
+            ClickEvent::Mouse(MouseClickEvent {
+                down: MouseDownEvent {
+                    click_count: count,
+                    first_mouse,
+                    ..Default::default()
+                },
+                up: MouseUpEvent {
+                    click_count: count,
+                    ..Default::default()
+                },
+            })
+        };
+        assert!(approves(&mouse(1, false)), "a plain click");
+        assert!(!approves(&mouse(2, false)), "a double click");
+        assert!(!approves(&mouse(1, true)), "the click that woke the window");
+        assert!(
+            !approves(&ClickEvent::Keyboard(Default::default())),
+            "a key"
+        );
+        assert!(!approves(&ClickEvent::Touch(Default::default())), "a touch");
+    }
+
+    #[test]
+    fn a_help_notice_covers_the_form_status_without_replacing_it() {
+        let error = "password authentication failed".to_string();
+        let notice = (Status::Idle, "Diagnostics copied.".to_string());
+        assert_eq!(
+            footer_status(Some(&notice), Some(&error), None),
+            Some(notice.clone())
+        );
+        assert_eq!(
+            footer_status(None, Some(&error), None),
+            Some((Status::Failed, error))
+        );
+        let failed = ConnectionTest::Failed("timed out".into());
+        assert_eq!(
+            footer_status(Some(&notice), None, Some(&failed)),
+            Some(notice)
+        );
+        assert_eq!(
+            footer_status(None, None, Some(&failed)),
+            Some((Status::Failed, "timed out".into()))
+        );
+    }
 }

@@ -52,7 +52,7 @@ use crate::{
     },
     explorer::ROW_LIMITS,
     filter::{Conjunction, FilterRow, Operator},
-    icons::icon,
+    icons::{icon, saved_query_icon},
     palette::Command,
     result_grid,
     result_grid::{NewValue, ResultGrid},
@@ -66,9 +66,9 @@ use crate::{
     tab_drag::{DragTab, TabStrip},
     theme::{Theme, fonts, layout, theme},
     ui::{
-        Code, Control, Tone, button, chord_hint, code_highlights, compact_count, group_thousands,
-        icon_button, key_hint, keycap_text, kind_color, object_icon, reconnect_button, row_icon,
-        section_label,
+        Code, Control, Tone, button, button_label, chord_hint, code_highlights, compact_count,
+        control, group_thousands, icon_button, key_hint, keycap_text, kind_color, object_icon,
+        reconnect_button, row_icon, section_label,
     },
     workspace::error_in_buffer,
 };
@@ -400,7 +400,7 @@ fn render_query_surface(
         &tab.editor,
         editor_font_size,
         &tab.query,
-        render_query_toolbar(&profile.session, profile.config.engine(), custom_limit, cx),
+        render_query_toolbar(&profile.session, profile.config.target(), custom_limit, cx),
         bottom,
         cx,
     )
@@ -3471,7 +3471,10 @@ fn render_tab_strip(
                 .id(("saved-query-tab", id as usize))
                 .group(group.clone())
                 .px(px(layout::SPACE_SM))
-                .child(row_icon(t, icon::SAVED_QUERY))
+                .child(row_icon(
+                    t,
+                    saved_query_icon(profile.config.engine().syntax()),
+                ))
                 .child(name_label(name.clone()))
                 .child(
                     div()
@@ -3685,10 +3688,11 @@ fn render_tab_strip(
 /// the Data/Plan pair on the left, saving and running it on the right.
 fn render_query_toolbar(
     session: &Session,
-    engine: Engine,
+    target: Target,
     custom_limit: Option<&(LimitTarget, Entity<InputState>)>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
+    let engine = target.engine;
     let t = *theme(cx);
     let workspace = cx.entity().downgrade();
     let confirm_workspace = workspace.clone();
@@ -3759,14 +3763,9 @@ fn render_query_toolbar(
     // writes its edits back to is what the new row is inserted into. Named,
     // since a queue's results can each be a different table.
     let new_row = (!session.naming)
-        .then(|| session.query_insert_target(cx))
+        .then(|| session.query_insert_target(target, cx))
         .flatten()
-        .map(|(_, table, _)| {
-            let label = format!("Insert in {table}");
-            button("new-row", label, Tone::Quiet, Control::Compact, t).on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(NewRow), cx);
-            })
-        });
+        .map(|(_, table, _)| insert_button("new-row", format!("Insert in {table}"), t));
 
     // First on the bar that is the editor/results boundary, and on every query
     // tab: an empty pane is exactly the room someone writing DDL wants back.
@@ -3800,9 +3799,9 @@ fn render_query_toolbar(
         .text_size(px(layout::chrome(layout::TEXT_SM)))
         .children(results_toggle)
         .children(plan_toggle)
-        .children(new_row)
         .child(div().flex_1())
         .children(naming)
+        .children(new_row)
         // A named query is already written to disk on every swap, so there
         // is nothing for a save button to do that has not been done. What
         // it can still do is change the name.
@@ -3930,13 +3929,29 @@ fn relation_controls(
                     cx,
                 )),
         )
-        .children(takes_inserts.then(|| {
-            button("new-row", "Insert", Tone::Quiet, Control::Compact, t).on_click(
-                |_, window, cx| {
-                    window.dispatch_action(Box::new(NewRow), cx);
-                },
-            )
-        }))
+        .children(takes_inserts.then(|| insert_button("new-row", "Insert".into(), t)))
+}
+
+/// Insert reads as an action, not a third view beside Data and Plan: a plus
+/// leads it and it takes the same button box as the controls around it.
+fn insert_button(id: &'static str, label: String, t: Theme) -> Button {
+    control(id, Tone::Quiet, Control::Compact)
+        .px(px(Control::Compact.padding()))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .child(
+                    icon(icon::PLUS)
+                        .size(px(layout::chrome(layout::ICON_SIZE)))
+                        .text_color(Tone::Quiet.ink(t)),
+                )
+                .child(button_label(label, Tone::Quiet, Control::Compact, t)),
+        )
+        .on_click(|_, window, cx| {
+            window.dispatch_action(Box::new(NewRow), cx);
+        })
 }
 
 /// One choice of a handful, in the row-limit chips' clothes: all of them on

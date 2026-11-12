@@ -170,6 +170,26 @@ impl Profile {
         shortcut_database(self.config.target(), shown, || self.active_database())
     }
 
+    /// The sidebar row of the tab in front: its object's, or its saved
+    /// query's. A scratch query has none, and nor has an object the catalog
+    /// does not list.
+    pub(crate) fn front_row(&self) -> Option<String> {
+        match self.session.active_object() {
+            Some(tab) => match &self.catalog {
+                CatalogState::Loaded(catalog, _) => {
+                    crate::explorer::object_row(catalog, &tab.schema, &tab.name, tab.kind)
+                }
+                _ => None,
+            },
+            None => self
+                .session
+                .active_query_tab()?
+                .open_query
+                .as_deref()
+                .map(crate::explorer::query_row),
+        }
+    }
+
     pub(crate) fn refreshing_schema(&self) -> bool {
         self.schema_refresh == Some(self.generation)
     }
@@ -1108,8 +1128,13 @@ impl Session {
 
     /// What a new row of the rows in front of the active query tab is
     /// inserted into, a queue's earlier result included. Nothing while the
-    /// tab shows its plan, which stands in for those rows.
-    pub(crate) fn query_insert_target(&self, cx: &App) -> Option<InsertTarget> {
+    /// tab shows its plan, which stands in for those rows, nor on a `target`
+    /// that takes no inserts: the grid's `edit` was set by whichever driver
+    /// read its rows, and the profile may have moved to another since.
+    pub(crate) fn query_insert_target(&self, target: Target, cx: &App) -> Option<InsertTarget> {
+        if !target.takes_inserts(RelationKind::Table) {
+            return None;
+        }
         self.active_query_tab()
             .filter(|tab| tab.plan_shown().is_none() && !tab.messages_shown())?
             .shown()
