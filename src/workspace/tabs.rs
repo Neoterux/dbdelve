@@ -4,7 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
-use crate::actions::{FocusSidebar, OpenSidebarItem, ToggleResultsFocus};
+use crate::actions::{FocusSidebar, OpenSidebarItem, ToggleResults, ToggleResultsFocus};
 use crate::session::PendingDiscard;
 use crate::tab_drag::{self, Drag, Slot};
 
@@ -126,6 +126,34 @@ impl Workspace {
                 cx,
             );
         }
+    }
+
+    /// Hide the query tab's results pane, giving the editor the whole height,
+    /// or bring it back. Only a query tab has one to hide: an opened relation's
+    /// rows are what the tab is for.
+    pub(crate) fn toggle_results(
+        &mut self,
+        _: &ToggleResults,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.profile_mut().map(|profile| &mut profile.session) else {
+            return;
+        };
+        let Tab::Query(id) = session.active else {
+            return;
+        };
+        let Some(tab) = session.query_tab_mut(id) else {
+            return;
+        };
+        tab.results_hidden = !tab.results_hidden;
+        // The grid is about to be unmounted, and a window focused on nothing
+        // has no path left for the chord that would bring it back.
+        let grid_focused = tab.shown().1.focus_handle(cx).contains_focused(window, cx);
+        if tab.results_hidden && grid_focused {
+            self.refocus_front();
+        }
+        cx.notify();
     }
 
     pub(crate) fn toggle_row_panel(
@@ -973,7 +1001,8 @@ impl Workspace {
         let Some(tab) = session.active_object() else {
             let tab = session.active_query_tab()?;
             let (state, grid) = tab.shown();
-            let drawn = tab.plan_shown().is_none()
+            let drawn = !tab.results_hidden
+                && tab.plan_shown().is_none()
                 && !tab.messages_shown()
                 && matches!(
                     state,
