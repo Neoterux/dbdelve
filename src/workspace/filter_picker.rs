@@ -462,6 +462,10 @@ fn same_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
+fn unchanged(written: &Include, saved: &Include) -> bool {
+    written == saved
+}
+
 /// The saved entries as rows: an entry that names a listed name, with no
 /// wildcard, is that row ticked; every other entry is kept as typed.
 fn split(saved: &[String], names: &[String]) -> (Vec<String>, Vec<String>) {
@@ -1338,6 +1342,55 @@ mod tests {
         assert!(listed.contains(&"main".to_string()));
         assert!(listed.contains(&"only_seq".to_string()));
         assert_eq!(listed, drawn);
+    }
+
+    /// The picker's tick and the filter's hide are one comparison: Greek
+    /// capital sigma lowercases to `σ` per character, so `ΑΣ` is not `ας`
+    /// (whole-string lowercase would apply the final-sigma rule and say it is).
+    #[test]
+    fn the_picker_reads_two_names_as_one_exactly_when_the_stored_rule_does() {
+        assert_eq!(
+            split(&["ΑΣ".into()], &["ας".into()]),
+            (vec![], vec!["ΑΣ".to_string()])
+        );
+        let include = Include {
+            databases: vec!["ΑΣ".into()],
+            ..Include::default()
+        };
+        assert!(
+            !include
+                .resolve(Levels::DatabaseIsSchema, None, None)
+                .shows_database("ας")
+        );
+        assert_eq!(
+            split(&["Billing".into()], &["billing".into()]),
+            (vec!["billing".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn lists_that_differ_from_the_saved_ones_only_in_case_are_unchanged() {
+        let include = |databases: &[&str], schemas: &[&str]| Include {
+            databases: databases.iter().map(|name| name.to_string()).collect(),
+            schemas: schemas.iter().map(|name| name.to_string()).collect(),
+        };
+        assert!(unchanged(&include(&["e2e"], &[]), &include(&["E2E"], &[])));
+        assert!(unchanged(
+            &include(&["a", "s*"], &["Public"]),
+            &include(&["A", "S*"], &["public"])
+        ));
+        assert!(!unchanged(
+            &include(&["a", "b"], &[]),
+            &include(&["b", "a"], &[])
+        ));
+        assert!(!unchanged(
+            &include(&["a"], &[]),
+            &include(&["a", "b"], &[])
+        ));
+        assert!(!unchanged(
+            &include(&[], &["main"]),
+            &include(&[], &["extra"])
+        ));
     }
 
     #[test]
