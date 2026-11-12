@@ -237,6 +237,17 @@ impl Workspace {
         ) {
             return;
         }
+        // An idle-closed profile stays in front with its tabs, so visiting one
+        // is its reconnect; the landing's `reload_front_object` loads this tab.
+        if let Some(index) = self.active
+            && matches!(
+                self.profiles.get(index).map(|profile| &profile.state),
+                Some(ProfileState::Idle)
+            )
+        {
+            self.begin_connect(index, cx);
+            return;
+        }
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         let (query, stale) = match &tab.body {
             ObjectBody::Relation { query, stale, .. } => (query, *stale),
