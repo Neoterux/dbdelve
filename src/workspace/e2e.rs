@@ -21339,6 +21339,40 @@ fn only_the_users_work_moves_the_idle_deadline(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn an_idle_deadline_leaves_a_lost_connection_failed(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+    store::tests::with_home(|| {
+        let (workspace, cx) = closing_after_a_minute(cx, "");
+        const LOST: &str = "Connection to Orders was lost.";
+        // What a lost session leaves: the state, with the generation the
+        // armed timer was set on.
+        workspace.update(cx, |workspace, _| {
+            workspace.profile_mut().expect("in front").state = ProfileState::Failed(LOST.into());
+        });
+
+        tick(cx, 60);
+
+        assert_eq!(state_of(&workspace, cx, "orders"), "failed");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("in front");
+            assert!(matches!(&profile.state, ProfileState::Failed(text) if text == LOST));
+            assert!(
+                profile
+                    .session
+                    .notice
+                    .as_deref()
+                    .is_none_or(|notice| !notice.contains("without use")),
+                "{:?}",
+                profile.session.notice
+            );
+            assert!(profile.idle_task.is_none());
+            assert!(!profile.idle_closed);
+        });
+        quit(workspace, cx);
+    });
+}
+
 /// Holds the agent's connection from opening until a test says so.
 static HOLD_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
