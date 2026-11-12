@@ -2361,6 +2361,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_startup_script_holds_on_every_login() {
+        let first_day = |connection: &Connection| {
+            let result = connection
+                .query("SELECT @@DATEFIRST", Fetch::default())
+                .expect("the option reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        let plain = live();
+        let default = first_day(&plain);
+        assert_ne!(default.as_deref(), Some("3"));
+        let scripted = live()
+            .with_startup(vec!["SET DATEFIRST 3".into()])
+            .expect("the script runs");
+        assert_eq!(first_day(&scripted).as_deref(), Some("3"));
+        // The lazy first login of a session beside it.
+        let beside = scripted.alongside();
+        assert_eq!(first_day(&beside).as_deref(), Some("3"));
+        let database = scripted.current_database().to_string();
+        let other = scripted.on_database(&database).expect("a session opens");
+        assert_eq!(first_day(&other).as_deref(), Some("3"));
+
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::SqlServer(
+            live_config(),
+        ))
+        .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SELECT @@DATEFIRST",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0).map(str::to_string), default);
+    }
+
+    #[test]
     fn a_composed_sequence_quotes_names_whatever_they_hold() {
         let parts = SequenceParts {
             data_type: "bigint",

@@ -1428,6 +1428,56 @@ mod tests {
         .expect("connection should open")
     }
 
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_startup_script_holds_on_every_user_session() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                ..live_config(engine)
+            };
+            let count = |connection: &Connection| {
+                let result = connection
+                    .query("SELECT @dbdelve_n", Fetch::default())
+                    .expect("the variable reads");
+                result.rows[0].get(0).map(str::to_string)
+            };
+            let script = || vec!["SET @dbdelve_n = COALESCE(@dbdelve_n, 0) + 1".to_string()];
+            let scripted = Connection::open(&config, engine)
+                .and_then(|connection| connection.with_startup(script()))
+                .expect("the script runs");
+            assert_eq!(count(&scripted).as_deref(), Some("1"), "{engine:?}");
+            let beside = scripted.alongside().expect("a session beside it opens");
+            assert_eq!(count(&beside).as_deref(), Some("1"), "{engine:?}");
+            let other = scripted
+                .on_database("dbdelve_archive")
+                .expect("a session opens");
+            assert_eq!(count(&other).as_deref(), Some("1"), "{engine:?}");
+            assert_eq!(count(&scripted).as_deref(), Some("1"), "{engine:?}");
+
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            let read = agent
+                .query(
+                    "SELECT @dbdelve_n",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), None, "{engine:?}");
+
+            let Err(error) = Connection::open(&config, engine).and_then(|connection| {
+                connection.with_startup(vec!["SELECT * FROM no_such_table".into()])
+            }) else {
+                panic!("{engine:?}: a failing script should fail the open");
+            };
+            assert!(error.message.contains("no_such_table"), "{}", error.message);
+        }
+    }
+
     /// The compose database as the bastion sees it, by service name and the
     /// port inside the network.
     fn live_tunnelled() -> ServerConfig {
