@@ -459,6 +459,15 @@ impl Profile {
         }
     }
 
+    /// Whether Filter Databases is offered for this profile, in the node menu
+    /// and the palette alike: its target has databases to choose between, and
+    /// its connection is open to list them. Omitted otherwise, never drawn
+    /// disabled.
+    pub(crate) fn offers_filter(&self) -> bool {
+        matches!(self.state, ProfileState::Connected(_))
+            && self.config.target().levels() != Levels::Flat
+    }
+
     pub(crate) fn connection(&self) -> Option<Connection> {
         match &self.state {
             ProfileState::Connected(connection) => Some((**connection).clone()),

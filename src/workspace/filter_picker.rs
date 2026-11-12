@@ -565,6 +565,7 @@ impl Workspace {
             return;
         }
         if found.connection().is_none() {
+            self.note("The connection is not open.".into(), cx);
             return;
         }
         let wants_schemas = lists_schemas(levels);

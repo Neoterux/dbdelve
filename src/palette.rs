@@ -43,7 +43,7 @@ use crate::{
         PaletteHistoryFilter, PaletteHistorySort, PaletteNext, PaletteNextScope, PalettePrevious,
         PalettePreviousScope, PaletteRowActions, PaletteScopeLeft, PaletteScopeRight,
     },
-    db::{ConnectionConfig, ExplainMode, Levels, RelationKind, RoutineKind, Syntax},
+    db::{ConnectionConfig, ExplainMode, RelationKind, RoutineKind, Syntax},
     explorer::ROW_LIMITS,
     explorer::{ExplorerTarget, ObjectKind},
     export::{ClipboardFormat, FileAs, Format, RowsAs},
@@ -51,8 +51,8 @@ use crate::{
     icons::{icon, saved_query_icon},
     import::Source,
     session::{
-        CatalogState, ObjectBody, Profile, ProfileState, QueryState, RowCount, Session,
-        StructureState, Tab, routine_name,
+        CatalogState, ObjectBody, Profile, QueryState, RowCount, Session, StructureState, Tab,
+        routine_name,
     },
     sidebar::{
         ListingScope, NodeAction, SelectedNode, SelectionAction, ViewMode, connection_row,
@@ -4012,15 +4012,16 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 }),
         );
     } else if let Some(node) = workspace.selected_node(cx)
-        && let Some(target) = workspace
+        && let Some((target, filterable)) = workspace
             .profiles
             .iter()
             .find(|found| found.id == node.profile)
-            .map(|found| found.config.target())
+            .map(|found| (found.config.target(), found.offers_filter()))
     {
         items.extend(
             node_actions(node.kind, &node.name, target)
                 .into_iter()
+                .filter(|action| filterable || *action != NodeAction::FilterDatabases)
                 .map(|action| {
                     let icon = match action {
                         NodeAction::NewQueryHere => icon::PLUS,
@@ -4528,9 +4529,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     }
     // Offered where there are databases to choose between, and omitted rather
     // than disabled where there are none.
-    if matches!(profile.state, ProfileState::Connected(_))
-        && profile.config.target().levels() != Levels::Flat
-    {
+    if profile.offers_filter() {
         // The count the tree draws, from what it already holds: simple mode
         // has no count slot and shows none.
         let row = connection_row(&profile.id);
