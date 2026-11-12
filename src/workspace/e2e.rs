@@ -8499,6 +8499,44 @@ fn the_kill_switch_answers_its_chord_on_every_surface(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_startup_script_placeholder_follows_the_engine(cx: &mut TestAppContext) {
+    use crate::connection_form::placeholders;
+    use crate::db::Target;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_with_profiles(cx, &sqlite_profile("orders", "Orders", ""));
+        cx.executor().allow_parking();
+        run_command(&workspace, cx, Command::NewConnection);
+        let mut seen = Vec::new();
+        for engine in [Engine::Postgres, Engine::Sqlite, Engine::DuckDb] {
+            workspace.update(cx, |workspace, cx| {
+                let form = workspace.form.as_mut().expect("the form is open");
+                form.set_target(Target::built_in(engine));
+                cx.notify();
+            });
+            settle(cx);
+            let shown = workspace.read_with(cx, |workspace, cx| {
+                let form = workspace.form.as_ref().expect("the form is open");
+                form.startup_script
+                    .read(cx)
+                    .presentation()
+                    .placeholder()
+                    .to_string()
+            });
+            assert_eq!(
+                shown,
+                placeholders(Target::built_in(engine)).startup_script,
+                "{engine:?}"
+            );
+            seen.push(shown);
+        }
+        assert_ne!(seen[0], seen[1], "SQLite shows Postgres's example");
+        assert_ne!(seen[0], seen[2], "DuckDB shows Postgres's example");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_time_zone_row_is_drawn_only_where_a_session_takes_one(cx: &mut TestAppContext) {
     use crate::db::Target;
 

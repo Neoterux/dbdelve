@@ -233,6 +233,11 @@ pub struct Hints {
     pub database: &'static str,
     pub user: &'static str,
     pub path: &'static str,
+    /// The Startup script field's placeholder: an example in the engine's own
+    /// dialect that passes the script gate under Read-only, the mode a new
+    /// profile starts in. An engine with no such statement keeps the neutral
+    /// line, so no form shows another dialect's example as its own.
+    pub startup_script: &'static str,
 }
 
 impl Hints {
@@ -242,6 +247,7 @@ impl Hints {
         database: "Optional",
         user: "Required",
         path: "/path/to/app.sqlite",
+        startup_script: "Statements run on every session",
     };
 }
 
