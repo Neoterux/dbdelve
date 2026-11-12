@@ -508,6 +508,22 @@ pub struct Connection {
     /// this one is busy reading its rows. Opened the first time it is needed
     /// and kept, so a run does not pay for a connect.
     side: Arc<Mutex<Option<Conn>>>,
+    /// The statements the profile's gated startup script came to, replayed by
+    /// [`Self::alongside`] and [`Self::on_database`] on every session opened
+    /// for the user. Empty in every open: an agent's opens never pass through
+    /// [`Self::with_startup`].
+    startup: Arc<[String]>,
+}
+
+/// The profile's startup statements on `connection`, in the order written.
+/// Ordinary statements after the connect and never the driver's `init`: a
+/// failing `init` is retried without TLS under `sslmode=prefer`, and the
+/// script is the user's text, which has no business causing that.
+fn replay(connection: &mut Conn, startup: &[String]) -> Result<(), DbError> {
+    startup
+        .iter()
+        .try_for_each(|statement| connection.query_drop(statement))
+        .map_err(|error| query_error(&error))
 }
 
 impl Connection {
@@ -526,8 +542,24 @@ impl Connection {
                 connection: Arc::new(Mutex::new(connection)),
                 tunnel,
                 side: Arc::default(),
+                startup: Arc::default(),
             })
         })
+    }
+
+    /// Runs `statements` now on this session and keeps them for every session
+    /// opened beside it. The first error stops the rest. Cancel and `KILL`
+    /// sessions never run them.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        replay(
+            &mut *self.connection.lock().map_err(|_| DbError {
+                message: "The connection is unavailable after an earlier internal failure.".into(),
+                position: None,
+            })?,
+            &statements,
+        )?;
+        self.startup = statements.into();
+        Ok(self)
     }
 
     pub fn engine(&self) -> Engine {
@@ -537,7 +569,8 @@ impl Connection {
     /// A second session, for a statement to run on beside this one's; see
     /// [`super::Connection::query_alongside`]. It shares the side session.
     pub fn alongside(&self) -> Result<Self, DbError> {
-        let connection = connect(&self.server, self.engine, self.dial()?)?;
+        let mut connection = connect(&self.server, self.engine, self.dial()?)?;
+        replay(&mut connection, &self.startup)?;
         Ok(Self {
             connection_id: connection.connection_id(),
             connection: Arc::new(Mutex::new(connection)),
@@ -557,7 +590,8 @@ impl Connection {
             database: database.to_string(),
             ..self.server.clone()
         };
-        let connection = connect(&server, self.engine, self.dial()?)?;
+        let mut connection = connect(&server, self.engine, self.dial()?)?;
+        replay(&mut connection, &self.startup)?;
         Ok(Self {
             connection_id: connection.connection_id(),
             server,
@@ -976,6 +1010,8 @@ impl Connection {
             connection: Arc::new(Mutex::new(connection)),
             tunnel: self.tunnel.clone(),
             side: Arc::default(),
+            // Reads of DBDelve's own, never a statement of the user's.
+            startup: Arc::default(),
         })
     }
 
