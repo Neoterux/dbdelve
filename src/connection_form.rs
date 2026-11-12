@@ -20,7 +20,7 @@ use crate::{
         check_time_zone, odbc_string,
     },
     explorer::Shortcuts,
-    session::{Behaviour, Depth, MIN_KEEP_ALIVE, Profile},
+    session::{Behaviour, Depth, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, Profile},
     sql::Mode,
     theme::ConnectionColor,
     ui::Status,
@@ -1180,8 +1180,8 @@ fn typed_time_zone(target: Target, text: &str) -> Result<Option<String>, String>
 }
 
 /// What the Keep-alive row says, where `target` draws it. Blank and 0 are off;
-/// anything else is whole seconds from [`MIN_KEEP_ALIVE`] up, and one that is
-/// not is the form's error. Text left in the row under a target that keeps no
+/// anything else is whole seconds from [`MIN_KEEP_ALIVE`] to
+/// [`MAX_KEEP_ALIVE`], and one that is not is the form's error. Text left in the row under a target that keeps no
 /// session is not read.
 fn typed_keep_alive(target: Target, text: &str) -> Result<Option<u32>, String> {
     let text = text.trim();
@@ -1190,15 +1190,16 @@ fn typed_keep_alive(target: Target, text: &str) -> Result<Option<u32>, String> {
     }
     match text.parse::<u32>() {
         Ok(0) => Ok(None),
-        Ok(seconds) if seconds >= MIN_KEEP_ALIVE => Ok(Some(seconds)),
+        Ok(seconds) if (MIN_KEEP_ALIVE..=MAX_KEEP_ALIVE).contains(&seconds) => Ok(Some(seconds)),
         _ => Err(format!(
-            "Keep-alive must be a whole number of seconds, {MIN_KEEP_ALIVE} or more."
+            "Keep-alive must be a whole number of seconds, from {MIN_KEEP_ALIVE} to {MAX_KEEP_ALIVE}."
         )),
     }
 }
 
 /// What the Idle timeout row says. Blank and 0 are off; anything else is whole
-/// minutes, and one that is not is the form's error. Read for every target,
+/// minutes up to [`MAX_IDLE_TIMEOUT`], and one that is not is the form's error.
+/// Read for every target,
 /// since every engine's connection can be left unused.
 fn typed_idle_timeout(text: &str) -> Result<Option<u32>, String> {
     let text = text.trim();
@@ -1207,8 +1208,10 @@ fn typed_idle_timeout(text: &str) -> Result<Option<u32>, String> {
     }
     match text.parse::<u32>() {
         Ok(0) => Ok(None),
-        Ok(minutes) => Ok(Some(minutes)),
-        Err(_) => Err("Idle timeout must be a whole number of minutes.".to_string()),
+        Ok(minutes) if minutes <= MAX_IDLE_TIMEOUT => Ok(Some(minutes)),
+        _ => Err(format!(
+            "Idle timeout must be a whole number of minutes, at most {MAX_IDLE_TIMEOUT}."
+        )),
     }
 }
 

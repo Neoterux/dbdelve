@@ -11,7 +11,8 @@ use crate::db::{ExternalConfig, Include, Plugin, Properties, Target, check_time_
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{
-    Behaviour, BoundSession, Depth, MIN_KEEP_ALIVE, STALE_ROWS, restored_shortcuts,
+    Behaviour, BoundSession, Depth, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, STALE_ROWS,
+    restored_shortcuts,
 };
 use crate::sidebar::OPEN_ROWS_CAP;
 use crate::sql::{Destructive, Mode};
@@ -308,14 +309,18 @@ impl Workspace {
                     .startup_script
                     .filter(|_| takes_script)
                     .unwrap_or_default(),
-                // Off where the engine keeps no session to ping, and under
-                // the floor a hand-edited file could set a ping storm with.
-                keep_alive: stored
-                    .keep_alive_seconds
-                    .filter(|&seconds| keeps_alive && seconds >= MIN_KEEP_ALIVE),
+                // Off where the engine keeps no session to ping, under the
+                // floor a hand-edited file could set a ping storm with, and
+                // past the ceiling it would set a timer that never fires.
+                keep_alive: stored.keep_alive_seconds.filter(|&seconds| {
+                    keeps_alive && (MIN_KEEP_ALIVE..=MAX_KEEP_ALIVE).contains(&seconds)
+                }),
                 // Every engine can be left idle; a 0 is the form's way of
-                // saying off, and a file can say it too.
-                idle_timeout: stored.idle_timeout_minutes.filter(|&minutes| minutes >= 1),
+                // saying off, and a file can say it too. Past the ceiling the
+                // deadline would never be reached, so that is off as well.
+                idle_timeout: stored
+                    .idle_timeout_minutes
+                    .filter(|minutes| (1..=MAX_IDLE_TIMEOUT).contains(minutes)),
             },
             keep_alive_task: None,
             last_activity: cx.background_executor().now(),
