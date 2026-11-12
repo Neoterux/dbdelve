@@ -3793,6 +3793,41 @@ open_objects = []
     }
 
     #[test]
+    fn the_keep_alive_round_trips_before_ssh() {
+        let mut profile = a_stored_profile();
+        profile.keep_alive_seconds = Some(120);
+        profile.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            ..Default::default()
+        });
+        let text = written_alone(profile.clone());
+        let at = text
+            .find("keep_alive_seconds = 120")
+            .expect("it is written");
+        let tunnel = text.find("[profiles.ssh]").expect("and the tunnel");
+        assert!(
+            at < tunnel,
+            "TOML cannot emit a scalar after a table, so it comes before `ssh`:\n{text}"
+        );
+        let decoded = decode_profiles(&text, &[]).expect("the file loads");
+        assert_eq!(decoded.profiles[0].keep_alive_seconds, Some(120));
+        assert_eq!(
+            written_alone(decoded.profiles[0].clone()),
+            text,
+            "saving what was saved changes nothing"
+        );
+
+        let bare = written_alone(a_stored_profile());
+        assert!(
+            !bare.contains("keep_alive"),
+            "a profile with none is written as it always was:\n{bare}"
+        );
+        let golden = include_str!("testdata/every-engine.resaved.toml");
+        assert_eq!(resaved(include_str!("testdata/every-engine.toml")), golden);
+        assert!(!golden.contains("keep_alive"));
+    }
+
+    #[test]
     fn the_time_zone_and_driver_properties_round_trip_before_ssh() {
         let mut profile = a_stored_profile();
         profile.time_zone = Some("Europe/Paris".into());
