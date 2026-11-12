@@ -1416,7 +1416,7 @@ fn type_name(field: &Field) -> String {
         DataType::Struct(_) => "struct".into(),
         DataType::Map(..) => "map".into(),
         DataType::Dictionary(_, value) => type_name(&Field::new("", value.as_ref().clone(), true)),
-        other => other.to_string(),
+        other => other.to_string().to_lowercase(),
     }
 }
 
