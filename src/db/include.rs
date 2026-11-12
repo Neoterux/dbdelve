@@ -28,13 +28,20 @@ pub struct Include {
 }
 
 impl Include {
-    /// What a file held: entries that are empty or only whitespace dropped,
-    /// at most [`ENTRIES_CAP`] of each list kept, in the order they were
-    /// written.
+    /// What a file held, or what Save is about to write: each entry trimmed,
+    /// those left empty dropped, at most [`ENTRIES_CAP`] of each list kept, in
+    /// the order written.
     pub fn from_stored(databases: Vec<String>, schemas: Vec<String>) -> Self {
         let kept = |list: Vec<String>| {
             list.into_iter()
-                .filter(|entry| !entry.trim().is_empty())
+                // ponytail: a name the server lists with leading or trailing
+                // whitespace is matched by no exact entry once trimmed, since
+                // matching runs on the server's own spelling; a glob such as
+                // `*name*` still covers it. The upgrade is an entry spelling
+                // that keeps edge whitespace (a quoted name), read here and
+                // written by the picker.
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
                 .take(ENTRIES_CAP)
                 .collect()
         };
