@@ -21407,6 +21407,7 @@ fn an_agent_read_on_an_idle_closed_profile_is_refused_until_the_profile_reconnec
         assert_eq!(state_of(&workspace, cx, "orders"), "idle");
         workspace.update(cx, |workspace, _| {
             let profile = workspace.profile_mut().expect("in front");
+            assert!(profile.idle_closed, "the close marks the profile");
             profile.behaviour.idle_timeout = None;
             workspace.agent.opener = Some(counting_opener);
         });
@@ -21414,18 +21415,17 @@ fn an_agent_read_on_an_idle_closed_profile_is_refused_until_the_profile_reconnec
 
         let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
         let answer = answer_of(cx, &answers);
-        assert_eq!(
-            answer.status,
-            crate::agent::Status::Failed,
-            "{}",
-            answer.text
-        );
+        assert_eq!(answer.status, crate::agent::Status::Failed);
+        assert_eq!(answer.text, super::agent_read::CONNECTION_IDLE);
         assert_eq!(AGENT_OPENS.load(Ordering::SeqCst), 0, "nothing was opened");
         workspace.read_with(cx, |workspace, _| {
             assert!(!workspace.agent.lanes.contains_key("orders"));
         });
 
         connect_profile(&workspace, cx, "orders");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.profile().expect("in front").idle_closed);
+        });
         let answers = inject_sql(&workspace, cx, "Orders", "SELECT 1");
         let answer = answer_of(cx, &answers);
         assert_eq!(

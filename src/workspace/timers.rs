@@ -237,12 +237,14 @@ impl Workspace {
             return;
         };
         let id = profile.id.clone();
+        profile.idle_closed = true;
         profile.session.notice = Some(format!(
             "Disconnected after {minutes} {} without use.",
             if minutes == 1 { "minute" } else { "minutes" }
         ));
         // Sessions first, then the lane: nothing of the agent's stays open on
-        // the server, and its next call opens one through the lane as ever.
+        // the server, and its calls are refused until the profile is connected
+        // again (`run_agent_work`) rather than opening one through the lane.
         self.agent.lanes.remove(&id);
         self.rebuild_connections(cx);
         cx.notify();
