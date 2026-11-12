@@ -730,6 +730,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `cache_size` is per connection, so a session that never ran the script
+    /// reads its default and one that did reads the script's value.
+    #[test]
+    fn a_startup_script_replays_beside_the_connection_and_never_on_an_agents() {
+        let dir =
+            std::env::temp_dir().join(format!("dbdelve-turso-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("startup.db").to_string_lossy().into_owned();
+        let cache_size = |connection: &Connection| {
+            let result = connection
+                .query("PRAGMA cache_size", Fetch::default())
+                .expect("the pragma reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        let plain = Connection::open_at(&path, None, 0).unwrap();
+        let default = cache_size(&plain);
+        assert_ne!(default.as_deref(), Some("4000"));
+
+        let scripted = Connection::open(&path, 0)
+            .unwrap()
+            .with_startup(vec!["PRAGMA cache_size = 4000".into()])
+            .expect("the script runs");
+        assert_eq!(cache_size(&scripted).as_deref(), Some("4000"));
+        let beside = scripted.alongside().unwrap();
+        assert_eq!(cache_size(&beside).as_deref(), Some("4000"));
+        assert_eq!(
+            cache_size(&plain),
+            default,
+            "the script is the session's own"
+        );
+
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::Turso {
+            path,
+            statement_timeout: 0,
+        })
+        .unwrap();
+        let read = agent
+            .query(
+                "PRAGMA cache_size",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .unwrap();
+        assert_eq!(read.rows[0].get(0).map(str::to_string), default);
+        drop((agent, scripted, beside, plain));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn an_agent_open_reads_committed_rows_and_refuses_a_write() {
         let dir = std::env::temp_dir().join(format!("dbdelve-turso-agent-{}", std::process::id()));

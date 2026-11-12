@@ -3130,6 +3130,117 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `default_order` is scoped to the connection (`LOCAL`), so a session that
+    /// never ran the script reads the default and one that did reads the
+    /// script's value.
+    fn default_order(connection: &Connection) -> String {
+        let result = connection
+            .query("SELECT current_setting('default_order')", Fetch::default())
+            .expect("the setting reads");
+        result.rows[0].get(0).unwrap_or_default().to_string()
+    }
+
+    const SCRIPT: &str = "SET default_order = 'desc'";
+
+    fn startup_file(name: &str) -> (std::path::PathBuf, String) {
+        let dir =
+            std::env::temp_dir().join(format!("dbdelve-duckdb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("startup.duckdb");
+        drop(::duckdb::Connection::open(&path).expect("the scratch database is created"));
+        let text = path.to_string_lossy().into_owned();
+        (dir, text)
+    }
+
+    #[test]
+    fn a_startup_script_replays_on_every_session_of_the_instance_and_never_on_an_agents() {
+        let (dir, path) = startup_file("replay");
+        let plain = Connection::open(&path, 0).unwrap();
+        let scope = plain
+            .query(
+                "SELECT scope FROM duckdb_settings() WHERE name = 'default_order'",
+                Fetch::default(),
+            )
+            .unwrap();
+        assert_eq!(scope.rows[0].get(0), Some("LOCAL"));
+        let default = default_order(&plain);
+        assert_ne!(default.to_lowercase(), "desc");
+        drop(plain);
+
+        let scripted = Connection::open(&path, 0)
+            .unwrap()
+            .with_startup(vec![SCRIPT.into()])
+            .expect("the script runs");
+        assert_eq!(default_order(&scripted).to_lowercase(), "desc");
+        assert_eq!(
+            default_order(&scripted.alongside().unwrap()).to_lowercase(),
+            "desc"
+        );
+        let apart = crate::db::Connection::DuckDb(scripted.clone())
+            .apart()
+            .expect("a session beside it opens");
+        let crate::db::Connection::DuckDb(apart) = apart else {
+            unreachable!("apart keeps the engine")
+        };
+        assert_eq!(default_order(&apart).to_lowercase(), "desc");
+        let home = scripted.current_database().to_string();
+        let other = scripted.on_database(&home).unwrap();
+        assert_eq!(default_order(&other).to_lowercase(), "desc");
+        drop((scripted, apart, other));
+
+        // The agent's open is built from the config alone, so it has no script.
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::duckdb(
+            path.clone(),
+            0,
+        ))
+        .unwrap();
+        let read = agent
+            .query(
+                "SELECT current_setting('default_order')",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            read.rows[0].get(0).map(str::to_lowercase),
+            Some(default.to_lowercase())
+        );
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_bound_tab_session_opened_by_its_caller_replays_the_startup_script() {
+        let (dir, path) = startup_file("bound");
+        let scripted = Connection::open(&path, 0)
+            .unwrap()
+            .with_startup(vec![SCRIPT.into()])
+            .unwrap();
+        let database = scripted.current_database().to_string();
+        let (session, _) = crate::session::Routed::Open {
+            from: crate::db::Connection::DuckDb(scripted),
+            database,
+            schema: None,
+            read_only: false,
+        }
+        .resolve()
+        .expect("the bound session opens");
+        let read = session
+            .query(
+                "SELECT current_setting('default_order')",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            read.rows[0].get(0).map(str::to_lowercase),
+            Some("desc".into())
+        );
+        drop(session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     struct ScratchDir(std::path::PathBuf);
 
     impl Drop for ScratchDir {
