@@ -7,7 +7,7 @@ use super::*;
 use gpui_component::menu::PopupMenuItem;
 
 use crate::connection_form::{ConnectionTest, Reported, duplicate_profile_name, keep_schema};
-use crate::db::{ExternalConfig, Include, Plugin};
+use crate::db::{ExternalConfig, Include, Plugin, Properties, Target, check_time_zone};
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{Behaviour, BoundSession, Depth, STALE_ROWS, restored_shortcuts};
@@ -171,6 +171,12 @@ impl Workspace {
             }
         };
         let read_as_postgres = unreadable_engine.is_some();
+        // Left out of the config rather than refused with the profile: the rest
+        // of it is still the connection that was asked for.
+        let refused = config
+            .server()
+            .and_then(|_| stored_session_settings(&stored, config.engine()).2)
+            .map(|message| format!("{message} It is not applied."));
         let stored_queries = stored_buffers(
             stored.open_queries,
             stored.next_query_id,
@@ -222,8 +228,9 @@ impl Workspace {
                     .filter(|_| config.server().is_some())
                     .map(|message| format!("{message} Connecting as verify-full."))
             });
-        if let Some(message) = notice {
-            session.notice = Some(message);
+        let notice = [notice, refused].into_iter().flatten().collect::<Vec<_>>();
+        if !notice.is_empty() {
+            session.notice = Some(notice.join(" "));
         }
         let id = stored.id.clone();
         if read_as_postgres && stored.agent_visible {
@@ -3304,6 +3311,37 @@ pub(crate) fn restored(text: &str) -> Vec<(String, ConnectionConfig)> {
         .collect()
 }
 
+/// A stored profile's session time zone and driver properties as `engine` may
+/// have them, and what was refused. A hand-edited value is checked here, never
+/// trusted from disk: a zone that fails [`check_time_zone`] is dropped, and a
+/// property list [`Properties::parse`] refuses is dropped whole. A zone on an
+/// engine with no time-zone row is left unread without a word, as a startup
+/// script is.
+fn stored_session_settings(
+    stored: &store::StoredProfile,
+    engine: Engine,
+) -> (Option<String>, Properties, Option<String>) {
+    let mut refused = Vec::new();
+    let time_zone = stored
+        .time_zone
+        .clone()
+        .filter(|_| Target::built_in(engine).takes_time_zone())
+        .filter(|zone| match check_time_zone(zone) {
+            Ok(()) => true,
+            Err(message) => {
+                refused.push(message);
+                false
+            }
+        });
+    let properties =
+        Properties::parse(engine, &stored.driver_properties).unwrap_or_else(|message| {
+            refused.push(message);
+            Properties::default()
+        });
+    let refused = (!refused.is_empty()).then(|| refused.join(" "));
+    (time_zone, properties, refused)
+}
+
 /// The connection a stored profile on a built-in `engine` describes, with
 /// `sslmode` as [`Workspace::restore_profile`] read it.
 fn stored_config(
@@ -3333,6 +3371,7 @@ fn stored_config(
         | Engine::ClickHouse
         | Engine::MongoDb
         | Engine::Redis => {
+            let (time_zone, properties, _) = stored_session_settings(stored, engine);
             let server = ServerConfig {
                 host: stored.host.clone(),
                 port: stored.port,
@@ -3346,6 +3385,8 @@ fn stored_config(
                 ssh: stored.ssh.clone(),
                 schema: stored.schema.clone(),
                 read_only: false,
+                time_zone,
+                properties,
             };
             match engine {
                 Engine::MySql => ConnectionConfig::MySql(server),

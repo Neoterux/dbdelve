@@ -42,8 +42,8 @@ use tokio::sync::oneshot;
 use super::ssh::{Tunnel, tunnelled};
 use super::{
     CancelToken, Catalog, Cell, Column, ColumnDefinition, DbError, EditTarget, Fetch, Index,
-    IndexKind, MISSING, NamedDefinition, QueryResult, Relation, RelationKind, Row, Schema,
-    ServerConfig, Sizes, SslMode, Statistics, Stopped, Structure, plain_error,
+    IndexKind, MISSING, NamedDefinition, Properties, QueryResult, Relation, RelationKind, Row,
+    Schema, ServerConfig, Sizes, SslMode, Statistics, Stopped, Structure, plain_error,
 };
 use crate::mql::{self, Arg, Call, CursorMethod, DbMethod, Method, Show, Target, Value};
 
@@ -220,6 +220,8 @@ pub fn config_from_url(url: &str) -> Result<MongoConfig, String> {
             ssh: None,
             schema: None,
             read_only: false,
+            time_zone: None,
+            properties: Properties::default(),
         },
         srv,
         options,
