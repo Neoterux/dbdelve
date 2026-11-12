@@ -20805,6 +20805,115 @@ fn an_idle_profile_is_closed_with_its_tabs_kept(cx: &mut TestAppContext) {
     });
 }
 
+/// The app on one SQLite profile `Idle` that has closed for want of use, in
+/// front with its query tab holding `text`, its idle timer disarmed so nothing
+/// that waits afterwards can close it again.
+fn gone_idle<'a>(
+    cx: &'a mut TestAppContext,
+    text: &str,
+) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let (workspace, cx) = launch_with_profiles(
+        cx,
+        &sqlite_profile("orders", "Orders", "idle_timeout_minutes = 1"),
+    );
+    cx.executor().allow_parking();
+    connect_profile(&workspace, cx, "orders");
+    assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+    cx.update(|window, cx| {
+        let editor = workspace
+            .read(cx)
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .expect("a connected profile opens on a query tab")
+            .editor
+            .clone();
+        editor.update(cx, |input, cx| input.set_value(text, window, cx));
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(60));
+    cx.run_until_parked();
+    assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+    workspace.update(cx, |workspace, _| {
+        if let Some(profile) = workspace.profile_mut() {
+            profile.behaviour.idle_timeout = None;
+        }
+    });
+    (workspace, cx)
+}
+
+/// The front profile's first query tab's first cell.
+fn first_cell(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    query_tab(workspace, cx, |tab, _, cx| {
+        tab.results
+            .read(cx)
+            .delegate()
+            .cell(0, 0)
+            .map(str::to_string)
+    })
+}
+
+#[gpui::test]
+fn a_front_profile_that_went_idle_reconnects_on_run(cx: &mut TestAppContext) {
+    use crate::session::ProfileState;
+    store::tests::with_home(|| {
+        let (workspace, cx) = gone_idle(cx, "SELECT 42");
+
+        cx.simulate_keystrokes("secondary-enter");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("in front");
+            assert!(matches!(profile.state, ProfileState::Connecting));
+            let tab = profile.session.active_query_tab().expect("a query tab").id;
+            assert_eq!(
+                workspace.runs_on_connect,
+                [("orders".to_string(), tab, "SELECT 42".to_string())],
+                "the run waits on the connect"
+            );
+        });
+
+        settle(cx);
+        assert_eq!(state_of(&workspace, cx, "orders"), "connected");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.runs_on_connect.is_empty());
+        });
+        assert_eq!(first_cell(&workspace, cx).as_deref(), Some("42"));
+
+        // Not a plain run: an explain is not parked, it fails as it did.
+        gone_idle_again(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            let tab = workspace
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("a query tab")
+                .id;
+            workspace.execute_and_then(
+                "SELECT 1".into(),
+                Tab::Query(tab),
+                None,
+                false,
+                Some(crate::db::ExplainMode::Plan),
+                cx,
+            );
+            assert!(workspace.runs_on_connect.is_empty(), "nothing is parked");
+        });
+        assert_eq!(state_of(&workspace, cx, "orders"), "idle");
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert_eq!(error.message, "The connection is not open."),
+            _ => panic!("the explain should have failed"),
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// Closes the front profile's sessions as the idle timer does.
+fn gone_idle_again(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, _| {
+        let index = workspace.active.expect("a profile is in front");
+        workspace.close_sessions(index);
+    });
+    settle(cx);
+    assert_eq!(state_of(workspace, cx, "orders"), "idle");
+}
+
 #[gpui::test]
 fn a_stored_idle_timeout_of_zero_restores_as_off(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
