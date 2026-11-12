@@ -24,7 +24,7 @@ use super::*;
 use crate::db::{Include, Levels, Shown, same_name};
 use crate::fuzzy::{Fuzzy, Query};
 use crate::theme::Theme;
-use crate::ui::{highlighted, well};
+use crate::ui::{button_inked, highlighted, quiet_ink, well};
 
 /// Which of the two lists a section edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -980,12 +980,12 @@ impl Workspace {
         let acts = !shown.is_empty();
         let action = |selector: String, label: &'static str, on: bool, cx: &mut Context<Self>| {
             div().debug_selector(move || selector.clone()).child(
-                button(
+                button_inked(
                     SharedString::from(format!("{label}-{key}")),
                     label,
                     Tone::Quiet,
                     Control::Compact,
-                    t,
+                    quiet_ink(t, acts),
                 )
                 .disabled(!acts)
                 .on_click(cx.listener(
@@ -1053,6 +1053,7 @@ impl Workspace {
         };
         Some(
             div()
+                .debug_selector(move || format!("filter-picker-section-{key}"))
                 .flex_1()
                 .min_w(px(layout::SETTINGS_TEXT_MIN_WIDTH))
                 .flex()
@@ -1102,6 +1103,7 @@ impl Workspace {
                 search.update(cx, |input, cx| input.focus(window, cx));
             });
         }
+        let removable = picker.can_remove();
         let sections: Vec<AnyElement> = [Which::Databases, Which::Schemas]
             .into_iter()
             .filter_map(|which| self.render_section(picker, which, cx))
@@ -1142,7 +1144,7 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_wrap()
-                            .gap(px(layout::SPACE_MD))
+                            .gap(px(layout::SPACE_LG))
                             .children(sections),
                     )
                     .child(
@@ -1161,14 +1163,14 @@ impl Workspace {
                                 div()
                                     .debug_selector(|| "filter-picker-remove".into())
                                     .child(
-                                        button(
+                                        button_inked(
                                             "filter-picker-remove-button",
                                             "Remove Filter",
                                             Tone::Quiet,
                                             Control::Standard,
-                                            t,
+                                            quiet_ink(t, removable),
                                         )
-                                        .disabled(!picker.can_remove())
+                                        .disabled(!removable)
                                         .on_click(
                                             cx.listener(
                                                 |workspace, _: &gpui::ClickEvent, window, cx| {

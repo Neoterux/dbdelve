@@ -983,8 +983,16 @@ pub(crate) fn button_inked(
         .child(inked_label(label, size, ink))
 }
 
-pub(crate) fn quiet_ink(t: Theme, _live: bool) -> Srgb {
-    Tone::Quiet.ink(t)
+/// The ink a Quiet button's label wears, for [`button_inked`]: its tone's
+/// while the button can act and the faint one while it is disabled, decided by
+/// the same value the button's `.disabled` is given, since the library's
+/// disabled style dims only a fill and a ghost has none.
+pub(crate) fn quiet_ink(t: Theme, live: bool) -> Srgb {
+    if live {
+        Tone::Quiet.ink(t)
+    } else {
+        t.text_faint
+    }
 }
 
 /// A button that is only its icon, so it is square and reads as an
