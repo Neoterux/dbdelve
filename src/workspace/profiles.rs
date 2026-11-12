@@ -2451,6 +2451,21 @@ impl Workspace {
         let Some(connection) = self.session_for(id, database, generation) else {
             return;
         };
+        // The profile's depth, as `load_routines` reads it: a skipped read
+        // lands `Skipped` so nothing waits on `Loading`.
+        let Some(profile) = self.issued_to(id, generation) else {
+            return;
+        };
+        if profile.behaviour.depth < Depth::Routines {
+            if let Some(CatalogState::Loaded(_, routines)) =
+                profile.database_catalogs.get_mut(database)
+            {
+                *routines = Routines::Skipped;
+            }
+            self.rebuild_connections(cx);
+            cx.notify();
+            return;
+        }
         // The active schema is kept in the connection's own database only.
         let Some(shown) = self
             .issued_to(id, generation)
@@ -2458,6 +2473,10 @@ impl Workspace {
         else {
             return;
         };
+        #[cfg(test)]
+        {
+            self.routine_reads += 1;
+        }
         let task = spawn_blocking(cx.background_executor(), move || {
             connection.routines(&shown)
         });
@@ -2532,6 +2551,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !self.settings.show_sizes {
+            return;
+        }
+        // Sizes load only when the profile's depth allows them too.
+        if self
+            .issued_to(id, generation)
+            .is_none_or(|profile| profile.behaviour.depth < Depth::Sizes)
+        {
             return;
         }
         let Some(connection) = self.session_for(id, database, generation) else {
