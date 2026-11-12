@@ -118,3 +118,124 @@ impl Properties {
         .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(key: &str, value: &str) -> Vec<(String, String)> {
+        vec![(key.to_string(), value.to_string())]
+    }
+
+    #[test]
+    fn an_unknown_driver_property_is_refused_by_name() {
+        let refused = |engine: Engine, key: &str, value: &str| {
+            Properties::parse(engine, &pair(key, value)).expect_err(&format!("{engine:?} {key}"))
+        };
+        let message = refused(Engine::Postgres, "foo", "1");
+        assert!(
+            message.contains("`foo`") && message.contains("Postgres"),
+            "{message}"
+        );
+        assert!(refused(Engine::Postgres, "Application_Name", "x").contains("`Application_Name`"));
+        assert!(refused(Engine::SqlServer, "connect_timeout", "5").contains("`connect_timeout`"));
+        for engine in [Engine::Redis, Engine::Sqlite, Engine::Snowflake] {
+            assert!(refused(engine, "application_name", "x").contains("`application_name`"));
+        }
+        assert!(
+            refused(
+                Engine::Postgres,
+                "options",
+                "-c default_transaction_read_only=off"
+            )
+            .contains("`options`")
+        );
+        assert!(refused(Engine::Postgres, "sslmode", "disable").contains("`sslmode`"));
+    }
+
+    #[test]
+    fn no_allowed_property_touches_the_hold_tls_or_credentials() {
+        const DENIED: [&str; 24] = [
+            "options",
+            "init",
+            "sslmode",
+            "sslrootcert",
+            "sslcert",
+            "sslkey",
+            "ssl_opts",
+            "channel_binding",
+            "password",
+            "pass",
+            "user",
+            "host",
+            "hostaddr",
+            "port",
+            "dbname",
+            "service",
+            "replication",
+            "target_session_attrs",
+            "local_infile",
+            "prefer_socket",
+            "trust_cert",
+            "encryption",
+            "authentication",
+            "readonly",
+        ];
+        for engine in Engine::ALL {
+            let allowed = engine.spec().driver_properties;
+            for property in allowed {
+                assert!(!DENIED.contains(&property.key()), "{engine:?} {property:?}");
+            }
+            let expected: &[Property] = match engine {
+                Engine::Postgres | Engine::MySql | Engine::MariaDb => {
+                    &[Property::ApplicationName, Property::ConnectTimeout]
+                }
+                Engine::SqlServer => &[Property::ApplicationName],
+                _ => &[],
+            };
+            assert_eq!(allowed, expected, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn values_are_typed_and_stored_in_list_order() {
+        for bad in ["0", "601", "ten", "-1", ""] {
+            let message =
+                Properties::parse(Engine::Postgres, &pair("connect_timeout", bad)).expect_err(bad);
+            assert!(message.contains("`connect_timeout`"), "{bad}: {message}");
+        }
+        for good in [("1", 1), ("600", 600)] {
+            let parsed =
+                Properties::parse(Engine::MySql, &pair("connect_timeout", good.0)).expect(good.0);
+            assert_eq!(parsed.connect_timeout, Some(good.1));
+        }
+        let long = "a".repeat(65);
+        for bad in [long.as_str(), "a\nb"] {
+            let message =
+                Properties::parse(Engine::Postgres, &pair("application_name", bad)).expect_err(bad);
+            assert!(message.contains("`application_name`"), "{message}");
+        }
+        assert!(
+            Properties::parse(Engine::Postgres, &pair("application_name", &"a".repeat(64))).is_ok()
+        );
+
+        let twice = vec![
+            ("application_name".to_string(), "a".to_string()),
+            ("application_name".to_string(), "b".to_string()),
+        ];
+        let message = Properties::parse(Engine::Postgres, &twice).expect_err("a key twice");
+        assert!(
+            message.contains("`application_name`") && message.contains("twice"),
+            "{message}"
+        );
+
+        let backwards = vec![
+            ("connect_timeout".to_string(), "5".to_string()),
+            ("application_name".to_string(), "billing".to_string()),
+        ];
+        let parsed = Properties::parse(Engine::Postgres, &backwards).expect("both are listed");
+        let keys: Vec<_> = parsed.stored().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["application_name", "connect_timeout"]);
+        assert_eq!(Properties::default().stored(), []);
+    }
+}

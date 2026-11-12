@@ -4532,6 +4532,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_time_zone_with_a_quote_is_refused() {
+        for zone in [
+            "UTC",
+            "SYSTEM",
+            "Europe/Paris",
+            "America/Port-au-Prince",
+            "Etc/GMT+5",
+            "+05:30",
+        ] {
+            assert_eq!(check_time_zone(zone), Ok(()), "{zone}");
+        }
+        let long = "a".repeat(65);
+        for zone in ["Europe/Paris'", "a b", "UTC;", r"a\b", long.as_str()] {
+            let message = check_time_zone(zone).expect_err(zone);
+            assert!(
+                message.contains(zone) || message.contains("64"),
+                "names the value or the limit: {message}"
+            );
+        }
+        assert!(check_time_zone("").is_err() && check_time_zone("   ").is_err());
+    }
+
+    #[test]
     fn only_mysql_and_mariadb_commit_an_open_transaction_at_a_begin() {
         for engine in [Engine::MySql, Engine::MariaDb] {
             assert!(engine.begin_ends_open_transaction(), "{engine:?}");
