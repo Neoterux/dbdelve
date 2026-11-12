@@ -862,6 +862,25 @@ impl Connection {
         Ok(self)
     }
 
+    /// One `SELECT 1` on the session. A statement holding it is the session in
+    /// use, so the ping is skipped, never queued behind it; a session that has
+    /// not logged in yet is left alone, since a ping that logged in would open
+    /// a login nobody asked for. A poisoned lock is a session every later
+    /// statement would fail on.
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut session = match self.session.try_lock() {
+            Ok(session) => session,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(plain_error("The connection is closed.".into()));
+            }
+        };
+        match session.as_mut() {
+            None => Ok(()),
+            Some(session) => ask(session, "SELECT 1").map(|_| ()),
+        }
+    }
+
     /// The profile's database, or the login's default when it names none,
     /// as the server spelled it on opening.
     pub fn current_database(&self) -> &str {
