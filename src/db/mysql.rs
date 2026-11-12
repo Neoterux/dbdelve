@@ -450,6 +450,11 @@ fn open(server: &ServerConfig, options: impl Fn() -> OptsBuilder) -> Result<Conn
 /// milliseconds and MariaDB's `max_statement_time` seconds, and a server too
 /// old to know the variable fails the connect here rather than the statement
 /// later.
+///
+/// Only DBDelve's fixed session defaults, never the time zone: that is
+/// user-typed text the server may refuse when its tz tables are not loaded,
+/// and a failing init is retried without TLS under `sslmode=prefer`, the
+/// hazard [`replay`]'s comment names. [`connect`] sends it after `open`.
 fn init_statements(server: &ServerConfig, engine: Engine) -> Vec<String> {
     let mut init = Vec::new();
     if server.read_only {
@@ -465,15 +470,6 @@ fn init_statements(server: &ServerConfig, engine: Engine) -> Vec<String> {
             u64::from(seconds) * 1_000
         )),
     }
-    // Last: it is part of the profile's config and deterministic, so `init`
-    // is right for it, where the user's startup script is not -- that one can
-    // fail or depend on the session and is replayed by the caller.
-    init.extend(
-        server
-            .time_zone
-            .as_deref()
-            .and_then(|zone| super::time_zone_statement(engine, zone)),
-    );
     init
 }
 
@@ -490,10 +486,20 @@ fn connect(
     dial: Option<SocketAddr>,
 ) -> Result<Conn, DbError> {
     let init = init_statements(server, engine);
-    open(server, || match init.is_empty() {
+    let mut connection = open(server, || match init.is_empty() {
         true => base_options(server, dial),
         false => base_options(server, dial).init(init.clone()),
-    })
+    })?;
+    // Before the callers' script replay, so a zone the script sets wins. Its
+    // refusal is a statement error here and never reaches `open`'s fallback.
+    if let Some(statement) = server
+        .time_zone
+        .as_deref()
+        .and_then(|zone| super::time_zone_statement(engine, zone))
+    {
+        replay(&mut connection, &[statement])?;
+    }
+    Ok(connection)
 }
 
 /// The throwaway connection a cancel opens: the same fields, but bounded end
