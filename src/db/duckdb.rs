@@ -1450,6 +1450,14 @@ mod tests {
     }
 
     #[test]
+    fn a_type_duckdb_names_no_other_way_reads_lowercase() {
+        let result = memory("")
+            .query("SELECT NULL AS nothing", Fetch::default())
+            .expect("the query runs");
+        assert_eq!(result.columns[0].data_type.as_deref(), Some("null"));
+    }
+
+    #[test]
     fn a_sequences_ddl_is_its_create_statement() {
         let connection = memory("CREATE SEQUENCE ticket START 5 INCREMENT 2;");
         let ddl = connection
