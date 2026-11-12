@@ -2060,7 +2060,13 @@ impl Workspace {
                     };
                     profile.catalog = match result {
                         Ok(catalog) => CatalogState::Loaded(catalog, Routines::Loading),
-                        Err(error) => CatalogState::Failed(error.message),
+                        Err(error) => {
+                            // A failed read stored nothing drawn with the old filter, and every
+                            // read takes `shown()` as it starts, so the next one applies the
+                            // saved filter; reading again here would be a retry nobody asked for.
+                            profile.reread_after_load = false;
+                            CatalogState::Failed(error.message)
+                        }
                     };
                     workspace.catalog_replaced(&id, generation, false, cx);
                     cx.notify();
