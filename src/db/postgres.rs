@@ -2339,6 +2339,20 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_run_with_no_schema_puts_back_the_search_path_the_script_left() {
+        assert_eq!(put_back_search_path_sql(None), "RESET search_path");
+        assert_eq!(
+            put_back_search_path_sql(Some("pg_catalog")),
+            "SELECT pg_catalog.set_config('search_path', E'pg_catalog', false)"
+        );
+        // Neither character may end the `E''` literal early.
+        assert_eq!(
+            put_back_search_path_sql(Some(r#""it's", "a\b""#)),
+            r#"SELECT pg_catalog.set_config('search_path', E'"it''s", "a\\b"', false)"#
+        );
+    }
+
+    #[test]
     #[ignore = "requires the compose databases"]
     fn live_the_startup_script_holds_on_every_user_session() {
         let scripted = Connection::open(&live_config())
@@ -2354,6 +2368,28 @@ mod tests {
         let database = scripted.current_database().to_string();
         let other = scripted.on_database(&database).expect("a session opens");
         assert_eq!(cell(&other, STARTUP_COUNT).as_deref(), Some("1"));
+        // A bound tab that picks no schema keeps the script's `search_path`; one
+        // that picks a schema overrides it, and the next no-schema run is back.
+        let bound = |connection: &Connection, schema: Option<&str>| {
+            let result = connection
+                .query_bound(schema, "SHOW search_path", Fetch::default())
+                .expect("the bound run works");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        assert_eq!(bound(&other, None).as_deref(), Some("pg_catalog"));
+        assert_eq!(
+            bound(&other, Some("public")).as_deref(),
+            Some("\"public\", \"$user\", public")
+        );
+        assert_eq!(bound(&other, None).as_deref(), Some("pg_catalog"));
+        assert_eq!(cell(&other, STARTUP_COUNT).as_deref(), Some("1"));
+        let unscripted = Connection::open(&live_config())
+            .and_then(|connection| connection.on_database(&database))
+            .expect("a session opens");
+        assert_eq!(
+            bound(&unscripted, None).as_deref(),
+            Some("\"$user\", public")
+        );
         let side = scripted
             .aside(Duration::from_secs(10), |side| {
                 Some(cell(side, STARTUP_COUNT))
