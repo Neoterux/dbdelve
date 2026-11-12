@@ -101,6 +101,10 @@ pub struct Connection {
     /// held: there a `USE` of the user's is meant to stay, and the catalog
     /// follows it.
     held: bool,
+    /// The statements the profile's gated startup script came to, replayed on
+    /// every session opened from this instance for the user. Empty in every
+    /// open: an agent's opens never pass through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 /// The database and schema unqualified names resolve in, None for where the
@@ -178,6 +182,7 @@ impl Connection {
             home: Arc::new(home),
             unpicked: None,
             held: false,
+            startup: Arc::default(),
         })
     }
 
@@ -233,6 +238,9 @@ impl Connection {
         if pick != Pick::default() {
             self.go(&connection, &pick)?;
         }
+        // After the pick, so the script runs last on a session that is already
+        // where it will work and the user's own text wins.
+        self.replay(&connection)?;
         Ok(Self {
             interrupt: connection.interrupt_handle(),
             connection: Arc::new(Mutex::new(connection)),
@@ -256,6 +264,7 @@ impl Connection {
             schema: None,
         };
         self.go(&connection, &pick)?;
+        self.replay(&connection)?;
         Ok(Self {
             interrupt: connection.interrupt_handle(),
             connection: Arc::new(Mutex::new(connection)),
@@ -264,6 +273,22 @@ impl Connection {
             held: true,
             ..self.clone()
         })
+    }
+
+    /// Runs `statements` now, in the order written, and keeps them for every
+    /// session [`Self::alongside`] and [`Self::on_database`] open. The first
+    /// error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        self.startup = statements.into();
+        self.replay(&*lock(&self.connection)?)?;
+        Ok(self)
+    }
+
+    /// The startup statements on `connection`, rows discarded.
+    fn replay(&self, connection: &duckdb::Connection) -> Result<(), DbError> {
+        self.startup
+            .iter()
+            .try_for_each(|statement| connection.execute_batch(statement).map_err(query_error))
     }
 
     fn pick(&self) -> std::sync::MutexGuard<'_, Pick> {
@@ -1391,7 +1416,7 @@ fn type_name(field: &Field) -> String {
         DataType::Struct(_) => "struct".into(),
         DataType::Map(..) => "map".into(),
         DataType::Dictionary(_, value) => type_name(&Field::new("", value.as_ref().clone(), true)),
-        other => other.to_string().to_lowercase(),
+        other => other.to_string(),
     }
 }
 
@@ -3130,17 +3155,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// `default_order` is scoped to the connection (`LOCAL`), so a session that
+    /// `progress_bar_time` is scoped to the connection (`LOCAL`), so a session that
     /// never ran the script reads the default and one that did reads the
     /// script's value.
-    fn default_order(connection: &Connection) -> String {
+    fn progress_bar_time(connection: &Connection) -> String {
         let result = connection
-            .query("SELECT current_setting('default_order')", Fetch::default())
+            .query(
+                "SELECT current_setting('progress_bar_time')",
+                Fetch::default(),
+            )
             .expect("the setting reads");
         result.rows[0].get(0).unwrap_or_default().to_string()
     }
 
-    const SCRIPT: &str = "SET default_order = 'desc'";
+    const SCRIPT: &str = "SET progress_bar_time = 5000";
 
     fn startup_file(name: &str) -> (std::path::PathBuf, String) {
         let dir =
@@ -3159,34 +3187,31 @@ mod tests {
         let plain = Connection::open(&path, 0).unwrap();
         let scope = plain
             .query(
-                "SELECT scope FROM duckdb_settings() WHERE name = 'default_order'",
+                "SELECT scope FROM duckdb_settings() WHERE name = 'progress_bar_time'",
                 Fetch::default(),
             )
             .unwrap();
         assert_eq!(scope.rows[0].get(0), Some("LOCAL"));
-        let default = default_order(&plain);
-        assert_ne!(default.to_lowercase(), "desc");
+        let default = progress_bar_time(&plain);
+        assert_ne!(default, "5000");
         drop(plain);
 
         let scripted = Connection::open(&path, 0)
             .unwrap()
             .with_startup(vec![SCRIPT.into()])
             .expect("the script runs");
-        assert_eq!(default_order(&scripted).to_lowercase(), "desc");
-        assert_eq!(
-            default_order(&scripted.alongside().unwrap()).to_lowercase(),
-            "desc"
-        );
+        assert_eq!(progress_bar_time(&scripted), "5000");
+        assert_eq!(progress_bar_time(&scripted.alongside().unwrap()), "5000");
         let apart = crate::db::Connection::DuckDb(scripted.clone())
             .apart()
             .expect("a session beside it opens");
         let crate::db::Connection::DuckDb(apart) = apart else {
             unreachable!("apart keeps the engine")
         };
-        assert_eq!(default_order(&apart).to_lowercase(), "desc");
+        assert_eq!(progress_bar_time(&apart), "5000");
         let home = scripted.current_database().to_string();
         let other = scripted.on_database(&home).unwrap();
-        assert_eq!(default_order(&other).to_lowercase(), "desc");
+        assert_eq!(progress_bar_time(&other), "5000");
         drop((scripted, apart, other));
 
         // The agent's open is built from the config alone, so it has no script.
@@ -3197,15 +3222,12 @@ mod tests {
         .unwrap();
         let read = agent
             .query(
-                "SELECT current_setting('default_order')",
+                "SELECT current_setting('progress_bar_time')",
                 &crate::db::CancelToken::default(),
                 Fetch::default(),
             )
             .unwrap();
-        assert_eq!(
-            read.rows[0].get(0).map(str::to_lowercase),
-            Some(default.to_lowercase())
-        );
+        assert_eq!(read.rows[0].get(0).map(str::to_string), Some(default));
         drop(agent);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3228,15 +3250,12 @@ mod tests {
         .expect("the bound session opens");
         let read = session
             .query(
-                "SELECT current_setting('default_order')",
+                "SELECT current_setting('progress_bar_time')",
                 &crate::db::CancelToken::default(),
                 Fetch::default(),
             )
             .unwrap();
-        assert_eq!(
-            read.rows[0].get(0).map(str::to_lowercase),
-            Some("desc".into())
-        );
+        assert_eq!(read.rows[0].get(0).map(str::to_string), Some("5000".into()));
         drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }
