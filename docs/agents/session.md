@@ -469,6 +469,14 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   its lane, which would otherwise put its connection back after the drop. A
   blocked profile waits a whole timeout more, counted from then: re-arming
   from `last_activity` would be a wait already over and fire at once, for ever.
+  An idle-closed profile comes back by use: a plain Run in its query tab is
+  parked on `runs_on_connect` and `begin_connect` starts, the landing's
+  `run_waiting_files` then hands the statement to `execute_sql`, so the mode
+  gate judges it when it runs; a connect that fails drops it and the text stays
+  in its tab. A relation tab visited on it (`load_relation`) and a tree expand
+  connect it too, and the status bar offers Reconnect as it does for a failed
+  connection. An explain, a refresh or an edit's read-back is not parked: on an
+  idle profile it fails with `The connection is not open.`.
 - **A dialog's keyboard is its ring** (`Workspace::dialog_layer`): the layer
   holds focus, and `left`/`right`/`tab` step a ring across its buttons and
   then its one other control, the "Don't ask again" box (`enter` or `space`
