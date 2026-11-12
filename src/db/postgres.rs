@@ -22,7 +22,7 @@ use super::{
     RelationKind, Row, RowBuilder, ServerConfig, Sizes, Stopped, Structure, assemble_catalog,
     assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
     assemble_sizes, assemble_structure, create_table, non_utf8_error, optional_cell, plain_error,
-    required_cell, terminated,
+    required_cell, terminated, time_zone_statement,
 };
 
 mod pgpass;
@@ -1065,6 +1065,15 @@ impl Connection {
                 });
         let pid = row.as_ref().and_then(|row| row.get(0)?.parse().ok());
         let current_schema = row.and_then(|row| row.get(1).map(str::to_string));
+        // Before the pick and the script, so a zone the script sets wins. A
+        // `SET` after connecting, not a startup option, as the pick is.
+        if let Some(statement) = server
+            .time_zone
+            .as_deref()
+            .and_then(|zone| time_zone_statement(Engine::Postgres, zone))
+        {
+            replay(&mut client, &[statement])?;
+        }
         if let Some(schema) = &server.schema {
             set_search_path(&mut client, schema)?;
         }

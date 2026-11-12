@@ -65,7 +65,7 @@ pub use spec::{
     ParserDialect, RegexMatch, SelectTop, SkipDuplicates, SqlSpec, StatementSplit, SubstringMatch,
     Truncate, TypedExplain,
 };
-pub use spec::{IdentityInsert, ReadOnlySession, UnreadableFloor};
+pub use spec::{IdentityInsert, ReadOnlySession, SessionTimeZone, UnreadableFloor};
 pub use target::{Driver, Levels, Target, cancel_cost, is_cancel};
 
 /// One run's claim on Cancel: [`Connection::query`] runs under it, and
@@ -4226,6 +4226,23 @@ fn lock_wait_statement(engine: Engine, seconds: u32) -> Option<String> {
             "SET SESSION lock_wait_timeout = {seconds}, innodb_lock_wait_timeout = {seconds}"
         )),
         _ => None,
+    }
+}
+
+/// The statement that sets this session's time zone, or `None` where the
+/// engine has no session statement for it: ClickHouse sends the zone as a
+/// setting on each request instead, and the rest take none from a profile.
+///
+/// `zone` has passed [`check_time_zone`] -- the form and the restore both ask
+/// it -- and is quoted here as well, so a zone that slipped past still cannot
+/// end the literal.
+fn time_zone_statement(engine: Engine, zone: &str) -> Option<String> {
+    let spec = engine.spec();
+    let literal = spec.quote_literal(zone);
+    match spec.sql.session_time_zone {
+        SessionTimeZone::SetTimeZone => Some(format!("SET TIME ZONE {literal}")),
+        SessionTimeZone::TimeZoneVariable => Some(format!("SET time_zone = {literal}")),
+        SessionTimeZone::None | SessionTimeZone::RequestSetting => None,
     }
 }
 

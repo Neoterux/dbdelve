@@ -441,6 +441,15 @@ fn init_statements(server: &ServerConfig, engine: Engine) -> Vec<String> {
             u64::from(seconds) * 1_000
         )),
     }
+    // Last: it is part of the profile's config and deterministic, so `init`
+    // is right for it, where the user's startup script is not -- that one can
+    // fail or depend on the session and is replayed by the caller.
+    init.extend(
+        server
+            .time_zone
+            .as_deref()
+            .and_then(|zone| super::time_zone_statement(engine, zone)),
+    );
     init
 }
 
