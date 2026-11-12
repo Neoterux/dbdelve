@@ -455,7 +455,14 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   it shares `disconnect`'s state change (`close_sessions`) but keeps the tabs,
   the buffers and the profile's place in front, and drops the agent's lane
   (`self.agent.lanes`) with it so nothing of the agent's stays open on the
-  server. Idle time counts from `Profile.last_activity`, read from
+  server, and it stays shut: the close sets `Profile.idle_closed` and
+  `begin_connect` clears it, and while it is set an agent call is answered
+  `failed` (`CONNECTION_IDLE`) at `run_agent_work`, before a lane exists, and at
+  an approval's landing, before the `started` audit line, so the agent opens
+  nothing until the user connects the profile. The person's Approve is still the
+  recorded decision. A profile never connected, or disconnected by hand, is
+  `ProfileState::Idle` but not idle-closed, and its agent reads are answered as
+  ever. Idle time counts from `Profile.last_activity`, read from
   `background_executor().now()` so `advance_clock` moves it, and only the user's
   own work moves it (`mark_activity`: a statement's start and landing in
   `execute_unchecked`, `run_routed`, the catalog reads, a connect landing);

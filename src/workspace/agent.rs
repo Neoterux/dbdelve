@@ -940,6 +940,13 @@ impl Workspace {
             {
                 (Status::RefusedByGate, CHANGED_SINCE_SHOWN, None)
             }
+            // Here and not at the proposal: a pending approval does not hold
+            // off the idle close, so the profile can go idle while the dialog
+            // is up. This is the last point before anything opens, and it is
+            // before the `started` line, which says a write began.
+            Some(profile) if profile.idle_closed => {
+                (Status::Failed, super::agent_read::CONNECTION_IDLE, None)
+            }
             Some(_) => {
                 // Before anything is opened: a write that cannot be recorded
                 // is not run, so the file never lacks a statement the server
@@ -1012,8 +1019,8 @@ impl Workspace {
             }
         };
         // The person did click Approve; what the answer says is that it did not
-        // run. A failure to record has no decision (see above).
-        let decision = (status != Status::Failed).then_some(Decision::Approved);
+        // run. Only a failure to record has no decision (see above).
+        let decision = error.is_none().then_some(Decision::Approved);
         self.agent_answered(
             id,
             Tool::ExecuteSql,
