@@ -2536,6 +2536,93 @@ fn saving_the_filter_while_the_catalog_loads_is_not_lost(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn a_profile_saved_with_relations_depth_reads_only_its_relations(cx: &mut TestAppContext) {
+    use crate::session::{Depth, Routines};
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb_seeded(
+            cx,
+            "sidebar_show_sizes = true",
+            "introspection_depth = \"routines\"",
+            "CREATE TABLE t (id INTEGER); CREATE SEQUENCE s;",
+            "CREATE TABLE u (id INTEGER);",
+        );
+        let reads = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (workspace.routine_reads, workspace.size_reads)
+            })
+        };
+        let held = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let profile = workspace.profile().expect("the connection is in front");
+                let CatalogState::Loaded(catalog, routines) = &profile.catalog else {
+                    panic!("the catalog has loaded");
+                };
+                let schemas = || catalog.schemas.iter();
+                (
+                    *routines,
+                    schemas().any(|s| s.relations.iter().any(|r| r.name == "t")),
+                    schemas().any(|s| s.sequences.iter().any(|name| name == "s")),
+                )
+            })
+        };
+        let (index, before) = workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.behaviour.depth, Depth::Routines);
+            let index = workspace
+                .profiles
+                .iter()
+                .position(|candidate| candidate.id == profile.id)
+                .expect("it is listed");
+            (
+                index,
+                (
+                    profile.generation,
+                    profile.config.clone(),
+                    profile.agent_visible,
+                ),
+            )
+        });
+        let (routine_reads, size_reads) = reads(&workspace, cx);
+        assert!(routine_reads >= 1, "Routines reads the routines");
+        assert_eq!(size_reads, 0, "Routines reads no sizes, Show sizes or not");
+        assert_eq!(held(&workspace, cx), (Routines::Loaded, true, true));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.edit_profile(index, window, cx);
+            let form = workspace.form.as_mut().expect("the edit form is open");
+            assert_eq!(form.depth, Depth::Routines, "the form opens on the depth");
+            form.depth = Depth::Relations;
+            workspace.submit_connection(&SubmitConnection, window, cx);
+        });
+        settle(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.form.is_none(), "the form saved");
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.behaviour.depth, Depth::Relations);
+            assert_eq!(
+                (
+                    profile.generation,
+                    profile.config.clone(),
+                    profile.agent_visible
+                ),
+                before,
+                "nothing reconnects"
+            );
+            assert!(matches!(profile.state, ProfileState::Connected(..)));
+            assert!(profile.session.notice.is_none(), "a skip is no notice");
+            assert_eq!(
+                profile.stored().introspection_depth.as_deref(),
+                Some("relations")
+            );
+        });
+        assert_eq!(reads(&workspace, cx), (routine_reads, size_reads));
+        assert_eq!(held(&workspace, cx), (Routines::Skipped, true, false));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_listing_that_lands_after_the_picker_closed_changes_nothing(cx: &mut TestAppContext) {
     use super::filter_picker::Listing;
     store::tests::with_home(|| {
