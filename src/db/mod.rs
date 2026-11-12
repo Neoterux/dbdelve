@@ -2782,8 +2782,8 @@ impl Connection {
     pub fn ping(&self) -> Result<(), DbError> {
         match self {
             Self::Postgres(connection) => connection.ping(),
-            Self::MySql(_)
-            | Self::SqlServer(_)
+            Self::MySql(connection) => connection.ping(),
+            Self::SqlServer(_)
             | Self::Sqlite(_)
             | Self::Turso(_)
             | Self::DuckDb(_)
