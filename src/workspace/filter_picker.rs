@@ -434,14 +434,8 @@ impl FilterPicker {
             return Some(format!("Showing all {total} {noun}{place}"));
         }
         let include = match which {
-            Which::Databases => Include {
-                databases: entries,
-                schemas: Vec::new(),
-            },
-            Which::Schemas => Include {
-                databases: Vec::new(),
-                schemas: entries,
-            },
+            Which::Databases => Include::from_stored(entries, Vec::new()),
+            Which::Schemas => Include::from_stored(Vec::new(), entries),
         };
         let shown = include.resolve(
             self.levels,
