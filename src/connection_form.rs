@@ -1272,6 +1272,48 @@ mod tests {
     }
 
     #[test]
+    fn driver_property_lines_are_read_and_refused_by_name() {
+        let postgres = Target::built_in(Engine::Postgres);
+        let read = typed_driver_properties(
+            postgres,
+            "application_name = o'brien app\nconnect_timeout = 5",
+        )
+        .expect("both are listed on Postgres");
+        assert_eq!(read.application_name.as_deref(), Some("o'brien app"));
+        assert_eq!(read.connect_timeout, Some(5));
+
+        let message = typed_driver_properties(postgres, "foo = 1").expect_err("not listed");
+        assert!(message.contains("`foo`"), "{message}");
+        let message =
+            typed_driver_properties(postgres, "connect_timeout = 5\nfoo").expect_err("no `=`");
+        assert!(message.contains("line 2"), "{message}");
+
+        // Not read where the row is not drawn, so text left in it by another
+        // engine neither fails the save nor is stored.
+        let sqlite = Target::built_in(Engine::Sqlite);
+        assert_eq!(
+            typed_driver_properties(sqlite, "foo = 1"),
+            Ok(Properties::default())
+        );
+        let sql_server = Target::built_in(Engine::SqlServer);
+        assert!(typed_driver_properties(sql_server, "connect_timeout = 5").is_err());
+
+        for engine in Engine::ALL {
+            let target = Target::built_in(engine);
+            let listed = matches!(
+                engine,
+                Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::SqlServer
+            );
+            assert_eq!(!target.driver_properties().is_empty(), listed, "{engine:?}");
+        }
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: crate::db::Driver::Plugin(crate::store::tests::odbc_plugin()),
+        };
+        assert!(plugin.driver_properties().is_empty());
+    }
+
+    #[test]
     fn the_time_zone_row_is_asked_of_the_target() {
         let postgres = Target::built_in(Engine::Postgres);
         assert_eq!(
