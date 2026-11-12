@@ -2015,6 +2015,25 @@ impl Workspace {
         explain: Option<ExplainMode>,
         cx: &mut Context<Self>,
     ) {
+        // An idle-closed profile stays in front with its tabs (the idle
+        // timer), so its next run is its reconnect: parked until the connect
+        // lands, where `run_waiting_files` hands it back to `execute_sql` and
+        // the mode gate judges it then. An explain, a refresh or an edit's
+        // read-back is not the user pressing Run and goes on to fail as it
+        // does with no connection.
+        if let (Some(index), Tab::Query(query), None, None, false) =
+            (self.active, tab, &refresh, &explain, keep_rows)
+            && self
+                .profiles
+                .get(index)
+                .is_some_and(|profile| matches!(profile.state, ProfileState::Idle))
+        {
+            let id = self.profiles[index].id.clone();
+            self.runs_on_connect.push((id, query, sql));
+            self.begin_connect(index, cx);
+            return;
+        }
+
         let verdict = sql::classify(self.engine(), &sql);
         let stopped = self
             .profile()

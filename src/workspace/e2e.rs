@@ -20858,8 +20858,9 @@ fn a_front_profile_that_went_idle_reconnects_on_run(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = gone_idle(cx, "SELECT 42");
 
-        cx.simulate_keystrokes("secondary-enter");
-        workspace.read_with(cx, |workspace, _| {
+        // In one update, so the connect the run starts cannot land between.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_query(&crate::RunQuery, window, cx);
             let profile = workspace.profile().expect("in front");
             assert!(matches!(profile.state, ProfileState::Connecting));
             let tab = profile.session.active_query_tab().expect("a query tab").id;
