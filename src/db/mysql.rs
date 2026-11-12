@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use ::mysql::consts::{ColumnFlags, ColumnType};
@@ -629,6 +629,24 @@ impl Connection {
         self.connection
             .lock()
             .map_or(true, |mut connection| connection.ping().is_err())
+    }
+
+    /// One `COM_PING` on the session. A statement holding the connection is
+    /// the session in use, so the ping is skipped, never queued behind it; a
+    /// poisoned lock is a session every later statement would fail on, as
+    /// [`Connection::is_lost`] counts it.
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut connection = match self.connection.try_lock() {
+            Ok(connection) => connection,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(DbError {
+                    message: "The connection is closed.".into(),
+                    position: None,
+                });
+            }
+        };
+        connection.ping().map_err(|error| query_error(&error))
     }
 
     fn dial(&self) -> Result<Option<SocketAddr>, DbError> {
