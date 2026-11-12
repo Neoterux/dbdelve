@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::net::{Shutdown, SocketAddr};
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
@@ -465,6 +465,15 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
 
 type Tds = Client<Compat<TcpStream>>;
 
+/// The name the server shows for this login: the profile's, else `DBDelve`.
+fn application_name_of(server: &ServerConfig) -> &str {
+    server
+        .properties
+        .application_name
+        .as_deref()
+        .unwrap_or("DBDelve")
+}
+
 /// dbdelve's five rungs as tiberius's two settings.
 ///
 /// tiberius builds its own rustls configuration and offers three trusts:
@@ -486,7 +495,7 @@ fn config(server: &ServerConfig, encryption: EncryptionLevel) -> Config {
     if !server.database.is_empty() {
         config.database(&server.database);
     }
-    config.application_name("DBDelve");
+    config.application_name(application_name_of(server));
     // Sent as typed, blank included: cloud IAM issues a token or nothing.
     config.authentication(AuthMethod::sql_server(&server.user, &server.password));
     config.encryption(encryption);
@@ -758,6 +767,11 @@ pub struct Connection {
     /// good rather than reconnecting, and has no session of the user's to
     /// report lost.
     alongside: bool,
+    /// The statements the profile's gated startup script came to, run by
+    /// [`Self::connect`] on every login: the main session's, one opened for a
+    /// database, one beside it, and any reconnect after a stop. Empty in every
+    /// open: an agent's opens never pass through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 impl Connection {
@@ -769,6 +783,7 @@ impl Connection {
                 server: server.clone(),
                 tunnel,
                 alongside: false,
+                startup: Arc::default(),
             };
             let mut session = connection.connect()?;
             // Asked even when the profile names one, for the server's spelling
@@ -813,13 +828,57 @@ impl Connection {
         .map_err(|error| connect_error(&error, &self.server))?;
 
         self.in_flight().socket = Some(socket);
-        Ok(Session {
+        let mut session = Session {
             runtime,
             client,
             timeout: self.server.statement_timeout,
             lost: None,
             rowcount: false,
-        })
+        };
+        // Session options last on a login are the script's: a login holds them
+        // until the connection drops, so replaying here covers every one.
+        self.startup
+            .iter()
+            .try_for_each(|statement| ask(&mut session, statement).map(|_| ()))?;
+        Ok(session)
+    }
+
+    /// Runs `statements` now on the session `open` logged in, and keeps them
+    /// for every login from here on. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        {
+            let mut session = self.session.lock().map_err(|_| {
+                plain_error(
+                    "The connection is unavailable after an earlier internal failure.".into(),
+                )
+            })?;
+            if let Some(session) = session.as_mut() {
+                statements
+                    .iter()
+                    .try_for_each(|statement| ask(session, statement).map(|_| ()))?;
+            }
+        }
+        self.startup = statements.into();
+        Ok(self)
+    }
+
+    /// One `SELECT 1` on the session. A statement holding it is the session in
+    /// use, so the ping is skipped, never queued behind it; a session that has
+    /// not logged in yet is left alone, since a ping that logged in would open
+    /// a login nobody asked for. A poisoned lock is a session every later
+    /// statement would fail on.
+    pub fn ping(&self) -> Result<(), DbError> {
+        let mut session = match self.session.try_lock() {
+            Ok(session) => session,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(plain_error("The connection is closed.".into()));
+            }
+        };
+        match session.as_mut() {
+            None => Ok(()),
+            Some(session) => ask(session, "SELECT 1").map(|_| ()),
+        }
     }
 
     /// The profile's database, or the login's default when it names none,
@@ -2356,8 +2415,125 @@ mod tests {
         config_from_url(&url).expect("dbdelve_MSSQL_URL should parse")
     }
 
+    #[test]
+    fn a_blank_application_name_keeps_dbdelve() {
+        let named = |application_name: Option<&str>| {
+            application_name_of(&ServerConfig {
+                properties: crate::db::Properties {
+                    application_name: application_name.map(str::to_string),
+                    connect_timeout: None,
+                },
+                ..ServerConfig::default()
+            })
+            .to_string()
+        };
+        assert_eq!(named(None), "DBDelve");
+        assert_eq!(named(Some("billing")), "billing");
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_driver_properties_reach_the_server() {
+        let name = |connection: &Connection| {
+            let result = connection
+                .query("SELECT APP_NAME()", Fetch::default())
+                .expect("the name reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        assert_eq!(name(&live()).as_deref(), Some("DBDelve"));
+        let config = ServerConfig {
+            properties: crate::db::Properties {
+                application_name: Some("billing app".into()),
+                connect_timeout: None,
+            },
+            ..live_config()
+        };
+        let main = Connection::open(&config).expect("the connection opens");
+        assert_eq!(name(&main).as_deref(), Some("billing app"));
+        let agent =
+            crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::SqlServer(config))
+                .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SELECT APP_NAME()",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0), Some("billing app"));
+    }
+
     fn live() -> Connection {
         Connection::open(&live_config()).expect("connection should open")
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_a_keep_alive_ping_answers_and_never_waits_on_a_busy_session() {
+        let connection = live();
+        assert!(connection.ping().is_ok(), "an idle session answers");
+
+        // A statement holds the session for as long as it runs; the round
+        // skips it rather than queue behind it.
+        let busy = connection.session.lock().expect("nothing else holds it");
+        let started = Instant::now();
+        assert!(connection.ping().is_ok(), "a busy session is skipped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and the skip does not wait"
+        );
+        drop(busy);
+
+        let unopened = connection.alongside();
+        assert!(
+            unopened.ping().is_ok(),
+            "a session never logged in is left alone"
+        );
+        assert!(
+            unopened
+                .session
+                .lock()
+                .expect("nothing else holds it")
+                .is_none(),
+            "and the ping did not log it in"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_startup_script_holds_on_every_login() {
+        let first_day = |connection: &Connection| {
+            let result = connection
+                .query("SELECT @@DATEFIRST", Fetch::default())
+                .expect("the option reads");
+            result.rows[0].get(0).map(str::to_string)
+        };
+        let plain = live();
+        let default = first_day(&plain);
+        assert_ne!(default.as_deref(), Some("3"));
+        let scripted = live()
+            .with_startup(vec!["SET DATEFIRST 3".into()])
+            .expect("the script runs");
+        assert_eq!(first_day(&scripted).as_deref(), Some("3"));
+        // The lazy first login of a session beside it.
+        let beside = scripted.alongside();
+        assert_eq!(first_day(&beside).as_deref(), Some("3"));
+        let database = scripted.current_database().to_string();
+        let other = scripted.on_database(&database).expect("a session opens");
+        assert_eq!(first_day(&other).as_deref(), Some("3"));
+
+        let agent = crate::db::Connection::open_for_agent(crate::db::ConnectionConfig::SqlServer(
+            live_config(),
+        ))
+        .expect("the agent's connection opens");
+        let read = agent
+            .query(
+                "SELECT @@DATEFIRST",
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the agent reads");
+        assert_eq!(read.rows[0].get(0).map(str::to_string), default);
     }
 
     #[test]
@@ -2519,12 +2695,7 @@ mod tests {
                 database: "dbdelve_test".into(),
                 user: "person@example.com".into(),
                 password: "pa ss".into(),
-                sslmode: SslMode::default(),
-                root_certificate: None,
-                statement_timeout: 0,
-                ssh: None,
-                schema: None,
-                read_only: false,
+                ..ServerConfig::default()
             }
         );
         let error = config_from_url("mssql://someone@db.example.test/db?encrypt=true").unwrap_err();
@@ -5065,6 +5236,7 @@ mod tests {
             .unwrap(),
             tunnel: None,
             alongside: false,
+            startup: Arc::default(),
         };
         let user = connection.clone();
         let run = std::thread::spawn(move || user.query("SELECT 1", Fetch::default()));

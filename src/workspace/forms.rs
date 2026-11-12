@@ -8,6 +8,7 @@ use std::time::Duration;
 use gpui::{Animation, AnimationExt, Div, PathPromptOptions, StyledText, ease_out_quint};
 use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
+use gpui_component::input::Textarea;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::spinner::Spinner;
@@ -28,7 +29,7 @@ use crate::explorer::{
 };
 use crate::icons::{queries_group_icon, saved_query_icon};
 use crate::scroller::{SmoothScrollable, smooth_scoped};
-use crate::session::PendingDelete;
+use crate::session::{Depth, PendingDelete};
 use crate::sidebar::{NodeAction, NodeKind, SelectedNode, SelectionAction, node_actions};
 use crate::sql::{Destructive, Stop};
 use crate::ui::{
@@ -535,6 +536,86 @@ impl Workspace {
             }
         }
 
+        let mut session = Vec::new();
+        // The target decides, as it does for the rows above: a plugin's
+        // process and an engine with no session to set draw none.
+        if form.target().takes_time_zone() {
+            session.push(
+                ui::option_row(
+                    "Time zone",
+                    Some(
+                        "Applied as the session default on every session of this connection, \
+                         an agent's included. A name such as Europe/Paris or an offset such \
+                         as +02:00; blank leaves the server's own."
+                            .into(),
+                    ),
+                    div()
+                        .flex()
+                        .items_center()
+                        .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH * 2.0)))
+                        .h(px(Control::Compact.height()))
+                        .px(px(layout::SPACE_SM))
+                        .rounded(px(layout::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(t.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(gpui_component::Sizable::small(bare(&form.time_zone))),
+                        ),
+                    t,
+                )
+                .debug_selector(|| "form-time-zone".into())
+                .into_any_element(),
+            );
+        }
+        if form.target().takes_startup_script() {
+            session.push(
+                ui::stacked_option_row(
+                    "Startup script",
+                    Some(
+                        "Runs on every session DBDelve opens for this connection, checked \
+                         against its access mode first, and never on an agent's connection. \
+                         Stored in profiles.toml as plain text."
+                            .into(),
+                    ),
+                    div()
+                        .w_full()
+                        .child(Textarea::new(&form.startup_script).font_family(mono.clone())),
+                    t,
+                )
+                .into_any_element(),
+            );
+        }
+
+        let listed = form.target().driver_properties();
+        if !listed.is_empty() {
+            let keys = listed
+                .iter()
+                .map(|property| property.key())
+                .collect::<Vec<_>>()
+                .join(", ");
+            session.push(
+                ui::stacked_option_row(
+                    "Driver properties",
+                    Some(
+                        format!(
+                            "One key = value per line; only {keys} are taken. Applied to \
+                             every session of this connection, an agent's included."
+                        )
+                        .into(),
+                    ),
+                    div()
+                        .w_full()
+                        .child(Textarea::new(&form.properties).font_family(mono.clone())),
+                    t,
+                )
+                .debug_selector(|| "form-driver-properties".into())
+                .into_any_element(),
+            );
+        }
+
         let mut behaviour = Vec::new();
         // Only while creating: past that, `Workspace::set_mode` is the one
         // door a mode changes through, from the titlebar, and it pushes the
@@ -586,36 +667,97 @@ impl Workspace {
         );
         behaviour
             .push(ui::option_row("Project", None, self.project_dropdown(cx), t).into_any_element());
+        // The same box for each row that is a whole number of a unit.
+        let number_box = |input: &Entity<InputState>, unit: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
+                .h(px(Control::Compact.height()))
+                .px(px(layout::SPACE_SM))
+                .rounded(px(layout::RADIUS_CONTROL))
+                .border_1()
+                .border_color(t.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(gpui_component::Sizable::small(bare(input))),
+                )
+                .child(
+                    div()
+                        .text_size(px(layout::chrome(layout::TEXT_SM)))
+                        .text_color(t.text_faint)
+                        .child(unit),
+                )
+        };
         // Every engine can stop a statement, and this is the only place a
         // profile has to say for how long.
         behaviour.push(
             ui::option_row(
                 "Statement timeout",
                 None,
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::SPACE_XS))
-                    .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
-                    .h(px(Control::Compact.height()))
-                    .px(px(layout::SPACE_SM))
-                    .rounded(px(layout::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(gpui_component::Sizable::small(bare(
-                                &form.statement_timeout,
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(layout::chrome(layout::TEXT_SM)))
-                            .text_color(t.text_faint)
-                            .child("s"),
+                number_box(&form.statement_timeout, "s"),
+                t,
+            )
+            .into_any_element(),
+        );
+        // Asked of the target, so the engines that keep a session open gain the
+        // row by turning the fact on, with no change here.
+        if form.target().keeps_alive() {
+            behaviour.push(
+                ui::option_row(
+                    "Keep-alive",
+                    Some(
+                        "Pings the connection's open sessions this often so an idle cut-off \
+                         between here and the server does not close them. Off when blank."
+                            .into(),
                     ),
+                    number_box(&form.keep_alive, "s"),
+                    t,
+                )
+                .into_any_element(),
+            );
+        }
+        // Every engine's connection can be left unused, so every target draws it.
+        behaviour.push(
+            ui::option_row(
+                "Idle timeout",
+                Some(
+                    "Closes this connection's sessions and the agent's after this long without \
+                     use, never while work is unfinished. Off when blank."
+                        .into(),
+                ),
+                number_box(&form.idle_timeout, "min"),
+                t,
+            )
+            .into_any_element(),
+        );
+        // Every target's connect runs the loads this chooses among.
+        let depths = Depth::ALL.into_iter().enumerate().map(|(index, depth)| {
+            ui::segmented_choice(
+                ("introspection", index),
+                depth.label(),
+                depth == form.depth,
+                t,
+            )
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                if let Some(form) = &mut workspace.form {
+                    form.depth = depth;
+                    cx.notify();
+                }
+            }))
+        });
+        behaviour.push(
+            ui::option_row(
+                "Introspection",
+                Some(
+                    "What a connect reads before the tree is drawn: relations always, then \
+                     routines and sequences, then table sizes while Show sizes is on."
+                        .into(),
+                ),
+                ui::segmented(t).children(depths),
                 t,
             )
             .into_any_element(),
@@ -642,6 +784,9 @@ impl Workspace {
             .child(section("Connection", connection))
             .when(!security.is_empty(), |body| {
                 body.child(section("Security", security))
+            })
+            .when(!session.is_empty(), |body| {
+                body.child(section("Session", session))
             })
             .child(section("Behaviour", behaviour))
     }

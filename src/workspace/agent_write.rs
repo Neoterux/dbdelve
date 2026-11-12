@@ -462,11 +462,7 @@ mod tests {
             // The compose database speaks no TLS, and this test is the one
             // place a plaintext connection is the point.
             sslmode: crate::db::SslMode::Disable,
-            root_certificate: None,
-            statement_timeout: 0,
-            ssh: None,
-            schema: None,
-            read_only: false,
+            ..crate::db::ServerConfig::default()
         })
     }
 
@@ -668,11 +664,8 @@ mod tests {
             user: "dbdelve".to_string(),
             password: "dbdelve".to_string(),
             sslmode: crate::db::SslMode::Disable,
-            root_certificate: None,
             statement_timeout: 1,
-            ssh: None,
-            schema: None,
-            read_only: false,
+            ..crate::db::ServerConfig::default()
         });
         let bound = Duration::from_secs(u64::from(write_timeout(1)));
         const SQL: &str = "BLPOP dbdelve:never 0";

@@ -237,6 +237,17 @@ impl Workspace {
         ) {
             return;
         }
+        // An idle-closed profile stays in front with its tabs, so visiting one
+        // is its reconnect; the landing's `reload_front_object` loads this tab.
+        if let Some(index) = self.active
+            && matches!(
+                self.profiles.get(index).map(|profile| &profile.state),
+                Some(ProfileState::Idle)
+            )
+        {
+            self.begin_connect(index, cx);
+            return;
+        }
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         let (query, stale) = match &tab.body {
             ObjectBody::Relation { query, stale, .. } => (query, *stale),
@@ -1515,6 +1526,8 @@ impl Workspace {
             } => Some((database.clone(), *read_only)),
             _ => None,
         };
+        // A tab's read of its own: the user is looking at it.
+        self.mark_activity(id, cx);
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
             let resolved = match opens {
@@ -2804,6 +2817,18 @@ mod tests {
             restorable(Engine::Postgres, &catalog_with(Routines::Loaded), &pending);
         assert_eq!(opened.len(), 2);
         assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn a_stored_routine_waits_while_the_depth_skips_the_routines() {
+        let pending = [stored("accounts", false), stored("digest()", true)];
+
+        let (opened, waiting) =
+            restorable(Engine::Postgres, &catalog_with(Routines::Skipped), &pending);
+
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].0.name(), "accounts");
+        assert_eq!(waiting, [stored("digest()", true)]);
     }
 
     #[test]

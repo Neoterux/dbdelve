@@ -69,6 +69,31 @@ pub(crate) struct Profile {
     /// What the connections tree and the agent lane show of the server. Not
     /// part of `config`: changing it never reconnects.
     pub(crate) include: Include,
+    /// What this profile does with its connection rather than what the
+    /// connection is. Not part of `config`: changing it never reconnects.
+    pub(crate) behaviour: Behaviour,
+    /// The pending keep-alive round, one-shot and re-armed after each. Dropping
+    /// it cancels the round, which is how a disconnect, a connect and a changed
+    /// interval end the old timer.
+    pub(crate) keep_alive_task: Option<gpui::Task<()>>,
+    /// When the user last used this profile, on the scheduler's clock
+    /// (`BackgroundExecutor::now`) so a test's `advance_clock` moves it. Moved
+    /// only by the user's own work -- a statement, a catalog read, a connect --
+    /// and never by an agent call or a keep-alive ping, which would hold an
+    /// unattended connection open for ever.
+    pub(crate) last_activity: std::time::Instant,
+    /// The pending idle close, one-shot: it sleeps until `last_activity` plus
+    /// the timeout. Dropping it cancels the close, which is how a disconnect, a
+    /// connect and a changed timeout end the old one.
+    pub(crate) idle_task: Option<gpui::Task<()>>,
+    /// Whether the idle timeout closed this connection and nothing has
+    /// connected it since: set by the close, cleared by the next connect. While
+    /// it is set an agent call opens nothing for this profile, so a server
+    /// session the user's setting closed is not reopened behind their back.
+    /// Runtime only and never stored. Not [`ProfileState::Idle`], which also
+    /// covers a profile never connected or disconnected by hand, and whose
+    /// agent reads are answered as ever.
+    pub(crate) idle_closed: bool,
     pub(crate) confirmed: Vec<Destructive>,
     /// Whether this connection has silenced the prompt before editing rows
     /// restored from an earlier session. Stored as [`STALE_ROWS`] among
@@ -561,6 +586,16 @@ impl Profile {
             agent_visible: self.agent_visible,
             include_databases: self.include.databases.clone(),
             include_schemas: self.include.schemas.clone(),
+            introspection_depth: (self.behaviour.depth != Depth::default())
+                .then(|| self.behaviour.depth.slug().to_string()),
+            startup_script: Some(self.behaviour.startup_script.clone())
+                .filter(|script| !script.trim().is_empty()),
+            keep_alive_seconds: self.behaviour.keep_alive,
+            idle_timeout_minutes: self.behaviour.idle_timeout,
+            time_zone: server.and_then(|server| server.time_zone.clone()),
+            driver_properties: server
+                .map(|server| server.properties.stored())
+                .unwrap_or_default(),
             confirmed: self
                 .confirmed
                 .iter()
@@ -1880,6 +1915,78 @@ pub(crate) enum Routines {
     Loading,
     Loaded,
     Failed,
+    /// The profile's [`Depth`] chose not to read them. Not an error and no
+    /// notice is written, but nothing about a routine can be said from it
+    /// either, so a restored routine tab keeps waiting as under `Failed`.
+    Skipped,
+}
+
+/// Which of the connect-time loads run. `Sizes` is every load, as before the
+/// setting existed; columns are no level, since no connect reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Depth {
+    /// The relations of the catalog.
+    Relations,
+    /// Then the routines and sequences.
+    Routines,
+    /// Then table sizes, which also need Show sizes.
+    #[default]
+    Sizes,
+}
+
+impl Depth {
+    pub(crate) const ALL: [Depth; 3] = [Depth::Relations, Depth::Routines, Depth::Sizes];
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Depth::Relations => "relations",
+            Depth::Routines => "routines",
+            Depth::Sizes => "sizes",
+        }
+    }
+
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|depth| depth.slug() == slug)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Depth::Relations => "Relations",
+            Depth::Routines => "+ Routines",
+            Depth::Sizes => "+ Sizes",
+        }
+    }
+}
+
+/// The fewest seconds between keep-alive pings. Under it a ping is traffic of
+/// its own rather than a keep-alive, and a hand-edited file could set a storm.
+pub(crate) const MIN_KEEP_ALIVE: u32 = 10;
+
+/// The most seconds between keep-alive pings. Every cut-off a ping answers (a
+/// load balancer, a pooler's idle limit) is under an hour, so past this the
+/// timer would not fire in any session a user keeps; the number was one of two
+/// in the phase with no ceiling at all.
+pub(crate) const MAX_KEEP_ALIVE: u32 = 3600;
+
+/// The most minutes an idle timeout may wait: a day. Past it the deadline is
+/// one a session left open would not reach, so the setting would be a timer
+/// that never fires.
+pub(crate) const MAX_IDLE_TIMEOUT: u32 = 1440;
+
+/// What a profile does with its connection rather than what the connection
+/// is, so changing it never reconnects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Behaviour {
+    pub(crate) depth: Depth,
+    /// The user's text, as typed. Gated on every use and never stored gated: a
+    /// mode lowered since it was written is judged at the next connect.
+    pub(crate) startup_script: String,
+    /// Seconds between pings of the sessions the user holds open; `None` is
+    /// off. Never read by anything but the keep-alive timer.
+    pub(crate) keep_alive: Option<u32>,
+    /// Whole minutes without use after which the profile closes its own
+    /// sessions and the agent's; `None` is off. Read by the idle timer only.
+    pub(crate) idle_timeout: Option<u32>,
 }
 
 /// Which surface the main pane is showing, and what a run targets. Both kinds
@@ -4848,5 +4955,16 @@ mod tests {
         // a newer build's tabs -- must not hand out a live id.
         assert_eq!(next_query_id(1, &tabs(&[0, 4])), 5);
         assert_eq!(next_query_id(0, &tabs(&[])), 0);
+    }
+
+    #[test]
+    fn depth_levels_are_ordered_and_default_to_today() {
+        assert!(Depth::Relations < Depth::Routines);
+        assert!(Depth::Routines < Depth::Sizes);
+        assert_eq!(Depth::default(), Depth::Sizes);
+        for depth in Depth::ALL {
+            assert_eq!(Depth::from_slug(depth.slug()), Some(depth));
+        }
+        assert_eq!(Depth::from_slug("everything"), None);
     }
 }
