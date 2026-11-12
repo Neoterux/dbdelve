@@ -894,10 +894,23 @@ impl Workspace {
             return;
         }
         let depth_changed = profile.behaviour.depth != behaviour.depth;
+        let script_changed = profile.behaviour.startup_script != behaviour.startup_script;
         profile.behaviour = behaviour;
         self.remember_profiles(cx);
         let profile = &mut self.profiles[index];
-        if !depth_changed || profile.connection().is_none() {
+        if profile.connection().is_none() {
+            // Nothing live to disagree with the text: the next connect reads
+            // it. A save that reconnects is in this arm too, and the connect
+            // it started has its landing check the script (`begin_connect`).
+            return;
+        }
+        if script_changed {
+            // The sessions already open were given the statements the connect
+            // ran, and are not changed under the user (D-26).
+            profile.session.notice =
+                Some("The startup script applies from the next connect.".to_string());
+        }
+        if !depth_changed {
             return;
         }
         // As `save_filter` does: a refresh declines to start while a read is
@@ -2002,6 +2015,7 @@ impl Workspace {
         let mode = profile.mode;
         let confirmed = profile.confirmed.clone();
         let script = profile.behaviour.startup_script.clone();
+        let ran_script = script.clone();
         let engine_of = config.engine();
         // The sidebar draws the tree whenever there are saved queries, so the
         // old catalog's rows have to leave it with the catalog.
@@ -2086,7 +2100,15 @@ impl Workspace {
                     // cannot read in Read-only on the strength of that hold.
                     let held_otherwise =
                         (profile.mode == Mode::ReadOnly) != (mode == Mode::ReadOnly);
-                    if held_otherwise && result.is_ok() {
+                    // The same for the startup script, in two ways. A mode
+                    // lowered meanwhile may refuse a script that ran under the
+                    // mode this set out under, and the drivers replay it on
+                    // every later session. And a script saved meanwhile -- a
+                    // save that edits it and reconnects starts this connect
+                    // before the edit lands -- was not the one this ran.
+                    let regate = profile.mode < mode && script_refused(profile, profile.mode);
+                    let script_moved = profile.behaviour.startup_script != ran_script;
+                    if ((held_otherwise || regate) && result.is_ok()) || script_moved {
                         if let Some(index) = workspace.profiles.iter().position(|p| p.id == id) {
                             workspace.begin_connect(index, cx);
                         }
