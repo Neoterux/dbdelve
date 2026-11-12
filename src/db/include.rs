@@ -420,6 +420,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_entry_is_trimmed_so_a_padded_one_matches() {
+        let include =
+            Include::from_stored(text(&["  prod  ", " \t ", "app*\t"]), text(&[" public"]));
+        assert_eq!(include.databases, ["prod", "app*"]);
+        assert_eq!(include.schemas, ["public"]);
+
+        let shown = include.resolve(Levels::DatabaseThenSchema, None, None);
+        assert!(shown.shows_database("PROD"));
+        assert!(shown.shows_database("app1"));
+        assert!(shown.shows_schema("public"));
+    }
+
+    #[test]
     fn each_level_filters_the_list_it_owns() {
         let include = Include::from_stored(text(&["a*"]), text(&["s"]));
         for levels in FILTERED {

@@ -2653,6 +2653,66 @@ fn a_save_past_the_cap_keeps_the_first_500_entries_in_the_profile_and_the_file(
 }
 
 #[gpui::test]
+fn a_padded_entry_in_the_file_loads_trimmed_and_opens_the_picker_with_nothing_to_save(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"\ninclude_databases = [\" e2e \"]");
+        let at =
+            connections_row(&workspace, cx, &connection_row("e2e")).expect("the connection shows");
+        click_connections_row(cx, at);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the connection is in front");
+            assert_eq!(profile.include.databases, ["e2e"]);
+        });
+        open_the_picker_from_the_menu(&workspace, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(picker.databases.ticked, ["e2e"]);
+            assert!(picker.databases.patterns.is_empty());
+            assert!(!picker.can_save(), "the list is the one saved");
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_preview_counts_only_the_entries_save_keeps(cx: &mut TestAppContext) {
+    use super::filter_picker::Which;
+    store::tests::with_home(|| {
+        let (workspace, cx) = three_databases_with_the_picker_open(cx);
+        // 500 is `db::include::ENTRIES_CAP`, which is not reachable from here.
+        let mut patterns: Vec<String> = (0..500).map(|number| format!("zz{number:03}*")).collect();
+        patterns.push("sc*".into());
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace.filter_picker.as_mut().expect("the picker is up");
+            picker.databases.patterns = patterns;
+            cx.notify();
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let picker = workspace.filter_picker.as_ref().expect("the picker is up");
+            assert_eq!(
+                picker.preview(Which::Databases).as_deref(),
+                Some("Showing 1 of 3 databases"),
+                "sc* is the 501st entry, which Save drops"
+            );
+        });
+        workspace.update(cx, |workspace, cx| workspace.save_filter(cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let row = connection_row("e2e");
+            assert_eq!(workspace.connections.counts.get(&row), Some(&1));
+            assert_eq!(workspace.connections.totals.get(&row), Some(&3));
+        });
+        assert!(
+            connections_row(&workspace, cx, &database_row("e2e", "scratch")).is_none(),
+            "the database past the cap is not drawn"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_long_database_list_scrolls_inside_the_picker(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_duckdb(cx, "mode = \"full\"");
