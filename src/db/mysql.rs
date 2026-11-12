@@ -1519,6 +1519,69 @@ ORDER BY 1, 2
     }
 
     #[test]
+    fn the_listing_a_filtered_catalog_counts_over_reads_with_each_readers_predicates() {
+        let listing = catalog_databases_sql();
+        assert!(
+            listing.contains("TABLE_TYPE IN ('BASE TABLE', 'VIEW', 'SEQUENCE')"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')"),
+            "{listing}"
+        );
+        assert_eq!(listing.matches(SYSTEM_SCHEMAS).count(), 2, "{listing}");
+        assert!(
+            !listing.contains("SCHEMATA") && !listing.contains('{'),
+            "{listing}"
+        );
+        assert!(RELATIONS_SQL.contains("TABLE_TYPE IN ('BASE TABLE', 'VIEW')"));
+        assert!(SEQUENCES_SQL.contains("TABLE_TYPE = 'SEQUENCE'"));
+        assert!(ROUTINES_SQL.contains("ROUTINE_TYPE IN ('FUNCTION', 'PROCEDURE')"));
+    }
+
+    /// The picker's list, the unfiltered tree and a filtered one count the
+    /// same databases, so a filtered total never exceeds the unfiltered one.
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_pickers_total_and_a_filtered_total_are_the_unfiltered_count() {
+        use crate::db::{Include, Levels};
+
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let connection = live_profile(engine);
+            let mut picker = connection
+                .catalog_databases(engine)
+                .expect("databases should list")
+                .names;
+            let drawn = |shown: &Shown| {
+                let mut catalog = connection.catalog(shown).expect("catalog should read");
+                catalog.merge(connection.routines(shown).expect("routines should read"));
+                catalog
+            };
+            let unfiltered = drawn(&Shown::everything());
+            let filtered = drawn(
+                &Include {
+                    databases: vec!["dbdelve_arch*".into()],
+                    ..Include::default()
+                }
+                .resolve(Levels::DatabaseIsSchema, None, None),
+            );
+
+            assert_eq!(
+                filtered.schemas.len() + filtered.left_out,
+                unfiltered.schemas.len(),
+                "{engine:?}"
+            );
+            let mut tree: Vec<_> = unfiltered.schemas.iter().map(|s| s.name.clone()).collect();
+            picker.sort();
+            tree.sort();
+            assert_eq!(picker, tree, "{engine:?}");
+            for system in ["information_schema", "mysql", "performance_schema", "sys"] {
+                assert!(!picker.iter().any(|name| name == system), "{engine:?}");
+            }
+        }
+    }
+
+    #[test]
     fn the_in_list_keeps_the_server_order_and_each_listed_spelling_once() {
         let names = ["Zed".to_string(), "Ab".to_string(), "ab".to_string()];
         assert!(
@@ -1537,12 +1600,11 @@ ORDER BY 1, 2
 
         for engine in [Engine::MySql, Engine::MariaDb] {
             let connection = live(engine);
-            let listed = connection.databases().expect("databases should list");
-            let user_databases = listed
+            let user_databases = connection
+                .catalog_databases()
+                .expect("databases should list")
                 .names
-                .iter()
-                .filter(|name| !engine.is_system_database(name))
-                .count();
+                .len();
             let shown = |entries: &[&str]| {
                 Include {
                     databases: entries.iter().map(|entry| (*entry).to_string()).collect(),
