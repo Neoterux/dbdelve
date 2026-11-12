@@ -421,7 +421,14 @@ mod tests {
         for engine in Engine::ALL {
             assert_eq!(
                 Target::built_in(engine).keeps_alive(),
-                matches!(engine, Engine::Postgres | Engine::MySql | Engine::MariaDb),
+                matches!(
+                    engine,
+                    Engine::Postgres
+                        | Engine::MySql
+                        | Engine::MariaDb
+                        | Engine::SqlServer
+                        | Engine::Redis
+                ),
                 "{engine:?}"
             );
         }
