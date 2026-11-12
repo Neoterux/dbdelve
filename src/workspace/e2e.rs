@@ -20970,7 +20970,10 @@ fn idle_disconnect_waits_for_unfinished_work(cx: &mut TestAppContext) {
             &workspace,
             cx,
             "a queue with statements left",
-            |profile, _| profile.session.queries[0].queue = Some(queue(false, vec![9..18])),
+            |profile, _| {
+                profile.session.queries[0].queue =
+                    Some(queue(false, std::iter::once(9..18).collect()))
+            },
             |profile, _| profile.session.queries[0].queue = None,
         );
         held_open_by(

@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use gpui::{App, Context};
 
-use super::{Workspace, spawn_blocking};
+use super::{Workspace, profiles::unapplied_edits_of, spawn_blocking};
 use crate::db::{Connection, DbError};
-use crate::session::{Profile, ProfileState};
+use crate::session::{Profile, ProfileState, Tab};
 
 impl Workspace {
     /// Set the profile's keep-alive timer from its interval, replacing the one
@@ -190,16 +190,34 @@ impl Workspace {
     /// Whether the profile has something unfinished that closing would lose or
     /// roll back, front or not. Asked at the deadline, so none of it is watched
     /// for in between.
-    fn idle_blocked(&self, index: usize, _cx: &App) -> bool {
+    fn idle_blocked(&self, index: usize, cx: &App) -> bool {
         let Some(profile) = self.profiles.get(index) else {
             return false;
         };
-        // A call under way would put its connection back in the lane after it
-        // was dropped; one waiting would open a new one beside the close.
-        self.agent
-            .lanes
-            .get(&profile.id)
-            .is_some_and(|lane| lane.running.is_some() || !lane.waiting.is_empty())
+        let session = &profile.session;
+        // The user's own work: a transaction would be rolled back, a statement
+        // cancelled, an import or export left half done, and edits lost.
+        profile.in_transaction
+            || !profile.bound_transactions.is_empty()
+            || session
+                .queries
+                .iter()
+                .any(|tab| session.running(Tab::Query(tab.id)) || tab.queue.as_ref().is_some_and(|queue| queue.awaiting || !queue.remaining.is_empty()))
+            || session
+                .objects
+                .iter()
+                .any(|tab| session.running(Tab::Object(tab.id)))
+            || self.running_import_into(&profile.id).is_some()
+            || session.exporting.is_some()
+            || unapplied_edits_of(profile, cx).is_some()
+            // The agent's: a call under way would put its connection back in
+            // the lane after it was dropped, and one waiting would open a new
+            // one beside the close.
+            || self
+                .agent
+                .lanes
+                .get(&profile.id)
+                .is_some_and(|lane| lane.running.is_some() || !lane.waiting.is_empty())
     }
 
     /// Close the profile's sessions and the agent's cached connection to it.

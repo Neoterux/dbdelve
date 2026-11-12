@@ -445,6 +445,27 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   timers but `advance_clock` fires them, and a test that then blocks on a
   future must drop an armed timer first (`set_behaviour` with `keep_alive:
   None`), because the scheduler jumps to the next timer when it would park.
+  `advance_clock` also runs every task that is ready, so a test that needs a
+  call still in flight when a timer fires holds it open on something that
+  only the clock or the test releases, never on the scheduler's order.
+  The idle close (`idle_timeout_minutes`, `Profile.idle_task`) is the second:
+  it shares `disconnect`'s state change (`close_sessions`) but keeps the tabs,
+  the buffers and the profile's place in front, and drops the agent's lane
+  (`self.agent.lanes`) with it so nothing of the agent's stays open on the
+  server. Idle time counts from `Profile.last_activity`, read from
+  `background_executor().now()` so `advance_clock` moves it, and only the user's
+  own work moves it (`mark_activity`: a statement's start and landing in
+  `execute_unchecked`, `run_routed`, the catalog reads, a connect landing);
+  agent calls and keep-alive pings never do. The timer sleeps to the deadline
+  and checks it then, so use moves it with no re-arm per event. The deadline
+  passing does not close a profile that has work unfinished, front or not
+  (`idle_blocked`): a transaction, a bound session's transaction, a running
+  statement, a queue awaiting or holding statements, an import into it, an
+  export from it, a grid with unapplied edits (`unapplied_edits_of`, of that
+  profile, not the front-only helper), or an agent call running or waiting on
+  its lane, which would otherwise put its connection back after the drop. A
+  blocked profile waits a whole timeout more, counted from then: re-arming
+  from `last_activity` would be a wait already over and fire at once, for ever.
 - **A dialog's keyboard is its ring** (`Workspace::dialog_layer`): the layer
   holds focus, and `left`/`right`/`tab` step a ring across its buttons and
   then its one other control, the "Don't ask again" box (`enter` or `space`
