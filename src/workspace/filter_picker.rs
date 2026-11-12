@@ -21,7 +21,7 @@ use gpui_component::{
 };
 
 use super::*;
-use crate::db::{Include, Levels, Shown};
+use crate::db::{Include, Levels, Shown, same_name};
 use crate::fuzzy::{Fuzzy, Query};
 use crate::theme::Theme;
 use crate::ui::{highlighted, well};
@@ -409,7 +409,7 @@ impl FilterPicker {
     /// Nothing to write while a section is still being read, or when the lists
     /// are the ones the profile already holds.
     pub(crate) fn can_save(&self) -> bool {
-        !self.loading() && self.written() != self.saved
+        !self.loading() && !unchanged(&self.written(), &self.saved)
     }
 
     /// The line under a list: how many of the listed names the list, as
@@ -457,13 +457,14 @@ impl FilterPicker {
     }
 }
 
-/// Whether two names are one, ignoring case as the filter does.
-fn same_name(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
-}
-
+/// Whether `written` and `saved` hold the same lists. Case alone is not a
+/// change (the filter reads the two spellings alike, so a resave would rewrite
+/// the file for nothing); order is, because it is what the file holds.
 fn unchanged(written: &Include, saved: &Include) -> bool {
-    written == saved
+    let same = |a: &[String], b: &[String]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_name(a, b))
+    };
+    same(&written.databases, &saved.databases) && same(&written.schemas, &saved.schemas)
 }
 
 /// The saved entries as rows: an entry that names a listed name, with no
