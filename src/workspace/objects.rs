@@ -1515,6 +1515,8 @@ impl Workspace {
             } => Some((database.clone(), *read_only)),
             _ => None,
         };
+        // A tab's read of its own: the user is looking at it.
+        self.mark_activity(id, cx);
         let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
             let resolved = match opens {

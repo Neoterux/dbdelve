@@ -29,6 +29,30 @@ fn mark_rows_stale(profile: &mut Profile) {
     }
 }
 
+/// Which grid of `profile` holds cell edits nobody applied, said as the start
+/// of a refusal. Of any profile, not only the one in front: the idle close asks
+/// it of every one.
+pub(super) fn unapplied_edits_of(profile: &Profile, cx: &App) -> Option<String> {
+    let session = &profile.session;
+    let unapplied = |results: &Entity<gpui_component::table::TableState<ResultGrid>>| {
+        results.read(cx).delegate().has_pending()
+    };
+    if !session.grids().any(unapplied) {
+        return None;
+    }
+    let edited = session
+        .objects
+        .iter()
+        .find(|tab| session.results(Tab::Object(tab.id)).is_some_and(unapplied));
+    Some(match edited {
+        Some(tab) => format!(
+            "{}.{} has cell edits that have not been applied",
+            tab.schema, tab.name
+        ),
+        None => "A query tab has cell edits that have not been applied".into(),
+    })
+}
+
 /// What `profile` lists in the sidebar under `filter`: its Pinned group and
 /// folders, its saved queries, then the catalog's schemas. Both trees draw
 /// this, so a connection's rows are the same in either.
@@ -1173,6 +1197,10 @@ impl Workspace {
     /// one except when a read that was under way when a filter was saved comes
     /// back after the user moved on.
     fn refresh_schema_of(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.profiles.get(index).map(|profile| profile.id.clone()) else {
+            return;
+        };
+        self.mark_activity(&id, cx);
         let Some(profile) = self.profiles.get_mut(index) else {
             return;
         };
@@ -1437,24 +1465,7 @@ impl Workspace {
     /// Which grid of the profile in front holds cell edits nobody applied,
     /// said as the start of a refusal.
     fn unapplied_edits(&self, cx: &App) -> Option<String> {
-        let session = &self.profile()?.session;
-        let unapplied = |results: &Entity<gpui_component::table::TableState<ResultGrid>>| {
-            results.read(cx).delegate().has_pending()
-        };
-        if !session.grids().any(unapplied) {
-            return None;
-        }
-        let edited = session
-            .objects
-            .iter()
-            .find(|tab| session.results(Tab::Object(tab.id)).is_some_and(unapplied));
-        Some(match edited {
-            Some(tab) => format!(
-                "{}.{} has cell edits that have not been applied",
-                tab.schema, tab.name
-            ),
-            None => "A query tab has cell edits that have not been applied".into(),
-        })
+        unapplied_edits_of(self.profile()?, cx)
     }
 
     /// What closing a profile's connection changes in the profile itself, shared
@@ -2230,6 +2241,9 @@ impl Workspace {
     }
 
     pub(crate) fn load_catalog(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+        if self.issued_to(id, generation).is_some() {
+            self.mark_activity(id, cx);
+        }
         let Some(profile) = self.issued_to(id, generation) else {
             return;
         };
@@ -2497,6 +2511,9 @@ impl Workspace {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
+        if self.issued_to(id, generation).is_some() {
+            self.mark_activity(id, cx);
+        }
         let Some(connection) = self.session_for(id, &database, generation) else {
             return;
         };

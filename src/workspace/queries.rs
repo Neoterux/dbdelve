@@ -2334,6 +2334,9 @@ impl Workspace {
             }
             _ => None,
         };
+        // The user's own work, whichever profile the run belongs to: the one
+        // thing besides a catalog read that keeps an idle timeout away.
+        self.mark_activity(&id, cx);
         // Marked on the way out, like the history: a statement that failed
         // part way may still have opened a transaction.
         // Not a bound tab's: what it leaves is left on the session of its
@@ -2634,6 +2637,11 @@ impl Workspace {
                 .map(|entry| answered(entry, &result, feed.is_some(), started.elapsed(), target));
             workspace
                 .update(cx, |workspace, cx| {
+                    // A landing for a profile since reconnected is not use of
+                    // the new connection.
+                    if workspace.issued_to(&id, generation).is_some() {
+                        workspace.mark_activity(&id, cx);
+                    }
                     // The plan is carried out of this block rather than stored
                     // inside it: `slot` holds the session borrowed, and the tab
                     // it belongs on has to be reached through the same session.
