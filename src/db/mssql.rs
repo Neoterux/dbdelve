@@ -758,6 +758,11 @@ pub struct Connection {
     /// good rather than reconnecting, and has no session of the user's to
     /// report lost.
     alongside: bool,
+    /// The statements the profile's gated startup script came to, run by
+    /// [`Self::connect`] on every login: the main session's, one opened for a
+    /// database, one beside it, and any reconnect after a stop. Empty in every
+    /// open: an agent's opens never pass through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 impl Connection {
@@ -769,6 +774,7 @@ impl Connection {
                 server: server.clone(),
                 tunnel,
                 alongside: false,
+                startup: Arc::default(),
             };
             let mut session = connection.connect()?;
             // Asked even when the profile names one, for the server's spelling
@@ -813,13 +819,38 @@ impl Connection {
         .map_err(|error| connect_error(&error, &self.server))?;
 
         self.in_flight().socket = Some(socket);
-        Ok(Session {
+        let mut session = Session {
             runtime,
             client,
             timeout: self.server.statement_timeout,
             lost: None,
             rowcount: false,
-        })
+        };
+        // Session options last on a login are the script's: a login holds them
+        // until the connection drops, so replaying here covers every one.
+        self.startup
+            .iter()
+            .try_for_each(|statement| ask(&mut session, statement).map(|_| ()))?;
+        Ok(session)
+    }
+
+    /// Runs `statements` now on the session `open` logged in, and keeps them
+    /// for every login from here on. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        {
+            let mut session = self.session.lock().map_err(|_| {
+                plain_error(
+                    "The connection is unavailable after an earlier internal failure.".into(),
+                )
+            })?;
+            if let Some(session) = session.as_mut() {
+                statements
+                    .iter()
+                    .try_for_each(|statement| ask(session, statement).map(|_| ()))?;
+            }
+        }
+        self.startup = statements.into();
+        Ok(self)
     }
 
     /// The profile's database, or the login's default when it names none,
@@ -5097,6 +5128,7 @@ mod tests {
             .unwrap(),
             tunnel: None,
             alongside: false,
+            startup: Arc::default(),
         };
         let user = connection.clone();
         let run = std::thread::spawn(move || user.query("SELECT 1", Fetch::default()));

@@ -2259,6 +2259,9 @@ impl Connection {
     pub fn with_startup(self, statements: Vec<String>) -> Result<Self, DbError> {
         match self {
             Self::Sqlite(connection) => connection.with_startup(statements).map(Self::Sqlite),
+            Self::Postgres(connection) => connection.with_startup(statements).map(Self::Postgres),
+            Self::MySql(connection) => connection.with_startup(statements).map(Self::MySql),
+            Self::SqlServer(connection) => connection.with_startup(statements).map(Self::SqlServer),
             Self::Turso(connection) => connection.with_startup(statements).map(Self::Turso),
             Self::DuckDb(connection) => connection.with_startup(statements).map(Self::DuckDb),
             other if statements.is_empty() => Ok(other),

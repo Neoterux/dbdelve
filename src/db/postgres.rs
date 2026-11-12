@@ -629,6 +629,19 @@ fn set_search_path_sql(schema: &str) -> String {
     )
 }
 
+/// The profile's startup statements on `client`, in the order written, rows
+/// discarded. The first error stops the rest.
+fn replay(client: &mut Client, startup: &[String]) -> Result<(), DbError> {
+    let Client { client, driver, .. } = client;
+    startup.iter().try_for_each(|statement| {
+        driver
+            .block_on(client.simple_query(statement))
+            .and_then(|done| done)
+            .map(|_| ())
+            .map_err(|error| query_error(&error, statement))
+    })
+}
+
 /// A `SET` after connecting rather than a startup option: PgBouncer and other
 /// poolers refuse a connection that sends `options` at all.
 fn set_search_path(client: &mut Client, schema: &str) -> Result<(), DbError> {
@@ -930,6 +943,10 @@ pub struct Connection {
     /// (AGENTS.md, hard rule 4). Shared between clones, so a schema set on one
     /// reaches the sessions any of them opens later.
     server: Arc<Mutex<ServerConfig>>,
+    /// The statements the profile's gated startup script came to, replayed in
+    /// [`Self::connect`] on every session opened for the user. Empty in every
+    /// open: an agent's opens never pass through [`Self::with_startup`].
+    startup: Arc<[String]>,
 }
 
 #[derive(Clone)]
@@ -950,10 +967,10 @@ impl Connection {
         match &server.ssh {
             Some(ssh) if server.host.starts_with('/') => {
                 let bridge = SocketBridge::new(ssh, &socket_path(server))?;
-                Self::connect(server, Route::Socket(Arc::new(bridge)))
+                Self::connect(server, Route::Socket(Arc::new(bridge)), &[])
             }
             _ => tunnelled(server, DEFAULT_PORT, |tunnel| {
-                Self::connect(server, tunnel.map_or(Route::Direct, Route::Tunnel))
+                Self::connect(server, tunnel.map_or(Route::Direct, Route::Tunnel), &[])
             }),
         }
     }
@@ -969,7 +986,7 @@ impl Connection {
         std::thread::spawn(move || this.aside(Duration::ZERO, |_| Some(())));
     }
 
-    fn connect(server: &ServerConfig, route: Route) -> Result<Self, DbError> {
+    fn connect(server: &ServerConfig, route: Route, startup: &[String]) -> Result<Self, DbError> {
         let connector = tls::connector(server.sslmode, server.root_certificate.as_deref())
             .map_err(|message| DbError {
                 message,
@@ -1049,6 +1066,8 @@ impl Connection {
         if let Some(schema) = &server.schema {
             set_search_path(&mut client, schema)?;
         }
+        // After the schema pick, so a `search_path` the script sets wins.
+        replay(&mut client, startup)?;
 
         Ok(Self {
             cancel: client.client.cancel_token(),
@@ -1060,7 +1079,26 @@ impl Connection {
             client: Arc::new(Mutex::new(client)),
             route,
             server: Arc::new(Mutex::new(server.clone())),
+            startup: startup.into(),
         })
+    }
+
+    /// Runs `statements` now on this session and keeps them for every session
+    /// this connection opens from here on. The first error stops the rest.
+    pub fn with_startup(mut self, statements: Vec<String>) -> Result<Self, DbError> {
+        replay(
+            &mut *self.client.lock().map_err(|_| DbError {
+                message: "The connection is unavailable after an earlier internal failure.".into(),
+                position: None,
+            })?,
+            &statements,
+        )?;
+        self.startup = statements.into();
+        // One opened before the script was known has not run it.
+        if let Ok(mut side) = self.side.lock() {
+            *side = None;
+        }
+        Ok(self)
     }
 
     fn server(&self) -> ServerConfig {
@@ -1118,7 +1156,7 @@ impl Connection {
         Ok(Self {
             side: self.side.clone(),
             server: self.server.clone(),
-            ..Self::connect(&self.server(), self.route.clone())?
+            ..Self::connect(&self.server(), self.route.clone(), &self.startup)?
         })
     }
 
@@ -1139,7 +1177,28 @@ impl Connection {
                 ..self.server()
             },
             self.route.clone(),
+            &self.startup,
         )
+    }
+
+    /// This side session with its bound back after the startup script ran on
+    /// it: the script is the user's text and may `SET statement_timeout` away
+    /// the 2 seconds the connection string gave it, which bounds every
+    /// describe and size read on it. In the same milliseconds the startup
+    /// option sends.
+    fn with_side_bound(self) -> Result<Self, DbError> {
+        if !self.startup.is_empty() {
+            let bound = format!(
+                "SET statement_timeout = {}",
+                u64::from(SIDE_TIMEOUT_SECONDS) * 1_000
+            );
+            let mut client = self.client.lock().map_err(|_| DbError {
+                message: "The connection is unavailable after an earlier internal failure.".into(),
+                position: None,
+            })?;
+            replay(&mut client, &[bound])?;
+        }
+        Ok(self)
     }
 
     /// A poisoned mutex counts: every later statement would fail on it too.
@@ -1376,7 +1435,9 @@ impl Connection {
                 statement_timeout: SIDE_TIMEOUT_SECONDS,
                 ..self.server()
             };
-            *side = Self::connect(&server, self.route.clone()).ok();
+            *side = Self::connect(&server, self.route.clone(), &self.startup)
+                .and_then(|side| side.with_side_bound())
+                .ok();
         }
         ask(side.as_ref()?)
     }
@@ -1511,7 +1572,7 @@ impl Connection {
     /// carries whatever that config holds -- the read-only hold of an agent's
     /// connection included -- from its first statement.
     fn side_session(&self) -> Result<Self, DbError> {
-        Self::connect(&self.server(), self.route.clone())
+        Self::connect(&self.server(), self.route.clone(), &self.startup)
     }
 
     pub fn references(&self, schema: &str, relation: &str) -> Result<Vec<Reference>, DbError> {
