@@ -2,8 +2,9 @@
 //!
 //! On open it reads, unfiltered, the databases the tree draws
 //! (`Connection::catalog_databases`), and the own database's schemas where the
-//! target has both levels, whatever the tree shows, so a name the filter hides
-//! can be ticked again. Where the catalog lists databases as schemas that leaves
+//! target has both levels (the catalog with its routines and sequences merged,
+//! as the tree assembles it), whatever the tree shows, so a name the filter
+//! hides can be ticked again. Where the catalog lists databases as schemas that leaves
 //! out the system databases and any holding nothing, so the preview's total is
 //! the connection row's. Save writes the profile's lists
 //! and reads the catalog again; it never reconnects, because the lists are not
@@ -504,7 +505,8 @@ type PickerNames = (
 /// The blocking read the picker sends on open and on retry, run off the UI
 /// thread so a test can drive it without a window. The databases are the ones
 /// the tree draws (`Connection::catalog_databases`), so the picker's total is
-/// the connection row's; the schemas are the whole catalog's.
+/// the connection row's; the schemas are the whole catalog's with its routines
+/// and sequences merged in, as the tree assembles it.
 fn read_names_for_picker(
     connection: Connection,
     engine: Engine,
@@ -520,7 +522,14 @@ fn read_names_for_picker(
             true => connection.apart()?,
             false => connection.clone(),
         };
-        let catalog = reader.catalog(&Shown::everything())?;
+        let mut catalog = reader.catalog(&Shown::everything())?;
+        // A schema holding only a routine or a sequence is drawn by the tree
+        // after its merge; a list without it would offer no row to tick and a
+        // total short of the row's. When the routines read fails the tree
+        // keeps its relations, so a schema list is never lost to it either.
+        if let Ok(routines) = reader.routines(&Shown::everything()) {
+            catalog.merge(routines);
+        }
         Ok::<_, DbError>(
             catalog
                 .schemas
