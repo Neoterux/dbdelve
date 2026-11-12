@@ -220,11 +220,8 @@ impl ConnectionForm {
         };
 
         let url = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a connection URL"));
-        let startup_script = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(3, 12)
-                .placeholder("SET search_path TO app, public;")
-        });
+        // The placeholder is the target's, written by `sync_placeholders`.
+        let startup_script = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12));
         let name = cx.new(|cx| {
             InputState::new(window, cx).default_value(value(
                 server
@@ -719,6 +716,10 @@ impl ConnectionForm {
                 input.set_placeholder(placeholder, window, cx)
             });
         }
+        // A textarea, so not one of the inputs above.
+        self.startup_script.update(cx, |input, cx| {
+            input.set_placeholder(blank.startup_script, window, cx)
+        });
     }
 
     /// The service typed, where the engine has one.

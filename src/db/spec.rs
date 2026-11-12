@@ -866,6 +866,7 @@ pub(crate) const POSTGRES: EngineSpec = EngineSpec {
     type_wrappers: &[],
     hints: Hints {
         database: "postgres",
+        startup_script: "SET search_path TO app, public;",
         ..Hints::DEFAULT
     },
     sql: SqlSpec {
@@ -1145,7 +1146,10 @@ pub(crate) const MYSQL: EngineSpec = EngineSpec {
     binary_types: &[],
     numeric_types: &[],
     type_wrappers: &[],
-    hints: Hints::DEFAULT,
+    hints: Hints {
+        startup_script: "SET SESSION wait_timeout = 28800;",
+        ..Hints::DEFAULT
+    },
     sql: SqlSpec {
         identifier_quote: IdentifierQuote::Backtick,
         // Unless `NO_BACKSLASH_ESCAPES` is set, which is not dbdelve's to know
@@ -1243,7 +1247,10 @@ pub(crate) const MARIADB: EngineSpec = EngineSpec {
     binary_types: &[],
     numeric_types: &[],
     type_wrappers: &[],
-    hints: Hints::DEFAULT,
+    hints: Hints {
+        startup_script: "SET SESSION wait_timeout = 28800;",
+        ..Hints::DEFAULT
+    },
     sql: SqlSpec {
         identifier_quote: IdentifierQuote::Backtick,
         backslash_escapes: true,
@@ -1469,6 +1476,7 @@ pub(crate) const DUCKDB: EngineSpec = EngineSpec {
     type_wrappers: &[],
     hints: Hints {
         path: "Blank for a database in memory",
+        startup_script: "SET threads = 4;",
         ..Hints::DEFAULT
     },
     sql: SqlSpec {
@@ -1734,7 +1742,10 @@ pub(crate) const SQL_SERVER: EngineSpec = EngineSpec {
     binary_types: &["image", "rowversion", "timestamp"],
     numeric_types: &[],
     type_wrappers: &[],
-    hints: Hints::DEFAULT,
+    hints: Hints {
+        startup_script: "SET NOCOUNT ON;",
+        ..Hints::DEFAULT
+    },
     sql: SqlSpec {
         nul_text: NulText::AddedNchar,
         national_strings: true,
