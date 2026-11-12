@@ -96,6 +96,10 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   drawn nor opened. `Databases::left_out` carries how many it hid, which
   `SidebarTree::totals` turns into the connection row's `1 of 2` while no
   search text is typed.
+  Save and load both pass the lists through `Include::from_stored` (entries
+  trimmed, blanks dropped, at most `ENTRIES_CAP`, 500, per list), so what a
+  profile holds is what its file holds and the picker's preview counts only
+  what Save keeps.
 - **New Query Here opens a tab bound to a database** (`QueryTab::binding`,
   `session::Binding`), from the connections tree's menu. A database row binds
   that database; a schema row binds by its connection's levels
