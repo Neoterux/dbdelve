@@ -19928,3 +19928,119 @@ fn a_stored_script_on_an_engine_without_the_row_is_dropped_at_restore(cx: &mut T
         quit(workspace, cx);
     });
 }
+
+fn generation_of(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: &str) -> u64 {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("the profile is listed")
+            .generation
+    })
+}
+
+#[gpui::test]
+fn lowering_the_mode_below_the_script_reconnects_and_says_why(cx: &mut TestAppContext) {
+    use crate::sql::Mode;
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let script = "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = 4000\"";
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER);",
+            "",
+            &format!(
+                "{}{}",
+                sqlite_profile("e2e", "E2E", script),
+                sqlite_profile("busy", "Busy", script),
+            ),
+        );
+        connect_profile(&workspace, cx, "e2e");
+        let before = generation_of(&workspace, cx, "e2e");
+        workspace.update(cx, |workspace, cx| workspace.set_mode(Mode::ReadWrite, cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the profile stays in front");
+            assert_eq!(profile.mode, Mode::ReadWrite);
+            assert!(profile.generation > before, "the profile reconnected");
+            let ProfileState::Failed(message) = &profile.state else {
+                panic!("the connect should have failed");
+            };
+            assert!(message.starts_with("The startup script"), "{message}");
+            assert!(!message.contains("PRAGMA"), "{message}");
+        });
+
+        // An import holds the mode where it is: `reconnect` declines to
+        // interrupt it, so lowering would leave the badge below what the open
+        // sessions ran.
+        connect_profile(&workspace, cx, "busy");
+        let file = store::dbdelve_directory().unwrap().join("rows.csv");
+        std::fs::write(&file, "id\n1\n").unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_import_file(
+                "busy".into(),
+                None,
+                "main".into(),
+                "t".into(),
+                file,
+                window,
+                cx,
+            );
+        });
+        settle(cx);
+        let before = generation_of(&workspace, cx, "busy");
+        workspace.update(cx, |workspace, cx| {
+            workspace.start_import(cx);
+            assert!(workspace.running_import_into("busy").is_some());
+            workspace.set_mode(Mode::ReadWrite, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().expect("the profile is in front");
+            assert_eq!(profile.mode, Mode::Full, "the mode was not lowered");
+            assert_eq!(profile.generation, before, "nothing reconnected");
+            let notice = profile.session.notice.as_deref().unwrap_or_default();
+            assert!(notice.contains("`main.t`"), "{notice}");
+            assert!(notice.contains("import"), "{notice}");
+        });
+        settle(cx);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn lowering_the_mode_to_one_the_script_passes_keeps_the_session(cx: &mut TestAppContext) {
+    use crate::sql::Mode;
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER);",
+            "",
+            &format!(
+                "{}{}",
+                sqlite_profile(
+                    "scripted",
+                    "Scripted",
+                    "mode = \"full\"\nstartup_script = \"SELECT 1\""
+                ),
+                sqlite_profile("plain", "Plain", "mode = \"full\""),
+            ),
+        );
+        for id in ["scripted", "plain"] {
+            connect_profile(&workspace, cx, id);
+            let before = generation_of(&workspace, cx, id);
+            for mode in [Mode::ReadOnly, Mode::Full] {
+                workspace.update(cx, |workspace, cx| workspace.set_mode(mode, cx));
+                settle(cx);
+                workspace.read_with(cx, |workspace, _| {
+                    let profile = workspace.profile().expect("the profile stays in front");
+                    assert_eq!(profile.mode, mode);
+                    assert_eq!(profile.generation, before, "{id} kept its sessions");
+                    assert!(matches!(profile.state, ProfileState::Connected(..)));
+                });
+            }
+        }
+        quit(workspace, cx);
+    });
+}
