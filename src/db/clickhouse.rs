@@ -196,7 +196,7 @@ WHERE database = {schema} AND name = {relation} AND primary_key != ''";
 /// The server's version, and the settings a request may carry, with whether
 /// this user may change each.
 const FACTS_SQL: &str = "SELECT version() AS version, name, value, readonly FROM system.settings \
-                         WHERE name IN ('readonly', 'max_execution_time', \
+                         WHERE name IN ('readonly', 'max_execution_time', 'session_timezone', \
                          'format_tsv_null_representation', 'enable_http_compression')";
 
 /// Carries exactly what every later request will, so a setting this user may
@@ -401,7 +401,11 @@ impl Connection {
                 read => read.map_err(|failed| connection.explain(failed))?,
             };
             let connection = Self {
-                server: Arc::new(facts(&read, server.statement_timeout)?),
+                server: Arc::new(facts(
+                    &read,
+                    server.statement_timeout,
+                    server.time_zone.as_deref(),
+                )?),
                 ..connection
             };
             if !connection.server.settings.is_empty() {
@@ -1588,11 +1592,18 @@ fn cap(sets: &mut [QueryResult], returned: usize, kept: usize) {
 /// - `max_execution_time` is sent unless it already is the profile's timeout.
 ///   A user who may not change it and has another value fails the validation
 ///   request, in the server's words.
+/// - `session_timezone` is sent unless it already is the profile's time zone,
+///   with the same outcome for a user who may not change it. The text is
+///   compared as the server shows it, which is how a request will name it.
 /// - `format_tsv_null_representation=\N` is sent wherever it may be, so a
 ///   user's `SET` of it cannot make NULL and the text `NULL` the same bytes.
 ///   Where it may not be, it has to be `\N` already.
 /// - `enable_http_compression=1` where it is off and may be turned on.
-fn facts(read: &QueryResult, statement_timeout: u32) -> Result<ServerFacts, DbError> {
+fn facts(
+    read: &QueryResult,
+    statement_timeout: u32,
+    time_zone: Option<&str>,
+) -> Result<ServerFacts, DbError> {
     let mut version = String::new();
     let mut found = HashMap::new();
     for row in &read.rows {
@@ -1615,6 +1626,11 @@ fn facts(read: &QueryResult, statement_timeout: u32) -> Result<ServerFacts, DbEr
         if current != Some(f64::from(statement_timeout)) {
             settings.push(("max_execution_time", statement_timeout.to_string()));
         }
+    }
+    if let Some(zone) = time_zone
+        && found.get("session_timezone").map(|(value, _)| *value) != Some(zone)
+    {
+        settings.push(("session_timezone", zone.to_string()));
     }
     match found.get("format_tsv_null_representation") {
         Some((value, false)) if *value == NULL => {}

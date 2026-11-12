@@ -11728,13 +11728,9 @@ fn an_agent_lists_only_the_schemas_the_filter_shows_and_says_how_many(cx: &mut T
 }
 
 /// One `[[profiles]]` table of a ClickHouse profile `Clicks` (id `clicks`) on
-/// a mock's `port`, visible to the agent, as `profiles.toml` spells one.
-fn clickhouse_profile(port: u16) -> String {
-    clickhouse_profile_with(port, "")
-}
-
-/// [`clickhouse_profile`] with `extra` keys appended to its table.
-fn clickhouse_profile_with(port: u16, extra: &str) -> String {
+/// a mock's `port`, visible to the agent, as `profiles.toml` spells one, with
+/// `extra` keys appended to its table.
+fn clickhouse_profile(port: u16, extra: &str) -> String {
     format!(
         "[[profiles]]\nid = \"clicks\"\nname = \"Clicks\"\nhost = \"127.0.0.1\"\nport = {port}\n\
          database = \"dbdelve_dev\"\nuser = \"me@example.com\"\nengine = \"clickhouse\"\n\
@@ -11826,7 +11822,7 @@ fn launch_beside_a_clickhouse_mock_with<'a>(
         cx,
         &[
             sqlite_profile("orders", "Orders", ""),
-            clickhouse_profile_with(port, extra),
+            clickhouse_profile(port, extra),
         ]
         .concat(),
     );
