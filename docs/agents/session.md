@@ -440,7 +440,10 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   session a statement holds is skipped and never waited on; it is skipped whole
   while `in_transaction` or any `bound_transactions` entry holds; and a failed
   ping stops the keep-alive until the next connect without a word, the lost
-  session being found on its next use. A ping writes no profile field: it is not
+  session being found on its next use. Only engines with `EngineSpec.keeps_alive`
+  are pinged (Postgres, MySQL, MariaDB, SQL Server, Redis); each ping is
+  `try_lock`, leaves a session never logged in or dialled alone, and a Redis
+  session with a `MULTI` open too, where a `PING` would be queued. A ping writes no profile field: it is not
   the user's activity. In the e2e harness `run_until_parked` does not jump to
   timers but `advance_clock` fires them, and a test that then blocks on a
   future must drop an armed timer first (`set_behaviour` with `keep_alive:
