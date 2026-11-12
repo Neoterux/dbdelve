@@ -1514,6 +1514,57 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires the compose databases"]
+    fn live_the_time_zone_reaches_every_session() {
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            let config = ServerConfig {
+                sslmode: SslMode::Disable,
+                time_zone: Some("+02:00".into()),
+                ..live_config(engine)
+            };
+            let zone = |connection: &Connection| {
+                let result = connection
+                    .query("SELECT @@session.time_zone", Fetch::default())
+                    .expect("the variable reads");
+                result.rows[0].get(0).map(str::to_string)
+            };
+            let main = Connection::open(&config, engine).expect("the connection opens");
+            assert_eq!(zone(&main).as_deref(), Some("+02:00"), "{engine:?}");
+            let beside = main.alongside().expect("a session beside it opens");
+            assert_eq!(zone(&beside).as_deref(), Some("+02:00"), "{engine:?}");
+            let other = main
+                .on_database("dbdelve_archive")
+                .expect("a session opens");
+            assert_eq!(zone(&other).as_deref(), Some("+02:00"), "{engine:?}");
+
+            let agent = crate::db::Connection::open_for_agent(match engine {
+                Engine::MariaDb => crate::db::ConnectionConfig::MariaDb(config.clone()),
+                _ => crate::db::ConnectionConfig::MySql(config.clone()),
+            })
+            .expect("the agent's connection opens");
+            let read = agent
+                .query(
+                    "SELECT @@session.time_zone",
+                    &crate::db::CancelToken::default(),
+                    Fetch::default(),
+                )
+                .expect("the agent reads");
+            assert_eq!(read.rows[0].get(0), Some("+02:00"), "{engine:?}");
+
+            // Without one the session is the server's own.
+            let bare = Connection::open(
+                &ServerConfig {
+                    time_zone: None,
+                    ..config
+                },
+                engine,
+            )
+            .expect("the connection opens");
+            assert_eq!(zone(&bare).as_deref(), Some("SYSTEM"), "{engine:?}");
+        }
+    }
+
     /// The compose database as the bastion sees it, by service name and the
     /// port inside the network.
     fn live_tunnelled() -> ServerConfig {
@@ -2154,6 +2205,31 @@ ORDER BY 1, 2
         assert_eq!(
             init_statements(&server(false, 30), Engine::MariaDb),
             ["SET SESSION max_statement_time = 30"]
+        );
+    }
+
+    #[test]
+    fn the_time_zone_follows_the_hold_and_the_timeout_in_init() {
+        let server = |time_zone: Option<&str>| ServerConfig {
+            read_only: true,
+            statement_timeout: 30,
+            time_zone: time_zone.map(str::to_string),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            init_statements(&server(Some("Europe/Paris")), Engine::MySql),
+            [
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET SESSION max_execution_time = 30000",
+                "SET time_zone = 'Europe/Paris'"
+            ]
+        );
+        assert_eq!(
+            init_statements(&server(None), Engine::MySql),
+            [
+                "SET SESSION TRANSACTION READ ONLY",
+                "SET SESSION max_execution_time = 30000"
+            ]
         );
     }
 
