@@ -100,6 +100,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   trimmed, blanks dropped, at most `ENTRIES_CAP`, 500, per list), so what a
   profile holds is what its file holds and the picker's preview counts only
   what Save keeps.
+  Where the catalog lists databases as schemas (MySQL, MariaDB, ClickHouse),
+  the hidden count comes from the listing the picker reads
+  (`Connection::catalog_databases`: the databases holding a table, view,
+  routine or sequence), so shown plus hidden is the unfiltered count and a
+  database holding nothing is in neither.
 - **New Query Here opens a tab bound to a database** (`QueryTab::binding`,
   `session::Binding`), from the connections tree's menu. A database row binds
   that database; a schema row binds by its connection's levels
