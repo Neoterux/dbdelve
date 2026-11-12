@@ -20048,3 +20048,163 @@ fn lowering_the_mode_to_one_the_script_passes_keeps_the_session(cx: &mut TestApp
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_mode_lowered_while_connecting_regates_the_script(cx: &mut TestAppContext) {
+    use crate::sql::Mode;
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER);",
+            "",
+            &sqlite_profile(
+                "e2e",
+                "E2E",
+                "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = 4000\"",
+            ),
+        );
+        settle(cx);
+        // One update, so the connect cannot land between: the profile is
+        // `Connecting` and `set_mode` finds no connection to re-gate.
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_connect(0, cx);
+            assert!(matches!(
+                workspace.profiles[0].state,
+                ProfileState::Connecting
+            ));
+            workspace.set_mode(Mode::ReadWrite, cx);
+        });
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = &workspace.profiles[0];
+            assert_eq!(profile.mode, Mode::ReadWrite);
+            let ProfileState::Failed(message) = &profile.state else {
+                panic!("the landing should have connected again and failed");
+            };
+            assert!(message.starts_with("The startup script"), "{message}");
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// Saves the edit form of `id` with `script` and, when given, `path`.
+fn save_script(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: &str,
+    script: &str,
+    path: Option<String>,
+) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        let index = workspace
+            .profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .expect("the profile is listed");
+        workspace.edit_profile(index, window, cx);
+        let form = workspace.form.as_mut().expect("the edit form is open");
+        form.startup_script.update(cx, |input, cx| {
+            input.set_value(script.to_string(), window, cx)
+        });
+        if let Some(path) = path {
+            form.path
+                .update(cx, |input, cx| input.set_value(path, window, cx));
+        }
+        workspace.submit_connection(&SubmitConnection, window, cx);
+    });
+    settle(cx);
+}
+
+fn session_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .and_then(|profile| profile.session.notice.clone())
+            .unwrap_or_default()
+    })
+}
+
+fn front_cache_size(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| {
+        let connection = workspace
+            .profile()
+            .and_then(crate::session::Profile::connection)
+            .expect("the profile is connected");
+        cache_size(&connection)
+    })
+}
+
+#[gpui::test]
+fn a_script_saved_while_connected_applies_from_the_next_connect(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER);",
+            "",
+            &sqlite_profile(
+                "e2e",
+                "E2E",
+                "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = 4000\"",
+            ),
+        );
+        connect_profile(&workspace, cx, "e2e");
+        let before = generation_of(&workspace, cx, "e2e");
+
+        save_script(&workspace, cx, "e2e", "PRAGMA cache_size = 3000", None);
+        assert_eq!(generation_of(&workspace, cx, "e2e"), before);
+        let notice = session_notice(&workspace, cx);
+        assert!(notice.contains("applies from the next connect"), "{notice}");
+        assert_eq!(front_cache_size(&workspace, cx).as_deref(), Some("4000"));
+
+        workspace.update(cx, |workspace, cx| workspace.reconnect(0, cx));
+        settle(cx);
+        assert_eq!(front_cache_size(&workspace, cx).as_deref(), Some("3000"));
+
+        // A save that leaves the script as it was says nothing about it.
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        save_script(&workspace, cx, "e2e", "PRAGMA cache_size = 3000", None);
+        assert_eq!(session_notice(&workspace, cx), "");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_save_that_edits_the_script_and_reconnects_runs_the_new_script(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let (workspace, cx) = launch_connections(
+            cx,
+            "CREATE TABLE t (id INTEGER);",
+            "",
+            &sqlite_profile(
+                "e2e",
+                "E2E",
+                "mode = \"full\"\nstartup_script = \"PRAGMA cache_size = 4000\"",
+            ),
+        );
+        connect_profile(&workspace, cx, "e2e");
+        let other = store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("other.db");
+        rusqlite::Connection::open(&other).expect("the second database creates");
+
+        save_script(
+            &workspace,
+            cx,
+            "e2e",
+            "PRAGMA cache_size = 3000",
+            Some(other.display().to_string()),
+        );
+        // The reconnect the save starts read the script before it was saved;
+        // the landing connects again so no session runs the old one.
+        assert_eq!(front_cache_size(&workspace, cx).as_deref(), Some("3000"));
+        let notice = session_notice(&workspace, cx);
+        assert!(
+            !notice.contains("applies from the next connect"),
+            "{notice}"
+        );
+        quit(workspace, cx);
+    });
+}
