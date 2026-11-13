@@ -34,7 +34,7 @@ mod welcome;
 use std::collections::{HashMap, HashSet};
 
 use crate::export::ClipboardFormat;
-use gpui_component::menu::DropdownMenu;
+use gpui_component::{menu::DropdownMenu, tooltip::Tooltip};
 
 pub(crate) use import_dialog::PreviewGrid;
 #[cfg(test)]
@@ -1976,6 +1976,7 @@ impl Render for Workspace {
         // status line in green shouts about being connected, which is the
         // least interesting thing dbdelve can tell you.
         let status_group = div()
+            .debug_selector(|| "status-connection".into())
             .flex()
             .items_center()
             .gap(px(layout::SPACE_SM))
@@ -2065,6 +2066,16 @@ impl Render for Workspace {
             || structure_copies.is_some()
             || has_pending;
 
+        // How soon each part of the bar gives way when the window is too
+        // narrow for all of it: the larger the factor, the sooner. A group
+        // clips what it holds at its own edge and a part that does not give
+        // way is never narrower than its content, so nothing is painted over
+        // its neighbour. The control that ends a transaction, the chips and
+        // the paging do not give way at all; a bar narrower than those is cut
+        // at its right edge.
+        const NOTICE_MIN_WIDTH: f32 = 120.;
+        const STATS_SHRINK: f32 = 64.;
+        const ACTIONS_SHRINK: f32 = 8.;
         let results_status = bar_has_content.then(|| {
             div()
                 .debug_selector(|| "status-bar".into())
@@ -2074,27 +2085,34 @@ impl Render for Workspace {
                 .border_color(t.border)
                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                 .min_w_0()
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
                 .px(px(layout::SPACE_MD))
                 .bg(t.data_glass())
                 .children(inline_status)
-                // The control ends a transaction, so it takes its room before
-                // either side shares the rest. One that overflows its group is
-                // painted under whatever comes after it, and that element
-                // takes the click.
                 .children(transaction)
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
+                        .debug_selector(|| "status-chips".into())
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
                         .children(view_sorting)
                         .children(edit_mode)
-                        .children(uncommitted)
+                        .children(uncommitted),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "status-stats-group".into())
+                        .flex_shrink(STATS_SHRINK)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
                             div()
@@ -2105,39 +2123,51 @@ impl Render for Workspace {
                                 .child(stats)
                         }))
                         .children(count_control)
-                        .children(export_status)
-                        .children(notice.map(|notice| {
-                            div()
-                                .debug_selector(|| "status-notice".into())
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(t.text_muted)
-                                .child(one_line(&notice))
-                        })),
+                        .children(export_status),
                 )
-                // Between two sides that share the free space equally, so
-                // it sits at the middle of the bar whatever either holds.
+                // Whatever width the rest leaves, so a notice is cut only
+                // when the bar is full, and then its tooltip has all of it.
+                .child(match notice {
+                    Some(notice) => {
+                        let whole = one_line(&notice);
+                        div()
+                            .id("status-notice")
+                            .debug_selector(|| "status-notice".into())
+                            .flex_1()
+                            .min_w(px(layout::chrome(NOTICE_MIN_WIDTH)))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(t.text_muted)
+                            .child(whole.clone())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(whole.clone()).build(window, cx)
+                            })
+                            .into_any_element()
+                    }
+                    None => div().flex_1().into_any_element(),
+                })
                 .children(paging)
-                // One right-hand cluster taking the other half of that
-                // space, so the readout stays against the edge.
+                // One right-hand cluster, against the edge.
                 //
                 // Each control appears only when it does something. A pair
                 // of buttons that do nothing is a pair to read past --
                 // see `apply_edits` for its `cmd+s` binding.
                 //
-                // Its box holds its content, because a `justify_end` group
-                // narrower than its controls spills them leftward over paging
-                // and the transaction control.
+                // Its box clips, and it is aligned to the end, so a window
+                // too narrow for it loses the readout and Import first and
+                // keeps the controls at the edge.
                 //
-                // ponytail: below the width that fits the control, paging and
-                // this cluster, the bar runs off its right edge and the
-                // rightmost controls are out of reach. The upgrade is an
-                // overflow menu for the cluster.
+                // ponytail: below the width of the control, the chips and
+                // the paging, the bar is cut at its right edge and the
+                // controls there are out of reach. The upgrade is an overflow
+                // menu for the cluster.
                 .child(
                     div()
-                        .flex_1()
+                        .debug_selector(|| "status-actions".into())
+                        .flex_shrink(ACTIONS_SHRINK)
+                        .min_w_0()
+                        .overflow_hidden()
                         .justify_end()
                         .flex()
                         .items_center()
@@ -2244,9 +2274,17 @@ impl Render for Workspace {
                                         },
                                     )
                                 }))
-                        }))
-                        // A tinted cell scrolled out of view is an edit
-                        // nobody knows is about to be written.
+                        })),
+                )
+                // Apart from the cluster above, which gives way, and never
+                // given way to: a tinted cell scrolled out of view is an edit
+                // nobody knows is about to be written.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
                         .children(has_pending.then(|| {
                             let label = div()
                                 .min_w_0()
