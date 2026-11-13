@@ -1603,6 +1603,32 @@ impl Session {
         }
     }
 
+    /// When one named tab's edits are sent: its own for a relation, `Draft` for
+    /// every other tab, which has no Row mode to be in.
+    pub(crate) fn edit_mode(&self, tab: Tab) -> EditMode {
+        match tab {
+            Tab::Query(_) => EditMode::Draft,
+            Tab::Object(id) => match self.objects.iter().find(|tab| tab.id == id) {
+                Some(ObjectTab {
+                    body: ObjectBody::Relation { edit_mode, .. },
+                    ..
+                }) => *edit_mode,
+                _ => EditMode::Draft,
+            },
+        }
+    }
+
+    /// `Some` only for a relation tab, the one view with a mode to change.
+    pub(crate) fn edit_mode_mut(&mut self, tab: Tab) -> Option<&mut EditMode> {
+        match tab {
+            Tab::Query(_) => None,
+            Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
+                ObjectBody::Relation { edit_mode, .. } => Some(edit_mode),
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
+            },
+        }
+    }
+
     /// Every live grid this session holds, across both tab strips. `results`
     /// and `slot` reach one grid by tab; this reaches all of them, for a
     /// setting that belongs to the connection rather than to a run --
@@ -2173,6 +2199,54 @@ impl Sorting {
                     .collect(),
             ),
             None => Self::Server,
+        }
+    }
+}
+
+/// When a view's edits are sent. `Row` sends a row's `UPDATE` as the row is
+/// left or saved, with no review; `Draft` holds every edit until it is applied
+/// through the review. Per view, because a table the user is correcting row by
+/// row and a result they are drafting a batch against want different answers;
+/// a new view starts from the Edit mode setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EditMode {
+    #[default]
+    Draft,
+    Row,
+}
+
+impl EditMode {
+    pub(crate) const ALL: [EditMode; 2] = [EditMode::Draft, EditMode::Row];
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Row => "row",
+        }
+    }
+
+    /// Absent or unknown is `Draft`, the mode that sends nothing unasked.
+    pub(crate) fn from_slug(slug: Option<&str>) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|mode| Some(mode.slug()) == slug)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Row => "Row",
+        }
+    }
+
+    /// This mode, but `Draft` where the target does not offer Row: Row is
+    /// offered exactly where `Target::row_edits` holds, the targets whose edit
+    /// send keeps the grid, so a Row send is never made on one that clears it.
+    pub(crate) fn on(self, target: Target) -> Self {
+        match (self, target.row_edits()) {
+            (Self::Row, false) => Self::Draft,
+            (mode, _) => mode,
         }
     }
 }
@@ -3198,6 +3272,9 @@ pub(crate) enum ObjectBody {
         /// this page alone, and is never written into `sort`, which is what
         /// the statement is rebuilt from.
         sorting: Sorting,
+        /// When this view's edits are sent. Per view and never in the tab's
+        /// snapshot, so a restored tab starts from the default.
+        edit_mode: EditMode,
         /// The `WHERE` expression this preview narrows the relation by, without
         /// the keyword; empty means none. The fifth control of the same kind as
         /// the sort, the limit and the offset: a change regenerates the
@@ -4111,6 +4188,29 @@ mod tests {
                 Some((explained, showing))
             );
         }
+    }
+
+    #[test]
+    fn an_edit_mode_reads_back_from_its_slug_and_anything_else_is_draft() {
+        assert_eq!(EditMode::default(), EditMode::Draft);
+        for mode in EditMode::ALL {
+            assert_eq!(EditMode::from_slug(Some(mode.slug())), mode);
+        }
+        for unknown in [None, Some(""), Some("instant")] {
+            assert_eq!(EditMode::from_slug(unknown), EditMode::Draft, "{unknown:?}");
+        }
+        assert_eq!(
+            EditMode::Row.on(Target::built_in(Engine::Redis)),
+            EditMode::Draft
+        );
+        assert_eq!(
+            EditMode::Row.on(Target::built_in(Engine::Postgres)),
+            EditMode::Row
+        );
+        assert_eq!(
+            EditMode::Draft.on(Target::built_in(Engine::Postgres)),
+            EditMode::Draft
+        );
     }
 
     #[test]

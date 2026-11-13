@@ -1560,6 +1560,9 @@ impl Workspace {
         .detach();
     }
 
+    /// Stub for the red commit.
+    pub(crate) fn set_edit_mode(&mut self, _mode: EditMode, _cx: &mut Context<Self>) {}
+
     /// Turn the grid's pending edits into SQL and put it where the user can read
     /// it: the query tab's buffer, or the review modal on a relation tab and on
     /// a query tab whose target reviews them (`Target::reviews_query_edits`).

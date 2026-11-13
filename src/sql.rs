@@ -1187,6 +1187,11 @@ pub fn row_guard(engine: Engine, statement: &str) -> Option<String> {
     is_generated_select(engine, &guard).then_some(guard)
 }
 
+/// Stub for the red commit.
+pub(crate) fn row_read(_engine: Engine, _statement: &str) -> Option<String> {
+    None
+}
+
 /// Whether `sql` is a `SELECT` dbdelve could have written: exactly one root
 /// statement, a query, with nothing destructive anywhere under it.
 ///
@@ -7714,6 +7719,73 @@ mod tests {
             assert_eq!(row_guard(Engine::Postgres, refused), None, "{refused}");
         }
         assert_eq!(row_guard(Engine::MongoDb, "db.t.deleteOne({_id: 1})"), None);
+    }
+
+    #[test]
+    fn a_row_read_is_cut_from_the_gated_update() {
+        use crate::db::Target;
+
+        let engines: Vec<_> = Engine::ALL
+            .into_iter()
+            .filter(|engine| Target::built_in(*engine).row_edits())
+            .collect();
+        assert!(engines.len() > 1, "{engines:?}");
+        for engine in engines {
+            for sets in [
+                vec![("name", set("wren")), ("note", set("it's"))],
+                vec![("name", set("wren")), ("note", NewValue::Default)],
+                vec![("name", NewValue::Null), ("note", set("x"))],
+            ] {
+                for keys in [vec![("id", "7")], vec![("id", "7"), ("rev", "2")]] {
+                    let row = pending_row(&sets, &keys);
+                    let update = update_batch(engine, std::slice::from_ref(&row)).unwrap();
+                    let predicate = update
+                        .trim_end_matches(';')
+                        .rsplit_once(" WHERE ")
+                        .unwrap()
+                        .1
+                        .to_string();
+                    let table = engine.spec().qualified("public", "accounts");
+                    let read = row_read(engine, &update)
+                        .unwrap_or_else(|| panic!("{engine:?} read nothing of {update}"));
+                    assert_eq!(
+                        read,
+                        format!("SELECT * FROM {table} WHERE {predicate}"),
+                        "{engine:?}"
+                    );
+                    assert!(is_generated_select(engine, &read), "{engine:?} {read}");
+                }
+            }
+        }
+
+        let engine = Engine::Postgres;
+        let one = pending_row(&[("name", set("a"))], &[("id", "1")]);
+        let two = pending_row(&[("name", set("b"))], &[("id", "2")]);
+        let batch = update_batch(engine, &[one, two]).unwrap();
+        let delete = delete_row(engine, "public", "accounts", &[("id", "1")], &[]).unwrap();
+        let insert = insert_row(engine, "public", "accounts", &[("name", Some("a"))], &[]).unwrap();
+        for refused in [
+            batch.as_str(),
+            delete.as_str(),
+            insert.as_str(),
+            "UPDATE t SET a = a + 1 WHERE id = 1",
+            "UPDATE t SET a = '1' WHERE id > '7'",
+            "SELECT * FROM t WHERE id = '7'",
+            "BEGIN",
+        ] {
+            assert_eq!(row_read(engine, refused), None, "{refused}");
+        }
+        assert_eq!(
+            row_read(Engine::MongoDb, "db.t.updateOne({_id: 1}, {$set: {a: 1}})"),
+            None
+        );
+        assert_eq!(
+            row_read(
+                Engine::ClickHouse,
+                "ALTER TABLE t UPDATE a = '1' WHERE b = '2' SETTINGS mutations_sync = 2"
+            ),
+            None
+        );
     }
 
     fn set(value: &str) -> NewValue {
