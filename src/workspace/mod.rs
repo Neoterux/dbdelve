@@ -1771,6 +1771,8 @@ impl Render for Workspace {
         let paging =
             running.or_else(|| views::render_paging(profile, self.custom_limit.as_ref(), cx));
         let view_sorting = views::render_view_sorting(profile, cx);
+        let edit_mode = views::render_edit_mode(profile, cx);
+        let apply_label = views::apply_label(views::view_edit_mode(profile));
         let transaction = views::render_transaction(profile, cx);
         let hidden_columns = views::render_hidden_columns(profile, cx);
         let relation = profile
@@ -2033,6 +2035,7 @@ impl Render for Workspace {
             || notice.is_some()
             || paging.is_some()
             || view_sorting.is_some()
+            || edit_mode.is_some()
             || transaction.is_some()
             || hidden_columns.is_some()
             || query_status.is_some()
@@ -2068,6 +2071,7 @@ impl Render for Workspace {
                         .items_center()
                         .gap(px(layout::SPACE_SM))
                         .children(view_sorting)
+                        .children(edit_mode)
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
                             div()
@@ -2280,7 +2284,7 @@ impl Render for Workspace {
                         .children(has_pending.then(|| {
                             button(
                                 "apply-edits",
-                                "Apply edits",
+                                apply_label,
                                 Tone::Primary,
                                 Control::Compact,
                                 t,

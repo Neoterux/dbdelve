@@ -3228,19 +3228,64 @@ pub(crate) fn render_view_sorting(
     })
 }
 
-pub(crate) fn view_edit_mode(_profile: &Profile) -> Option<EditMode> {
-    None
+/// The edit mode of the view in front, where there is a choice of one: `None`
+/// on anything but a relation's rows, and on a target that does not offer Row.
+/// The status bar's chips and the palette's rows for them.
+pub(crate) fn view_edit_mode(profile: &Profile) -> Option<EditMode> {
+    let session = &profile.session;
+    // The target is asked, never the engine: Row is offered where an edit's
+    // send keeps the grid and the statement carries its own one-row guard.
+    (relation_preview(session).is_some() && profile.config.target().row_edits())
+        .then(|| session.edit_mode(session.active))
 }
 
+/// How the view in front sends its edits: Draft holds them for a review, Row
+/// sends a row's own `UPDATE`.
 pub(crate) fn render_edit_mode(
-    _profile: &Profile,
-    _cx: &mut Context<Workspace>,
+    profile: &Profile,
+    cx: &mut Context<Workspace>,
 ) -> Option<AnyElement> {
-    None
+    let t = *theme(cx);
+    view_edit_mode(profile).map(|mode| {
+        div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(layout::SPACE_XS))
+            .child(
+                div()
+                    .text_size(px(layout::chrome(layout::TEXT_SM)))
+                    .text_color(t.text_faint)
+                    .child("Edit"),
+            )
+            .children(EditMode::ALL.map(|choice| {
+                div()
+                    .debug_selector(move || {
+                        match choice {
+                            EditMode::Draft => "edit-mode-draft",
+                            EditMode::Row => "edit-mode-row",
+                        }
+                        .into()
+                    })
+                    .child(choice_chip(
+                        ("edit-mode", choice as usize),
+                        choice.label(),
+                        choice == mode,
+                        cx,
+                        move |workspace, _, cx| workspace.set_edit_mode(choice, cx),
+                    ))
+            }))
+            .into_any_element()
+    })
 }
 
-pub(crate) fn apply_label(_mode: Option<EditMode>) -> &'static str {
-    "Apply edits"
+/// What the button over staged edits says it does: a Row view saves the row,
+/// a Draft view applies the draft.
+pub(crate) fn apply_label(mode: Option<EditMode>) -> &'static str {
+    match mode {
+        Some(EditMode::Row) => "Save row",
+        _ => "Apply edits",
+    }
 }
 
 /// Transaction control: whether each statement commits on its own, and the
