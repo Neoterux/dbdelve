@@ -2134,6 +2134,7 @@ impl Render for Workspace {
                                 Control::Compact,
                                 t,
                             )
+                            .debug_selector(|| "previous-edit".into())
                             .tooltip("Previous edit")
                             .on_click(move |_, window, cx| {
                                 _ = previous_workspace.update(cx, |workspace, cx| {
@@ -2161,6 +2162,7 @@ impl Render for Workspace {
                                 Control::Compact,
                                 t,
                             )
+                            .debug_selector(|| "next-edit".into())
                             .tooltip("Next edit")
                             .on_click(move |_, window, cx| {
                                 _ = next_workspace.update(cx, |workspace, cx| {

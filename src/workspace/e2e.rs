@@ -25892,12 +25892,41 @@ fn resize_to(
     settle(cx);
 }
 
-/// Whether the item is drawn whole inside the bar, which is not the same as
-/// being laid out: an item pushed past the bar's edge still has bounds.
+/// The parts of the pending count and the box that clips them. Kept out of
+/// [`STATUS_ITEMS`]: the overlap test would read a part as drawn over its own
+/// group.
+const COUNT_PARTS: [(&str, &str); 2] = [
+    ("previous-edit", "status-pending-count"),
+    ("next-edit", "status-pending-count"),
+];
+
+/// Whether the item is drawn whole, which is not the same as being laid out:
+/// an item pushed past the bar's edge, or past the edge of the group that
+/// clips it, still has bounds. Import is clipped by `status-actions`, not by
+/// the bar, so a check against the bar alone passes it while its button is cut.
+/// An item in neither table is clipped by the bar alone.
 fn drawn_whole(cx: &mut VisualTestContext, selector: &'static str) -> bool {
     let bar = cx.debug_bounds("status-bar").expect("the bar is drawn");
-    cx.debug_bounds(selector)
-        .is_some_and(|item| item.intersect(&bar) == item)
+    let Some(item) = cx.debug_bounds(selector) else {
+        return false;
+    };
+    let mut current = selector;
+    while let Some((_, group)) = COUNT_PARTS
+        .iter()
+        .chain(STATUS_ITEMS.iter())
+        .find(|(name, _)| *name == current)
+    {
+        if *group == "status-bar" {
+            break;
+        }
+        if let Some(clip) = cx.debug_bounds(group)
+            && item.intersect(&clip) != item
+        {
+            return false;
+        }
+        current = group;
+    }
+    item.intersect(&bar) == item
 }
 
 /// A pending edit on the table in front, in Draft, where the staged-edit
@@ -26058,6 +26087,61 @@ fn count_stays_reachable_beside_the_badge_and_the_transaction_at_1536px(cx: &mut
             assert!(
                 drawn_whole(cx, "count-rows"),
                 "Count is a button, and is cut off with the sidebar hidden {hidden}"
+            );
+        }
+        quit(workspace, cx);
+    });
+}
+
+/// The painted lines inside the status bar, as text.
+fn status_bar_lines(cx: &mut VisualTestContext) -> Vec<String> {
+    let bar = cx.debug_bounds("status-bar").expect("the bar is drawn");
+    cx.update(|window, _| window.debug_text().to_vec())
+        .into_iter()
+        .filter(|(_, bounds)| bar.intersect(bounds) == *bounds)
+        .map(|(text, _)| text.to_string())
+        .collect()
+}
+
+#[gpui::test]
+fn the_pending_edit_count_reads_whole_beside_the_transaction_and_the_badge_at_1536px(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = crowded_status_bar(cx);
+        draft_with_a_pending_edit(&workspace, cx);
+        let width = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("status-pending-count")
+                .expect("the count is drawn")
+                .size
+                .width
+        };
+        resize_to(&workspace, cx, 3000., true);
+        let wide = width(cx);
+        let wide_lines = status_bar_lines(cx);
+        assert!(
+            wide_lines.iter().any(|line| line == "1 pending edit"),
+            "a wide bar paints the count's label: {wide_lines:?}"
+        );
+        for hidden in [false, true] {
+            resize_to(&workspace, cx, 1536., hidden);
+            assert_eq!(
+                width(cx),
+                wide,
+                "the pending count is narrower than in a wide window at 1536px, sidebar hidden \
+                 {hidden}"
+            );
+            for item in ["previous-edit", "next-edit", "status-pending-count"] {
+                assert!(
+                    drawn_whole(cx, item),
+                    "{item} is cut off at 1536px, sidebar hidden {hidden}"
+                );
+            }
+            let lines = status_bar_lines(cx);
+            assert!(
+                lines.iter().any(|line| line == "1 pending edit"),
+                "no painted line reads `1 pending edit` at 1536px, sidebar hidden {hidden}: \
+                 {lines:?}"
             );
         }
         quit(workspace, cx);
