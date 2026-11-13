@@ -1199,25 +1199,53 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.has_unapplied_edits(tab, cx) {
+        if !self.held_for_edits(tab, AfterEdits::Close { deleting: None }, cx) {
             self.close_now(tab, window, cx);
-            return;
+        }
+    }
+
+    /// Whether `then` is held back because `tab`'s grid holds edits nobody has
+    /// applied; `true` means the caller stops, having changed nothing.
+    ///
+    /// Asked on every target and engine alike: what a send does differs
+    /// between them, but an unapplied edit is replaced by a requery the same
+    /// way on all of them. The action waits on `pending_discard` as data, to be
+    /// carried out by [`Self::resume_after_edits`] if the user lets the edits
+    /// go.
+    pub(crate) fn held_for_edits(
+        &mut self,
+        tab: Tab,
+        then: AfterEdits,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.has_unapplied_edits(tab, cx) {
+            return false;
+        }
+        // Edits in flight are neither the user's to discard nor ours to wait
+        // on: the send decides what becomes of them, and a prompt over them
+        // would answer before it has.
+        if !matches!(then, AfterEdits::Close { .. })
+            && self
+                .profile()
+                .is_some_and(|profile| profile.session.running(tab))
+        {
+            self.note("This tab's edits are still being sent.".into(), cx);
+            return true;
         }
         if let Some(profile) = self.profile_mut() {
-            profile.session.pending_discard = Some(PendingDiscard {
-                tab,
-                then: AfterEdits::Close { deleting: None },
-            });
+            profile.session.pending_discard = Some(PendingDiscard { tab, then });
         }
         cx.notify();
+        true
     }
 
     pub(crate) fn has_unapplied_edits(&self, tab: Tab, cx: &App) -> bool {
         self.profile().is_some_and(|profile| {
             profile
                 .session
-                .results(tab)
-                .is_some_and(|results| results.read(cx).delegate().has_pending())
+                .tab_grids(tab)
+                .iter()
+                .any(|grid| grid.read(cx).delegate().has_pending())
         })
     }
 
@@ -1282,7 +1310,8 @@ impl Workspace {
         .detach();
     }
 
-    /// Close the tab the discard prompt was raised over, edits and all.
+    /// Drop the edits of the tab the discard prompt was raised over, and do
+    /// what it was raised for.
     pub(crate) fn confirm_discard_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(discard) = self
             .profile_mut()
@@ -1290,25 +1319,93 @@ impl Workspace {
         else {
             return;
         };
-        match discard.then {
+        // The grids the question read, every one of them: a Discard that left
+        // one holding edits would put the action back in front of the prompt.
+        let grids = self
+            .profile()
+            .map(|profile| profile.session.tab_grids(discard.tab))
+            .unwrap_or_default();
+        for grid in grids {
+            grid.update(cx, |table, cx| {
+                table.delegate_mut().discard_pending();
+                table.refresh(cx);
+            });
+        }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.drop_apply_review_of(discard.tab);
+        }
+        self.resume_after_edits(discard.tab, discard.then, window, cx);
+        self.refocus_front();
+        cx.notify();
+    }
+
+    /// Carry out what was held back for `tab`'s edits, which are gone. Each
+    /// arm calls the handler the guard stands in, which passes it this time.
+    /// Anything but a close does nothing when `tab` is not the tab in front: a
+    /// prompt never acts on another tab.
+    pub(crate) fn resume_after_edits(
+        &mut self,
+        tab: Tab,
+        then: AfterEdits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let in_front = self.profile().map(|profile| profile.session.active) == Some(tab);
+        match then {
             AfterEdits::Close {
                 deleting: Some(name),
             } => self.delete_saved_query_now(name, window, cx),
-            _ => self.close_now(discard.tab, window, cx),
+            AfterEdits::Close { deleting: None } => self.close_now(tab, window, cx),
+            _ if !in_front => {}
+            AfterEdits::Requery {
+                filter,
+                sort,
+                limit,
+                offset,
+            } => {
+                if let Tab::Object(id) = tab {
+                    self.requery_relation(
+                        id,
+                        move |tab_filter, tab_sort, tab_limit, tab_offset| {
+                            *tab_filter = filter;
+                            *tab_sort = sort;
+                            *tab_limit = limit;
+                            *tab_offset = offset;
+                            true
+                        },
+                        cx,
+                    );
+                }
+            }
+            // Filled in with their guards.
+            AfterEdits::Refresh
+            | AfterEdits::Filter { .. }
+            | AfterEdits::ViewSorting(_)
+            | AfterEdits::Run
+            | AfterEdits::Sort(_)
+            | AfterEdits::Rerun { .. } => {}
         }
-        self.refocus_front();
     }
 
+    /// Put the prompt away. A changed filter bar goes back to what it was: the
+    /// bars were changed before anything could ask, and are the state the tab
+    /// saves and restores from.
     pub(crate) fn cancel_discard_close(&mut self, cx: &mut Context<Self>) -> bool {
-        let cancelled = self
+        let Some(discard) = self
             .profile_mut()
             .and_then(|profile| profile.session.pending_discard.take())
-            .is_some();
-        if cancelled {
-            self.refocus_front();
-            cx.notify();
+        else {
+            return false;
+        };
+        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) =
+            (discard.tab, discard.then)
+            && let Some(bars) = self.filter_rows_mut(id)
+        {
+            *bars = rows;
         }
-        cancelled
+        self.refocus_front();
+        cx.notify();
+        true
     }
 
     pub(crate) fn cancel_delete_query(&mut self, cx: &mut Context<Self>) -> bool {

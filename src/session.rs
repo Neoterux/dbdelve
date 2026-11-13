@@ -1565,6 +1565,26 @@ impl Session {
         }
     }
 
+    /// Every grid one named tab keeps rows in: its slot, the slot's own grid
+    /// while a queue's earlier result stands in for it, and each finished
+    /// result of a queue. The edits a requery would replace are in any of
+    /// them, so the question and the Discard that answers it read the same set.
+    pub(crate) fn tab_grids(&self, tab: Tab) -> Vec<Entity<TableState<ResultGrid>>> {
+        let mut grids: Vec<_> = self.results(tab).into_iter().cloned().collect();
+        if let Tab::Query(id) = tab
+            && let Some(query) = self.query_tab(id)
+        {
+            grids.extend(query.lent.iter().map(|(grid, _)| grid.clone()));
+            grids.extend(
+                query
+                    .queue
+                    .iter()
+                    .flat_map(|queue| queue.done.iter().map(|finished| finished.grid.clone())),
+            );
+        }
+        grids
+    }
+
     /// Whether one named tab has a statement in flight: its own slot, not
     /// whichever of a queue's results the switcher is showing.
     pub(crate) fn running(&self, tab: Tab) -> bool {
@@ -1771,6 +1791,9 @@ pub(crate) enum PendingDelete {
 /// the edits are out of the way. Never a stored closure: every variant is the
 /// values the action was raised with, so a Discard runs what the user asked
 /// for and not what the tab has become since.
+// Every variant but the first two is built by a guard added with the next
+// commit; the allow goes with it.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) enum AfterEdits {
     /// Close the tab, and delete the saved query first when deleting it is
@@ -1804,10 +1827,26 @@ pub(crate) enum AfterEdits {
 impl AfterEdits {
     /// The prompt's title and its sentence: what the edits are discarded by.
     pub(crate) fn discards(&self) -> (&'static str, &'static str) {
-        (
-            "Close tab",
-            "This tab has cell edits that have not been applied. Closing it discards them.",
-        )
+        match self {
+            Self::Close { .. } => (
+                "Close tab",
+                "This tab has cell edits that have not been applied. Closing it discards them.",
+            ),
+            Self::Requery { .. }
+            | Self::Refresh
+            | Self::Filter { .. }
+            | Self::ViewSorting(_)
+            | Self::Sort(_) => (
+                "Discard edits",
+                "This tab has cell edits that have not been applied. Reading the rows again \
+                 discards them.",
+            ),
+            Self::Run | Self::Rerun { .. } => (
+                "Discard edits",
+                "This tab has cell edits that have not been applied. Running the statement \
+                 discards them.",
+            ),
+        }
     }
 }
 
