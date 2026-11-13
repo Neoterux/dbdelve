@@ -1266,10 +1266,8 @@ impl Workspace {
     /// Undoes what an action that is not going ahead changed before it asked:
     /// a filter bar the user edited goes back to what it was.
     pub(crate) fn put_back(&mut self, tab: Tab, then: AfterEdits) {
-        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) = (tab, then)
-            && let Some(bars) = self.filter_rows_mut(id)
-        {
-            *bars = rows;
+        if let Some(profile) = self.profile_mut() {
+            profile.session.put_back(tab, then);
         }
     }
 

@@ -2104,6 +2104,14 @@ impl Workspace {
         self.execute_unchecked(sql, tab, refresh, keep_rows, explain, None, cx);
     }
 
+    /// A send that is dropped before it runs: the action it carried is put
+    /// back, as it is on every other outcome that does not carry it out.
+    fn drop_parked(&mut self, tab: Tab, refresh: Option<Refresh>) {
+        if let Some(then) = refresh.and_then(Refresh::into_parked) {
+            self.put_back(tab, then);
+        }
+    }
+
     /// Runs a statement without consulting the connection's mode. Only two
     /// callers: `execute_and_then`, once the mode has allowed it, and the
     /// prompt's own Run.
@@ -2149,6 +2157,7 @@ impl Workspace {
             None => self.profile_mut(),
         };
         let Some(profile) = profile else {
+            self.drop_parked(tab, refresh);
             return;
         };
         // Read before the task, which outlives the borrow of `self`.
@@ -2222,6 +2231,7 @@ impl Workspace {
         // routes through this one, and a caller that forgets would let two
         // results race into the grid with the older one landing last.
         if matches!(state, QueryState::Running { .. }) {
+            self.drop_parked(tab, refresh);
             return;
         }
 
@@ -2237,6 +2247,7 @@ impl Workspace {
                 });
             }
             cx.notify();
+            self.drop_parked(tab, refresh);
             if let Some(lane) = lane {
                 self.land_lane(tab, lane, Vec::new(), cx);
             }
@@ -3276,16 +3287,15 @@ impl Workspace {
                     // outcome cancels it, with the tab as it was. An action
                     // already waiting is the user's own, and this one only a
                     // re-read's.
+                    // Whichever profile is in front: a send that lands behind
+                    // another connection's tab still owes its own bars their
+                    // way back, and the action does not follow the user.
                     if let Some(then) = row_then
-                        && in_front_now
+                        && let Some(profile) = workspace.issued_to(&id, generation)
                     {
-                        match row_said.is_some() {
-                            true => {
-                                if let Some(profile) = workspace.issued_to(&id, generation) {
-                                    profile.session.resume_after.get_or_insert((tab, then));
-                                }
-                            }
-                            false => workspace.put_back(tab, then),
+                        match in_front_now && row_said.is_some() {
+                            true => profile.session.park_resume(tab, then),
+                            false => profile.session.put_back(tab, then),
                         }
                     }
                     // Not tied to the profile being in front: its transaction
