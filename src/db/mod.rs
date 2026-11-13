@@ -54,6 +54,8 @@ pub(crate) use include::same_name;
 pub use include::{Include, Shown};
 pub use plugin::Plugin;
 pub use properties::{Properties, Property};
+#[cfg(test)]
+pub(crate) use snowflake::mock as snowflake_mock;
 
 pub use mongo::MongoConfig;
 pub use postgres::PostgresConfig;

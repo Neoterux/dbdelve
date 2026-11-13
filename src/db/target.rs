@@ -445,7 +445,6 @@ mod tests {
                         | Engine::Sqlite
                         | Engine::Turso
                         | Engine::DuckDb
-                        | Engine::Snowflake
                         | Engine::SqlServer
                 ),
                 "{engine:?}"

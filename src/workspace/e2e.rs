@@ -25072,3 +25072,92 @@ fn a_row_send_on_another_databases_table_is_written_there(cx: &mut TestAppContex
         quit(workspace, cx);
     });
 }
+
+/// A Snowflake relation tab, opened on the recorded mock, which no result of
+/// is ever editable (`docs/agents/engines.md`): its keys are declared and not
+/// enforced, so Row mode has no row to send and nothing to switch to.
+#[gpui::test]
+fn a_snowflake_table_offers_no_edit_mode(cx: &mut TestAppContext) {
+    use crate::db::snowflake_mock::{Mock, Response};
+
+    store::tests::with_home(|| {
+        crate::IGNORE_ENVIRONMENT.set(true);
+        let mock = Mock::start();
+        let within = "IN SCHEMA \"DBDELVE_TEST\".\"SALES\"";
+        for (statement, name) in [
+            ("FROM INFORMATION_SCHEMA.TABLES", "relations"),
+            ("FROM INFORMATION_SCHEMA.FUNCTIONS", "functions"),
+            ("FROM INFORMATION_SCHEMA.PROCEDURES", "procedures"),
+            ("TABLE_NAME = 'ORDER_LINES'", "columns_ORDER_LINES"),
+            (&format!("SHOW PRIMARY KEYS {within}"), "show_primary"),
+            (&format!("SHOW UNIQUE KEYS {within}"), "show_unique"),
+            (&format!("SHOW IMPORTED KEYS {within}"), "show_imported"),
+        ] {
+            mock.on_statement(
+                "",
+                statement,
+                [Response::fixture(200, &format!("{name}.json"))],
+            );
+        }
+        // Rows of the recorded `customers` answer stand in for the preview's:
+        // what the tab shows is not what is asserted.
+        mock.answer("SELECT * FROM \"SALES\".\"ORDER_LINES\"", "customers");
+
+        let config = mock.config();
+        let (workspace, cx) = launch_with_profiles(
+            cx,
+            &format!(
+                "{}[[profiles]]\nid = \"snow\"\nname = \"Snow\"\nhost = {:?}\ndatabase = {:?}\n\
+                 user = {:?}\nengine = \"snowflake\"\naccount = {:?}\nprivate_key = {:?}\n\
+                 warehouse = {:?}\nmode = \"full\"\n",
+                sqlite_profile("orders", "Orders", ""),
+                config.host.as_deref().expect("the mock names its address"),
+                config.database,
+                config.user,
+                config.account,
+                config.private_key,
+                config.warehouse.as_deref().expect("a warehouse"),
+            ),
+        );
+        cx.executor().allow_parking();
+        activate_by_id(&workspace, cx, "snow");
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .is_some_and(|profile| profile.id == "snow" && profile.connection().is_some())
+            })
+        });
+        settle(cx);
+        let id = workspace.update_in(cx, |workspace, window, cx| {
+            let opened = crate::session::OpenedObject::Relation {
+                schema: "SALES".into(),
+                name: "ORDER_LINES".into(),
+                kind: Default::default(),
+                filter: String::new(),
+                filters: Vec::new(),
+            };
+            let id = workspace
+                .open_object(opened, None, window, cx)
+                .expect("the relation opens");
+            workspace.activate_tab(Tab::Object(id), window, cx);
+            id
+        });
+        drive_until(cx, |cx| {
+            settle(cx);
+            relation_grid(&workspace, cx, id)
+                .read_with(cx, |grid, _| !grid.delegate().result().rows.is_empty())
+        });
+
+        assert_eq!(front_edit_mode(&workspace, cx), None);
+        assert_eq!(
+            drawn(cx, &["edit-mode-draft", "edit-mode-row"]),
+            [false, false]
+        );
+        let rows = palette_listing(&workspace, cx);
+        for label in ["Edit in Row mode", "Edit in Draft mode"] {
+            assert!(!rows.iter().any(|row| row == label), "{label}: {rows:?}");
+        }
+        quit(workspace, cx);
+    });
+}
