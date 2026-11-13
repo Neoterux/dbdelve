@@ -24393,3 +24393,364 @@ fn a_page_turn_in_row_mode_saves_the_dirty_row_first(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// Settles through a landed send and what its release starts, which takes a
+/// frame to reach render and another round of the executor to run.
+fn settle_through(cx: &mut VisualTestContext) {
+    for _ in 0..3 {
+        settle(cx);
+    }
+}
+
+/// No prompt of any kind is up over the tab.
+fn assert_no_discard_prompt(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    assert!(discard_holds(workspace, cx).is_none(), "no discard prompt");
+    assert_ne!(front_dialog(workspace, cx), Some("discard"));
+}
+
+const SIX_BIRDS: &str = "create table birds (id integer primary key, name text not null); \
+     insert into birds values (1, 'wren'), (2, 'tit'), (3, 'kite'), (4, 'owl'), (5, 'jay'), \
+     (6, 'crow');";
+
+#[gpui::test]
+fn row_mode_saves_the_dirty_row_before_a_sort_a_filter_a_refresh_or_a_row_limit(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        actions::{RefreshRelation, SetRowLimit, SortColumn},
+        result_grid::NewValue,
+        session::Sorting,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIX_BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let edit_first_row = |name: &str, cx: &mut VisualTestContext| -> String {
+            let key = cell_of(&grid, cx, 0, 0).expect("a first row");
+            stage(&grid, cx, 0, 1, NewValue::Value(name.into()));
+            key
+        };
+        let name_of = |key: &str| on_disk(&format!("select name from birds where id = {key}"));
+
+        // A header click on a view the server sorts, as a new tab's is.
+        assert_eq!(sorting_of(&workspace, cx, Tab::Object(id)), Sorting::Server);
+        let key = edit_first_row("alpha", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.sort_column(&SortColumn { column: 1 }, window, cx)
+        });
+        assert_eq!(state_kind(&workspace, cx), "running", "the row goes first");
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(name_of(&key).as_deref(), Some("alpha"));
+        assert_eq!(
+            relation_view(&workspace, cx, id).1.len(),
+            1,
+            "then it sorts"
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+
+        // A header click on a view sorted in memory.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(true, window, cx)
+        });
+        settle(cx);
+        let held = sorting_of(&workspace, cx, Tab::Object(id));
+        let key = edit_first_row("bravo", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.sort_column(&SortColumn { column: 0 }, window, cx)
+        });
+        assert_eq!(state_kind(&workspace, cx), "running", "the row goes first");
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(name_of(&key).as_deref(), Some("bravo"));
+        assert_ne!(sorting_of(&workspace, cx, Tab::Object(id)), held);
+        assert!(matches!(
+            sorting_of(&workspace, cx, Tab::Object(id)),
+            Sorting::Client(keys) if keys.len() == 2
+        ));
+        assert_eq!(pending_of(&grid, cx), 0);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(false, window, cx)
+        });
+        settle_through(cx);
+
+        // A filter bar submitted.
+        let key = edit_first_row("charlie", cx);
+        let input = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.push_filter_row(id, window, cx);
+            let input = workspace.filter_rows_mut(id).unwrap()[0].value.clone();
+            input.update(cx, |input, cx| input.set_value("id > 2", window, cx));
+            input
+        });
+        workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(name_of(&key).as_deref(), Some("charlie"));
+        assert_eq!(relation_view(&workspace, cx, id).0, "id > 2");
+        assert_eq!(
+            grid.read_with(cx, |g, _| g.delegate().result().rows.len()),
+            4
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+
+        // A refresh, which reads what is on the server now.
+        let key = edit_first_row("delta", cx);
+        rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
+            .and_then(|db| db.execute("update birds set name = 'finch' where id = 6", []))
+            .unwrap();
+        cx.dispatch_action(RefreshRelation);
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(name_of(&key).as_deref(), Some("delta"));
+        let shown: Vec<_> = (0..4)
+            .filter_map(|row| cell_of(&grid, cx, row, 1))
+            .collect();
+        assert!(shown.contains(&"finch".to_string()), "{shown:?}");
+        assert!(shown.contains(&"delta".to_string()), "{shown:?}");
+        assert_eq!(pending_of(&grid, cx), 0);
+
+        // A row limit change.
+        let key = edit_first_row("echo", cx);
+        cx.dispatch_action(SetRowLimit { rows: Some(2) });
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(name_of(&key).as_deref(), Some("echo"));
+        assert_eq!(relation_view(&workspace, cx, id).2, Some(2));
+        assert_eq!(
+            grid.read_with(cx, |g, _| g.delegate().result().rows.len()),
+            2
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+
+        // A refused row cancels the action and keeps the row.
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        let before = relation_view(&workspace, cx, id);
+        cx.dispatch_action(SetRowLimit { rows: Some(3) });
+        settle_through(cx);
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some());
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn switching_tabs_in_row_mode_saves_the_dirty_row_first(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = workspace.read_with(cx, |workspace, _| {
+            Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+        });
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let table = Tab::Object(id);
+        let front = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.active
+            })
+        };
+        let switch = |tab: Tab, workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_tab(tab, window, cx)
+            })
+        };
+
+        // The row is sent, and the other tab comes forward when it lands.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        switch(query, &workspace, cx);
+        assert_eq!(front(&workspace, cx), table, "not yet");
+        assert_eq!(state_kind(&workspace, cx), "running");
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(front(&workspace, cx), query);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(resume_after_of(&workspace, cx), None);
+
+        // A row the server refuses keeps the tab in front.
+        switch(table, &workspace, cx);
+        settle(cx);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        switch(query, &workspace, cx);
+        settle_through(cx);
+        assert_eq!(front(&workspace, cx), table);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some_and(|(row, _)| row == 0));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+fn table_tab_is_open(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: u64) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .unwrap()
+            .session
+            .objects
+            .iter()
+            .any(|tab| tab.id == id)
+    })
+}
+
+#[gpui::test]
+fn closing_a_row_mode_tab_saves_its_dirty_row_first(cx: &mut TestAppContext) {
+    use crate::{actions::CloseTab, result_grid::NewValue};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_tab(&CloseTab, window, cx)
+        });
+        assert_no_discard_prompt(&workspace, cx);
+        assert!(table_tab_is_open(&workspace, cx, id), "not before the save");
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert!(!table_tab_is_open(&workspace, cx, id), "then it closes");
+
+        // A row the server refuses keeps the tab open with the row marked.
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        cx.dispatch_action(CloseTab);
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert!(table_tab_is_open(&workspace, cx, id));
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some());
+
+        // Esc puts the row back, and the tab then closes without a send.
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        press(cx, "escape");
+        assert_eq!(pending_of(&grid, cx), 0);
+        cx.dispatch_action(CloseTab);
+        settle_through(cx);
+        assert!(!table_tab_is_open(&workspace, cx, id));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn row_to_draft_saves_the_dirty_row_first(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        // A row the server refuses leaves the view in Row.
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        click_selector(cx, "edit-mode-draft");
+        settle_through(cx);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some());
+        assert_no_discard_prompt(&workspace, cx);
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().discard_pending();
+            table.refresh(cx);
+        });
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        click_selector(cx, "edit-mode-draft");
+        settle_through(cx);
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_draft_view_keeps_its_edits_across_a_tab_switch(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = workspace.read_with(cx, |workspace, _| {
+            Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+        });
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let history = history_sql(&workspace, cx).len();
+
+        for tab in [query, Tab::Object(id)] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_tab(tab, window, cx)
+            });
+            settle_through(cx);
+            assert_no_discard_prompt(&workspace, cx);
+            assert_eq!(pending_of(&grid, cx), 1);
+        }
+        assert_eq!(history_sql(&workspace, cx).len(), history, "nothing sent");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_reread_after_one_rows_send_sends_the_other_dirty_rows_first(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text not null); \
+             insert into birds values (1, 'wren'), (2, 'tit'), (3, 'kite'); \
+             create trigger vanish after update on birds when new.name = 'ghost' \
+             begin delete from birds where id = new.id; end;",
+        );
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+
+        // Row 0 is gone once it is sent, so it cannot be read back and the
+        // relation is owed a read.
+        stage(&grid, cx, 0, 1, NewValue::Value("ghost".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        save(&workspace, cx);
+        settle_through(cx);
+
+        assert_no_discard_prompt(&workspace, cx);
+        assert_eq!(on_disk("select name from birds where id = 1"), None);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay"),
+            "the other row's edit was sent, not dropped"
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        assert_eq!(state_kind(&workspace, cx), "complete");
+        let shown: Vec<_> = (0..3)
+            .filter_map(|row| cell_of(&grid, cx, row, 1))
+            .collect();
+        assert!(shown.contains(&"jay".to_string()), "{shown:?}");
+        assert!(table_tab_is_open(&workspace, cx, id));
+        quit(workspace, cx);
+    });
+}
