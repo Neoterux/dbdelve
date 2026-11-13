@@ -851,6 +851,12 @@ pub(crate) struct ApplyReview {
     pub(crate) sql: String,
     /// What the engine adds about running `sql`, one paragraph each.
     pub(crate) notes: Vec<String>,
+    /// What the last run of `sql` came to when it failed or was refused,
+    /// drawn where the statement is. Cleared when it runs again.
+    pub(crate) error: Option<String>,
+    /// Whether `sql` is the grid's pending edits, which a successful run
+    /// clears. An `INSERT` or a `DELETE` sends none of them.
+    pub(crate) edits: bool,
 }
 
 impl ApplyReview {
@@ -3810,6 +3816,8 @@ mod tests {
             title: "Apply edits",
             sql: "UPDATE t SET a = 1".into(),
             notes: Vec::new(),
+            error: None,
+            edits: true,
         }
     }
 
