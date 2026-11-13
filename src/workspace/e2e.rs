@@ -24784,3 +24784,291 @@ fn a_refused_row_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// The relation tabs of the profile in front whose Row-mode writes sit inside
+/// its open transaction.
+fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<u64> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .expect("a profile is in front")
+            .uncommitted
+            .iter()
+            .copied()
+            .collect()
+    })
+}
+
+/// Whether relation tab `id` of the profile in front is owed a re-read.
+fn relation_is_stale(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: u64) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        let tab = workspace
+            .profile()
+            .and_then(|profile| profile.session.objects.iter().find(|tab| tab.id == id))
+            .expect("the relation tab is open");
+        matches!(tab.body, ObjectBody::Relation { stale: true, .. })
+    })
+}
+
+/// The id of the query tab in front.
+fn front_query_id(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> u64 {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .and_then(|profile| profile.session.active_query_tab())
+            .expect("a query tab is in front")
+            .id
+    })
+}
+
+fn bring_forward(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, tab: Tab) {
+    cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.activate_tab(tab, window, cx));
+    });
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_row_send_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = front_query_id(&workspace, cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "nothing sent yet"
+        );
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "staged is not sent"
+        );
+        save(&workspace, cx);
+
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("robin"));
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "a second connection does not see it"
+        );
+        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert!(
+            open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.starts_with("UPDATE")),
+            "the Auto prompt and the end dialog name the row's UPDATE"
+        );
+
+        bring_forward(&workspace, cx, Tab::Query(query));
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "drawn only with the tab in front"
+        );
+        run_in_front(&workspace, cx, "COMMIT");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        bring_forward(&workspace, cx, Tab::Object(id));
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn rolling_back_reads_again_the_rows_saved_inside_the_transaction(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = front_query_id(&workspace, cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("robin"));
+        assert!(!relation_is_stale(&workspace, cx, id));
+
+        bring_forward(&workspace, cx, Tab::Query(query));
+        run_in_front(&workspace, cx, "ROLLBACK");
+        assert!(
+            relation_is_stale(&workspace, cx, id),
+            "which way it ended is not read off the statement"
+        );
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+
+        bring_forward(&workspace, cx, Tab::Object(id));
+        assert_eq!(
+            cell_of(&grid, cx, 0, 1).as_deref(),
+            Some("wren"),
+            "the server's row, not the one the rollback undid"
+        );
+        assert!(!relation_is_stale(&workspace, cx, id));
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_outside_a_transaction_shows_no_badge(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = front_query_id(&workspace, cx);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin"),
+            "committed as it landed"
+        );
+
+        // A Draft apply inside a transaction is not a Row write.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Draft, cx)
+        });
+        bring_forward(&workspace, cx, Tab::Query(query));
+        run_in_front(&workspace, cx, "BEGIN");
+        bring_forward(&workspace, cx, Tab::Object(id));
+        stage(&grid, cx, 1, 1, NewValue::Value("sparrow".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert!(
+            open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.starts_with("UPDATE")),
+            "the apply joined the transaction"
+        );
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_from_a_bound_tab_is_refused_while_its_session_holds_a_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        new_query_here(&workspace, cx, Some("other"), None);
+        run_in_front(&workspace, cx, "BEGIN");
+        click_t_under(&workspace, cx, "other");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = workspace.read_with(cx, |workspace, _| {
+            match &workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_object()
+                .unwrap()
+                .body
+            {
+                ObjectBody::Relation { results, .. } => results.clone(),
+                _ => panic!("a relation tab"),
+            }
+        });
+        stage(&grid, cx, 0, 0, NewValue::Value("edited".into()));
+        save(&workspace, cx);
+
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().pending_count(), 1, "the row stays edited");
+            assert_eq!(grid.delegate().cell(0, 0), Some("other"));
+        });
+        assert_eq!(refused_row(&grid, cx).map(|(row, _)| row), Some(0));
+        let notice = shown_notice(&workspace, cx).expect("the refusal is said");
+        assert!(
+            notice.starts_with("Not sent: a transaction is open on the session of"),
+            "{notice}"
+        );
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        assert_eq!(
+            answer_in_the_first_query_tab(
+                &workspace,
+                cx,
+                "SELECT name FROM other.main.t WHERE id = 1"
+            )
+            .as_deref(),
+            Some("other"),
+            "nothing was written"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_on_another_databases_table_is_written_there(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = two_databases_each_holding_t(cx);
+        click_t_under(&workspace, cx, "other");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = workspace.read_with(cx, |workspace, _| {
+            match &workspace
+                .profile()
+                .unwrap()
+                .session
+                .active_object()
+                .unwrap()
+                .body
+            {
+                ObjectBody::Relation { results, .. } => results.clone(),
+                _ => panic!("a relation tab"),
+            }
+        });
+        stage(&grid, cx, 0, 0, NewValue::Value("edited".into()));
+        save(&workspace, cx);
+
+        assert_eq!(
+            front_object_database_and_cell(&workspace, cx),
+            Some((Some("other".into()), Some("edited".into())))
+        );
+        assert_eq!(
+            answer_in_the_first_query_tab(
+                &workspace,
+                cx,
+                "SELECT name FROM other.main.t WHERE id = 1"
+            )
+            .as_deref(),
+            Some("edited"),
+            "`other.duckdb` changed"
+        );
+        assert_eq!(
+            answer_in_the_first_query_tab(
+                &workspace,
+                cx,
+                "SELECT name FROM e2e.main.t WHERE id = 1"
+            )
+            .as_deref(),
+            Some("own"),
+            "the connection's own file did not"
+        );
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        quit(workspace, cx);
+    });
+}
