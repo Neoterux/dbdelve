@@ -1866,6 +1866,7 @@ impl Render for Workspace {
                         let sql = explorer::count_sql(engine, &tab.schema, &tab.name, filter);
                         Some(
                             button("count-rows", "Count", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "count-rows".into())
                                 .tooltip(sql)
                                 .on_click(move |_, _, cx| {
                                     _ = workspace.update(cx, |workspace, cx| {
@@ -2074,12 +2075,16 @@ impl Render for Workspace {
         // narrow for all of it: the larger the factor, the sooner. A group
         // clips what it holds at its own edge and a part that does not give
         // way is never narrower than its content, so nothing is painted over
-        // its neighbour. The control that ends a transaction, the chips and
-        // the paging do not give way at all; a bar narrower than those is cut
-        // at its right edge.
+        // its neighbour. The control that ends a transaction, the Edit chips,
+        // the Uncommitted badge and the staged-edit buttons do not give way
+        // at all, and a bar narrower than those, laid out in that order, is
+        // cut at its right edge: the later one goes first. After them come
+        // the notice at its minimum width, then Sort, then the readouts and
+        // the endpoint, which narrow.
         const NOTICE_MIN_WIDTH: f32 = 120.;
         const STATS_SHRINK: f32 = 64.;
         const ACTIONS_SHRINK: f32 = 8.;
+        const PENDING_COUNT_SHRINK: f32 = 16.;
         let results_status = bar_has_content.then(|| {
             div()
                 .debug_selector(|| "status-bar".into())
@@ -2104,15 +2109,98 @@ impl Render for Workspace {
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
-                        .children(view_sorting.map(|sort| {
-                            div()
-                                .debug_selector(|| "status-sort".into())
-                                .flex_shrink_0()
-                                .child(sort)
-                        }))
                         .children(edit_mode)
                         .children(uncommitted),
                 )
+                // The staged edits, right behind the control that ends the
+                // transaction and the chips that say what a keystroke will do
+                // to the database: past the bar's edge only after those are.
+                // Their count and arrows give way first, as a readout does,
+                // and their buttons never narrow. A tinted cell scrolled out
+                // of view is an edit nobody knows is about to be written.
+                .children(has_pending.then(|| {
+                    div()
+                        .debug_selector(|| "status-pending-count".into())
+                        .flex_shrink(PENDING_COUNT_SHRINK)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .child(
+                            icon_button(
+                                "previous-edit",
+                                icon::CHEVRON_LEFT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .tooltip("Previous edit")
+                            .on_click(move |_, window, cx| {
+                                _ = previous_workspace.update(cx, |workspace, cx| {
+                                    workspace.previous_edit(&PreviousEdit, window, cx);
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_color(t.text_muted)
+                                .child(format!(
+                                    "{pending_count} pending {}",
+                                    if pending_count == 1 { "edit" } else { "edits" }
+                                )),
+                        )
+                        .child(
+                            icon_button(
+                                "next-edit",
+                                icon::CHEVRON_RIGHT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .tooltip("Next edit")
+                            .on_click(move |_, window, cx| {
+                                _ = next_workspace.update(cx, |workspace, cx| {
+                                    workspace.next_edit(&NextEdit, window, cx);
+                                });
+                            }),
+                        )
+                }))
+                .children(has_pending.then(|| {
+                    div()
+                        .debug_selector(|| "status-pending".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .child(
+                            button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "discard-edits".into())
+                                .on_click(move |_, window, cx| {
+                                    _ = discard_workspace.update(cx, |workspace, cx| {
+                                        workspace.discard_edits(&DiscardEdits, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            button(
+                                "apply-edits",
+                                apply_label,
+                                Tone::Primary,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "apply-edits".into())
+                            .on_click(move |_, window, cx| {
+                                _ = apply_workspace.update(cx, |workspace, cx| {
+                                    workspace.apply_edits(&ApplyEdits, window, cx);
+                                });
+                            }),
+                        )
+                }))
                 .child(
                     div()
                         .debug_selector(|| "status-stats-group".into())
@@ -2131,7 +2219,6 @@ impl Render for Workspace {
                                 .text_color(t.text_faint)
                                 .child(stats)
                         }))
-                        .children(count_control)
                         .children(export_status),
                 )
                 // Whatever width the rest leaves, so a notice is cut only
@@ -2156,7 +2243,19 @@ impl Render for Workspace {
                     }
                     None => div().flex_1().into_any_element(),
                 })
+                // A view preference, so it goes when the bar is full, after
+                // the things above and before the readouts below.
+                .children(view_sorting.map(|sort| {
+                    div()
+                        .debug_selector(|| "status-sort".into())
+                        .flex_shrink_0()
+                        .child(sort)
+                }))
                 .children(paging)
+                // A button, not a readout, so it is its own item: a window
+                // narrower than the cluster beside it squeezes the cluster
+                // and leaves this whole.
+                .children(count_control)
                 // One right-hand cluster, against the edge.
                 //
                 // Each control appears only when it does something. A pair
@@ -2167,10 +2266,14 @@ impl Render for Workspace {
                 // too narrow for it loses the readout and Import first and
                 // keeps the controls at the edge.
                 //
-                // ponytail: below the width of the control, the chips and
-                // the paging, the bar is cut at its right edge and the
-                // controls there are out of reach. The upgrade is an overflow
-                // menu for the cluster.
+                // ponytail: below the width of the transaction control, the
+                // Edit chips, the badge, the staged-edit buttons and the
+                // notice's minimum (about 980px with all of them showing),
+                // the bar is cut at its right edge and what is there is out
+                // of reach: Sort and Count first, the staged-edit buttons
+                // when the transaction is open at 700px. The upgrade is an
+                // overflow menu for the cluster, and for the transaction
+                // control's own Auto and Manual switch.
                 .child(
                     div()
                         .debug_selector(|| "status-actions".into())
@@ -2287,93 +2390,6 @@ impl Render for Workspace {
                                         },
                                     )
                                 }))
-                        })),
-                )
-                // Apart from the cluster above, which gives way, and never
-                // given way to: a tinted cell scrolled out of view is an edit
-                // nobody knows is about to be written.
-                .child(
-                    div()
-                        .debug_selector(|| "status-pending".into())
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(layout::SPACE_SM))
-                        .children(has_pending.then(|| {
-                            let label = div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(t.text_muted)
-                                .child(format!(
-                                    "{pending_count} pending {}",
-                                    if pending_count == 1 { "edit" } else { "edits" }
-                                ));
-                            div()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .child(
-                                    icon_button(
-                                        "previous-edit",
-                                        icon::CHEVRON_LEFT,
-                                        Tone::Quiet,
-                                        Control::Compact,
-                                        t,
-                                    )
-                                    .tooltip("Previous edit")
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = previous_workspace.update(cx, |workspace, cx| {
-                                                workspace.previous_edit(&PreviousEdit, window, cx);
-                                            });
-                                        },
-                                    ),
-                                )
-                                .child(label)
-                                .child(
-                                    icon_button(
-                                        "next-edit",
-                                        icon::CHEVRON_RIGHT,
-                                        Tone::Quiet,
-                                        Control::Compact,
-                                        t,
-                                    )
-                                    .tooltip("Next edit")
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = next_workspace.update(cx, |workspace, cx| {
-                                                workspace.next_edit(&NextEdit, window, cx);
-                                            });
-                                        },
-                                    ),
-                                )
-                                .into_any_element()
-                        }))
-                        .children(has_pending.then(|| {
-                            button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
-                                .debug_selector(|| "discard-edits".into())
-                                .on_click(move |_, window, cx| {
-                                    _ = discard_workspace.update(cx, |workspace, cx| {
-                                        workspace.discard_edits(&DiscardEdits, window, cx);
-                                    });
-                                })
-                        }))
-                        .children(has_pending.then(|| {
-                            button(
-                                "apply-edits",
-                                apply_label,
-                                Tone::Primary,
-                                Control::Compact,
-                                t,
-                            )
-                            .debug_selector(|| "apply-edits".into())
-                            .on_click(move |_, window, cx| {
-                                _ = apply_workspace.update(cx, |workspace, cx| {
-                                    workspace.apply_edits(&ApplyEdits, window, cx);
-                                });
-                            })
                         })),
                 )
         });
