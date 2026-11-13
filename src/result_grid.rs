@@ -1592,8 +1592,9 @@ impl ResultGrid {
     /// this is a view sorted in memory, which a header click there and every
     /// result landing in it both come through.
     ///
-    /// Pending edits move with their rows, since they are what the user typed
-    /// against those rows. The ring, the row selection and an open input are
+    /// Pending edits, a refused row's mark and the row the ring left move with
+    /// their rows, since they are what the user typed against those rows. The
+    /// ring, the row selection and an open input are
     /// dropped, as a sort the server runs drops them by replacing the grid:
     /// each names a position, and a different row is there now.
     pub fn rows_id(&self) -> u64 {
@@ -1614,6 +1615,18 @@ impl ResultGrid {
         }
         for edit in &mut self.pending {
             edit.row = moved_to[edit.row];
+        }
+        // Every field that names a row by its index goes through the same
+        // permutation: a refused row's mark and Esc's target would otherwise
+        // sit on whichever row is now at the old position.
+        if let Some((row, _)) = &mut self.send_failure {
+            *row = moved_to[*row];
+        }
+        if let Some(row) = &mut self.left_row {
+            *row = moved_to[*row];
+        }
+        if let Some((row, _, _)) = &mut self.closed_input {
+            *row = moved_to[*row];
         }
         self.active = None;
         self.editing = None;
