@@ -21884,6 +21884,10 @@ fn a_failed_apply_keeps_the_draft(cx: &mut TestAppContext) {
         let (_, _, error) = front_review(&workspace, cx).expect("the review stays");
         let error = error.expect("the review says why");
         assert!(error.contains("NOT NULL"), "{error}");
+        assert!(
+            cx.debug_bounds("apply-review-error").is_some(),
+            "the review draws it"
+        );
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren")
