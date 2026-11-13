@@ -22665,6 +22665,61 @@ fn the_status_bar_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
     });
 }
 
+/// `profiles.toml` as the window last saved it.
+fn saved_profiles_text() -> String {
+    std::fs::read_to_string(
+        store::dbdelve_directory()
+            .expect("the test home has a data directory")
+            .join("profiles.toml"),
+    )
+    .expect("profiles.toml reads")
+}
+
+#[gpui::test]
+fn a_new_table_tab_starts_in_the_default_edit_mode(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text); \
+             create table nests (id integer primary key, owner text);",
+        );
+        let set_default = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, mode| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_default_edit_mode(mode, cx)
+            })
+        };
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.settings.edit_mode),
+            EditMode::Draft
+        );
+        let birds = open_own_table(&workspace, cx, "birds");
+        assert_eq!(edit_mode_of(&workspace, cx, birds), EditMode::Draft);
+
+        set_default(&workspace, cx, EditMode::Row);
+        assert_eq!(
+            edit_mode_of(&workspace, cx, birds),
+            EditMode::Draft,
+            "each open tab holds its own"
+        );
+        assert!(saved_profiles_text().contains("edit_mode = \"row\""));
+        let nests = open_own_table(&workspace, cx, "nests");
+        assert_eq!(edit_mode_of(&workspace, cx, nests), EditMode::Row);
+
+        // The default it already holds: nothing is written.
+        let before = saved_profiles_text();
+        let path = store::dbdelve_directory().unwrap().join("profiles.toml");
+        std::fs::write(&path, format!("{before}# marker\n")).unwrap();
+        set_default(&workspace, cx, EditMode::Row);
+        assert!(saved_profiles_text().ends_with("# marker\n"), "no save");
+
+        set_default(&workspace, cx, EditMode::Draft);
+        assert!(!saved_profiles_text().contains("edit_mode"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn delete_row_and_new_row_keep_their_review_and_form_in_a_row_view(cx: &mut TestAppContext) {
     use crate::session::EditMode;

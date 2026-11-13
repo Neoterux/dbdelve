@@ -4264,6 +4264,33 @@ mod tests {
     }
 
     #[test]
+    fn settings_from_before_the_edit_mode_read_as_draft() {
+        let read = |text: &str| -> store::StoredSettings {
+            toml::from_str(text).expect("the settings must still decode")
+        };
+        let settings = read("color_titlebar = true");
+        assert_eq!(settings.edit_mode, None);
+        assert_eq!(
+            EditMode::from_slug(settings.edit_mode.as_deref()),
+            EditMode::Draft
+        );
+
+        let settings = read("edit_mode = \"row\"");
+        assert_eq!(
+            EditMode::from_slug(settings.edit_mode.as_deref()),
+            EditMode::Row
+        );
+        for unreadable in ["instant", ""] {
+            let settings = read(&format!("edit_mode = \"{unreadable}\""));
+            assert_eq!(
+                EditMode::from_slug(settings.edit_mode.as_deref()),
+                EditMode::Draft,
+                "{unreadable:?}"
+            );
+        }
+    }
+
+    #[test]
     fn switching_sorting_carries_the_sort_on_screen_across() {
         let shown = vec![SortKey::new("\"name\"", false)];
 

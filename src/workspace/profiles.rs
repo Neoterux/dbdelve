@@ -11,8 +11,8 @@ use crate::db::{ExternalConfig, Include, Plugin, Properties, Target, check_time_
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{
-    Behaviour, BoundSession, Depth, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, STALE_ROWS,
-    restored_shortcuts,
+    Behaviour, BoundSession, Depth, EditMode, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE,
+    STALE_ROWS, restored_shortcuts,
 };
 use crate::sidebar::OPEN_ROWS_CAP;
 use crate::sql::{Destructive, Mode};
@@ -143,6 +143,8 @@ impl Workspace {
             agent_access,
             view_mode: Some(self.settings.view_mode.slug().into()),
             listing_scope: Some(self.settings.listing_scope.slug().into()),
+            edit_mode: (self.settings.edit_mode != EditMode::default())
+                .then(|| self.settings.edit_mode.slug().into()),
             sidebar_density: Some(self.settings.density.slug().into()),
             sidebar_show_host: Some(self.settings.show_host),
             sidebar_show_sizes: Some(self.settings.show_sizes),

@@ -109,6 +109,7 @@ impl SettingsTab {
 enum SettingId {
     RowLimit,
     DefaultSorting,
+    DefaultEditMode,
     QualifyCompletions,
     CheckForUpdates,
     VerboseLogging,
@@ -849,6 +850,7 @@ fn render_control(
                 )
                 .into_any_element()
         }
+        SettingId::DefaultEditMode => div().into_any_element(),
         SettingId::CheckForUpdates => switch("check-for-updates", settings.check_for_updates, t)
             .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
                 let check = !workspace.settings.check_for_updates;
@@ -1230,6 +1232,13 @@ mod tests {
         assert!(found("transparency").contains(&SettingId::Opacity));
         assert!(found("updates").contains(&SettingId::CheckForUpdates));
         assert!(found("auto").contains(&SettingId::MatchSystemAppearance));
+    }
+
+    #[test]
+    fn the_default_edit_mode_is_found_by_row_and_draft() {
+        assert!(found("draft").contains(&SettingId::DefaultEditMode));
+        assert!(found("edit mode").contains(&SettingId::DefaultEditMode));
+        assert!(found("row").contains(&SettingId::DefaultEditMode));
     }
 
     #[test]

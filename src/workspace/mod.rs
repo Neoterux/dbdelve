@@ -85,6 +85,9 @@ pub(crate) struct Settings {
     /// holds rather than by asking the server again. Off by default, which is
     /// how every tab sorted before this was a choice.
     pub(crate) client_sort: bool,
+    /// The edit mode a new table tab starts in. Draft by default, so nothing
+    /// is sent without a review until the user chooses otherwise.
+    pub(crate) edit_mode: EditMode,
     /// Whether completing a relation writes it as `schema.relation`, for
     /// databases whose search path does not reach every schema.
     pub(crate) qualify_completions: bool,
@@ -139,6 +142,7 @@ impl Default for Settings {
             check_for_updates: true,
             color_titlebar: true,
             client_sort: false,
+            edit_mode: EditMode::Draft,
             qualify_completions: false,
             verbose_logging: false,
             welcomed: false,
@@ -707,6 +711,8 @@ impl Workspace {
                     stored_settings.check_for_updates.unwrap_or(true);
                 workspace.settings.color_titlebar = stored_settings.color_titlebar.unwrap_or(true);
                 workspace.settings.client_sort = stored_settings.client_sort.unwrap_or(false);
+                workspace.settings.edit_mode =
+                    EditMode::from_slug(stored_settings.edit_mode.as_deref());
                 workspace.settings.qualify_completions =
                     stored_settings.qualify_completions.unwrap_or(false);
                 workspace.settings.verbose_logging =
@@ -1217,6 +1223,10 @@ impl Workspace {
         self.remember_profiles(cx);
         cx.notify();
     }
+
+    /// The edit mode a new table tab starts in. Not applied to the tabs already
+    /// open, each of which holds its own.
+    pub(crate) fn set_default_edit_mode(&mut self, _mode: EditMode, _cx: &mut Context<Self>) {}
 
     /// Rebuilt on every profile now rather than at its next catalog load, which
     /// may be a reconnect away.
