@@ -21634,3 +21634,100 @@ fn an_agent_call_in_flight_defers_the_idle_close(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// How many rows the grid of the query tab in front holds.
+fn front_rows(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    query_tab(workspace, cx, |tab, _, cx| {
+        tab.results.read(cx).delegate().result().rows.len()
+    })
+}
+
+#[gpui::test]
+fn an_edit_send_on_clickhouse_still_clears_the_grid_and_ends_failed(cx: &mut TestAppContext) {
+    use crate::{db::clickhouse_mock::Response, session::Refresh};
+
+    store::tests::with_home(|| {
+        let (mock, workspace, cx) = launch_beside_a_clickhouse_mock(cx);
+        cx.executor().allow_parking();
+        connect_clicks(&workspace, cx);
+        let read = "SELECT id, name FROM orders";
+        mock.on_statement(
+            "FROM orders",
+            [Response::rows(
+                &[("id", "UInt32"), ("name", "String")],
+                &[&["1", "ann"], &["2", "bob"]],
+            )],
+        );
+        cx.update(|window, cx| {
+            let editor = workspace
+                .read(cx)
+                .profile()
+                .and_then(|profile| profile.session.active_query_tab())
+                .expect("a connected profile opens on a query tab")
+                .editor
+                .clone();
+            editor.update(cx, |input, cx| input.set_value(read, window, cx));
+        });
+        cx.dispatch_action(crate::actions::RunQuery);
+        drive_until(cx, |cx| front_rows(&workspace, cx) == 2);
+
+        // No transaction brackets a batch here, so a draft kept after a failure
+        // part way through would send the rows that did apply a second time:
+        // the grid goes as the statement is sent, and a failure is the error.
+        mock.on_statement(
+            "INSERT INTO orders",
+            [
+                Response::error(500, 241, "MEMORY_LIMIT_EXCEEDED", "Memory limit exceeded")
+                    .held("insert"),
+            ],
+        );
+        let send = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let tab = workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.active
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute_unchecked(
+                    "INSERT INTO orders VALUES (3, 'jay')".into(),
+                    tab,
+                    Some(Refresh::Statement(read.into())),
+                    false,
+                    None,
+                    None,
+                    cx,
+                );
+            });
+        };
+        send(&workspace, cx);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(matches!(tab.query, QueryState::Running { .. }));
+        });
+        assert_eq!(front_rows(&workspace, cx), 0, "cleared as it is sent");
+
+        mock.release("insert");
+        drive_until(cx, |cx| {
+            query_tab(&workspace, cx, |tab, _, _| {
+                !matches!(tab.query, QueryState::Running { .. })
+            })
+        });
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Failed(error) => assert!(
+                error.message.contains("Memory limit exceeded"),
+                "{}",
+                error.message
+            ),
+            _ => panic!("the failed insert ends the tab in an error"),
+        });
+        assert_eq!(front_rows(&workspace, cx), 0, "and the grid stays empty");
+
+        mock.on_statement("INSERT INTO orders", [Response::empty()]);
+        send(&workspace, cx);
+        drive_until(cx, |cx| {
+            query_tab(&workspace, cx, |tab, _, _| {
+                matches!(tab.query, QueryState::Complete { .. })
+            }) && front_rows(&workspace, cx) == 2
+        });
+        settle(cx);
+        quit(workspace, cx);
+    });
+}
