@@ -238,15 +238,7 @@ impl Profile {
     /// read off the statement.
     pub(crate) fn end_uncommitted(&mut self) {
         for id in std::mem::take(&mut self.uncommitted) {
-            if let Some(ObjectBody::Relation { stale, .. }) = self
-                .session
-                .objects
-                .iter_mut()
-                .find(|tab| tab.id == id)
-                .map(|tab| &mut tab.body)
-            {
-                *stale = true;
-            }
+            self.session.mark_stale(id);
         }
     }
 
@@ -1391,6 +1383,19 @@ impl Session {
         match tab {
             Tab::Query(id) => self.query_tab(id).is_some(),
             Tab::Object(id) => self.objects.iter().any(|object| object.id == id),
+        }
+    }
+
+    /// Owes relation tab `id` a read of its rows on its next visit, for rows
+    /// that no longer say what the server holds.
+    pub(crate) fn mark_stale(&mut self, id: u64) {
+        if let Some(ObjectBody::Relation { stale, .. }) = self
+            .objects
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .map(|tab| &mut tab.body)
+        {
+            *stale = true;
         }
     }
 
