@@ -6623,6 +6623,43 @@ mod tests {
     }
 
     #[test]
+    fn an_in_memory_sort_moves_a_refused_rows_mark_and_the_row_the_ring_left_with_the_row() {
+        // Both name a row by its index, so each follows the row through the
+        // permutation as its staged edits do.
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(
+                    (0..4)
+                        .map(|row| vec![Some(row.to_string()), Some("n".into())])
+                        .collect(),
+                ),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("body".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert!(grid.set_pending(0, 1, NewValue::Value("x".into())));
+        grid.set_send_failure(0, "refused".into());
+        grid.left_row = Some(0);
+
+        grid.sort_in_memory(vec![(0, false)]);
+
+        assert_eq!(grid.cell(3, 0), Some("0"), "row 0 is now last");
+        assert!(grid.row_has_pending(3));
+        assert_eq!(grid.send_failure(), Some((3, "refused")));
+        assert_eq!(grid.take_left_row(), Some(3));
+        grid.discard_row(3);
+        assert_eq!(grid.send_failure(), None, "the mark went with its row");
+    }
+
+    #[test]
     fn a_snapshot_of_rows_sorted_in_memory_keeps_the_order_on_screen() {
         let mut grid = four_row_grid();
         grid.sort_in_memory(vec![(0, false)]);
