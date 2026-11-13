@@ -58,8 +58,8 @@ use crate::{
     result_grid::{NewValue, ResultGrid},
     scroller::{SmoothScrollable, scroll_to, smooth, smooth_for, smooth_scoped},
     session::{
-        Explained, ObjectBody, ObjectTab, Profile, ProfileState, QueryState, QueryTab, Said,
-        Session, StructureState, Tab, query_label, result_pane_is_expanded,
+        EditMode, Explained, ObjectBody, ObjectTab, Profile, ProfileState, QueryState, QueryTab,
+        Said, Session, StructureState, Tab, query_label, result_pane_is_expanded,
     },
     sidebar::ViewMode,
     sql::Mode,
@@ -3228,6 +3228,21 @@ pub(crate) fn render_view_sorting(
     })
 }
 
+pub(crate) fn view_edit_mode(_profile: &Profile) -> Option<EditMode> {
+    None
+}
+
+pub(crate) fn render_edit_mode(
+    _profile: &Profile,
+    _cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    None
+}
+
+pub(crate) fn apply_label(_mode: Option<EditMode>) -> &'static str {
+    "Apply edits"
+}
+
 /// Transaction control: whether each statement commits on its own, and the
 /// way to end one that is open.
 ///
@@ -4202,6 +4217,13 @@ mod tests {
     use lsp_types::CompletionItem;
 
     use super::*;
+
+    #[test]
+    fn the_button_over_staged_edits_names_what_it_does_in_each_mode() {
+        assert_eq!(apply_label(Some(EditMode::Row)), "Save row");
+        assert_eq!(apply_label(Some(EditMode::Draft)), "Apply edits");
+        assert_eq!(apply_label(None), "Apply edits");
+    }
 
     #[test]
     fn a_parallel_chip_for_the_largest_worker_count_counts_the_leader_without_overflow() {
