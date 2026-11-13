@@ -25981,15 +25981,20 @@ fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
 }
 
 /// What the bar keeps, most first, as its width runs out: the control that
-/// ends the transaction, the Edit chips, the badge, the staged-edit group, the
-/// notice, then Sort. An item is never whole while one above it is not.
-const KEPT_IN_ORDER: [&str; 6] = [
+/// ends the transaction, the Edit chips, the badge, the staged-edit buttons,
+/// the pending count, the notice, then Sort, the paging and Count. These keep
+/// their width, so the bar's right edge cuts them strictly in this order. An
+/// item is never whole while one above it is not.
+const KEPT_IN_ORDER: [&str; 9] = [
     "transaction-rollback",
     "edit-mode-row",
     "uncommitted-rows",
     "apply-edits",
+    "status-pending-count",
     "status-notice",
     "status-sort",
+    "status-paging",
+    "count-rows",
 ];
 
 #[gpui::test]
@@ -25999,6 +26004,12 @@ fn the_status_bar_gives_up_sort_before_the_edit_chips_and_the_staged_edits(
     store::tests::with_home(|| {
         let (workspace, cx) = crowded_status_bar(cx);
         draft_with_a_pending_edit(&workspace, cx);
+        // An item that is not drawn at all would read as cut below, so each is
+        // first shown whole in a window with room for everything.
+        resize_to(&workspace, cx, 3000., true);
+        for item in KEPT_IN_ORDER {
+            assert!(drawn_whole(cx, item), "{item} is not drawn at 3000px");
+        }
         for hidden in [false, true] {
             for width in STATUS_WIDTHS {
                 resize_to(&workspace, cx, width, hidden);
@@ -26088,6 +26099,73 @@ fn count_stays_reachable_beside_the_badge_and_the_transaction_at_1536px(cx: &mut
                 drawn_whole(cx, "count-rows"),
                 "Count is a button, and is cut off with the sidebar hidden {hidden}"
             );
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_row_limit_and_pager_keep_their_width_while_a_readout_gives_way(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{DiscardEdits, SetRowLimit},
+        result_grid::NewValue,
+    };
+
+    store::tests::with_home(|| {
+        // The count's setup: more rows than the limit shows, so there is a
+        // pager, with a transaction open and a row saved inside it. The limit
+        // is set before the draft holds an edit, which would raise a prompt.
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        cx.dispatch_action(SetRowLimit { rows: Some(2) });
+        settle(cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        draft_with_a_pending_edit(&workspace, cx);
+
+        let width = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector)
+                .map_or(gpui::px(0.), |bounds| bounds.size.width)
+        };
+        resize_to(&workspace, cx, 3000., true);
+        assert_eq!(drawn(cx, &["next-page"]), [true], "the table has a pager");
+        let wide = width(cx, "status-paging");
+        for hidden in [false, true] {
+            for window in STATUS_WIDTHS {
+                resize_to(&workspace, cx, window, hidden);
+                assert_eq!(
+                    width(cx, "status-paging"),
+                    wide,
+                    "the row limit and pager are narrower than in a wide window at {window}px, \
+                     sidebar hidden {hidden}: the bar's edge cuts them, a readout narrows"
+                );
+            }
+        }
+
+        // The crowded bar with no staged edit, where Import is built: it is
+        // never cut by its cluster while the readout beside it still has width.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.discard_edits(&DiscardEdits, window, cx)
+            });
+        });
+        settle(cx);
+        resize_to(&workspace, cx, 3000., true);
+        assert!(
+            drawn_whole(cx, "import-rows"),
+            "Import is built without an edit"
+        );
+        for hidden in [false, true] {
+            for window in STATUS_WIDTHS {
+                resize_to(&workspace, cx, window, hidden);
+                assert!(
+                    drawn_whole(cx, "import-rows") || width(cx, "status-readout") == gpui::px(0.),
+                    "Import is cut by its cluster at {window}px, sidebar hidden {hidden}, while \
+                     the readout is {:?} wide",
+                    width(cx, "status-readout")
+                );
+            }
         }
         quit(workspace, cx);
     });
