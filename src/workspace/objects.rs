@@ -8,7 +8,9 @@ use super::*;
 use super::sidebar::new_query_binding;
 use crate::db::{ColumnDefinition, Structure};
 use crate::explorer::Pin;
-use crate::session::{Binding, BoundSession, Explained, Finished, Queue, Routed, TabKey};
+use crate::session::{
+    AfterEdits, Binding, BoundSession, Explained, Finished, Queue, Routed, TabKey,
+};
 use crate::sidebar::{
     NodeAction, NodeKind, SelectedNode, SelectionAction, schema_row_is_a_database,
 };
@@ -292,6 +294,43 @@ impl Workspace {
         change: impl FnOnce(&mut String, &mut Vec<SortKey>, &mut Option<usize>, &mut usize) -> bool,
         cx: &mut Context<Self>,
     ) {
+        // `change` is asked of copies, and the tab takes them only once the
+        // action may run: a guard after the change would leave a cancelled tab
+        // claiming a page, sort or limit it is not showing.
+        let Some((mut new_filter, mut new_sort, mut new_limit, mut new_offset)) =
+            self.profile().and_then(|profile| {
+                let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
+                match &tab.body {
+                    ObjectBody::Relation {
+                        filter,
+                        sort,
+                        limit,
+                        offset,
+                        ..
+                    } => Some((filter.clone(), sort.clone(), *limit, *offset)),
+                    ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
+                }
+            })
+        else {
+            return;
+        };
+        if !change(
+            &mut new_filter,
+            &mut new_sort,
+            &mut new_limit,
+            &mut new_offset,
+        ) {
+            return;
+        }
+        let held = AfterEdits::Requery {
+            filter: new_filter.clone(),
+            sort: new_sort.clone(),
+            limit: new_limit,
+            offset: new_offset,
+        };
+        if self.held_for_edits(Tab::Object(id), held, cx) {
+            return;
+        }
         let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
@@ -317,9 +356,10 @@ impl Workspace {
         else {
             return;
         };
-        if !change(filter, sort, limit, offset) {
-            return;
-        }
+        *filter = new_filter;
+        *sort = new_sort;
+        *limit = new_limit;
+        *offset = new_offset;
         // Bars this engine refuses reach here only from a tab restored under
         // another one, whose filter is still that engine's (`restored_filter`):
         // the tab stays as it was and says why, as `apply_filter` leaves it.
