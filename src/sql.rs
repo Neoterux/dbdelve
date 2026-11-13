@@ -1198,6 +1198,9 @@ pub fn row_guard(engine: Engine, statement: &str) -> Option<String> {
 /// the row unread. `None` for anything else -- more than one statement, a
 /// statement that is not an `UPDATE` -- and for a read [`is_generated_select`]
 /// does not admit: a caller that gets no read sends nothing.
+///
+/// ClickHouse's `ALTER TABLE … UPDATE` is read as the update it is, so it has a
+/// read too; no Row send is made there (`Target::row_edits`).
 pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
     if engine.syntax() != Syntax::Sql {
         return None;
