@@ -25836,13 +25836,14 @@ fn crowded_status_bar(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visua
 /// What the status bar items paint, each with the box of the group that
 /// clips it (an item taller or wider than its group is cut at the group's
 /// edge, not drawn over what is next to it).
-const STATUS_ITEMS: [(&str, &str); 16] = [
+const STATUS_ITEMS: [(&str, &str); 17] = [
     ("status-connection", "status-bar"),
     ("transaction-commit", "status-bar"),
     ("transaction-rollback", "status-bar"),
     ("edit-mode-draft", "status-chips"),
     ("edit-mode-row", "status-chips"),
     ("uncommitted-rows", "status-chips"),
+    ("status-pending-count", "status-bar"),
     ("discard-edits", "status-pending"),
     ("apply-edits", "status-pending"),
     ("status-notice", "status-bar"),
@@ -25850,7 +25851,7 @@ const STATUS_ITEMS: [(&str, &str); 16] = [
     ("status-stats", "status-stats-group"),
     ("status-paging", "status-bar"),
     ("status-readout", "status-actions"),
-    ("count-rows", "status-actions"),
+    ("count-rows", "status-bar"),
     ("import-rows", "status-actions"),
     ("export-results", "status-actions"),
 ];
@@ -25905,6 +25906,7 @@ fn draft_with_a_pending_edit(workspace: &Entity<Workspace>, cx: &mut VisualTestC
     use crate::result_grid::NewValue;
 
     click_selector(cx, "edit-mode-draft");
+    settle_through(cx);
     let id = workspace.read_with(cx, |workspace, _| {
         match workspace.profile().unwrap().session.active {
             Tab::Object(id) => id,
@@ -25912,8 +25914,11 @@ fn draft_with_a_pending_edit(workspace: &Entity<Workspace>, cx: &mut VisualTestC
         }
     });
     let grid = relation_grid(workspace, cx, id);
-    stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+    // A value other than the row holds: staging what is already there stages
+    // nothing, and the crowded bar's row was saved as `robin`.
+    stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
     settle(cx);
+    assert_eq!(pending_of(&grid, cx), 1);
 }
 
 #[gpui::test]
@@ -26007,9 +26012,10 @@ fn the_staged_edit_buttons_are_drawn_whole_where_the_transaction_leaves_room(
         quit(workspace, cx);
     });
     store::tests::with_home(|| {
-        // With a transaction open and its badge showing the control that ends
-        // it, the Edit chips, the badge and the buttons need 981px of bar; at
-        // 700px they do not fit together (see `KEPT_IN_ORDER`).
+        // With a transaction open and its badge showing, the control that ends
+        // it, the Edit chips, the badge and the buttons need about 980px of
+        // bar: at 700px they do not fit together, and the buttons are the
+        // first of them to go (`KEPT_IN_ORDER`).
         let (workspace, cx) = crowded_status_bar(cx);
         draft_with_a_pending_edit(&workspace, cx);
         for (width, hidden) in [(1536., false), (1536., true), (1100., true)] {
@@ -26033,8 +26039,19 @@ fn the_staged_edit_buttons_are_drawn_whole_where_the_transaction_leaves_room(
 
 #[gpui::test]
 fn count_stays_reachable_beside_the_badge_and_the_transaction_at_1536px(cx: &mut TestAppContext) {
+    use crate::{actions::SetRowLimit, result_grid::NewValue};
+
     store::tests::with_home(|| {
-        let (workspace, cx) = crowded_status_bar(cx);
+        // More rows than the limit shows, so the table's count is still to ask
+        // for, with a transaction open and a row saved inside it.
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        cx.dispatch_action(SetRowLimit { rows: Some(2) });
+        settle(cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
         for hidden in [false, true] {
             resize_to(&workspace, cx, 1536., hidden);
             assert!(drawn_whole(cx, "uncommitted-rows"));
