@@ -1560,8 +1560,126 @@ impl Workspace {
         .detach();
     }
 
-    /// Stub for the red commit.
-    pub(crate) fn set_edit_mode(&mut self, _mode: EditMode, _cx: &mut Context<Self>) {}
+    /// Puts the table in front into `mode`, when its target offers it
+    /// (`EditMode::on`). Nothing changes, and nothing is said, for a mode the
+    /// view already has or a tab that has none to choose.
+    ///
+    /// Draft to Row is refused while the grid holds staged edits: they are a
+    /// draft, and one switch must not turn them into sends, one row at a time,
+    /// that nobody reviewed. Row to Draft is always allowed, as there is nothing
+    /// staged that the other mode would not hold.
+    // The view's control and the palette call it, and land after the send does:
+    // until then only the tests do.
+    #[allow(dead_code)]
+    pub(crate) fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
+        let mode = mode.on(self.target());
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let tab = profile.session.active;
+        let Some(results) = profile.session.results(tab) else {
+            return;
+        };
+        if !matches!(tab, Tab::Object(_)) || profile.session.edit_mode(tab) == mode {
+            return;
+        }
+        let staged = results.read(cx).delegate().pending_count();
+        if mode == EditMode::Row && staged > 0 {
+            let edits = match staged {
+                1 => "1 edit".to_string(),
+                count => format!("{count} edits"),
+            };
+            self.note(
+                format!("The draft has {edits}, so the view was not switched to Row mode."),
+                cx,
+            );
+            return;
+        }
+        if let Some(slot) = self
+            .profile_mut()
+            .and_then(|profile| profile.session.edit_mode_mut(tab))
+        {
+            *slot = mode;
+            cx.notify();
+        }
+    }
+
+    /// Sends the staged edits of `row` of relation tab `tab` as the one
+    /// `UPDATE` of a Row-mode view, with no review. True when the statement was
+    /// handed to [`Self::execute_and_then`], which judges it under the mode in
+    /// force as it is sent; false when nothing was sent.
+    ///
+    /// The one writer of a Row send: the statement is written as a draft's
+    /// batch is, over one row, and passes the same gate before anything runs
+    /// (`AGENTS.md` rule 2). It carries the read of the row by its key, which
+    /// is cut from the gated statement (`sql::row_read`), so what the grid shows
+    /// afterwards is what the server holds. A tab already sending sends nothing
+    /// more: a second Save while the first is out would be the same `UPDATE`
+    /// twice.
+    pub(crate) fn save_row(&mut self, tab: u64, row: usize, cx: &mut Context<Self>) -> bool {
+        let tab = Tab::Object(tab);
+        let Some(profile) = self.profile() else {
+            return false;
+        };
+        let Some(results) = profile.session.results(tab).cloned() else {
+            return false;
+        };
+        if profile.session.running(tab) {
+            return false;
+        }
+        let target = self.target();
+        if let Some(reason) = target.unwritable() {
+            self.note(reason, cx);
+            return false;
+        }
+        let (pending, rows_id) = {
+            let grid = results.read(cx).delegate();
+            (grid.pending_row(row), grid.rows_id())
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        // As `apply_edits` chooses: a bound tab's edit is refused outright
+        // while its session holds a transaction, and on the connection's own
+        // session the edit joins the user's open one.
+        let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
+        let written = match joins {
+            true => sql::update_batch_joining(self.engine(), &[pending]),
+            false => update_batch(self.engine(), &[pending]),
+        };
+        let update = match written {
+            Ok(update) => update,
+            Err(message) => {
+                self.note(message, cx);
+                return false;
+            }
+        };
+        if !sql::is_generated_write_on(self.engine(), &update) {
+            self.note(
+                "dbdelve refused to run a statement it wrote itself: it is not an UPDATE.".into(),
+                cx,
+            );
+            return false;
+        }
+        let Some(read) = sql::row_read(self.engine(), &update) else {
+            self.note(
+                "dbdelve refused to run a statement it wrote itself: it is not the read of one \
+                 row."
+                    .into(),
+                cx,
+            );
+            return false;
+        };
+        self.execute_and_then(
+            update,
+            tab,
+            Some(Refresh::Row { row, rows_id, read }),
+            false,
+            None,
+            cx,
+        );
+        true
+    }
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
     /// it: the query tab's buffer, or the review modal on a relation tab and on
@@ -1592,6 +1710,22 @@ impl Workspace {
         let target = self.target();
         if let Some(reason) = target.unwritable() {
             self.note(reason, cx);
+            return;
+        }
+        // A Row view sends one row's edits as they are saved, with no review.
+        // Whichever row Save sends, the ring's first, and none at all when
+        // nothing is staged.
+        if let Tab::Object(object) = tab
+            && profile.session.edit_mode(tab) == EditMode::Row
+        {
+            let grid = results.read(cx).delegate();
+            let ring = grid.active().map(|(row, _)| row);
+            let row = ring
+                .filter(|row| grid.row_has_pending(*row))
+                .or_else(|| grid.first_pending_row());
+            if let Some(row) = row {
+                self.save_row(object, row, cx);
+            }
             return;
         }
         let own_review = profile.session.apply_review_covers(tab);

@@ -2122,27 +2122,56 @@ impl ResultGrid {
         });
     }
 
-    /// Stub for the red commit.
-    pub fn pending_row(&self, _row: usize) -> Option<PendingRow> {
-        None
+    /// `row`'s edits as the one `UPDATE` a Row-mode send writes, `None` when
+    /// the row has none or dbdelve cannot name it by its key
+    /// (`pending_updates` drops such a row too). `Workspace::save_row` is the
+    /// caller.
+    pub fn pending_row(&self, row: usize) -> Option<PendingRow> {
+        self.pending_rows(|edited| edited == row).pop()
     }
 
-    /// Stub for the red commit.
-    pub fn row_has_pending(&self, _row: usize) -> bool {
-        false
+    /// Whether `row` holds a staged edit: what Save asks to choose the row it
+    /// sends, the ring's before any other.
+    pub fn row_has_pending(&self, row: usize) -> bool {
+        self.pending.iter().any(|edit| edit.row == row)
     }
 
-    /// Stub for the red commit.
+    /// The row edited first, the row Save sends when the ring is not on an
+    /// edited one.
     pub fn first_pending_row(&self) -> Option<usize> {
-        None
+        self.pending.first().map(|edit| edit.row)
     }
 
-    /// Stub for the red commit.
-    pub fn discard_row(&mut self, _row: usize) {}
+    /// Drops every staged edit of `row` and an input open on it, leaving the
+    /// other rows' edits. For a row the server no longer has, or one whose
+    /// relation is read again.
+    pub fn discard_row(&mut self, row: usize) {
+        self.pending.retain(|edit| edit.row != row);
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.row == row)
+        {
+            self.editing = None;
+        }
+    }
 
-    /// Stub for the red commit.
-    pub fn replace_row(&mut self, _row: usize, _fetched: db::Row) -> bool {
-        false
+    /// Swaps the cells of `row` for `fetched`, the row as the server now holds
+    /// it. `false`, with nothing changed, when there is no such row or
+    /// `fetched` has another number of cells. The ring, the scroll, the
+    /// selection, the other rows and every staged edit stay: the caller clears
+    /// the edits it sent. The `Workspace` landing of a Row send is the caller.
+    pub fn replace_row(&mut self, row: usize, fetched: db::Row) -> bool {
+        let Some(held) = self.result.rows.get_mut(row) else {
+            return false;
+        };
+        if held.len() != fetched.len() {
+            return false;
+        }
+        *held = fetched;
+        // A value may now be longer or shorter than the width fitted to it.
+        self.refit_from_the_top();
+        true
     }
 
     /// One entry per changed row, in the order the rows were first edited, with
@@ -2152,12 +2181,22 @@ impl ResultGrid {
     /// a `NULL` in a key column, or a key column the result set does not carry,
     /// leaves dbdelve unable to name the row.
     pub fn pending_updates(&self) -> Vec<PendingRow> {
+        self.pending_rows(|_| true)
+    }
+
+    /// [`Self::pending_updates`] over the rows `wanted` names.
+    fn pending_rows(&self, wanted: impl Fn(usize) -> bool) -> Vec<PendingRow> {
         let Some(edit) = &self.result.edit else {
             return Vec::new();
         };
 
         let mut rows: Vec<usize> = Vec::new();
-        for row in self.pending.iter().map(|edit| edit.row) {
+        for row in self
+            .pending
+            .iter()
+            .map(|edit| edit.row)
+            .filter(|row| wanted(*row))
+        {
             if !rows.contains(&row) {
                 rows.push(row);
             }
