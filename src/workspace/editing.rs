@@ -204,6 +204,8 @@ impl Workspace {
                 title: "Insert",
                 notes,
                 sql: statement,
+                error: None,
+                edits: false,
             });
         }
         cx.notify();
@@ -1282,6 +1284,8 @@ impl Workspace {
                 title: "Delete row",
                 notes: target.review_notes(&statement),
                 sql: statement,
+                error: None,
+                edits: false,
             });
         }
         cx.notify();
@@ -1633,6 +1637,8 @@ impl Workspace {
                         title: "Apply edits",
                         notes,
                         sql: batch,
+                        error: None,
+                        edits: true,
                     });
                     cx.notify();
                 }
@@ -1704,6 +1710,12 @@ impl Workspace {
                 }
             },
         };
+        // A second Run starts clean: what the first came to is not this one's.
+        if let Some(profile) = self.profile_mut()
+            && let Some(review) = &mut profile.session.apply_review
+        {
+            review.error = None;
+        }
         self.execute_and_then(sql, tab, Some(refresh), false, None, cx);
     }
 
