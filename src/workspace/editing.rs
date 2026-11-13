@@ -422,6 +422,14 @@ impl Workspace {
             .and_then(Sorting::client_keys)
             .is_some()
         {
+            // A Row view's edited row is saved before the rows move under it,
+            // as a sort on the server would (`requery_relation`); a Draft view
+            // keeps its edits through a sort in memory.
+            if profile.session.edit_mode(tab) == EditMode::Row
+                && self.held_for_edits(tab, AfterEdits::Sort(column), cx)
+            {
+                return;
+            }
             self.sort_held_rows(tab, column, cx);
             return;
         }
@@ -1591,8 +1599,9 @@ impl Workspace {
     ///
     /// Draft to Row is refused while the grid holds staged edits: they are a
     /// draft, and one switch must not turn them into sends, one row at a time,
-    /// that nobody reviewed. Row to Draft is always allowed, as there is nothing
-    /// staged that the other mode would not hold.
+    /// that nobody reviewed. Row to Draft over edited rows sends them first, as
+    /// any action that leaves them would (`held_for_edits`), and does not
+    /// switch if one is refused.
     pub(crate) fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
         let mode = mode.on(self.target());
         let Some(profile) = self.profile() else {
@@ -1606,6 +1615,10 @@ impl Workspace {
             return;
         }
         let staged = results.read(cx).delegate().pending_count();
+        // Row to Draft sends the dirty row first and switches when it lands.
+        if mode == EditMode::Draft && self.held_for_edits(tab, AfterEdits::EditMode(mode), cx) {
+            return;
+        }
         if mode == EditMode::Row && staged > 0 {
             let edits = match staged {
                 1 => "1 edit".to_string(),

@@ -2491,6 +2491,20 @@ impl Workspace {
     }
 
     pub(crate) fn activate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        // Before anything is written: a Row view's edited row is saved and the
+        // tab comes forward once it has landed (`AfterEdits::Activate`). A
+        // Draft view is not asked, its draft stays with its tab. A tab just
+        // closed holds no edits and mode, so `front_after_close` passes.
+        let front = self.profile().map(|profile| profile.session.active);
+        if let Some(front) = front
+            && front != tab
+            && self
+                .profile()
+                .is_some_and(|profile| profile.session.edit_mode(front) == EditMode::Row)
+            && self.held_for_edits(front, AfterEdits::Activate(tab), cx)
+        {
+            return;
+        }
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
             profile.session.clear_prompts();

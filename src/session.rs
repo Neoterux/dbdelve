@@ -1836,10 +1836,17 @@ pub(crate) enum AfterEdits {
     ViewSorting(bool),
     /// A query tab's Run.
     Run,
-    /// A header click on a query tab's grid, on the server.
+    /// A header click on a grid holding edits: a query tab's, on the server, or
+    /// a Row view's, in memory.
     Sort(usize),
     /// One of a finished queue's statements run again, as `sql`.
     Rerun { index: usize, sql: String },
+    /// Bring this tab forward. Only a Row view's row waits on this: a Draft
+    /// view's draft stays with its tab, so a tab switch asks nothing.
+    Activate(Tab),
+    /// Switch the view's edit mode. Only a Row view's row waits on this, being
+    /// sent before the view becomes a draft.
+    EditMode(EditMode),
 }
 
 impl AfterEdits {
@@ -1862,6 +1869,14 @@ impl AfterEdits {
             Self::Run | Self::Rerun { .. } => (
                 "Discard edits",
                 "This tab has cell edits that have not been applied. Running the statement \
+                 discards them.",
+            ),
+            // Never parked on the prompt: a Row view's row is sent first and a
+            // Draft view is not asked. The sentence is the one a requery gets,
+            // were one ever to reach it.
+            Self::Activate(_) | Self::EditMode(_) => (
+                "Discard edits",
+                "This tab has cell edits that have not been applied. Reading the rows again \
                  discards them.",
             ),
         }

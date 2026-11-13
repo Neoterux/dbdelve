@@ -24496,7 +24496,7 @@ fn row_mode_saves_the_dirty_row_before_a_sort_a_filter_a_refresh_or_a_row_limit(
         // A refresh, which reads what is on the server now.
         let key = edit_first_row("delta", cx);
         rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
-            .and_then(|db| db.execute("update birds set name = 'finch' where id = 6", []))
+            .and_then(|db| db.execute("update birds set name = 'finch' where id = 3", []))
             .unwrap();
         cx.dispatch_action(RefreshRelation);
         settle_through(cx);
@@ -24751,6 +24751,36 @@ fn a_reread_after_one_rows_send_sends_the_other_dirty_rows_first(cx: &mut TestAp
             .collect();
         assert!(shown.contains(&"jay".to_string()), "{shown:?}");
         assert!(table_tab_is_open(&workspace, cx, id));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refused_row_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let input = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.push_filter_row(id, window, cx);
+            workspace.filter_rows_mut(id).unwrap()[0].value.clone()
+        });
+        let bars = bars_of(&workspace, cx, id);
+        let view = relation_view(&workspace, cx, id);
+
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        input.update_in(cx, |input, window, cx| {
+            input.set_value("id = 2", window, cx)
+        });
+        workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+        settle_through(cx);
+
+        assert_eq!(relation_view(&workspace, cx, id), view, "the filter stays");
+        assert_eq!(bars_of(&workspace, cx, id), bars, "and so do the bars");
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some());
+        assert_no_discard_prompt(&workspace, cx);
         quit(workspace, cx);
     });
 }

@@ -1457,6 +1457,8 @@ impl Workspace {
             AfterEdits::Rerun { index, sql } => {
                 self.rerun_queued(tab, index, sql, cx);
             }
+            AfterEdits::Activate(next) => self.activate_tab(next, window, cx),
+            AfterEdits::EditMode(mode) => self.set_edit_mode(mode, cx),
         }
     }
 
