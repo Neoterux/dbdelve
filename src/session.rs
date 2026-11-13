@@ -3470,6 +3470,13 @@ pub(crate) enum Refresh {
         row: usize,
         rows_id: u64,
         read: String,
+        /// The cells that went with the send, by column, which the landing
+        /// clears: an edit staged on the row while it was out is not among them.
+        sent: Vec<(usize, NewValue)>,
+        /// The row the ring moved to when a row leave started the send, which a
+        /// refusal puts the ring back from; `None` for Save, which does not
+        /// move it.
+        to: Option<usize>,
     },
 }
 

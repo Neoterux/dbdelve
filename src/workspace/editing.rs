@@ -1613,7 +1613,17 @@ impl Workspace {
     /// afterwards is what the server holds. A tab already sending sends nothing
     /// more: a second Save while the first is out would be the same `UPDATE`
     /// twice.
-    pub(crate) fn save_row(&mut self, tab: u64, row: usize, cx: &mut Context<Self>) -> bool {
+    ///
+    /// `to` is the row the ring moved to when a row leave started the send, and
+    /// `None` for Save, which does not move it. A send that fails, or is stopped
+    /// by the mode, puts the ring back from `to` onto `row`.
+    pub(crate) fn save_row(
+        &mut self,
+        tab: u64,
+        row: usize,
+        to: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let tab = Tab::Object(tab);
         let Some(profile) = self.profile() else {
             return false;
@@ -1639,9 +1649,13 @@ impl Workspace {
             self.note(reason, cx);
             return false;
         }
-        let (pending, rows_id) = {
+        let (pending, rows_id, sent) = {
             let grid = results.read(cx).delegate();
-            (grid.pending_row(row), grid.rows_id())
+            (
+                grid.pending_row(row),
+                grid.rows_id(),
+                grid.pending_cells(row),
+            )
         };
         let Some(pending) = pending else {
             return false;
@@ -1680,12 +1694,104 @@ impl Workspace {
         self.execute_and_then(
             update,
             tab,
-            Some(Refresh::Row { row, rows_id, read }),
+            Some(Refresh::Row {
+                row,
+                rows_id,
+                read,
+                sent,
+                to,
+            }),
             false,
             None,
             cx,
         );
+        // Not sent: the mode stopped it and raised its prompt, or the
+        // connection was gone. Nothing went, the row is still dirty, and the
+        // ring the user moved off it goes back (`to` is where it moved to).
+        if to.is_some()
+            && !self
+                .profile()
+                .is_some_and(|profile| profile.session.running(tab))
+        {
+            self.snap_back_to(tab, row, to, cx);
+        }
         true
+    }
+
+    /// Esc on a Row view's grid: puts the ring's row back as it was fetched,
+    /// its staged values and the mark of a refused send gone, the other rows'
+    /// edits kept. True when it reverted something; false leaves the key to
+    /// whatever it did before.
+    ///
+    /// Only while the grid itself holds the keyboard, so never while a cell's
+    /// input does: that Esc cancels the input.
+    pub(crate) fn revert_active_row(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let Some(profile) = self.profile() else {
+            return false;
+        };
+        let tab = profile.session.active;
+        if !matches!(tab, Tab::Object(_)) || profile.session.edit_mode(tab) != EditMode::Row {
+            return false;
+        }
+        let Some(results) = profile.session.results(tab).cloned() else {
+            return false;
+        };
+        if !results.focus_handle(cx).is_focused(window) {
+            return false;
+        }
+        let row = {
+            let grid = results.read(cx).delegate();
+            grid.active().map(|(row, _)| row).filter(|row| {
+                grid.row_has_pending(*row)
+                    || grid
+                        .send_failure()
+                        .is_some_and(|(refused, _)| refused == *row)
+            })
+        };
+        let Some(row) = row else {
+            return false;
+        };
+        results.update(cx, |table, cx| {
+            table.delegate_mut().discard_row(row);
+            table.refresh(cx);
+        });
+        if let Some(profile) = self.profile_mut() {
+            profile
+                .session
+                .tab_notice
+                .take_if(|(noticed, _)| *noticed == tab);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Puts the ring of relation tab `tab` back on `row` when it is still on
+    /// `to`, the row it moved to as `row` was left, and `to` holds no edits: a
+    /// ring the user has moved on, or into a row of edits, is theirs. Hands the
+    /// keyboard back to the grid when an input of `to`'s went with the move.
+    pub(crate) fn snap_back_to(
+        &mut self,
+        tab: Tab,
+        row: usize,
+        to: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(to) = to else {
+            return;
+        };
+        let Some(results) = self
+            .profile()
+            .and_then(|profile| profile.session.results(tab))
+            .cloned()
+        else {
+            return;
+        };
+        let stays = results.read(cx).delegate().active().map(|(at, _)| at) == Some(to)
+            && !results.read(cx).delegate().row_has_pending(to);
+        if stays && results.update(cx, |table, cx| result_grid::snap_back(table, row, cx)) {
+            self.refocus_front();
+        }
+        cx.notify();
     }
 
     /// What a ring move off an edited row does, called after every move the
@@ -1700,9 +1806,15 @@ impl Workspace {
         grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
         cx: &mut Context<Self>,
     ) {
-        let (left, ring) = grid.update(cx, |table, _| {
+        // Both taken first and whatever comes of them, so a grid with no Row
+        // view to ask does not hold either for a later move.
+        let (left, closed, ring) = grid.update(cx, |table, cx| {
             let grid = table.delegate_mut();
-            (grid.take_left_row(), grid.active().map(|(row, _)| row))
+            (
+                grid.take_left_row(),
+                grid.take_closed_input(cx),
+                grid.active().map(|(row, _)| row),
+            )
         });
         let Some(row) = left.filter(|row| Some(*row) != ring) else {
             return;
@@ -1721,10 +1833,34 @@ impl Workspace {
         }) else {
             return;
         };
-        if mode != EditMode::Row || !grid.read(cx).delegate().row_has_pending(row) {
+        if mode != EditMode::Row {
             return;
         }
-        self.save_row(tab, row, cx);
+        // What was typed in a cell the ring was moved off the row of is staged
+        // with the row's other edits. A mode that refuses the write leaves it
+        // unstaged.
+        if let Some((closed_row, col, text)) = closed
+            && closed_row == row
+        {
+            grid.update(cx, |table, _| {
+                table
+                    .delegate_mut()
+                    .set_pending(row, col, NewValue::Value(text))
+            });
+        }
+        if !grid.read(cx).delegate().row_has_pending(row) {
+            return;
+        }
+        // One send a tab at a time: this row stays staged, which is as visible
+        // as it was, and is sent by the next leave or by Save.
+        if self
+            .profile()
+            .is_some_and(|profile| profile.session.running(Tab::Object(tab)))
+        {
+            self.note("The previous row is still being saved.".into(), cx);
+            return;
+        }
+        self.save_row(tab, row, ring, cx);
     }
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
@@ -1770,7 +1906,7 @@ impl Workspace {
                 .filter(|row| grid.row_has_pending(*row))
                 .or_else(|| grid.first_pending_row());
             if let Some(row) = row {
-                self.save_row(object, row, cx);
+                self.save_row(object, row, None, cx);
             }
             return;
         }

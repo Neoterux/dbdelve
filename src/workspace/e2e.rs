@@ -23462,3 +23462,50 @@ fn a_cell_being_typed_in_is_dropped_when_its_row_is_clicked_away_from_in_draft_m
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_refused_typed_edit_carried_down_returns_with_the_keyboard_and_the_mark_drawn(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let schema = "create table birds (id integer primary key, \
+             name text not null check (name <> 'bad'), n integer); \
+             insert into birds values (1, 'wren', 1), (2, 'tit', 2), (3, 'kite', 3);";
+        let (workspace, cx) = launch_on_sqlite_holding(cx, schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("bad");
+        settle(cx);
+        // Down commits the text and opens the next row's cell, which the
+        // refusal then puts away with the ring.
+        press(cx, "down");
+        settle(cx);
+
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)));
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(refused_row(&grid, cx).is_some());
+        assert!(
+            cx.debug_bounds("row-send-failed-0").is_some(),
+            "the refused row's number is drawn marked"
+        );
+        assert!(grid_holds_keyboard(&grid, cx));
+
+        // Esc, with the keyboard back on the grid, puts the row back.
+        press(cx, "escape");
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(refused_row(&grid, cx), None);
+        assert!(cx.debug_bounds("row-send-failed-0").is_none());
+        quit(workspace, cx);
+    });
+}
+
+fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| {
+        use gpui::Focusable;
+        grid.focus_handle(cx).is_focused(window)
+    })
+}

@@ -1021,7 +1021,8 @@ impl Workspace {
         if self.close_import(cx) {
             return;
         }
-        if self.close_apply_review(cx) {
+        // A Row view's dirty row is put back before the key is handed on.
+        if self.close_apply_review(cx) || self.revert_active_row(window, cx) {
             return;
         }
         if self.close_ddl_view(cx) {

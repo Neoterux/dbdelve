@@ -12,6 +12,7 @@ use gpui_component::{
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     table::TableEvent,
     table::{Column, TableDelegate, TableState},
+    tooltip::Tooltip,
 };
 
 use crate::{
@@ -304,6 +305,10 @@ pub struct ResultGrid {
     /// it ([`Self::take_left_row`]). The grid does not know the view's edit mode,
     /// so it only records.
     left_row: Option<usize>,
+    /// The cell, and the input, a ring move off its row closed without
+    /// committing, until the workspace takes it ([`Self::take_closed_input`]):
+    /// what was typed in it is a Row view's to stage and send with its row.
+    closed_input: Option<(usize, usize, Entity<InputState>)>,
     /// The row whose send the server refused, and what it said, until that row
     /// is edited, reverted or sent.
     send_failure: Option<(usize, String)>,
@@ -547,6 +552,7 @@ impl ResultGrid {
             pending: Vec::new(),
             editing: None,
             left_row: None,
+            closed_input: None,
             send_failure: None,
             captured: None,
             streamed: None,
@@ -1808,7 +1814,14 @@ impl ResultGrid {
             self.left_row = Some(old);
         }
         if closing {
-            self.editing = None;
+            // Kept only when the move leaves the input's row: a click on
+            // another cell of the same row drops what was typed, as it always
+            // did.
+            self.closed_input = self
+                .editing
+                .take()
+                .filter(|editing| editing.row != row)
+                .and_then(|editing| Some((editing.row, editing.col, editing.input?)));
         }
         self.active = Some((row, col));
     }
@@ -1819,6 +1832,12 @@ impl ResultGrid {
         self.left_row.take()
     }
 
+    /// The cell a ring move closed an input on, and the text it holds, once.
+    pub(crate) fn take_closed_input(&mut self, cx: &App) -> Option<(usize, usize, SharedString)> {
+        let (row, col, input) = self.closed_input.take()?;
+        Some((row, col, input.read(cx).value().clone()))
+    }
+
     /// The row whose send the server refused and the words it said, drawn on
     /// that row's gutter cell.
     pub fn send_failure(&self) -> Option<(usize, &str)> {
@@ -1827,7 +1846,8 @@ impl ResultGrid {
             .map(|(row, message)| (*row, message.as_str()))
     }
 
-    /// Marks `row` as the one the server refused.
+    /// Marks `row` as the one the server refused, until it is edited, reverted
+    /// or sent.
     pub fn set_send_failure(&mut self, row: usize, message: String) {
         self.send_failure = Some((row, message));
     }
@@ -2036,6 +2056,7 @@ impl ResultGrid {
         if self.unconfirmed || !self.editable(row, col) {
             return false;
         }
+        self.forget_failure(row);
 
         // An input seeds itself with the value as fetched, so opening an edit
         // and closing it without typing arrives here carrying the server's own
@@ -2143,6 +2164,12 @@ impl ResultGrid {
     pub fn discard_pending(&mut self) {
         self.pending.clear();
         self.editing = None;
+        self.send_failure = None;
+    }
+
+    /// Drops the failure mark when it is `row`'s.
+    fn forget_failure(&mut self, row: usize) {
+        self.send_failure.take_if(|(marked, _)| *marked == row);
     }
 
     /// The staged edits of `row`, by column, as a send carries them.
@@ -2156,8 +2183,9 @@ impl ResultGrid {
 
     /// Removes from `row` only the staged edits whose column and value are in
     /// `sent`: an edit staged after `sent` was taken, or staged again with
-    /// another value, stays.
+    /// another value, stays. The row's failure mark goes with them: it was sent.
     pub fn clear_sent(&mut self, row: usize, sent: &[(usize, NewValue)]) {
+        self.forget_failure(row);
         self.pending.retain(|edit| {
             edit.row != row
                 || !sent
@@ -2190,6 +2218,7 @@ impl ResultGrid {
     /// other rows' edits. For a row the server no longer has, or one whose
     /// relation is read again.
     pub fn discard_row(&mut self, row: usize) {
+        self.forget_failure(row);
         self.pending.retain(|edit| edit.row != row);
         if self
             .editing
@@ -2213,6 +2242,7 @@ impl ResultGrid {
             return false;
         }
         *held = fetched;
+        self.forget_failure(row);
         // A value may now be longer or shorter than the width fitted to it.
         self.refit_from_the_top();
         true
@@ -2513,6 +2543,28 @@ pub(crate) fn step_pending(
     table.delegate_mut().set_active(row, col);
     table.set_selected_row(row, cx);
     scroll_to_drawn_col(table, col, cx);
+}
+
+/// Puts the ring back on `row`, keeping its column, and tells the library, as
+/// `step_pending` does. For a send that was refused or stopped by the mode,
+/// whose row is still dirty: the user's own move off it has already happened.
+///
+/// A programmatic move, not the user leaving a row: the ring is written
+/// directly, so the move marks nothing for the workspace to send. An input the
+/// move into the other row opened is dropped. True when it was one, whose
+/// focus the caller hands back to the grid.
+pub(crate) fn snap_back(
+    table: &mut TableState<ResultGrid>,
+    row: usize,
+    cx: &mut Context<TableState<ResultGrid>>,
+) -> bool {
+    let grid = table.delegate_mut();
+    let first = grid.view.first().copied().unwrap_or(0);
+    let col = grid.active.map_or(first, |(_, col)| col);
+    let dropped = grid.editing.take().is_some();
+    grid.active = Some((row, col));
+    table.set_selected_row(row, cx);
+    dropped
 }
 
 /// A header's menu: hide, pin or unpin that column, and bring back the
@@ -2986,11 +3038,18 @@ impl TableDelegate for ResultGrid {
         match col_ix.checked_sub(GUTTER).and_then(|p| self.column_at(p)) {
             Some(col) => self.data_td(row_ix, col, window, cx).into_any_element(),
             None => {
-                let (faint, text, selected_bg) = {
+                let (faint, text, selected_bg, danger) = {
                     let t = theme(cx);
-                    (t.text_faint, t.text, t.selection)
+                    (t.text_faint, t.text, t.selection, t.danger)
                 };
                 let selected = self.selected_rows.contains(&row_ix);
+                // What the server said to this row's send, on the one cell
+                // that is the row's and not a column's.
+                let refused = self
+                    .send_failure()
+                    .filter(|(row, _)| *row == row_ix)
+                    .map(|(_, message)| SharedString::from(message.to_string()));
+                let number = (row_ix + 1).to_string();
                 gutter_cell()
                     .id(("row-number", row_ix))
                     .debug_selector(move || format!("row-number-{row_ix}"))
@@ -2998,7 +3057,20 @@ impl TableDelegate for ResultGrid {
                     .justify_end()
                     .when(selected, |cell| cell.bg(selected_bg))
                     .text_color(if selected { text } else { faint })
-                    .child((row_ix + 1).to_string())
+                    .when_some(refused.clone(), |cell, message| {
+                        cell.text_color(danger).tooltip(move |window, cx| {
+                            Tooltip::new(message.clone()).build(window, cx)
+                        })
+                    })
+                    .child(match refused {
+                        // Its own name, so a driver can tell a refused row
+                        // from the colour alone.
+                        Some(_) => div()
+                            .debug_selector(move || format!("row-send-failed-{row_ix}"))
+                            .child(number)
+                            .into_any_element(),
+                        None => number.into_any_element(),
+                    })
                     // Left click only: a right click still opens the cell
                     // menu the row's own cells offer, and a gutter with two
                     // different rules for the two buttons would be a gutter
