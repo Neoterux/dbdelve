@@ -792,6 +792,9 @@ pub(crate) struct Session {
     /// The tab a close is asking about, because it holds cell edits nobody
     /// has applied.
     pub(crate) pending_discard: Option<PendingDiscard>,
+    /// An action a landed row send released, waiting for render, which has the
+    /// `Window` its handler needs (`Workspace::resume_parked`).
+    pub(crate) resume_after: Option<(Tab, AfterEdits)>,
     /// The question turning auto-commit back on asks while a transaction is
     /// open: commit it, roll it back, or leave it.
     pub(crate) auto_commit_prompt: Option<AutoCommitPrompt>,
@@ -1270,6 +1273,7 @@ impl Session {
             query_rename: None,
             query_rename_needs_focus: false,
             pending_discard: None,
+            resume_after: None,
             auto_commit_prompt: None,
             auto_after_end: None,
             notice,
@@ -3573,6 +3577,9 @@ pub(crate) enum Refresh {
         /// refusal puts the ring back from; `None` for Save, which does not
         /// move it.
         to: Option<usize>,
+        /// What the user asked for that this row had to be saved before: a page
+        /// turn, a sort, a tab switch. Carried out only when the send lands.
+        then: Option<AfterEdits>,
     },
 }
 

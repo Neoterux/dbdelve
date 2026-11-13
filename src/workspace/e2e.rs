@@ -24257,3 +24257,139 @@ fn a_stale_tab_with_edits_is_not_reloaded_on_a_visit(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// What the tab's parked run, if it is a Row send, would resume once it runs:
+/// `None` for no parked Row send, `Some(None)` for one that resumes nothing.
+fn parked_row_send_action(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<Option<crate::session::AfterEdits>> {
+    workspace.read_with(cx, |workspace, _| {
+        let resume = workspace
+            .profile()?
+            .session
+            .pending_run
+            .as_ref()?
+            .resume
+            .as_ref()?;
+        match resume.refresh.as_ref()? {
+            crate::session::Refresh::Row { then, .. } => Some(then.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn resume_after_of(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::session::Tab> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()?
+            .session
+            .resume_after
+            .as_ref()
+            .map(|(tab, _)| *tab)
+    })
+}
+
+#[gpui::test]
+fn a_page_turn_in_row_mode_saves_the_dirty_row_first(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{NextPage, PreviousPage, SetRowLimit},
+        result_grid::NewValue,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        cx.dispatch_action(SetRowLimit { rows: Some(2) });
+        settle(cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+
+        // The row goes first and no prompt is raised over it.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.next_page(&NextPage, window, cx)
+        });
+        assert!(discard_holds(&workspace, cx).is_none(), "no prompt");
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(state_kind(&workspace, cx), "running", "the row is sent");
+        assert_eq!(relation_view(&workspace, cx, id).3, 0, "not turned yet");
+        settle(cx);
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(
+            relation_view(&workspace, cx, id).3,
+            2,
+            "then the page turns"
+        );
+        assert_eq!(first_column(&grid, cx), ["3", "4"]);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert!(
+            history_sql(&workspace, cx)[0].starts_with("UPDATE"),
+            "the row's UPDATE is the newest entry"
+        );
+        assert_eq!(resume_after_of(&workspace, cx), None);
+
+        // Back on page 1, a row the server refuses keeps the page.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.previous_page(&PreviousPage, window, cx)
+        });
+        settle(cx);
+        assert_eq!(relation_view(&workspace, cx, id).3, 0);
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.next_page(&NextPage, window, cx)
+        });
+        settle(cx);
+        settle(cx);
+        assert_eq!(relation_view(&workspace, cx, id).3, 0, "the page stays");
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        assert_eq!(pending_of(&grid, cx), 1, "the edit is kept");
+        assert!(refused_row(&grid, cx).is_some_and(|(row, _)| row == 0));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        assert_eq!(discard_holds(&workspace, cx).map(|_| ()), None);
+
+        // A send the mode stops resumes nothing, and neither Cancel nor a later
+        // Run turns the page.
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().discard_pending();
+            table.refresh(cx);
+        });
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::ReadOnly, cx)
+        });
+        settle(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.next_page(&NextPage, window, cx)
+        });
+        settle(cx);
+        assert!(
+            matches!(parked_row_send_action(&workspace, cx), Some(None)),
+            "the parked send carries no action"
+        );
+        assert_eq!(relation_view(&workspace, cx, id).3, 0);
+        assert_eq!(pending_of(&grid, cx), 1);
+        workspace.update(cx, |workspace, cx| workspace.cancel_pending_run(cx));
+        settle(cx);
+        assert_eq!(relation_view(&workspace, cx, id).3, 0);
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
