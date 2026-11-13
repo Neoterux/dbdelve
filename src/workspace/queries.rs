@@ -2639,11 +2639,18 @@ impl Workspace {
         // has landed, which can take as long as a connect.
         let reopened = matches!(routed, Routed::Open { .. }).then(|| sql::classify(engine, &sql));
         // The read of a Row send's row, run on the connection the write used
-        // once the write has succeeded.
+        // once the write has succeeded. It is the caller's string, so it meets
+        // the select gate here, with nothing between the gate and the run: a
+        // caller that fills it in by hand cannot get any other statement run
+        // on the connection (`AGENTS.md`, rule 2).
         let row_read = match &refresh {
             Some(Refresh::Row { read, .. }) => Some(read.clone()),
             _ => None,
         };
+        let read_refused = row_read
+            .as_deref()
+            .is_some_and(|read| !sql::is_generated_select(engine, read));
+        let row_read = row_read.filter(|_| !read_refused);
         // What the status line says of it, once `work` has taken the statement.
         let row_statement = row_sent.as_ref().map(|_| sql.clone());
         let work = move |connection: Connection| {
@@ -2986,6 +2993,7 @@ impl Workspace {
                                             table.delegate_mut(),
                                             (*row, *rows_id, cells),
                                             read_back,
+                                            read_refused,
                                             status,
                                         );
                                         table.refresh(cx);
@@ -3289,6 +3297,12 @@ impl Workspace {
                         && profile.in_transaction
                     {
                         profile.uncommitted.insert(object);
+                    }
+                    if read_refused
+                        && let Tab::Object(object) = tab
+                        && let Some(profile) = workspace.issued_to(&id, generation)
+                    {
+                        profile.session.mark_stale(object);
                     }
                     if let Some((said, reread)) = row_said {
                         // The relation is read again first: that clears the
@@ -4092,8 +4106,23 @@ fn land_row(
     grid: &mut ResultGrid,
     (row, rows_id, sent): (usize, u64, &[(usize, NewValue)]),
     read: Option<Result<QueryResult, DbError>>,
+    read_refused: bool,
     status: String,
 ) -> (String, bool) {
+    // The write landed and the read was not run, so the row on screen is what
+    // it was fetched as: the tab is owed a read (the caller marks it) and the
+    // relation is not read here, which is not what the user asked for.
+    if read_refused {
+        if grid.rows_id() == rows_id {
+            grid.clear_sent(row, sent);
+        }
+        return (
+            "The row was updated. dbdelve refused to run a read it wrote itself: it is not a \
+             SELECT, so the row was not read back."
+                .into(),
+            false,
+        );
+    }
     if grid.rows_id() != rows_id {
         return (
             "The row was updated. The rows were reordered while it was saved, so it was not \
