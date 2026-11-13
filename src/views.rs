@@ -3288,6 +3288,27 @@ pub(crate) fn apply_label(mode: Option<EditMode>) -> &'static str {
     }
 }
 
+/// Says that the rows saved on the table in front sit inside the open
+/// transaction: the grid shows them, and a rollback undoes them.
+pub(crate) fn render_uncommitted(
+    profile: &Profile,
+    cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    let Tab::Object(object) = profile.session.active else {
+        return None;
+    };
+    (profile.in_transaction && profile.uncommitted.contains(&object)).then(|| {
+        open_indicator_chip("uncommitted-rows", "Uncommitted", *theme(cx))
+            .tooltip(|window, cx| {
+                Tooltip::new(
+                    "Rows saved on this tab are inside the open transaction. A rollback undoes them.",
+                )
+                .build(window, cx)
+            })
+            .into_any_element()
+    })
+}
+
 /// Transaction control: whether each statement commits on its own, and the
 /// way to end one that is open.
 ///
@@ -3435,6 +3456,11 @@ pub(crate) fn render_transaction(
 /// are "changed and not yet committed". Sized as a choice chip so it sits level
 /// with the chips beside it.
 fn open_indicator(selector: &'static str, label: &'static str, t: Theme) -> AnyElement {
+    open_indicator_chip(selector, label, t).into_any_element()
+}
+
+/// [`open_indicator`] before it is an element, for one that carries a tooltip.
+fn open_indicator_chip(selector: &'static str, label: &'static str, t: Theme) -> Stateful<Div> {
     div()
         .id(selector)
         .debug_selector(move || selector.into())
@@ -3449,7 +3475,6 @@ fn open_indicator(selector: &'static str, label: &'static str, t: Theme) -> AnyE
         .bg(t.edited)
         .text_color(t.text)
         .child(label)
-        .into_any_element()
 }
 
 /// The element name of a chip, or of `part` of it (`context`, `tint`), for a

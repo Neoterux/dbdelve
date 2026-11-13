@@ -2493,7 +2493,10 @@ impl Workspace {
                 && profile.in_transaction
                 && sql::after_last_end(engine, text).is_empty()
             {
-                ended = Some(std::mem::take(&mut profile.transaction_statements));
+                ended = Some((
+                    std::mem::take(&mut profile.transaction_statements),
+                    profile.uncommitted.clone(),
+                ));
             }
             profile.record_sent(&sql, leaves.transaction);
             if let Some(open) = leaves.transaction {
@@ -2520,6 +2523,9 @@ impl Workspace {
         // the user's open transaction and is committed or rolled back with it,
         // so the prompt that ends it lists it. Its reads stay out.
         let mut joined_batch = false;
+        // Whether a Row send runs inside the user's open transaction, which a
+        // ROLLBACK would undo under a grid that shows it as saved.
+        let mut joined_row = false;
         if generated
             && edit
             && binding.is_none()
@@ -2527,6 +2533,7 @@ impl Workspace {
             && let Some(profile) = self.issued_to(&id, generation)
         {
             profile.record_sent(&sql, None);
+            joined_row = row_sent.is_some() && profile.in_transaction;
             // Without brackets of its own it is not all-or-nothing: on an
             // engine where a failed statement leaves the transaction open,
             // the rows before the failure stay in it.
@@ -2870,7 +2877,7 @@ impl Workspace {
                         // left the transaction open; a guess would keep a
                         // flag no COMMIT could clear, or offer a Roll Back
                         // for work the server had already rolled back.
-                        if let Some(statements) = ended
+                        if let Some((statements, uncommitted)) = ended
                             && !lost
                             && result
                                 .as_ref()
@@ -2879,6 +2886,7 @@ impl Workspace {
                         {
                             profile.in_transaction = true;
                             profile.transaction_statements = statements;
+                            profile.uncommitted = uncommitted;
                         }
                         if profile.session.auto_after_end == Some(tab) {
                             profile.session.auto_after_end = None;
@@ -3271,6 +3279,16 @@ impl Workspace {
                             }
                             false => workspace.put_back(tab, then),
                         }
+                    }
+                    // Not tied to the profile being in front: its transaction
+                    // holds the write whichever one the user is looking at.
+                    if joined_row
+                        && row_said.is_some()
+                        && let Tab::Object(object) = tab
+                        && let Some(profile) = workspace.issued_to(&id, generation)
+                        && profile.in_transaction
+                    {
+                        profile.uncommitted.insert(object);
                     }
                     if let Some((said, reread)) = row_said {
                         // The relation is read again first: that clears the
