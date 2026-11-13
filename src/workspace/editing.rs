@@ -1674,7 +1674,8 @@ impl Workspace {
     ///
     /// `then` is the action the user asked for that the row had to be saved
     /// before (`held_for_edits`): carried out when the send lands, dropped on
-    /// every other outcome.
+    /// every other outcome, which puts back what it had changed
+    /// (`Session::put_back`).
     pub(crate) fn save_row(
         &mut self,
         tab: u64,

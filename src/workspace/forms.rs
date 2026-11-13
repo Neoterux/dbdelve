@@ -1617,13 +1617,11 @@ impl Workspace {
 
     pub(crate) fn render_discard_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
-        let (title, sentence) = self
-            .profile()?
-            .session
-            .pending_discard
-            .as_ref()?
-            .then
-            .discards();
+        let pending = self.profile()?.session.pending_discard.as_ref()?;
+        let (title, sentence) = match pending.row {
+            Some(_) => pending.then.discards_refused_row(),
+            None => pending.then.discards(),
+        };
         let cancel_workspace = cx.entity().downgrade();
         let discard_workspace = cancel_workspace.clone();
 

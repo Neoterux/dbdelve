@@ -1953,6 +1953,7 @@ impl Workspace {
                     then: AfterEdits::Close {
                         deleting: Some(name),
                     },
+                    row: None,
                 });
             }
             cx.notify();
@@ -3189,7 +3190,22 @@ impl Workspace {
                                         cx.notify();
                                     });
                                 }
-                                (false, false, None, Vec::new(), Some(error.message), landed)
+                                // A refused row is left dirty and marked, and the
+                                // tab's controls ask before they leave it, so the
+                                // notice says what gets it back.
+                                let said = match row_sent.is_some() {
+                                    true => format!(
+                                        "{}{} {}",
+                                        error.message.trim_end(),
+                                        match error.message.trim_end().ends_with(['.', '!', '?']) {
+                                            true => "",
+                                            false => ".",
+                                        },
+                                        Self::ROW_KEPT
+                                    ),
+                                    false => error.message,
+                                };
+                                (false, false, None, Vec::new(), Some(said), landed)
                             }
                             Err(mut error) => {
                                 // Rows of a statement that failed part way are
@@ -3505,6 +3521,9 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// Said after the server refused a Row send, after what it said.
+    const ROW_KEPT: &str = "The row keeps its edits; Esc puts it back as it was read.";
 
     /// Said after a Row send that left the relation owed a read, over a tab
     /// that still holds another row's edits.

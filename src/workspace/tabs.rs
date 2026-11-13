@@ -1213,12 +1213,14 @@ impl Workspace {
     /// carried out by [`Self::resume_after_edits`] if the user lets the edits
     /// go.
     ///
-    /// A Row view never reaches the discard prompt: the row it holds is one
-    /// Row mode can save, so `then` goes with the row's send (`save_row`) and is
-    /// carried out, from render, only when that send lands
-    /// ([`Self::resume_parked`]). A send that fails, or is stopped by the mode,
-    /// drops it: the user repeats the action once the row is dealt with. Only
-    /// a Draft view is asked.
+    /// A Row view's row is one Row mode can save, so `then` goes with the row's
+    /// send (`save_row`) and is carried out, from render, only when that send
+    /// lands ([`Self::resume_parked`]). A send that fails, or is stopped by the
+    /// mode, drops it and puts back what it had changed. The user repeats the
+    /// action, and a row the server has refused (it stays marked until it is
+    /// edited, reverted or sent) is not sent again: the prompt asks whether to
+    /// drop that row, and Discard drops it alone and carries the action out.
+    /// A Draft view is asked about every edit.
     pub(crate) fn held_for_edits(
         &mut self,
         tab: Tab,
@@ -1236,9 +1238,28 @@ impl Workspace {
                 .results(tab)
                 .and_then(|results| results.read(cx).delegate().row_to_send())
         {
+            let refused = profile.session.results(tab).is_some_and(|results| {
+                results
+                    .read(cx)
+                    .delegate()
+                    .send_failure()
+                    .is_some_and(|(marked, _)| marked == row)
+            });
             if profile.session.running(tab) {
                 self.note("The previous row is still being saved.".into(), cx);
                 self.put_back(tab, then);
+            } else if refused {
+                // The server has already refused this row as it stands (an
+                // edit clears the mark), so sending it again would only hear
+                // the same answer. The user is asked whether to drop it.
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.pending_discard = Some(PendingDiscard {
+                        tab,
+                        then,
+                        row: Some(row),
+                    });
+                }
+                cx.notify();
             } else if !self.save_row(id, row, None, Some(then.clone()), cx) {
                 // `save_row` said why it sent nothing.
                 self.put_back(tab, then);
@@ -1257,7 +1278,11 @@ impl Workspace {
             return true;
         }
         if let Some(profile) = self.profile_mut() {
-            profile.session.pending_discard = Some(PendingDiscard { tab, then });
+            profile.session.pending_discard = Some(PendingDiscard {
+                tab,
+                then,
+                row: None,
+            });
         }
         cx.notify();
         true
@@ -1389,7 +1414,12 @@ impl Workspace {
             .unwrap_or_default();
         for grid in grids {
             grid.update(cx, |table, cx| {
-                table.delegate_mut().discard_pending();
+                match discard.row {
+                    // The one row the server refused: another row's edits are
+                    // not the user's to lose here, and the action sends them.
+                    Some(row) => table.delegate_mut().discard_row(row),
+                    None => table.delegate_mut().discard_pending(),
+                }
                 table.refresh(cx);
             });
         }
@@ -1417,7 +1447,9 @@ impl Workspace {
             AfterEdits::Close {
                 deleting: Some(name),
             } => self.delete_saved_query_now(name, window, cx),
-            AfterEdits::Close { deleting: None } => self.close_now(tab, window, cx),
+            // Asked again rather than closed outright: the rows a Row view
+            // still holds are sent first.
+            AfterEdits::Close { deleting: None } => self.ask_before_close(tab, window, cx),
             _ if !in_front => self.put_back(tab, then),
             AfterEdits::Requery {
                 filter,
