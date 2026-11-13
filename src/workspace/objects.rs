@@ -100,6 +100,7 @@ impl Workspace {
         let engine = self.engine();
         let target = self.target();
         let sorting = Sorting::new(self.settings.client_sort).on(engine);
+        let edit_mode = self.settings.edit_mode.on(target);
         let structure = matches!(opened, OpenedObject::Structure { .. });
         let profile = self.profile_mut()?;
         let existing = matching_tab(
@@ -185,7 +186,7 @@ impl Workspace {
                     query: QueryState::Idle,
                     sort: Vec::new(),
                     sorting,
-                    edit_mode: EditMode::default().on(target),
+                    edit_mode,
                     filter,
                     filters,
                     next_join: Conjunction::default(),

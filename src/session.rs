@@ -2227,9 +2227,6 @@ impl EditMode {
     }
 }
 
-// The Edit mode setting and the view's control read these, and land after the
-// send does: until then only the tests call them.
-#[allow(dead_code)]
 impl EditMode {
     pub(crate) const ALL: [EditMode; 2] = [EditMode::Draft, EditMode::Row];
 

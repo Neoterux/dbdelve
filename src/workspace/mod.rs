@@ -1226,7 +1226,14 @@ impl Workspace {
 
     /// The edit mode a new table tab starts in. Not applied to the tabs already
     /// open, each of which holds its own.
-    pub(crate) fn set_default_edit_mode(&mut self, _mode: EditMode, _cx: &mut Context<Self>) {}
+    pub(crate) fn set_default_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
+        if self.settings.edit_mode == mode {
+            return;
+        }
+        self.settings.edit_mode = mode;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
 
     /// Rebuilt on every profile now rather than at its next catalog load, which
     /// may be a reconnect away.
