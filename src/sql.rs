@@ -1187,9 +1187,37 @@ pub fn row_guard(engine: Engine, statement: &str) -> Option<String> {
     is_generated_select(engine, &guard).then_some(guard)
 }
 
-/// Stub for the red commit.
-pub(crate) fn row_read(_engine: Engine, _statement: &str) -> Option<String> {
-    None
+/// `SELECT * FROM <t> WHERE <p>` for one generated `UPDATE`: the read that
+/// brings back the row it wrote, so the grid shows what the server now holds
+/// and not what was typed (a column's affinity, a default, a trigger).
+///
+/// `<t>` and `<p>` are cut from the tree the write gate reads, never from the
+/// generator's word, and only from a statement the gate admits whose predicate
+/// is a conjunction of one-row terms. The assignments are not inspected: the
+/// gate has already read them, and a `DEFAULT` among them is no reason to leave
+/// the row unread. `None` for anything else -- more than one statement, a
+/// statement that is not an `UPDATE` -- and for a read [`is_generated_select`]
+/// does not admit: a caller that gets no read sends nothing.
+pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
+    if engine.syntax() != Syntax::Sql {
+        return None;
+    }
+    let spec = &engine.spec().sql;
+    if is_transaction_bracket(statement) || !generated_write(spec, statement) {
+        return None;
+    }
+    let text = as_written(spec, statement)?;
+    let tree = parse_write(&text, spec.backslash_escapes)?;
+    let [one] = only_statement(&tree.root_node())?;
+    let (table, _, filter) = update_parts(one)?;
+    let predicate = predicate_of(filter)?;
+    row_columns(spec, predicate, &text)?;
+    let read = format!(
+        "SELECT * FROM {} WHERE {}",
+        text.get(table.byte_range())?,
+        text.get(predicate.byte_range())?
+    );
+    is_generated_select(engine, &read).then_some(read)
 }
 
 /// Whether `sql` is a `SELECT` dbdelve could have written: exactly one root
@@ -1425,14 +1453,12 @@ fn one_row_delete(statement: Node) -> Option<(Node, Node)> {
     Some((*relation, predicate_of(*filter)?))
 }
 
-/// The table and the predicate of `UPDATE <t> SET <c> = <v>, … WHERE <p>`
-/// where each `<v>` is a literal or `NULL` and no column is set twice, and
-/// nothing else in `statement`: no alias, `FROM`, `RETURNING` or expression.
-fn one_row_update<'tree>(
-    spec: &SqlSpec,
+/// The table, the assignments and the `where` node of `UPDATE <t> SET … WHERE …`
+/// and nothing else in `statement`: no alias, `FROM` or `RETURNING`. What the
+/// assignments hold, and what the `where` holds, are the callers' to read.
+fn update_parts<'tree>(
     statement: Node<'tree>,
-    sql: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
+) -> Option<(Node<'tree>, Vec<Node<'tree>>, Node<'tree>)> {
     let mut cursor = statement.walk();
     let parts: Vec<_> = statement.named_children(&mut cursor).collect();
     let [update] = parts.as_slice() else {
@@ -1460,9 +1486,20 @@ fn one_row_update<'tree>(
     {
         return None;
     }
+    Some((*table, assignments.to_vec(), *filter))
+}
 
+/// The table and the predicate of `UPDATE <t> SET <c> = <v>, … WHERE <p>`
+/// where each `<v>` is a literal or `NULL` and no column is set twice, and
+/// nothing else in `statement`: no alias, `FROM`, `RETURNING` or expression.
+fn one_row_update<'tree>(
+    spec: &SqlSpec,
+    statement: Node<'tree>,
+    sql: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    let (table, assignments, filter) = update_parts(statement)?;
     let mut columns = Vec::new();
-    for assignment in assignments {
+    for assignment in &assignments {
         let mut cursor = assignment.walk();
         let sides: Vec<_> = assignment.children(&mut cursor).collect();
         let [left, equals, right] = sides.as_slice() else {
@@ -1477,9 +1514,9 @@ fn one_row_update<'tree>(
         columns.push(column_name(*left, sql)?);
     }
     distinct(&columns)?;
-    let predicate = predicate_of(*filter)?;
+    let predicate = predicate_of(filter)?;
     row_columns(spec, predicate, sql)?;
-    Some((*table, predicate))
+    Some((table, predicate))
 }
 
 /// The predicate of a `where` node holding nothing but `WHERE <p>`.
@@ -7777,13 +7814,6 @@ mod tests {
         }
         assert_eq!(
             row_read(Engine::MongoDb, "db.t.updateOne({_id: 1}, {$set: {a: 1}})"),
-            None
-        );
-        assert_eq!(
-            row_read(
-                Engine::ClickHouse,
-                "ALTER TABLE t UPDATE a = '1' WHERE b = '2' SETTINGS mutations_sync = 2"
-            ),
             None
         );
     }

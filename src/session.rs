@@ -1619,6 +1619,8 @@ impl Session {
     }
 
     /// `Some` only for a relation tab, the one view with a mode to change.
+    // Called by `Workspace::set_edit_mode`, which only the tests call yet.
+    #[allow(dead_code)]
     pub(crate) fn edit_mode_mut(&mut self, tab: Tab) -> Option<&mut EditMode> {
         match tab {
             Tab::Query(_) => None,
@@ -2216,6 +2218,21 @@ pub(crate) enum EditMode {
 }
 
 impl EditMode {
+    /// This mode, but `Draft` where the target does not offer Row: Row is
+    /// offered exactly where `Target::row_edits` holds, the targets whose edit
+    /// send keeps the grid, so a Row send is never made on one that clears it.
+    pub(crate) fn on(self, target: Target) -> Self {
+        match (self, target.row_edits()) {
+            (Self::Row, false) => Self::Draft,
+            (mode, _) => mode,
+        }
+    }
+}
+
+// The Edit mode setting and the view's control read these, and land after the
+// send does: until then only the tests call them.
+#[allow(dead_code)]
+impl EditMode {
     pub(crate) const ALL: [EditMode; 2] = [EditMode::Draft, EditMode::Row];
 
     pub(crate) fn slug(self) -> &'static str {
@@ -2237,16 +2254,6 @@ impl EditMode {
         match self {
             Self::Draft => "Draft",
             Self::Row => "Row",
-        }
-    }
-
-    /// This mode, but `Draft` where the target does not offer Row: Row is
-    /// offered exactly where `Target::row_edits` holds, the targets whose edit
-    /// send keeps the grid, so a Row send is never made on one that clears it.
-    pub(crate) fn on(self, target: Target) -> Self {
-        match (self, target.row_edits()) {
-            (Self::Row, false) => Self::Draft,
-            (mode, _) => mode,
         }
     }
 }
@@ -3460,6 +3467,15 @@ pub(crate) enum Refresh {
     /// A relation tab, refreshed the way its own controls refresh it — so it
     /// picks up whatever sort and row limit the tab is now set to.
     Relation(u64),
+    /// A Row-mode send of one row's `UPDATE`, which is followed in the same
+    /// task by `read`, the row read back by its key, landing in `row` of the
+    /// grid whose rows are `rows_id`. No refresh of the relation follows: the
+    /// row is replaced where it stands.
+    Row {
+        row: usize,
+        rows_id: u64,
+        read: String,
+    },
 }
 
 /// `Clone` because a queue keeps the state of every statement it has run

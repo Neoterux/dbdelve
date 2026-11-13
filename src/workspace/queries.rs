@@ -2129,7 +2129,12 @@ impl Workspace {
         // others for: not sent while a transaction is open on that session.
         let edit = matches!(
             refresh,
-            Some(Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_))
+            Some(
+                Refresh::Statement(_)
+                    | Refresh::Earlier { .. }
+                    | Refresh::Relation(_)
+                    | Refresh::Row { .. }
+            )
         );
         let refusal = edit
             .then(|| match &binding {
@@ -2149,6 +2154,7 @@ impl Workspace {
         // row sends none of them, and a relation tab's send without a review
         // has a landing of its own.
         let carries = kept
+            && !matches!(refresh, Some(Refresh::Row { .. }))
             && match (profile.session.apply_review.as_ref(), tab) {
                 (Some(review), _) if review.covers(tab) => review.edits,
                 (_, Tab::Query(_)) => true,
@@ -2304,6 +2310,16 @@ impl Workspace {
                 .collect();
             (grid.rows_id(), cells)
         });
+        // A Row send's one row, with the cells it carries, read now for the
+        // same reason: the landing clears those and no edit staged since.
+        let row_sent = match &refresh {
+            Some(Refresh::Row { row, rows_id, .. }) => Some((
+                *row,
+                *rows_id,
+                results.read(cx).delegate().pending_cells(*row),
+            )),
+            _ => None,
+        };
         // A kept send touches neither: its rows, ring, scroll and edits stay.
         if !kept && !keep_rows && explain.is_none() {
             results.update(cx, |table, cx| {
@@ -2349,7 +2365,13 @@ impl Workspace {
         // to say which statement produced it. An `EXPLAIN` produces no rows to
         // describe and belongs in nobody's history -- it is dbdelve's prefix over
         // the user's statement, and the statement itself is already there.
-        let statement = (matches!(tab, Tab::Query(_)) && explain.is_none()).then(|| sql.clone());
+        // A Row send is recorded as a statement's run is, though it is a
+        // relation tab's and dbdelve's: it is the user's edit, sent unreviewed,
+        // and the history is where they can read what it was. Not one refused
+        // before the server (`refusal`), which sent nothing.
+        let statement = ((matches!(tab, Tab::Query(_)) && explain.is_none())
+            || (row_sent.is_some() && refusal.is_none()))
+        .then(|| sql.clone());
         // What the plan pane says it is a plan of: the user's statement, without
         // the prefix dbdelve put in front of it.
         let explained = explain
@@ -2558,6 +2580,14 @@ impl Workspace {
         // The verdict the mode is asked again of once a session this run opens
         // has landed, which can take as long as a connect.
         let reopened = matches!(routed, Routed::Open { .. }).then(|| sql::classify(engine, &sql));
+        // The read of a Row send's row, run on the connection the write used
+        // once the write has succeeded.
+        let row_read = match &refresh {
+            Some(Refresh::Row { read, .. }) => Some(read.clone()),
+            _ => None,
+        };
+        // What the status line says of it, once `work` has taken the statement.
+        let row_statement = row_sent.as_ref().map(|_| sql.clone());
         let work = move |connection: Connection| {
             let fetch = Fetch {
                 limit,
@@ -2582,10 +2612,26 @@ impl Workspace {
                 (false, false, _) => connection.query(&sql, &cancel, fetch),
                 (false, true, _) => connection.query_alongside(&sql, &cancel, fetch, read_only),
             };
+            // Through the call the write used, with no feed and no row limit:
+            // the one row is the whole answer.
+            let read_back = match (&result, &row_read) {
+                (Ok(_), Some(read)) => Some(match binding.as_ref() {
+                    Some(binding) => connection.generated_bound(
+                        binding.schema.as_deref(),
+                        read,
+                        &cancel,
+                        None,
+                        None,
+                    ),
+                    None => connection.generated(read, &cancel, None, None),
+                }),
+                _ => None,
+            };
             // A connection of the lane's own that failed is gone with it, and
             // says nothing about the profile's.
-            let lost = !alongside && result.is_err() && connection.is_lost();
-            (result, lost)
+            let failed = result.is_err() || matches!(read_back, Some(Err(_)));
+            let lost = !alongside && failed && connection.is_lost();
+            (result, lost, read_back)
         };
         let number = crate::logging::connection_number(&id);
         // The database to open a session for, when none is open for it.
@@ -2647,11 +2693,11 @@ impl Workspace {
             // Blocks for as long as the server takes, and statements queued
             // behind it on the same session block on its lock, so none of them
             // may hold one of the executor's threads (`spawn_blocking`).
-            let (result, lost) = match ready {
+            let (result, lost, read_back) = match ready {
                 Ok(connection) => {
                     spawn_blocking(cx.background_executor(), move || work(connection)).await
                 }
-                Err(error) => (Err(error), false),
+                Err(error) => (Err(error), false, None),
             };
             // Outcome and duration only. Not even at debug the server's text:
             // some engines quote the statement back in a syntax error.
@@ -2711,6 +2757,9 @@ impl Workspace {
                     // The plan is carried out of this block rather than stored
                     // inside it: `slot` holds the session borrowed, and the tab
                     // it belongs on has to be reached through the same session.
+                    // What a Row send's landing says, and whether the relation
+                    // is read again.
+                    let mut row_said: Option<(String, bool)> = None;
                     let (succeeded, produced_grid, plan, rest, notice, landed) = {
                         let Some(profile) = workspace.issued_to(&id, generation) else {
                             workspace.drop_stale_run(&id, tab, lane.as_ref(), cx);
@@ -2865,6 +2914,24 @@ impl Workspace {
                                     recorded.as_ref().map(|entry| entry.succeeded(&result));
                                 if let Some(previous) = restored {
                                     *state = previous;
+                                }
+                                if let Some((row, rows_id, cells)) = &row_sent {
+                                    let sent = row_statement.as_deref().unwrap_or_default();
+                                    let status = match result.rows_affected {
+                                        Some(1) => format!("1 row updated: {sent}"),
+                                        Some(count) => format!("{count} rows updated: {sent}"),
+                                        None => format!("Sent: {sent}"),
+                                    };
+                                    row_said = Some(results.update(cx, |table, cx| {
+                                        let said = land_row(
+                                            table.delegate_mut(),
+                                            (*row, *rows_id, cells),
+                                            read_back,
+                                            status,
+                                        );
+                                        table.refresh(cx);
+                                        said
+                                    }));
                                 }
                                 if let Some((rows_id, rows)) = &sent {
                                     results.update(cx, |table, cx| {
@@ -3115,6 +3182,24 @@ impl Workspace {
                     {
                         profile.session.tab_notice = Some((tab, reset));
                     }
+                    let in_front_now = workspace.profile().is_some_and(|profile| {
+                        profile.id == id && profile.generation == generation
+                    });
+                    if let Some((said, reread)) = row_said {
+                        // The relation is read again first: that clears the
+                        // notices, and the last send is what the status line
+                        // is to show.
+                        if reread
+                            && in_front_now
+                            && let Tab::Object(object) = tab
+                        {
+                            workspace.refresh_relation(object, cx);
+                        }
+                        if let Some(profile) = workspace.issued_to(&id, generation) {
+                            profile.session.notice = None;
+                            profile.session.tab_notice = Some((tab, said));
+                        }
+                    }
                     if succeeded && let Some(profile) = workspace.issued_to(&id, generation) {
                         // A statement that returned no columns produced no grid,
                         // so it is not the statement to go back to — which is
@@ -3207,6 +3292,7 @@ impl Workspace {
                     // rows again would drop them unseen.
                     let edits_left = kept
                         && succeeded
+                        && row_sent.is_none()
                         && in_front
                         && workspace
                             .issued_to(&id, generation)
@@ -3253,6 +3339,8 @@ impl Workspace {
                                 }
                             }
                             Refresh::Return => {}
+                            // Landed where it stands, above.
+                            Refresh::Row { .. } => {}
                             Refresh::Relation(id) => workspace.refresh_relation(id, cx),
                         }
                     }
@@ -3885,6 +3973,59 @@ fn pour(
         render_aside(results, engine, cx);
     }
     changed
+}
+
+/// What a Row send's landing does to the grid, and what it says. The row the
+/// server now holds is put where the row stood and the cells that were sent
+/// are cleared, so an edit staged while it was out stays. Anything else leaves
+/// the grid's row to a read of the whole relation, and says what happened:
+/// the second of the pair is whether that read is owed.
+///
+/// An index into rows that were reordered while the send was out names
+/// another row, so nothing is placed or cleared by it then.
+fn land_row(
+    grid: &mut ResultGrid,
+    (row, rows_id, sent): (usize, u64, &[(usize, NewValue)]),
+    read: Option<Result<QueryResult, DbError>>,
+    status: String,
+) -> (String, bool) {
+    if grid.rows_id() != rows_id {
+        return (
+            "The row was updated. The rows were reordered while it was saved, so it was not \
+             read back."
+                .into(),
+            false,
+        );
+    }
+    match read {
+        Some(Ok(mut read)) if read.rows.len() == 1 => {
+            if grid.replace_row(row, read.rows.remove(0)) {
+                grid.clear_sent(row, sent);
+                (status, false)
+            } else {
+                grid.discard_row(row);
+                (status, true)
+            }
+        }
+        Some(Ok(read)) if read.rows.is_empty() => {
+            grid.discard_row(row);
+            ("The row was not found after the update.".into(), true)
+        }
+        Some(Ok(_)) | None => {
+            grid.discard_row(row);
+            (status, true)
+        }
+        Some(Err(error)) => {
+            grid.discard_row(row);
+            (
+                format!(
+                    "The row was updated. Reading it back failed: {}",
+                    error.message
+                ),
+                true,
+            )
+        }
+    }
 }
 
 /// What a run came to, told from its answer alone, for a run whose tab or
