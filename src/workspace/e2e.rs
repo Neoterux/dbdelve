@@ -24840,6 +24840,57 @@ fn a_refused_row_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_read(
+    cx: &mut TestAppContext,
+) {
+    use crate::session::Refresh;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
+
+        // The write is a real one; only the read it carries is not a read.
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_and_then(
+                "UPDATE \"birds\" SET \"name\" = 'robin' WHERE \"id\" = 1;".into(),
+                Tab::Object(id),
+                Some(Refresh::Row {
+                    row: 0,
+                    rows_id,
+                    read: "DELETE FROM birds".into(),
+                    sent: Vec::new(),
+                    to: None,
+                    then: None,
+                }),
+                false,
+                None,
+                cx,
+            )
+        });
+        settle_through(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin"),
+            "the write ran"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("2"),
+            "the carried statement did not"
+        );
+        let notice = shown_notice(&workspace, cx).expect("the status line says what happened");
+        assert!(
+            notice.contains("refused to run a read it wrote itself"),
+            "{notice}"
+        );
+        assert!(relation_is_stale(&workspace, cx, id));
+        quit(workspace, cx);
+    });
+}
+
 /// The relation tabs of the profile in front whose Row-mode writes sit inside
 /// its open transaction.
 fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<u64> {
