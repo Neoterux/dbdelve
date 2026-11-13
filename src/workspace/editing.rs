@@ -1624,10 +1624,7 @@ impl Workspace {
                 1 => "1 edit".to_string(),
                 count => format!("{count} edits"),
             };
-            self.note(
-                format!("The draft has {edits}, so the view was not switched to Row mode."),
-                cx,
-            );
+            self.note(format!("The draft has {edits}{}", Self::DRAFT_REFUSAL), cx);
             return;
         }
         if let Some(slot) = self
@@ -1635,7 +1632,26 @@ impl Workspace {
             .and_then(|profile| profile.session.edit_mode_mut(tab))
         {
             *slot = mode;
+            self.clear_draft_refusal();
             cx.notify();
+        }
+    }
+
+    /// What the notice says after how many edits the draft holds, when a
+    /// switch to Row is refused over them.
+    const DRAFT_REFUSAL: &str = ", so the view was not switched to Row mode.";
+
+    /// Takes the draft's refusal down once what it reported is over: the draft
+    /// is gone or the view is in Row mode. Only that notice goes; whatever else
+    /// the bar says, such as the row a Row send just wrote, is not this call's.
+    fn clear_draft_refusal(&mut self) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if profile.session.notice.as_deref().is_some_and(|notice| {
+            notice.starts_with("The draft has ") && notice.ends_with(Self::DRAFT_REFUSAL)
+        }) {
+            profile.session.notice = None;
         }
     }
 
@@ -2157,6 +2173,7 @@ impl Workspace {
         if let Some(profile) = self.profile_mut() {
             profile.session.drop_apply_review_of(tab);
         }
+        self.clear_draft_refusal();
         cx.notify();
     }
 
