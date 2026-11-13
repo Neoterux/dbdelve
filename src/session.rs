@@ -1753,6 +1753,9 @@ impl Session {
         {
             *filters = rows;
         }
+        // An action released by a landed send does not follow the user to
+        // another tab or connection.
+        self.resume_after = None;
         self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;

@@ -1212,6 +1212,13 @@ impl Workspace {
     /// way on all of them. The action waits on `pending_discard` as data, to be
     /// carried out by [`Self::resume_after_edits`] if the user lets the edits
     /// go.
+    ///
+    /// A Row view never reaches the discard prompt: the row it holds is one
+    /// Row mode can save, so `then` goes with the row's send (`save_row`) and is
+    /// carried out, from render, only when that send lands
+    /// ([`Self::resume_parked`]). A send that fails, or is stopped by the mode,
+    /// drops it: the user repeats the action once the row is dealt with. Only
+    /// a Draft view is asked.
     pub(crate) fn held_for_edits(
         &mut self,
         tab: Tab,
@@ -1220,6 +1227,23 @@ impl Workspace {
     ) -> bool {
         if !self.has_unapplied_edits(tab, cx) {
             return false;
+        }
+        if let Tab::Object(id) = tab
+            && let Some(profile) = self.profile()
+            && profile.session.edit_mode(tab) == EditMode::Row
+            && let Some(row) = profile
+                .session
+                .results(tab)
+                .and_then(|results| results.read(cx).delegate().row_to_send())
+        {
+            if profile.session.running(tab) {
+                self.note("The previous row is still being saved.".into(), cx);
+                self.put_back(tab, then);
+            } else if !self.save_row(id, row, None, Some(then.clone()), cx) {
+                // `save_row` said why it sent nothing.
+                self.put_back(tab, then);
+            }
+            return true;
         }
         // Edits in flight are neither the user's to discard nor ours to wait
         // on: the send decides what becomes of them, and a prompt over them
@@ -1237,6 +1261,46 @@ impl Workspace {
         }
         cx.notify();
         true
+    }
+
+    /// Undoes what an action that is not going ahead changed before it asked:
+    /// a filter bar the user edited goes back to what it was.
+    pub(crate) fn put_back(&mut self, tab: Tab, then: AfterEdits) {
+        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) = (tab, then)
+            && let Some(bars) = self.filter_rows_mut(id)
+        {
+            *bars = rows;
+        }
+    }
+
+    /// Carries out the action a landed row send released, from render for the
+    /// `Window` its handler needs (`restore_objects` is the precedent). Waits
+    /// while the tab is still reading, since a requery over a read in flight
+    /// would be dropped; drops the action when its tab has gone. With rows still
+    /// edited, the handler meets [`Self::held_for_edits`] again and the next row
+    /// is sent.
+    pub(crate) fn resume_parked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some((tab, _)) = &profile.session.resume_after else {
+            return;
+        };
+        if profile.session.running(*tab) {
+            return;
+        }
+        let open = profile.session.results(*tab).is_some();
+        let Some((tab, then)) = self
+            .profile_mut()
+            .and_then(|profile| profile.session.resume_after.take())
+        else {
+            return;
+        };
+        if open {
+            self.resume_after_edits(tab, then, window, cx);
+        } else {
+            self.put_back(tab, then);
+        }
     }
 
     pub(crate) fn has_unapplied_edits(&self, tab: Tab, cx: &App) -> bool {
@@ -1356,7 +1420,7 @@ impl Workspace {
                 deleting: Some(name),
             } => self.delete_saved_query_now(name, window, cx),
             AfterEdits::Close { deleting: None } => self.close_now(tab, window, cx),
-            _ if !in_front => {}
+            _ if !in_front => self.put_back(tab, then),
             AfterEdits::Requery {
                 filter,
                 sort,
@@ -1406,12 +1470,7 @@ impl Workspace {
         else {
             return false;
         };
-        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) =
-            (discard.tab, discard.then)
-            && let Some(bars) = self.filter_rows_mut(id)
-        {
-            *bars = rows;
-        }
+        self.put_back(discard.tab, discard.then);
         self.refocus_front();
         cx.notify();
         true
