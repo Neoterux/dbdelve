@@ -1800,7 +1800,7 @@ impl Session {
         // The bars a dropped filter prompt was holding go back as Cancel puts
         // them: they were changed before anything could ask, and the filter
         // that ran is the one they have to describe.
-        if let Some(PendingDiscard { tab, then }) = self.pending_discard.take() {
+        if let Some(PendingDiscard { tab, then, .. }) = self.pending_discard.take() {
             self.put_back(tab, then);
         }
         // An action released by a landed send does not follow the user to
@@ -1893,45 +1893,55 @@ pub(crate) enum AfterEdits {
     Sort(usize),
     /// One of a finished queue's statements run again, as `sql`.
     Rerun { index: usize, sql: String },
-    /// Bring this tab forward. Only a Row view's row waits on this: a Draft
-    /// view's draft stays with its tab, so a tab switch asks nothing.
+    /// Bring this tab forward. Only a Row view's row waits on this, sent first
+    /// (or asked about, when the server refused it): a Draft view's draft stays
+    /// with its tab, so a tab switch asks nothing.
     Activate(Tab),
     /// Switch the view's edit mode. Only a Row view's row waits on this, being
-    /// sent before the view becomes a draft.
+    /// sent before the view becomes a draft (or asked about, when the server
+    /// refused it).
     EditMode(EditMode),
 }
 
 impl AfterEdits {
-    /// The prompt's title and its sentence: what the edits are discarded by.
-    pub(crate) fn discards(&self) -> (&'static str, &'static str) {
+    /// The prompt's title, and the act that discards the edits as the subject
+    /// of its sentence.
+    fn leaves(&self) -> (&'static str, &'static str) {
         match self {
-            Self::Close { .. } => (
-                "Close tab",
-                "This tab has cell edits that have not been applied. Closing it discards them.",
-            ),
+            Self::Close { .. } => ("Close tab", "Closing it"),
             Self::Requery { .. }
             | Self::Refresh
             | Self::Filter { .. }
             | Self::ViewSorting(_)
-            | Self::Sort(_) => (
-                "Discard edits",
-                "This tab has cell edits that have not been applied. Reading the rows again \
-                 discards them.",
-            ),
-            Self::Run | Self::Rerun { .. } => (
-                "Discard edits",
-                "This tab has cell edits that have not been applied. Running the statement \
-                 discards them.",
-            ),
-            // Never parked on the prompt: a Row view's row is sent first and a
-            // Draft view is not asked. The sentence is the one a requery gets,
-            // were one ever to reach it.
-            Self::Activate(_) | Self::EditMode(_) => (
-                "Discard edits",
-                "This tab has cell edits that have not been applied. Reading the rows again \
-                 discards them.",
-            ),
+            | Self::Sort(_) => ("Discard edits", "Reading the rows again"),
+            Self::Run | Self::Rerun { .. } => ("Discard edits", "Running the statement"),
+            // Reached only over a row the server refused: any other Row view's
+            // row is sent first, and a Draft view is not asked.
+            Self::Activate(_) => ("Discard edits", "Switching to another tab"),
+            Self::EditMode(_) => ("Discard edits", "Switching the edit mode"),
         }
+    }
+
+    /// The prompt's title and its sentence: what the edits are discarded by.
+    pub(crate) fn discards(&self) -> (&'static str, String) {
+        let (title, act) = self.leaves();
+        (
+            title,
+            format!("This tab has cell edits that have not been applied. {act} discards them."),
+        )
+    }
+
+    /// The same prompt over a row of a Row view the server refused, whose
+    /// edits are all that Discard drops.
+    pub(crate) fn discards_refused_row(&self) -> (&'static str, String) {
+        let (title, act) = self.leaves();
+        (
+            title,
+            format!(
+                "The server refused a row of this tab, so its edits have not been applied. \
+                 {act} discards that row's edits."
+            ),
+        )
     }
 }
 
@@ -1941,6 +1951,10 @@ impl AfterEdits {
 pub(crate) struct PendingDiscard {
     pub(crate) tab: Tab,
     pub(crate) then: AfterEdits,
+    /// The row of a Row view the server refused, when that is what the prompt
+    /// is over: Discard drops its edits and no other row's, which are sent as
+    /// the action meets them. `None` for a draft, all of whose edits go.
+    pub(crate) row: Option<usize>,
 }
 
 /// The question Auto asks while a transaction is open, and whether its list
@@ -5323,13 +5337,15 @@ mod tests {
     fn the_discard_prompt_names_what_discards_the_edits() {
         let close = (
             "Close tab",
-            "This tab has cell edits that have not been applied. Closing it discards them.",
+            "This tab has cell edits that have not been applied. Closing it discards them."
+                .to_string(),
         );
         assert_eq!(AfterEdits::Close { deleting: None }.discards(), close);
         let reading = (
             "Discard edits",
             "This tab has cell edits that have not been applied. Reading the rows again \
-             discards them.",
+             discards them."
+                .to_string(),
         );
         for then in [
             AfterEdits::Requery {
@@ -5348,7 +5364,8 @@ mod tests {
         let running = (
             "Discard edits",
             "This tab has cell edits that have not been applied. Running the statement \
-             discards them.",
+             discards them."
+                .to_string(),
         );
         assert_eq!(AfterEdits::Run.discards(), running);
         assert_eq!(
@@ -5358,6 +5375,25 @@ mod tests {
             }
             .discards(),
             running
+        );
+    }
+
+    #[test]
+    fn the_prompt_over_a_refused_row_says_whose_edits_go_and_what_discards_them() {
+        let refused = |then: AfterEdits| then.discards_refused_row().1;
+        assert_eq!(
+            refused(AfterEdits::Close { deleting: None }),
+            "The server refused a row of this tab, so its edits have not been applied. \
+             Closing it discards that row's edits."
+        );
+        assert!(refused(AfterEdits::Refresh).contains("Reading the rows again discards"));
+        assert!(
+            refused(AfterEdits::Activate(Tab::Query(0)))
+                .contains("Switching to another tab discards")
+        );
+        assert!(
+            refused(AfterEdits::EditMode(EditMode::Draft))
+                .contains("Switching the edit mode discards")
         );
     }
 }
