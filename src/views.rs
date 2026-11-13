@@ -3136,9 +3136,7 @@ pub(crate) fn render_paging(
     preview.map(|_| {
         div()
             .debug_selector(|| "status-paging".into())
-            .flex_shrink(2.)
-            .min_w_0()
-            .overflow_hidden()
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap(px(layout::SPACE_MD))

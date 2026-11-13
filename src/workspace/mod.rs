@@ -2071,16 +2071,28 @@ impl Render for Workspace {
             || structure_copies.is_some()
             || has_pending;
 
-        // How soon each part of the bar gives way when the window is too
-        // narrow for all of it: the larger the factor, the sooner. A group
-        // clips what it holds at its own edge and a part that does not give
-        // way is never narrower than its content, so nothing is painted over
-        // its neighbour. The control that ends a transaction, the Edit chips,
-        // the Uncommitted badge and the staged-edit buttons do not give way
-        // at all, and a bar narrower than those, laid out in that order, is
-        // cut at its right edge: the later one goes first. After them come
-        // the notice at its minimum width, then Sort, then the readouts and
-        // the endpoint, which narrow.
+        // What gives way when the window is too narrow for all of the bar,
+        // in two tiers. A group clips what it holds at its own edge and an
+        // item that does not narrow is never narrower than its content, so
+        // nothing is painted over its neighbour.
+        //
+        // First, three groups narrow, before anything else gives up any
+        // width. Not all of what they hold is a readout: the inline
+        // endpoint, with the reconnect button when the connection failed or
+        // idled; the row-statistics group, with the hidden-columns Show
+        // button and the export progress with its Cancel; and the right-hand
+        // cluster, whose readout goes before its Refresh, Import, Export and
+        // the structure copies. They share the cut in proportion to the
+        // factors below, the larger the sooner.
+        //
+        // Every other item keeps its width, and a bar narrower than those is
+        // cut at its right edge, so the order they are laid out in is the
+        // order they go in: Count, the paging, Sort, the notice at its
+        // minimum, the pending count, Discard and Apply edits, the badge and
+        // the Edit chips, the control that ends the transaction. It is not
+        // done with shrink factors because a proportional factor always
+        // leaves an item a share of the cut: it cannot say that this goes
+        // before that.
         const NOTICE_MIN_WIDTH: f32 = 120.;
         const STATS_SHRINK: f32 = 64.;
         const ACTIONS_SHRINK: f32 = 8.;
@@ -2244,17 +2256,21 @@ impl Render for Workspace {
                     None => div().flex_1().into_any_element(),
                 })
                 // A view preference, so it goes when the bar is full, after
-                // the things above and before the readouts below.
+                // the things above and before the paging and Count.
                 .children(view_sorting.map(|sort| {
                     div()
                         .debug_selector(|| "status-sort".into())
                         .flex_shrink_0()
                         .child(sort)
                 }))
+                // The row limit and pager are controls, not readouts: they
+                // keep their width, so the cut a narrowing group does not
+                // take lands on the bar's edge, not on the arrow of the pager.
                 .children(paging)
                 // A button, not a readout, so it is its own item: a window
                 // narrower than the cluster beside it squeezes the cluster
-                // and leaves this whole.
+                // and leaves this whole. It is the last to be laid out, so
+                // the first the bar's edge cuts.
                 .children(count_control)
                 // One right-hand cluster, against the edge.
                 //
@@ -2263,17 +2279,19 @@ impl Render for Workspace {
                 // see `apply_edits` for its `cmd+s` binding.
                 //
                 // Its box clips, and it is aligned to the end, so a window
-                // too narrow for it loses the readout and Import first and
-                // keeps the controls at the edge.
+                // too narrow for it loses the readout and then Import first
+                // and keeps the controls at the edge.
                 //
                 // ponytail: below the width of the transaction control, the
-                // Edit chips, the badge, the staged-edit buttons and the
-                // notice's minimum (about 980px with all of them showing),
-                // the bar is cut at its right edge and what is there is out
-                // of reach: Sort and Count first, the staged-edit buttons
-                // when the transaction is open at 700px. The upgrade is an
-                // overflow menu for the cluster, and for the transaction
-                // control's own Auto and Manual switch.
+                // Edit chips, the badge, the staged-edit buttons, the pending
+                // count and the notice's minimum (about 980px with all of
+                // them showing, plus the count's own width), the bar is cut
+                // at its right edge and what is there is out of reach: Count,
+                // the paging and Sort first, then the notice, then the
+                // pending count, and the staged-edit buttons only when the
+                // transaction is open at 700px. The upgrade is an overflow
+                // menu for the cluster, and for the transaction control's
+                // own Auto and Manual switch.
                 .child(
                     div()
                         .debug_selector(|| "status-actions".into())
