@@ -3262,6 +3262,7 @@ impl Workspace {
                         .children(error.map(|message| {
                             div()
                                 .id("apply-review-error")
+                                .debug_selector(|| "apply-review-error".into())
                                 .max_h(px(layout::DIALOG_TEXT_MAX_HEIGHT))
                                 .overflow_y_scroll()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
