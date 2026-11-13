@@ -16543,14 +16543,12 @@ fn an_edit_is_refused_while_a_transaction_is_open_on_its_databases_session(
         // A second tab bound to `other` shares the session the BEGIN is on:
         // an edit applied there would join a transaction nothing shows.
         new_query_here(&workspace, cx, Some("other"), None);
-        match apply_insert_from_the_front_tab(&workspace, cx) {
-            QueryState::Failed(error) => assert!(
-                error.message.contains("Not sent") && error.message.contains("transaction"),
-                "{}",
-                error.message
-            ),
-            _ => panic!("an edit must not join another tab's open transaction"),
-        }
+        apply_insert_from_the_front_tab(&workspace, cx);
+        let message = edit_notice(&workspace, cx);
+        assert!(
+            message.contains("Not sent") && message.contains("transaction"),
+            "an edit must not join another tab's open transaction: {message}"
+        );
 
         // Ending it from either tab frees the session, and nothing was written.
         run_in_front(&workspace, cx, "ROLLBACK");
@@ -19728,14 +19726,11 @@ fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
         let listed = open_transaction_statements(&workspace, cx);
 
         apply_from_the_front_tab(&workspace, cx, batch);
-        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
-            QueryState::Failed(error) => assert_eq!(
-                error.message,
-                "Not sent: a transaction is open on this connection, and the batch of edits \
-                 would end it with a COMMIT of its own."
-            ),
-            _ => panic!("the batch was not refused"),
-        });
+        assert_eq!(
+            edit_notice(&workspace, cx),
+            "Not sent: a transaction is open on this connection, and the batch of edits \
+             would end it with a COMMIT of its own."
+        );
         let (auto_commit_now, open_now, _) = transaction_state(&workspace, cx);
         assert_eq!(
             (
@@ -19780,14 +19775,11 @@ fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
             cx,
             "INSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);",
         );
-        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
-            QueryState::Failed(error) => assert_eq!(
-                error.message,
-                "Not sent: no transaction is open on this connection, and the batch of edits \
-                 was written to join one."
-            ),
-            _ => panic!("the batch was not refused"),
-        });
+        assert_eq!(
+            edit_notice(&workspace, cx),
+            "Not sent: no transaction is open on this connection, and the batch of edits \
+             was written to join one."
+        );
         run_in_front(&workspace, cx, "SELECT count(*) FROM t");
         assert_eq!(answer(&workspace, cx).as_deref(), Some("0"), "no row ran");
 
@@ -19819,17 +19811,14 @@ fn a_joined_batch_that_fails_part_way_says_its_earlier_rows_stay_in_the_open_tra
             cx,
             "INSERT INTO birds VALUES (2, 'tit');\nINSERT INTO birds VALUES (2, 'jay');",
         );
-        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
-            QueryState::Failed(error) => assert!(
-                error.message.ends_with(
-                    "Rows of the batch before the failed one were applied inside the open \
-                     transaction and stay in it, to be committed or rolled back with it."
-                ),
-                "{}",
-                error.message
+        let message = edit_notice(&workspace, cx);
+        assert!(
+            message.ends_with(
+                "Rows of the batch before the failed one were applied inside the open \
+                 transaction and stay in it, to be committed or rolled back with it."
             ),
-            _ => panic!("the second row was not refused by the table"),
-        });
+            "{message}"
+        );
         run_in_front(&workspace, cx, "SELECT count(*) FROM birds");
         assert_eq!(
             answer(&workspace, cx).as_deref(),
@@ -22015,6 +22004,186 @@ fn an_edit_staged_while_an_apply_is_in_flight_stays_staged(cx: &mut TestAppConte
             assert_eq!(grid.pending_count(), 0);
             assert_eq!(grid.cell(0, 1), Some("finch"));
             assert_eq!(grid.cell(1, 1), Some("jay"), "the re-read ran");
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// The notice the session holds for a tab, whichever tab is in front.
+fn tab_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<(Tab, String)> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().session.tab_notice.clone()
+    })
+}
+
+/// What a failed or refused edit send said about the tab in front, which it
+/// leaves as it was rather than in an error.
+fn edit_notice(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+    assert!(
+        !matches!(front_state(workspace, cx), QueryState::Failed(_)),
+        "an error pane would cover the rows the edits are staged on"
+    );
+    let front = workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().session.active
+    });
+    match tab_notice(workspace, cx) {
+        Some((tab, message)) if tab == front => message,
+        other => panic!("the failure was not said for the tab in front: {other:?}"),
+    }
+}
+
+#[gpui::test]
+fn a_failed_apply_from_a_query_tab_keeps_the_draft(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let tab = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.active
+        });
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        grid.update(cx, |grid, _| {
+            // A NULL into a NOT NULL column, which the table refuses.
+            assert!(grid.delegate_mut().set_pending(0, 1, NewValue::Null));
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(grid.delegate().pending_count(), 1);
+        });
+        assert!(
+            matches!(front_state(&workspace, cx), QueryState::Complete { .. }),
+            "the tab is as it was, not an error pane over the rows"
+        );
+        let (noticed, message) = tab_notice(&workspace, cx).expect("the failure is said");
+        assert_eq!(noticed, tab);
+        assert!(message.contains("NOT NULL"), "{message}");
+        assert!(
+            buffer(&workspace, cx).contains("UPDATE"),
+            "{}",
+            buffer(&workspace, cx)
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refused_apply_keeps_the_draft(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = workspace.read_with(cx, |workspace, _| {
+            workspace.profile().unwrap().session.active
+        });
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            for (row, name) in [(0, "robin"), (1, "jay")] {
+                assert!(
+                    grid.delegate_mut()
+                        .set_pending(row, 1, NewValue::Value(name.into()))
+                );
+            }
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert!(
+            front_review(&workspace, cx).is_some(),
+            "the batch is in review"
+        );
+
+        // A transaction opened after the batch was written for none: sent, its
+        // brackets would end it.
+        let bring_forward = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, tab| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_tab(tab, window, cx)
+            });
+            settle(cx);
+        };
+        bring_forward(&workspace, cx, query);
+        run_in_front(&workspace, cx, "BEGIN");
+        bring_forward(&workspace, cx, Tab::Object(id));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        let (_, _, error) = front_review(&workspace, cx).expect("the review stays");
+        let error = error.expect("the refusal is said in the review");
+        assert!(error.starts_with("Not sent:"), "{error}");
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(grid.delegate().pending_count(), 2);
+        });
+        assert!(!matches!(
+            front_state(&workspace, cx),
+            QueryState::Failed(_)
+        ));
+        assert!(
+            profile_flags(&workspace, cx).0,
+            "the transaction is still open"
+        );
+
+        bring_forward(&workspace, cx, query);
+        run_in_front(&workspace, cx, "ROLLBACK");
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 2));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_reviewed_delete_leaves_other_rows_edits_staged(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(
+                grid.delegate_mut()
+                    .set_pending(0, 1, NewValue::Value("robin".into()))
+            );
+            grid.delegate_mut().select_row(1);
+        });
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("1"),
+            "row 2 is gone"
+        );
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(
+                grid.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("robin".into())),
+                "the other row's edit is not the delete's to drop"
+            );
+            assert_eq!(grid.delegate().pending_count(), 1);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.profile().unwrap().session.shown_notice(),
+                Some("The change was applied. The rows were not read again: this tab has unapplied edits.")
+            );
         });
         quit(workspace, cx);
     });
