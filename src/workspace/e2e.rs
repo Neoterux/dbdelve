@@ -22588,6 +22588,83 @@ fn draft_to_row_is_refused_while_the_draft_holds_edits(cx: &mut TestAppContext) 
     });
 }
 
+/// The edit mode `views::view_edit_mode` answers for the tab in front.
+fn front_edit_mode(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::session::EditMode> {
+    workspace.read_with(cx, |workspace, _| {
+        crate::views::view_edit_mode(workspace.profile().unwrap())
+    })
+}
+
+#[gpui::test]
+fn the_status_bar_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query_tab = workspace.read_with(cx, |workspace, _| {
+            Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+        });
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let chips = ["edit-mode-draft", "edit-mode-row"];
+        assert_eq!(drawn(cx, &chips), [true, true]);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        assert_eq!(front_review(&workspace, cx), None, "no dialog");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin"),
+            "the chip's choice reaches the send"
+        );
+
+        // The mode the view already has: nothing changes and nothing is said.
+        workspace.update(cx, |workspace, _| workspace.clear_notice());
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        click_selector(cx, "edit-mode-draft");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+
+        // A draft is never sent by switching: the Row chip refuses and says so.
+        stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("owl".into()));
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 2));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("tit")
+        );
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The draft has 2 edits, so the view was not switched to Row mode.")
+        );
+
+        // A query tab has no rows to choose a mode for.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_tab(query_tab, window, cx)
+            });
+        });
+        settle(cx);
+        assert_eq!(drawn(cx, &chips), [false, false]);
+        assert_eq!(front_edit_mode(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn delete_row_and_new_row_keep_their_review_and_form_in_a_row_view(cx: &mut TestAppContext) {
     use crate::session::EditMode;
