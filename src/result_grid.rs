@@ -300,6 +300,10 @@ pub struct ResultGrid {
     /// The one cell showing an input, if any. At most one: an input is a far
     /// heavier thing to draw than the text every other cell paints.
     editing: Option<Editing>,
+    /// The row the ring last left while it held edits, until the workspace takes
+    /// it ([`Self::take_left_row`]). The grid does not know the view's edit mode,
+    /// so it only records.
+    left_row: Option<usize>,
     /// When these rows were snapshotted, for a grid that came off disk.
     ///
     /// Held here rather than on the tab because a completed run replaces the
@@ -539,6 +543,7 @@ impl ResultGrid {
             painted_x: Pixels::ZERO,
             pending: Vec::new(),
             editing: None,
+            left_row: None,
             captured: None,
             streamed: None,
             filled: None,
@@ -1786,6 +1791,12 @@ impl ResultGrid {
             self.editing = None;
         }
         self.active = Some((row, col));
+    }
+
+    /// The row the ring left while it held edits, once: what the workspace asks
+    /// after a ring move to decide whether a Row view sends it.
+    pub(crate) fn take_left_row(&mut self) -> Option<usize> {
+        self.left_row.take()
     }
 
     /// `sort_in_memory` for rows a snapshot restored already in `keys`' order.
@@ -3933,6 +3944,52 @@ mod tests {
             },
             Mode::ReadWrite,
         )
+    }
+
+    #[test]
+    fn the_ring_leaving_a_row_with_edits_is_marked_once() {
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("7".into()), Some("first".into())],
+                    vec![Some("8".into()), Some("second".into())],
+                    vec![Some("9".into()), Some("third".into())],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("body".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        grid.select_row(0);
+        assert!(grid.set_pending(0, 1, NewValue::Value("edited".into())));
+
+        // A column move on one row leaves nothing behind.
+        grid.select_col(1);
+        assert_eq!(grid.take_left_row(), None);
+
+        grid.select_row(1);
+        assert_eq!(grid.take_left_row(), Some(0));
+        assert_eq!(grid.take_left_row(), None, "taken once");
+
+        // Row 1 holds no edit, so leaving it marks nothing.
+        grid.select_row(2);
+        assert_eq!(grid.take_left_row(), None);
+
+        // A mark waiting for the workspace is not overwritten by a later move.
+        grid.select_row(0);
+        assert!(grid.set_pending(0, 1, NewValue::Value("again".into())));
+        assert!(grid.set_pending(1, 1, NewValue::Value("also".into())));
+        grid.select_row(1);
+        grid.select_row(2);
+        assert_eq!(grid.take_left_row(), Some(0));
+        assert_eq!(grid.take_left_row(), None);
     }
 
     /// A grid whose columns have been told what the relation's structure says

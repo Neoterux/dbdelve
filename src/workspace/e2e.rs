@@ -22915,3 +22915,231 @@ fn a_row_save_does_not_send_over_an_open_review(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+const THREE_BIRDS: &str = "create table birds (id integer primary key, name text not null, n integer); \
+     insert into birds values (1, 'wren', 1), (2, 'tit', 2), (3, 'kite', 3);";
+
+/// The grid has the keyboard, as it does once a tab opens or a cell's input
+/// closes.
+fn focus_grid(grid: &Grid, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        use gpui::Focusable;
+        grid.focus_handle(cx).focus(window, cx)
+    });
+    settle(cx);
+}
+
+/// Puts the ring on a cell as a pointer would reach it from the library's side:
+/// the row through the table's own selection, the column through the grid.
+fn ring_on(grid: &Grid, cx: &mut VisualTestContext, row: usize, col: usize) {
+    grid.update(cx, |table, cx| table.set_selected_row(row, cx));
+    grid.update(cx, |table, _| table.delegate_mut().select_col(col));
+    settle(cx);
+}
+
+fn ring_of(grid: &Grid, cx: &mut VisualTestContext) -> Option<(usize, usize)> {
+    grid.read_with(cx, |grid, _| grid.delegate().active())
+}
+
+fn pending_of(grid: &Grid, cx: &mut VisualTestContext) -> usize {
+    grid.read_with(cx, |grid, _| grid.delegate().pending_count())
+}
+
+fn state_kind(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> &'static str {
+    match front_state(workspace, cx) {
+        QueryState::Idle => "idle",
+        QueryState::Running { .. } => "running",
+        QueryState::Complete { .. } => "complete",
+        QueryState::Failed(_) => "failed",
+        QueryState::Explained { .. } => "explained",
+    }
+}
+
+#[gpui::test]
+fn leaving_an_edited_row_sends_its_update(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        // An edit typed into the cell, carried down with the arrow.
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+        press(cx, "down");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(ring_of(&grid, cx), Some((1, 1)));
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("robin"));
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(front_review(&workspace, cx), None, "no dialog");
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert!(profile.session.history[0].sql.starts_with("UPDATE"));
+        });
+
+        // A staged edit, left by the arrow on the grid. The input the carried
+        // edit opened on row 1 is put away first.
+        press(cx, "escape");
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        press(cx, "down");
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(ring_of(&grid, cx), Some((2, 1)));
+
+        // A staged edit, left by the pointer.
+        stage(&grid, cx, 2, 1, NewValue::Value("owl".into()));
+        grid.update(cx, |table, cx| table.set_selected_row(0, cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("owl")
+        );
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(0));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn draft_mode_sends_nothing_when_the_row_is_left(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        assert_eq!(
+            edit_mode_of(&workspace, cx, id),
+            crate::session::EditMode::Draft
+        );
+        let grid = relation_grid(&workspace, cx, id);
+        let before = state_kind(&workspace, cx);
+
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        press(cx, "down");
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
+        grid.update(cx, |table, cx| table.set_selected_row(2, cx));
+        settle(cx);
+        grid.update(cx, |table, cx| table.set_selected_row(0, cx));
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(shown_notice(&workspace, cx), None);
+        assert_eq!(state_kind(&workspace, cx), before);
+        assert_eq!(history_sql(&workspace, cx).len(), 0);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn moving_within_a_row_sends_nothing(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+
+        for key in ["right", "tab", "left"] {
+            press(cx, key);
+            assert_eq!(
+                ring_of(&grid, cx).map(|(row, _)| row),
+                Some(0),
+                "{key} stays on the row"
+            );
+            assert_eq!(
+                on_disk("select name from birds where id = 1").as_deref(),
+                Some("wren"),
+                "{key} sent the row"
+            );
+            assert_eq!(pending_of(&grid, cx), 1, "{key}");
+        }
+
+        // An input committed with the value it was opened on stages nothing, so
+        // the row it leaves is not sent.
+        grid.update(cx, |table, _| table.delegate_mut().discard_pending());
+        ring_on(&grid, cx, 1, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        press(cx, "enter");
+        assert_eq!(pending_of(&grid, cx), 0);
+        press(cx, "down");
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(2));
+        assert_eq!(history_sql(&workspace, cx).len(), 0);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("tit")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn scrolling_and_window_blur_send_nothing(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let schema = "create table birds (id integer primary key, name text not null, n integer); \
+             with recursive s(i) as (select 1 union all select i + 1 from s where i < 60) \
+             insert into birds select i, 'bird' || i, i from s;";
+        let (workspace, cx) = launch_on_sqlite_holding(cx, schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let history = history_sql(&workspace, cx);
+
+        let over = cx
+            .debug_bounds("row-number-3")
+            .expect("a row of the grid is drawn")
+            .center();
+        let offset = |grid: &Grid, cx: &mut VisualTestContext| {
+            grid.read_with(cx, |table, _| {
+                table
+                    .vertical_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y
+            })
+        };
+        let top = offset(&grid, cx);
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: over,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-600.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        settle(cx);
+        assert!(offset(&grid, cx) < top, "the wheel did not scroll the grid");
+        cx.deactivate_window();
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("bird1")
+        );
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)));
+        assert_eq!(history_sql(&workspace, cx), history);
+        assert_eq!(shown_notice(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
