@@ -724,9 +724,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   from the status bar chips or the palette, starts from the Default edit mode
   setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
   this that is persisted), and is offered only where `Target::row_edits()`
-  holds (`EditMode::on`): Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB and
-  SQL Server. A Snowflake table has no control, for the reason in the next
-  bullet. Draft is never turned into Row sends by a switch: Draft to Row is
+  holds (`EditMode::on`): Postgres, MySQL, MariaDB, SQLite, DuckDB and
+  SQL Server. A Snowflake or Turso table has no control, for the reason in the
+  next bullet. Draft is never turned into Row sends by a switch: Draft to Row is
   refused while the grid holds edits, so a multi-row draft is not sent
   unreviewed one row at a time (`Workspace::set_edit_mode`).
 
@@ -776,11 +776,12 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   carried the draft), and re-reads; when edits remain (an Insert or Delete over
   a draft, an edit staged while the batch was in flight) it keeps them and does
   not re-read. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
-  a plugin, Snowflake) an edit send clears the grid as it starts and a failure
+  a plugin, Snowflake, Turso) an edit send clears the grid as it starts and a failure
   is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
-  Snowflake is out of the Row-mode set (no Draft or Row control on its tables)
-  because its results are never editable: its keys are not enforced.
+  Snowflake and Turso are out of the Row-mode set (no Draft or Row control on
+  their tables) because their results are never editable: Snowflake's keys are
+  not enforced, and Turso's driver names no column's table.
 - **A requery over a draft asks first.** An action that would replace a grid's
   rows over cell edits nobody has applied asks Discard / Cancel and does
   nothing until answered. `Workspace::held_for_edits` is the one guard,

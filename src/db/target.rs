@@ -216,10 +216,12 @@ impl Target {
         // one-row guard is not in the statement text, so a batch there is not
         // one the draft can be kept behind. Snowflake's keys are declared and
         // not enforced, so no result of it is editable (`QueryResult::edit` is
-        // always `None`) and there is no row for Row mode to send.
+        // always `None`) and there is no row for Row mode to send. Turso's
+        // driver names no column's table (`docs/agents/engines.md`), so none of
+        // its results is editable either.
         matches!(self.driver, Driver::BuiltIn)
             && self.engine.syntax() == Syntax::Sql
-            && self.engine != Engine::Snowflake
+            && !matches!(self.engine, Engine::Snowflake | Engine::Turso)
             && self.edits_rows()
             && !self.reviews_query_edits()
     }
