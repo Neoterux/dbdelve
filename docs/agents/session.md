@@ -717,6 +717,53 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   must not reach the server unasked. Rows are reordered in place rather than
   through a display permutation, so every row index in the grid names the row
   on screen; pending edits move with their rows.
+- **A view's edit mode is its own (`session::EditMode`).** `Draft` holds every
+  edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
+  row is left or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
+  send still passes). It lives on a relation tab beside `sorting`, is switched
+  from the status bar chips or the palette, starts from the Default edit mode
+  setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
+  this that is persisted), and is offered only where `Target::row_edits()`
+  holds (`EditMode::on`): Postgres, MySQL, MariaDB, SQLite, Turso, DuckDB and
+  SQL Server. A Snowflake table has no control, for the reason in the next
+  bullet. Draft is never turned into Row sends by a switch: Draft to Row is
+  refused while the grid holds edits, so a multi-row draft is not sent
+  unreviewed one row at a time (`Workspace::set_edit_mode`).
+
+  The one writer of a Row send is `Workspace::save_row`; Save and the funnel
+  are its callers. The funnel is `ResultGrid::take_left_row`, which marks the
+  row the ring leaves while it holds edits or an input, and
+  `Workspace::flush_left_row`, which consumes the mark in the grid's selection
+  events and sends only in a Row view. The send is `Refresh::Row`: it writes
+  the `UPDATE` and, in the same background task, reads the row back by its key
+  (`sql::row_read`). The landing replaces that row where it stands
+  (`ResultGrid::replace_row`) and clears the cells that were sent
+  (`clear_sent`), so a cell staged while the send was out stays staged. A
+  vanished or unreadable row reads the table again instead. A send is refused
+  while a review covers the tab, and a tab sends one row at a time.
+
+  A refused send (the server's, the gate's, or a mode that stopped it) never
+  sets `Failed`. The row keeps its edits and is marked with the message
+  (`ResultGrid::send_failure`, drawn on its number), the ring goes back to it
+  (`result_grid::snap_back`) unless the user has moved on, and Esc puts the row
+  back as fetched (`Workspace::revert_active_row`).
+
+  Every action that would replace or leave the rows saves the dirty row first
+  and goes ahead only when that save lands: a page turn, row limit, sort,
+  filter, refresh, tab switch, tab close, a switch to Draft. This is
+  `Workspace::held_for_edits`' Row branch, so a Row view never meets the
+  discard prompt the next bullets describe. The action travels with the send as
+  data (`Refresh::Row::then`, an `AfterEdits`) and is released by the landing
+  into `Session::resume_after`, which render drains through
+  `Workspace::resume_parked`; only a write that landed releases it, and any
+  other outcome drops it and restores what the action had already changed
+  (`Workspace::put_back`). A Row write inside the open transaction is shown as
+  uncommitted (see that bullet).
+
+  An `UPDATE` matches on the key alone, in both modes. A row changed on the
+  server since it was fetched is overwritten, and nothing detects it: a stale
+  edit (`StaleEdit`) is not drift detection. Verifying that the row is as it was
+  fetched is left to Phase 10.2.
 - **An edit send keeps the grid, on a transactional SQL engine.** Where the
   target answers `Target::row_edits()`, a statement dbdelve sends for a grid
   edit (an Apply edits batch, an Insert, a Delete row) leaves the rows, the
