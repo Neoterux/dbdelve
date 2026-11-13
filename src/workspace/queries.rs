@@ -358,6 +358,11 @@ impl Workspace {
         let Some(editor) = profile.session.editor(tab) else {
             return;
         };
+        // Before the tab is touched: a Run over edits nobody applied replaces
+        // them, and Cancel has to leave the tab as it was.
+        if self.held_for_edits(tab, AfterEdits::Run, cx) {
+            return;
+        }
         // Here and not where each statement goes out, which a queue does once
         // per statement: someone reading its messages stays on them while the
         // rest arrive.
@@ -627,6 +632,13 @@ impl Workspace {
         let Tab::Query(id) = tab else {
             return false;
         };
+        let rerun = AfterEdits::Rerun {
+            index,
+            sql: sql.clone(),
+        };
+        if self.held_for_edits(tab, rerun, cx) {
+            return false;
+        }
         let Some(profile) = self.profile_mut() else {
             return false;
         };
@@ -2017,6 +2029,26 @@ impl Workspace {
         explain: Option<ExplainMode>,
         cx: &mut Context<Self>,
     ) {
+        // ponytail: the entry points are the guard (`held_for_edits`), because
+        // this runs after a sort has rewritten the buffer. This exists so a
+        // path nobody guarded costs a notice rather than a draft; the upgrade
+        // is to delete it once every caller is proven guarded.
+        if refresh.is_none()
+            && explain.is_none()
+            && self
+                .profile()
+                .and_then(|profile| profile.session.results(tab))
+                .is_some_and(|grid| grid.read(cx).delegate().has_pending())
+        {
+            if let Some(profile) = self.profile_mut() {
+                profile.session.tab_notice = Some((
+                    tab,
+                    "The statement was not run: this tab has unapplied edits.".into(),
+                ));
+            }
+            cx.notify();
+            return;
+        }
         // An idle-closed profile stays in front with its tabs (the idle
         // timer), so its next run is its reconnect: parked until the connect
         // lands, where `run_waiting_files` hands it back to `execute_sql` and

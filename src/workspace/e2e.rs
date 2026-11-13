@@ -24220,3 +24220,40 @@ fn lowering_to_read_only_keeps_the_draft_and_an_apply_raises_the_mode_prompt(
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_stale_tab_with_edits_is_not_reloaded_on_a_visit(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        workspace.update(cx, |workspace, _| {
+            let tab = workspace
+                .profile_mut()
+                .unwrap()
+                .session
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .unwrap();
+            let ObjectBody::Relation { stale, .. } = &mut tab.body else {
+                panic!("a relation tab");
+            };
+            *stale = true;
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_tab(Tab::Object(id), window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None, "no prompt");
+        assert!(discard_holds(&workspace, cx).is_none());
+        assert!(relation_view(&workspace, cx, id).4, "still owed its reload");
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("wren"));
+        quit(workspace, cx);
+    });
+}

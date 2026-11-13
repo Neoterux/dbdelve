@@ -1377,13 +1377,22 @@ impl Workspace {
                     );
                 }
             }
-            // Filled in with their guards.
-            AfterEdits::Refresh
-            | AfterEdits::Filter { .. }
-            | AfterEdits::ViewSorting(_)
-            | AfterEdits::Run
-            | AfterEdits::Sort(_)
-            | AfterEdits::Rerun { .. } => {}
+            AfterEdits::Refresh => {
+                if let Tab::Object(id) = tab {
+                    self.refresh_relation(id, cx);
+                }
+            }
+            AfterEdits::Filter { .. } => {
+                if let Tab::Object(id) = tab {
+                    self.apply_filter(id, None, cx);
+                }
+            }
+            AfterEdits::ViewSorting(client) => self.set_view_sorting(client, window, cx),
+            AfterEdits::Run => self.run_query(&RunQuery, window, cx),
+            AfterEdits::Sort(column) => self.sort_column(&SortColumn { column }, window, cx),
+            AfterEdits::Rerun { index, sql } => {
+                self.rerun_queued(tab, index, sql, cx);
+            }
         }
     }
 
