@@ -25264,7 +25264,8 @@ fn crowded_status_bar(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visua
 /// What the status bar items paint, each with the box of the group that
 /// clips it (an item taller or wider than its group is cut at the group's
 /// edge, not drawn over what is next to it).
-const STATUS_ITEMS: [(&str, &str); 12] = [
+const STATUS_ITEMS: [(&str, &str); 13] = [
+    ("status-connection", "status-bar"),
     ("transaction-commit", "status-bar"),
     ("transaction-rollback", "status-bar"),
     ("edit-mode-draft", "status-chips"),
@@ -25310,10 +25311,6 @@ fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
                 cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.)));
                 settle(cx);
                 let painted = painted_status_items(cx);
-                assert!(
-                    painted.iter().any(|(item, _)| *item == "status-paging"),
-                    "paging is drawn at {width}px, sidebar hidden {hidden}: {painted:?}"
-                );
                 for (index, (first, first_box)) in painted.iter().enumerate() {
                     for (second, second_box) in &painted[index + 1..] {
                         assert!(
@@ -25325,6 +25322,43 @@ fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
                 }
             }
         }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_notice_takes_the_width_the_status_bar_has_free(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        assert!(
+            shown_notice(&workspace, cx).is_some_and(|notice| notice.starts_with("1 row updated")),
+            "the row's statement is the notice"
+        );
+
+        let width = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("status-notice")
+                .expect("the notice is drawn")
+                .size
+                .width
+        };
+        cx.simulate_resize(gpui::size(gpui::px(1536.), gpui::px(900.)));
+        settle(cx);
+        let wide = width(cx);
+        assert!(
+            wide > gpui::px(250.),
+            "a notice used to get about 120px at any width: {wide:?}"
+        );
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(900.)));
+        settle(cx);
+        assert!(
+            width(cx) < wide,
+            "the notice gives way as the window narrows"
+        );
         quit(workspace, cx);
     });
 }

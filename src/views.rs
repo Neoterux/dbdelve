@@ -2968,7 +2968,7 @@ fn relation_preview(session: &Session) -> Option<(Option<usize>, usize, bool)> {
     })
 }
 
-/// A run in flight, centred in the status bar in place of the pager: how long
+/// A run in flight, in the status bar in place of the pager: how long
 /// it has taken, the rows that have streamed in so far, and the way to stop it.
 pub(crate) fn render_running(
     query: &QueryState,
@@ -3044,7 +3044,7 @@ pub(crate) fn render_running(
     )
 }
 
-/// The preview's row limit and pager, centred in the status bar: what the
+/// The preview's row limit and pager, in the status bar: what the
 /// relation's rows were asked for, and the way to the ones after them. `None`
 /// where there are no rows to page.
 pub(crate) fn render_paging(
@@ -3135,7 +3135,9 @@ pub(crate) fn render_paging(
     preview.map(|_| {
         div()
             .debug_selector(|| "status-paging".into())
-            .flex_shrink_0()
+            .flex_shrink(2.)
+            .min_w_0()
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(layout::SPACE_MD))
