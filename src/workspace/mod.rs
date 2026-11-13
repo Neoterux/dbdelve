@@ -2084,7 +2084,6 @@ impl Render for Workspace {
         const NOTICE_MIN_WIDTH: f32 = 120.;
         const STATS_SHRINK: f32 = 64.;
         const ACTIONS_SHRINK: f32 = 8.;
-        const PENDING_COUNT_SHRINK: f32 = 16.;
         let results_status = bar_has_content.then(|| {
             div()
                 .debug_selector(|| "status-bar".into())
@@ -2115,62 +2114,13 @@ impl Render for Workspace {
                 // The staged edits, right behind the control that ends the
                 // transaction and the chips that say what a keystroke will do
                 // to the database: past the bar's edge only after those are.
-                // Their count and arrows give way first, as a readout does,
-                // and their buttons never narrow. A tinted cell scrolled out
-                // of view is an edit nobody knows is about to be written.
-                .children(has_pending.then(|| {
-                    div()
-                        .debug_selector(|| "status-pending-count".into())
-                        .flex_shrink(PENDING_COUNT_SHRINK)
-                        .min_w_0()
-                        .overflow_hidden()
-                        .flex()
-                        .items_center()
-                        .child(
-                            icon_button(
-                                "previous-edit",
-                                icon::CHEVRON_LEFT,
-                                Tone::Quiet,
-                                Control::Compact,
-                                t,
-                            )
-                            .debug_selector(|| "previous-edit".into())
-                            .tooltip("Previous edit")
-                            .on_click(move |_, window, cx| {
-                                _ = previous_workspace.update(cx, |workspace, cx| {
-                                    workspace.previous_edit(&PreviousEdit, window, cx);
-                                });
-                            }),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(t.text_muted)
-                                .child(format!(
-                                    "{pending_count} pending {}",
-                                    if pending_count == 1 { "edit" } else { "edits" }
-                                )),
-                        )
-                        .child(
-                            icon_button(
-                                "next-edit",
-                                icon::CHEVRON_RIGHT,
-                                Tone::Quiet,
-                                Control::Compact,
-                                t,
-                            )
-                            .debug_selector(|| "next-edit".into())
-                            .tooltip("Next edit")
-                            .on_click(move |_, window, cx| {
-                                _ = next_workspace.update(cx, |workspace, cx| {
-                                    workspace.next_edit(&NextEdit, window, cx);
-                                });
-                            }),
-                        )
-                }))
+                // Their buttons never narrow, and the count of the edits about
+                // to be written is not a readout, so it keeps its width too. It
+                // sits behind the buttons, so where the bar is too narrow for
+                // all three its edge reaches the count before the buttons that
+                // apply or drop the edits. Its arrows stay with it. A tinted
+                // cell scrolled out of view is an edit nobody knows is about
+                // to be written.
                 .children(has_pending.then(|| {
                     div()
                         .debug_selector(|| "status-pending".into())
@@ -2199,6 +2149,54 @@ impl Render for Workspace {
                             .on_click(move |_, window, cx| {
                                 _ = apply_workspace.update(cx, |workspace, cx| {
                                     workspace.apply_edits(&ApplyEdits, window, cx);
+                                });
+                            }),
+                        )
+                }))
+                .children(has_pending.then(|| {
+                    div()
+                        .debug_selector(|| "status-pending-count".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(
+                            icon_button(
+                                "previous-edit",
+                                icon::CHEVRON_LEFT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "previous-edit".into())
+                            .tooltip("Previous edit")
+                            .on_click(move |_, window, cx| {
+                                _ = previous_workspace.update(cx, |workspace, cx| {
+                                    workspace.previous_edit(&PreviousEdit, window, cx);
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(t.text_muted)
+                                .child(format!(
+                                    "{pending_count} pending {}",
+                                    if pending_count == 1 { "edit" } else { "edits" }
+                                )),
+                        )
+                        .child(
+                            icon_button(
+                                "next-edit",
+                                icon::CHEVRON_RIGHT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "next-edit".into())
+                            .tooltip("Next edit")
+                            .on_click(move |_, window, cx| {
+                                _ = next_workspace.update(cx, |workspace, cx| {
+                                    workspace.next_edit(&NextEdit, window, cx);
                                 });
                             }),
                         )
