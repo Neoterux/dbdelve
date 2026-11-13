@@ -22632,3 +22632,45 @@ fn delete_row_and_new_row_keep_their_review_and_form_in_a_row_view(cx: &mut Test
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_row_save_does_not_send_over_an_open_review(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
+            })
+        });
+        settle(cx);
+
+        // Nothing went to the server, the review is not given an `UPDATE`'s
+        // outcome and the edit stays.
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 1));
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The row was not sent: a statement is waiting in review.")
+        );
+        quit(workspace, cx);
+    });
+}
