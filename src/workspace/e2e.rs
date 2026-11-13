@@ -23143,3 +23143,322 @@ fn scrolling_and_window_blur_send_nothing(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// The refusal a `NOT NULL` column gives a staged `NULL`, which the server
+/// sends back whole.
+fn refused_row(grid: &Grid, cx: &mut VisualTestContext) -> Option<(usize, String)> {
+    grid.read_with(cx, |grid, _| {
+        grid.delegate()
+            .send_failure()
+            .map(|(row, message)| (row, message.to_string()))
+    })
+}
+
+#[gpui::test]
+fn a_failed_row_send_keeps_the_cursor_and_the_edits(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        press(cx, "down");
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)), "the ring is back");
+        assert_eq!(pending_of(&grid, cx), 1, "the edit is still staged");
+        let (row, message) = refused_row(&grid, cx).expect("the row is marked");
+        assert_eq!(row, 0);
+        assert!(message.contains("NOT NULL"), "{message}");
+        let notice = shown_notice(&workspace, cx).expect("the status line says why");
+        assert!(notice.contains("NOT NULL"), "{notice}");
+        assert_ne!(state_kind(&workspace, cx), "failed");
+
+        // Fixed, the row goes, and the mark with it.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        assert_eq!(refused_row(&grid, cx), None, "editing the row clears it");
+        press(cx, "down");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_failed_row_send_does_not_pull_the_cursor_back_from_a_later_row(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+
+        // On to row 2 before the refusal comes back.
+        grid.update(cx, |table, cx| table.set_selected_row(1, cx));
+        grid.update(cx, |table, cx| table.set_selected_row(2, cx));
+        settle(cx);
+
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(2));
+        assert_eq!(pending_of(&grid, cx), 1);
+        let (row, message) = refused_row(&grid, cx).expect("the row is still marked");
+        assert_eq!(row, 0);
+        assert!(message.contains("NOT NULL"), "{message}");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn escape_reverts_the_dirty_row(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        press(cx, "down");
+        assert!(refused_row(&grid, cx).is_some());
+        stage(&grid, cx, 2, 1, NewValue::Value("owl".into()));
+        assert_eq!(pending_of(&grid, cx), 2);
+
+        press(cx, "escape");
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(pending_of(&grid, cx), 1, "row 2's edit stays");
+        grid.read_with(cx, |grid, _| {
+            assert!(!grid.delegate().row_has_pending(0));
+            assert!(grid.delegate().row_has_pending(2));
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(0));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn escape_reverts_nothing_in_a_draft_view(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        press(cx, "escape");
+        assert_eq!(pending_of(&grid, cx), 1);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_under_read_only_raises_the_mode_prompt_and_keeps_the_edits(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let prompt = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.pending_run.is_some()
+            })
+        };
+
+        // Lowering the mode sends nothing and keeps the row.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_mode(crate::sql::Mode::ReadOnly, cx)
+        });
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert!(!prompt(&workspace, cx));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+
+        // Leaving it asks, and the edit and the ring stay where they were.
+        press(cx, "down");
+        assert!(prompt(&workspace, cx), "the mode prompt is up");
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(0));
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.cancel_pending_run(cx));
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 1, "cancelling leaves the row staged");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_second_row_left_while_the_first_is_saving_stays_staged(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+
+        // One turn: row 0 is left and its send is out when row 1 is left.
+        grid.update(cx, |table, cx| table.set_selected_row(1, cx));
+        grid.update(cx, |table, cx| table.set_selected_row(2, cx));
+        assert_eq!(state_kind(&workspace, cx), "running");
+        grid.read_with(cx, |grid, _| {
+            assert!(grid.delegate().row_has_pending(1), "row 1 was not dropped");
+        });
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The previous row is still being saved.")
+        );
+
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("tit")
+        );
+        grid.read_with(cx, |grid, _| {
+            assert!(!grid.delegate().row_has_pending(0));
+            assert!(grid.delegate().row_has_pending(1));
+        });
+
+        save(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_edit_typed_while_its_row_is_saving_stays_staged(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        grid.update(cx, |table, cx| table.set_selected_row(1, cx));
+        assert_eq!(state_kind(&workspace, cx), "running");
+        stage(&grid, cx, 0, 2, NewValue::Value("9".into()));
+
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("robin"));
+        assert_eq!(pending_of(&grid, cx), 1, "the edit made mid-send stays");
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("1")
+        );
+
+        save(&workspace, cx);
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("9")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+/// A click on the `id` cell of drawn row `row`, which is where the pointer
+/// reaches the cell's own mouse-down listener.
+fn click_cell_of_row(cx: &mut VisualTestContext, row: usize) {
+    let selector: &'static str = Box::leak(format!("row-number-{row}").into_boxed_str());
+    let gutter = cx.debug_bounds(selector).expect("the row is drawn");
+    let at = gpui::point(gutter.right() + gpui::px(40.), gutter.center().y);
+    cx.simulate_click(at, gpui::Modifiers::default());
+    settle(cx);
+}
+
+#[gpui::test]
+fn a_cell_being_typed_in_is_kept_when_its_row_is_clicked_away_from_in_row_mode(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 0, "typed, never committed");
+
+        click_cell_of_row(cx, 1);
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_being_typed_in_is_dropped_when_its_row_is_clicked_away_from_in_draft_mode(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+
+        click_cell_of_row(cx, 1);
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
+        assert_eq!(pending_of(&grid, cx), 0, "Draft stages nothing");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
