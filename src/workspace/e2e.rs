@@ -25244,3 +25244,87 @@ fn the_refusal_to_leave_draft_is_taken_down_with_the_draft_and_with_the_switch(
         quit(workspace, cx);
     });
 }
+
+/// A table saved from in Row mode inside an open transaction, the most the
+/// status bar draws at once: the transaction control, both chip pairs, the
+/// Uncommitted badge, the row statistics, the paging, the statement just sent
+/// as the notice and the right-hand controls.
+fn crowded_status_bar(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    use crate::result_grid::NewValue;
+
+    let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+    run_in_front(&workspace, cx, "BEGIN");
+    let (_, grid) = open_in_row_mode(&workspace, cx);
+    stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+    save(&workspace, cx);
+    assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+    (workspace, cx)
+}
+
+/// What the status bar items paint, each with the box of the group that
+/// clips it (an item taller or wider than its group is cut at the group's
+/// edge, not drawn over what is next to it).
+const STATUS_ITEMS: [(&str, &str); 12] = [
+    ("transaction-commit", "status-bar"),
+    ("transaction-rollback", "status-bar"),
+    ("edit-mode-draft", "status-chips"),
+    ("edit-mode-row", "status-chips"),
+    ("uncommitted-rows", "status-chips"),
+    ("status-stats", "status-stats-group"),
+    ("count-rows", "status-stats-group"),
+    ("status-notice", "status-bar"),
+    ("status-paging", "status-bar"),
+    ("status-readout", "status-actions"),
+    ("import-rows", "status-actions"),
+    ("export-results", "status-actions"),
+];
+
+/// The painted boxes of the status bar's items that are showing, clipped to
+/// the bar and to their group.
+fn painted_status_items(
+    cx: &mut VisualTestContext,
+) -> Vec<(&'static str, gpui::Bounds<gpui::Pixels>)> {
+    let bar = cx
+        .debug_bounds("status-bar")
+        .expect("the status bar is drawn");
+    STATUS_ITEMS
+        .iter()
+        .filter_map(|(item, group)| {
+            let mut painted = cx.debug_bounds(item)?.intersect(&bar);
+            if let Some(group) = cx.debug_bounds(group) {
+                painted = painted.intersect(&group);
+            }
+            (painted.size.width > gpui::px(0.) && painted.size.height > gpui::px(0.))
+                .then_some((*item, painted))
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = crowded_status_bar(cx);
+        for hidden in [false, true] {
+            workspace.update(cx, |workspace, _| workspace.sidebar_hidden = hidden);
+            for width in [1536., 1100., 700., 500.] {
+                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.)));
+                settle(cx);
+                let painted = painted_status_items(cx);
+                assert!(
+                    painted.iter().any(|(item, _)| *item == "status-paging"),
+                    "paging is drawn at {width}px, sidebar hidden {hidden}: {painted:?}"
+                );
+                for (index, (first, first_box)) in painted.iter().enumerate() {
+                    for (second, second_box) in &painted[index + 1..] {
+                        assert!(
+                            !first_box.intersects(second_box),
+                            "{first} {first_box:?} is drawn over {second} {second_box:?} at \
+                             {width}px, sidebar hidden {hidden}"
+                        );
+                    }
+                }
+            }
+        }
+        quit(workspace, cx);
+    });
+}

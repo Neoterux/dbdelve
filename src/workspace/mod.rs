@@ -2067,6 +2067,7 @@ impl Render for Workspace {
 
         let results_status = bar_has_content.then(|| {
             div()
+                .debug_selector(|| "status-bar".into())
                 .h(px(layout::chrome(layout::STATUS_HEIGHT)))
                 .flex_shrink_0()
                 .border_t_1()
@@ -2097,6 +2098,7 @@ impl Render for Workspace {
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
                             div()
+                                .debug_selector(|| "status-stats".into())
                                 .flex_shrink_0()
                                 .whitespace_nowrap()
                                 .text_color(t.text_faint)
@@ -2106,6 +2108,7 @@ impl Render for Workspace {
                         .children(export_status)
                         .children(notice.map(|notice| {
                             div()
+                                .debug_selector(|| "status-notice".into())
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
@@ -2141,6 +2144,7 @@ impl Render for Workspace {
                         .gap(px(layout::SPACE_SM))
                         .children(query_status.map(|query_status| {
                             div()
+                                .debug_selector(|| "status-readout".into())
                                 .text_color(match stale_buffer {
                                     true => t.text_muted,
                                     false => t.text_faint,
