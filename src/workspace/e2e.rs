@@ -23695,3 +23695,528 @@ fn closing_a_tab_with_edits_asks_and_discard_closes_it(cx: &mut TestAppContext) 
         quit(workspace, cx);
     });
 }
+
+fn sorting_of(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    tab: Tab,
+) -> crate::session::Sorting {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .unwrap()
+            .session
+            .sorting(tab)
+            .cloned()
+            .expect("the tab has a sorting")
+    })
+}
+
+/// Relation tab `id`'s row count, as `Some(filter, rows)` once counted.
+fn counted(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: u64,
+) -> Option<(String, u64)> {
+    workspace.read_with(cx, |workspace, _| {
+        let tab = workspace
+            .profile()?
+            .session
+            .objects
+            .iter()
+            .find(|tab| tab.id == id)?;
+        match &tab.body {
+            ObjectBody::Relation {
+                count: crate::session::RowCount::Counted(filter, rows),
+                ..
+            } => Some((filter.clone(), *rows)),
+            _ => None,
+        }
+    })
+}
+
+fn set_counted(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, id: u64) {
+    workspace.update(cx, |workspace, _| {
+        let tab = workspace
+            .profile_mut()
+            .unwrap()
+            .session
+            .objects
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .unwrap();
+        let ObjectBody::Relation { count, .. } = &mut tab.body else {
+            panic!("a relation tab");
+        };
+        *count = crate::session::RowCount::Counted(String::new(), 2);
+    });
+}
+
+/// The bars of relation tab `id`: operator, joiner and the value each last
+/// applied.
+fn bars_of(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: u64,
+) -> Vec<(crate::filter::Operator, crate::filter::Conjunction, String)> {
+    workspace.update(cx, |workspace, _| {
+        workspace
+            .filter_rows_mut(id)
+            .unwrap()
+            .iter()
+            .map(|row| (row.operator, row.conjunction, row.applied.clone()))
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn a_refresh_sort_filter_or_row_limit_over_a_draft_asks_first(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{RefreshRelation, RunQuery, SortColumn},
+        result_grid::NewValue,
+        session::{AfterEdits, Sorting},
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let tab = Tab::Object(id);
+        set_counted(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+        let sorting = sorting_of(&workspace, cx, tab);
+
+        // Refresh, by its action and by Run on the object tab.
+        for run in [false, true] {
+            if run {
+                cx.dispatch_action(RunQuery);
+            } else {
+                cx.dispatch_action(RefreshRelation);
+            }
+            settle(cx);
+            assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+            assert!(matches!(
+                discard_holds(&workspace, cx),
+                Some(AfterEdits::Refresh)
+            ));
+            assert_eq!(relation_view(&workspace, cx, id), before);
+            assert_eq!(counted(&workspace, cx, id), Some((String::new(), 2)));
+            assert_eq!(sorting_of(&workspace, cx, tab), sorting);
+            assert_eq!(pending_of(&grid, cx), 1);
+            assert_eq!(state_kind(&workspace, cx), "complete");
+            press(cx, "escape");
+            assert_eq!(pending_of(&grid, cx), 1);
+        }
+        // Discard re-reads: a row changed on disk since is what lands.
+        rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
+            .and_then(|db| db.execute("update birds set name = 'finch' where id = 1", []))
+            .unwrap();
+        cx.dispatch_action(RefreshRelation);
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("finch"));
+        assert_eq!(
+            counted(&workspace, cx, id),
+            None,
+            "the count is asked again"
+        );
+
+        // The view's sorting switched to the server, with a sort on screen.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(true, window, cx)
+        });
+        cx.dispatch_action(SortColumn { column: 1 });
+        settle(cx);
+        let held = sorting_of(&workspace, cx, tab);
+        assert!(matches!(&held, Sorting::Client(keys) if keys.len() == 1));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(false, window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::ViewSorting(false))
+        ));
+        assert_eq!(sorting_of(&workspace, cx, tab), held);
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+        press(cx, "escape");
+        assert_eq!(sorting_of(&workspace, cx, tab), held);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(false, window, cx)
+        });
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        assert_eq!(sorting_of(&workspace, cx, tab), Sorting::Server);
+        assert_eq!(
+            relation_view(&workspace, cx, id).1.len(),
+            1,
+            "the sort reached the server"
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+
+        // A filter bar submitted with a value.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+        let input = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.push_filter_row(id, window, cx);
+            let input = workspace.filter_rows_mut(id).unwrap()[0].value.clone();
+            input.update(cx, |input, cx| input.set_value("id = 2", window, cx));
+            input
+        });
+        workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Filter { .. })
+        ));
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(
+            grid.read_with(cx, |g, _| g.delegate().result().rows.len()),
+            2
+        );
+        confirm_discard(&workspace, cx);
+        assert_eq!(relation_view(&workspace, cx, id).0, "id = 2");
+        assert_eq!(
+            grid.read_with(cx, |g, _| g.delegate().result().rows.len()),
+            1
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn cancelling_the_discard_prompt_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
+    use crate::{
+        filter::{Conjunction, FilterBar, Operator},
+        result_grid::NewValue,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let bar = FilterBar {
+            column: Some("name".into()),
+            operator: Operator::Equals,
+            value: "wren".into(),
+            ..Default::default()
+        };
+        let id = workspace.update_in(cx, |workspace, window, cx| {
+            let opened = crate::session::OpenedObject::Relation {
+                schema: "main".into(),
+                name: "birds".into(),
+                kind: Default::default(),
+                filter: crate::filter::derived_filter(
+                    Engine::Sqlite,
+                    std::slice::from_ref(&bar),
+                    &[],
+                ),
+                filters: vec![bar.clone()],
+            };
+            let id = workspace
+                .open_object(opened, None, window, cx)
+                .expect("the relation opens");
+            workspace.activate_tab(Tab::Object(id), window, cx);
+            id
+        });
+        settle(cx);
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let bars = bars_of(&workspace, cx, id);
+        let view = relation_view(&workspace, cx, id);
+        assert_eq!(bars, [(Operator::Equals, Conjunction::And, "wren".into())]);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let action = crate::actions::SetFilterOperator {
+                row: 0,
+                operator: Operator::NotEquals,
+            };
+            workspace.set_filter_operator(&action, window, cx);
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert_eq!(relation_view(&workspace, cx, id), view);
+        press(cx, "escape");
+        assert_eq!(
+            bars_of(&workspace, cx, id),
+            bars,
+            "the operator is put back"
+        );
+        assert_eq!(relation_view(&workspace, cx, id), view);
+        assert_eq!(pending_of(&grid, cx), 1);
+
+        // A value typed into the bar and sent.
+        let input = workspace.update_in(cx, |workspace, window, cx| {
+            let input = workspace.filter_rows_mut(id).unwrap()[0].value.clone();
+            input.update(cx, |input, cx| input.set_value("tit", window, cx));
+            input
+        });
+        workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        press(cx, "escape");
+        assert_eq!(
+            bars_of(&workspace, cx, id),
+            bars,
+            "the applied value is put back"
+        );
+        assert_eq!(relation_view(&workspace, cx, id), view);
+        assert_eq!(pending_of(&grid, cx), 1);
+
+        // Clearing the bars.
+        cx.dispatch_action(crate::actions::ClearFilter);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        press(cx, "escape");
+        assert_eq!(
+            bars_of(&workspace, cx, id),
+            bars,
+            "the cleared bar is put back"
+        );
+        assert_eq!(relation_view(&workspace, cx, id), view);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_run_or_a_header_sort_on_a_query_tab_over_a_draft_asks_first(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{RunQuery, SortColumn},
+        result_grid::NewValue,
+        session::AfterEdits,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        cx.simulate_input("select * from birds order by id");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let text = buffer(&workspace, cx);
+
+        cx.dispatch_action(RunQuery);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Run)
+        ));
+        assert_eq!(buffer(&workspace, cx), text);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(state_kind(&workspace, cx), "complete");
+        press(cx, "escape");
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps the edit");
+        assert_eq!(buffer(&workspace, cx), text);
+
+        cx.dispatch_action(SortColumn { column: 1 });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Sort(1))
+        ));
+        assert_eq!(buffer(&workspace, cx), text, "the buffer is not rewritten");
+        assert_eq!(pending_of(&grid, cx), 1);
+        press(cx, "escape");
+        assert_eq!(buffer(&workspace, cx), text);
+
+        cx.dispatch_action(SortColumn { column: 1 });
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        let sorted = buffer(&workspace, cx);
+        assert!(sorted.to_lowercase().contains("name"), "{sorted}");
+        assert_ne!(sorted, text);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(state_kind(&workspace, cx), "complete");
+
+        // Run again, and Discard runs it.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(RunQuery);
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(state_kind(&workspace, cx), "complete");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_requery_that_changes_nothing_over_a_draft_asks_nothing(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{PreviousPage, SetRowLimit, SortColumn},
+        result_grid::NewValue,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let limit = relation_view(&workspace, cx, id).2;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(true, window, cx)
+        });
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+
+        cx.dispatch_action(SetRowLimit { rows: limit });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None, "the limit in force");
+        cx.dispatch_action(PreviousPage);
+        settle(cx);
+        assert_eq!(
+            front_dialog(&workspace, cx),
+            None,
+            "no page before the first"
+        );
+
+        // Sorted in memory: the edit moves with its row.
+        cx.dispatch_action(SortColumn { column: 1 });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            let staged = (0..2)
+                .find(|&row| grid.pending_value(row, 1).is_some())
+                .expect("the edit is on a row");
+            assert_eq!(grid.cell(staged, 0), Some("1"), "the row it was staged on");
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_requery_while_the_tabs_edits_are_being_sent_is_not_run(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{ApplyEdits, SetRowLimit},
+        result_grid::NewValue,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        assert_eq!(state_kind(&workspace, cx), "running");
+        let before = relation_view(&workspace, cx, id);
+
+        // Not through the action, which runs the executor to the answer.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_row_limit(&SetRowLimit { rows: Some(1) }, window, cx)
+        });
+        // The apply's own review is still up until the send lands.
+        assert_ne!(front_dialog(&workspace, cx), Some("discard"), "no prompt");
+        assert!(discard_holds(&workspace, cx).is_none(), "nothing is parked");
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("This tab's edits are still being sent.")
+        );
+
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(state_kind(&workspace, cx), "complete");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_run_that_reaches_a_grid_with_edits_unguarded_is_not_sent(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        cx.simulate_input("select * from birds");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        let (tab_id, grid) = query_tab(&workspace, cx, |tab, _, _| (tab.id, tab.results.clone()));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let rows = grid.read_with(cx, |grid, _| grid.delegate().result().rows.len());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_sql("select 1".into(), Tab::Query(tab_id), cx)
+        });
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(
+            grid.read_with(cx, |grid, _| grid.delegate().result().rows.len()),
+            rows
+        );
+        assert_eq!(state_kind(&workspace, cx), "complete");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The statement was not run: this tab has unapplied edits.")
+        );
+
+        // A question about the statement is not a replacement of the rows.
+        cx.simulate_keystrokes("secondary-shift-enter");
+        settle(cx);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(tab.plan.is_some(), "the Explain ran");
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn lowering_to_read_only_keeps_the_draft_and_an_apply_raises_the_mode_prompt(
+    cx: &mut TestAppContext,
+) {
+    use crate::{actions::ApplyEdits, result_grid::NewValue, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+
+        workspace.update(cx, |workspace, cx| workspace.set_mode(Mode::ReadOnly, cx));
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        grid.update(cx, |grid, _| {
+            assert!(
+                !grid
+                    .delegate_mut()
+                    .set_pending(1, 1, NewValue::Value("owl".into())),
+                "no further staging"
+            );
+        });
+
+        cx.dispatch_action(ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().session.pending_run.is_some());
+        });
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(grid.delegate().pending_count(), 1);
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+
+        // Cancelling the prompt leaves the draft staged.
+        workspace.update(cx, |workspace, cx| workspace.cancel_pending_run(cx));
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 1);
+        quit(workspace, cx);
+    });
+}
