@@ -446,7 +446,6 @@ mod tests {
                         | Engine::MySql
                         | Engine::MariaDb
                         | Engine::Sqlite
-                        | Engine::Turso
                         | Engine::DuckDb
                         | Engine::SqlServer
                 ),

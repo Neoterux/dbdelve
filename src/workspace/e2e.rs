@@ -25161,3 +25161,45 @@ fn a_snowflake_table_offers_no_edit_mode(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// A Turso relation tab, which no result of is ever editable
+/// (`docs/agents/engines.md`): the driver names no column's table, so Row mode
+/// has no row to send and nothing to switch to.
+#[gpui::test]
+fn a_turso_table_offers_no_edit_mode(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_connections(
+            cx,
+            BIRDS,
+            "",
+            "[[profiles]]\nid = \"turso\"\nname = \"Turso\"\nhost = \"\"\ndatabase = \"\"\n\
+             user = \"\"\nengine = \"turso\"\npath = DB_PATH\nmode = \"full\"\n",
+        );
+        cx.executor().allow_parking();
+        drive_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .is_some_and(|profile| profile.id == "turso" && profile.connection().is_some())
+            })
+        });
+        settle(cx);
+        let id = open_own_table(&workspace, cx, "birds");
+        drive_until(cx, |cx| {
+            settle(cx);
+            relation_grid(&workspace, cx, id)
+                .read_with(cx, |grid, _| !grid.delegate().result().rows.is_empty())
+        });
+
+        assert_eq!(front_edit_mode(&workspace, cx), None);
+        assert_eq!(
+            drawn(cx, &["edit-mode-draft", "edit-mode-row"]),
+            [false, false]
+        );
+        let rows = palette_listing(&workspace, cx);
+        for label in ["Edit in Row mode", "Edit in Draft mode"] {
+            assert!(!rows.iter().any(|row| row == label), "{label}: {rows:?}");
+        }
+        quit(workspace, cx);
+    });
+}
