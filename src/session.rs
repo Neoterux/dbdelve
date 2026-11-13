@@ -1386,6 +1386,32 @@ impl Session {
         }
     }
 
+    /// Undoes what an action that is not going ahead changed before it asked:
+    /// a filter bar the user edited goes back to what it was. Every way a
+    /// parked [`AfterEdits`] can be dropped ends here, so the bars never show
+    /// a filter that did not run.
+    pub(crate) fn put_back(&mut self, tab: Tab, then: AfterEdits) {
+        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) = (tab, then)
+            && let Some(ObjectBody::Relation { filters, .. }) = self
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .map(|tab| &mut tab.body)
+        {
+            *filters = rows;
+        }
+    }
+
+    /// Holds `then` for render to carry out once a landed send has released
+    /// it. One slot: an action already waiting is the user's own, and this
+    /// one is put back instead.
+    pub(crate) fn park_resume(&mut self, tab: Tab, then: AfterEdits) {
+        match self.resume_after {
+            Some(_) => self.put_back(tab, then),
+            None => self.resume_after = Some((tab, then)),
+        }
+    }
+
     /// Owes relation tab `id` a read of its rows on its next visit, for rows
     /// that no longer say what the server holds.
     pub(crate) fn mark_stale(&mut self, id: u64) {
@@ -1774,21 +1800,14 @@ impl Session {
         // The bars a dropped filter prompt was holding go back as Cancel puts
         // them: they were changed before anything could ask, and the filter
         // that ran is the one they have to describe.
-        if let Some(PendingDiscard {
-            tab: Tab::Object(id),
-            then: AfterEdits::Filter { before: Some(rows) },
-        }) = self.pending_discard.take()
-            && let Some(ObjectBody::Relation { filters, .. }) = self
-                .objects
-                .iter_mut()
-                .find(|tab| tab.id == id)
-                .map(|tab| &mut tab.body)
-        {
-            *filters = rows;
+        if let Some(PendingDiscard { tab, then }) = self.pending_discard.take() {
+            self.put_back(tab, then);
         }
         // An action released by a landed send does not follow the user to
-        // another tab or connection.
-        self.resume_after = None;
+        // another tab or connection, and its bars go back like a Cancel's.
+        if let Some((tab, then)) = self.resume_after.take() {
+            self.put_back(tab, then);
+        }
         self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;
@@ -3632,6 +3651,17 @@ pub(crate) enum Refresh {
         /// turn, a sort, a tab switch. Carried out only when the send lands.
         then: Option<AfterEdits>,
     },
+}
+
+impl Refresh {
+    /// The action a Row send was carrying, for a send that is dropped before
+    /// it runs: its owner puts back what the action had changed.
+    pub(crate) fn into_parked(self) -> Option<AfterEdits> {
+        match self {
+            Self::Row { then, .. } => then,
+            _ => None,
+        }
+    }
 }
 
 /// `Clone` because a queue keeps the state of every statement it has run
