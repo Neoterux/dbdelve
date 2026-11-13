@@ -1782,12 +1782,28 @@ impl ResultGrid {
     /// Move the ring to a cell. An input open on some other cell goes with it:
     /// one cell holding a focused input while another wears the ring `Enter`
     /// follows is two cells claiming the keyboard.
+    ///
+    /// The one place the ring moves, so it is also the one place a row is left:
+    /// a ring that goes off a row holding edits, or an input, marks that row for
+    /// the workspace ([`Self::take_left_row`]), which decides what the view's
+    /// edit mode does about it.
     fn set_active(&mut self, row: usize, col: usize) {
-        if self
+        let closing = self
             .editing
             .as_ref()
-            .is_some_and(|editing| (editing.row, editing.col) != (row, col))
+            .is_some_and(|editing| (editing.row, editing.col) != (row, col));
+        if let Some((old, _)) = self.active
+            && old != row
+            && self.left_row.is_none()
+            && (self.row_has_pending(old)
+                || self
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editing| closing && editing.row == old))
         {
+            self.left_row = Some(old);
+        }
+        if closing {
             self.editing = None;
         }
         self.active = Some((row, col));
@@ -3576,52 +3592,60 @@ pub(crate) fn new_grid(
     // Hooked in the constructor because every relation tab builds its grid
     // through it: a subscription set up at one call site would leave the other
     // grid navigating an invisible selection.
-    cx.subscribe(&grid, |_, table, event: &TableEvent, cx| match event {
-        TableEvent::SelectRow(row) => {
-            let row = *row;
-            table.update(cx, |table, cx| {
-                table.delegate_mut().select_row(row);
-                cx.notify();
-            });
-        }
-        TableEvent::ColumnWidthsChanged(widths) => {
-            let widths = widths.get(GUTTER..).unwrap_or_default().to_vec();
-            table.update(cx, |table, _| {
-                table.delegate_mut().set_drawn_widths(&widths)
-            });
-        }
-        TableEvent::SelectColumn(col) => {
-            let col = *col;
-            table.update(cx, |table, cx| {
-                // Selecting a fixed column (the gutter or a pinned one) makes
-                // the library scroll to the first column that scrolls instead.
-                // A fixed column is always in view, so put the offset back
-                // before the frame that would show the jump. Caught here
-                // because arrows, tab and header clicks all select inside the
-                // library, past any hook of ours.
-                if col < GUTTER + table.delegate().pinned {
-                    let mut offset = table.horizontal_scroll_handle.offset();
-                    offset.x = table.delegate().painted_x;
-                    table.horizontal_scroll_handle.set_offset(offset);
-                }
-                let Some(col) = col
-                    .checked_sub(GUTTER)
-                    .and_then(|position| table.delegate().column_at(position))
-                else {
-                    return;
-                };
-                table.delegate_mut().select_col(col);
-                cx.notify();
-            });
-        }
-        TableEvent::ClearSelection => {
-            table.update(cx, |table, cx| {
-                table.delegate_mut().selected_row = None;
-                cx.notify();
-            });
-        }
-        _ => {}
-    })
+    //
+    // Every ring move ends in `SelectRow` or `ClearSelection`, so these two arms
+    // are the one consumer of the row the ring left: a Row view sends it.
+    cx.subscribe(
+        &grid,
+        |workspace, table, event: &TableEvent, cx| match event {
+            TableEvent::SelectRow(row) => {
+                let row = *row;
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().select_row(row);
+                    cx.notify();
+                });
+                workspace.flush_left_row(&table, cx);
+            }
+            TableEvent::ColumnWidthsChanged(widths) => {
+                let widths = widths.get(GUTTER..).unwrap_or_default().to_vec();
+                table.update(cx, |table, _| {
+                    table.delegate_mut().set_drawn_widths(&widths)
+                });
+            }
+            TableEvent::SelectColumn(col) => {
+                let col = *col;
+                table.update(cx, |table, cx| {
+                    // Selecting a fixed column (the gutter or a pinned one) makes
+                    // the library scroll to the first column that scrolls instead.
+                    // A fixed column is always in view, so put the offset back
+                    // before the frame that would show the jump. Caught here
+                    // because arrows, tab and header clicks all select inside the
+                    // library, past any hook of ours.
+                    if col < GUTTER + table.delegate().pinned {
+                        let mut offset = table.horizontal_scroll_handle.offset();
+                        offset.x = table.delegate().painted_x;
+                        table.horizontal_scroll_handle.set_offset(offset);
+                    }
+                    let Some(col) = col
+                        .checked_sub(GUTTER)
+                        .and_then(|position| table.delegate().column_at(position))
+                    else {
+                        return;
+                    };
+                    table.delegate_mut().select_col(col);
+                    cx.notify();
+                });
+            }
+            TableEvent::ClearSelection => {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().selected_row = None;
+                    cx.notify();
+                });
+                workspace.flush_left_row(&table, cx);
+            }
+            _ => {}
+        },
+    )
     .detach();
 
     grid

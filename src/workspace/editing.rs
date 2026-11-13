@@ -1688,6 +1688,45 @@ impl Workspace {
         true
     }
 
+    /// What a ring move off an edited row does, called after every move the
+    /// grid made ([`ResultGrid::take_left_row`]): in a Row view the row left is
+    /// sent, in a Draft view the mark is dropped and nothing is said. The one
+    /// caller of [`Self::save_row`] besides Save.
+    ///
+    /// A grid that is not a relation tab's of the profile in front (a query
+    /// tab's, or one of a profile behind) has no mode to ask and drops the mark.
+    pub(crate) fn flush_left_row(
+        &mut self,
+        grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
+        cx: &mut Context<Self>,
+    ) {
+        let (left, ring) = grid.update(cx, |table, _| {
+            let grid = table.delegate_mut();
+            (grid.take_left_row(), grid.active().map(|(row, _)| row))
+        });
+        let Some(row) = left.filter(|row| Some(*row) != ring) else {
+            return;
+        };
+        let Some((tab, mode)) = self.profile().and_then(|profile| {
+            profile
+                .session
+                .objects
+                .iter()
+                .find_map(|tab| match &tab.body {
+                    ObjectBody::Relation {
+                        results, edit_mode, ..
+                    } if results == grid => Some((tab.id, *edit_mode)),
+                    _ => None,
+                })
+        }) else {
+            return;
+        };
+        if mode != EditMode::Row || !grid.read(cx).delegate().row_has_pending(row) {
+            return;
+        }
+        self.save_row(tab, row, cx);
+    }
+
     /// Turn the grid's pending edits into SQL and put it where the user can read
     /// it: the query tab's buffer, or the review modal on a relation tab and on
     /// a query tab whose target reviews them (`Target::reviews_query_edits`).
