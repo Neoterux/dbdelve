@@ -1980,7 +1980,11 @@ impl Render for Workspace {
             .flex()
             .items_center()
             .gap(px(layout::SPACE_SM))
+            // First to give way in a narrow bar: the switcher in the titlebar
+            // already names the connection.
+            .flex_shrink(32.)
             .min_w_0()
+            .overflow_hidden()
             .child(ui::status_dot(t, &profile.state))
             .child(
                 div()
@@ -2175,6 +2179,10 @@ impl Render for Workspace {
                         .children(query_status.map(|query_status| {
                             div()
                                 .debug_selector(|| "status-readout".into())
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
                                 .text_color(match stale_buffer {
                                     true => t.text_muted,
                                     false => t.text_faint,
