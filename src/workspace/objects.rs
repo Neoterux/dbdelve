@@ -98,6 +98,7 @@ impl Workspace {
         let (schema, name, kind) = (opened.schema().to_string(), opened.name(), opened.kind());
         let row_limit = self.settings.row_limit;
         let engine = self.engine();
+        let target = self.target();
         let sorting = Sorting::new(self.settings.client_sort).on(engine);
         let structure = matches!(opened, OpenedObject::Structure { .. });
         let profile = self.profile_mut()?;
@@ -184,6 +185,7 @@ impl Workspace {
                     query: QueryState::Idle,
                     sort: Vec::new(),
                     sorting,
+                    edit_mode: EditMode::default().on(target),
                     filter,
                     filters,
                     next_join: Conjunction::default(),

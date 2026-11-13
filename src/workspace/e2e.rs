@@ -22192,3 +22192,101 @@ fn a_reviewed_delete_leaves_other_rows_edits_staged(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// `BIRDS` with a number beside the name, which a typed `07` and the server's
+/// `7` tell apart.
+const COUNTED_BIRDS: &str = "create table birds (id integer primary key, name text not null, n integer); \
+                             insert into birds values (1, 'wren', 1), (2, 'tit', 2);";
+
+/// The edit mode of relation tab `id` of the profile in front.
+fn edit_mode_of(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: u64,
+) -> crate::session::EditMode {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()
+            .unwrap()
+            .session
+            .edit_mode(Tab::Object(id))
+    })
+}
+
+/// The tab in front's grid cell, the server's value as the grid holds it.
+fn cell_of(
+    grid: &Entity<gpui_component::table::TableState<crate::result_grid::ResultGrid>>,
+    cx: &mut VisualTestContext,
+    row: usize,
+    col: usize,
+) -> Option<String> {
+    grid.read_with(cx, |grid, _| {
+        grid.delegate().cell(row, col).map(str::to_string)
+    })
+}
+
+#[gpui::test]
+fn saving_in_row_mode_sends_the_rows_update_without_a_dialog(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, COUNTED_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            let grid = grid.delegate_mut();
+            assert!(grid.set_pending(0, 1, NewValue::Value("robin".into())));
+            assert!(grid.set_pending(0, 2, NewValue::Value("07".into())));
+        });
+        // Not through the action, which runs the executor to the answer before
+        // the test can look at the send in flight.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
+            })
+        });
+        assert_eq!(front_review(&workspace, cx), None, "no dialog");
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Running { .. }
+        ));
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(grid.delegate().pending_count(), 2, "kept until answered");
+        });
+
+        settle(cx);
+        assert_eq!(
+            on_disk("select name || ':' || n from birds where id = 1").as_deref(),
+            Some("robin:7")
+        );
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2);
+            assert_eq!(grid.delegate().pending_count(), 0);
+        });
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("robin"));
+        assert_eq!(
+            cell_of(&grid, cx, 0, 2).as_deref(),
+            Some("7"),
+            "the server's value, not the typed one"
+        );
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some("tit"));
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Complete { .. }
+        ));
+        assert_eq!(front_review(&workspace, cx), None);
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert!(profile.session.history[0].sql.starts_with("UPDATE"));
+        });
+        let notice = shown_notice(&workspace, cx).expect("the send is on the status line");
+        assert!(notice.starts_with("1 row updated: UPDATE"), "{notice}");
+        quit(workspace, cx);
+    });
+}

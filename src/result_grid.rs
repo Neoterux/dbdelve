@@ -2122,6 +2122,29 @@ impl ResultGrid {
         });
     }
 
+    /// Stub for the red commit.
+    pub fn pending_row(&self, _row: usize) -> Option<PendingRow> {
+        None
+    }
+
+    /// Stub for the red commit.
+    pub fn row_has_pending(&self, _row: usize) -> bool {
+        false
+    }
+
+    /// Stub for the red commit.
+    pub fn first_pending_row(&self) -> Option<usize> {
+        None
+    }
+
+    /// Stub for the red commit.
+    pub fn discard_row(&mut self, _row: usize) {}
+
+    /// Stub for the red commit.
+    pub fn replace_row(&mut self, _row: usize, _fetched: db::Row) -> bool {
+        false
+    }
+
     /// One entry per changed row, in the order the rows were first edited, with
     /// every changed column of that row in a single `SET`.
     ///
@@ -4154,6 +4177,47 @@ mod tests {
         assert_eq!(grid.shown(0, 1).as_deref(), Some("first"));
         assert_eq!(grid.cell(0, 1), Some("first"));
         assert!(grid.has_pending());
+    }
+
+    #[test]
+    fn replacing_a_row_leaves_every_other_row_and_its_edits_alone() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, value("one")));
+        assert!(grid.set_pending(1, 1, value("two")));
+        grid.set_active(1, 1);
+
+        assert_eq!(grid.first_pending_row(), Some(0));
+        assert!(grid.row_has_pending(0) && grid.row_has_pending(1));
+        assert!(!grid.row_has_pending(2));
+        let held = grid.pending_row(0).expect("row 0 is edited");
+        assert_eq!(held.sets, vec![("body".to_string(), value("one"))]);
+        assert_eq!(held.keys, vec![("id".to_string(), "7".to_string())]);
+        assert!(grid.pending_row(2).is_none());
+
+        let fetched = db::Row::new([Some("7"), Some("fresh"), Some("9")]).unwrap();
+        assert!(grid.replace_row(0, fetched));
+        assert_eq!(grid.result.rows[0].get(1), Some("fresh"));
+        assert_eq!(grid.result.rows[0].get(2), Some("9"));
+        assert_eq!(grid.cell(1, 1), Some("second"), "row 1 is as it was");
+        assert_eq!(grid.active(), Some((1, 1)), "the ring stays");
+        assert_eq!(grid.pending_value(1, 1), Some(&value("two")));
+        assert_eq!(
+            grid.pending_value(0, 1),
+            Some(&value("one")),
+            "the caller clears the edits it sent"
+        );
+
+        grid.discard_row(0);
+        assert!(!grid.row_has_pending(0));
+        assert_eq!(grid.pending_count(), 1);
+        assert_eq!(grid.first_pending_row(), Some(1));
+
+        let before = grid.result.rows.clone();
+        let short = db::Row::new([Some("7")]).unwrap();
+        assert!(!grid.replace_row(1, short));
+        let fetched = db::Row::new([Some("7"), Some("x"), Some("y")]).unwrap();
+        assert!(!grid.replace_row(2, fetched));
+        assert_eq!(grid.result.rows, before);
     }
 
     #[test]
