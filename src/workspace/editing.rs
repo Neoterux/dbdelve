@@ -1627,6 +1627,16 @@ impl Workspace {
         if profile.session.running(tab) {
             return false;
         }
+        // A statement waiting in review is the user's to run or close first:
+        // this send's outcome would be written into it, and a success would
+        // drop it unread.
+        if profile.session.apply_review_covers(tab) {
+            self.note(
+                "The row was not sent: a statement is waiting in review.".into(),
+                cx,
+            );
+            return false;
+        }
         let target = self.target();
         if let Some(reason) = target.unwritable() {
             self.note(reason, cx);
