@@ -24827,6 +24827,321 @@ fn a_reread_owed_after_one_rows_send_sends_no_other_dirty_row_and_leaves_the_tab
     });
 }
 
+/// A Row view of `birds` whose first row the server has refused: `name` is
+/// `NOT NULL`, the staged `NULL` was sent when the ring left the row, and the
+/// ring is back on it.
+fn refused_row_view(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (u64, Grid) {
+    use crate::result_grid::NewValue;
+
+    let (id, grid) = open_in_row_mode(workspace, cx);
+    focus_grid(&grid, cx);
+    ring_on(&grid, cx, 0, 1);
+    stage(&grid, cx, 0, 1, NewValue::Null);
+    press(cx, "down");
+    assert_eq!(refused_row(&grid, cx).map(|(row, _)| row), Some(0));
+    assert_eq!(ring_of(&grid, cx), Some((0, 1)));
+    (id, grid)
+}
+
+/// What a blocked action leaves behind while the prompt is up: the question
+/// asked, nothing sent, the row still dirty and still marked.
+fn assert_asks_about_the_refused_row(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    grid: &Grid,
+    history: usize,
+) {
+    settle_through(cx);
+    assert!(discard_holds(workspace, cx).is_some(), "the prompt is up");
+    assert_eq!(front_dialog(workspace, cx), Some("discard"));
+    assert_eq!(
+        history_sql(workspace, cx).len(),
+        history,
+        "nothing was sent"
+    );
+    assert_eq!(pending_of(grid, cx), 1);
+    assert_eq!(refused_row(grid, cx).map(|(row, _)| row), Some(0));
+    assert_eq!(
+        on_disk("select name from birds where id = 1").as_deref(),
+        Some("wren")
+    );
+}
+
+fn answer_discard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, discard: bool) {
+    workspace.update_in(cx, |workspace, window, cx| match discard {
+        true => workspace.confirm_discard_close(window, cx),
+        false => {
+            workspace.cancel_discard_close(cx);
+        }
+    });
+    settle_through(cx);
+}
+
+/// A refused row is gone, and with it the mark, and the server was never
+/// asked to change it.
+fn assert_refused_row_dropped(grid: &Grid, cx: &mut VisualTestContext) {
+    assert_eq!(pending_of(grid, cx), 0);
+    assert_eq!(refused_row(grid, cx), None);
+    assert_eq!(
+        on_disk("select name from birds where id = 1").as_deref(),
+        Some("wren")
+    );
+}
+
+#[gpui::test]
+fn a_refused_rows_notice_says_how_the_row_goes_back(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let _ = refused_row_view(&workspace, cx);
+        let notice = shown_notice(&workspace, cx).expect("the status line says why");
+        assert!(notice.contains("NOT NULL"), "{notice}");
+        assert!(
+            notice.contains("Esc puts it back as it was read"),
+            "{notice}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn closing_a_tab_whose_row_the_server_refused_asks_to_discard_the_row(cx: &mut TestAppContext) {
+    use crate::actions::CloseTab;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = refused_row_view(&workspace, cx);
+        let history = history_sql(&workspace, cx).len();
+
+        cx.dispatch_action(CloseTab);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        assert!(table_tab_is_open(&workspace, cx, id));
+
+        answer_discard(&workspace, cx, false);
+        assert!(discard_holds(&workspace, cx).is_none());
+        assert!(table_tab_is_open(&workspace, cx, id));
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+        assert!(refused_row(&grid, cx).is_some());
+
+        cx.dispatch_action(CloseTab);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert!(!table_tab_is_open(&workspace, cx, id), "then it closes");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn switching_tabs_from_a_row_the_server_refused_asks_to_discard_the_row(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = workspace.read_with(cx, |workspace, _| {
+            Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+        });
+        let (id, grid) = refused_row_view(&workspace, cx);
+        let history = history_sql(&workspace, cx).len();
+        let front = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.profile().unwrap().session.active
+            })
+        };
+
+        bring_forward(&workspace, cx, query);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        assert_eq!(front(&workspace, cx), Tab::Object(id));
+
+        answer_discard(&workspace, cx, false);
+        assert_eq!(front(&workspace, cx), Tab::Object(id));
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+
+        bring_forward(&workspace, cx, query);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert_eq!(front(&workspace, cx), query);
+        assert_refused_row_dropped(&grid, cx);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_refresh_over_a_row_the_server_refused_asks_to_discard_the_row(cx: &mut TestAppContext) {
+    use crate::actions::RefreshRelation;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let (_, grid) = refused_row_view(&workspace, cx);
+        let history = history_sql(&workspace, cx).len();
+        rusqlite::Connection::open(store::dbdelve_directory().unwrap().join("e2e.db"))
+            .and_then(|db| db.execute("update birds set name = 'finch' where id = 3", []))
+            .unwrap();
+
+        cx.dispatch_action(RefreshRelation);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, false);
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+        assert_eq!(cell_of(&grid, cx, 2, 1).as_deref(), Some("kite"));
+
+        cx.dispatch_action(RefreshRelation);
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert_refused_row_dropped(&grid, cx);
+        assert_eq!(cell_of(&grid, cx, 2, 1).as_deref(), Some("finch"), "read");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_page_turn_over_a_row_the_server_refused_asks_to_discard_the_row(cx: &mut TestAppContext) {
+    use crate::actions::NextPage;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let (id, grid) = refused_row_view(&workspace, cx);
+        // A row limit the page turn pages by.
+        workspace.update(cx, |workspace, _| {
+            let ObjectBody::Relation { limit, .. } = workspace
+                .object_body_mut(id)
+                .expect("the relation tab is open")
+            else {
+                panic!("a relation tab");
+            };
+            *limit = Some(2);
+        });
+        let history = history_sql(&workspace, cx).len();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.next_page(&NextPage, window, cx)
+        });
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, false);
+        assert_eq!(relation_view(&workspace, cx, id).3, 0, "the page stays");
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.next_page(&NextPage, window, cx)
+        });
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert_eq!(relation_view(&workspace, cx, id).3, 2, "then it turns");
+        assert_eq!(first_column(&grid, cx), ["3", "4"]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_sort_or_a_filter_over_a_row_the_server_refused_asks_to_discard_the_row(
+    cx: &mut TestAppContext,
+) {
+    use crate::actions::SortColumn;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let (id, grid) = refused_row_view(&workspace, cx);
+        let history = history_sql(&workspace, cx).len();
+        let input = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.push_filter_row(id, window, cx);
+            workspace.filter_rows_mut(id).unwrap()[0].value.clone()
+        });
+        let bars = bars_of(&workspace, cx, id);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.sort_column(&SortColumn { column: 1 }, window, cx)
+        });
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, false);
+        assert!(relation_view(&workspace, cx, id).1.is_empty());
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+
+        input.update_in(cx, |input, window, cx| {
+            input.set_value("id > 2", window, cx)
+        });
+        workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, false);
+        assert_eq!(
+            bars_of(&workspace, cx, id),
+            bars,
+            "Cancel puts the bar back"
+        );
+        assert_eq!(relation_view(&workspace, cx, id).0, "");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.sort_column(&SortColumn { column: 1 }, window, cx)
+        });
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert_refused_row_dropped(&grid, cx);
+        assert_eq!(relation_view(&workspace, cx, id).1.len(), 1, "it sorted");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn switching_to_draft_from_a_row_the_server_refused_asks_to_discard_the_row(
+    cx: &mut TestAppContext,
+) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = refused_row_view(&workspace, cx);
+        let history = history_sql(&workspace, cx).len();
+
+        click_selector(cx, "edit-mode-draft");
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        answer_discard(&workspace, cx, false);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
+
+        click_selector(cx, "edit-mode-draft");
+        assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
+        answer_discard(&workspace, cx, true);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+        assert_refused_row_dropped(&grid, cx);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn discarding_a_refused_row_drops_only_that_row_and_the_others_are_saved_first(
+    cx: &mut TestAppContext,
+) {
+    use crate::{actions::RefreshRelation, result_grid::NewValue};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let (_, grid) = refused_row_view(&workspace, cx);
+        stage(&grid, cx, 2, 1, NewValue::Value("owl".into()));
+        let history = history_sql(&workspace, cx).len();
+
+        // The ring is on the refused row, so that is the one the action meets.
+        cx.dispatch_action(RefreshRelation);
+        settle_through(cx);
+        assert!(discard_holds(&workspace, cx).is_some());
+        assert_eq!(history_sql(&workspace, cx).len(), history);
+        assert_eq!(pending_of(&grid, cx), 2);
+
+        answer_discard(&workspace, cx, true);
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("owl"),
+            "the other row was saved, not discarded"
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_no_discard_prompt(&workspace, cx);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_refused_row_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
