@@ -729,9 +729,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   carried the draft), and re-reads; when edits remain (an Insert or Delete over
   a draft, an edit staged while the batch was in flight) it keeps them and does
   not re-read. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
-  a plugin) an edit send clears the grid as it starts and a failure is
-  `QueryState::Failed`: a batch with no transaction that failed part way has
+  a plugin, Snowflake) an edit send clears the grid as it starts and a failure
+  is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
+  Snowflake is out of the Row-mode set (no Draft or Row control on its tables)
+  because its results are never editable: its keys are not enforced.
 - **A requery over a draft asks first.** An action that would replace a grid's
   rows over cell edits nobody has applied asks Discard / Cancel and does
   nothing until answered. `Workspace::held_for_edits` is the one guard,

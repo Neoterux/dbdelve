@@ -214,9 +214,12 @@ impl Target {
     pub fn row_edits(self) -> bool {
         // ClickHouse reviews a query tab's edits (`reviews_query_edits`): its
         // one-row guard is not in the statement text, so a batch there is not
-        // one the draft can be kept behind.
+        // one the draft can be kept behind. Snowflake's keys are declared and
+        // not enforced, so no result of it is editable (`QueryResult::edit` is
+        // always `None`) and there is no row for Row mode to send.
         matches!(self.driver, Driver::BuiltIn)
             && self.engine.syntax() == Syntax::Sql
+            && self.engine != Engine::Snowflake
             && self.edits_rows()
             && !self.reviews_query_edits()
     }
