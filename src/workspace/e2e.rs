@@ -25203,3 +25203,44 @@ fn a_turso_table_offers_no_edit_mode(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+/// A refusal to leave Draft is about the draft, so it goes once the draft
+/// does, and once the view is in Row mode: the notice would otherwise stay
+/// over a view it no longer describes.
+#[gpui::test]
+fn the_refusal_to_leave_draft_is_taken_down_with_the_draft_and_with_the_switch(
+    cx: &mut TestAppContext,
+) {
+    use crate::{actions::DiscardEdits, result_grid::NewValue, session::EditMode};
+
+    const REFUSAL: &str = "The draft has 1 edit, so the view was not switched to Row mode.";
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(REFUSAL));
+
+        // Discard is the condition the refusal reported going away.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.discard_edits(&DiscardEdits, window, cx)
+            });
+        });
+        settle(cx);
+        assert_eq!(shown_notice(&workspace, cx), None);
+
+        // And the switch that follows says nothing of the refusal it replaces.
+        stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(REFUSAL));
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        click_selector(cx, "edit-mode-row");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        assert_eq!(shown_notice(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
