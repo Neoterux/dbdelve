@@ -7,7 +7,7 @@ use super::sidebar::front_row_id;
 use super::*;
 use crate::actions::{FocusSidebar, OpenSidebarItem, ToggleResults, ToggleResultsFocus};
 use crate::explorer::Shortcut;
-use crate::session::PendingDiscard;
+use crate::session::{AfterEdits, PendingDiscard};
 use crate::sidebar::{ViewMode, connection_row};
 use crate::tab_drag::{self, Drag, Slot};
 
@@ -1206,7 +1206,7 @@ impl Workspace {
         if let Some(profile) = self.profile_mut() {
             profile.session.pending_discard = Some(PendingDiscard {
                 tab,
-                deleting: None,
+                then: AfterEdits::Close { deleting: None },
             });
         }
         cx.notify();
@@ -1290,9 +1290,11 @@ impl Workspace {
         else {
             return;
         };
-        match discard.deleting {
-            Some(name) => self.delete_saved_query_now(name, window, cx),
-            None => self.close_now(discard.tab, window, cx),
+        match discard.then {
+            AfterEdits::Close {
+                deleting: Some(name),
+            } => self.delete_saved_query_now(name, window, cx),
+            _ => self.close_now(discard.tab, window, cx),
         }
         self.refocus_front();
     }

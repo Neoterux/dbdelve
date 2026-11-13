@@ -1617,7 +1617,13 @@ impl Workspace {
 
     pub(crate) fn render_discard_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = popup_theme(cx);
-        self.profile()?.session.pending_discard.as_ref()?;
+        let (title, sentence) = self
+            .profile()?
+            .session
+            .pending_discard
+            .as_ref()?
+            .then
+            .discards();
         let cancel_workspace = cx.entity().downgrade();
         let discard_workspace = cancel_workspace.clone();
 
@@ -1631,18 +1637,16 @@ impl Workspace {
                 .justify_center()
                 .child(
                     dialog(t)
-                        .child(section_label(t, "Close tab"))
+                        .child(section_label(t, title))
                         .child(
                             div()
                                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                                 .text_color(t.text_muted)
                                 // The edits are held against the fetched rows
-                                // and never written to them, so closing the
-                                // tab is the moment they stop existing.
-                                .child(
-                                    "This tab has cell edits that have not been applied. \
-                                     Closing it discards them.",
-                                ),
+                                // and never written to them, so whatever
+                                // replaces or closes them is the moment they
+                                // stop existing.
+                                .child(sentence),
                         )
                         .child(
                             div()

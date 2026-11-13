@@ -23509,3 +23509,189 @@ fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
         grid.focus_handle(cx).is_focused(window)
     })
 }
+
+const FIVE_BIRDS: &str = "create table birds (id integer primary key, name text not null); \
+     insert into birds values (1, 'wren'), (2, 'tit'), (3, 'kite'), (4, 'owl'), (5, 'jay');";
+
+/// What relation tab `id` would read next if asked again: its filter, sort,
+/// row limit and page offset, and whether its rows are owed a refresh.
+fn relation_view(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: u64,
+) -> (String, Vec<crate::sql::SortKey>, Option<usize>, usize, bool) {
+    workspace.read_with(cx, |workspace, _| {
+        let tab = workspace
+            .profile()
+            .and_then(|profile| profile.session.objects.iter().find(|tab| tab.id == id))
+            .expect("the relation tab is open");
+        let ObjectBody::Relation {
+            filter,
+            sort,
+            limit,
+            offset,
+            stale,
+            ..
+        } = &tab.body
+        else {
+            panic!("the tab is a relation");
+        };
+        (filter.clone(), sort.clone(), *limit, *offset, *stale)
+    })
+}
+
+/// The action the discard prompt holds, if it is up.
+fn discard_holds(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::session::AfterEdits> {
+    workspace.read_with(cx, |workspace, _| {
+        workspace
+            .profile()?
+            .session
+            .pending_discard
+            .as_ref()
+            .map(|discard| discard.then.clone())
+    })
+}
+
+/// Discard, as the prompt's button does it.
+fn confirm_discard(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.confirm_discard_close(window, cx)
+    });
+    settle(cx);
+}
+
+/// `rows` of the first column of the grid, as it shows them.
+fn first_column(grid: &Grid, cx: &mut VisualTestContext) -> Vec<String> {
+    grid.read_with(cx, |grid, _| {
+        let grid = grid.delegate();
+        (0..grid.result().rows.len())
+            .filter_map(|row| grid.cell(row, 0).map(str::to_string))
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn a_page_turn_over_a_draft_asks_first(cx: &mut TestAppContext) {
+    use crate::{
+        actions::{NextPage, SetRowLimit, SortColumn},
+        result_grid::NewValue,
+        session::AfterEdits,
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, FIVE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        cx.dispatch_action(SetRowLimit { rows: Some(2) });
+        settle(cx);
+        let grid = relation_grid(&workspace, cx, id);
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+
+        cx.dispatch_action(NextPage);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Requery { offset: 2, .. })
+        ));
+        assert_eq!(
+            relation_view(&workspace, cx, id),
+            before,
+            "the tab still claims the page it shows"
+        );
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(state_kind(&workspace, cx), "complete", "nothing ran");
+
+        // Cancel leaves it all as it was.
+        press(cx, "escape");
+        assert!(discard_holds(&workspace, cx).is_none());
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(first_column(&grid, cx), ["1", "2"]);
+
+        // Discard drops the edit and turns the page it was raised for.
+        cx.dispatch_action(NextPage);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        confirm_discard(&workspace, cx);
+        assert!(discard_holds(&workspace, cx).is_none());
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(relation_view(&workspace, cx, id).3, 2);
+        assert_eq!(first_column(&grid, cx), ["3", "4"]);
+        // Answered twice, it acts once.
+        confirm_discard(&workspace, cx);
+        assert_eq!(relation_view(&workspace, cx, id).3, 2);
+        assert_eq!(first_column(&grid, cx), ["3", "4"]);
+
+        // A header sort and a row limit change ask as a page turn does.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let before = relation_view(&workspace, cx, id);
+        cx.dispatch_action(SortColumn { column: 1 });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        press(cx, "escape");
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+
+        cx.dispatch_action(SetRowLimit { rows: Some(3) });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        press(cx, "escape");
+        assert_eq!(relation_view(&workspace, cx, id), before);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(first_column(&grid, cx), ["3", "4"]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn closing_a_tab_with_edits_asks_and_discard_closes_it(cx: &mut TestAppContext) {
+    use crate::{actions::CloseTab, result_grid::NewValue, session::AfterEdits};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        cx.simulate_input("select * from birds");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        let (tab_id, grid) = query_tab(&workspace, cx, |tab, _, _| (tab.id, tab.results.clone()));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+
+        cx.dispatch_action(CloseTab);
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("discard"));
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Close { deleting: None })
+        ));
+        let title = discard_holds(&workspace, cx).unwrap().discards().0;
+        assert_eq!(title, "Close tab");
+
+        press(cx, "escape");
+        assert!(discard_holds(&workspace, cx).is_none());
+        assert_eq!(pending_of(&grid, cx), 1, "the edit is kept");
+        let open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .unwrap()
+                    .session
+                    .query_tab(tab_id)
+                    .is_some()
+            })
+        };
+        assert!(open(cx), "the tab is kept");
+
+        cx.dispatch_action(CloseTab);
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        assert!(!open(cx), "Discard closes the tab");
+        quit(workspace, cx);
+    });
+}
