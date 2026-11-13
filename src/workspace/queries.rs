@@ -12,8 +12,8 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
-    Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename, Queue, Resume,
-    Routed, Step, TabKey, next_step, query_name_refusal, reveals_results,
+    AfterEdits, Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename,
+    Queue, Resume, Routed, Step, TabKey, next_step, query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -1938,7 +1938,9 @@ impl Workspace {
             if let Some(profile) = self.profile_mut() {
                 profile.session.pending_discard = Some(PendingDiscard {
                     tab,
-                    deleting: Some(name),
+                    then: AfterEdits::Close {
+                        deleting: Some(name),
+                    },
                 });
             }
             cx.notify();

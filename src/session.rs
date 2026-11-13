@@ -1766,11 +1766,57 @@ pub(crate) enum PendingDelete {
     Folder(String, usize),
 }
 
-/// A close held up by the unapplied-edits question, and the saved query to
-/// delete once the tab goes, when deleting it is what closes the tab.
+/// What a tab was asked to do while its grid held edits nobody had applied,
+/// kept as data so the prompt, and in Row mode the send, can carry it out once
+/// the edits are out of the way. Never a stored closure: every variant is the
+/// values the action was raised with, so a Discard runs what the user asked
+/// for and not what the tab has become since.
+#[derive(Clone)]
+pub(crate) enum AfterEdits {
+    /// Close the tab, and delete the saved query first when deleting it is
+    /// what closes the tab.
+    Close { deleting: Option<String> },
+    /// A relation tab's statement again, with the filter, sort, row limit and
+    /// page offset the action produced. The tab's own are untouched until it
+    /// runs, so a cancelled page turn leaves the page on screen as it was.
+    Requery {
+        filter: String,
+        sort: Vec<SortKey>,
+        limit: Option<usize>,
+        offset: usize,
+    },
+    /// A relation tab's rows read again as they stand.
+    Refresh,
+    /// The filter bars as the user just changed them. `before` is what they
+    /// were, put back on Cancel: the bars are the tab's state and were changed
+    /// by the caller before anything could ask.
+    Filter { before: Option<Vec<FilterRow>> },
+    /// The view's sorting switched to the server (`false`) or to memory.
+    ViewSorting(bool),
+    /// A query tab's Run.
+    Run,
+    /// A header click on a query tab's grid, on the server.
+    Sort(usize),
+    /// One of a finished queue's statements run again, as `sql`.
+    Rerun { index: usize, sql: String },
+}
+
+impl AfterEdits {
+    /// The prompt's title and its sentence: what the edits are discarded by.
+    pub(crate) fn discards(&self) -> (&'static str, &'static str) {
+        (
+            "Close tab",
+            "This tab has cell edits that have not been applied. Closing it discards them.",
+        )
+    }
+}
+
+/// An action held up by the unapplied-edits question, and what to do once the
+/// edits are gone. One slot: the prompt covers the tab, so no second action can
+/// be raised behind it.
 pub(crate) struct PendingDiscard {
     pub(crate) tab: Tab,
-    pub(crate) deleting: Option<String>,
+    pub(crate) then: AfterEdits,
 }
 
 /// The question Auto asks while a transaction is open, and whether its list
@@ -5133,5 +5179,47 @@ mod tests {
             assert_eq!(Depth::from_slug(depth.slug()), Some(depth));
         }
         assert_eq!(Depth::from_slug("everything"), None);
+    }
+
+    #[test]
+    fn the_discard_prompt_names_what_discards_the_edits() {
+        let close = (
+            "Close tab",
+            "This tab has cell edits that have not been applied. Closing it discards them.",
+        );
+        assert_eq!(AfterEdits::Close { deleting: None }.discards(), close);
+        let reading = (
+            "Discard edits",
+            "This tab has cell edits that have not been applied. Reading the rows again \
+             discards them.",
+        );
+        for then in [
+            AfterEdits::Requery {
+                filter: String::new(),
+                sort: Vec::new(),
+                limit: Some(2),
+                offset: 2,
+            },
+            AfterEdits::Refresh,
+            AfterEdits::Filter { before: None },
+            AfterEdits::ViewSorting(false),
+            AfterEdits::Sort(1),
+        ] {
+            assert_eq!(then.discards(), reading);
+        }
+        let running = (
+            "Discard edits",
+            "This tab has cell edits that have not been applied. Running the statement \
+             discards them.",
+        );
+        assert_eq!(AfterEdits::Run.discards(), running);
+        assert_eq!(
+            AfterEdits::Rerun {
+                index: 0,
+                sql: "select 1".into()
+            }
+            .discards(),
+            running
+        );
     }
 }
