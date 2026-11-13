@@ -10,7 +10,7 @@
 //! changed but their visibility.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -113,6 +113,7 @@ pub(crate) struct Profile {
     /// history file, `profiles.toml` or any log, since it is SQL text that
     /// ends with its session. Emptied with [`Profile::in_transaction`].
     pub(crate) transaction_statements: Vec<String>,
+    pub(crate) uncommitted: BTreeSet<u64>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
     /// `BEGIN` into the buffer where they can read it -- never onto the wire
