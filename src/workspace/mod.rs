@@ -1448,12 +1448,14 @@ impl Render for Workspace {
         if self.form.is_some() && self.settings_open {
             self.drop_settings(window, cx);
         }
-        // Both deferred to render for the `&mut Window` a background task
-        // does not have: a connect finds the picked database gone, and the
+        // All three deferred to render for the `&mut Window` a background task
+        // does not have: a connect finds the picked database gone, the
         // catalog that names these tabs resolves, off-thread, and neither a
-        // tab can be closed nor a grid built without a window.
+        // tab can be closed nor a grid built without a window, and a row send
+        // that landed releases the action it was sent for.
         self.leave_database_left_behind(window, cx);
         self.restore_objects(window, cx);
+        self.resume_parked(window, cx);
         self.sync_page_input(window, cx);
         self.sync_row_panel_filter(window, cx);
         self.sync_row_panel_inputs(window, cx);

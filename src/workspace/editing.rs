@@ -1642,6 +1642,10 @@ impl Workspace {
     /// `to` is the row the ring moved to when a row leave started the send, and
     /// `None` for Save, which does not move it. A send that fails, or is stopped
     /// by the mode, puts the ring back from `to` onto `row`.
+    ///
+    /// `then` is the action the user asked for that the row had to be saved
+    /// before (`held_for_edits`): carried out when the send lands, dropped on
+    /// every other outcome.
     pub(crate) fn save_row(
         &mut self,
         tab: u64,
@@ -1927,12 +1931,7 @@ impl Workspace {
         if let Tab::Object(object) = tab
             && profile.session.edit_mode(tab) == EditMode::Row
         {
-            let grid = results.read(cx).delegate();
-            let ring = grid.active().map(|(row, _)| row);
-            let row = ring
-                .filter(|row| grid.row_has_pending(*row))
-                .or_else(|| grid.first_pending_row());
-            if let Some(row) = row {
+            if let Some(row) = results.read(cx).delegate().row_to_send() {
                 self.save_row(object, row, None, None, cx);
             }
             return;

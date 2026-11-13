@@ -2074,6 +2074,15 @@ impl Workspace {
             .and_then(|profile| sql::gate(&verdict, profile.mode, &profile.confirmed));
 
         if stopped.is_some() {
+            // What a Row send was to be followed by does not wait on the
+            // prompt: a Run from it sends the row and the user repeats the
+            // action, which has by then read the rows it names.
+            let mut refresh = refresh;
+            if let Some(Refresh::Row { then, .. }) = &mut refresh
+                && let Some(then) = then.take()
+            {
+                self.put_back(tab, then);
+            }
             if let Some(profile) = self.profile_mut() {
                 profile.session.pending_run = Some(PendingRun {
                     resume: Some(Resume {
@@ -2355,6 +2364,11 @@ impl Workspace {
                 to,
                 ..
             }) => Some((*row, *rows_id, sent.clone(), *to)),
+            _ => None,
+        };
+        // The action the send was for, which its landing releases.
+        let row_then = match &refresh {
+            Some(Refresh::Row { then, .. }) => then.clone(),
             _ => None,
         };
         // A kept send touches neither: its rows, ring, scroll and edits stay.
@@ -3241,6 +3255,22 @@ impl Workspace {
                         && let Some((row, _, _, to)) = &row_sent
                     {
                         workspace.snap_back_to(tab, *row, *to, cx);
+                    }
+                    // Released only by a write that landed; every other
+                    // outcome cancels it, with the tab as it was. An action
+                    // already waiting is the user's own, and this one only a
+                    // re-read's.
+                    if let Some(then) = row_then
+                        && in_front_now
+                    {
+                        match row_said.is_some() {
+                            true => {
+                                if let Some(profile) = workspace.issued_to(&id, generation) {
+                                    profile.session.resume_after.get_or_insert((tab, then));
+                                }
+                            }
+                            false => workspace.put_back(tab, then),
+                        }
                     }
                     if let Some((said, reread)) = row_said {
                         // The relation is read again first: that clears the

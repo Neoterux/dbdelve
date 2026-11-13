@@ -2214,6 +2214,16 @@ impl ResultGrid {
         self.pending.first().map(|edit| edit.row)
     }
 
+    /// The row a Row view sends next, whether Save asks or an action that would
+    /// leave the rows does: the ring's when it holds edits, else the one edited
+    /// first. `None` when nothing is staged.
+    pub fn row_to_send(&self) -> Option<usize> {
+        self.active()
+            .map(|(row, _)| row)
+            .filter(|row| self.row_has_pending(*row))
+            .or_else(|| self.first_pending_row())
+    }
+
     /// Drops every staged edit of `row` and an input open on it, leaving the
     /// other rows' edits. For a row the server no longer has, or one whose
     /// relation is read again.
