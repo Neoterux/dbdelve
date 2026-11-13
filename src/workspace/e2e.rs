@@ -21909,6 +21909,7 @@ fn a_failed_apply_keeps_the_draft(cx: &mut TestAppContext) {
         );
 
         workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        settle(cx);
         grid.update(cx, |grid, _| {
             assert!(
                 grid.delegate_mut()

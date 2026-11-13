@@ -1649,9 +1649,10 @@ impl Workspace {
     /// The query tab: the batch is appended to the user's buffer, runs from
     /// there, and the `SELECT` that produced the grid runs after it.
     ///
-    /// The append is what keeps a failure readable. `execute_sql` clears the
-    /// grid as it starts, so the pending edits are gone either way — but the
-    /// statement that was attempted is still in the buffer.
+    /// The append is what keeps a failure readable: the statement that was
+    /// attempted is still in the buffer. On a target that answers
+    /// `Target::row_edits` a failure leaves the edits staged as well; elsewhere
+    /// `execute_sql` clears the grid as it starts and they go with it.
     pub(crate) fn apply_in_buffer(
         &mut self,
         batch: String,

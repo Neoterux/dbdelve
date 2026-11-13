@@ -1298,6 +1298,20 @@ impl Session {
         })
     }
 
+    /// Says what became of an edit send that failed or was refused, where the
+    /// statement is: in the review when one covers `tab`, otherwise in the
+    /// tab's notice, beside the statement appended to its buffer.
+    pub(crate) fn edit_failed(&mut self, tab: Tab, message: String) {
+        match self
+            .apply_review
+            .as_mut()
+            .filter(|review| review.covers(tab))
+        {
+            Some(review) => review.error = Some(message),
+            None => self.tab_notice = Some((tab, message)),
+        }
+    }
+
     pub(crate) fn query_tab(&self, id: u64) -> Option<&QueryTab> {
         self.queries.iter().find(|tab| tab.id == id)
     }

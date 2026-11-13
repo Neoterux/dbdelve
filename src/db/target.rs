@@ -212,7 +212,13 @@ impl Target {
     /// always have, because a batch there has no transaction and a draft kept
     /// after a part-way failure would be sent twice.
     pub fn row_edits(self) -> bool {
-        false
+        // ClickHouse reviews a query tab's edits (`reviews_query_edits`): its
+        // one-row guard is not in the statement text, so a batch there is not
+        // one the draft can be kept behind.
+        matches!(self.driver, Driver::BuiltIn)
+            && self.engine.syntax() == Syntax::Sql
+            && self.edits_rows()
+            && !self.reviews_query_edits()
     }
 
     /// What the review of a generated write says beyond its statements.
