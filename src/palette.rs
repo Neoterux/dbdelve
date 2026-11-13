@@ -467,6 +467,8 @@ pub enum Command {
     SortActiveColumn,
     /// The status bar's Client (`true`) or Server.
     SetViewSorting(bool),
+    /// The status bar's Draft or Row, on the table in front.
+    SetEditMode(crate::session::EditMode),
     /// The explorer menu's Copy DDL, for the relation in front.
     CopyDdl,
     /// The explorer menu's other copies: put this on the clipboard, and

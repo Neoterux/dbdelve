@@ -22720,6 +22720,115 @@ fn a_new_table_tab_starts_in_the_default_edit_mode(cx: &mut TestAppContext) {
     });
 }
 
+/// What the palette lists with nothing typed, closed again.
+fn palette_listing(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.simulate_keystrokes("secondary-shift-p");
+    settle(cx);
+    let labels = palette_labels(workspace, cx);
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    labels
+}
+
+#[gpui::test]
+fn the_palette_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let has = |rows: &[String], label: &str| rows.iter().any(|row| row == label);
+
+        let rows = palette_listing(&workspace, cx);
+        assert!(!has(&rows, "Edit in Row mode"), "{rows:?}");
+        assert!(!has(&rows, "Edit in Draft mode"), "{rows:?}");
+
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Edit in Row mode"), "{rows:?}");
+        assert!(!has(&rows, "Edit in Draft mode"), "{rows:?}");
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Edit in Row mode");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Edit in Draft mode"), "{rows:?}");
+        assert!(!has(&rows, "Edit in Row mode"), "{rows:?}");
+        assert!(!has(&rows, "Save row"), "nothing is staged: {rows:?}");
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Save row"), "{rows:?}");
+        assert!(!has(&rows, "Apply edits"), "{rows:?}");
+
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Edit in Draft mode");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Apply edits"), "{rows:?}");
+        assert!(!has(&rows, "Save row"), "{rows:?}");
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_table_without_a_key_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table logs (note text, at text); \
+             insert into logs values ('a', 'x');",
+        );
+        let id = open_own_table(&workspace, cx, "logs");
+        let grid = relation_grid(&workspace, cx, id);
+        // Whether any cell takes an edit, and what the grid says about why not.
+        let staged = |cx: &mut VisualTestContext| {
+            grid.update(cx, |grid, _| {
+                let grid = grid.delegate_mut();
+                let staged: Vec<bool> = (0..2)
+                    .map(|col| grid.set_pending(0, col, NewValue::Value("b".into())))
+                    .collect();
+                (
+                    staged,
+                    grid.read_only_reason().map(str::to_string),
+                    grid.pending_count(),
+                )
+            })
+        };
+        let in_draft = staged(cx);
+        assert_eq!(in_draft, (vec![false, false], None, 0));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+        assert_eq!(staged(cx), in_draft, "Row mode adds no way to stage");
+        save(&workspace, cx);
+        assert_eq!(front_review(&workspace, cx), None);
+        assert_eq!(on_disk("select note from logs").as_deref(), Some("a"));
+        assert_eq!(history_sql(&workspace, cx), Vec::<String>::new());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Draft, cx)
+        });
+        assert_eq!(staged(cx), in_draft, "and Draft is as it was");
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn delete_row_and_new_row_keep_their_review_and_form_in_a_row_view(cx: &mut TestAppContext) {
     use crate::session::EditMode;
