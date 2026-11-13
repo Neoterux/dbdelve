@@ -46,7 +46,8 @@ require it, stop and raise it instead.
    comment the user wrote. Row mode is the one exception: on a relation tab
    whose view the user has put in Row mode, a row's `UPDATE` is sent when the
    user leaves the row, presses Save, or takes an action that saves it first,
-   with no buffer and no dialog. That send is the user's own act; it still
+   with no buffer and no dialog, and nothing else sends it (a read after a send
+   never sends another row). That send is the user's own act; it still
    passes `sql::is_generated_write_on` and the connection-mode check as it is
    sent, is written to the query history, and the last one is shown in the
    status line. Draft, the default, sends nothing unread, and no agent's

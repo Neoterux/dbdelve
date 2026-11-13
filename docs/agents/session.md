@@ -739,8 +739,13 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   (`sql::row_read`). The landing replaces that row where it stands
   (`ResultGrid::replace_row`) and clears the cells that were sent
   (`clear_sent`), so a cell staged while the send was out stays staged. A
-  vanished or unreadable row reads the table again instead. A send is refused
-  while a review covers the tab, and a tab sends one row at a time.
+  vanished or unreadable row reads the table again instead, unless another
+  row of the tab still holds edits: that read would send them, and nothing is
+  sent without the user's act, so those rows are kept, the tab is marked stale
+  and the status line says the rows were not read again. A read-back is
+  checked with `sql::is_generated_select` where it runs; one that fails the
+  gate is not run and leaves the tab stale. A send is refused while a review
+  covers the tab, and a tab sends one row at a time.
 
   A refused send (the server's, the gate's, or a mode that stopped it) never
   sets `Failed`. The row keeps its edits and is marked with the message
@@ -751,14 +756,23 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   Every action that would replace or leave the rows saves the dirty row first
   and goes ahead only when that save lands: a page turn, row limit, sort,
   filter, refresh, tab switch, tab close, a switch to Draft. This is
-  `Workspace::held_for_edits`' Row branch, so a Row view never meets the
-  discard prompt the next bullets describe. The action travels with the send as
-  data (`Refresh::Row::then`, an `AfterEdits`) and is released by the landing
-  into `Session::resume_after`, which render drains through
-  `Workspace::resume_parked`; only a write that landed releases it, and any
-  other outcome drops it and restores what the action had already changed
-  (`Workspace::put_back`). A Row write inside the open transaction is shown as
-  uncommitted (see that bullet).
+  `Workspace::held_for_edits`' Row branch, so a Row view meets the discard
+  prompt the next bullets describe only over a row the server has refused. The
+  action travels with the send as data (`Refresh::Row::then`, an `AfterEdits`)
+  and is released by the landing into `Session::resume_after`, which render
+  drains through `Workspace::resume_parked`; only a write that landed releases
+  it, and every other way it can be dropped (a refused or stopped send, a
+  closed connection, a landing behind another connection, an action already
+  waiting, the prompts being cleared) restores what the action had already
+  changed (`Session::put_back`).
+
+  A row the server refused stays marked until it is edited, reverted or sent,
+  so an action that meets the mark does not send the row again: it raises the
+  Discard / Cancel prompt (`PendingDiscard::row`). Discard drops that row's
+  edits alone and carries the action out, which sends any other dirty row
+  first; Cancel keeps everything. The refusal's notice says Esc puts the row
+  back. A Row write inside the open transaction is shown as uncommitted (see
+  that bullet).
 
   An `UPDATE` matches on the key alone, in both modes. A row changed on the
   server since it was fetched is overwritten, and nothing detects it: a stale
