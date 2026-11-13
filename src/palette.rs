@@ -4292,6 +4292,22 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             RESULTS,
         ));
     }
+    // The status bar's Draft and Row, as the one the view is not in.
+    let edit_mode = crate::views::view_edit_mode(profile);
+    if let Some(mode) = edit_mode {
+        let (label, other) = match mode {
+            crate::session::EditMode::Draft => ("Edit in Row mode", crate::session::EditMode::Row),
+            crate::session::EditMode::Row => {
+                ("Edit in Draft mode", crate::session::EditMode::Draft)
+            }
+        };
+        items.push(command(
+            label,
+            icon::RENAME,
+            Command::SetEditMode(other),
+            RESULTS,
+        ));
+    }
     // Not the active cell's: the columns come back whichever cell is ringed.
     if let Some(hidden) = shown_grid
         .map(|grid| grid.hidden_columns())
@@ -4335,7 +4351,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     // pair of buttons is conditional too.
     if workspace.has_pending_edits(cx) {
         items.push(command(
-            "Apply edits",
+            crate::views::apply_label(edit_mode),
             icon::SAVE,
             Command::ApplyEdits,
             EDITS,
