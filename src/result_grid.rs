@@ -304,6 +304,9 @@ pub struct ResultGrid {
     /// it ([`Self::take_left_row`]). The grid does not know the view's edit mode,
     /// so it only records.
     left_row: Option<usize>,
+    /// The row whose send the server refused, and what it said, until that row
+    /// is edited, reverted or sent.
+    send_failure: Option<(usize, String)>,
     /// When these rows were snapshotted, for a grid that came off disk.
     ///
     /// Held here rather than on the tab because a completed run replaces the
@@ -544,6 +547,7 @@ impl ResultGrid {
             pending: Vec::new(),
             editing: None,
             left_row: None,
+            send_failure: None,
             captured: None,
             streamed: None,
             filled: None,
@@ -1813,6 +1817,19 @@ impl ResultGrid {
     /// after a ring move to decide whether a Row view sends it.
     pub(crate) fn take_left_row(&mut self) -> Option<usize> {
         self.left_row.take()
+    }
+
+    /// The row whose send the server refused and the words it said, drawn on
+    /// that row's gutter cell.
+    pub fn send_failure(&self) -> Option<(usize, &str)> {
+        self.send_failure
+            .as_ref()
+            .map(|(row, message)| (*row, message.as_str()))
+    }
+
+    /// Marks `row` as the one the server refused.
+    pub fn set_send_failure(&mut self, row: usize, message: String) {
+        self.send_failure = Some((row, message));
     }
 
     /// `sort_in_memory` for rows a snapshot restored already in `keys`' order.
