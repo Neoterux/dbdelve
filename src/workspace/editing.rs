@@ -1647,6 +1647,7 @@ impl Workspace {
         tab: u64,
         row: usize,
         to: Option<usize>,
+        then: Option<AfterEdits>,
         cx: &mut Context<Self>,
     ) -> bool {
         let tab = Tab::Object(tab);
@@ -1725,6 +1726,7 @@ impl Workspace {
                 read,
                 sent,
                 to,
+                then,
             }),
             false,
             None,
@@ -1885,7 +1887,7 @@ impl Workspace {
             self.note("The previous row is still being saved.".into(), cx);
             return;
         }
-        self.save_row(tab, row, ring, cx);
+        self.save_row(tab, row, ring, None, cx);
     }
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
@@ -1931,7 +1933,7 @@ impl Workspace {
                 .filter(|row| grid.row_has_pending(*row))
                 .or_else(|| grid.first_pending_row());
             if let Some(row) = row {
-                self.save_row(object, row, None, cx);
+                self.save_row(object, row, None, None, cx);
             }
             return;
         }
