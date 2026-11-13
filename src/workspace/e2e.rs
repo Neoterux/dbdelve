@@ -23251,6 +23251,61 @@ fn escape_reverts_the_dirty_row(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_refused_rows_mark_and_escape_follow_the_row_into_a_client_sort(cx: &mut TestAppContext) {
+    use crate::{actions::SortColumn, result_grid::NewValue};
+
+    store::tests::with_home(|| {
+        // Byte order puts a capital ahead of every lowercase letter and the
+        // client's sort does not, so entering memory moves `Wren` down a row.
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text not null, n integer); \
+             insert into birds values (1, 'Wren', 1), (2, 'tit', 2), (3, 'Kite', 3);",
+        );
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.sort_column(&SortColumn { column: 1 }, window, cx)
+        });
+        settle_through(cx);
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some("Wren"));
+
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 1, 1);
+        stage(&grid, cx, 1, 1, NewValue::Null);
+        press(cx, "down");
+        assert_eq!(refused_row(&grid, cx).map(|(row, _)| row), Some(1));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_view_sorting(true, window, cx)
+        });
+        settle(cx);
+        assert_eq!(
+            cell_of(&grid, cx, 2, 1).as_deref(),
+            Some("Wren"),
+            "it moved"
+        );
+        assert_eq!(
+            refused_row(&grid, cx).map(|(row, _)| row),
+            Some(2),
+            "the mark is on the row the server refused"
+        );
+        assert_eq!(pending_of(&grid, cx), 1);
+
+        // Esc on the moved row puts that row back, and no other.
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 2, 1);
+        press(cx, "escape");
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("Wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn escape_reverts_nothing_in_a_draft_view(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
 
