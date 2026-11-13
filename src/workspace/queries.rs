@@ -3314,15 +3314,24 @@ impl Workspace {
                     {
                         profile.session.mark_stale(object);
                     }
-                    if let Some((said, reread)) = row_said {
+                    if let Some((mut said, reread)) = row_said {
                         // The relation is read again first: that clears the
                         // notices, and the last send is what the status line
-                        // is to show.
-                        if reread
-                            && in_front_now
-                            && let Tab::Object(object) = tab
-                        {
-                            workspace.refresh_relation(object, cx);
+                        // is to show. Not over another row's edits: the read
+                        // would send them, and nothing is sent without the
+                        // user's act. Those rows are kept and the tab is owed
+                        // the read, which its next refresh or visit does.
+                        if reread && let Tab::Object(object) = tab {
+                            if in_front_now && !workspace.has_unapplied_edits(tab, cx) {
+                                workspace.refresh_relation(object, cx);
+                            } else {
+                                if in_front_now {
+                                    said = format!("{said} {}", Self::NOT_READ_AGAIN);
+                                }
+                                if let Some(profile) = workspace.issued_to(&id, generation) {
+                                    profile.session.mark_stale(object);
+                                }
+                            }
                         }
                         if let Some(profile) = workspace.issued_to(&id, generation) {
                             profile.session.notice = None;
@@ -3496,6 +3505,10 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// Said after a Row send that left the relation owed a read, over a tab
+    /// that still holds another row's edits.
+    const NOT_READ_AGAIN: &str = "The rows were not read again: this tab has unapplied edits.";
 
     /// Said after an edit send succeeded over a grid that still holds edits,
     /// which the re-read would have dropped unseen.
