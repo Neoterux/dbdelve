@@ -3124,6 +3124,7 @@ pub(crate) fn render_paging(
                             Control::Compact,
                             t,
                         )
+                        .debug_selector(|| "next-page".into())
                         .tooltip("Next page")
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(Box::new(NextPage), cx);
