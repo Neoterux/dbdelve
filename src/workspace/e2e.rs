@@ -25836,18 +25836,21 @@ fn crowded_status_bar(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visua
 /// What the status bar items paint, each with the box of the group that
 /// clips it (an item taller or wider than its group is cut at the group's
 /// edge, not drawn over what is next to it).
-const STATUS_ITEMS: [(&str, &str); 13] = [
+const STATUS_ITEMS: [(&str, &str); 16] = [
     ("status-connection", "status-bar"),
     ("transaction-commit", "status-bar"),
     ("transaction-rollback", "status-bar"),
     ("edit-mode-draft", "status-chips"),
     ("edit-mode-row", "status-chips"),
     ("uncommitted-rows", "status-chips"),
-    ("status-stats", "status-stats-group"),
-    ("count-rows", "status-stats-group"),
+    ("discard-edits", "status-pending"),
+    ("apply-edits", "status-pending"),
     ("status-notice", "status-bar"),
+    ("status-sort", "status-bar"),
+    ("status-stats", "status-stats-group"),
     ("status-paging", "status-bar"),
     ("status-readout", "status-actions"),
+    ("count-rows", "status-actions"),
     ("import-rows", "status-actions"),
     ("export-results", "status-actions"),
 ];
@@ -25873,26 +25876,172 @@ fn painted_status_items(
         .collect()
 }
 
+/// The window sizes the status bar is checked at, each with the sidebar open
+/// and closed.
+const STATUS_WIDTHS: [f32; 4] = [1536., 1100., 700., 500.];
+
+fn resize_to(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    width: f32,
+    sidebar_hidden: bool,
+) {
+    workspace.update(cx, |workspace, _| workspace.sidebar_hidden = sidebar_hidden);
+    cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.)));
+    settle(cx);
+}
+
+/// Whether the item is drawn whole inside the bar, which is not the same as
+/// being laid out: an item pushed past the bar's edge still has bounds.
+fn drawn_whole(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    let bar = cx.debug_bounds("status-bar").expect("the bar is drawn");
+    cx.debug_bounds(selector)
+        .is_some_and(|item| item.intersect(&bar) == item)
+}
+
+/// A pending edit on the table in front, in Draft, where the staged-edit
+/// group is the only way to apply it.
+fn draft_with_a_pending_edit(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    use crate::result_grid::NewValue;
+
+    click_selector(cx, "edit-mode-draft");
+    let id = workspace.read_with(cx, |workspace, _| {
+        match workspace.profile().unwrap().session.active {
+            Tab::Object(id) => id,
+            Tab::Query(_) => panic!("a table is in front"),
+        }
+    });
+    let grid = relation_grid(workspace, cx, id);
+    stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+    settle(cx);
+}
+
 #[gpui::test]
 fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = crowded_status_bar(cx);
-        for hidden in [false, true] {
-            workspace.update(cx, |workspace, _| workspace.sidebar_hidden = hidden);
-            for width in [1536., 1100., 700., 500.] {
-                cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.)));
-                settle(cx);
-                let painted = painted_status_items(cx);
-                for (index, (first, first_box)) in painted.iter().enumerate() {
-                    for (second, second_box) in &painted[index + 1..] {
-                        assert!(
-                            !first_box.intersects(second_box),
-                            "{first} {first_box:?} is drawn over {second} {second_box:?} at \
-                             {width}px, sidebar hidden {hidden}"
-                        );
+        // The bar as a Row save leaves it, then as a Draft with an edit staged
+        // holds it, with the transaction and its badge still showing.
+        for staged in [false, true] {
+            if staged {
+                draft_with_a_pending_edit(&workspace, cx);
+            }
+            for hidden in [false, true] {
+                for width in STATUS_WIDTHS {
+                    resize_to(&workspace, cx, width, hidden);
+                    let painted = painted_status_items(cx);
+                    for (index, (first, first_box)) in painted.iter().enumerate() {
+                        for (second, second_box) in &painted[index + 1..] {
+                            assert!(
+                                !first_box.intersects(second_box),
+                                "{first} {first_box:?} is drawn over {second} {second_box:?} at \
+                                 {width}px, sidebar hidden {hidden}, staged {staged}"
+                            );
+                        }
                     }
                 }
             }
+        }
+        quit(workspace, cx);
+    });
+}
+
+/// What the bar keeps, most first, as its width runs out: the control that
+/// ends the transaction, the Edit chips, the badge, the staged-edit group, the
+/// notice, then Sort. An item is never whole while one above it is not.
+const KEPT_IN_ORDER: [&str; 6] = [
+    "transaction-rollback",
+    "edit-mode-row",
+    "uncommitted-rows",
+    "apply-edits",
+    "status-notice",
+    "status-sort",
+];
+
+#[gpui::test]
+fn the_status_bar_gives_up_sort_before_the_edit_chips_and_the_staged_edits(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = crowded_status_bar(cx);
+        draft_with_a_pending_edit(&workspace, cx);
+        for hidden in [false, true] {
+            for width in STATUS_WIDTHS {
+                resize_to(&workspace, cx, width, hidden);
+                let whole: Vec<bool> = KEPT_IN_ORDER
+                    .iter()
+                    .map(|item| drawn_whole(cx, item))
+                    .collect();
+                if let Some(first_cut) = whole.iter().position(|whole| !whole) {
+                    assert!(
+                        whole[first_cut..].iter().all(|whole| !whole),
+                        "{KEPT_IN_ORDER:?} are whole as {whole:?} at {width}px, sidebar \
+                         hidden {hidden}: one is kept over another it should give way to"
+                    );
+                }
+            }
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_staged_edit_buttons_are_drawn_whole_where_the_transaction_leaves_room(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        // No transaction: Discard and Apply edits are drawn whole at 700 px,
+        // with the sidebar open and closed, beside the Edit chips.
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        open_own_table(&workspace, cx, "birds");
+        draft_with_a_pending_edit(&workspace, cx);
+        for hidden in [false, true] {
+            resize_to(&workspace, cx, 700., hidden);
+            for item in ["edit-mode-row", "discard-edits", "apply-edits"] {
+                assert!(
+                    drawn_whole(cx, item),
+                    "{item} is cut off at 700px, sidebar hidden {hidden}"
+                );
+            }
+        }
+        quit(workspace, cx);
+    });
+    store::tests::with_home(|| {
+        // With a transaction open and its badge showing the control that ends
+        // it, the Edit chips, the badge and the buttons need 981px of bar; at
+        // 700px they do not fit together (see `KEPT_IN_ORDER`).
+        let (workspace, cx) = crowded_status_bar(cx);
+        draft_with_a_pending_edit(&workspace, cx);
+        for (width, hidden) in [(1536., false), (1536., true), (1100., true)] {
+            resize_to(&workspace, cx, width, hidden);
+            for item in [
+                "transaction-rollback",
+                "edit-mode-row",
+                "uncommitted-rows",
+                "discard-edits",
+                "apply-edits",
+            ] {
+                assert!(
+                    drawn_whole(cx, item),
+                    "{item} is cut off at {width}px, sidebar hidden {hidden}"
+                );
+            }
+        }
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn count_stays_reachable_beside_the_badge_and_the_transaction_at_1536px(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = crowded_status_bar(cx);
+        for hidden in [false, true] {
+            resize_to(&workspace, cx, 1536., hidden);
+            assert!(drawn_whole(cx, "uncommitted-rows"));
+            assert!(
+                drawn_whole(cx, "count-rows"),
+                "Count is a button, and is cut off with the sidebar hidden {hidden}"
+            );
         }
         quit(workspace, cx);
     });

@@ -2104,7 +2104,12 @@ impl Render for Workspace {
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
-                        .children(view_sorting)
+                        .children(view_sorting.map(|sort| {
+                            div()
+                                .debug_selector(|| "status-sort".into())
+                                .flex_shrink_0()
+                                .child(sort)
+                        }))
                         .children(edit_mode)
                         .children(uncommitted),
                 )
@@ -2289,6 +2294,7 @@ impl Render for Workspace {
                 // nobody knows is about to be written.
                 .child(
                     div()
+                        .debug_selector(|| "status-pending".into())
                         .flex_shrink_0()
                         .flex()
                         .items_center()
@@ -2347,6 +2353,7 @@ impl Render for Workspace {
                         }))
                         .children(has_pending.then(|| {
                             button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "discard-edits".into())
                                 .on_click(move |_, window, cx| {
                                     _ = discard_workspace.update(cx, |workspace, cx| {
                                         workspace.discard_edits(&DiscardEdits, window, cx);
@@ -2361,6 +2368,7 @@ impl Render for Workspace {
                                 Control::Compact,
                                 t,
                             )
+                            .debug_selector(|| "apply-edits".into())
                             .on_click(move |_, window, cx| {
                                 _ = apply_workspace.update(cx, |workspace, cx| {
                                     workspace.apply_edits(&ApplyEdits, window, cx);
