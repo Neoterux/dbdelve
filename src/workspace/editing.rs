@@ -1568,9 +1568,6 @@ impl Workspace {
     /// draft, and one switch must not turn them into sends, one row at a time,
     /// that nobody reviewed. Row to Draft is always allowed, as there is nothing
     /// staged that the other mode would not hold.
-    // The view's control and the palette call it, and land after the send does:
-    // until then only the tests do.
-    #[allow(dead_code)]
     pub(crate) fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
         let mode = mode.on(self.target());
         let Some(profile) = self.profile() else {

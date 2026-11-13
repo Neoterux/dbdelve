@@ -1619,8 +1619,6 @@ impl Session {
     }
 
     /// `Some` only for a relation tab, the one view with a mode to change.
-    // Called by `Workspace::set_edit_mode`, which only the tests call yet.
-    #[allow(dead_code)]
     pub(crate) fn edit_mode_mut(&mut self, tab: Tab) -> Option<&mut EditMode> {
         match tab {
             Tab::Query(_) => None,
