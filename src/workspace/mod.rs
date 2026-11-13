@@ -1793,6 +1793,7 @@ impl Render for Workspace {
         let edit_mode = views::render_edit_mode(profile, cx);
         let apply_label = views::apply_label(views::view_edit_mode(profile));
         let transaction = views::render_transaction(profile, cx);
+        let uncommitted = views::render_uncommitted(profile, cx);
         let hidden_columns = views::render_hidden_columns(profile, cx);
         let relation = profile
             .session
@@ -2056,6 +2057,7 @@ impl Render for Workspace {
             || view_sorting.is_some()
             || edit_mode.is_some()
             || transaction.is_some()
+            || uncommitted.is_some()
             || hidden_columns.is_some()
             || query_status.is_some()
             || refreshable_snapshot
@@ -2091,6 +2093,7 @@ impl Render for Workspace {
                         .gap(px(layout::SPACE_SM))
                         .children(view_sorting)
                         .children(edit_mode)
+                        .children(uncommitted)
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
                             div()

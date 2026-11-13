@@ -113,6 +113,10 @@ pub(crate) struct Profile {
     /// history file, `profiles.toml` or any log, since it is SQL text that
     /// ends with its session. Emptied with [`Profile::in_transaction`].
     pub(crate) transaction_statements: Vec<String>,
+    /// The relation tabs, by id, whose Row-mode writes joined the open
+    /// transaction, for the status bar to say they are not committed. Held in
+    /// memory only and ended with [`Profile::transaction_statements`]
+    /// ([`Profile::end_uncommitted`]).
     pub(crate) uncommitted: BTreeSet<u64>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
@@ -193,7 +197,10 @@ impl Profile {
     /// transaction was open before it.
     pub(crate) fn record_sent(&mut self, sql: &str, transaction: Option<bool>) {
         match transaction {
-            Some(false) => self.transaction_statements.clear(),
+            Some(false) => {
+                self.transaction_statements.clear();
+                self.end_uncommitted();
+            }
             // The record must hold everything the next COMMIT ends, so it
             // restarts only when the open transaction really ended: none was
             // open, this submission ends one before opening the next, or the
@@ -204,6 +211,7 @@ impl Profile {
             Some(true) => {
                 let engine = self.config.engine();
                 if crate::sql::ends_transaction(engine, sql) {
+                    self.end_uncommitted();
                     // Only what follows the last end belongs to the new
                     // transaction: the `COMMIT;` Manual sends ahead of its
                     // `BEGIN;` closed the one before.
@@ -213,6 +221,7 @@ impl Profile {
                         false => vec![rest.to_string()],
                     };
                 } else if !self.in_transaction || engine.begin_ends_open_transaction() {
+                    self.end_uncommitted();
                     self.transaction_statements = vec![sql.to_string()];
                 } else {
                     self.transaction_statements.push(sql.to_string());
@@ -220,6 +229,24 @@ impl Profile {
             }
             None if self.in_transaction => self.transaction_statements.push(sql.to_string()),
             None => {}
+        }
+    }
+
+    /// The transaction the Row-mode writes of [`Profile::uncommitted`] were
+    /// in has ended, so the tabs that showed them are owed a re-read: a
+    /// rollback undid what their grids show, and which way it ended is not
+    /// read off the statement.
+    pub(crate) fn end_uncommitted(&mut self) {
+        for id in std::mem::take(&mut self.uncommitted) {
+            if let Some(ObjectBody::Relation { stale, .. }) = self
+                .session
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .map(|tab| &mut tab.body)
+            {
+                *stale = true;
+            }
         }
     }
 

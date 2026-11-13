@@ -1506,6 +1506,7 @@ impl Workspace {
         profile.state = ProfileState::Idle;
         profile.in_transaction = false;
         profile.transaction_statements.clear();
+        profile.end_uncommitted();
         profile.session.auto_after_end = None;
         profile.session_changed = false;
         profile.session.clear_prompts();
@@ -2070,6 +2071,7 @@ impl Workspace {
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
         profile.transaction_statements.clear();
+        profile.end_uncommitted();
         profile.session.auto_after_end = None;
         // The transaction it was holding died with the session, and silently
         // opening another on a connection the user has just watched drop is
