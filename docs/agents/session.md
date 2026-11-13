@@ -717,6 +717,21 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   must not reach the server unasked. Rows are reordered in place rather than
   through a display permutation, so every row index in the grid names the row
   on screen; pending edits move with their rows.
+- **An edit send keeps the grid, on a transactional SQL engine.** Where the
+  target answers `Target::row_edits()`, a statement dbdelve sends for a grid
+  edit (an Apply edits batch, an Insert, a Delete row) leaves the rows, the
+  ring and the pending edits where they are until the server answers, because
+  the error pane that `QueryState::Failed` draws would cover the rows the
+  edits are staged on. A failure or a refusal puts the tab's state back and is
+  shown in the review (`ApplyReview::error`) or, with none over the tab, in the
+  tab's notice, never as `Failed`. A success clears the cells it sent, read off
+  the grid when it was sent (`ApplyReview::edits` says whether a reviewed send
+  carried the draft), and re-reads; when edits remain (an Insert or Delete over
+  a draft, an edit staged while the batch was in flight) it keeps them and does
+  not re-read. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
+  a plugin) an edit send clears the grid as it starts and a failure is
+  `QueryState::Failed`: a batch with no transaction that failed part way has
+  already applied some of a draft, and keeping it would send those rows again.
 - **`queries` can be empty.** Any buffer can be closed, the last one
   included, and a profile with no tab open shows an empty pane and relaunches
   that way. A new connection, and one written before buffers were tabs, opens
