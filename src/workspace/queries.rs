@@ -2310,14 +2310,17 @@ impl Workspace {
                 .collect();
             (grid.rows_id(), cells)
         });
-        // A Row send's one row, with the cells it carries, read now for the
-        // same reason: the landing clears those and no edit staged since.
+        // A Row send's one row, the cells it carries and where the ring went
+        // as it was left, taken now: the landing clears those cells and no
+        // edit staged since, and puts the ring back from `to` after a refusal.
         let row_sent = match &refresh {
-            Some(Refresh::Row { row, rows_id, .. }) => Some((
-                *row,
-                *rows_id,
-                results.read(cx).delegate().pending_cells(*row),
-            )),
+            Some(Refresh::Row {
+                row,
+                rows_id,
+                sent,
+                to,
+                ..
+            }) => Some((*row, *rows_id, sent.clone(), *to)),
             _ => None,
         };
         // A kept send touches neither: its rows, ring, scroll and edits stay.
@@ -2915,7 +2918,7 @@ impl Workspace {
                                 if let Some(previous) = restored {
                                     *state = previous;
                                 }
-                                if let Some((row, rows_id, cells)) = &row_sent {
+                                if let Some((row, rows_id, cells, _)) = &row_sent {
                                     let sent = row_statement.as_deref().unwrap_or_default();
                                     let status = match result.rows_affected {
                                         Some(1) => format!("1 row updated: {sent}"),
@@ -3100,6 +3103,17 @@ impl Workspace {
                                 if let Some(previous) = restored {
                                     *state = previous;
                                 }
+                                // The row says what the server said to it, and
+                                // keeps its edits.
+                                if let Some((row, rows_id, _, _)) = &row_sent {
+                                    results.update(cx, |table, cx| {
+                                        let grid = table.delegate_mut();
+                                        if grid.rows_id() == *rows_id {
+                                            grid.set_send_failure(*row, error.message.clone());
+                                        }
+                                        cx.notify();
+                                    });
+                                }
                                 (false, false, None, Vec::new(), Some(error.message), landed)
                             }
                             Err(mut error) => {
@@ -3185,6 +3199,15 @@ impl Workspace {
                     let in_front_now = workspace.profile().is_some_and(|profile| {
                         profile.id == id && profile.generation == generation
                     });
+                    // A refused or cancelled row send leaves the row dirty, so the
+                    // ring the user moved off it goes back, unless they have
+                    // moved it on since (`snap_back_to`).
+                    if !succeeded
+                        && in_front_now
+                        && let Some((row, _, _, to)) = &row_sent
+                    {
+                        workspace.snap_back_to(tab, *row, *to, cx);
+                    }
                     if let Some((said, reread)) = row_said {
                         // The relation is read again first: that clears the
                         // notices, and the last send is what the status line
