@@ -2101,6 +2101,27 @@ impl ResultGrid {
         self.editing = None;
     }
 
+    /// The staged edits of `row`, by column, as a send carries them.
+    pub fn pending_cells(&self, row: usize) -> Vec<(usize, NewValue)> {
+        self.pending
+            .iter()
+            .filter(|edit| edit.row == row)
+            .map(|edit| (edit.col, edit.value.clone()))
+            .collect()
+    }
+
+    /// Removes from `row` only the staged edits whose column and value are in
+    /// `sent`: an edit staged after `sent` was taken, or staged again with
+    /// another value, stays.
+    pub fn clear_sent(&mut self, row: usize, sent: &[(usize, NewValue)]) {
+        self.pending.retain(|edit| {
+            edit.row != row
+                || !sent
+                    .iter()
+                    .any(|(col, value)| *col == edit.col && *value == edit.value)
+        });
+    }
+
     /// One entry per changed row, in the order the rows were first edited, with
     /// every changed column of that row in a single `SET`.
     ///

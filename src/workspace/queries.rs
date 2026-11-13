@@ -2137,6 +2137,23 @@ impl Workspace {
                 None => profile.own_write_refusal(&sql),
             })
             .flatten();
+        // An edit sent to a transactional SQL engine leaves the grid and the
+        // draft where they are until the server answers, so a refusal or a
+        // failure costs the user nothing. Not for a target whose batch has no
+        // transaction (`Target::row_edits`): what failed part way there has
+        // already applied some of the draft, and keeping it would send those
+        // rows again.
+        let kept = edit && target.row_edits();
+        // Whether the batch is the grid's staged cells: Apply edits, from its
+        // review or appended to a query tab's buffer. An Insert or a Delete
+        // row sends none of them, and a relation tab's send without a review
+        // has a landing of its own.
+        let carries = kept
+            && match (profile.session.apply_review.as_ref(), tab) {
+                (Some(review), _) if review.covers(tab) => review.edits,
+                (_, Tab::Query(_)) => true,
+                (_, Tab::Object(_)) => false,
+            };
         // A statement the user typed as an `EXPLAIN` is theirs, run and kept in
         // the history as typed; only its answer goes where the Explain
         // command's does. Not in a queue, where every result holds a grid.
@@ -2160,10 +2177,16 @@ impl Workspace {
         }
 
         if !routed.is_available() {
-            *state = QueryState::Failed(DbError {
-                message: "The connection is not open.".into(),
-                position: None,
-            });
+            if kept {
+                profile
+                    .session
+                    .edit_failed(tab, "The connection is not open.".into());
+            } else {
+                *state = QueryState::Failed(DbError {
+                    message: "The connection is not open.".into(),
+                    position: None,
+                });
+            }
             cx.notify();
             if let Some(lane) = lane {
                 self.land_lane(tab, lane, Vec::new(), cx);
@@ -2199,8 +2222,10 @@ impl Workspace {
             },
         );
         // What a cancelled refresh goes back to: the rows it kept on screen
-        // are still the ones that state describes.
-        let restored = keep_rows.then_some(previous);
+        // are still the ones that state describes. A kept edit send goes back
+        // to it on either outcome, since `Failed` would draw the error over
+        // the rows the draft is staged on.
+        let restored = (keep_rows || kept).then_some(previous);
         // The spinner beside the clock redraws every frame, but not under
         // reduce motion, so the clock cannot lean on it to tick.
         cx.spawn({
@@ -2260,7 +2285,27 @@ impl Workspace {
                 table.delegate().column_view(),
             )
         };
-        if !keep_rows && explain.is_none() {
+        // What the batch carries, read now: on success only these cells are
+        // cleared, so an edit staged while it is out stays. A lent slot's grid
+        // is the one in front of the batch by here. Nothing can be staged
+        // between the batch's writing and this read: a review holds the grid
+        // against staging (`may_stage_into`), the buffer append sends in the
+        // call that wrote it, and a batch the mode gate parks waits under
+        // Read-only, where `set_pending` refuses. So every staged cell is in
+        // the batch: a key is never NULL (`RowMatch::Key`) and only named
+        // columns open, which leaves `pending_updates` no row to drop.
+        let sent = carries.then(|| {
+            let grid = results.read(cx).delegate();
+            let cells: Vec<_> = (0..grid.result().rows.len())
+                .filter_map(|row| {
+                    let cells = grid.pending_cells(row);
+                    (!cells.is_empty()).then_some((row, cells))
+                })
+                .collect();
+            (grid.rows_id(), cells)
+        });
+        // A kept send touches neither: its rows, ring, scroll and edits stay.
+        if !kept && !keep_rows && explain.is_none() {
             results.update(cx, |table, cx| {
                 *table.delegate_mut() = ResultGrid::empty();
                 // Rows dropped from the gutter's multi-row selection too, for
@@ -2271,7 +2316,7 @@ impl Workspace {
                 table.clear_selection(cx);
                 table.refresh(cx);
             });
-        } else if keep_rows {
+        } else if !kept && keep_rows {
             // Edits staged on the rows kept go now, as they went when a
             // refresh blanked the grid: they were made against rows about to
             // be replaced, and the replacement would drop them unseen.
@@ -2441,7 +2486,9 @@ impl Workspace {
         // preview is dbdelve's statement and streams like the user's; a query
         // tab's generated run is an edit, with no rows to stream.
         let streams = matches!(tab, Tab::Object(_)) || !generated;
-        let feed = (!keep_rows && streams && explaining.is_none()).then(Feed::default);
+        // Never for a kept send, whose grid must be left alone and whose rows are
+        // not a result to stream.
+        let feed = (!keep_rows && !kept && streams && explaining.is_none()).then(Feed::default);
         if let Some(feed) = feed.clone() {
             let (id, results, lane) = (id.clone(), results.clone(), lane.clone());
             let (names, widths, column_view) = (shown.0.clone(), shown.1.clone(), shown.4.clone());
@@ -2809,6 +2856,36 @@ impl Workspace {
                                 // prefix, never recorded.
                                 (true, false, Some(answer), Vec::new(), result.notice, None)
                             }
+                            // The write's own answer has no rows to show, and
+                            // the grid is not replaced by it: it clears what
+                            // it carried and the tab goes back to what it was.
+                            Ok(mut result) if kept => {
+                                let notice = result.notice.take();
+                                let landed =
+                                    recorded.as_ref().map(|entry| entry.succeeded(&result));
+                                if let Some(previous) = restored {
+                                    *state = previous;
+                                }
+                                if let Some((rows_id, rows)) = &sent {
+                                    results.update(cx, |table, cx| {
+                                        let grid = table.delegate_mut();
+                                        // ponytail: the sent cells are matched
+                                        // by row index and value under an
+                                        // unchanged `rows_id`, so a sort in
+                                        // memory during the round trip leaves
+                                        // them staged (applying them again
+                                        // writes the same values); the upgrade
+                                        // is to match them by the row's key.
+                                        if grid.rows_id() == *rows_id {
+                                            for (row, cells) in rows {
+                                                grid.clear_sent(*row, cells);
+                                            }
+                                        }
+                                        table.refresh(cx);
+                                    });
+                                }
+                                (true, false, None, Vec::new(), notice, landed)
+                            }
                             Ok(mut result) => {
                                 // Rows that streamed in were scrolled through as
                                 // they came, so the grid stays where the user
@@ -2940,6 +3017,24 @@ impl Workspace {
                                 }
                                 (true, produced_grid, plan, rest, notice, landed)
                             }
+                            // Rows and edits stay and the tab is as it was; the
+                            // message is said where the statement is.
+                            Err(mut error) if kept => {
+                                let landed = recorded.as_ref().map(|entry| {
+                                    entry.failed(&error, started.elapsed(), cancel_landed)
+                                });
+                                if joined_batch {
+                                    error.message.push_str(
+                                        " Rows of the batch before the failed one were applied \
+                                         inside the open transaction and stay in it, to be \
+                                         committed or rolled back with it.",
+                                    );
+                                }
+                                if let Some(previous) = restored {
+                                    *state = previous;
+                                }
+                                (false, false, None, Vec::new(), Some(error.message), landed)
+                            }
                             Err(mut error) => {
                                 // Rows of a statement that failed part way are
                                 // not its result, and nothing on screen would
@@ -3007,7 +3102,13 @@ impl Workspace {
                     if let Some(notice) = notice
                         && let Some(profile) = workspace.issued_to(&id, generation)
                     {
-                        profile.session.tab_notice = Some((tab, notice));
+                        // A kept send that failed says so where its statement
+                        // is, which is the review when one covers the tab.
+                        if kept && !succeeded {
+                            profile.session.edit_failed(tab, notice);
+                        } else {
+                            profile.session.tab_notice = Some((tab, notice));
+                        }
                     }
                     if let Some(reset) = reset
                         && let Some(profile) = workspace.issued_to(&id, generation)
@@ -3100,7 +3201,25 @@ impl Workspace {
                     let in_front = workspace.profile().is_some_and(|profile| {
                         profile.id == id && profile.generation == generation
                     });
-                    if succeeded
+                    // Edits still staged once a kept send has cleared what it
+                    // carried: an Insert or Delete row carries none, and one
+                    // staged while the batch was out is not in it. Reading the
+                    // rows again would drop them unseen.
+                    let edits_left = kept
+                        && succeeded
+                        && in_front
+                        && workspace
+                            .issued_to(&id, generation)
+                            .and_then(|profile| profile.session.slot(tab))
+                            .is_some_and(|(_, results)| results.read(cx).delegate().has_pending());
+                    if edits_left {
+                        if matches!(refresh, Some(Refresh::Earlier { .. })) {
+                            workspace.give_back(&id, generation, tab);
+                        }
+                        if let Some(profile) = workspace.issued_to(&id, generation) {
+                            profile.session.tab_notice = Some((tab, Self::EDITS_KEPT.into()));
+                        }
+                    } else if succeeded
                         && !in_front
                         && let Some(
                             Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_),
@@ -3160,6 +3279,11 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// Said after an edit send succeeded over a grid that still holds edits,
+    /// which the re-read would have dropped unseen.
+    const EDITS_KEPT: &str =
+        "The change was applied. The rows were not read again: this tab has unapplied edits.";
 
     /// A run's outcome into the history of the profile that sent it, by id
     /// alone: a reconnect retires the session's generation, not its history.
