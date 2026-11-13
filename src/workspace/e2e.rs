@@ -24840,6 +24840,140 @@ fn a_refused_row_puts_a_changed_filter_bar_back(cx: &mut TestAppContext) {
     });
 }
 
+/// A relation tab in Row mode with one filter bar and a valid edit on its first
+/// row, the bar then changed to `id = 2` and submitted: the row is sent first
+/// and the filter waits behind it. Returns the bars as they were before the
+/// change.
+fn filter_waiting_on_a_row_send(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    connection_open: bool,
+) -> (
+    u64,
+    Vec<(crate::filter::Operator, crate::filter::Conjunction, String)>,
+) {
+    use crate::result_grid::NewValue;
+
+    let (id, grid) = open_in_row_mode(workspace, cx);
+    let input = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.push_filter_row(id, window, cx);
+        workspace.filter_rows_mut(id).unwrap()[0].value.clone()
+    });
+    let bars = bars_of(workspace, cx, id);
+    stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+    if !connection_open {
+        workspace.update(cx, |workspace, _| {
+            workspace.profile_mut().unwrap().state = ProfileState::Idle;
+        });
+    }
+    input.update_in(cx, |input, window, cx| {
+        input.set_value("id = 2", window, cx)
+    });
+    workspace.update(cx, |workspace, cx| workspace.submit_filter(id, &input, cx));
+    (id, bars)
+}
+
+#[gpui::test]
+fn a_filter_waiting_on_a_row_send_into_a_closed_connection_puts_the_bars_back(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, bars) = filter_waiting_on_a_row_send(&workspace, cx, false);
+        settle_through(cx);
+
+        assert_eq!(relation_view(&workspace, cx, id).0, "", "no filter ran");
+        assert_eq!(bars_of(&workspace, cx, id), bars);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_filter_waiting_on_a_row_send_goes_back_when_another_action_already_waits(
+    cx: &mut TestAppContext,
+) {
+    use crate::session::AfterEdits;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, bars) = filter_waiting_on_a_row_send(&workspace, cx, true);
+        workspace.update(cx, |workspace, _| {
+            workspace.profile_mut().unwrap().session.resume_after =
+                Some((Tab::Object(id), AfterEdits::Refresh));
+        });
+        settle_through(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin"),
+            "the row was sent"
+        );
+        assert_eq!(
+            relation_view(&workspace, cx, id).0,
+            "",
+            "the filter did not run"
+        );
+        assert_eq!(bars_of(&workspace, cx, id), bars);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_filter_waiting_on_a_row_send_goes_back_when_the_landing_finds_another_connection_in_front(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, bars) = filter_waiting_on_a_row_send(&workspace, cx, true);
+        let front = workspace.update(cx, |workspace, _| workspace.active.take());
+        settle_through(cx);
+        workspace.update(cx, |workspace, _| workspace.active = front);
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin"),
+            "the row was sent"
+        );
+        assert_eq!(
+            relation_view(&workspace, cx, id).0,
+            "",
+            "the filter did not run"
+        );
+        assert_eq!(bars_of(&workspace, cx, id), bars);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn dropping_the_prompts_puts_back_the_bars_of_an_action_waiting_to_resume(cx: &mut TestAppContext) {
+    use crate::session::AfterEdits;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, _) = open_in_row_mode(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.push_filter_row(id, window, cx)
+        });
+        let bars = bars_of(&workspace, cx, id);
+        workspace.update(cx, |workspace, _| {
+            let before = workspace.filter_rows_mut(id).unwrap().clone();
+            workspace.filter_rows_mut(id).unwrap()[0].applied = "id = 2".into();
+            let session = &mut workspace.profile_mut().unwrap().session;
+            session.resume_after = Some((
+                Tab::Object(id),
+                AfterEdits::Filter {
+                    before: Some(before),
+                },
+            ));
+            session.clear_prompts();
+            assert!(session.resume_after.is_none());
+        });
+        assert_eq!(bars_of(&workspace, cx, id), bars);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_read(
     cx: &mut TestAppContext,
