@@ -274,6 +274,12 @@ impl Workspace {
         if !stale && !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
             return;
         }
+        // The rows on screen carry edits nobody has applied. A visit is not a
+        // request to replace them, so the tab stays owed its reload, and asks
+        // nothing: the next refresh the user asks for is the one that asks.
+        if self.has_unapplied_edits(Tab::Object(id), cx) {
+            return;
+        }
 
         self.load_structure(id, schema, relation, cx);
         self.requery_relation(id, |_, _, _, _| true, cx);
@@ -1538,7 +1544,10 @@ impl Workspace {
                     // land last, so both sides mark.
                     workspace.mark_columns(id, cx);
                     // The page `requery_relation` held back for this key.
-                    if waited && workspace.engine().pages_by_key() {
+                    if waited
+                        && workspace.engine().pages_by_key()
+                        && !workspace.has_unapplied_edits(Tab::Object(id), cx)
+                    {
                         workspace.requery_relation(id, |_, _, _, _| true, cx);
                     }
                 })

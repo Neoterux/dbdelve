@@ -1734,7 +1734,21 @@ impl Session {
         self.pending_delete = None;
         self.query_rename = None;
         self.query_rename_needs_focus = false;
-        self.pending_discard = None;
+        // The bars a dropped filter prompt was holding go back as Cancel puts
+        // them: they were changed before anything could ask, and the filter
+        // that ran is the one they have to describe.
+        if let Some(PendingDiscard {
+            tab: Tab::Object(id),
+            then: AfterEdits::Filter { before: Some(rows) },
+        }) = self.pending_discard.take()
+            && let Some(ObjectBody::Relation { filters, .. }) = self
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .map(|tab| &mut tab.body)
+        {
+            *filters = rows;
+        }
         self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;
@@ -1791,9 +1805,6 @@ pub(crate) enum PendingDelete {
 /// the edits are out of the way. Never a stored closure: every variant is the
 /// values the action was raised with, so a Discard runs what the user asked
 /// for and not what the tab has become since.
-// Every variant but the first two is built by a guard added with the next
-// commit; the allow goes with it.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) enum AfterEdits {
     /// Close the tab, and delete the saved query first when deleting it is

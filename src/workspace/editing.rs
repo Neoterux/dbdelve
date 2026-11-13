@@ -4,7 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
-use crate::session::{ReviewSlot, StaleEdit, StaleResume, refreshing};
+use crate::session::{AfterEdits, ReviewSlot, StaleEdit, StaleResume, refreshing};
 
 impl Workspace {
     /// Open the "Insert" form over the preview in front, one field per column
@@ -427,8 +427,16 @@ impl Workspace {
         }
 
         match tab {
+            // Already guarded inside `requery_relation`, which asks of copies.
             Tab::Object(id) => self.relation_sort(id, column, cx),
-            Tab::Query(_) => self.query_sort(column, window, cx),
+            Tab::Query(_) => {
+                // Before `query_sort` rewrites the buffer: a prompt asked after
+                // it would leave a cancelled sort written into the user's SQL.
+                if self.held_for_edits(tab, AfterEdits::Sort(column), cx) {
+                    return;
+                }
+                self.query_sort(column, window, cx)
+            }
         }
     }
 
@@ -473,7 +481,7 @@ impl Workspace {
     ) {
         self.clear_notice();
         let engine = self.engine();
-        let Some(profile) = self.profile_mut() else {
+        let Some(profile) = self.profile() else {
             return;
         };
         let tab = profile.session.active;
@@ -495,6 +503,23 @@ impl Workspace {
                 })
                 .collect();
             (grid.sort().to_vec(), shown)
+        };
+        // Only a switch that runs the statement again can lose a draft: into
+        // memory nothing runs, and out of it with no sort on screen there is
+        // nothing to ask the server for. Before `switch` moves the sorting.
+        let leaves_memory = !client
+            && profile
+                .session
+                .sorting(tab)
+                .is_some_and(|sorting| sorting.client_keys().is_some());
+        if leaves_memory
+            && !shown.is_empty()
+            && self.held_for_edits(tab, AfterEdits::ViewSorting(client), cx)
+        {
+            return;
+        }
+        let Some(profile) = self.profile_mut() else {
+            return;
         };
         let Some(sorting) = profile.session.sorting_mut(tab) else {
             return;

@@ -732,6 +732,28 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   a plugin) an edit send clears the grid as it starts and a failure is
   `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
+- **A requery over a draft asks first.** An action that would replace a grid's
+  rows over cell edits nobody has applied asks Discard / Cancel and does
+  nothing until answered. `Workspace::held_for_edits` is the one guard,
+  `session::AfterEdits` what it parks on `PendingDiscard` (the action's own
+  values, as data, never a closure), and `resume_after_edits` runs it once
+  Discard has emptied every grid the question read (`Session::tab_grids`: the
+  slot, a lent slot and each finished result of a queue). It stands in
+  `requery_relation` (page turn, Go to page, row limit, a relation's header
+  sort, the filter bars), `refresh_relation` (Refresh, Run on an object tab,
+  the palette), `apply_filter`, `set_view_sorting`, a query tab's header sort,
+  `run_query` and `rerun_queued`. It is asked on every target whatever the send
+  does there, because a requery replaces a draft the same way on all of them,
+  and it is asked before any state moves: `requery_relation` asks its `change`
+  of copies, the others at their own entry, and a filter bar changed by its
+  caller is put back on Cancel (`AfterEdits::Filter { before }`, also when
+  `clear_prompts` drops the prompt). An action that would change nothing, or a
+  sort done in memory, asks nothing. While the tab's edits are in flight the
+  action is neither run nor parked and the status line says so. A stale or
+  restored tab with edits is not reloaded on a visit (`load_relation` returns,
+  leaving `stale` set). `execute_and_then` is the fallback: a run with no
+  refresh and no explain over a grid holding edits is not sent and the tab's
+  notice says so, so a path nobody guarded costs a notice, not a draft.
 - **`queries` can be empty.** Any buffer can be closed, the last one
   included, and a profile with no tab open shows an empty pane and relaunches
   that way. A new connection, and one written before buffers were tabs, opens
@@ -746,7 +768,7 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   explicit Delete (the sidebar row's menu, or "Delete saved query…" in the
   palette, both through one dialog) removes it. Deleting a query whose tab is
   open closes that tab, its text with it; a tab holding cell edits nobody
-  applied asks first, as any close does (`PendingDiscard::deleting`), and the
+  applied asks first, as any close does (`AfterEdits::Close { deleting }`), and the
   file stays until it is told. A file already removed outside the app counts
   as deleted, so its stale library row and open tab can still be removed.
   Rename… on a sidebar row turns the row into a field
