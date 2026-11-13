@@ -24771,7 +24771,9 @@ fn a_draft_view_keeps_its_edits_across_a_tab_switch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_reread_after_one_rows_send_sends_the_other_dirty_rows_first(cx: &mut TestAppContext) {
+fn a_reread_owed_after_one_rows_send_sends_no_other_dirty_row_and_leaves_the_tab_stale(
+    cx: &mut TestAppContext,
+) {
     use crate::result_grid::NewValue;
 
     store::tests::with_home(|| {
@@ -24788,24 +24790,39 @@ fn a_reread_after_one_rows_send_sends_the_other_dirty_rows_first(cx: &mut TestAp
         // relation is owed a read.
         stage(&grid, cx, 0, 1, NewValue::Value("ghost".into()));
         stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        let history = history_sql(&workspace, cx).len();
         save(&workspace, cx);
         settle_through(cx);
 
+        // Nothing but the row the user saved went to the server: reading the
+        // relation again would have sent the other row with no act of theirs.
         assert_no_discard_prompt(&workspace, cx);
         assert_eq!(on_disk("select name from birds where id = 1"), None);
         assert_eq!(
             on_disk("select name from birds where id = 2").as_deref(),
-            Some("jay"),
-            "the other row's edit was sent, not dropped"
+            Some("tit"),
+            "the other row was not sent"
+        );
+        assert_eq!(history_sql(&workspace, cx).len(), history + 1);
+        assert_eq!(pending_of(&grid, cx), 1, "its edit is kept");
+        grid.read_with(cx, |grid, _| assert!(grid.delegate().row_has_pending(1)));
+        assert!(relation_is_stale(&workspace, cx, id), "the read is owed");
+        assert_eq!(resume_after_of(&workspace, cx), None);
+        let notice = shown_notice(&workspace, cx).expect("the status line says so");
+        assert!(
+            notice.contains("The rows were not read again: this tab has unapplied edits"),
+            "{notice}"
+        );
+        assert!(table_tab_is_open(&workspace, cx, id));
+
+        // The next act of the user's that saves the row sends it as usual.
+        save(&workspace, cx);
+        settle_through(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
         );
         assert_eq!(pending_of(&grid, cx), 0);
-        assert_eq!(resume_after_of(&workspace, cx), None);
-        assert_eq!(state_kind(&workspace, cx), "complete");
-        let shown: Vec<_> = (0..3)
-            .filter_map(|row| cell_of(&grid, cx, row, 1))
-            .collect();
-        assert!(shown.contains(&"jay".to_string()), "{shown:?}");
-        assert!(table_tab_is_open(&workspace, cx, id));
         quit(workspace, cx);
     });
 }
