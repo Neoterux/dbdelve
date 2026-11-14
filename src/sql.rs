@@ -8006,19 +8006,40 @@ mod tests {
 
     #[test]
     fn only_an_engine_naming_rows_by_every_value_reads_the_row_terms() {
-        let terms = [
+        // `IS NULL` names a NULL cell on ClickHouse and on the six engines whose
+        // drafts are verified; `toString` and `ALTER TABLE … UPDATE` are
+        // ClickHouse's alone.
+        let null_term = "DELETE FROM t WHERE c IS NULL";
+        let clickhouse_only = [
             "DELETE FROM t WHERE toString(c) = '1.5'",
-            "DELETE FROM t WHERE c IS NULL",
             "ALTER TABLE t UPDATE a = '1' WHERE b = '2' SETTINGS mutations_sync = 2",
         ];
+        let six = [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::DuckDb,
+            Engine::SqlServer,
+        ];
         for engine in Engine::ALL {
-            for sql in terms {
+            assert_eq!(
+                is_generated_write_on(engine, null_term),
+                engine == Engine::ClickHouse || six.contains(&engine),
+                "{engine:?} {null_term}"
+            );
+            for sql in clickhouse_only {
                 assert_eq!(
                     is_generated_write_on(engine, sql),
                     engine == Engine::ClickHouse,
                     "{engine:?} {sql}"
                 );
             }
+            // Never `IS NOT NULL`: it names no value.
+            assert!(
+                !is_generated_write_on(engine, "DELETE FROM t WHERE c IS NOT NULL"),
+                "{engine:?}"
+            );
         }
     }
 

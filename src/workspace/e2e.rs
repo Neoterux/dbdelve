@@ -28973,3 +28973,150 @@ fn a_table_without_a_primary_key_is_edited_by_every_value_and_a_null_is_matched_
         quit(workspace, cx);
     });
 }
+
+const TWO_IDENTICAL_SIGHTINGS: &str = "create table sightings (bird text, place text); \
+     insert into sightings values ('wren', 'oak'), ('wren', 'oak');";
+
+const DUPLICATE_SENTENCE: &str =
+    "Nothing was applied. Row bird = wren, place = oak matches 2 rows on the server.";
+
+/// Two rows alike in every column cannot be told apart by their values, so an
+/// edit of one is refused before any write and says which row, and neither
+/// changes.
+#[gpui::test]
+fn a_duplicate_row_without_a_primary_key_is_refused_and_named(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, TWO_IDENTICAL_SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'wren'").as_deref(),
+            Some("2"),
+            "neither row changed"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A duplicate another session inserted after the grid read its row makes the
+/// re-read return two rows, so the apply is refused with nothing written.
+#[gpui::test]
+fn a_duplicate_inserted_behind_the_grid_is_caught_before_the_write(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table sightings (bird text, place text); \
+             insert into sightings values ('wren', 'oak');",
+        );
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        behind_the_grid("insert into sightings values ('wren', 'oak')");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'wren'").as_deref(),
+            Some("2"),
+            "nothing was written"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// Delete row in a Row view of a table with no primary key names its row by
+/// every value and removes that row alone; over two rows alike it is refused
+/// by the re-read.
+#[gpui::test]
+fn delete_row_on_a_table_without_a_primary_key_deletes_exactly_its_row(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.contains(r#""bird" = 'tit' AND "place" = ''"#), "{sql}");
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'tit'").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where place is null").as_deref(),
+            Some("1"),
+            "the NULL row is still there"
+        );
+        quit(workspace, cx);
+    });
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, TWO_IDENTICAL_SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(0));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2"),
+            "neither row was deleted"
+        );
+        quit(workspace, cx);
+    });
+}

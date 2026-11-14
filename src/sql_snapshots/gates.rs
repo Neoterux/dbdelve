@@ -1237,3 +1237,104 @@ fn mongo_draft_gate_corpus() {
     }
     check("gates_mongo_draft", &out);
 }
+
+/// What a keyless draft's apply asks of a text besides the gate: how many
+/// `DELETE`s it names against the key of every column of the table
+/// (`bird`, `place`) and against a keyed table's `id`, and how many statements
+/// the gate recovers from it.
+fn keyless_more(engine: Engine, text: &str) -> String {
+    let key = |keys: &[&str]| sql::draft_deletes_match(engine, text, keys, "public", "accounts");
+    format!(
+        " draft_deletes_match[bird+place]={:?} draft_deletes_match[id]={:?} statements={:?}",
+        key(&["bird", "place"]),
+        key(&["id"]),
+        sql::generated_writes(engine, text).map(|statements| statements.len()),
+    )
+}
+
+/// A row named by every value, a NULL as `IS NULL`, on every SQL engine: what
+/// the gate admits where `null_terms` (or ClickHouse's `row_terms`) is set and
+/// refuses elsewhere, and the shapes it refuses everywhere.
+#[test]
+fn keyless_gate_corpus_per_engine() {
+    let mut out = String::new();
+    for engine in sql_engines() {
+        let q = engine.qualified("public", "accounts");
+        let id = engine.quote_identifier("id");
+        let bird = engine.quote_identifier("bird");
+        let place = engine.quote_identifier("place");
+        let every = format!("{bird} = 'wren' AND {place} IS NULL");
+        let delete = |predicate: &str| format!("DELETE FROM {q} WHERE {predicate}");
+        let ins = format!("INSERT INTO {q} ({bird}, {place}) VALUES ('tit', NULL)");
+        let cases: Vec<(&str, String)> = vec![
+            ("delete every column, a null", delete(&every)),
+            (
+                "delete every column, no null",
+                delete(&format!("{bird} = 'wren' AND {place} = 'oak'")),
+            ),
+            (
+                "delete every column, other order",
+                delete(&format!("{place} IS NULL AND {bird} = 'wren'")),
+            ),
+            (
+                "delete every column, an empty string",
+                delete(&format!("{bird} = 'wren' AND {place} = ''")),
+            ),
+            (
+                "delete fewer columns than the row",
+                delete(&format!("{bird} = 'wren'")),
+            ),
+            ("delete a null alone", delete(&format!("{place} IS NULL"))),
+            (
+                "delete or",
+                delete(&format!("{bird} = 'wren' OR {place} IS NULL")),
+            ),
+            (
+                "delete subquery",
+                delete(&format!("{bird} = (SELECT 'wren') AND {place} IS NULL")),
+            ),
+            (
+                "delete is not null",
+                delete(&format!("{bird} = 'wren' AND {place} IS NOT NULL")),
+            ),
+            (
+                "delete is null twice",
+                delete(&format!("{place} IS NULL AND {place} IS NULL")),
+            ),
+            (
+                "delete an extra null term on a keyed table",
+                delete(&format!("{id} = '7' AND {place} IS NULL")),
+            ),
+            (
+                "update every column, a null",
+                format!("UPDATE {q} SET {bird} = 'finch' WHERE {every}"),
+            ),
+            (
+                "update to null, every column",
+                format!("UPDATE {q} SET {place} = NULL WHERE {every}"),
+            ),
+            (
+                "draft, delete every column then insert",
+                format!("{};\n{};", delete(&every), ins),
+            ),
+            (
+                "draft, bracketed",
+                format!("BEGIN;\n{};\n{};\nCOMMIT;", delete(&every), ins),
+            ),
+        ];
+        for (case, text) in cases {
+            let more = keyless_more(engine, &text);
+            corpus_with(&mut out, engine, case, &text, &more);
+        }
+    }
+
+    // A plugin that speaks Postgres's dialect reads the same gate through
+    // `generated_writes`, so what it is asked to run is what is admitted here.
+    let q = Engine::Postgres.qualified("public", "accounts");
+    let text = format!(r#"DELETE FROM {q} WHERE "bird" = 'wren' AND "place" IS NULL"#);
+    out.push_str(&format!(
+        "\n[plugin speaking postgres] every-column delete => generated_writes={:?}\n",
+        sql::generated_writes(Engine::Postgres, &text)
+    ));
+    check("gates_keyless", &out);
+}
