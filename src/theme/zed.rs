@@ -153,6 +153,16 @@ pub(super) fn finished(theme: Theme) -> Theme {
     }
 }
 
+/// The Zed defaults as [`convert`] reads them, for the tests that hold every
+/// theme to one floor.
+#[cfg(test)]
+pub(super) fn bundled() -> Vec<Theme> {
+    BUNDLED
+        .iter()
+        .flat_map(|text| parse_zed(text).unwrap())
+        .collect()
+}
+
 fn parse_zed(text: &str) -> Result<Vec<Theme>, String> {
     zed_family(serde_json::from_str(text).map_err(|error| error.to_string())?)
 }
@@ -380,7 +390,7 @@ pub(super) fn hex(text: &str) -> Option<Rgba> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Appearance;
+    use crate::theme::{Appearance, ROW_WASH_FROM_SELECTION};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -571,6 +581,51 @@ mod tests {
         ] {
             assert_eq!(rgba_hex(got), rgba_hex(put));
         }
+    }
+
+    #[test]
+    fn a_zed_theme_maps_created_modified_and_deleted_to_the_three_row_washes() {
+        let [mapped, bare, crowded] = parse_zed(
+            r##"{ "themes": [
+                { "name": "Mapped", "style": {
+                    "created": "#2ecc71", "modified": "#e056fd", "deleted": "#ff4d4d"
+                } },
+                { "name": "Bare", "style": {} },
+                { "name": "Crowded", "style": {
+                    "created": "#2ecc71", "modified": "#0055aa", "deleted": "#ff4d4d",
+                    "players": [{ "selection": "#0055aa66" }]
+                } }
+            ] }"##,
+        )
+        .unwrap()[..] else {
+            panic!("three themes");
+        };
+        let dark = Theme::dark();
+        assert_eq!(
+            mapped.added,
+            Srgb::from_hex(0x2ecc71).alpha(PALETTE_ADDED_ALPHA)
+        );
+        assert_eq!(
+            mapped.updated,
+            Srgb::from_hex(0xe056fd).alpha(PALETTE_UPDATED_ALPHA)
+        );
+        assert_eq!(
+            mapped.deleted,
+            Srgb::from_hex(0xff4d4d).alpha(PALETTE_DELETED_ALPHA)
+        );
+        assert_eq!(
+            (bare.added, bare.updated, bare.deleted),
+            (dark.added, dark.updated, dark.deleted)
+        );
+        // A modified colour that is the selection's own would be a changed row
+        // read as a selected one.
+        assert_ne!(
+            crowded.updated,
+            Srgb::from_hex(0x0055aa).alpha(PALETTE_UPDATED_ALPHA)
+        );
+        let updated = crowded.updated.flatten(crowded.bg);
+        assert!(updated.distance(crowded.selection.flatten(crowded.bg)) >= ROW_WASH_FROM_SELECTION);
+        assert!(crowded.selection.flatten(updated).distance(updated) >= ROW_WASH_FROM_SELECTION);
     }
 
     #[test]
