@@ -105,9 +105,19 @@ mode, always where the user can read it before it runs:
   (`sql::update_batch_joining`) and joins the open transaction, committed or
   rolled back with it, as a single-statement edit always has. That batch is
   not all-or-nothing: where a failed statement leaves the transaction open
-  (SQLite, MySQL, MariaDB, SQL Server without `XACT_ABORT`), one that fails
-  partway leaves the rows before the failure inside it, and the error says so.
-  Postgres aborts the transaction instead. dbdelve writes no `SAVEPOINT` to
+  (MySQL, MariaDB and SQLite: `Engine::keeps_failed_transaction_open`), one
+  that fails partway leaves the rows before the failure inside it, and the
+  error says so. Postgres and DuckDB abort the transaction instead. dbdelve's
+  generated SQL on SQL Server runs with `XACT_ABORT ON`, so a failed statement
+  inside the user's transaction rolls the whole of it back, the user's earlier
+  statements included. That is a known finding left for a later phase (D-16a),
+  not a guarantee to lean on. A draft that inserts is refused for that reason:
+  a joining draft of more than one statement is not written on an engine that
+  keeps a failed transaction open (`Workspace::apply_draft`), because the
+  inserts before a failing statement would stay applied in the user's
+  transaction; the draft is kept for when the transaction ends. An
+  update-only draft and a draft of one statement join as they always have.
+  dbdelve writes no `SAVEPOINT` to
   undo them, because a savepoint alone undoes nothing without a statement to
   follow it, and the gate admits none. A bracketed
   batch that still reaches the run (written before the transaction opened) is
