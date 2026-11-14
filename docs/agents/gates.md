@@ -83,7 +83,10 @@ mode, always where the user can read it before it runs:
   the row as the grid fetched it (copied by value when the review was written);
   a row that differs or is gone writes nothing, keeps the draft and is named in
   the review. A statement that does not count exactly one row rolls the whole
-  sequence back. Under a transaction of the user's own nothing is opened, ended
+  sequence back; a `DELETE` may count none only when a second read of its row
+  finds it gone, which an earlier `DELETE` of the draft taking it along would
+  leave, and a statement something skipped (a trigger returning without writing)
+  leaves its row there. Under a transaction of the user's own nothing is opened, ended
   or rolled back. There is no `FOR UPDATE`: the pinned grammar cannot read it,
   so the compare catches a change made between the fetch and the apply, not one
   made in the milliseconds between the re-read and the write, and the count
