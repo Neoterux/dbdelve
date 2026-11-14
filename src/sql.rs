@@ -698,10 +698,11 @@ pub fn delete_row(
 
 /// One row's `DELETE`: every column in `keys` matched, and nothing else.
 ///
-/// One row per statement. Multi-row deletion is cut, and the upgrade path when
-/// it is wanted is the `BEGIN`/`COMMIT` bracketing multi-row edits already use
-/// on the engines that commit each statement alone — one `DELETE` per row, each
-/// naming its own key, never one statement with a predicate covering several.
+/// One row per statement. Multi-row deletion by predicate is cut: deleting
+/// several rows is one `DELETE` per row, each naming its own key, in a reviewed
+/// draft ([`draft_batch`]) inside the `BEGIN`/`COMMIT` multi-row edits use on
+/// the engines that commit each statement alone, never one statement with a
+/// predicate covering several.
 ///
 /// `None` on an empty key list. A `DELETE` with no `WHERE` empties the table, so
 /// it must not be possible to produce one: a caller that has lost the row's key
@@ -893,9 +894,9 @@ pub(crate) fn generated_write(spec: &SqlSpec, sql: &str) -> bool {
                 .iter()
                 .all(|statement| one_row_update(spec, *statement, sql).is_some()));
 
-    // One insert alone, or a batch of updates. A batch of inserts is a shape
-    // nothing generates, so admitting it would widen the gate for nobody.
-    // A comment anywhere in an insert refuses it: MySQL runs `/*! … */` as
+    // One insert alone, or a batch of updates. Several inserts are a draft's
+    // and were read by the arm above. A comment anywhere in an insert refuses
+    // it: MySQL runs `/*! … */` as
     // SQL, and the grammar hides one inside a name or between tokens the shape
     // checks below read only by kind.
     ((kinds == ["insert"] && literal_insert(statements[0], sql) && !commented(root)) || updates)
@@ -908,11 +909,12 @@ pub(crate) fn generated_write(spec: &SqlSpec, sql: &str) -> bool {
 ///
 /// Each top-level statement is read from the tree: an `INSERT` is one row of
 /// literals with no tail, and a `DELETE` is [`one_row_delete`] over a
-/// conjunction of equalities. The count of `delete` nodes in the whole tree
-/// must equal the count of those statements, so one hidden in a CTE beside an
-/// `UPDATE` finds no statement to account for it. No comment is admitted
-/// anywhere (MySQL runs `/*! … */` as SQL), and not on a spec that names a row
-/// by every value, whose one-row guard a sequence cannot carry.
+/// conjunction of equalities. The count of `delete` nodes, and of `DELETE`
+/// keywords, in the whole tree must equal the count of those statements, so one
+/// hidden in a CTE beside an `UPDATE` finds no statement to account for it. No
+/// comment is admitted anywhere (MySQL runs `/*! … */` as SQL), and not on a
+/// spec that names a row by every value, whose one-row guard a sequence cannot
+/// carry.
 ///
 /// Reads a `DELETE`'s shape and never its key or table, as the lone `DELETE`
 /// does: those are [`draft_deletes_match`]'s to answer.
@@ -936,8 +938,13 @@ fn draft_sequence(
             .is_some_and(|(_, predicate)| row_columns(spec, predicate, sql).is_some()),
     };
     let deletes = kinds.iter().filter(|kind| **kind == "delete").count();
+    // Both node kinds, as `deletes_anything` read them: the `delete` node and
+    // the keyword inside it, which a spelling of `DELETE` the grammar wraps
+    // otherwise would still carry.
     statements.iter().zip(kinds).all(|(s, k)| one_row(s, k))
-        && count_kind(root, "delete") == deletes
+        && ["delete", "keyword_delete"]
+            .iter()
+            .all(|kind| count_kind(root, kind) == deletes)
 }
 
 /// How many nodes of `kind` the tree holds, at any depth.
