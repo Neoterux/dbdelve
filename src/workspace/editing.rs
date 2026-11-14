@@ -243,6 +243,18 @@ impl Workspace {
             );
             return;
         }
+        // The `INSERT` must count the one row it adds.
+        let verify = if self.target().verifies_applies() {
+            match lone_verification(engine, &statement, StepKind::Insert, None, None) {
+                Ok(verify) => Some(verify),
+                Err(message) => {
+                    self.note(message, cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.review_slot_free(tab, false, window, cx) {
             return;
         }
@@ -257,7 +269,7 @@ impl Workspace {
                 sql: statement,
                 error: None,
                 edits: false,
-                verify: None,
+                verify,
             });
         }
         cx.notify();
@@ -1318,7 +1330,7 @@ impl Workspace {
             );
             return;
         }
-        let Some(results) = profile.session.active_results() else {
+        let Some(results) = profile.session.active_results().cloned() else {
             return;
         };
         let grid = results.read(cx);
@@ -1331,11 +1343,12 @@ impl Workspace {
         );
         let key = grid.delegate().active().and_then(|(row, _)| {
             Some((
+                row,
                 grid.delegate().row_key(row)?,
                 grid.delegate().row_types(row),
             ))
         });
-        let Some(((schema, table, keys, null_keys), types)) = key else {
+        let Some((row, (schema, table, keys, null_keys), types)) = key else {
             self.note(unnameable, cx);
             return;
         };
@@ -1375,6 +1388,25 @@ impl Workspace {
             );
             return;
         }
+        // The row read again before the `DELETE`, which must count one.
+        let verify = if target.verifies_applies() {
+            let grid = results.read(cx).delegate();
+            match lone_verification(
+                engine,
+                &statement,
+                StepKind::Delete,
+                Some((grid.fetched_cells(row), grid.row_label(row))),
+                None,
+            ) {
+                Ok(verify) => Some(verify),
+                Err(message) => {
+                    self.note(message, cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.review_slot_free(tab, false, window, cx) {
             return;
         }
@@ -1387,7 +1419,7 @@ impl Workspace {
                 sql: statement,
                 error: None,
                 edits: false,
-                verify: None,
+                verify,
             });
         }
         cx.notify();
