@@ -205,6 +205,13 @@ impl Target {
         }
     }
 
+    /// Whether a query tab's Apply is shown in the review dialog rather than
+    /// appended to its buffer. A stub of [`Self::reviews_query_edits`] until the
+    /// verified apply is routed to query tabs.
+    pub fn reviews_query_apply(self) -> bool {
+        self.reviews_query_edits()
+    }
+
     /// Whether this target is one of the transactional SQL engines dbdelve
     /// drives itself: a built-in driver speaking SQL that edits rows and names
     /// a row by its key in the statement text. An edit sent to one keeps the
@@ -446,6 +453,29 @@ mod tests {
             version: "1".into(),
             executable: "dbdelve-odbc".into(),
         }))
+    }
+
+    #[test]
+    fn a_query_tabs_apply_is_reviewed_where_its_rows_are_guarded_or_verified() {
+        for engine in Engine::ALL {
+            let target = Target::built_in(engine);
+            assert_eq!(
+                target.reviews_query_apply(),
+                target.reviews_query_edits() || (target.row_edits() && target.verifies_applies()),
+                "{engine:?}"
+            );
+        }
+        // Verified, so its edits are reviewed; and guarded, so ClickHouse's are.
+        assert!(Target::built_in(Engine::Sqlite).reviews_query_apply());
+        assert!(Target::built_in(Engine::ClickHouse).reviews_query_apply());
+        // Neither: their query-tab edits stay appended to the buffer.
+        assert!(!Target::built_in(Engine::MongoDb).reviews_query_apply());
+        assert!(!Target::built_in(Engine::Redis).reviews_query_apply());
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: Driver::Plugin(odbc()),
+        };
+        assert!(plugin.reviews_query_apply());
     }
 
     #[test]
