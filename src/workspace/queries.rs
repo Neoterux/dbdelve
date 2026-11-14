@@ -7,8 +7,10 @@ use std::ops::Range;
 
 use gpui_component::table::TableState;
 
-use crate::db::{ApplyOutcome, Bracket, Drift, Feed, Fetch, QueryResult, Row, StepKind, Stopped};
-use crate::result_grid::{ColumnView, ColumnWidth};
+use crate::db::{
+    ApplyOutcome, ApplyStage, Bracket, Drift, Feed, Fetch, QueryResult, Row, StepKind, Stopped,
+};
+use crate::result_grid::{ColumnView, ColumnWidth, StepRow};
 
 use super::*;
 use crate::session::{
@@ -2763,6 +2765,9 @@ impl Workspace {
             // A verified apply whose `COMMIT` has no answer: the grid is
             // marked when this lands.
             let mut unknown = false;
+            // The rows of an ordered apply that was written before it stopped,
+            // which the landing takes out of the draft.
+            let mut applied = Vec::new();
             let result = match (&verification, generated, alongside, binding.as_ref()) {
                 // A reviewed draft, or a Row send, of a target that verifies an
                 // apply: its rows read again and compared inside one
@@ -2782,6 +2787,13 @@ impl Workspace {
                         verified_read = read_back.take().map(|rows| Ok(*rows));
                     }
                     unknown = matches!(outcome, ApplyOutcome::Unknown(_));
+                    if ordered {
+                        applied = verify
+                            .identities
+                            .get(..written_before_stop(&outcome))
+                            .map(<[StepRow]>::to_vec)
+                            .unwrap_or_default();
+                    }
                     verified_result(outcome, verify, ordered)
                 }
                 // An edit applied from a bound tab's grid belongs to its
@@ -2825,7 +2837,7 @@ impl Workspace {
             // says nothing about the profile's.
             let failed = result.is_err() || matches!(read_back, Some(Err(_)));
             let lost = !alongside && failed && connection.is_lost();
-            (result, lost, read_back, unknown)
+            (result, lost, read_back, unknown, applied)
         };
         let number = crate::logging::connection_number(&id);
         // The database to open a session for, when none is open for it.
@@ -2887,11 +2899,11 @@ impl Workspace {
             // Blocks for as long as the server takes, and statements queued
             // behind it on the same session block on its lock, so none of them
             // may hold one of the executor's threads (`spawn_blocking`).
-            let (result, lost, read_back, unknown) = match ready {
+            let (result, lost, read_back, unknown, applied) = match ready {
                 Ok(connection) => {
                     spawn_blocking(cx.background_executor(), move || work(connection)).await
                 }
-                Err(error) => (Err(error), false, None, false),
+                Err(error) => (Err(error), false, None, false, Vec::new()),
             };
             // Outcome and duration only. Not even at debug the server's text:
             // some engines quote the statement back in a syntax error.
@@ -2954,6 +2966,9 @@ impl Workspace {
                     // What a Row send's landing says, and whether the relation
                     // is read again.
                     let mut row_said: Option<(String, bool)> = None;
+                    // Whether an ordered apply stopped after writing some of the
+                    // draft, which is then no longer the draft the review shows.
+                    let mut part_way = false;
                     let (succeeded, produced_grid, plan, rest, notice, landed) = {
                         let Some(profile) = workspace.issued_to(&id, generation) else {
                             workspace.drop_stale_run(&id, tab, lane.as_ref(), cx);
@@ -3328,6 +3343,17 @@ impl Workspace {
                                     ),
                                     false => error.message,
                                 };
+                                // What an ordered apply wrote before it stopped
+                                // is on the server and not to be sent again, so
+                                // it leaves the draft, by what names it: the rows
+                                // may have been sorted since the apply began.
+                                if !applied.is_empty() {
+                                    part_way = true;
+                                    results.update(cx, |table, cx| {
+                                        table.delegate_mut().drop_applied(&applied);
+                                        table.refresh(cx);
+                                    });
+                                }
                                 // The row says what the server said to it, and
                                 // keeps its edits.
                                 if let Some((row, rows_id, _, _)) = &row_sent {
@@ -3403,7 +3429,13 @@ impl Workspace {
                     {
                         // A kept send that failed says so where its statement
                         // is, which is the review when one covers the tab.
-                        if kept && !succeeded {
+                        if kept && !succeeded && part_way {
+                            // The review's statements include the ones that
+                            // applied, and Run would send them again: the draft
+                            // that is left is written afresh by Apply.
+                            profile.session.drop_apply_review_of(tab);
+                            profile.session.tab_notice = Some((tab, notice));
+                        } else if kept && !succeeded {
                             profile.session.edit_failed(tab, notice);
                         } else {
                             profile.session.tab_notice = Some((tab, notice));
@@ -4289,12 +4321,61 @@ fn verified_result(
             rows_affected: Some(affected),
             ..QueryResult::default()
         }),
-        ApplyOutcome::Failed { error, .. } => Err(error),
+        // An ordered target's failure after its first write is told with what
+        // applied (`verified_message`); every other is the driver's own words.
+        ApplyOutcome::Failed { stage, error }
+            if !(ordered && matches!(stage, ApplyStage::Write(_))) =>
+        {
+            Err(error)
+        }
         refused => Err(DbError {
             message: verified_message(&refused, verify, ordered).unwrap_or_default(),
             position: None,
         }),
     }
+}
+
+/// How many statements of an ordered apply were written when it stopped, the
+/// ones before the step it names: a statement the server refused, or counted
+/// other than one row. Nothing was sent after it. A drift and a failure
+/// before the first write wrote nothing.
+///
+/// `ApplyStage::ReadBack` is not one a draft can reach: a MongoDB draft's steps
+/// carry no read-back.
+fn written_before_stop(outcome: &ApplyOutcome) -> usize {
+    match outcome {
+        ApplyOutcome::Miscounted { step, .. }
+        | ApplyOutcome::Failed {
+            stage: ApplyStage::Write(step),
+            ..
+        } => *step,
+        _ => 0,
+    }
+}
+
+/// What an ordered apply that stopped at step `stopped` says: what applied and
+/// has left the draft, the sentence for the statement it stopped at, and the
+/// statements after it that were never sent.
+fn stopped_part_way(verify: &Verification, stopped: usize, sentence: String) -> String {
+    let total = verify.steps.len();
+    let applied = match stopped {
+        0 => "Nothing was applied.".to_string(),
+        1 => "Statement 1 was applied and has left the draft.".to_string(),
+        written => format!("Statements 1 to {written} were applied and have left the draft."),
+    };
+    let unsent = match total.saturating_sub(stopped + 1) {
+        0 => None,
+        1 => Some(format!("Statement {total} was not sent.")),
+        _ => Some(format!(
+            "Statements {} to {total} were not sent.",
+            stopped + 2
+        )),
+    };
+    [Some(applied), Some(sentence), unsent]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What the review says of a verified apply that wrote nothing, naming the
@@ -4303,12 +4384,22 @@ fn verified_result(
 /// alone, since nothing is known of what it did. `None` for an outcome that
 /// carries no such sentence, the write that landed and the errors a driver
 /// words itself.
+///
+/// For an `ordered` target, which has no transaction to roll back, a statement
+/// that failed or counted wrongly after others had been written says which
+/// were applied, which one stopped it and which were not sent
+/// ([`stopped_part_way`]); a drift wrote nothing and keeps the sentences above.
 fn verified_message(
     outcome: &ApplyOutcome,
     verify: &Verification,
-    _ordered: bool,
+    ordered: bool,
 ) -> Option<String> {
     let row = |step: usize| verify.rows.get(step).map_or("?", String::as_str);
+    // An added row is named as it is, an existing one by its key.
+    let named = |step: usize| match verify.steps.get(step).map(|step| step.kind) {
+        Some(StepKind::Insert) => row(step).to_string(),
+        Some(StepKind::Update | StepKind::Delete) | None => format!("row {}", row(step)),
+    };
     let sentences: Vec<String> = match outcome {
         ApplyOutcome::Drifted(drifted) => drifted
             .iter()
@@ -4323,21 +4414,42 @@ fn verified_message(
             })
             .collect(),
         ApplyOutcome::Miscounted { step, count } => {
-            // An added row is named as it is, an existing one by its key.
-            let kind = verify.steps.get(*step).map(|step| step.kind);
-            let named = match kind {
-                Some(StepKind::Insert) => row(*step).to_string(),
-                Some(StepKind::Update | StepKind::Delete) | None => format!("row {}", row(*step)),
-            };
             let what = match count {
                 Some(count) => format!("affected {count} rows"),
                 None => "did not say how many rows it affected".to_string(),
             };
-            vec![format!(
-                "{} {} ({named}) {what}.",
-                kind.map_or("Statement", StepKind::keyword),
-                step + 1
-            )]
+            let sentence = format!(
+                "{} {} ({}) {what}.",
+                verify
+                    .steps
+                    .get(*step)
+                    .map_or("Statement", |step| step.kind.keyword()),
+                step + 1,
+                named(*step)
+            );
+            if ordered {
+                return Some(stopped_part_way(verify, *step, sentence));
+            }
+            vec![sentence]
+        }
+        ApplyOutcome::Failed {
+            stage: ApplyStage::Write(step),
+            error,
+        } if ordered => {
+            let said = error.message.trim_end();
+            let stop = match said.ends_with(['.', '!', '?']) {
+                true => "",
+                false => ".",
+            };
+            return Some(stopped_part_way(
+                verify,
+                *step,
+                format!(
+                    "Statement {} ({}) failed: {said}{stop}",
+                    step + 1,
+                    named(*step)
+                ),
+            ));
         }
         ApplyOutcome::Unknown(_) => {
             return Some(
@@ -4745,6 +4857,37 @@ mod tests {
         let landed = verified_result(failed(db::ApplyStage::Write(2)), &verify, true)
             .expect_err("a part-way failure is an error");
         assert!(landed.message.starts_with("Statements 1 to 2 were applied"));
+    }
+
+    #[test]
+    fn an_ordered_apply_has_written_the_steps_before_the_one_it_stopped_at() {
+        let failed = |stage| ApplyOutcome::Failed {
+            stage,
+            error: DbError {
+                message: "refused".into(),
+                position: None,
+            },
+        };
+        assert_eq!(written_before_stop(&failed(ApplyStage::Write(3))), 3);
+        assert_eq!(
+            written_before_stop(&ApplyOutcome::Miscounted {
+                step: 2,
+                count: Some(0)
+            }),
+            2
+        );
+        // Before any write, or with none sent: nothing is written.
+        for outcome in [
+            failed(ApplyStage::Begin),
+            failed(ApplyStage::Reread(2)),
+            ApplyOutcome::Drifted(vec![(1, Drift::Gone)]),
+            ApplyOutcome::Applied {
+                affected: 3,
+                read_back: None,
+            },
+        ] {
+            assert_eq!(written_before_stop(&outcome), 0, "{outcome:?}");
+        }
     }
 
     #[test]
