@@ -647,11 +647,15 @@ impl Engine {
     /// [`Connection::generated`], and one added later must be decided here.
     pub fn verifies_applies(self) -> bool {
         match self {
-            Self::Sqlite | Self::DuckDb | Self::Postgres | Self::MySql | Self::MariaDb => true,
+            Self::Sqlite
+            | Self::DuckDb
+            | Self::Postgres
+            | Self::MySql
+            | Self::MariaDb
+            | Self::SqlServer => true,
             Self::Turso
             | Self::Snowflake
             | Self::ClickHouse
-            | Self::SqlServer
             | Self::MongoDb
             | Self::Redis
             | Self::Generic => false,
@@ -2273,8 +2277,8 @@ impl Connection {
                 Self::MySql(connection) => {
                     connection.apply_verified(bound.is_some(), steps, bracket, &proceed)
                 }
-                Self::SqlServer(_)
-                | Self::Turso(_)
+                Self::SqlServer(connection) => connection.apply_verified(steps, bracket, &proceed),
+                Self::Turso(_)
                 | Self::Snowflake(_)
                 | Self::ClickHouse(_)
                 | Self::MongoDb(_)
