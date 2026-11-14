@@ -4005,6 +4005,10 @@ pub(crate) struct VerifiedStep {
     pub reread: Option<String>,
     /// The row as it was fetched, empty for an `INSERT`.
     pub before: Vec<FetchedCell>,
+    /// A read of the row, run after this statement's write inside the same
+    /// transaction, so a Row-mode send shows what the server now holds.
+    #[allow(dead_code)] // RED stub: read by the implementation
+    pub read_back: Option<String>,
 }
 
 /// Whose transaction a verified apply runs in.
@@ -4027,6 +4031,9 @@ pub(crate) enum ApplyStage {
     Begin,
     Reread(usize),
     Write(usize),
+    /// The second read of a `DELETE`'s row that counted none.
+    Confirm(usize),
+    ReadBack(usize),
     Commit,
 }
 
@@ -4059,7 +4066,13 @@ pub(crate) enum Sending {
 pub(crate) enum ApplyOutcome {
     /// Every statement counted the one row it was written for, and the
     /// transaction committed. `affected` is the rows written, all together.
-    Applied { affected: u64 },
+    /// `read_back` is the last step's read-back, when it had one, boxed so the
+    /// outcomes that carry no rows stay small.
+    Applied {
+        affected: u64,
+        #[allow(dead_code)] // RED stub: read by the implementation
+        read_back: Option<Box<QueryResult>>,
+    },
     /// No write was sent: these steps' rows are not the rows that were read.
     Drifted(Vec<(usize, Drift)>),
     /// A statement counted another number of rows than the one it names; the
@@ -4277,7 +4290,10 @@ pub(super) fn run_verified(
             error,
         };
     }
-    ApplyOutcome::Applied { affected }
+    ApplyOutcome::Applied {
+        affected,
+        read_back: None,
+    }
 }
 
 /// The second half of the catalog: the routines, with the sequences joined
@@ -5052,6 +5068,43 @@ mod tests {
             );
         }
         assert!(check_time_zone("").is_err() && check_time_zone("   ").is_err());
+    }
+
+    #[test]
+    fn a_write_that_reports_no_count_is_miscounted_and_rolled_back() {
+        let step = VerifiedStep {
+            sql: r#"UPDATE "main"."t" SET "a" = 'x' WHERE "id" = '1'"#.into(),
+            kind: StepKind::Update,
+            reread: Some(r#"SELECT * FROM "main"."t" WHERE "id" = '1'"#.into()),
+            before: vec![fetched("id", Some("1"))],
+            read_back: None,
+        };
+        let mut sent = Vec::new();
+        let mut send = |sql: &str, _: Sending| {
+            sent.push(sql.to_string());
+            Ok(match sql.starts_with("SELECT") {
+                true => reread(&["id"], &[&[Some("1")]]),
+                false => QueryResult::default(),
+            })
+        };
+        assert_eq!(
+            run_verified(
+                Engine::Sqlite,
+                &[step],
+                Bracket::Own,
+                &mut send,
+                &|| true,
+                &|_| false,
+                &|_| false
+            ),
+            ApplyOutcome::Miscounted {
+                step: 0,
+                count: None
+            }
+        );
+        assert_eq!(sent.first().map(String::as_str), Some("BEGIN"));
+        assert_eq!(sent.last().map(String::as_str), Some("ROLLBACK"));
+        assert!(!sent.iter().any(|sql| sql == "COMMIT"), "{sent:?}");
     }
 
     #[test]

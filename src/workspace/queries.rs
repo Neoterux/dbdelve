@@ -4240,7 +4240,7 @@ fn verified_result(
         )
     };
     match outcome {
-        ApplyOutcome::Applied { affected } => Ok(QueryResult {
+        ApplyOutcome::Applied { affected, .. } => Ok(QueryResult {
             rows_affected: Some(affected),
             ..QueryResult::default()
         }),
@@ -4397,6 +4397,88 @@ pub(super) fn answered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verification() -> Verification {
+        let step = |kind| db::VerifiedStep {
+            sql: String::new(),
+            kind,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        };
+        Verification {
+            steps: vec![
+                step(db::StepKind::Delete),
+                step(db::StepKind::Update),
+                step(db::StepKind::Insert),
+            ],
+            rows: vec!["id = 1".into(), "id = 2".into(), "added row 1".into()],
+        }
+    }
+
+    #[test]
+    fn a_verified_outcome_names_each_row_in_what_happened() {
+        let verify = verification();
+        let said = |outcome: ApplyOutcome| verified_message(&outcome, &verify);
+
+        assert_eq!(
+            said(ApplyOutcome::Drifted(vec![
+                (0, Drift::Changed),
+                (1, Drift::Gone)
+            ]))
+            .as_deref(),
+            Some(
+                "Nothing was applied. Row id = 1 does not match the row as it was read. \
+                 Row id = 2 is no longer on the server."
+            ),
+            "every drifted row, in step order"
+        );
+        assert_eq!(
+            said(ApplyOutcome::Drifted(vec![(1, Drift::Ambiguous(2))])).as_deref(),
+            Some("Nothing was applied. Row id = 2 matches 2 rows on the server.")
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            })
+            .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 0,
+                count: Some(2)
+            })
+            .as_deref(),
+            Some("Nothing was applied. DELETE 1 (row id = 1) affected 2 rows.")
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 1,
+                count: None
+            })
+            .as_deref(),
+            Some(
+                "Nothing was applied. UPDATE 2 (row id = 2) did not say how many rows it affected."
+            )
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 2,
+                count: Some(0)
+            })
+            .as_deref(),
+            Some("Nothing was applied. INSERT 3 (added row 1) affected 0 rows.")
+        );
+        assert_eq!(
+            said(ApplyOutcome::Applied {
+                affected: 3,
+                read_back: None
+            }),
+            None
+        );
+    }
 
     #[test]
     fn a_run_answered_without_its_tab_keeps_only_what_the_answer_says() {

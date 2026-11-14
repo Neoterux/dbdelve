@@ -22342,6 +22342,198 @@ fn a_row_changed_on_the_server_since_it_was_read_applies_nothing_and_is_named_in
     });
 }
 
+/// A row another session deleted after the grid read it is not written over:
+/// it is named as gone.
+#[gpui::test]
+fn a_row_deleted_on_the_server_since_it_was_read_is_named_as_gone(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 1, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        behind_the_grid("delete from birds where id = 2");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 2 is no longer on the server.")
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 2").as_deref(),
+            Some("0")
+        );
+        quit(workspace, cx);
+    });
+}
+
+const BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT: &str = "create table birds (id integer primary key, \
+     name text not null); insert into birds values (1, 'wren'), (2, 'tit'); \
+     create trigger keeps before update on birds when old.id = 2 \
+     begin select raise(ignore); end;";
+
+/// An `UPDATE` a trigger skipped changed no row, which the server answers as
+/// a success. The count refuses it, with the draft's `DELETE` undone.
+#[gpui::test]
+fn an_update_a_trigger_skipped_rolls_the_whole_draft_back_and_is_named(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0]))
+        });
+        stage(&grid, cx, 1, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 1").as_deref(),
+            Some("1"),
+            "the DELETE before it is undone"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().marked_count(), 1);
+            assert_eq!(table.delegate().pending_count(), 2, "the mark and the edit");
+        });
+        quit(workspace, cx);
+    });
+}
+
+const BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD: &str = "create table birds (id integer primary key, \
+     name text not null, parent integer); \
+     insert into birds values (1, 'wren', null), (2, 'tit', 1), (3, 'jay', null); \
+     create trigger cascades after delete on birds \
+     begin delete from birds where parent = old.id; end;";
+
+/// A draft that marks a row and the child a trigger deletes with it: the
+/// child's own `DELETE` counts none, because the row was taken already, and
+/// the second read of it finds it gone.
+#[gpui::test]
+fn a_delete_that_counts_zero_applies_only_when_its_row_is_gone(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0, 1]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "it applied");
+        assert_eq!(
+            on_disk("select group_concat(id) from birds").as_deref(),
+            Some("3")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The same draft where a trigger keeps the child: its `DELETE` counts none
+/// and the row is still there, which is a refusal.
+#[gpui::test]
+fn a_delete_that_counts_zero_with_its_row_still_there_is_refused_and_named(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            &format!(
+                "{BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD} create trigger keeps before delete \
+                 on birds when old.id = 2 begin select raise(ignore); end;"
+            ),
+        );
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0, 1]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. DELETE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("3"),
+            "the first DELETE is undone"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A run the mode prompt held is still a verified one when it is let go.
+#[gpui::test]
+fn a_verified_apply_held_by_the_mode_prompt_still_reads_its_rows_when_resumed(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        workspace.update(cx, |workspace, cx| workspace.set_mode(Mode::ReadOnly, cx));
+        settle(cx);
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().session.pending_run.is_some());
+        });
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.approve_pending_run(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
+        quit(workspace, cx);
+    });
+}
+
 /// A marked row is on its way out, so it takes no edit, and says so rather than
 /// asking for a higher mode or calling the column the problem.
 #[gpui::test]
