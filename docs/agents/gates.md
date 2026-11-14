@@ -312,7 +312,9 @@ must return one. An update on a table lacking the block columns is spelled
 `ALTER TABLE <t> UPDATE <assignments> WHERE <predicate> SETTINGS
 mutations_sync = 2`, exactly, with the setting last. A column that cannot be
 matched by equality (on SQLite, any declared type outside the INTEGER, TEXT,
-REAL and BLOB affinities) leaves the grid read-only and says why; it is never
+REAL and BLOB affinities; on Postgres and DuckDB, any type not on the list
+`docs/agents/engines.md` gives, each listed because a test matched it on that
+engine) leaves the grid read-only and says why; it is never
 left out of the `WHERE`, and no unique key, rowid or subset of the columns
 names the row in its place.
 
