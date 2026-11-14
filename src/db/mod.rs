@@ -5158,12 +5158,160 @@ mod tests {
         assert!(!sent.iter().any(|sql| sql == "COMMIT"), "{sent:?}");
     }
 
+    fn update_step() -> VerifiedStep {
+        VerifiedStep {
+            sql: r#"UPDATE "public"."t" SET "a" = 'x' WHERE "id" = '1'"#.into(),
+            kind: StepKind::Update,
+            reread: Some(r#"SELECT * FROM "public"."t" WHERE "id" = '1'"#.into()),
+            before: vec![fetched("id", Some("1"))],
+            read_back: None,
+        }
+    }
+
+    #[test]
+    fn a_cancel_between_statements_rolls_the_sequence_back() {
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let mut send = |sql: &str, _: Sending| {
+            sent.borrow_mut().push(sql.to_string());
+            Ok(match sql.starts_with("SELECT") {
+                true => reread(&["id"], &[&[Some("1")]]),
+                false => QueryResult::default(),
+            })
+        };
+        // A Cancel comes once the re-read has gone out.
+        let proceed = || !sent.borrow().iter().any(|sql| sql.starts_with("SELECT"));
+        let outcome = run_verified(
+            Engine::Postgres,
+            &[update_step()],
+            Bracket::Own,
+            &mut send,
+            &proceed,
+            &|_| false,
+            &|_| false,
+        );
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Write(0),
+                error: plain_error("Cancelled before it was sent.".into()),
+            }
+        );
+        assert_eq!(
+            sent.into_inner(),
+            [
+                "BEGIN",
+                r#"SELECT * FROM "public"."t" WHERE "id" = '1'"#,
+                "ROLLBACK"
+            ],
+            "no write went out, and the transaction the apply opened was ended"
+        );
+
+        // A write the server stopped while it ran fails at that write.
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let mut send = |sql: &str, _: Sending| {
+            sent.borrow_mut().push(sql.to_string());
+            match sql.split_whitespace().next() {
+                Some("SELECT") => Ok(reread(&["id"], &[&[Some("1")]])),
+                Some("UPDATE") => Err(plain_error(
+                    "canceling statement due to user request".into(),
+                )),
+                _ => Ok(QueryResult::default()),
+            }
+        };
+        let outcome = run_verified(
+            Engine::Postgres,
+            &[update_step()],
+            Bracket::Own,
+            &mut send,
+            &|| true,
+            &|_| false,
+            &|_| false,
+        );
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Write(0),
+                error: plain_error("canceling statement due to user request".into()),
+            }
+        );
+        assert_eq!(sent.borrow().last().map(String::as_str), Some("ROLLBACK"));
+    }
+
+    #[test]
+    fn a_lost_session_at_commit_is_an_unknown_outcome_and_before_it_is_not_applied() {
+        // Answers every statement but `failing`, which gets the error.
+        let run = |failing: &str, lost: bool| {
+            let sent = std::cell::RefCell::new(Vec::<String>::new());
+            let mut send = |sql: &str, _: Sending| {
+                sent.borrow_mut().push(sql.to_string());
+                match sql {
+                    _ if sql.starts_with(failing) => {
+                        Err(plain_error("the connection closed".into()))
+                    }
+                    _ if sql.starts_with("SELECT") => Ok(reread(&["id"], &[&[Some("1")]])),
+                    _ if sql.starts_with("UPDATE") => Ok(QueryResult {
+                        rows_affected: Some(1),
+                        ..QueryResult::default()
+                    }),
+                    _ => Ok(QueryResult::default()),
+                }
+            };
+            let outcome = run_verified(
+                Engine::Postgres,
+                &[update_step()],
+                Bracket::Own,
+                &mut send,
+                &|| true,
+                &|_| false,
+                &|_| lost,
+            );
+            (outcome, sent.into_inner())
+        };
+        let error = || plain_error("the connection closed".into());
+
+        let (outcome, _) = run("SELECT", true);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Reread(0),
+                error: error()
+            },
+            "a lost session before the write is not applied"
+        );
+        let (outcome, _) = run("UPDATE", true);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Write(0),
+                error: error()
+            },
+            "a lost session at the write is not applied either"
+        );
+        let (outcome, sent) = run("COMMIT", true);
+        assert_eq!(outcome, ApplyOutcome::Unknown(error()));
+        assert_eq!(
+            sent.last().map(String::as_str),
+            Some("COMMIT"),
+            "nothing is sent after a COMMIT whose answer did not come"
+        );
+        let (outcome, sent) = run("COMMIT", false);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Commit,
+                error: error()
+            },
+            "a COMMIT the server refused on a live session was not applied"
+        );
+        assert_eq!(sent.last().map(String::as_str), Some("ROLLBACK"));
+    }
+
     #[test]
     fn only_the_engines_with_an_arm_verify_an_apply() {
         for engine in Engine::ALL {
             assert_eq!(
                 engine.verifies_applies(),
-                matches!(engine, Engine::Sqlite | Engine::DuckDb),
+                matches!(engine, Engine::Sqlite | Engine::DuckDb | Engine::Postgres),
                 "{engine:?}"
             );
         }

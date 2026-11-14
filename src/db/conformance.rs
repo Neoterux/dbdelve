@@ -1831,6 +1831,35 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
     );
 }
 
+/// The steps of a draft the way the workspace builds them: `batch`'s
+/// statements cut by [`sql::generated_writes`], each paired with the re-read
+/// [`sql::row_reread`] cuts from it. `rows` are the draft's statements in the
+/// order [`sql::draft_batch`] writes them (deletes, updates, inserts), each
+/// with the row it was fetched from.
+pub(super) fn verified_steps(
+    engine: Engine,
+    batch: &str,
+    rows: Vec<(StepKind, Vec<FetchedCell>)>,
+) -> Vec<VerifiedStep> {
+    let statements = sql::generated_writes(engine, batch)
+        .unwrap_or_else(|| panic!("{engine:?}: the gate refuses `{batch}`"));
+    assert_eq!(statements.len(), rows.len(), "{engine:?}: {batch}");
+    statements
+        .into_iter()
+        .zip(rows)
+        .map(|(statement, (kind, before))| VerifiedStep {
+            reread: Some(
+                sql::row_reread(engine, &statement)
+                    .unwrap_or_else(|| panic!("{engine:?}: no re-read of `{statement}`")),
+            ),
+            sql: statement,
+            kind,
+            before,
+            read_back: None,
+        })
+        .collect()
+}
+
 /// A draft applied through the verified primitive, on a subject whose target
 /// has an arm for it: an unchanged draft applies, a row changed or deleted
 /// since it was read applies nothing and is named, and a statement that
@@ -1936,27 +1965,8 @@ pub(super) fn verified_draft_round_trip(subject: &Subject) {
         types: types.clone(),
         ..PendingRow::default()
     };
-    // `rows` are the draft's statements in the order `draft_batch` writes
-    // them (deletes, updates, inserts), each with the row it was fetched from.
-    let steps = |batch: &str, rows: Vec<(StepKind, Vec<FetchedCell>)>| -> Vec<VerifiedStep> {
-        let statements = sql::generated_writes(engine, batch)
-            .unwrap_or_else(|| panic!("{at}: the gate refuses `{batch}`"));
-        assert_eq!(statements.len(), rows.len(), "{at}: {batch}");
-        statements
-            .into_iter()
-            .zip(rows)
-            .map(|(statement, (kind, before))| VerifiedStep {
-                reread: Some(
-                    sql::row_reread(engine, &statement)
-                        .unwrap_or_else(|| panic!("{at}: no re-read of `{statement}`")),
-                ),
-                sql: statement,
-                kind,
-                before,
-                read_back: None,
-            })
-            .collect()
-    };
+    let steps =
+        |batch: &str, rows: Vec<(StepKind, Vec<FetchedCell>)>| verified_steps(engine, batch, rows);
     let draft = |deletes: &[sql::DraftDelete], updates: &[PendingRow]| {
         sql::draft_batch(engine, deletes, updates, &[], false)
             .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"))
