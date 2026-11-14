@@ -29120,3 +29120,63 @@ fn delete_row_on_a_table_without_a_primary_key_deletes_exactly_its_row(cx: &mut 
         quit(workspace, cx);
     });
 }
+
+/// A Row send on a table with no primary key reads its row back by the values
+/// it now holds, since the values it was named by are gone; a value set to
+/// DEFAULT leaves no value to name it by, so that send is refused and kept.
+#[gpui::test]
+fn a_row_send_on_a_table_without_a_primary_key_reads_its_row_back_by_its_new_values(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+        // Not "The row was not found after the update.", which a read by the
+        // values the row had says before the grid reads the table again.
+        assert!(
+            shown_notice(&workspace, cx).is_some_and(|notice| notice.starts_with("1 row updated")),
+            "{:?}",
+            shown_notice(&workspace, cx)
+        );
+        assert_eq!(cell_of(&grid, cx, 0, 0).as_deref(), Some("finch"));
+        assert_eq!(cell_of(&grid, cx, 0, 1), None, "the NULL is still NULL");
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some(""));
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().send_failure(), None);
+            assert_eq!(table.delegate().pending_count(), 0);
+        });
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
+        );
+
+        stage(&grid, cx, 1, 1, NewValue::Default);
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    1,
+                    "The row was not sent: a value set to DEFAULT cannot be read back on a row \
+                     named by every value."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where place = ''").as_deref(),
+            Some("1"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+}
