@@ -22892,6 +22892,125 @@ fn a_row_that_is_gone_after_its_update_says_so_and_rereads(cx: &mut TestAppConte
     });
 }
 
+/// A row another session changed after the grid read it is not written over by
+/// a Row send: it is read again inside the send's transaction, found to differ,
+/// and the row keeps its edits and its ring.
+#[gpui::test]
+fn a_row_send_over_a_row_changed_on_the_server_keeps_the_edits_and_the_ring(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        press(cx, "down");
+
+        let (row, message) = refused_row(&grid, cx).expect("the row says why it was refused");
+        assert_eq!(row, 0);
+        assert!(
+            message.starts_with(
+                "Nothing was applied. Row id = 1 does not match the row as it was read."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("The row keeps its edits; Esc puts it back as it was read."),
+            "{message}"
+        );
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)), "the ring is back");
+        grid.read_with(cx, |grid, _| {
+            assert!(matches!(
+                grid.delegate().pending_cells(0).as_slice(),
+                [(1, NewValue::Value(name))] if name == "finch"
+            ));
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite"),
+            "the other session's value stands"
+        );
+
+        // The row is read again by the next Save, not judged by the first one.
+        behind_the_grid("update birds set name = 'wren' where id = 1");
+        save(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+/// An `UPDATE` a trigger skipped changed no row, which the server answers as a
+/// success; the count refuses it and the row keeps its edit.
+#[gpui::test]
+fn a_row_send_a_trigger_skipped_is_refused_and_keeps_the_edits(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger keeps before update on birds when old.id = 1 \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+
+        let (row, message) = refused_row(&grid, cx).expect("the row says why it was refused");
+        assert_eq!(row, 0);
+        assert!(
+            message.starts_with("Nothing was applied. UPDATE 1 (row id = 1) affected 0 rows."),
+            "{message}"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the edit is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// What the grid shows after a Row send is what the server holds once its
+/// triggers ran, read inside the send's transaction, not what was typed.
+#[gpui::test]
+fn a_verified_row_send_reads_its_row_back_from_inside_the_transaction(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        // SQLite cannot change `new` in a trigger, so the row is written again
+        // after its update, as a `BEFORE` trigger would have it written.
+        let schema = format!(
+            "{BIRDS} create trigger shouts after update of name on birds \
+             begin update birds set name = upper(new.name) where id = new.id; end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("FINCH"));
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("FINCH")
+        );
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn saving_twice_sends_one_update(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
