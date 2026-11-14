@@ -126,6 +126,22 @@ Decided, and not to be re-litigated:
   statement that met it, so a conflict is a failure at that write. Its
   `is_autocommit` answers true whatever the state, so the apply knows it opened
   its own transaction from its own bracket.
+  MySQL and MariaDB count the rows a statement *changed* by default, so a
+  same-value `UPDATE` counts none and cannot be told from one that matched
+  nothing. The verified apply reads an `UPDATE`'s matched count from the OK
+  packet's info text, by position and never by label (`lc_messages` translates
+  it; the numbers keep the order matched, changed, warnings), and cross-checks
+  the changed number against the affected count: a text that is not three
+  integers, or whose changed number disagrees, is not believed, and the
+  affected count stands only when it names a row. An `INSERT`'s and a
+  `DELETE`'s count is the one reported. `CLIENT_FOUND_ROWS` stays off, because
+  it would change the counts shown for the user's own statements and the
+  import's Skip summary. The apply sends its own `BEGIN` after putting a bound
+  tab's database back, under the one lock, and sends none inside the user's
+  open transaction (`Bracket::Joined`), where it would commit that transaction;
+  the driver cannot be asked whether one is open, so the workspace's tracked
+  state chooses the bracket. An error at `COMMIT` is an unknown outcome only
+  when a ping finds the session gone.
 - **A batch that fails part way is rolled back, and the error says which state
   the data is in.** Without that the brackets produce a third state, neither
   applied nor discarded, and rendered as applied, because the refresh `SELECT`

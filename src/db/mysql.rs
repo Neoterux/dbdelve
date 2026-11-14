@@ -29,10 +29,11 @@ use ::mysql::{Conn, OptsBuilder, SslOpts, Value};
 
 use super::ssh::{Tunnel, tunnelled};
 use super::{
-    Catalog, Column, DbError, EditTarget, Engine, Fetch, Index, IndexKind, QueryResult, Reference,
-    RowBuilder, ServerConfig, Shown, Sizes, SslMode, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
-    assemble_sizes, assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
+    ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Fetch, Index,
+    IndexKind, QueryResult, Reference, RowBuilder, Sending, ServerConfig, Shown, Sizes, SslMode,
+    StepKind, Stopped, Structure, VerifiedStep, assemble_catalog, assemble_databases,
+    assemble_foreign_keys, assemble_references, assemble_sequences, assemble_sizes,
+    assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
 };
 
 /// Without this the driver waits out the OS SYN retry budget, so a host that
@@ -714,6 +715,70 @@ impl Connection {
         self.run(sql, true, fetch, true)
     }
 
+    /// Applies `steps` as one verified sequence on this session, under one
+    /// acquisition of its lock, so no other tab's statement runs between the
+    /// re-reads and the writes: see [`super::run_verified`]. `bound` puts the
+    /// session back on its own database first, in the same acquisition, as
+    /// [`Self::query_bound`] does. Every statement goes through [`Self::ran`],
+    /// so none takes the lock again.
+    ///
+    /// An `UPDATE`'s count is the rows it matched ([`matched_count`]): the
+    /// server's own count is the rows it changed, and a row already holding the
+    /// value would count none. An `INSERT`'s and a `DELETE`'s is the count as
+    /// reported. Under [`Bracket::Joined`] no `BEGIN` is sent, because here it
+    /// would commit the user's open transaction.
+    pub fn apply_verified(
+        &self,
+        bound: bool,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        proceed: &dyn Fn() -> bool,
+    ) -> ApplyOutcome {
+        let failed = |error| ApplyOutcome::Failed {
+            stage: ApplyStage::Begin,
+            error,
+        };
+        let mut connection = match self.connection.lock() {
+            Ok(connection) => connection,
+            Err(_) => {
+                return failed(plain_error(
+                    "The connection is unavailable after an earlier internal failure.".into(),
+                ));
+            }
+        };
+        // Registers the run, so a Cancel finds the session, and checks for one
+        // that came first, as `run` does before it touches the session.
+        if !proceed() {
+            return failed(plain_error("Cancelled before it was sent.".into()));
+        }
+        if bound && let Err(error) = connection.select_db(&self.server.database) {
+            return failed(super::unplaced(query_error(&error)));
+        }
+        // Asked of the held connection when a statement fails, and read by the
+        // lost test, which cannot take the lock `send` holds: only an error at
+        // `COMMIT` with the session gone is an outcome nobody can know.
+        let gone = std::cell::Cell::new(false);
+        let mut send = |sql: &str, sending: Sending| {
+            let update = sending == Sending::Write(StepKind::Update);
+            let result = self
+                .ran(&mut connection, sql, false, Fetch::default(), update)
+                .map(|(result, _)| result);
+            if result.is_err() {
+                gone.set(connection.ping().is_err());
+            }
+            result
+        };
+        super::run_verified(
+            self.engine,
+            steps,
+            bracket,
+            &mut send,
+            proceed,
+            &|_| false,
+            &|_| gone.get(),
+        )
+    }
+
     /// dbdelve's own SQL. Its rows are never editable, so it does not pay for the
     /// round trip that reads a primary key.
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
@@ -784,6 +849,36 @@ impl Connection {
                 .map_err(|error| super::unplaced(query_error(&error)))?;
         }
 
+        let (mut result, probed) = match self.ran(&mut connection, sql, editable, fetch, false) {
+            Ok(ran) => ran,
+            Err(error) => return Err(rolled_back(&mut connection, sql, error)),
+        };
+
+        // The connection mutex is not reentrant and `edit_target` runs a catalog
+        // query through it, so the lock has to go before the question is asked.
+        drop(connection);
+        if editable {
+            result.edit = self.edit_target(&probed);
+        }
+
+        Ok(result)
+    }
+
+    /// The part of [`Self::run`] that works under the held connection, for the
+    /// verified apply, which holds it across several statements and so cannot
+    /// take its lock again. The lock, the binding and the question of which
+    /// table the columns belong to stay with the callers.
+    ///
+    /// `update` reads the count as the rows the statement *matched*
+    /// ([`matched_count`]) and not the ones it changed, for an `UPDATE` step.
+    fn ran(
+        &self,
+        connection: &mut Conn,
+        sql: &str,
+        editable: bool,
+        fetch: Fetch,
+        update: bool,
+    ) -> Result<(QueryResult, Vec<ProbedColumn>), DbError> {
         let mut result = QueryResult::default();
         let mut probed = Vec::new();
         // How long the kept rows took, once there were as many as the limit.
@@ -828,8 +923,13 @@ impl Connection {
                 // command has rows to have affected.
                 if columns.is_empty() {
                     // Read first: draining the set moves the driver past its
-                    // OK packet, after which the count reads as zero.
-                    result.rows_affected = Some(set.affected_rows());
+                    // OK packet, after which the count reads as zero and the
+                    // info as empty.
+                    let affected = set.affected_rows();
+                    result.rows_affected = match update {
+                        true => matched_count(affected, &set.info_str()),
+                        false => Some(affected),
+                    };
                     warned = set.warnings();
                     for row in &mut set {
                         row.map_err(|error| query_error(&error))?;
@@ -918,24 +1018,14 @@ impl Connection {
                     ));
                 }
                 if connection.warnings() > 0 {
-                    result.messages.extend(warnings(&mut connection));
+                    result.messages.extend(warnings(connection));
                 }
             }
             Ok(())
         };
 
-        if let Err(error) = submit() {
-            return Err(rolled_back(&mut connection, sql, error));
-        }
-
-        // The connection mutex is not reentrant and `edit_target` runs a catalog
-        // query through it, so the lock has to go before the question is asked.
-        drop(connection);
-        if editable {
-            result.edit = self.edit_target(&probed);
-        }
-
-        Ok(result)
+        submit()?;
+        Ok((result, probed))
     }
 
     /// Which table these columns can be written back to, if any.
@@ -1495,11 +1585,6 @@ fn rolled_back(connection: &mut Conn, sql: &str, error: DbError) -> DbError {
 /// reorders the numbers then fails that check and refuses the count, rather
 /// than being believed. Text that is not three integers, or one no `u64`
 /// holds, is not read, and the affected count stands only when it names a row.
-// Read by the verified apply's `UPDATE` step, which task 2 of plan 10.2-05 adds.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the verified apply reads it next")
-)]
 fn matched_count(affected: u64, info: &str) -> Option<u64> {
     let numbers: Option<Vec<u64>> = info
         .split(|c: char| !c.is_ascii_digit())
