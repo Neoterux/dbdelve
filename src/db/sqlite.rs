@@ -1309,6 +1309,17 @@ mod tests {
                     column_type: None,
                 })
                 .collect(),
+            read_back: None,
+        }
+    }
+
+    fn insert(id: &str, name: &str) -> crate::db::VerifiedStep {
+        crate::db::VerifiedStep {
+            sql: format!(r#"INSERT INTO "main"."birds" ("id", "name") VALUES ('{id}', '{name}')"#),
+            kind: crate::db::StepKind::Insert,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
         }
     }
 
@@ -1321,6 +1332,202 @@ mod tests {
                 row.get(0)
             })
             .ok()
+    }
+
+    #[test]
+    fn an_update_or_insert_must_count_one_and_a_zero_delete_must_find_its_row_gone() {
+        use crate::db::{ApplyOutcome, Bracket, StepKind};
+
+        let birds = "create table birds (id integer primary key, name text not null, label text); \
+                     insert into birds values (1, 'wren', 'a'), (2, 'tit', 'a'), (3, 'jay', 'b');";
+        let delete = |id: &str, name: &str| {
+            step(
+                StepKind::Delete,
+                &format!(r#"DELETE FROM "main"."birds" WHERE "id" = '{id}'"#),
+                id,
+                &[("id", Some(id)), ("name", Some(name))],
+            )
+        };
+        let update = |id: &str, name: &str| {
+            step(
+                StepKind::Update,
+                &format!(r#"UPDATE "main"."birds" SET "name" = 'robin' WHERE "id" = '{id}'"#),
+                id,
+                &[("id", Some(id)), ("name", Some(name))],
+            )
+        };
+        let apply = |connection: &Connection, steps: &[crate::db::VerifiedStep]| {
+            connection.apply_verified(steps, Bracket::Own, &|| true)
+        };
+        let rows_of = |connection: &Connection| -> i64 {
+            connection
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("select count(*) from birds", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        // An UPDATE a trigger skipped counts none: the whole sequence, the
+        // DELETE before it included, is rolled back.
+        let connection = memory(&format!(
+            "{birds} create trigger skips before update on birds when old.id = 2 \
+             begin select raise(ignore); end;"
+        ));
+        assert_eq!(
+            apply(&connection, &[delete("1", "wren"), update("2", "tit")]),
+            ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            }
+        );
+        assert_eq!(rows_of(&connection), 3);
+        assert_eq!(name_of(&connection, 2).as_deref(), Some("tit"));
+        assert!(connection.connection.lock().unwrap().is_autocommit());
+
+        // An UPDATE that reaches two rows counts two, and both keep their values.
+        let connection = memory(birds);
+        let mut both = update("1", "wren");
+        both.sql = r#"UPDATE "main"."birds" SET "name" = 'robin' WHERE "label" = 'a'"#.into();
+        assert_eq!(
+            apply(&connection, &[both]),
+            ApplyOutcome::Miscounted {
+                step: 0,
+                count: Some(2)
+            }
+        );
+        assert_eq!(name_of(&connection, 1).as_deref(), Some("wren"));
+        assert_eq!(name_of(&connection, 2).as_deref(), Some("tit"));
+
+        // One that counts one applies.
+        let connection = memory(birds);
+        assert_eq!(
+            apply(&connection, &[update("1", "wren")]),
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: None
+            }
+        );
+        assert_eq!(name_of(&connection, 1).as_deref(), Some("robin"));
+
+        // A DELETE that counts none is a row an earlier DELETE took with it,
+        // which the second read of its row finds gone.
+        let connection = memory(&format!(
+            "{birds} create trigger cascades after delete on birds when old.id = 1 \
+             begin delete from birds where id = 2; end;"
+        ));
+        assert_eq!(
+            apply(&connection, &[delete("1", "wren"), delete("2", "tit")]),
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: None
+            }
+        );
+        assert_eq!(rows_of(&connection), 1);
+
+        // One that counts none with its row still there was skipped, and is
+        // refused.
+        let connection = memory(&format!(
+            "{birds} create trigger keeps before delete on birds when old.id = 2 \
+             begin select raise(ignore); end;"
+        ));
+        assert_eq!(
+            apply(&connection, &[delete("2", "tit")]),
+            ApplyOutcome::Miscounted {
+                step: 0,
+                count: Some(0)
+            }
+        );
+        assert_eq!(rows_of(&connection), 3);
+
+        // An INSERT counts one, or is refused when a trigger skipped it.
+        let connection = memory(&format!(
+            "{birds} create trigger skips before insert on birds when new.id = 5 \
+             begin select raise(ignore); end;"
+        ));
+        assert_eq!(
+            apply(&connection, &[insert("4", "owl")]),
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: None
+            }
+        );
+        assert_eq!(
+            apply(&connection, &[delete("1", "wren"), insert("5", "kite")]),
+            ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            }
+        );
+        assert_eq!(rows_of(&connection), 4, "the DELETE before it is undone");
+        assert_eq!(name_of(&connection, 5), None);
+    }
+
+    #[test]
+    fn a_verified_step_reads_its_row_back_inside_the_transaction() {
+        use crate::db::{ApplyOutcome, Bracket, StepKind};
+
+        let setup = "create table birds (id integer primary key, name text not null); \
+                     insert into birds values (1, 'wren');";
+        let mut update = step(
+            StepKind::Update,
+            r#"UPDATE "main"."birds" SET "name" = 'robin' WHERE "id" = '1'"#,
+            "1",
+            &[("id", Some("1")), ("name", Some("wren"))],
+        );
+        update.read_back = update.reread.clone();
+        let named = |outcome: ApplyOutcome| {
+            let ApplyOutcome::Applied {
+                affected,
+                read_back: Some(read),
+            } = outcome
+            else {
+                panic!("applied with its row read back, not {outcome:?}");
+            };
+            let name = read.columns.iter().position(|c| c.name == "name").unwrap();
+            assert_eq!(read.rows.len(), 1);
+            (affected, read.rows[0].get(name).map(str::to_owned))
+        };
+
+        let connection = memory(setup);
+        assert_eq!(
+            named(connection.apply_verified(std::slice::from_ref(&update), Bracket::Own, &|| true)),
+            (1, Some("robin".to_string()))
+        );
+        assert!(connection.connection.lock().unwrap().is_autocommit());
+
+        // In a transaction of the user's own, nothing is opened or ended.
+        let connection = memory(setup);
+        connection
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN")
+            .unwrap();
+        assert_eq!(
+            named(connection.apply_verified(
+                std::slice::from_ref(&update),
+                Bracket::Joined,
+                &|| true
+            )),
+            (1, Some("robin".to_string()))
+        );
+        assert!(
+            !connection.connection.lock().unwrap().is_autocommit(),
+            "the user's transaction is still open"
+        );
+        assert_eq!(name_of(&connection, 1).as_deref(), Some("robin"));
+        connection
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("ROLLBACK")
+            .unwrap();
+        assert_eq!(
+            name_of(&connection, 1).as_deref(),
+            Some("wren"),
+            "it was theirs to end"
+        );
     }
 
     #[test]
@@ -1357,7 +1564,10 @@ mod tests {
         let connection = memory(setup);
         assert_eq!(
             connection.apply_verified(&steps("tit"), Bracket::Own, &|| true),
-            ApplyOutcome::Applied { affected: 2 }
+            ApplyOutcome::Applied {
+                affected: 2,
+                read_back: None
+            }
         );
         assert_eq!(name_of(&connection, 1), None);
         assert_eq!(name_of(&connection, 2).as_deref(), Some("robin"));

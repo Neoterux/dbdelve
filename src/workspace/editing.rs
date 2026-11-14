@@ -2637,6 +2637,7 @@ fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verifi
             kind,
             reread,
             before,
+            read_back: None,
         });
         rows.push(label);
     }
