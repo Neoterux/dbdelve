@@ -20,8 +20,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    CancelToken, Connection, Driver, Engine, Fetch, QueryResult, RelationKind, Stopped, Target,
-    is_cancel,
+    ApplyOutcome, Bracket, CancelToken, Connection, Drift, Driver, Engine, Fetch, FetchedCell,
+    QueryResult, RelationKind, StepKind, Stopped, Target, VerifiedStep, is_cancel,
 };
 use crate::explorer;
 use crate::filter::{self, Operator};
@@ -1829,6 +1829,232 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
         [Some("added".to_string())],
         "{at}"
     );
+}
+
+/// A draft applied through the verified primitive, on a subject whose target
+/// has an arm for it: an unchanged draft applies, a row changed or deleted
+/// since it was read applies nothing and is named, and a statement that
+/// touches two rows is refused with both left as they were. Every step but the
+/// one hand-written statement is built the way the workspace builds one: from
+/// [`sql::draft_batch`], cut by [`sql::generated_writes`] and paired with
+/// [`sql::row_reread`].
+pub(super) fn verified_draft_round_trip(subject: &Subject) {
+    let scenario = "verified_draft_round_trip";
+    let at = format!("{scenario} on {:?}", subject.target.engine);
+    let engine = subject.target.engine;
+    if !subject.target.verifies_applies() {
+        return;
+    }
+    let (schema, relation, key) = (subject.schema, subject.relation, subject.key);
+    let label = subject.columns[1];
+    let structure = subject
+        .connection
+        .structure(schema, relation)
+        .unwrap_or_else(|error| panic!("{at}: {error}"));
+    let types: Vec<(String, String)> = structure
+        .columns
+        .iter()
+        .map(|column| (column.name.clone(), column.data_type.clone()))
+        .collect();
+
+    // Ids apart from `generated_draft_round_trip`'s, since suites on a shared
+    // server run in parallel.
+    let ids = [911_u32, 912, 913, 914];
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: ids
+            .iter()
+            .map(|id| sql_delete(engine, schema, *id))
+            .collect(),
+        rollback: true,
+        read_write: false,
+    };
+    for id in ids {
+        if !subject.label_of(scenario, &id.to_string()).is_empty() {
+            subject.run(scenario, &sql_delete(engine, schema, id), Fetch::default());
+        }
+    }
+
+    let table = engine.qualified(schema, relation);
+    let by_key = |id: u32| format!("{} = {id}", engine.quote_identifier(key));
+    let set_label = |text: &str, filter: &str| {
+        format!(
+            "UPDATE {table} SET {} = {} WHERE {filter}",
+            engine.quote_identifier(label),
+            engine.quote_literal(text)
+        )
+    };
+    let put = |id: u32, text: &str| {
+        subject.run(
+            scenario,
+            &sql_insert(engine, schema, id, text),
+            Fetch::default(),
+        );
+    };
+    // The row as the grid would hold it. `subject.read` stops short of these
+    // ids, so the one row is read on its own.
+    let fetch = |id: u32| -> Vec<FetchedCell> {
+        let columns: Vec<String> = subject
+            .columns
+            .iter()
+            .map(|column| engine.quote_identifier(column))
+            .collect();
+        let select = format!(
+            "SELECT {} FROM {table} WHERE {}",
+            columns.join(", "),
+            by_key(id)
+        );
+        let result = subject.run(scenario, &select, Fetch::default());
+        let row = result
+            .rows
+            .first()
+            .unwrap_or_else(|| panic!("{at}: row {id} is not there to read"));
+        result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| FetchedCell {
+                column: column.name.clone(),
+                text: row.get(index).map(str::to_string),
+                cell_type: None,
+                column_type: column.data_type.clone(),
+            })
+            .collect()
+    };
+    let delete = |id: &str| sql::DraftDelete {
+        schema: schema.into(),
+        table: relation.into(),
+        keys: vec![(key.into(), id.into())],
+        null_keys: Vec::new(),
+        types: types.clone(),
+    };
+    let update = |id: &str, text: &str| PendingRow {
+        schema: schema.into(),
+        table: relation.into(),
+        sets: vec![(label.into(), NewValue::Value(text.to_string().into()))],
+        keys: vec![(key.into(), id.into())],
+        types: types.clone(),
+        ..PendingRow::default()
+    };
+    // `rows` are the draft's statements in the order `draft_batch` writes
+    // them (deletes, updates, inserts), each with the row it was fetched from.
+    let steps = |batch: &str, rows: Vec<(StepKind, Vec<FetchedCell>)>| -> Vec<VerifiedStep> {
+        let statements = sql::generated_writes(engine, batch)
+            .unwrap_or_else(|| panic!("{at}: the gate refuses `{batch}`"));
+        assert_eq!(statements.len(), rows.len(), "{at}: {batch}");
+        statements
+            .into_iter()
+            .zip(rows)
+            .map(|(statement, (kind, before))| VerifiedStep {
+                reread: Some(
+                    sql::row_reread(engine, &statement)
+                        .unwrap_or_else(|| panic!("{at}: no re-read of `{statement}`")),
+                ),
+                sql: statement,
+                kind,
+                before,
+                read_back: None,
+            })
+            .collect()
+    };
+    let draft = |deletes: &[sql::DraftDelete], updates: &[PendingRow]| {
+        sql::draft_batch(engine, deletes, updates, &[], false)
+            .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"))
+    };
+    let apply = |steps: &[VerifiedStep]| {
+        subject
+            .connection
+            .apply_verified(steps, Bracket::Own, &CancelToken::default())
+    };
+
+    // (a) A draft that updates one row and deletes another, both as read.
+    put(911, "before");
+    put(912, "doomed");
+    let (first, second) = (fetch(911), fetch(912));
+    let batch = draft(&[delete("912")], &[update("911", "after")]);
+    let outcome = apply(&steps(
+        &batch,
+        vec![(StepKind::Delete, second), (StepKind::Update, first)],
+    ));
+    assert!(
+        matches!(outcome, ApplyOutcome::Applied { affected: 2, .. }),
+        "{at}: {outcome:?}"
+    );
+    assert_eq!(
+        subject.label_of(scenario, "911"),
+        [Some("after".to_string())],
+        "{at}"
+    );
+    assert!(subject.label_of(scenario, "912").is_empty(), "{at}");
+
+    // (b) Another statement changes the row after it was read: nothing is
+    // written, and the other statement's value is still what the row holds.
+    let held = fetch(911);
+    subject.run(
+        scenario,
+        &set_label("theirs", &by_key(911)),
+        Fetch::default(),
+    );
+    let batch = draft(&[], &[update("911", "mine")]);
+    assert_eq!(
+        apply(&steps(&batch, vec![(StepKind::Update, held)])),
+        ApplyOutcome::Drifted(vec![(0, Drift::Changed)]),
+        "{at}"
+    );
+    assert_eq!(
+        subject.label_of(scenario, "911"),
+        [Some("theirs".to_string())],
+        "{at}: a drifted draft wrote"
+    );
+
+    // (c) A hand-written statement the gate admits whose `WHERE` matches two
+    // rows. Its re-read is the key-built one for the first of them, since a
+    // re-read of the label would itself find two rows and refuse before any
+    // write; the compare passes and the count is what refuses.
+    put(913, "twin");
+    put(914, "twin");
+    let held = fetch(913);
+    let merge = set_label(
+        "merged",
+        &format!(
+            "{} = {}",
+            engine.quote_identifier(label),
+            engine.quote_literal("twin")
+        ),
+    );
+    assert!(sql::is_generated_write_on(engine, &merge), "{at}: {merge}");
+    let keyed = draft(&[], &[update("913", "merged")]);
+    let reread = steps(&keyed, vec![(StepKind::Update, held)]).remove(0);
+    let twin = VerifiedStep {
+        sql: merge,
+        ..reread
+    };
+    assert_eq!(
+        apply(&[twin]),
+        ApplyOutcome::Miscounted {
+            step: 0,
+            count: Some(2)
+        },
+        "{at}"
+    );
+    for id in ["913", "914"] {
+        assert_eq!(
+            subject.label_of(scenario, id),
+            [Some("twin".to_string())],
+            "{at}: a miscounted draft kept its write"
+        );
+    }
+
+    // (d) The row is deleted after it was read.
+    let held = fetch(911);
+    subject.run(scenario, &sql_delete(engine, schema, 911), Fetch::default());
+    let batch = draft(&[], &[update("911", "mine")]);
+    assert_eq!(
+        apply(&steps(&batch, vec![(StepKind::Update, held)])),
+        ApplyOutcome::Drifted(vec![(0, Drift::Gone)]),
+        "{at}"
+    );
+    assert!(subject.label_of(scenario, "911").is_empty(), "{at}");
 }
 
 /// What DBDelve writes for a browsing surface, run on the subject: a paged

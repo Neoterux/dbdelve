@@ -3351,5 +3351,6 @@ mod tests {
         denied_functions_agree_with_the_server,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
     );
 }
