@@ -23975,14 +23975,14 @@ fn the_palette_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_table_without_a_key_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
+fn a_table_whose_column_cannot_be_matched_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
     use crate::{result_grid::NewValue, session::EditMode};
 
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(
             cx,
-            "create table logs (note text, at text); \
-             insert into logs values ('a', 'x');",
+            "create table logs (note text, at numeric); \
+             insert into logs values ('a', 1);",
         );
         let id = open_own_table(&workspace, cx, "logs");
         let grid = relation_grid(&workspace, cx, id);
@@ -24001,7 +24001,18 @@ fn a_table_without_a_key_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
             })
         };
         let in_draft = staged(cx);
-        assert_eq!(in_draft, (vec![false, false], None, 0));
+        assert_eq!(
+            in_draft,
+            (
+                vec![false, false],
+                Some(
+                    "A table without a primary key is edited by matching every column, \
+                     and at (numeric) cannot be matched by its value."
+                        .to_string()
+                ),
+                0
+            )
+        );
 
         workspace.update(cx, |workspace, cx| {
             workspace.set_edit_mode(EditMode::Row, cx)

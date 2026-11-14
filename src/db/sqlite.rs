@@ -26,9 +26,9 @@ use rusqlite::{Batch, InterruptHandle, OpenFlags};
 
 use super::{
     ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Fetch,
-    ForeignKey, Index, IndexKind, NamedDefinition, QueryResult, Reference, RowBuilder, Sending,
-    Stopped, Structure, VerifiedStep, assemble_catalog, assemble_references, assemble_structure,
-    non_utf8_error, optional_cell, percent_decoded, plain_error, required_cell,
+    ForeignKey, Index, IndexKind, NamedDefinition, QueryResult, Reference, RowBuilder, RowMatch,
+    Sending, Stopped, Structure, VerifiedStep, assemble_catalog, assemble_references,
+    assemble_structure, non_utf8_error, optional_cell, percent_decoded, plain_error, required_cell,
 };
 
 /// The path out of a `sqlite:` or `file:` URL.
@@ -275,25 +275,37 @@ impl Connection {
         // so the lock has to go before the question is asked.
         drop(connection);
         if editable {
-            result.edit = self.edit_target(&probed);
+            (result.edit, result.read_only_reason) = self.edit_target(&probed);
         }
 
         Ok(result)
     }
 
-    /// Which table these columns can be written back to, if any.
+    /// Which table these columns can be written back to, if any, and when the
+    /// answer is no for a reason the user can act on, that reason.
     ///
     /// Every step is allowed to answer "no": a join, a computed column, a table
-    /// without a primary key, a key the select omitted. A failure answers "no"
-    /// too — this runs after the user's statement already succeeded, and a
-    /// pragma that refused must not turn that success into an error.
-    fn edit_target(&self, probed: &[ProbedColumn]) -> Option<EditTarget> {
-        let (schema, table) = sole_table(probed)?;
+    /// without a primary key whose values cannot all be matched, a key the
+    /// select omitted. A failure answers "no" too — this runs after the user's
+    /// statement already succeeded, and a pragma that refused must not turn
+    /// that success into an error.
+    fn edit_target(&self, probed: &[ProbedColumn]) -> (Option<EditTarget>, Option<String>) {
+        let Some((schema, table)) = sole_table(probed) else {
+            return (None, None);
+        };
         // ponytail: one pragma per result set, no cache. A map from table to key
         // held on the connection is the upgrade path if the trip shows up in
         // query timings.
-        let key = self.schema().primary_key(&schema, &table).ok()?;
-        resolve_edit_target(probed, &schema, &table, &key)
+        let Ok(key) = self.schema().primary_key(&schema, &table) else {
+            return (None, None);
+        };
+        if !key.is_empty() {
+            return (resolve_edit_target(probed, &schema, &table, &key), None);
+        }
+        match self.schema().table_columns(&schema, &table) {
+            Ok(columns) => resolve_keyless_target(probed, &schema, &table, &columns),
+            Err(_) => (None, None),
+        }
     }
 
     fn schema(&self) -> Schema<impl Fn(&str) -> Result<QueryResult, DbError> + '_> {
@@ -381,6 +393,38 @@ impl<F: Fn(&str) -> Result<QueryResult, DbError>> Schema<F> {
         ))?;
 
         column_of(&result, "column_name")
+    }
+
+    /// The columns of an ordinary table, in table order, as `table_xinfo` lists
+    /// them: the generated ones too, none of a virtual table's hidden ones.
+    /// Empty for a view, a virtual table or a table that is not there, none of
+    /// which has rows to name by their values.
+    fn table_columns(&self, schema: &str, table: &str) -> Result<Vec<TableColumn>, DbError> {
+        let result = (self.run)(&format!(
+            "SELECT info.name AS column_name, info.type AS column_type,
+                    info.hidden AS column_hidden
+             FROM pragma_table_xinfo({table}{schema_argument}) AS info
+             WHERE info.hidden IN (0, 2, 3)
+               AND EXISTS (SELECT 1 FROM pragma_table_list AS listed
+                           WHERE listed.name = {table} AND listed.schema = {schema}
+                             AND listed.type = 'table')
+             ORDER BY info.cid",
+            table = self.engine.quote_literal(table),
+            schema = self.engine.quote_literal(schema),
+            schema_argument = self.argument(schema),
+        ))?;
+
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                Ok(TableColumn {
+                    name: required_cell(&result, row, "column_name")?.to_string(),
+                    declared: required_cell(&result, row, "column_type")?.to_string(),
+                    generated: required_cell(&result, row, "column_hidden")? != "0",
+                })
+            })
+            .collect()
     }
 
     pub(super) fn catalog(&self) -> Result<Catalog, DbError> {
@@ -785,6 +829,29 @@ fn sole_table(probed: &[ProbedColumn]) -> Option<(String, String)> {
     named.all(|table| table == first).then_some(first)
 }
 
+/// Whether no two result columns read the same table column.
+///
+/// Two result columns reading the same table column are the two sides of a
+/// self-join, and no driver reports the alias that tells them apart. The key
+/// is located by position, so it would resolve to whichever side came first
+/// and write the edit at the other row's key; the same shape also generates
+/// one SET clause per side for the same column. Refusing the whole result set
+/// is one answer to both.
+fn reads_each_column_once(probed: &[ProbedColumn]) -> bool {
+    let mut origins = HashSet::new();
+    probed
+        .iter()
+        .filter_map(origin_of)
+        .all(|column| origins.insert(column))
+}
+
+/// The real column name behind a result column. The caller has already
+/// established that the columns carrying a table all carry the same one, so
+/// carrying a table at all means carrying this one.
+fn origin_of(column: &ProbedColumn) -> Option<String> {
+    column.table.as_ref().and(column.column.clone())
+}
+
 /// The description decided against the table's key.
 ///
 /// Refuses unless *every* primary key column is present in the result set: a
@@ -796,21 +863,7 @@ fn resolve_edit_target(
     table: &str,
     key: &[String],
 ) -> Option<EditTarget> {
-    // The caller has already established that the columns carrying a table all
-    // carry the same one, so carrying a table at all means carrying this one.
-    let column_of = |column: &ProbedColumn| column.table.as_ref().and(column.column.clone());
-    // Two result columns reading the same table column are the two sides of a
-    // self-join, and no driver reports the alias that tells them apart. The key
-    // below is located by position, so it would resolve to whichever side came
-    // first and write the edit at the other row's key; the same shape also
-    // generates one SET clause per side for the same column. Refusing the whole
-    // result set is one answer to both.
-    let mut origins = HashSet::new();
-    if !probed
-        .iter()
-        .filter_map(column_of)
-        .all(|column| origins.insert(column))
-    {
+    if !reads_each_column_once(probed) {
         return None;
     }
     let keys = key
@@ -818,7 +871,7 @@ fn resolve_edit_target(
         .map(|name| {
             probed
                 .iter()
-                .position(|column| column_of(column).as_deref() == Some(name.as_str()))
+                .position(|column| origin_of(column).as_deref() == Some(name.as_str()))
         })
         .collect::<Option<Vec<usize>>>()?;
     if keys.is_empty() {
@@ -828,10 +881,109 @@ fn resolve_edit_target(
     Some(EditTarget {
         schema: schema.to_string(),
         table: table.to_string(),
-        columns: probed.iter().map(column_of).collect(),
+        columns: probed.iter().map(origin_of).collect(),
         keys,
         ..Default::default()
     })
+}
+
+/// One column of a table as `table_xinfo` describes it.
+struct TableColumn {
+    name: String,
+    /// The type as the table declares it, possibly empty.
+    declared: String,
+    /// A generated column: matched, never set.
+    generated: bool,
+}
+
+/// Whether `=` against a literal finds a column's values as the grid shows
+/// them. Fail closed: only the affinities the apply was probed on are listed.
+///
+/// ponytail: INTEGER, TEXT, REAL and BLOB, by SQLite's own rules for a
+/// declared type; NUMERIC affinity (`numeric`, `decimal`, `date`, `boolean`)
+/// and a column with no declared type are not, so a keyless table holding one
+/// is read-only until its matching is probed.
+fn is_matchable(declared: &str) -> bool {
+    let declared = declared.to_ascii_uppercase();
+    !declared.is_empty()
+        && [
+            "INT", "CHAR", "CLOB", "TEXT", "BLOB", "REAL", "FLOA", "DOUB",
+        ]
+        .iter()
+        .any(|word| declared.contains(word))
+}
+
+/// The target of a result set over a table with no primary key: every column
+/// of the table names the row, a NULL as `IS NULL`, the generated columns
+/// matched but never set. Or the reason it cannot be, when the user can do
+/// something about it.
+///
+/// Never a unique key and never the rowid (neither is in the result set the
+/// grid reads its values from), and never some of the columns: a column left
+/// out of the `WHERE` matches rows the user is not looking at, so a column that
+/// cannot be matched by its value, or that the result omits, makes the whole
+/// result read-only.
+fn resolve_keyless_target(
+    probed: &[ProbedColumn],
+    schema: &str,
+    table: &str,
+    described: &[TableColumn],
+) -> (Option<EditTarget>, Option<String>) {
+    // A view, a virtual table or a table that is gone describes no columns.
+    if described.is_empty() || !reads_each_column_once(probed) {
+        return (None, None);
+    }
+    if probed.iter().any(|column| origin_of(column).is_none()) {
+        return (None, None);
+    }
+    let refusal = |what: String| {
+        Some(format!(
+            "A table without a primary key is edited by matching every column, and {what}."
+        ))
+    };
+    if let Some(column) = described
+        .iter()
+        .find(|column| !is_matchable(&column.declared))
+    {
+        let declared = match column.declared.as_str() {
+            "" => "no declared type",
+            declared => declared,
+        };
+        return (
+            None,
+            refusal(format!(
+                "{} ({declared}) cannot be matched by its value",
+                column.name
+            )),
+        );
+    }
+    let mut keys = Vec::new();
+    let mut fixed = Vec::new();
+    for column in described {
+        let Some(at) = probed
+            .iter()
+            .position(|probed| origin_of(probed).as_deref() == Some(column.name.as_str()))
+        else {
+            return (
+                None,
+                refusal(format!("{} is not in the result", column.name)),
+            );
+        };
+        keys.push(at);
+        if column.generated {
+            fixed.push(at);
+        }
+    }
+
+    let target = EditTarget {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        columns: probed.iter().map(origin_of).collect(),
+        keys,
+        row_match: RowMatch::EveryColumn { fixed },
+        ..Default::default()
+    };
+    (Some(target), None)
 }
 
 /// One `sqlite_master` scan per schema, aliased to the column names
