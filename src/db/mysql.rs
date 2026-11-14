@@ -334,6 +334,47 @@ WHERE TABLE_SCHEMA = {schema}
 ORDER BY SEQ_IN_INDEX
 ";
 
+/// What a table with no primary key is edited by: each of its columns, the type
+/// the catalog names and whether the server computes it. Answers for a base
+/// table alone; a view has no row of its own to name by its values.
+///
+/// `{data_type}` is [`edit_columns_sql`]'s to fill: the catalog's own type name,
+/// except where the engine hides a type behind another.
+const EDIT_COLUMNS_SQL: &str = "
+SELECT c.COLUMN_NAME AS column_name,
+       {data_type} AS data_type,
+       IF(c.EXTRA LIKE '%VIRTUAL GENERATED%' OR c.EXTRA LIKE '%STORED GENERATED%',
+          'yes', 'no') AS is_generated
+FROM information_schema.COLUMNS AS c
+JOIN information_schema.TABLES AS t
+  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
+WHERE c.TABLE_SCHEMA = {schema}
+  AND c.TABLE_NAME = {relation}
+  AND t.TABLE_TYPE = 'BASE TABLE'
+ORDER BY c.ORDINAL_POSITION
+";
+
+/// [`EDIT_COLUMNS_SQL`] for `engine`.
+///
+/// MariaDB has no JSON type: `JSON` is a `LONGTEXT` with a `json_valid` check
+/// of the column's own name, and the catalog's `DATA_TYPE` says `longtext`. The
+/// check is what tells such a column from text, so it is reported as `json`.
+fn edit_columns_sql(engine: Engine) -> String {
+    let data_type = match engine {
+        Engine::MariaDb => {
+            "IF(c.DATA_TYPE = 'longtext' AND EXISTS (
+                SELECT 1 FROM information_schema.CHECK_CONSTRAINTS AS k
+                WHERE k.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA
+                  AND k.TABLE_NAME = c.TABLE_NAME
+                  AND k.CONSTRAINT_NAME = c.COLUMN_NAME
+                  AND k.CHECK_CLAUSE LIKE 'json\\_valid(%'
+            ), 'json', c.DATA_TYPE)"
+        }
+        _ => "c.DATA_TYPE",
+    };
+    EDIT_COLUMNS_SQL.replace("{data_type}", data_type)
+}
+
 /// The key-part rows of [`STRUCTURE_INDEXES_SQL`] as one index per name. The
 /// definition names the plain columns alone, as it always has.
 fn assemble_indexes(result: &QueryResult) -> Result<Vec<Index>, DbError> {
@@ -858,7 +899,7 @@ impl Connection {
         // query through it, so the lock has to go before the question is asked.
         drop(connection);
         if editable {
-            result.edit = self.edit_target(&probed);
+            (result.edit, result.read_only_reason) = self.edit_target(&probed);
         }
 
         Ok(result)
@@ -1028,23 +1069,42 @@ impl Connection {
         Ok((result, probed))
     }
 
-    /// Which table these columns can be written back to, if any.
+    /// Which table these columns can be written back to, if any, and when the
+    /// answer is no for a reason the user can act on, that reason.
     ///
-    /// Every step is allowed to answer "no": a join, a computed column, a table
-    /// without a primary key, a key the select omitted. A failure answers "no"
-    /// too — this runs after the user's statement already succeeded, and a
-    /// catalog query that was refused must not turn that success into an error.
-    fn edit_target(&self, probed: &[ProbedColumn]) -> Option<EditTarget> {
-        let (schema, table) = sole_table(probed)?;
+    /// Every step is allowed to answer "no": a join, a computed column, a key
+    /// the select omitted. A failure answers "no" too — this runs after the
+    /// user's statement already succeeded, and a catalog query that was refused
+    /// must not turn that success into an error.
+    fn edit_target(&self, probed: &[ProbedColumn]) -> (Option<EditTarget>, Option<String>) {
+        let Some((schema, table)) = sole_table(probed) else {
+            return (None, None);
+        };
         // ponytail: one catalog round trip per result set, no cache. A map from
         // table to key held on the connection is the upgrade path if the trip
         // shows up in query timings.
-        let key = self
-            .internal_query(&structure_sql(PRIMARY_KEY_SQL, &schema, &table))
-            .ok()?;
-        let key = column_of(&key, "column_name").ok()?;
-
-        resolve_edit_target(probed, &schema, &table, &key)
+        let Ok(key) = self.internal_query(&structure_sql(PRIMARY_KEY_SQL, &schema, &table)) else {
+            return (None, None);
+        };
+        let Ok(key) = column_of(&key, "column_name") else {
+            return (None, None);
+        };
+        if !key.is_empty() {
+            return (resolve_edit_target(probed, &schema, &table, &key), None);
+        }
+        // No primary key: the table's rows are named by every column, which
+        // takes the columns' types.
+        let Ok(catalog) = self.internal_query(&structure_sql(
+            &edit_columns_sql(self.engine),
+            &schema,
+            &table,
+        )) else {
+            return (None, None);
+        };
+        match table_columns(&catalog) {
+            Some(columns) => resolve_keyless_target(probed, &schema, &table, &columns),
+            None => (None, None),
+        }
     }
 
     pub fn databases(&self) -> Result<super::Databases, DbError> {
@@ -1424,6 +1484,51 @@ fn resolve_edit_target(
         keys,
         ..Default::default()
     })
+}
+
+/// One column of a table as [`EDIT_COLUMNS_SQL`] describes it.
+struct TableColumn {
+    name: String,
+    /// The catalog's type name, which [`is_matchable`] is asked about.
+    data_type: String,
+    /// Computed by the server: matched, never set.
+    generated: bool,
+}
+
+/// The table's columns in order, or `None` where the catalog said none (a view,
+/// or a table that is not there) or an answer was malformed.
+fn table_columns(result: &QueryResult) -> Option<Vec<TableColumn>> {
+    let columns = result
+        .rows
+        .iter()
+        .map(|row| {
+            Some(TableColumn {
+                name: required_cell(result, row, "column_name").ok()?.to_string(),
+                data_type: required_cell(result, row, "data_type").ok()?.to_string(),
+                generated: required_cell(result, row, "is_generated").ok()? == "yes",
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!columns.is_empty()).then_some(columns)
+}
+
+/// Whether `=` against a column's value rendered as text finds it, for the
+/// type [`EDIT_COLUMNS_SQL`] names.
+fn is_matchable(data_type: &str) -> bool {
+    let _ = data_type;
+    false
+}
+
+/// The target of a result set over a table with no primary key, or the reason
+/// it has none.
+fn resolve_keyless_target(
+    probed: &[ProbedColumn],
+    schema: &str,
+    table: &str,
+    columns: &[TableColumn],
+) -> (Option<EditTarget>, Option<String>) {
+    let _ = (probed, schema, table, columns, is_matchable);
+    (None, None)
 }
 
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
@@ -2415,6 +2520,178 @@ ORDER BY 1, 2
                 &[],
             ),
             None
+        );
+    }
+
+    fn keyless(columns: &[(&str, &str, bool)]) -> Vec<TableColumn> {
+        columns
+            .iter()
+            .map(|(name, data_type, generated)| TableColumn {
+                name: (*name).to_string(),
+                data_type: (*data_type).to_string(),
+                generated: *generated,
+            })
+            .collect()
+    }
+
+    /// A result over `sightings` carrying these columns, in this order.
+    fn sightings(columns: &[&str]) -> Vec<ProbedColumn> {
+        probed(
+            &columns
+                .iter()
+                .map(|column| (Some("sightings"), Some(*column)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn a_table_without_a_primary_key_is_matched_by_every_column_or_read_only_with_a_reason() {
+        use crate::db::RowMatch;
+        let table = keyless(&[
+            ("bird", "varchar", false),
+            ("place", "text", false),
+            ("seen", "int", false),
+            ("weight", "double", false),
+            ("at", "datetime", false),
+        ]);
+        let whole = sightings(&["bird", "place", "seen", "weight", "at"]);
+        let (target, reason) = resolve_keyless_target(&whole, "dbdelve_dev", "sightings", &table);
+        let target = target.expect("every column is of a listed type");
+        assert_eq!(target.schema, "dbdelve_dev");
+        assert_eq!(target.table, "sightings");
+        assert_eq!(target.keys, [0, 1, 2, 3, 4]);
+        assert_eq!(
+            target.columns,
+            ["bird", "place", "seen", "weight", "at"].map(|name| Some(name.to_string()))
+        );
+        assert_eq!(target.row_match, RowMatch::EveryColumn { fixed: vec![] });
+        assert_eq!(reason, None);
+
+        // Table order, whatever order the result lists them in.
+        let (reordered, _) = resolve_keyless_target(
+            &sightings(&["place", "bird", "seen", "weight", "at"]),
+            "dbdelve_dev",
+            "sightings",
+            &table,
+        );
+        assert_eq!(reordered.expect("reordered").keys, [1, 0, 2, 3, 4]);
+
+        // A column the server computes is matched and never set.
+        let (computed, _) = resolve_keyless_target(
+            &sightings(&["bird", "place", "label"]),
+            "dbdelve_dev",
+            "sightings",
+            &keyless(&[
+                ("bird", "varchar", false),
+                ("place", "varchar", false),
+                ("label", "varchar", true),
+            ]),
+        );
+        assert_eq!(
+            computed.expect("a computed column is matched").row_match,
+            RowMatch::EveryColumn { fixed: vec![2] }
+        );
+
+        let refused = |column: &str| {
+            Some(format!(
+                "A table without a primary key is edited by matching every column, \
+                 and {column} cannot be matched by its value."
+            ))
+        };
+        // FLOAT and JSON find nothing by `=` against their own text; the rest are
+        // types no test matched.
+        for data_type in [
+            "float",
+            "json",
+            "bit",
+            "geometry",
+            "point",
+            "blob",
+            "binary",
+            "varbinary",
+            "tinyblob",
+            "mediumblob",
+            "longblob",
+            "vector",
+            "null",
+            "",
+        ] {
+            let (target, reason) = resolve_keyless_target(
+                &sightings(&["bird", "shape"]),
+                "dbdelve_dev",
+                "sightings",
+                &keyless(&[("bird", "varchar", false), ("shape", data_type, false)]),
+            );
+            assert!(target.is_none(), "{data_type}");
+            assert_eq!(
+                reason,
+                refused(&format!("shape ({data_type})")),
+                "{data_type}"
+            );
+        }
+        for data_type in [
+            "tinyint",
+            "smallint",
+            "mediumint",
+            "int",
+            "bigint",
+            "decimal",
+            "double",
+            "char",
+            "varchar",
+            "tinytext",
+            "text",
+            "mediumtext",
+            "longtext",
+            "date",
+            "time",
+            "datetime",
+            "timestamp",
+            "year",
+            "enum",
+            "set",
+        ] {
+            let (target, reason) = resolve_keyless_target(
+                &sightings(&["one"]),
+                "dbdelve_dev",
+                "sightings",
+                &keyless(&[("one", data_type, false)]),
+            );
+            assert!(target.is_some(), "{data_type}");
+            assert_eq!(reason, None, "{data_type}");
+        }
+
+        // A column the result leaves out would be left out of the WHERE.
+        let (target, reason) =
+            resolve_keyless_target(&sightings(&["bird"]), "dbdelve_dev", "sightings", &table);
+        assert!(target.is_none());
+        assert_eq!(
+            reason,
+            Some(
+                "A table without a primary key is edited by matching every column, \
+                 and place is not in the result."
+                    .to_string()
+            )
+        );
+        // Computed beside real columns, and a self-join, are no table's rows.
+        let one = keyless(&[("bird", "varchar", false)]);
+        assert_eq!(
+            resolve_keyless_target(
+                &probed(&[(Some("sightings"), Some("bird")), (None, None)]),
+                "dbdelve_dev",
+                "sightings",
+                &one,
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            resolve_keyless_target(
+                &sightings(&["bird", "bird"]),
+                "dbdelve_dev",
+                "sightings",
+                &one
+            ),
+            (None, None)
         );
     }
 
@@ -3924,6 +4201,216 @@ ORDER BY 1, 2
         live_a_same_value_update_counts_its_matched_row_in_any_server_language(Engine::MariaDb);
     }
 
+    /// Drops scratch tables when a test ends, panicking or not.
+    struct Scratch<'a>(&'a Connection, &'a [&'a str]);
+
+    impl Scratch<'_> {
+        fn drop_all(&self) {
+            for name in self.1 {
+                let _ = self.0.query(
+                    &format!("DROP TABLE IF EXISTS {name}; DROP VIEW IF EXISTS {name}"),
+                    Fetch::default(),
+                );
+            }
+        }
+    }
+
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            self.drop_all();
+        }
+    }
+
+    /// One column of each listed type, with a value that shows how it renders.
+    const TYPE_SAMPLES: &[(&str, &str)] = &[
+        ("tinyint", "-5"),
+        ("tinyint unsigned", "250"),
+        ("smallint", "-300"),
+        ("mediumint", "-8388608"),
+        ("int", "42"),
+        ("int unsigned", "4000000000"),
+        ("bigint", "9007199254740993"),
+        ("bigint unsigned", "18446744073709551615"),
+        ("decimal(10,2)", "-12.50"),
+        ("double", "0.30000000000000004"),
+        ("char(3)", "'ab'"),
+        ("varchar(32)", "'h''e llo, \\\\ {a: 1}'"),
+        ("varchar(32)", "''"),
+        ("tinytext", "'tiny'"),
+        ("text", "'tab\\there\\nnewline \u{fc}n\u{ef}'"),
+        ("mediumtext", "'medium'"),
+        ("longtext", "'long'"),
+        ("date", "'2024-02-29'"),
+        ("time(6)", "'12:34:56.123456'"),
+        ("time", "'-838:59:59'"),
+        ("datetime(6)", "'2024-02-29 12:34:56.123456'"),
+        ("timestamp(6) NULL", "'2024-06-01 00:00:00.5'"),
+        ("year", "2024"),
+        ("enum('a','b')", "'b'"),
+        ("set('x','y')", "'x,y'"),
+    ];
+
+    /// Types left off the list because `=` against their own rendered text finds
+    /// nothing, and the engines it holds on: a `FLOAT` is compared to the text
+    /// as a double, which it is not, and a `JSON` value is never equal to a
+    /// string. MariaDB's `JSON` is a `LONGTEXT` the catalog query tells by its
+    /// check; the text equals itself there, and the type is left off all the
+    /// same.
+    const UNMATCHED_SAMPLES: &[(&str, &str, &[Engine])] = &[
+        ("float", "0.1", &[Engine::MySql, Engine::MariaDb]),
+        ("json", "'{\"a\": [1,   2]}'", &[Engine::MySql]),
+    ];
+
+    /// Types left off the list that nothing was matched with: the grid is
+    /// read-only and says which column is why.
+    const UNLISTED_SAMPLES: &[(&str, &str)] = &[
+        ("bit(8)", "b'101'"),
+        ("binary(4)", "0x6162"),
+        ("varbinary(8)", "0xdeadbeef"),
+        ("tinyblob", "0x00ff"),
+        ("blob", "0x00ff"),
+        ("mediumblob", "0x00ff"),
+        ("longblob", "0x00ff"),
+        ("geometry", "ST_GeomFromText('POINT(1 2)')"),
+    ];
+
+    fn live_every_listed_type_matches_its_row_by_its_rendered_text(engine: Engine) {
+        let connection = live(engine);
+        let scratch = Scratch(
+            &connection,
+            &[
+                "dbdelve_keyless_types",
+                "dbdelve_keyless_probe",
+                "dbdelve_keyless_view",
+            ],
+        );
+        scratch.drop_all();
+        let run = |sql: &str| connection.query(sql, Fetch::default());
+        let columns: Vec<String> = TYPE_SAMPLES
+            .iter()
+            .enumerate()
+            .map(|(index, (declared, _))| format!("c{index} {declared}"))
+            .collect();
+        let values: Vec<&str> = TYPE_SAMPLES.iter().map(|(_, value)| *value).collect();
+        run(&format!(
+            "CREATE TABLE dbdelve_keyless_types ({})",
+            columns.join(", ")
+        ))
+        .expect("the scratch table is built");
+        run(&format!(
+            "INSERT INTO dbdelve_keyless_types VALUES ({})",
+            values.join(", ")
+        ))
+        .expect("the scratch row is inserted");
+
+        let read = run("SELECT * FROM dbdelve_keyless_types").expect("the row reads");
+        let edit = read.edit.clone().unwrap_or_else(|| {
+            panic!(
+                "every column is of a listed type: {:?}",
+                read.read_only_reason
+            )
+        });
+        assert_eq!(
+            edit.row_match,
+            crate::db::RowMatch::EveryColumn { fixed: vec![] }
+        );
+        assert_eq!(edit.keys.len(), TYPE_SAMPLES.len());
+        let count = |column: &str, literal: &str| {
+            run(&format!(
+                "SELECT COUNT(*) FROM dbdelve_keyless_types WHERE {} = {literal}",
+                engine.quote_identifier(column)
+            ))
+            .map(|result| result.rows[0].get(0).unwrap_or("NULL").to_string())
+            .map_err(|error| error.message)
+        };
+        for (index, (declared, value)) in TYPE_SAMPLES.iter().enumerate() {
+            let column = &read.columns[index];
+            let rendered = read.rows[0].get(index).expect("a value");
+            // The literal the keyless WHERE writes for it.
+            let literal = engine.quote_value(rendered, column.data_type.as_deref());
+            assert_eq!(
+                count(&column.name, &literal).as_deref(),
+                Ok("1"),
+                "{declared}: {value} -> {rendered}"
+            );
+        }
+
+        for (declared, value, finds_nothing) in UNMATCHED_SAMPLES {
+            let scratch = Scratch(&connection, &["dbdelve_keyless_probe"]);
+            scratch.drop_all();
+            run(&format!(
+                "CREATE TABLE dbdelve_keyless_probe (c {declared})"
+            ))
+            .expect("the scratch table is built");
+            run(&format!(
+                "INSERT INTO dbdelve_keyless_probe VALUES ({value})"
+            ))
+            .expect("the scratch row is inserted");
+            let read = run("SELECT * FROM dbdelve_keyless_probe").expect("the row reads");
+            assert!(read.edit.is_none(), "{declared}");
+            assert!(
+                read.read_only_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(&format!("c ({declared})"))),
+                "{declared}: {:?}",
+                read.read_only_reason
+            );
+            if finds_nothing.contains(&engine) {
+                let rendered = read.rows[0].get(0).expect("a value");
+                let counted = run(&format!(
+                    "SELECT COUNT(*) FROM dbdelve_keyless_probe WHERE c = {}",
+                    engine.quote_literal(rendered)
+                ))
+                .map(|result| result.rows[0].get(0).unwrap_or("NULL").to_string())
+                .map_err(|error| error.message);
+                assert_ne!(counted.as_deref(), Ok("1"), "{declared}: {rendered}");
+            }
+        }
+
+        for (declared, value) in UNLISTED_SAMPLES {
+            let scratch = Scratch(&connection, &["dbdelve_keyless_probe"]);
+            scratch.drop_all();
+            run(&format!(
+                "CREATE TABLE dbdelve_keyless_probe (c {declared})"
+            ))
+            .expect("the scratch table is built");
+            run(&format!(
+                "INSERT INTO dbdelve_keyless_probe VALUES ({value})"
+            ))
+            .expect("the scratch row is inserted");
+            let read = run("SELECT * FROM dbdelve_keyless_probe").expect("the row reads");
+            assert!(read.edit.is_none(), "{declared}");
+            let kind = declared.split('(').next().unwrap_or(declared);
+            assert!(
+                read.read_only_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(&format!("c ({kind})"))),
+                "{declared}: {:?}",
+                read.read_only_reason
+            );
+        }
+
+        // A view over a table with no primary key names no row of its own.
+        run("CREATE TABLE dbdelve_keyless_probe (c int)").expect("the table is built");
+        run("CREATE VIEW dbdelve_keyless_view AS SELECT c FROM dbdelve_keyless_probe")
+            .expect("the view is built");
+        let viewed = run("SELECT * FROM dbdelve_keyless_view").expect("the view reads");
+        assert!(viewed.edit.is_none());
+        assert_eq!(viewed.read_only_reason, None);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MYSQL_URL"]
+    fn live_every_listed_type_matches_its_row_by_its_rendered_text_on_mysql() {
+        live_every_listed_type_matches_its_row_by_its_rendered_text(Engine::MySql);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MARIADB_URL"]
+    fn live_every_listed_type_matches_its_row_by_its_rendered_text_on_mariadb() {
+        live_every_listed_type_matches_its_row_by_its_rendered_text(Engine::MariaDb);
+    }
+
     fn conformance_subject(engine: Engine) -> crate::db::conformance::Subject {
         use crate::db::conformance::{COLUMNS, Fixture, Subject, sql_find, sql_read};
         Subject {
@@ -3986,6 +4473,7 @@ ORDER BY 1, 2
         generated_writes_round_trip,
         generated_draft_round_trip,
         verified_draft_round_trip,
+        verified_keyless_round_trip,
     );
 
     crate::db::conformance::suite!(
@@ -4009,6 +4497,7 @@ ORDER BY 1, 2
         generated_writes_round_trip,
         generated_draft_round_trip,
         verified_draft_round_trip,
+        verified_keyless_round_trip,
     );
 
     on_both_servers!(
