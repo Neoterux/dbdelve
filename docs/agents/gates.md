@@ -158,7 +158,14 @@ mode, always where the user can read it before it runs:
   (`Workspace::apply_edits`, `Workspace::apply_draft`), again at Run for a
   review written before the transaction opened (`Profile::own_write_refusal`,
   in the way `Profile::bound_write_refusal` does for a bound session), and
-  `db::run_verified` refuses a joined sequence of several steps itself.
+  `db::run_verified` refuses a joined sequence of several steps itself. A write
+  on a table with no primary key never joins the user's open transaction, and
+  is refused with the draft kept (a Row send says
+  `A transaction is open on this connection; the row was not sent.` and keeps
+  the row's edits): its rows are named by every column, so it could count two
+  where a rollback would end the user's transaction. `Verification::keyed`,
+  set from the grid's `EditTarget.row_match` by every builder, carries that
+  to Run, which refuses any run that would join without `may_join()`.
 - **Format Query** rewrites the buffer on command only, through
   `sqlformat`'s token-level reformatter (on MongoDB, `mql::format`'s
   bracket-depth layout over the tree-sitter tokens, refused unless the
