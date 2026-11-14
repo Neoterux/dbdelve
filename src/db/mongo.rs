@@ -2404,13 +2404,44 @@ fn prepared(step: &VerifiedStep) -> Option<Prepared> {
     })
 }
 
-/// How the document as it was fetched differs from its re-read.
-fn document_drift(_before: &[FetchedCell], reread: &QueryResult) -> Option<Drift> {
+/// How the document as it was fetched differs from its re-read, which is the
+/// `find` of its `_id` ([`mql::browse::row_reread`]).
+///
+/// No document is [`Drift::Gone`], and more than one is [`Drift::Ambiguous`].
+/// The whole document is compared, by field name and never by position, since
+/// the server may send fields in any order: each fetched field must be in the
+/// re-read with the same text and the same `$type` tag, a field fetched
+/// [`MISSING`] must still be absent from it (a null is not a missing field),
+/// and a field the fetch did not hold is a difference. Names and text are
+/// compared byte for byte, with no Unicode normalisation, so `1` the int and
+/// `1` the double, and `café` written two ways, are different values.
+fn document_drift(before: &[FetchedCell], reread: &QueryResult) -> Option<Drift> {
     match reread.rows.as_slice() {
-        [] => Some(Drift::Gone),
-        [_] => None,
-        rows => Some(Drift::Ambiguous(rows.len())),
+        [] => return Some(Drift::Gone),
+        [_] => {}
+        rows => return Some(Drift::Ambiguous(rows.len())),
     }
+    let row = &reread.rows[0];
+    let tags = reread.cell_types.first();
+    let position = |name: &str| reread.columns.iter().position(|column| column.name == name);
+    let held =
+        before.iter().all(
+            |cell| match (position(&cell.column), cell.cell_type.as_deref()) {
+                (None, Some(MISSING)) => true,
+                (None, _) | (Some(_), Some(MISSING)) => false,
+                (Some(at), tag) => {
+                    row.get(at) == cell.text.as_deref()
+                        && tag
+                            .zip(tags.and_then(|tags| tags.get(at)))
+                            .is_none_or(|(fetched, now)| fetched == *now)
+                }
+            },
+        );
+    let whole = reread
+        .columns
+        .iter()
+        .all(|column| before.iter().any(|cell| cell.column == column.name));
+    (!(held && whole)).then_some(Drift::Changed)
 }
 
 /// A reply as one row of its fields.
