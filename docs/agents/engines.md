@@ -849,6 +849,30 @@ Decided, and not to be re-litigated:
   which row did and that the rows before it applied. Nothing is rolled back.
   Import Rows offers no All or nothing either (`Engine::all_or_nothing`), so
   each chunk's `insertMany` is kept as it lands.
+- **A MongoDB apply is verified one statement at a time, and not atomically**
+  (`Connection::apply_verified`'s MongoDB arm; plans 11, 13 and 14 of phase
+  10.2). The dev server is a standalone one, so there is no session
+  transaction to wrap a draft in (it is deferred until a replica set is the
+  target) and no bracket: `Target::ordered_edits()` is true for it. Each
+  `updateOne` and `deleteOne` carries the `find` of its `_id`
+  (`mql::browse::row_reread`); the document is read again by that `_id` and
+  compared with the document as the grid fetched it by field name and `$type`
+  tag, a field fetched as missing having to still be missing (a null is not a
+  missing field) and a field the fetch did not hold counting as a change
+  (`document_drift`), before any statement is sent. Then the statements go in
+  order, `deleteOne`s, `updateOne`s, `insertOne`s, and each is counted by the
+  server's own `n`: a matched count on an update, so a same-value `updateOne`
+  counts one. The first failure or count other than one stops the rest unsent,
+  and the ones before it stay applied. The workspace therefore removes the rows
+  that applied from the draft by identity (`ResultGrid::drop_applied`, by `_id`
+  or by place among the added rows) and keeps the rest, where a transactional
+  engine keeps the whole draft after a rollback. Row mode is offered where
+  `Target::keeps_edits()` holds, so a MongoDB collection tab has it: leaving an
+  edited document sends one verified step, the `updateOne` with its re-read and
+  its read-back both the `find` of the `_id`, which an `updateOne` never
+  changes. A document another client changes between the re-read and the write
+  is overwritten, since there is no transaction to hold it (the count still
+  sees one that vanished); a query tab never offers Row.
 - **A missing field is not a null.** A document may lack a field another has, and
   the grid says so: a missing cell renders empty with no `NULL` label, a null
   renders `NULL`, and a snapshot keeps the difference.

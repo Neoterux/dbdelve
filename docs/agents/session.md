@@ -721,15 +721,18 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
   row is left (a ring move off it, or a step key past the grid's edge from a
   cell's input) or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
-  send still passes). On a target that verifies applies the send is
-  re-read and compared before its `UPDATE` (`Refresh::Row::verify`, the one
-  step of `lone_verification`). It lives on a relation tab beside `sorting`, is switched
+  send still passes). The send is re-read and compared before its `UPDATE`
+  (`Refresh::Row::verify`, the one step of `lone_verification`). It lives on a relation tab beside `sorting`, is switched
   from the status bar chips or the palette, starts from the Default edit mode
   setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
-  this that is persisted), and is offered only where `Target::row_edits()`
-  holds (`EditMode::on`): Postgres, MySQL, MariaDB, SQLite, DuckDB and
-  SQL Server. A Snowflake or Turso table has no control, for the reason in the
-  next bullet. Draft is never turned into Row sends by a switch: Draft to Row is
+  this that is persisted), and is offered only where `Target::keeps_edits()`
+  holds (`EditMode::on`, `views::view_edit_mode`): Postgres, MySQL, MariaDB,
+  SQLite, DuckDB, SQL Server and a MongoDB collection (the verified send is one
+  `updateOne` re-read by its `_id`, `sql::row_read`'s MongoDB arm). Every
+  target that offers Row verifies its applies, so a Row send has one path: a
+  `Refresh::Row` with no `Verification` is refused in `execute_unchecked` and
+  nothing is sent. A Snowflake or Turso table has no control, for the reason in the
+  next bullet, and neither has a MongoDB query tab, which never offers Row. Draft is never turned into Row sends by a switch: Draft to Row is
   refused while the grid holds edits, so a multi-row draft is not sent
   unreviewed one row at a time (`Workspace::set_edit_mode`).
 
@@ -759,16 +762,16 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `StepPastEdge`: in a Row view it commits the input and sends the row, the ring
   left on the cell, and in a Draft view or on a query tab it leaves the input
   open. The send is `Refresh::Row`: it writes
-  the `UPDATE` and, in the same background task, reads the row back by its key
+  the `UPDATE` and, in the same verified step, reads the row back by its key
   (`sql::row_read`). The landing replaces that row where it stands
   (`ResultGrid::replace_row`) and clears the cells that were sent
   (`clear_sent`), so a cell staged while the send was out stays staged. A
   vanished or unreadable row reads the table again instead, unless another
   row of the tab still holds edits: that read would send them, and nothing is
   sent without the user's act, so those rows are kept, the tab is marked stale
-  and the status line says the rows were not read again. A read-back is
-  checked with `sql::is_generated_select` where it runs; one that fails the
-  gate is not run and leaves the tab stale. A send is refused while a review
+  and the status line says the rows were not read again. A step's read-back
+  is checked with `sql::is_generated_select` before anything is sent; one that
+  fails the gate refuses the whole step, so the `UPDATE` does not run either. A send is refused while a review
   covers the tab, and a tab sends one row at a time.
 
   A refused send (the server's, the gate's, or a mode that stopped it) never
@@ -832,9 +835,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `sql::draft_batch` and checked by `sql::draft_deletes_match` against the
   marks. The four call sites that decided by `row_edits()` (`kept` in
   `execute_unchecked`, `has_markable_row`, `new_row`'s in-grid row, `delete_row`'s
-  marks) ask `keeps_edits()`; `EditMode::on`, the Row control and the
-  conformance filters stay on `row_edits()`, since Row mode sends a SQL
-  `UPDATE` with a read-back and a MongoDB view has none. The review carries a
+  marks) ask `keeps_edits()`, and so do `EditMode::on` and the Row control
+  (plan 14: a MongoDB `updateOne` is read back by its `_id`); only the
+  conformance filters stay on `row_edits()`. The review carries a
   `Verification` (`Engine::verifies_applies` is true for MongoDB): each fetched
   cell with its `$type` tag, each `updateOne` and `deleteOne` with the `find` of
   its `_id`, applied by `Connection::apply_verified`'s MongoDB arm, which has no

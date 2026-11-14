@@ -3715,7 +3715,7 @@ pub(crate) enum Refresh {
         /// The row's one verified step: the row read again and compared before
         /// the `UPDATE`, the write counted, and the row read back inside the
         /// same transaction. A Row send without one is refused
-        /// (`Workspace::execute_and_then`).
+        /// (`Workspace::execute_unchecked`).
         verify: Option<Verification>,
     },
 }
