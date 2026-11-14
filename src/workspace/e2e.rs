@@ -29304,3 +29304,101 @@ fn a_review_that_was_open_and_a_row_save_are_refused_while_the_outcome_is_unknow
         quit(workspace, cx);
     });
 }
+
+/// A write on a table with no primary key names its row by every value, so it
+/// could count two where the user's open transaction cannot be rolled back
+/// without ending it: it never runs inside that transaction, whichever way it
+/// leaves the grid, and what the user typed stays.
+#[gpui::test]
+fn a_write_on_a_table_without_a_primary_key_never_joins_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // Apply edits: no review, and the draft stays.
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+
+        // A Row view's Save: nothing is sent and the row keeps its edit.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    0,
+                    "A transaction is open on this connection; the row was not sent."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+
+        // A review written before the transaction opened, and run after.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Draft, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        let grid = relation_grid(&workspace, cx, id);
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(!in_transaction(&workspace, cx));
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, Some(DRAFT_IN_TRANSACTION.into())))
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("wren"),
+            "nothing was written"
+        );
+
+        // Once the transaction has ended the same draft applies under its own
+        // bracket.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
+        );
+        quit(workspace, cx);
+    });
+}
