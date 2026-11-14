@@ -60,8 +60,10 @@ impl Workspace {
                 let Some(tab) = profile.session.objects.iter().find(|tab| tab.id == id) else {
                     return;
                 };
-                let structure = match &tab.body {
-                    ObjectBody::Relation { structure, .. } => structure,
+                let (structure, results) = match &tab.body {
+                    ObjectBody::Relation {
+                        structure, results, ..
+                    } => (structure, results),
                     ObjectBody::Structure { .. } | ObjectBody::Routine(_) => return,
                 };
                 if !tab.takes_inserts(self.target()) {
@@ -77,6 +79,17 @@ impl Workspace {
                     );
                     return;
                 };
+                // A Draft view of a table whose rows are written back keeps
+                // the row in the grid, where it is typed in place and read in
+                // the draft's review; every other view takes the form.
+                if profile.session.edit_mode(active) == EditMode::Draft
+                    && self.target().row_edits()
+                    && results.read(cx).delegate().insert_target().is_some()
+                {
+                    let results = results.clone();
+                    self.add_grid_row(active, results, cx);
+                    return;
+                }
                 let columns: Vec<(String, String)> = structure
                     .columns
                     .iter()
@@ -124,6 +137,41 @@ impl Workspace {
             });
         }
         cx.notify();
+    }
+
+    /// Insert in a Draft view: a new row at the end of the grid, the ring on
+    /// its first cell. Nothing is sent and nothing is asked; the row is part of
+    /// the draft, and `apply_edits` writes it.
+    ///
+    /// Held back as staging a cell is: not while a review holds the draft, and
+    /// not while the tab's rows are still being read, which would put the row
+    /// above rows that have not arrived.
+    fn add_grid_row(
+        &mut self,
+        tab: Tab,
+        results: Entity<gpui_component::table::TableState<ResultGrid>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        if !profile.session.may_stage_into(tab) {
+            return;
+        }
+        if profile.session.running(tab) {
+            self.note(
+                "The rows are still being read, so no row was added.".into(),
+                cx,
+            );
+            return;
+        }
+        if !self.confirm_stale(StaleResume::NewRow, cx) {
+            return;
+        }
+        results.update(cx, |table, cx| {
+            crate::result_grid::add_row_at_end(table, cx);
+            cx.notify();
+        });
     }
 
     pub(crate) fn touch_insert_field(&mut self, index: usize) {
@@ -1173,6 +1221,7 @@ impl Workspace {
                 None => self.stage_and_refocus(cell, value, window, cx),
             },
             StaleResume::Delete => self.delete_row(&DeleteRow, window, cx),
+            StaleResume::NewRow => self.new_row(&NewRow, window, cx),
         }
         cx.notify();
     }
@@ -1967,13 +2016,19 @@ impl Workspace {
             return;
         }
         let own_review = profile.session.apply_review_covers(tab);
-        let pending = results.read(cx).delegate().pending_updates();
-        // Nothing partial runs: a batch missing one of its rows is not the
-        // change the user made.
         // A bound tab's edit is refused outright while its session holds a
         // transaction (`Profile::bound_write_refusal`); on the connection's own
         // session the edit joins the user's open one, as a single row's does.
         let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
+        // A draft holding an added row is written by the draft's own writer,
+        // for a relation tab alone: only there can a row be added.
+        if matches!(tab, Tab::Object(_)) && results.read(cx).delegate().added_count() > 0 {
+            self.apply_draft(tab, &results, joins, window, cx);
+            return;
+        }
+        let pending = results.read(cx).delegate().pending_updates();
+        // Nothing partial runs: a batch missing one of its rows is not the
+        // change the user made.
         let written = match joins {
             true => sql::update_batch_joining(self.engine(), &pending),
             false => update_batch(self.engine(), &pending),
@@ -2018,6 +2073,86 @@ impl Workspace {
                     cx.notify();
                 }
             }
+        }
+    }
+
+    /// Write the draft of relation tab `tab`, which holds an added row, as one
+    /// batch and put it in an `Apply draft` review. Nothing runs here: Run in
+    /// the review is the ask (`AGENTS.md` rule 1).
+    ///
+    /// The batch passes both checks a generated draft is held to before it is
+    /// shown: the gate's read of its shape and the key check's read of which
+    /// table and key every `DELETE` names, against the rows marked.
+    fn apply_draft(
+        &mut self,
+        tab: Tab,
+        results: &Entity<gpui_component::table::TableState<ResultGrid>>,
+        joins: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine();
+        let target = self.target();
+        let (inserts, updates, keys, relation) = {
+            let grid = results.read(cx).delegate();
+            (
+                grid.draft_inserts(),
+                grid.pending_updates(),
+                grid.key_columns(),
+                grid.insert_target(),
+            )
+        };
+        let inserts = match inserts {
+            Ok(inserts) => inserts,
+            Err(row) => {
+                self.note(
+                    format!(
+                        "The added row {} holds no value, so the draft was not applied.",
+                        row + 1
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        let Some((schema, table, _)) = relation else {
+            return;
+        };
+        let batch = match sql::draft_batch(engine, &[], &updates, &inserts, !joins) {
+            Ok(batch) => batch,
+            Err(message) => {
+                self.note(message, cx);
+                return;
+            }
+        };
+        // Failing either check is dbdelve disagreeing with itself, a bug in
+        // dbdelve rather than a user error, so it is said and not run.
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        if !sql::is_generated_write_on(engine, &batch)
+            || sql::draft_deletes_match(engine, &batch, &keys, &schema, &table) != Some(0)
+        {
+            self.note(
+                "dbdelve refused to run a statement it wrote itself: it is not a draft of \
+                 one-row deletes, updates and inserts."
+                    .into(),
+                cx,
+            );
+            return;
+        }
+        if !self.review_slot_free(tab, true, window, cx) {
+            return;
+        }
+        let notes = target.review_notes(&batch);
+        if let Some(profile) = self.profile_mut() {
+            profile.session.apply_review = Some(ApplyReview {
+                tab,
+                title: "Apply draft",
+                notes,
+                sql: batch,
+                error: None,
+                edits: true,
+            });
+            cx.notify();
         }
     }
 

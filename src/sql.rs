@@ -1263,10 +1263,6 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
 // ponytail: only a top-level `DELETE` is counted. One hidden elsewhere in the
 // tree is not found here, because the gate's whole-tree count of `delete` nodes
 // refuses it first, and a caller runs both.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draft's apply is the first caller")
-)]
 pub fn draft_deletes_match(
     engine: Engine,
     batch: &str,
@@ -2522,10 +2518,6 @@ fn bracketed(spec: &EngineSpec, batch: String, statements: usize, own_brackets: 
 /// A marked row, named by the key it was fetched with: what the grid hands over
 /// for a draft's `DELETE`. `null_keys` are the columns of a row named by every
 /// value that read NULL, as on [`PendingRow`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draft's apply is the first caller")
-)]
 pub(crate) struct DraftDelete {
     pub schema: String,
     pub table: String,
@@ -2537,10 +2529,6 @@ pub(crate) struct DraftDelete {
 /// An added row's touched cells, which is every column its `INSERT` names: an
 /// untouched column is left out, so the server's default applies to it. `None`
 /// is `NULL`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draft's apply is the first caller")
-)]
 pub(crate) struct DraftInsert {
     pub schema: String,
     pub table: String,
@@ -2566,10 +2554,6 @@ pub(crate) struct DraftInsert {
 // foreign key, an existing row re-pointed at a new parent, and a two-row unique
 // swap fail with the server's own error; the bracket rolls the batch back and
 // the draft is kept. The upgrade is ordering by the relation's keys.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draft's apply is the first caller")
-)]
 pub(crate) fn draft_batch(
     engine: Engine,
     deletes: &[DraftDelete],
@@ -2586,10 +2570,6 @@ pub(crate) fn draft_batch(
 }
 
 /// [`draft_batch`] for a spec of its own, which `src/sql_snapshots` writes.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draft's apply is the first caller")
-)]
 pub(crate) fn sql_draft_batch(
     spec: &EngineSpec,
     deletes: &[DraftDelete],

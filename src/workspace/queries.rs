@@ -2346,10 +2346,11 @@ impl Workspace {
                 table.delegate().column_view(),
             )
         };
-        // What the batch carries, read now: on success only these cells are
-        // cleared, so an edit staged while it is out stays. A lent slot's grid
-        // is the one in front of the batch by here. Nothing can be staged
-        // between the batch's writing and this read: a review holds the grid
+        // What the batch carries, read now: on a query tab only these cells
+        // are cleared on success, so an edit staged while it is out stays; a
+        // relation tab's reviewed draft clears whole (see the landing). A lent
+        // slot's grid is the one in front of the batch by here. Nothing can be
+        // staged between the batch's writing and this read: a review holds the grid
         // against staging (`may_stage_into`), the buffer append sends in the
         // call that wrote it, and a batch the mode gate parks waits under
         // Read-only, where `set_pending` refuses. So every staged cell is in
@@ -3015,16 +3016,32 @@ impl Workspace {
                                 if let Some((rows_id, rows)) = &sent {
                                     results.update(cx, |table, cx| {
                                         let grid = table.delegate_mut();
-                                        // ponytail: the sent cells are matched
-                                        // by row index and value under an
-                                        // unchanged `rows_id`, so a sort in
-                                        // memory during the round trip leaves
-                                        // them staged (applying them again
-                                        // writes the same values); the upgrade
-                                        // is to match them by the row's key.
-                                        if grid.rows_id() == *rows_id {
-                                            for (row, cells) in rows {
-                                                grid.clear_sent(*row, cells);
+                                        match tab {
+                                            // A reviewed relation tab's apply
+                                            // sent the whole draft, cells and
+                                            // added rows: the review held the
+                                            // grid against staging while it was
+                                            // out (`may_stage_into`), and a
+                                            // sort in memory only permuted what
+                                            // it held. So the whole draft goes,
+                                            // whatever `rows_id` now is, and an
+                                            // added row is not left staged to
+                                            // be sent twice.
+                                            Tab::Object(_) => grid.discard_pending(),
+                                            // ponytail: the sent cells are
+                                            // matched by row index and value
+                                            // under an unchanged `rows_id`, so
+                                            // a sort in memory during the round
+                                            // trip leaves them staged (applying
+                                            // them again writes the same
+                                            // values); the upgrade is to match
+                                            // them by the row's key.
+                                            Tab::Query(_) => {
+                                                if grid.rows_id() == *rows_id {
+                                                    for (row, cells) in rows {
+                                                        grid.clear_sent(*row, cells);
+                                                    }
+                                                }
                                             }
                                         }
                                         table.refresh(cx);
