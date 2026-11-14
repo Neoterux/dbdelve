@@ -1863,6 +1863,27 @@ impl Workspace {
             );
             return false;
         };
+        // On a target that verifies an apply the send is one step: the row
+        // read again and compared before the `UPDATE`, the write counted, and
+        // `read` taken inside the same transaction.
+        let verify = if target.verifies_applies() {
+            let grid = results.read(cx).delegate();
+            match lone_verification(
+                self.engine(),
+                &update,
+                StepKind::Update,
+                Some((grid.fetched_cells(row), grid.row_label(row))),
+                Some(read.clone()),
+            ) {
+                Ok(verify) => Some(verify),
+                Err(message) => {
+                    self.note(message, cx);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         self.execute_and_then(
             update,
             tab,
@@ -1873,6 +1894,7 @@ impl Workspace {
                 sent,
                 to,
                 then,
+                verify,
             }),
             false,
             None,
@@ -2643,6 +2665,61 @@ fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verifi
     }
     Ok(Verification { steps, rows })
 }
+
+/// The sentence for a statement whose write cannot be checked against the
+/// server: it is not one statement of the kind it was written as.
+const UNCHECKABLE: &str =
+    "dbdelve refused to run a statement it wrote itself: it cannot be checked against the server.";
+
+/// [`verification`] for the one statement of a Row send, a New row form's
+/// `INSERT` or a lone Delete row's `DELETE`: one step, cut from the text the
+/// gate admitted. An `UPDATE` or a `DELETE` is paired with `row`, the row as
+/// it was fetched (`ResultGrid::fetched_cells`) and what it is called
+/// (`ResultGrid::row_label`), and with the read that brings it back; an
+/// `INSERT` has no row to read and is called `new row` in what the apply says
+/// of it.
+/// `read_back` is the read a Row send takes of its row inside the transaction.
+///
+/// Refused, so nothing is sent, when the statement is not exactly one of the
+/// kind named or its row cannot be read again or named: an apply that cannot
+/// be verified is not offered for a target that verifies.
+fn lone_verification(
+    engine: Engine,
+    statement: &str,
+    kind: StepKind,
+    row: Option<(Vec<db::FetchedCell>, Option<String>)>,
+    read_back: Option<String>,
+) -> Result<Verification, String> {
+    let written = sql::generated_writes(engine, statement);
+    let Some([one]) = written.as_deref() else {
+        return Err(UNCHECKABLE.into());
+    };
+    let (reread, before, label) = match (kind, row) {
+        (StepKind::Insert, None) => (None, Vec::new(), "new row".to_string()),
+        (StepKind::Update | StepKind::Delete, Some((before, label))) => (
+            Some(sql::row_reread(engine, one).ok_or(NOT_ONE_ROW)?),
+            before,
+            label.ok_or(NOT_ONE_ROW)?,
+        ),
+        (StepKind::Insert | StepKind::Update | StepKind::Delete, _) => {
+            return Err(UNCHECKABLE.into());
+        }
+    };
+    Ok(Verification {
+        steps: vec![VerifiedStep {
+            sql: one.clone(),
+            kind,
+            reread,
+            before,
+            read_back,
+        }],
+        rows: vec![label],
+    })
+}
+
+/// The sentence for a row write whose row cannot be read by its key.
+const NOT_ONE_ROW: &str =
+    "dbdelve refused to run a statement it wrote itself: it is not the read of one row.";
 
 #[cfg(test)]
 mod tests {
