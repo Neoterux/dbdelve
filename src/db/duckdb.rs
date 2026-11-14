@@ -38,8 +38,8 @@ use crate::sql::Projected;
 
 use super::{
     ApplyOutcome, ApplyStage, Bracket, Catalog, Column, Databases, DbError, EditTarget, Engine,
-    Fetch, QueryResult, Reference, RowBuilder, Sending, Stopped, Structure, Unpicked, VerifiedStep,
-    assemble_catalog, assemble_foreign_keys, assemble_references, assemble_sequences,
+    Fetch, QueryResult, Reference, RowBuilder, RowMatch, Sending, Stopped, Structure, Unpicked,
+    VerifiedStep, assemble_catalog, assemble_foreign_keys, assemble_references, assemble_sequences,
     assemble_structure, plain_error, required_cell, terminated,
 };
 
@@ -476,7 +476,7 @@ impl Connection {
         let mut result =
             run(&connection, sql, fetch).map_err(|error| rolled_back(&connection, sql, error))?;
         if !result.columns.is_empty() {
-            result.edit = edit_target(&connection, sql, &result.columns);
+            (result.edit, result.read_only_reason) = edit_target(&connection, sql, &result.columns);
         }
         Ok(result)
     }
@@ -913,9 +913,51 @@ fn run(connection: &duckdb::Connection, sql: &str, fetch: Fetch) -> Result<Query
 }
 
 /// Whether `=` against a column's value rendered as text finds it, for the
-/// type the catalog gives the column. A stub until the keyless target exists.
-fn is_matchable(_data_type: &str) -> bool {
-    false
+/// type the catalog gives the column. Fail closed: only types the pinned
+/// engine was seen to match are listed.
+///
+/// ponytail: a type is added when
+/// `tests::every_listed_type_matches_its_row_by_its_rendered_text` exercises it
+/// on the pinned engine. Left off: `BLOB` (rendered as hex, which reads back as
+/// the characters), lists of text, structs and maps (rendered without quoting,
+/// so a comma splits a value and a struct or a map does not read back), enums,
+/// fixed-size arrays and the rest.
+fn is_matchable(data_type: &str) -> bool {
+    const LISTED: &[&str] = &[
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "UHUGEINT",
+        "BOOLEAN",
+        "VARCHAR",
+        "FLOAT",
+        "DOUBLE",
+        "DECIMAL",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMP WITH TIME ZONE",
+        "TIME WITH TIME ZONE",
+        "INTERVAL",
+        "UUID",
+        "JSON",
+        "BIT",
+        "INTEGER[]",
+        "BIGINT[]",
+    ];
+    let name = data_type.to_ascii_uppercase();
+    // `DECIMAL(10,2)` is one type whatever its precision.
+    let base = match name.split_once('(') {
+        Some(("DECIMAL", _)) => "DECIMAL",
+        _ => name.as_str(),
+    };
+    LISTED.contains(&base)
 }
 
 /// Which table these columns can be written back to, if any.
@@ -924,12 +966,30 @@ fn is_matchable(_data_type: &str) -> bool {
 /// came from, and only a select of one table's own columns
 /// ([`crate::sql::table_read`]) answers at all; the catalog says what the
 /// table is and which key names its rows. Every step may answer "no", a
-/// failed lookup included: the user's statement has already succeeded.
+/// failed lookup included: the user's statement has already succeeded. A table
+/// with no primary key is named by every column, or answers the reason it is
+/// not.
 fn edit_target(
     connection: &duckdb::Connection,
     sql: &str,
     columns: &[Column],
-) -> Option<EditTarget> {
+) -> (Option<EditTarget>, Option<String>) {
+    let Some(target) = keyed_or_keyless_target(connection, sql, columns) else {
+        return (None, None);
+    };
+    match target {
+        Ok(target) => (Some(target), None),
+        Err(reason) => (None, Some(reason)),
+    }
+}
+
+/// [`edit_target`]'s steps, where `None` is "no, and nothing to say about it"
+/// and `Err` is the reason a keyless table is read-only.
+fn keyed_or_keyless_target(
+    connection: &duckdb::Connection,
+    sql: &str,
+    columns: &[Column],
+) -> Option<Result<EditTarget, String>> {
     let read = crate::sql::table_read(Engine::DuckDb, sql)?;
     let (schema, table) = resolved_table(connection, &read.table)?;
     let lookup = |sql: String| -> Option<Vec<String>> {
@@ -992,16 +1052,70 @@ fn edit_target(
                 .position(|origin| origin.as_ref() == Some(name))
         })
         .collect::<Option<Vec<usize>>>()?;
-    if keys.is_empty() {
+    if !keys.is_empty() {
+        return Some(Ok(EditTarget {
+            schema,
+            table,
+            columns: origins,
+            keys,
+            ..Default::default()
+        }));
+    }
+
+    // No primary key, whatever unique index there is. Every column of the
+    // table names the row, never some of them: a column left out of the WHERE
+    // matches rows the user is not looking at.
+    if origins.iter().any(Option::is_none) {
         return None;
     }
-    Some(EditTarget {
+    let described = |column: &str| {
+        lookup(format!(
+            "SELECT {column} FROM duckdb_columns()
+             WHERE database_name = current_database()
+               AND schema_name = {schema_literal} AND table_name = {table_literal}
+             ORDER BY column_index"
+        ))
+    };
+    let (types, generated) = (described("data_type")?, described("is_generated")?);
+    if types.len() != names.len() || generated.len() != names.len() {
+        return None;
+    }
+    let refusal = |what: String| {
+        Some(Err(format!(
+            "A table without a primary key is edited by matching every column, and {what}."
+        )))
+    };
+    if let Some((name, data_type)) = names
+        .iter()
+        .zip(&types)
+        .find(|(_, data_type)| !is_matchable(data_type))
+    {
+        return refusal(format!(
+            "{name} ({}) cannot be matched by its value",
+            data_type.to_ascii_lowercase()
+        ));
+    }
+    let (mut keys, mut fixed) = (Vec::new(), Vec::new());
+    for (name, generated) in names.iter().zip(&generated) {
+        let Some(at) = origins
+            .iter()
+            .position(|origin| origin.as_deref() == Some(name.as_str()))
+        else {
+            return refusal(format!("{name} is not in the result"));
+        };
+        keys.push(at);
+        if generated == "true" {
+            fixed.push(at);
+        }
+    }
+    Some(Ok(EditTarget {
         schema,
         table,
         columns: origins,
         keys,
+        row_match: RowMatch::EveryColumn { fixed },
         ..Default::default()
-    })
+    }))
 }
 
 /// The stored schema and name of the base table `written` names in the
