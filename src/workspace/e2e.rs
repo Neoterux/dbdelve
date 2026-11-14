@@ -25837,6 +25837,112 @@ fn a_second_run_while_an_added_rows_insert_is_out_sends_nothing_more(cx: &mut Te
     });
 }
 
+/// An edit that reaches the send with no verification, for a target that
+/// verifies applies, is not sent: every path that writes a grid's rows builds
+/// one, and this is what stops a future one that forgets.
+#[gpui::test]
+fn an_edit_of_a_verifying_target_without_its_verification_is_not_sent(cx: &mut TestAppContext) {
+    use crate::session::Refresh;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_and_then(
+                "UPDATE \"birds\" SET \"name\" = 'finch' WHERE \"id\" = 1;".into(),
+                Tab::Object(id),
+                Some(Refresh::Relation { id, verify: None }),
+                false,
+                None,
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing reached the file"
+        );
+        let said = match (front_review(&workspace, cx), tab_notice(&workspace, cx)) {
+            (Some((_, _, Some(error))), _) => error,
+            (_, Some((_, notice))) => notice,
+            other => panic!("the refusal was not said: {other:?}"),
+        };
+        assert_eq!(said, "dbdelve refused to send an edit it could not verify.");
+        quit(workspace, cx);
+    });
+}
+
+/// A second Apply while the first is out is the same `UPDATE` twice, and a
+/// re-run of the tab's query while it is out would read rows the apply is
+/// still changing; the tab's one-run-at-a-time guard refuses both.
+#[gpui::test]
+fn a_second_apply_from_a_query_tab_while_the_first_is_out_sends_nothing_more(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        // Every UPDATE that reaches the table leaves a line, so a second one
+        // shows even though it would write the same name.
+        let schema = format!(
+            "{BIRDS} create table log (n integer); create trigger logs after update on birds \
+             begin insert into log values (1); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
+            })
+        });
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Running { .. }
+        ));
+        let reviewing = front_review_sql(&workspace, cx);
+        // Neither a second Run, nor a second Apply, nor a re-run of the query
+        // sends anything while the first is out.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx);
+                workspace.run_query(&crate::actions::RunQuery, window, cx);
+            })
+        });
+        assert_eq!(
+            front_review_sql(&workspace, cx),
+            reviewing,
+            "no other statement was put up for review"
+        );
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select count(*) from log").as_deref(),
+            Some("1"),
+            "one UPDATE reached the table"
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(front_review(&workspace, cx), None);
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().pending_count(), 0);
+        });
+        quit(workspace, cx);
+    });
+}
+
 fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
     cx.update(|window, cx| {
         use gpui::Focusable;
