@@ -2434,10 +2434,11 @@ pub(crate) enum EditMode {
 
 impl EditMode {
     /// This mode, but `Draft` where the target does not offer Row: Row is
-    /// offered exactly where `Target::row_edits` holds, the targets whose edit
-    /// send keeps the grid, so a Row send is never made on one that clears it.
+    /// offered exactly where `Target::keeps_edits` holds, the targets whose edit
+    /// send keeps the grid and is verified, so a Row send is never made on one
+    /// that clears it.
     pub(crate) fn on(self, target: Target) -> Self {
-        match (self, target.row_edits()) {
+        match (self, target.keeps_edits()) {
             (Self::Row, false) => Self::Draft,
             (mode, _) => mode,
         }
