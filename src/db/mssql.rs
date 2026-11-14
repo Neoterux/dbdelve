@@ -1017,8 +1017,14 @@ impl Connection {
                 ));
             }
             self.run_held(&mut guard, sql, Origin::Generated, Fetch::default())
-                .map(|(result, _)| result)
+                .and_then(|(result, _)| kept_transaction(sql, result))
         };
+        // ponytail: a write's count is the outer statement's `@@ROWCOUNT`. An
+        // `INSTEAD OF` trigger that writes nothing still counts 1, and an
+        // `AFTER` trigger's writes are not counted, with or without `SET
+        // NOCOUNT ON`, so on SQL Server the count does not prove the write. The
+        // re-read before it still catches a changed or missing row. The
+        // upgrade is a read-back of the row after each write.
         super::run_verified(
             Engine::SqlServer,
             steps,
@@ -1026,7 +1032,7 @@ impl Connection {
             &mut send,
             proceed,
             &|_| false,
-            &|_| false,
+            &lost_session,
         )
     }
 
@@ -1338,8 +1344,6 @@ impl Connection {
         if self.alongside {
             return plain_error(what);
         }
-        let lost = "The connection was reset: the server rolled back any transaction that was \
-                    open, and temporary tables and SET options are gone with the session.";
         let reconnected = match self.connect() {
             Ok(fresh) => {
                 *session = Some(fresh);
@@ -1347,7 +1351,7 @@ impl Connection {
             }
             Err(error) => format!("Reconnecting failed: {}", error.message),
         };
-        plain_error(format!("{what} {lost} {reconnected}"))
+        plain_error(format!("{what} {RESET} {reconnected}"))
     }
 
     /// Which table these rows can be written back to, if any.
@@ -2409,22 +2413,29 @@ fn held_to_database(session: &mut Session, database: &str) -> Result<(), DbError
 const RESET: &str = "The connection was reset: the server rolled back any transaction that was \
                      open, and temporary tables and SET options are gone with the session.";
 
-fn lost_session(_: &DbError) -> bool {
-    false
+/// Whether `error` is [`Connection::stop`]'s: the session the statement ran on
+/// was closed and replaced, so whether a `COMMIT` that was on its way landed is
+/// not known. A [`Connection`] opened beside one ([`Connection::alongside`])
+/// says no such thing, and never runs a verified apply.
+fn lost_session(error: &DbError) -> bool {
+    error.message.contains(RESET)
 }
 
-fn kept_transaction(_: &str, result: QueryResult) -> Result<QueryResult, DbError> {
-    Ok(result)
+/// `result` of `sql` as a verified sequence may take it. A statement that
+/// finished but whose count round trip then reset the session returns whole,
+/// with the reset said in its notice, and the server has rolled the
+/// transaction back with the session: whatever the sequence sends next would
+/// run on its own, so it is an error, not a write. A `COMMIT` that finished
+/// stands whatever came after it.
+fn kept_transaction(sql: &str, result: QueryResult) -> Result<QueryResult, DbError> {
+    match &result.notice {
+        Some(notice) if sql != "COMMIT" && notice.contains(RESET) => {
+            Err(plain_error(notice.clone()))
+        }
+        _ => Ok(result),
+    }
 }
 
-/// Say what a failed statement did to the transactions open around it.
-///
-/// `SET XACT_ABORT ON` is what makes a generated batch's brackets atomic:
-/// without it a constraint violation ends only its own statement, the batch
-/// carries on, and the `COMMIT` dbdelve wrote commits the rows before it. It is
-/// the session's default too, so a failing statement of the user's ends a
-/// transaction they began earlier. T-SQL has no nested transactions, so either
-/// takes every open level with it -- which the counts before and after tell.
 fn transaction_outcome(
     session: &mut Session,
     sql: &str,
@@ -5543,6 +5554,62 @@ mod tests {
         assert!(
             after_reset(&steps[0].sql, "(1 row affected)").is_ok(),
             "a message the server sent is not a reset"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MSSQL_URL"]
+    fn live_an_instead_of_trigger_that_writes_nothing_still_counts_its_row() {
+        use crate::db::{
+            ApplyOutcome, Bracket, CancelToken, FetchedCell, StepKind, conformance::verified_steps,
+        };
+
+        let connection =
+            crate::db::Connection::open(crate::db::ConnectionConfig::SqlServer(live_config()))
+                .expect("connection should open");
+        let table = "verified_instead_of";
+        let scratch = ScratchTable(&connection, table);
+        scratch.drop_all();
+        let run = |sql: &str| {
+            connection
+                .query(sql, &CancelToken::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+        };
+        run(&format!(
+            "CREATE TABLE dbo.{table} (id int PRIMARY KEY, label nvarchar(50));
+             INSERT INTO dbo.{table} VALUES (1, N'one')"
+        ));
+        run(&format!(
+            "CREATE TRIGGER dbo.{table}_skip ON dbo.{table} INSTEAD OF UPDATE AS BEGIN SET NOCOUNT ON; END"
+        ));
+        let row = run(&format!("SELECT * FROM dbo.{table} WHERE id = 1"));
+        let before: Vec<FetchedCell> = row
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| FetchedCell {
+                column: column.name.clone(),
+                text: row.rows[0].get(index).map(str::to_string),
+                cell_type: None,
+                column_type: column.data_type.clone(),
+            })
+            .collect();
+        let write =
+            format!("UPDATE \"dbo\".\"{table}\" SET \"label\" = N'changed' WHERE \"id\" = '1'");
+        let steps = verified_steps(Engine::SqlServer, &write, vec![(StepKind::Update, before)]);
+
+        // The documented limit: the outer statement's count is 1, though the
+        // trigger wrote nothing.
+        let outcome = connection.apply_verified(&steps, Bracket::Own, &CancelToken::default());
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { affected: 1, .. }),
+            "{outcome:?}"
+        );
+        let label = run(&format!("SELECT label FROM dbo.{table} WHERE id = 1"));
+        assert_eq!(
+            label.rows[0].get(0),
+            Some("one"),
+            "the trigger kept the row"
         );
     }
 

@@ -84,8 +84,8 @@ mode, always where the user can read it before it runs:
   `INSERT` must count one row, and the `DELETE` re-reads its row first and
   must count one.
 - A relation tab's Draft apply on a target that verifies it
-  (`Target::verifies_applies`: SQLite, DuckDB, Postgres, MySQL and MariaDB so far, widened an
-  engine at a time as each one's arm of `Connection::apply_verified` lands) is not sent as the text
+  (`Target::verifies_applies`: SQLite, DuckDB, Postgres, MySQL, MariaDB and SQL Server so
+  far, widened an engine at a time as each one's arm of `Connection::apply_verified` lands) is not sent as the text
   the user read. The text is still what the user reads, and it is gated as it
   always was (`sql::is_generated_write_on`, `sql::draft_deletes_match`); the
   apply then cuts its statements out of that text (`sql::generated_writes`,
