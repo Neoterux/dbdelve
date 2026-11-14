@@ -5354,6 +5354,7 @@ mod tests {
                         | Engine::Postgres
                         | Engine::MySql
                         | Engine::MariaDb
+                        | Engine::SqlServer
                 ),
                 "{engine:?}"
             );
