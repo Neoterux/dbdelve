@@ -653,10 +653,6 @@ impl Engine {
     /// The engines that are not row-edit targets answer false: nothing asks
     /// them. An explicit arm per engine for the reason
     /// [`Engine::transaction_start`] has one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the draft's apply is the first caller")
-    )]
     pub fn keeps_failed_transaction_open(self) -> bool {
         match self {
             Self::MySql | Self::MariaDb | Self::Sqlite => true,
