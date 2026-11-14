@@ -7846,6 +7846,272 @@ mod tests {
         }
     }
 
+    fn draft_row_edit_engines() -> Vec<Engine> {
+        use crate::db::Target;
+
+        let engines: Vec<_> = Engine::ALL
+            .into_iter()
+            .filter(|engine| Target::built_in(*engine).row_edits())
+            .collect();
+        assert!(engines.len() > 1, "{engines:?}");
+        engines
+    }
+
+    #[test]
+    fn a_draft_refuses_a_hidden_delete_a_second_insert_row_and_a_comment_between_statements() {
+        for engine in draft_row_edit_engines() {
+            let q = engine.qualified("public", "accounts");
+            let id = engine.quote_identifier("id");
+            let name = engine.quote_identifier("Name");
+            let upd = format!("UPDATE {q} SET {name} = 'x' WHERE {id} = '8'");
+            let del = format!("DELETE FROM {q} WHERE {id} = '7'");
+            let ins = format!("INSERT INTO {q} ({id}) VALUES ('9')");
+            let cte_delete = format!("WITH d AS (DELETE FROM {q} WHERE {id} = '8' RETURNING *)");
+            let cases: Vec<(&str, Vec<String>)> = vec![
+                (
+                    "a CTE delete beside an update",
+                    vec![upd.clone(), format!("{cte_delete} SELECT 1")],
+                ),
+                (
+                    "an update carrying a CTE delete, beside an insert",
+                    vec![
+                        format!("{cte_delete} UPDATE {q} SET {name} = 'x' WHERE {id} = '8'"),
+                        ins.clone(),
+                    ],
+                ),
+                (
+                    "an update carrying a CTE delete, beside an update",
+                    vec![
+                        format!("{cte_delete} UPDATE {q} SET {name} = 'x' WHERE {id} = '8'"),
+                        upd.clone(),
+                    ],
+                ),
+                (
+                    "a delete beside a two-row insert",
+                    vec![del.clone(), format!("{ins}, ('10')")],
+                ),
+                (
+                    "a delete beside an insert from a select",
+                    vec![del.clone(), format!("INSERT INTO {q} SELECT * FROM {q}")],
+                ),
+                (
+                    "a delete beside an insert returning",
+                    vec![del.clone(), format!("{ins} RETURNING *")],
+                ),
+                (
+                    "a comment line between a delete and an insert",
+                    vec![del.clone(), "-- note".into(), ins.clone()],
+                ),
+                (
+                    "an executable comment between a delete and an insert",
+                    vec![del.clone(), "/*! SELECT 1 */".into(), ins.clone()],
+                ),
+                (
+                    "a delete matching more than its row, beside an insert",
+                    vec![format!("{del} OR 1 = 1"), ins.clone()],
+                ),
+                (
+                    "a delete with no where, beside an insert",
+                    vec![format!("DELETE FROM {q}"), ins.clone()],
+                ),
+            ];
+            for (case, statements) in &cases {
+                let body = statements
+                    .iter()
+                    .map(|statement| match statement.starts_with("--") {
+                        true => statement.clone(),
+                        false => format!("{statement};"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for text in [body.clone(), format!("BEGIN;\n{body}\nCOMMIT;")] {
+                    assert!(
+                        !is_generated_write_on(engine, &text),
+                        "{engine:?} admitted {case}: {text}"
+                    );
+                }
+            }
+            let unclosed = format!("BEGIN;\n{del};\n{ins};");
+            assert!(
+                !is_generated_write_on(engine, &unclosed),
+                "{engine:?} admitted a bracket never closed: {unclosed}"
+            );
+        }
+    }
+
+    fn draft_delete(id: &str) -> DraftDelete {
+        DraftDelete {
+            schema: "public".into(),
+            table: "accounts".into(),
+            keys: vec![("id".into(), id.into())],
+            null_keys: Vec::new(),
+            types: Vec::new(),
+        }
+    }
+
+    fn draft_insert(id: &str, name: Option<&str>) -> DraftInsert {
+        DraftInsert {
+            schema: "public".into(),
+            table: "accounts".into(),
+            columns: vec![
+                ("id".into(), Some(id.into())),
+                ("Name".into(), name.map(Into::into)),
+            ],
+            types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_mixed_draft_is_admitted_with_or_without_its_brackets_on_every_row_edit_engine() {
+        for engine in draft_row_edit_engines() {
+            let shapes: [(&str, Vec<DraftDelete>, Vec<PendingRow>, Vec<DraftInsert>); 6] = [
+                (
+                    "delete, update, insert",
+                    vec![draft_delete("7")],
+                    vec![pending_row(&[("Name", set("x"))], &[("id", "8")])],
+                    vec![draft_insert("9", None)],
+                ),
+                (
+                    "delete, delete",
+                    vec![draft_delete("7"), draft_delete("8")],
+                    vec![],
+                    vec![],
+                ),
+                (
+                    "insert, insert",
+                    vec![],
+                    vec![],
+                    vec![draft_insert("9", None), draft_insert("10", Some("y"))],
+                ),
+                (
+                    "update, insert",
+                    vec![],
+                    vec![pending_row(&[("Name", set("x"))], &[("id", "8")])],
+                    vec![draft_insert("9", None)],
+                ),
+                (
+                    "delete, insert",
+                    vec![draft_delete("7")],
+                    vec![],
+                    vec![draft_insert("9", None)],
+                ),
+                (
+                    "delete, update",
+                    vec![draft_delete("7")],
+                    vec![pending_row(&[("Name", set("x"))], &[("id", "8")])],
+                    vec![],
+                ),
+            ];
+            for (shape, deletes, updates, inserts) in &shapes {
+                for own_brackets in [true, false] {
+                    let batch = draft_batch(engine, deletes, updates, inserts, own_brackets)
+                        .unwrap_or_else(|error| panic!("{engine:?} {shape}: {error}"));
+                    assert!(
+                        is_generated_write_on(engine, &batch),
+                        "{engine:?} refused {shape} (own brackets {own_brackets}): {batch}"
+                    );
+                    match (own_brackets, engine.transaction_start()) {
+                        (true, Some(word)) => {
+                            assert!(batch.starts_with(&format!("{word};\n")), "{batch}");
+                            assert!(batch.ends_with("\nCOMMIT;"), "{batch}");
+                        }
+                        _ => assert!(
+                            !batch.contains("BEGIN") && !batch.contains("COMMIT"),
+                            "{engine:?} {shape} (own brackets {own_brackets}): {batch}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // ClickHouse names a row by every value, which a sequence cannot count.
+        let engine = Engine::ClickHouse;
+        for own_brackets in [true, false] {
+            let batch = draft_batch(
+                engine,
+                &[draft_delete("7")],
+                &[],
+                &[draft_insert("9", None)],
+                own_brackets,
+            )
+            .unwrap();
+            assert!(!is_generated_write_on(engine, &batch), "{batch}");
+        }
+    }
+
+    #[test]
+    fn a_draft_batch_keeps_its_statements_recoverable_in_delete_update_insert_order() {
+        for engine in draft_row_edit_engines() {
+            let updates = [
+                pending_row(&[("Name", set("a"))], &[("id", "8")]),
+                pending_row(&[("Name", set("b"))], &[("id", "4")]),
+            ];
+            let batch = draft_batch(
+                engine,
+                &[draft_delete("5"), draft_delete("2")],
+                &updates,
+                &[draft_insert("11", Some("k")), draft_insert("10", None)],
+                true,
+            )
+            .unwrap();
+            let statements = generated_writes(engine, &batch)
+                .unwrap_or_else(|| panic!("{engine:?} recovered nothing of {batch}"));
+            let delete = |id| delete_row(engine, "public", "accounts", &[("id", id)], &[]).unwrap();
+            let insert = |id, name: Option<&str>| {
+                insert_row(
+                    engine,
+                    "public",
+                    "accounts",
+                    &[("id", Some(id)), ("Name", name)],
+                    &[],
+                )
+                .unwrap()
+            };
+            let update = |row: &PendingRow| {
+                update_batch(engine, std::slice::from_ref(row))
+                    .unwrap()
+                    .trim_end_matches(';')
+                    .to_string()
+            };
+            assert_eq!(
+                statements,
+                [
+                    delete("5"),
+                    delete("2"),
+                    update(&updates[0]),
+                    update(&updates[1]),
+                    insert("11", Some("k")),
+                    insert("10", None),
+                ],
+                "{engine:?}: {batch}"
+            );
+            for statement in &statements {
+                assert!(
+                    is_generated_write_on(engine, statement),
+                    "{engine:?} refused alone: {statement}"
+                );
+            }
+
+            // One statement is never bracketed, whichever kind it is.
+            for one in [
+                draft_batch(engine, &[draft_delete("5")], &[], &[], true),
+                draft_batch(engine, &[], &updates[..1], &[], true),
+                draft_batch(engine, &[], &[], &[draft_insert("11", None)], true),
+            ] {
+                let one = one.unwrap();
+                assert!(
+                    !one.contains("BEGIN") && !one.contains("COMMIT") && one.ends_with(';'),
+                    "{engine:?}: {one}"
+                );
+            }
+            assert_eq!(
+                draft_batch(engine, &[], &[], &[], true),
+                Err("There are no edits to apply.".to_string()),
+                "{engine:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_nulled_cell_reaches_the_batch_as_the_keyword() {
         let rows = vec![pending_row(&[("name", NewValue::Null)], &[("id", "1")])];
