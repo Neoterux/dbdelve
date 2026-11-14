@@ -7464,4 +7464,96 @@ mod tests {
             [("id".to_string(), "8".to_string())]
         );
     }
+
+    #[test]
+    fn marking_an_added_row_removes_it() {
+        let mut grid = editable_grid();
+        assert_eq!(grid.add_row(), Some(2));
+        assert!(grid.set_pending(2, 1, NewValue::Value("third".into())));
+        assert_eq!(grid.add_row(), Some(3));
+        assert!(grid.set_pending(3, 1, NewValue::Value("fourth".into())));
+
+        assert!(grid.toggle_marks(&[2]));
+
+        assert_eq!(grid.added_count(), 1);
+        assert_eq!(
+            grid.marked_count(),
+            0,
+            "an added row is removed, not marked"
+        );
+        assert_eq!(
+            grid.pending_value(2, 1),
+            Some(&NewValue::Value("fourth".into())),
+            "the other added row moved up into the place"
+        );
+        assert_eq!(grid.pending_value(3, 1), None);
+        assert!(grid.active().is_none_or(|(row, _)| row < 3));
+
+        assert!(grid.toggle_marks(&[2]));
+        assert_eq!(grid.added_count(), 0);
+        assert!(!grid.has_pending());
+        assert_eq!(grid.active().map(|(row, _)| row), Some(1));
+    }
+
+    #[test]
+    fn a_marked_row_refuses_staging() {
+        let mut grid = editable_grid();
+        assert!(grid.toggle_marks(&[1]));
+
+        assert!(!grid.editable(1, 1));
+        assert!(!grid.begin_edit(1, 1));
+        assert!(!grid.set_pending(1, 1, NewValue::Value("late".into())));
+        assert!(!grid.stage(1, 1, NewValue::Null));
+        assert_eq!(grid.pending_value(1, 1), None);
+        assert!(!grid.row_editable(1));
+        assert!(grid.editable(0, 1), "another row is still editable");
+        assert!(grid.begin_edit(0, 1));
+    }
+
+    #[test]
+    fn a_mixed_selection_marks_every_unmarked_row_and_a_marked_selection_unmarks() {
+        let mut grid = editable_grid();
+        assert!(grid.toggle_marks(&[0]));
+
+        assert!(grid.toggle_marks(&[0, 1]));
+        assert!(grid.is_marked(0) && grid.is_marked(1), "a mixed one marks");
+        assert!(grid.toggle_marks(&[0, 1]));
+        assert!(
+            !grid.is_marked(0) && !grid.is_marked(1),
+            "a marked one unmarks"
+        );
+        assert_eq!(grid.marked_count(), 0);
+
+        // A row with no key to name it refuses the whole selection.
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("7".into()), Some("a".into())],
+                    vec![None, Some("b".into())],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("note".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert!(!grid.toggle_marks(&[0, 1]));
+        assert_eq!(
+            grid.marked_count(),
+            0,
+            "the nameable row was not marked either"
+        );
+        assert!(grid.toggle_marks(&[0]));
+
+        grid.set_mode(Mode::ReadOnly);
+        assert!(!grid.toggle_marks(&[0]), "below Read-write nothing toggles");
+        assert!(grid.is_marked(0));
+        assert!(!grid.toggle_marks(&[]), "nothing picked changes nothing");
+    }
 }

@@ -22282,6 +22282,91 @@ fn applying_a_draft_runs_its_deletes_updates_and_inserts_in_one_transaction_and_
     });
 }
 
+/// A marked row is on its way out, so it takes no edit, and says so rather than
+/// asking for a higher mode or calling the column the problem.
+#[gpui::test]
+fn editing_a_marked_row_says_it_is_marked_for_deletion(cx: &mut TestAppContext) {
+    use crate::sql::Mode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[1]));
+        });
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 1, 1);
+
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+
+        grid.read_with(cx, |grid, _| {
+            assert!(grid.delegate().is_marked(1));
+            assert!(!grid.delegate().editable(1, 1), "no input opens on the row");
+            assert_eq!(grid.delegate().pending_count(), 1, "only the mark");
+        });
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("This row is marked for deletion.")
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let profile = workspace.profile().unwrap();
+            assert_eq!(profile.mode, Mode::ReadWrite);
+            assert!(profile.session.pending_run.is_none(), "no mode prompt");
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// A review shows the batch the draft made; a mark changed behind it would
+/// leave the statement on screen describing something other than the draft.
+#[gpui::test]
+fn delete_row_changes_no_mark_while_a_review_holds_the_draft(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let reviewed = front_review_sql(&workspace, cx);
+
+        // Called rather than dispatched: with the review's dialog up the action
+        // would have no focused element to reach.
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.delete_row(&crate::actions::DeleteRow, window, cx)
+        });
+        settle(cx);
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().marked_count(), 0);
+            assert_eq!(grid.delegate().pending_count(), 1);
+        });
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        assert_eq!(front_review_sql(&workspace, cx), reviewed);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_apply_review(cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.delete_row(&crate::actions::DeleteRow, window, cx)
+        });
+        settle(cx);
+        grid.read_with(cx, |grid, _| assert!(grid.delegate().is_marked(1)));
+        quit(workspace, cx);
+    });
+}
+
 /// `BIRDS` with a number beside the name, which a typed `07` and the server's
 /// `7` tell apart.
 const COUNTED_BIRDS: &str = "create table birds (id integer primary key, name text not null, n integer); \
