@@ -41,9 +41,10 @@ use tokio::sync::oneshot;
 
 use super::ssh::{Tunnel, tunnelled};
 use super::{
-    CancelToken, Catalog, Cell, Column, ColumnDefinition, DbError, EditTarget, Fetch, Index,
-    IndexKind, MISSING, NamedDefinition, Properties, QueryResult, Relation, RelationKind, Row,
-    Schema, ServerConfig, Sizes, SslMode, Statistics, Stopped, Structure, plain_error,
+    ApplyOutcome, ApplyStage, CancelToken, Catalog, Cell, Column, ColumnDefinition, DbError, Drift,
+    EditTarget, Fetch, FetchedCell, Index, IndexKind, MISSING, NamedDefinition, Properties,
+    QueryResult, Relation, RelationKind, Row, Schema, ServerConfig, Sizes, SslMode, Statistics,
+    StepKind, Stopped, Structure, VerifiedStep, plain_error,
 };
 use crate::mql::{self, Arg, Call, CursorMethod, DbMethod, Method, Show, Target, Value};
 
@@ -593,6 +594,14 @@ impl Connection {
         // last kept row, which is not the wait for the rows shown.
         result.elapsed = started.elapsed().saturating_sub(result.elapsed);
         Ok(result)
+    }
+
+    /// Applies `steps` one statement at a time (see [`ApplyOutcome`]).
+    pub fn apply_verified(&self, _steps: &[VerifiedStep], _cancel: &CancelToken) -> ApplyOutcome {
+        ApplyOutcome::Failed {
+            stage: ApplyStage::Begin,
+            error: plain_error("A MongoDB apply is not written yet.".into()),
+        }
     }
 
     /// Ask the server to stop every statement running under `cancel`, then
@@ -2241,6 +2250,11 @@ fn number(value: Option<&Bson>) -> i64 {
 fn affected(mut result: QueryResult, written: &Document) -> QueryResult {
     result.rows_affected = u64::try_from(number(written.get("n"))).ok();
     result
+}
+
+/// How the document as it was fetched differs from its re-read.
+fn document_drift(_before: &[FetchedCell], _reread: &QueryResult) -> Option<Drift> {
+    None
 }
 
 /// A reply as one row of its fields.
@@ -4071,6 +4085,179 @@ mod tests {
             "a refused statement reached the server"
         );
         assert_eq!(count(&connection, "accounts"), 5);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MONGO_URL"]
+    fn live_a_verified_mongo_draft_applies_in_order_and_stops_at_the_first_failure() {
+        use crate::result_grid::{NewValue, PendingRow};
+        use crate::sql::{DraftDelete, DraftInsert};
+
+        let connection = live();
+        let name = format!("dbdelve_test_{}", ObjectId::new());
+        let collection = format!("db.getCollection('{name}')");
+        let drop = format!("{collection}.drop()");
+        let _ = connection.query(&drop, &CancelToken::default(), Fetch::default());
+        let _scratch = Scratch(&connection, name.clone());
+        let cancel = CancelToken::default();
+        let types = vec![
+            ("_id".to_owned(), "int".to_owned()),
+            ("name".to_owned(), "string".to_owned()),
+        ];
+        let delete = |id: i32| DraftDelete {
+            schema: String::new(),
+            table: name.clone(),
+            keys: vec![("_id".into(), id.to_string())],
+            null_keys: Vec::new(),
+            types: types.clone(),
+        };
+        let update = |id: i32, to: &str| PendingRow {
+            table: name.clone(),
+            keys: vec![("_id".into(), id.to_string())],
+            sets: vec![("name".into(), NewValue::Value(to.into()))],
+            types: types.clone(),
+            ..PendingRow::default()
+        };
+        let insert = |id: i32, who: &str| DraftInsert {
+            schema: String::new(),
+            table: name.clone(),
+            columns: vec![
+                ("_id".into(), Some(id.to_string())),
+                ("name".into(), Some(who.into())),
+            ],
+            types: types.clone(),
+        };
+        let manifest = |id: i32| -> Vec<FetchedCell> {
+            let read = ran(&connection, &format!("{collection}.find({{_id: {id}}})"));
+            read.columns
+                .iter()
+                .enumerate()
+                .map(|(at, column)| FetchedCell {
+                    column: column.name.clone(),
+                    text: read.rows[0].get(at).map(str::to_owned),
+                    cell_type: Some(read.cell_types[0][at].to_owned()),
+                    column_type: column.data_type.clone(),
+                })
+                .collect()
+        };
+        // The statements of a draft, each with the document it read as it was
+        // fetched, handed over in the order the draft names them.
+        let steps = |text: &str, mut befores: Vec<Vec<FetchedCell>>| -> Vec<VerifiedStep> {
+            befores.reverse();
+            text.lines()
+                .map(|line| {
+                    let sql = line.strip_suffix(';').unwrap_or(line).to_owned();
+                    let kind = match (sql.contains(".insertOne("), sql.contains(".updateOne(")) {
+                        (true, _) => StepKind::Insert,
+                        (_, true) => StepKind::Update,
+                        _ => StepKind::Delete,
+                    };
+                    let reread = mql::browse::row_reread(&sql);
+                    let before = match kind {
+                        StepKind::Insert => Vec::new(),
+                        _ => befores.pop().expect("a manifest for each document"),
+                    };
+                    VerifiedStep {
+                        sql,
+                        kind,
+                        reread,
+                        before,
+                        read_back: None,
+                    }
+                })
+                .collect()
+        };
+        let name_of = |id: i32| {
+            let read = ran(&connection, &format!("{collection}.find({{_id: {id}}})"));
+            (
+                read.rows.len(),
+                read.rows.first().and_then(|row| {
+                    read.columns
+                        .iter()
+                        .position(|column| column.name == "name")
+                        .and_then(|at| row.get(at).map(str::to_owned))
+                }),
+            )
+        };
+
+        ran(
+            &connection,
+            &format!(
+                "{collection}.insertMany([{{_id: 1, name: 'a'}}, {{_id: 2, name: 'b'}}, \
+                 {{_id: 3, name: 'c'}}])"
+            ),
+        );
+
+        // No step sends nothing and answers none applied.
+        assert_eq!(
+            connection.apply_verified(&[], &cancel),
+            ApplyOutcome::Applied {
+                affected: 0,
+                read_back: None
+            }
+        );
+
+        // A statement the gates never saw is refused before anything is sent,
+        // the draft's other statements with it.
+        let mut refused = steps(
+            &mql::draft_batch(&[delete(1)], &[update(2, "bee")], &[]).unwrap(),
+            vec![manifest(1), manifest(2)],
+        );
+        refused.push(VerifiedStep {
+            sql: format!("{collection}.deleteMany({{}})"),
+            kind: StepKind::Delete,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        });
+        match connection.apply_verified(&refused, &cancel) {
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Begin,
+                ..
+            } => {}
+            other => panic!("a statement no gate admits was not refused: {other:?}"),
+        }
+        assert_eq!(count(&connection, &name), 3);
+
+        // Delete 1, update 2, insert a second document with 3's `_id`: the
+        // insert is the third statement and the one the server refuses.
+        let draft =
+            mql::draft_batch(&[delete(1)], &[update(2, "bee")], &[insert(3, "dup")]).unwrap();
+        let outcome =
+            connection.apply_verified(&steps(&draft, vec![manifest(1), manifest(2)]), &cancel);
+        match outcome {
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Write(2),
+                error,
+            } => assert!(error.message.contains("duplicate key"), "{}", error.message),
+            other => panic!("the third statement was expected to fail: {other:?}"),
+        }
+        assert_eq!(name_of(1), (0, None), "the delete before it was applied");
+        assert_eq!(name_of(2), (1, Some("bee".into())), "so was the update");
+        assert_eq!(
+            name_of(3),
+            (1, Some("c".into())),
+            "and C is the one document"
+        );
+        assert_eq!(count(&connection, &name), 2);
+
+        // Fresh documents: delete one, update the other, each counted once.
+        ran(
+            &connection,
+            &format!("{collection}.insertMany([{{_id: 4, name: 'd'}}, {{_id: 5, name: 'e'}}])"),
+        );
+        let draft = mql::draft_batch(&[delete(4)], &[update(5, "five")], &[]).unwrap();
+        let mut applying = steps(&draft, vec![manifest(4), manifest(5)]);
+        applying[1].read_back = applying[1].reread.clone();
+        match connection.apply_verified(&applying, &cancel) {
+            ApplyOutcome::Applied {
+                affected: 2,
+                read_back: Some(shown),
+            } => assert_eq!(shown.rows.len(), 1),
+            other => panic!("the draft was expected to apply: {other:?}"),
+        }
+        assert_eq!(name_of(4), (0, None));
+        assert_eq!(name_of(5), (1, Some("five".into())));
     }
 
     #[test]

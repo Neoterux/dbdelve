@@ -2278,10 +2278,12 @@ impl Connection {
                     connection.apply_verified(bound.is_some(), steps, bracket, &proceed)
                 }
                 Self::SqlServer(connection) => connection.apply_verified(steps, bracket, &proceed),
+                // Each statement registers its own run in `cancel`, as `query`
+                // does, so this arm never asks `proceed`.
+                Self::MongoDb(connection) => connection.apply_verified(steps, cancel),
                 Self::Turso(_)
                 | Self::Snowflake(_)
                 | Self::ClickHouse(_)
-                | Self::MongoDb(_)
                 | Self::Redis(_)
                 | Self::External(_) => unverifiable(),
             }
