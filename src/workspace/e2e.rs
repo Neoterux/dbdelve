@@ -22196,6 +22196,140 @@ fn a_reviewed_delete_leaves_other_rows_edits_staged(cx: &mut TestAppContext) {
     });
 }
 
+/// In a Draft view Delete row is a mark on the selected rows: nothing is
+/// asked and nothing is sent, and pressing it again takes the mark back.
+#[gpui::test]
+fn delete_row_in_a_draft_view_toggles_a_mark_and_sends_nothing(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        grid.read_with(cx, |grid, _| {
+            assert!(grid.delegate().is_marked(1));
+            assert_eq!(
+                grid.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("robin".into())),
+                "the other row's edit is not the mark's to drop"
+            );
+            assert_eq!(grid.delegate().pending_count(), 2);
+        });
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("2"),
+            "nothing was sent"
+        );
+        grid.update(cx, |_, cx| cx.notify());
+        settle(cx);
+        assert!(
+            status_bar_lines(cx)
+                .iter()
+                .any(|line| line == "2 pending changes"),
+            "{:?}",
+            status_bar_lines(cx)
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The draft has 2 changes, so the view was not switched to Row mode.")
+        );
+
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        grid.read_with(cx, |grid, _| {
+            assert!(!grid.delegate().is_marked(1));
+            assert_eq!(grid.delegate().pending_count(), 1);
+        });
+        grid.update(cx, |_, cx| cx.notify());
+        settle(cx);
+        assert!(
+            status_bar_lines(cx)
+                .iter()
+                .any(|line| line == "1 pending edit"),
+            "{:?}",
+            status_bar_lines(cx)
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+        quit(workspace, cx);
+    });
+}
+
+/// The tracer: a draft of a mark, an edited cell and an added row is read in
+/// one `Apply draft`, deletes first, and runs as one transaction.
+#[gpui::test]
+fn applying_a_draft_runs_its_deletes_updates_and_inserts_in_one_transaction_and_clears_the_draft(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(2));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        add_bird(&grid, cx, "4", "jay");
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("BEGIN;"), "{sql}");
+        assert!(sql.ends_with("COMMIT;"), "{sql}");
+        let (delete, update, insert) = (
+            sql.find("DELETE").expect("a DELETE"),
+            sql.find("UPDATE").expect("an UPDATE"),
+            sql.find("INSERT").expect("an INSERT"),
+        );
+        assert!(delete < update && update < insert, "{sql}");
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("3"));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing is sent before Run"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 4").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("3"));
+        grid.read_with(cx, |table, _| {
+            let grid = table.delegate();
+            assert_eq!(grid.pending_count(), 0);
+            assert_eq!(grid.marked_count(), 0);
+            assert_eq!(grid.fetched_rows(), 3, "the table was read again");
+        });
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        quit(workspace, cx);
+    });
+}
+
 /// `BIRDS` with a number beside the name, which a typed `07` and the server's
 /// `7` tell apart.
 const COUNTED_BIRDS: &str = "create table birds (id integer primary key, name text not null, n integer); \

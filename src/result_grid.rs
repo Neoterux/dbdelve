@@ -7252,4 +7252,103 @@ mod tests {
         );
         assert_eq!(mysql, ["id"]);
     }
+
+    #[test]
+    fn the_draft_count_counts_cells_added_rows_and_marks() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, NewValue::Value("edited".into())));
+        assert_eq!(grid.add_row(), Some(2));
+        assert!(grid.toggle_marks(&[1]));
+
+        assert_eq!(grid.pending_count(), 3);
+        assert_eq!(grid.marked_count(), 1);
+        assert_eq!(grid.added_count(), 1);
+        assert!(grid.has_pending());
+        assert!(grid.holds_rows());
+
+        grid.discard_pending();
+        assert_eq!(grid.pending_count(), 0);
+        assert_eq!(grid.marked_count(), 0);
+        assert_eq!(grid.added_count(), 0);
+        assert!(!grid.has_pending());
+        assert!(!grid.holds_rows());
+
+        // A mark alone is a draft, and says changes rather than edits.
+        assert!(grid.toggle_marks(&[0]));
+        assert!(grid.has_pending() && grid.holds_rows());
+    }
+
+    #[test]
+    fn marking_a_row_clears_its_edits_and_unmarking_does_not_restore_them() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(1, 1, NewValue::Value("changed".into())));
+        assert!(grid.set_pending(0, 1, NewValue::Value("kept".into())));
+
+        assert!(grid.toggle_marks(&[1]));
+        assert!(grid.is_marked(1));
+        assert_eq!(grid.pending_value(1, 1), None);
+        assert_eq!(
+            grid.pending_value(0, 1),
+            Some(&NewValue::Value("kept".into())),
+            "another row's edit stays"
+        );
+        let updates = grid.pending_updates();
+        assert_eq!(updates.len(), 1, "only the unmarked row is updated");
+        assert_eq!(updates[0].keys, [("id".to_string(), "7".to_string())]);
+
+        let deletes = grid.draft_deletes();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            (deletes[0].schema.as_str(), deletes[0].table.as_str()),
+            ("public", "measurements")
+        );
+        assert_eq!(deletes[0].keys, [("id".to_string(), "8".to_string())]);
+
+        assert!(grid.toggle_marks(&[1]));
+        assert!(!grid.is_marked(1));
+        assert_eq!(grid.pending_value(1, 1), None, "the cleared edit is gone");
+        assert!(grid.draft_deletes().is_empty());
+    }
+
+    #[test]
+    fn marks_follow_their_rows_through_a_memory_sort() {
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("8".into()), Some("a".into())],
+                    vec![Some("7".into()), Some("b".into())],
+                    vec![Some("9".into()), Some("c".into())],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("note".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert!(grid.toggle_marks(&[0]));
+
+        grid.sort_in_memory(vec![(0, false)]);
+
+        assert_eq!(grid.cell(1, 0), Some("8"), "the marked row moved to the middle");
+        assert!(grid.is_marked(1) && !grid.is_marked(0) && !grid.is_marked(2));
+        let deletes = grid.draft_deletes();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].keys, [("id".to_string(), "8".to_string())]);
+
+        grid.sort_in_memory(vec![(0, true)]);
+        assert_eq!(grid.cell(1, 0), Some("8"));
+        grid.sort_in_memory(vec![(1, false)]);
+        assert_eq!(grid.cell(2, 1), Some("a"), "the marked row is last by note");
+        assert!(grid.is_marked(2) && !grid.is_marked(0) && !grid.is_marked(1));
+        assert_eq!(
+            grid.draft_deletes()[0].keys,
+            [("id".to_string(), "8".to_string())]
+        );
+    }
 }
