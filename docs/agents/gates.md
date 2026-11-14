@@ -61,7 +61,10 @@ mode, always where the user can read it before it runs:
   on one whose apply is verified (`Target::verifies_applies`: the rows are
   re-read and compared and each write counted, which a copy left in the buffer
   would run without). A verified query-tab apply is not kept in the history for
-  the same reason.
+  the same reason, and no edit of a verifying target is sent without its
+  verification: `execute_unchecked` refuses one that arrives with none (`dbdelve
+  refused to send an edit it could not verify.`), so a path added later that
+  forgets to build one cannot send the text alone.
   The exception is a relation tab's view in Row mode, which has no buffer and
   no dialog: the row's `UPDATE` is sent as the row is left or saved
   (`Workspace::save_row`), and that is the user's own act. It is gated by
