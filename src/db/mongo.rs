@@ -3527,6 +3527,139 @@ mod tests {
         assert_eq!(with_id(doc! { "a": 1, "_id": 7 }).0, Bson::Int32(7));
     }
 
+    /// `fields` as the one document a re-read of `_id` returns: each field's
+    /// text and `$type` tag, in the order the server sent them.
+    fn one_document(fields: &[(&str, Option<&str>, &'static str)]) -> QueryResult {
+        QueryResult {
+            columns: fields
+                .iter()
+                .map(|(name, _, _)| Column {
+                    name: (*name).into(),
+                    data_type: None,
+                })
+                .collect(),
+            rows: vec![Row::new(fields.iter().map(|(_, text, _)| *text)).unwrap()],
+            cell_types: vec![fields.iter().map(|(_, _, tag)| *tag).collect()],
+            ..QueryResult::default()
+        }
+    }
+
+    /// The document as it was fetched: one cell per field, each typed.
+    fn fetched_document(fields: &[(&str, Option<&str>, &str)]) -> Vec<FetchedCell> {
+        fields
+            .iter()
+            .map(|(name, text, tag)| FetchedCell {
+                column: (*name).into(),
+                text: text.map(str::to_owned),
+                cell_type: Some((*tag).into()),
+                column_type: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mongo_document_matches_by_field_name_and_a_missing_field_differs_from_a_null() {
+        let drift = |before: &[(&str, Option<&str>, &str)],
+                     now: &[(&str, Option<&str>, &'static str)]| {
+            document_drift(&fetched_document(before), &one_document(now))
+        };
+        let id = ("_id", Some("1"), "int");
+
+        // Name decides, not position: the server may send fields in any order.
+        assert_eq!(
+            drift(
+                &[id, ("name", Some("Ada"), "string"), ("n", Some("5"), "int")],
+                &[("n", Some("5"), "int"), ("name", Some("Ada"), "string"), id]
+            ),
+            None
+        );
+        // A document of its `_id` alone matches its own re-read.
+        assert_eq!(drift(&[id], &[id]), None);
+        // A field the document lacks is not a null, either way round.
+        let missing = ("email", None, MISSING);
+        let null = ("email", None, "null");
+        assert_eq!(drift(&[id, missing], &[id]), None);
+        assert_eq!(drift(&[id, missing], &[id, null]), Some(Drift::Changed));
+        assert_eq!(
+            drift(&[id, missing], &[id, ("email", Some("a@b.c"), "string")]),
+            Some(Drift::Changed)
+        );
+        assert_eq!(drift(&[id, null], &[id]), Some(Drift::Changed));
+        assert_eq!(drift(&[id, null], &[id, null]), None);
+        // `1` and `1.0` both render `1`; the tag tells them apart.
+        assert_eq!(
+            drift(
+                &[id, ("n", Some("1"), "int")],
+                &[id, ("n", Some("1"), "double")]
+            ),
+            Some(Drift::Changed)
+        );
+        assert_eq!(
+            drift(
+                &[id, ("n", Some("1"), "int")],
+                &[id, ("n", Some("1"), "int")]
+            ),
+            None
+        );
+        // A value that changed, and a field that arrived, are both drift: the
+        // whole document is compared.
+        assert_eq!(
+            drift(
+                &[id, ("n", Some("1"), "int")],
+                &[id, ("n", Some("2"), "int")]
+            ),
+            Some(Drift::Changed)
+        );
+        assert_eq!(
+            drift(&[id], &[id, ("added", Some("x"), "string")]),
+            Some(Drift::Changed)
+        );
+        // A field that went is drift too.
+        assert_eq!(
+            drift(&[id, ("n", Some("1"), "int")], &[id]),
+            Some(Drift::Changed)
+        );
+        // Names and text are compared byte for byte, with no normalisation.
+        let (precomposed, decomposed) = ("caf\u{e9}", "cafe\u{301}");
+        assert_eq!(
+            drift(
+                &[id, ("name", Some(precomposed), "string")],
+                &[id, ("name", Some(decomposed), "string")]
+            ),
+            Some(Drift::Changed)
+        );
+        assert_eq!(
+            drift(
+                &[id, (precomposed, Some("x"), "string")],
+                &[id, (decomposed, Some("x"), "string")]
+            ),
+            Some(Drift::Changed)
+        );
+        assert_eq!(
+            drift(
+                &[id, (precomposed, Some(precomposed), "string")],
+                &[id, (precomposed, Some(precomposed), "string")]
+            ),
+            None
+        );
+
+        // No document is gone, and more than one is not the one that was read.
+        let nothing = QueryResult {
+            columns: vec![],
+            ..QueryResult::default()
+        };
+        assert_eq!(
+            document_drift(&fetched_document(&[id]), &nothing),
+            Some(Drift::Gone)
+        );
+        let mut two = one_document(&[id]);
+        two.rows.push(two.rows[0].clone());
+        assert_eq!(
+            document_drift(&fetched_document(&[id]), &two),
+            Some(Drift::Ambiguous(2))
+        );
+    }
+
     /// The server the `live_` tests talk to, from `dbdelve_MONGO_URL`.
     fn live_config() -> MongoConfig {
         let url = std::env::var("dbdelve_MONGO_URL").expect("dbdelve_MONGO_URL is required");
@@ -4414,6 +4547,32 @@ mod tests {
         }
         assert_eq!(name_of(4), (0, None));
         assert_eq!(name_of(5), (1, Some("five".into())));
+
+        // A document changed since its manifest was taken stops the draft
+        // before anything is written: the delete ahead of it is not sent.
+        ran(
+            &connection,
+            &format!("{collection}.insertMany([{{_id: 6, name: 'f'}}, {{_id: 7, name: 'g'}}])"),
+        );
+        let draft = mql::draft_batch(&[delete(6)], &[update(7, "seven")], &[]).unwrap();
+        let drifting = steps(&draft, vec![manifest(6), manifest(7)]);
+        ran(
+            &connection,
+            &format!("{collection}.updateOne({{_id: 7}}, {{$set: {{name: 'someone else'}}}})"),
+        );
+        assert_eq!(
+            connection.apply_verified(&drifting, &cancel),
+            ApplyOutcome::Drifted(vec![(1, Drift::Changed)])
+        );
+        assert_eq!(name_of(6), (1, Some("f".into())), "the delete was not sent");
+        assert_eq!(name_of(7), (1, Some("someone else".into())));
+        // One that is gone is told from one that changed.
+        ran(&connection, &format!("{collection}.deleteOne({{_id: 7}})"));
+        assert_eq!(
+            connection.apply_verified(&drifting, &cancel),
+            ApplyOutcome::Drifted(vec![(1, Drift::Gone)])
+        );
+        assert_eq!(name_of(6), (1, Some("f".into())));
     }
 
     #[test]
