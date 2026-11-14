@@ -179,7 +179,7 @@ macro_rules! native_colors {
             surface, bg, panel, overlay, control, text, text_muted, text_faint, accent, on_accent,
             cursor, danger, success, syntax_comment, syntax_keyword, syntax_string, syntax_number,
             syntax_function, syntax_type, syntax_variable, syntax_operator;
-            element_hover, element_active, border, border_strong, selection, edited
+            element_hover, element_active, border, border_strong, selection, edited, added, updated, deleted
         )
     };
 }

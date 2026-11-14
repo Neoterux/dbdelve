@@ -699,6 +699,13 @@ const BAND_CHROME_GAP: f32 = 0.04;
 const PALETTE_SELECTION_ALPHA: f32 = 0.28;
 const PALETTE_EDITED_ALPHA: f32 = 0.14;
 
+/// A row's state washes, thicker than the edited cell's: three washes have to
+/// read as three, and the thinner the wash the closer they all are to the
+/// plane under them. Held down by the AAA text test over each.
+const PALETTE_ADDED_ALPHA: f32 = 0.18;
+const PALETTE_UPDATED_ALPHA: f32 = 0.18;
+const PALETTE_DELETED_ALPHA: f32 = 0.18;
+
 /// Set from the light theme, where chrome is near-white and a tint over it is
 /// at its weakest: 0.22 is the lowest that still steps the pill clear of the
 /// 8-level floor a plane has to clear to be seen at all.
@@ -766,6 +773,19 @@ pub struct Theme {
     /// and a hue of its own, because the accent wash next to it already means
     /// "selected".
     pub edited: Rgba,
+    /// A grid row the user has added and not yet applied. A wash under the
+    /// row, in the hue `success` has, and not the cell wash `edited` paints:
+    /// that marks a value, this marks a row that does not exist yet.
+    pub added: Rgba,
+    /// A grid row holding changed cells. A wash under the whole row, blue
+    /// where `edited` is amber: the changed cells inside it keep their own
+    /// amber wash, and it is not the selection, which is also blue and which
+    /// paints over it.
+    pub updated: Rgba,
+    /// A grid row the user has marked for deletion. A wash under the row, in
+    /// the hue `danger` has; the row's struck-through text carries the same
+    /// state where colour does not.
+    pub deleted: Rgba,
 
     pub danger: Srgb,
     pub success: Srgb,
@@ -1405,6 +1425,11 @@ impl Theme {
             selection: Oklch::new(0.68, 0.15, 250.0).to_srgb().alpha(0.28),
             cursor: Oklch::new(0.72, 0.14, 250.0).to_srgb(),
             edited: Oklch::new(0.60, 0.15, 75.0).to_srgb().alpha(0.32),
+            added: Oklch::new(0.72, 0.15, 150.0).to_srgb().alpha(0.18),
+            // Cyan, not the blue `selection` is, so a row with changes never
+            // reads as a selected one.
+            updated: Oklch::new(0.68, 0.12, 205.0).to_srgb().alpha(0.18),
+            deleted: Oklch::new(0.70, 0.19, 25.0).to_srgb().alpha(0.14),
 
             danger: Oklch::new(0.70, 0.19, 25.0).to_srgb(),
             success: Oklch::new(0.72, 0.15, 150.0).to_srgb(),
@@ -1453,6 +1478,10 @@ impl Theme {
             selection: Oklch::new(0.52, 0.17, 250.0).to_srgb().alpha(0.20),
             cursor: Oklch::new(0.48, 0.18, 250.0).to_srgb(),
             edited: Oklch::new(0.80, 0.14, 75.0).to_srgb().alpha(0.30),
+            added: Oklch::new(0.52, 0.15, 150.0).to_srgb().alpha(0.18),
+            // Violet-blue, not the blue `selection` is.
+            updated: Oklch::new(0.60, 0.10, 280.0).to_srgb().alpha(0.14),
+            deleted: Oklch::new(0.52, 0.20, 25.0).to_srgb().alpha(0.16),
 
             danger: Oklch::new(0.52, 0.20, 25.0).to_srgb(),
             success: Oklch::new(0.52, 0.15, 150.0).to_srgb(),
@@ -1494,6 +1523,11 @@ impl Theme {
             selection: Srgb::from_hex(0x83a598).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0xebdbb2),
             edited: Srgb::from_hex(0xfabd2f).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0xb8bb26).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x2e6e77).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xff674f: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xdb452f).alpha(PALETTE_DELETED_ALPHA),
 
             // Lifted from #fb4934, as is the keyword.
             danger: Srgb::from_hex(0xff674f),
@@ -1532,6 +1566,11 @@ impl Theme {
             selection: Srgb::from_hex(0x076678).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x3c3836),
             edited: Srgb::from_hex(0xb57614).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x79740e).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x468689).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0x9d0006: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xffbeb4).alpha(PALETTE_DELETED_ALPHA),
 
             danger: Srgb::from_hex(0x9d0006),
             success: Srgb::from_hex(0x79740e),
@@ -1573,6 +1612,10 @@ impl Theme {
             selection: Srgb::from_hex(0xb4befe).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0xf5e0dc),
             edited: Srgb::from_hex(0xf9e2af).alpha(PALETTE_EDITED_ALPHA),
+            // Moved in Oklch lightness from 0xa6e3a1: text has to hold AAA over the wash.
+            added: Srgb::from_hex(0x87c282).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x2d85a7).alpha(PALETTE_UPDATED_ALPHA),
+            deleted: Srgb::from_hex(0xf38ba8).alpha(PALETTE_DELETED_ALPHA),
 
             danger: Srgb::from_hex(0xf38ba8),
             success: Srgb::from_hex(0xa6e3a1),
@@ -1613,6 +1656,11 @@ impl Theme {
             selection: Srgb::from_hex(0x7287fd).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0xdc8a78),
             edited: Srgb::from_hex(0xdf8e1d).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x319218).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x7bcfff).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xd10d38: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xff757a).alpha(PALETTE_DELETED_ALPHA),
 
             // Darkened from #d20f39 and #40a02b.
             danger: Srgb::from_hex(0xd10d38),
@@ -1657,6 +1705,11 @@ impl Theme {
             selection: Srgb::from_hex(0x4493f8).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x4493f8),
             edited: Srgb::from_hex(0xd29922).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x3fb950).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x1dacb4).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xfa534b: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xc00917).alpha(PALETTE_DELETED_ALPHA),
 
             // Lifted from #f85149, which falls under 4.5 on the glass chrome.
             danger: Srgb::from_hex(0xfa534b),
@@ -1695,6 +1748,11 @@ impl Theme {
             selection: Srgb::from_hex(0x0969da).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x0969da),
             edited: Srgb::from_hex(0x9a6700).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x1a7f37).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x358f96).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xd1242f: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xffb3ac).alpha(PALETTE_DELETED_ALPHA),
 
             danger: Srgb::from_hex(0xd1242f),
             success: Srgb::from_hex(0x1a7f37),
@@ -1734,6 +1792,12 @@ impl Theme {
             selection: Srgb::from_hex(0x7aa2f7).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0xc0caf5),
             edited: Srgb::from_hex(0xe0af68).alpha(PALETTE_EDITED_ALPHA),
+            // Moved in Oklch lightness from 0x9ece6a: text has to hold AAA over the wash.
+            added: Srgb::from_hex(0x8cbb57).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x1c77a3).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xf7768e: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xc64a65).alpha(PALETTE_DELETED_ALPHA),
 
             danger: Srgb::from_hex(0xf7768e),
             success: Srgb::from_hex(0x9ece6a),
@@ -1775,6 +1839,11 @@ impl Theme {
             selection: Srgb::from_hex(0x2e7de9).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x3760bf),
             edited: Srgb::from_hex(0x8c6c3e).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x587539).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x3c97bf).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xbb003a: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xee4861).alpha(PALETTE_DELETED_ALPHA),
 
             // Darkened from #f52a65.
             danger: Srgb::from_hex(0xbb003a),
@@ -1825,6 +1894,11 @@ impl Theme {
             selection: Srgb::from_hex(0xbd93f9).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0xf8f8f2),
             edited: Srgb::from_hex(0xf1fa8c).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x50fa7b).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x47a8ba).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xff7773: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xf16a67).alpha(PALETTE_DELETED_ALPHA),
 
             // Lifted from #ff5555.
             danger: Srgb::from_hex(0xff7773),
@@ -1865,6 +1939,9 @@ impl Theme {
             selection: Srgb::from_hex(0x644ac9).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x1f1f1f),
             edited: Srgb::from_hex(0x846e15).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x14710a).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x3b8fbd).alpha(PALETTE_UPDATED_ALPHA),
+            deleted: Srgb::from_hex(0xc33223).alpha(PALETTE_DELETED_ALPHA),
 
             // Darkened from #cb3a2a.
             danger: Srgb::from_hex(0xc33223),
@@ -1907,6 +1984,12 @@ impl Theme {
             selection: Srgb::from_hex(0x61afef).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x528bff),
             edited: Srgb::from_hex(0xe5c07b).alpha(PALETTE_EDITED_ALPHA),
+            // Moved in Oklch lightness from 0x98c379: text has to hold AAA over the wash.
+            added: Srgb::from_hex(0x8cb66d).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x047d89).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xe46f78: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xcf5c66).alpha(PALETTE_DELETED_ALPHA),
 
             // Lifted from #e06c75.
             danger: Srgb::from_hex(0xe46f78),
@@ -1937,16 +2020,23 @@ impl Theme {
             control: Srgb::from_hex(0xe5e5e6),
 
             // Darkened from #383a42, #696c77 and #a0a1a7; the editor's
-            // identifiers keep the first.
+            // identifiers keep the first. The faint ink was #909197, which
+            // is 3.01 over this page and so left no room for the wash of a
+            // deleted row under it; it is #84858b, 3.5.
             text: Srgb::from_hex(0x33353d),
             text_muted: Srgb::from_hex(0x5d606b),
-            text_faint: Srgb::from_hex(0x909197),
+            text_faint: Srgb::from_hex(0x84858b),
 
             accent: Srgb::from_hex(0x4078f2),
             on_accent: Srgb::from_hex(0xfafafa),
             selection: Srgb::from_hex(0x4078f2).alpha(PALETTE_SELECTION_ALPHA),
             cursor: Srgb::from_hex(0x526fff),
             edited: Srgb::from_hex(0xc18401).alpha(PALETTE_EDITED_ALPHA),
+            added: Srgb::from_hex(0x3b8c3b).alpha(PALETTE_ADDED_ALPHA),
+            updated: Srgb::from_hex(0x48b0ea).alpha(PALETTE_UPDATED_ALPHA),
+            // Moved in Oklch lightness from 0xc2352c: a deleted row's faint ink
+            // has to hold its floor over the wash.
+            deleted: Srgb::from_hex(0xff8172).alpha(PALETTE_DELETED_ALPHA),
 
             // Darkened from #e45649 and #50a14f.
             danger: Srgb::from_hex(0xc2352c),

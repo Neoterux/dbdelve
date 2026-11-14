@@ -23572,6 +23572,9 @@ fn an_updated_row_is_marked_on_the_gutter_and_unmarked_when_discarded(cx: &mut T
         assert!(cx.debug_bounds("row-updated-0").is_none());
 
         stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        // `stage` writes the delegate directly, as a commit does before it
+        // asks for the repaint.
+        grid.update(cx, |_, cx| cx.notify());
         settle(cx);
         assert!(cx.debug_bounds("row-updated-0").is_some());
         assert!(cx.debug_bounds("row-updated-1").is_none());
