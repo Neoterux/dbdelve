@@ -23825,6 +23825,59 @@ fn an_added_row_is_marked_on_the_gutter(cx: &mut TestAppContext) {
     });
 }
 
+/// A row marked for deletion reads as deleted on its gutter, and the palette
+/// names the gesture for what it does in a draft, an added row included.
+#[gpui::test]
+fn an_added_row_and_a_deleted_row_are_marked_on_the_gutter(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let has = |rows: &[String], label: &str| rows.iter().any(|row| row == label);
+
+        ring_on(&grid, cx, 1, 1);
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Mark row for deletion"), "{rows:?}");
+        assert!(!has(&rows, "Delete row…"), "{rows:?}");
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Mark row for deletion");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        grid.read_with(cx, |grid, _| assert!(grid.delegate().is_marked(1)));
+
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        assert!(cx.debug_bounds("row-deleted-1").is_some());
+        assert!(cx.debug_bounds("row-added-2").is_some());
+        assert!(cx.debug_bounds("row-deleted-0").is_none());
+
+        ring_on(&grid, cx, 2, 0);
+        let rows = palette_listing(&workspace, cx);
+        assert!(
+            has(&rows, "Mark row for deletion"),
+            "an added row can be removed from the palette: {rows:?}"
+        );
+
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        assert!(cx.debug_bounds("row-deleted-1").is_none());
+        assert!(cx.debug_bounds("row-added-2").is_none());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        ring_on(&grid, cx, 1, 1);
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Delete row…"), "{rows:?}");
+        assert!(!has(&rows, "Mark row for deletion"), "{rows:?}");
+        quit(workspace, cx);
+    });
+}
+
 /// A draft holding only an added row is a draft: the Apply and Discard
 /// controls, the palette and the status bar count it, and it can neither be
 /// switched away into Row mode nor read over by a requery unasked.
