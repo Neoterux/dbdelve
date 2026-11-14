@@ -22338,6 +22338,22 @@ fn a_row_changed_on_the_server_since_it_was_read_applies_nothing_and_is_named_in
             Some("kite"),
             "the other session's value stands"
         );
+
+        // A second Run reads the rows again, so it refuses again while they
+        // still differ, and the draft is still there for it to refuse.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
         quit(workspace, cx);
     });
 }
@@ -22419,6 +22435,18 @@ fn an_update_a_trigger_skipped_rolls_the_whole_draft_back_and_is_named(cx: &mut 
             assert_eq!(table.delegate().marked_count(), 1);
             assert_eq!(table.delegate().pending_count(), 2, "the mark and the edit");
         });
+
+        // The rollback left the server's rows as they were, so a second Run
+        // counts them again and refuses the same statement.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
         quit(workspace, cx);
     });
 }
