@@ -23011,6 +23011,112 @@ fn a_verified_row_send_reads_its_row_back_from_inside_the_transaction(cx: &mut T
     });
 }
 
+/// The New row form's `INSERT` is counted like any write of a verifying
+/// target: one a trigger skipped changed no row, and the review stays.
+#[gpui::test]
+fn a_new_row_whose_insert_a_trigger_skipped_is_refused_and_the_form_review_stays(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger skips before insert on birds \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        // What the first keystroke does to a field, which `set_value` does
+        // not raise an event for.
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Insert",
+                false,
+                Some("Nothing was applied. INSERT 1 (new row) affected 0 rows.".to_string())
+            )),
+            "the review stays and says what happened"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0")
+        );
+
+        // Without the trigger the same Run applies and the grid shows the row.
+        behind_the_grid("drop trigger skips");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 3)
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// A lone Delete row reads its row again before the `DELETE`: one another
+/// session already deleted is found gone and nothing runs.
+#[gpui::test]
+fn delete_row_over_a_row_deleted_on_the_server_applies_nothing_and_says_it_is_gone(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+
+        behind_the_grid("delete from birds where id = 2");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Delete row",
+                false,
+                Some("Nothing was applied. Row id = 2 is no longer on the server.".to_string())
+            )),
+            "the review stays and says the row is gone"
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn saving_twice_sends_one_update(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
