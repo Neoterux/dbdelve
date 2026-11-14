@@ -4058,9 +4058,19 @@ pub(crate) enum ApplyOutcome {
     /// The count is the server's own for that statement, and SQLite's
     /// `changes()` excludes what a trigger or a foreign key wrote, so a
     /// trigger's own writes never raise a count.
+    ///
+    /// MongoDB has no transaction to roll back. There, a `Miscounted` and a
+    /// `Failed` at [`ApplyStage::Write`] or [`ApplyStage::ReadBack`] mean the
+    /// steps before `step` (or, at a read-back, up to and including it) were
+    /// applied and none after it was sent; `Drifted` and a `Failed` at
+    /// [`ApplyStage::Begin`] or [`ApplyStage::Reread`] wrote nothing. It never
+    /// answers `Unknown`: there is no `COMMIT` to lose.
     Miscounted { step: usize, count: Option<u64> },
     /// The server refused something before `COMMIT`, or the apply refused to
     /// send: nothing the apply opened stayed applied.
+    ///
+    /// On MongoDB, which has no transaction to roll back, that is not so:
+    /// see [`ApplyOutcome::Miscounted`].
     Failed { stage: ApplyStage, error: DbError },
     /// `COMMIT` was sent and its answer did not come back: whether it landed
     /// is not known.
