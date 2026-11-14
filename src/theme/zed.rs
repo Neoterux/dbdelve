@@ -10,7 +10,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::color::{Oklch, Rgba, Srgb, contrast_ratio};
-use super::{Appearance, PALETTE_EDITED_ALPHA, PALETTE_SELECTION_ALPHA, Theme};
+use super::{
+    Appearance, PALETTE_ADDED_ALPHA, PALETTE_DELETED_ALPHA, PALETTE_EDITED_ALPHA,
+    PALETTE_SELECTION_ALPHA, PALETTE_UPDATED_ALPHA, ROW_WASH_FROM_SELECTION, ROW_WASHES_APART,
+    Theme,
+};
 use crate::store;
 
 /// Zed's defaults, from `assets/themes` in its repository.
@@ -286,6 +290,16 @@ fn convert(entry: Entry) -> Theme {
     let cursor = solid("/players/0/cursor");
     let accent = solid("/text.accent").or(cursor).unwrap_or(base.accent);
     let syntax = |name: &str| solid(&format!("/syntax/{name}/color"));
+    let selection =
+        rgba("/players/0/selection").map_or(base.selection, |c| see_through(c, surface));
+    let edited = solid("/warning").map_or(base.edited, |c| c.alpha(PALETTE_EDITED_ALPHA));
+    let [added, updated, deleted] = row_washes(
+        &base,
+        editor.unwrap_or(base.bg),
+        selection,
+        edited,
+        [solid("/created"), solid("/modified"), solid("/deleted")],
+    );
     Theme {
         name: Box::leak(entry.name.into_boxed_str()),
         is_glass: glass,
@@ -303,9 +317,12 @@ fn convert(entry: Entry) -> Theme {
         text_faint: solid("/text.placeholder").unwrap_or(base.text_faint),
         accent,
         on_accent: on_accent(text, surface, accent),
-        selection: rgba("/players/0/selection").map_or(base.selection, |c| see_through(c, surface)),
+        selection,
         cursor: cursor.unwrap_or(base.cursor),
-        edited: solid("/warning").map_or(base.edited, |c| c.alpha(PALETTE_EDITED_ALPHA)),
+        edited,
+        added,
+        updated,
+        deleted,
         danger: solid("/error").unwrap_or(base.danger),
         success: solid("/success")
             .or(solid("/created"))
@@ -320,6 +337,76 @@ fn convert(entry: Entry) -> Theme {
         syntax_operator: syntax("operator").unwrap_or(base.syntax_operator),
         ..base
     }
+}
+
+/// The added, updated and deleted washes of an import, from the colours it
+/// names for them (`None` where it names none, which takes `base`'s). Each is
+/// the colour at its palette alpha, kept legible as a state: an updated wash
+/// that lands within [`ROW_WASH_FROM_SELECTION`] of the selection, of the
+/// selection over it, or of the edited cell wash over it is moved off in
+/// lightness the way [`apart_from`] moves chrome (Zed's `modified` is its
+/// `warning`, the edited amber, and is sometimes the selection's own hue); and
+/// a wash within [`ROW_WASHES_APART`] of an earlier one, or that no move
+/// rescues, is `base`'s instead, since two states drawn alike are worse than
+/// a borrowed colour. `bg` is what the washes are flattened over.
+pub(super) fn row_washes(
+    base: &Theme,
+    bg: Srgb,
+    selection: Rgba,
+    edited: Rgba,
+    named: [Option<Srgb>; 3],
+) -> [Rgba; 3] {
+    let own = [base.added, base.updated, base.deleted];
+    let alphas = [
+        PALETTE_ADDED_ALPHA,
+        PALETTE_UPDATED_ALPHA,
+        PALETTE_DELETED_ALPHA,
+    ];
+    let clear_of_selection = |color: Srgb| {
+        let under = color.alpha(PALETTE_UPDATED_ALPHA).flatten(bg);
+        [
+            under.distance(selection.flatten(bg)),
+            selection.flatten(under).distance(under),
+            edited.flatten(under).distance(under),
+        ]
+        .into_iter()
+        .all(|step| step >= ROW_WASH_FROM_SELECTION)
+    };
+    let mut washes = own;
+    for (i, named) in named.into_iter().enumerate() {
+        let Some(color) = named else { continue };
+        let color = if i == 1 {
+            let own = Oklch::from_srgb(color);
+            // Away from the selection first: toward the side with room.
+            let away = if Oklch::from_srgb(selection.flatten(bg)).l > own.l {
+                -0.02
+            } else {
+                0.02
+            };
+            // The colour as named first: a round trip through Oklch would
+            // nudge one that needs no move.
+            std::iter::once(color)
+                .chain(
+                    (1..=20)
+                        .flat_map(|n| [away * n as f32, -away * n as f32])
+                        .map(|step| {
+                            Oklch::new((own.l + step).clamp(0.0, 1.0), own.c, own.h).to_srgb()
+                        }),
+                )
+                .find(|candidate| clear_of_selection(*candidate))
+        } else {
+            Some(color)
+        };
+        washes[i] = color
+            .map(|color| color.alpha(alphas[i]))
+            .filter(|wash| {
+                washes[..i].iter().all(|earlier| {
+                    wash.flatten(bg).distance(earlier.flatten(bg)) >= ROW_WASHES_APART
+                })
+            })
+            .unwrap_or(own[i]);
+    }
+    washes
 }
 
 /// `chrome`, unless it sits too close to `editor` to tell the two apart, as
@@ -593,7 +680,7 @@ mod tests {
                 { "name": "Bare", "style": {} },
                 { "name": "Crowded", "style": {
                     "created": "#2ecc71", "modified": "#0055aa", "deleted": "#ff4d4d",
-                    "players": [{ "selection": "#0055aa66" }]
+                    "players": [{ "selection": "#0055aa2e" }]
                 } }
             ] }"##,
         )

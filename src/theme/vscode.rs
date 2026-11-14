@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 
 use super::color::{Rgba, contrast_ratio};
 use super::zed::{
-    apart_from, hex, keep_untaken, on_accent, read_text, see_through, skipped, sorted_entries,
+    apart_from, hex, keep_untaken, on_accent, read_text, row_washes, see_through, skipped,
+    sorted_entries,
 };
 use super::{PALETTE_EDITED_ALPHA, Theme};
 use crate::store;
@@ -263,6 +264,24 @@ fn convert(name: String, light: bool, source: &Source) -> Theme {
         .filter(|rule| rule.get("scope").is_none())
         .find_map(|rule| hex(rule.pointer("/settings/foreground")?.as_str()?))
         .map_or(text, |c| c.flatten(backdrop));
+    let selection =
+        first(&["editor.selectionBackground"]).map_or(base.selection, |c| see_through(c, surface));
+    let edited =
+        solid(&["editorWarning.foreground"]).map_or(base.edited, |c| c.alpha(PALETTE_EDITED_ALPHA));
+    // Gruvbox colours a file it added in its plain foreground, which as a wash
+    // is a grey that says nothing: a git colour that is the text's is not taken.
+    let git = |key: &str| solid(&[key]).filter(|color| *color != text);
+    let [added, updated, deleted] = row_washes(
+        &base,
+        backdrop,
+        selection,
+        edited,
+        [
+            git("gitDecoration.addedResourceForeground"),
+            git("gitDecoration.modifiedResourceForeground"),
+            git("gitDecoration.deletedResourceForeground"),
+        ],
+    );
     // ponytail: leaked, but themes load once per process so it is bounded.
     let name: &'static str = Box::leak(name.into_boxed_str());
     Theme {
@@ -315,11 +334,12 @@ fn convert(name: String, light: bool, source: &Source) -> Theme {
         text_faint: solid(&["editorLineNumber.foreground"]).unwrap_or(base.text_faint),
         accent,
         on_accent: on_accent(text, surface, accent),
-        selection: first(&["editor.selectionBackground"])
-            .map_or(base.selection, |c| see_through(c, surface)),
+        selection,
         cursor: solid(&["editorCursor.foreground"]).unwrap_or(text),
-        edited: solid(&["editorWarning.foreground"])
-            .map_or(base.edited, |c| c.alpha(PALETTE_EDITED_ALPHA)),
+        edited,
+        added,
+        updated,
+        deleted,
         danger: solid(&["errorForeground", "editorError.foreground"]).unwrap_or(base.danger),
         // Gruvbox's added-file colour is its plain foreground.
         success: solid(&[

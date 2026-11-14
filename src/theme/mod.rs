@@ -706,6 +706,18 @@ const PALETTE_ADDED_ALPHA: f32 = 0.18;
 const PALETTE_UPDATED_ALPHA: f32 = 0.18;
 const PALETTE_DELETED_ALPHA: f32 = 0.18;
 
+/// How far, in 0-255 levels (`Srgb::distance`), an updated row has to stand
+/// from a selected one, from the same row selected, and from the amber cell
+/// wash inside it. The weakest pair that still reads as a different state at a
+/// glance, set as the titlebar pill's floor is. The importers move or drop a
+/// colour that lands inside it, and the theme tests hold every theme to it.
+pub(super) const ROW_WASH_FROM_SELECTION: f32 = 20.0;
+
+/// How far apart an added, an updated and a deleted row have to be: the
+/// project's "seen at all" floor, since the gutter mark and the struck text
+/// carry the state where a wash alone is faint.
+pub(super) const ROW_WASHES_APART: f32 = 8.0;
+
 /// Set from the light theme, where chrome is near-white and a tint over it is
 /// at its weakest: 0.22 is the lowest that still steps the pill clear of the
 /// 8-level floor a plane has to clear to be seen at all.
@@ -989,7 +1001,15 @@ impl Theme {
             self.data_glass().flatten(chrome),
         ];
         let washed = planes.into_iter().flat_map(|plane| {
-            [self.selection, self.edited, self.element_active].map(|wash| wash.flatten(plane))
+            [
+                self.selection,
+                self.edited,
+                self.added,
+                self.updated,
+                self.deleted,
+                self.element_active,
+            ]
+            .map(|wash| wash.flatten(plane))
         });
         let luminance = |c: &Srgb| c.relative_luminance();
         let fills = planes.into_iter().chain(washed).chain([self.control]);
