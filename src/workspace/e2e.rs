@@ -23666,9 +23666,61 @@ fn a_cell_being_typed_in_is_kept_when_its_row_is_clicked_away_from_in_row_mode(
 }
 
 #[gpui::test]
-fn a_cell_being_typed_in_is_dropped_when_its_row_is_clicked_away_from_in_draft_mode(
+fn a_cell_being_typed_in_is_kept_as_a_staged_edit_when_its_row_is_clicked_away_from_in_draft_mode(
     cx: &mut TestAppContext,
 ) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+        // Tab commits the name and opens the next cell, the path UAT walked.
+        press(cx, "tab");
+        cx.simulate_input("7");
+        settle(cx);
+
+        click_cell_of_row(cx, 1);
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
+        assert_eq!(pending_of(&grid, cx), 2, "both typed cells are kept");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("robin".into()))
+            );
+            assert_eq!(
+                table.delegate().pending_value(0, 2),
+                Some(&NewValue::Value("7".into()))
+            );
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "kept, and nothing is sent"
+        );
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("1")
+        );
+        assert!(history_sql(&workspace, cx).is_empty());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_being_typed_in_is_kept_when_another_cell_of_its_row_is_clicked_in_draft_mode(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+    use gpui_component::table::TableDelegate;
+
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
         let id = open_own_table(&workspace, cx, "birds");
@@ -23681,13 +23733,157 @@ fn a_cell_being_typed_in_is_dropped_when_its_row_is_clicked_away_from_in_draft_m
         cx.simulate_input("robin");
         settle(cx);
 
-        click_cell_of_row(cx, 1);
-        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(1));
-        assert_eq!(pending_of(&grid, cx), 0, "Draft stages nothing");
+        click_cell_of_row(cx, 0);
+        assert_eq!(pending_of(&grid, cx), 1, "a same-row click keeps the text");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("robin".into()))
+            );
+        });
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren")
         );
+
+        // A column move, as a header click makes it, closes an input too.
+        ring_on(&grid, cx, 0, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("9");
+        settle(cx);
+        grid.update(cx, |table, cx| {
+            let col = table.delegate().table_col(1).expect("the name column");
+            table.set_selected_col(col, cx);
+        });
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 2),
+                Some(&NewValue::Value("9".into()))
+            );
+        });
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("1")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_being_typed_in_is_kept_when_another_cell_of_its_row_is_clicked_in_row_mode_and_sent_when_the_row_is_left(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+
+        click_cell_of_row(cx, 0);
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "the row was not left"
+        );
+        assert!(history_sql(&workspace, cx).is_empty());
+
+        click_cell_of_row(cx, 1);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_cell_being_typed_in_a_query_tabs_grid_is_kept_when_its_row_is_clicked_away_from(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+
+        click_cell_of_row(cx, 1);
+        assert_eq!(pending_of(&grid, cx), 1);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("robin".into()))
+            );
+        });
+        assert!(!buffer(&workspace, cx).contains("UPDATE"));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_added_rows_cell_closed_by_a_click_is_staged_only_when_typed_in(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        stage(&grid, cx, 2, 0, NewValue::Value("3".into()));
+
+        ring_on(&grid, cx, 2, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        click_cell_of_row(cx, 0);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_value(2, 1), None);
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        let sql = front_review_sql(&workspace, cx).expect("the draft is in review");
+        assert!(
+            !sql.contains("''"),
+            "an untouched cell is not written: {sql}"
+        );
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        settle(cx);
+
+        ring_on(&grid, cx, 2, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("robin");
+        settle(cx);
+        click_cell_of_row(cx, 0);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(2, 1),
+                Some(&NewValue::Value("robin".into()))
+            );
+        });
         quit(workspace, cx);
     });
 }
