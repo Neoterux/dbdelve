@@ -2193,6 +2193,16 @@ pub(crate) fn update_batch(rows: &[PendingRow]) -> Result<String, String> {
     Ok(statements.join("\n"))
 }
 
+/// RED stub: the writer is not written yet.
+#[cfg(test)]
+pub(crate) fn draft_batch(
+    _deletes: &[crate::sql::DraftDelete],
+    _updates: &[PendingRow],
+    _inserts: &[crate::sql::DraftInsert],
+) -> Result<String, String> {
+    Err("not implemented".into())
+}
+
 /// One `insertOne` of the fields the form filled. A field left empty is left
 /// out of the document rather than written as a null; a null is the field's
 /// null toggle. A field's sampled type decides how its text reads when the
@@ -4835,6 +4845,189 @@ mod tests {
         assert!(delete_row("c", &[], &[]).is_err());
     }
 
+    fn draft_delete(id: &str) -> crate::sql::DraftDelete {
+        crate::sql::DraftDelete {
+            schema: "dbdelve_dev".into(),
+            table: "accounts".into(),
+            keys: vec![("_id".into(), id.into())],
+            null_keys: Vec::new(),
+            types: vec![("_id".into(), "objectId".into())],
+        }
+    }
+
+    fn draft_insert(columns: &[(&str, Option<&str>)]) -> crate::sql::DraftInsert {
+        crate::sql::DraftInsert {
+            schema: "dbdelve_dev".into(),
+            table: "accounts".into(),
+            columns: columns
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), value.map(str::to_owned)))
+                .collect(),
+            types: vec![
+                ("name".into(), "string".into()),
+                ("seats".into(), "int".into()),
+            ],
+        }
+    }
+
+    fn draft_update(id: &str, name: &str) -> PendingRow {
+        edited(
+            &[("name", typed_text(name))],
+            id,
+            &[("_id", "objectId"), ("name", "string")],
+        )
+    }
+
+    fn oid(n: u8) -> String {
+        format!("ObjectId('65a4f1c0ffffffffffffff{n:02x}')")
+    }
+
+    fn methods_of(batch: &str) -> Vec<Method> {
+        parse(batch)
+            .unwrap_or_else(|e| panic!("{batch}: {e:?}"))
+            .iter()
+            .map(|statement| match &statement.target {
+                Target::Collection { call, .. } => call.method,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mongo_draft_is_written_deletes_then_updates_then_inserts() {
+        let deletes = [draft_delete(&oid(1)), draft_delete(&oid(2))];
+        let updates = [draft_update(&oid(3), "Ada"), draft_update(&oid(4), "Bo")];
+        let inserts = [
+            draft_insert(&[("name", Some("Cy")), ("seats", Some("3"))]),
+            draft_insert(&[("name", Some("Di"))]),
+        ];
+        let batch = draft_batch(&deletes, &updates, &inserts).unwrap();
+        assert_eq!(
+            methods_of(&batch),
+            [
+                Method::DeleteOne,
+                Method::DeleteOne,
+                Method::UpdateOne,
+                Method::UpdateOne,
+                Method::InsertOne,
+                Method::InsertOne,
+            ]
+        );
+        let lines: Vec<&str> = batch.lines().collect();
+        assert_eq!(lines.len(), 6, "{batch}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.ends_with(';') && !line.ends_with(";;"))
+        );
+        // Each group keeps the order it was given.
+        let key = |n| delete_row("accounts", &[("_id", &oid(n))], &deletes[0].types).unwrap();
+        assert_eq!(lines[0], format!("{};", key(1)));
+        assert_eq!(lines[1], format!("{};", key(2)));
+        assert!(lines[2].contains(&format!(
+            "_id: ObjectId(\"65a4f1c0ffffffffffffff{:02x}\")",
+            3
+        )));
+        assert!(lines[3].contains(&format!(
+            "_id: ObjectId(\"65a4f1c0ffffffffffffff{:02x}\")",
+            4
+        )));
+        assert!(lines[4].contains(r#""name": "Cy""#), "{}", lines[4]);
+        assert!(lines[5].contains(r#""name": "Di""#), "{}", lines[5]);
+
+        assert_eq!(
+            draft_batch(&[], &[], &[]),
+            Err("There are no edits to apply.".to_owned())
+        );
+        let one = draft_batch(&deletes[..1], &[], &[]).unwrap();
+        assert_eq!(one, format!("{};", key(1)));
+        let mut unnamed = draft_delete(&oid(1));
+        unnamed.null_keys = vec!["_id".into()];
+        assert_eq!(
+            draft_batch(&[unnamed], &[], &[]),
+            Err("dbdelve cannot name an edited row by its primary key.".to_owned())
+        );
+        assert!(draft_batch(&[], &[], &[draft_insert(&[("name", Some(""))])]).is_err());
+    }
+
+    #[test]
+    fn a_mixed_mongo_draft_is_admitted_and_every_widened_shape_refused() {
+        let delete = || vec![draft_delete(&oid(1))];
+        let update = || vec![draft_update(&oid(3), "Ada")];
+        let insert = || vec![draft_insert(&[("name", Some("Cy"))])];
+        let shapes: [(&str, Vec<_>, Vec<_>, Vec<_>); 5] = [
+            ("delete update insert", delete(), update(), insert()),
+            (
+                "delete delete",
+                vec![draft_delete(&oid(1)), draft_delete(&oid(2))],
+                vec![],
+                vec![],
+            ),
+            (
+                "insert insert",
+                vec![],
+                vec![],
+                vec![
+                    draft_insert(&[("name", Some("a"))]),
+                    draft_insert(&[("name", Some("b"))]),
+                ],
+            ),
+            ("update insert", vec![], update(), insert()),
+            ("delete insert", delete(), vec![], insert()),
+        ];
+        for (case, deletes, updates, inserts) in shapes {
+            let batch = draft_batch(&deletes, &updates, &inserts).unwrap();
+            assert!(is_generated_write(&batch), "{case}: {batch}");
+        }
+        for single in [
+            r#"db.c.insertOne({a: 1})"#,
+            "db.c.insertMany([{a: 1}])",
+            r#"db.c.deleteOne({_id: 1})"#,
+            r#"db.c.updateOne({_id: 1}, {$set: {a: 1}})"#,
+        ] {
+            assert!(is_generated_write(single), "{single}");
+        }
+
+        let c = r#"db.getCollection("accounts")"#;
+        for refused in [
+            // Out of order: the draft writes deletes, then updates, then inserts.
+            "{c}.insertOne({a: 1});\n{c}.deleteOne({_id: 1});",
+            "{c}.updateOne({_id: 1}, {$set: {a: 1}});\n{c}.deleteOne({_id: 2});",
+            "{c}.insertOne({a: 1});\n{c}.updateOne({_id: 1}, {$set: {a: 1}});",
+            // Methods that can reach more than one document, or replace one.
+            "{c}.deleteOne({_id: 1});\n{c}.deleteMany({});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateMany({_id: 1}, {$set: {a: 1}});",
+            "{c}.deleteOne({_id: 1});\n{c}.replaceOne({_id: 2}, {a: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.findOneAndDelete({_id: 2});",
+            "{c}.deleteOne({_id: 1});\n{c}.insertMany([{a: 1}]);",
+            // A filter that is not exactly `{_id: <literal>}`.
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({_id: 2, a: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({a: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({});",
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({_id: {$ne: 1}});",
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({_id: /./});",
+            "{c}.deleteOne({_id: 1});\n{c}.deleteOne({_id: 2}, {collation: {}});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateOne({a: 1}, {$set: {a: 1}});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateOne({_id: 2}, {$set: {a: 1}}, {upsert: true});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateOne({_id: 2}, {$unset: {a: 1}});",
+            // One collection of the connected database, and nothing chained.
+            "{c}.deleteOne({_id: 1});\ndb.getCollection(\"other\").deleteOne({_id: 2});",
+            "{c}.deleteOne({_id: 1});\ndb.getSiblingDB(\"x\").accounts.deleteOne({_id: 2});",
+            "{c}.find({}).limit(1);\n{c}.deleteOne({_id: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.find({});",
+            "{c}.deleteOne({_id: 1});\ndb.dropDatabase();",
+            // An operator riding in a value.
+            "{c}.deleteOne({_id: 1});\n{c}.insertOne({\"$where\": \"1\"});",
+            "{c}.deleteOne({_id: 1});\n{c}.insertOne({a: {\"$set\": {b: 1}}});",
+            "{c}.deleteOne({_id: 1});\n{c}.insertOne({});",
+            "{c}.deleteOne({_id: 1});\n{c}.insertOne({a: 1}, {writeConcern: {w: 0}});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateOne({_id: 2}, {$set: {a: {$where: \"1\"}}});",
+        ] {
+            let refused = refused.replace("{c}", c);
+            assert!(!is_generated_write(&refused), "{refused} passed the gate");
+        }
+    }
+
     #[test]
     fn the_write_gate_admits_the_four_generated_shapes_and_nothing_else() {
         for admitted in [
@@ -4883,10 +5076,9 @@ mod tests {
             "db.c.replaceOne({_id: 1}, {a: 1})",
             "db.c.updateOne({_id: 1}, {$set: {a: 1}}); db.d.updateOne({_id: 1}, {$set: {a: 1}})",
             "db.getSiblingDB('admin').c.updateOne({_id: 1}, {$set: {a: 1}})",
-            "db.c.insertOne({a: 1}); db.c.insertOne({a: 2})",
+            // Two inserts or two deletes are a draft, admitted in `a_mixed_mongo_draft_is_admitted_and_every_widened_shape_refused`.
             "db.c.insertOne({})",
             "db.c.insertOne({a: 1}, {writeConcern: {w: 0}})",
-            "db.c.deleteOne({_id: 1}); db.c.deleteOne({_id: 2})",
             "db.c.deleteOne({_id: 1}); db.c.drop()",
             "db.c.updateOne({_id: 1}, {$set: {a: 1}}); db.c.drop()",
             "db.c.updateOne({_id: 1}, {$set: {a: 1}}); db.c.deleteOne({_id: 1})",
