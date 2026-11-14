@@ -4638,6 +4638,17 @@ mod tests {
     }
 
     #[test]
+    fn only_mysql_mariadb_and_sqlite_keep_a_failed_transaction_open() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                engine.keeps_failed_transaction_open(),
+                matches!(engine, Engine::MySql | Engine::MariaDb | Engine::Sqlite),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
     fn placeholders_are_filled_in_one_pass() {
         assert_eq!(
             fill_placeholders("{schema}.{relation} {x}", "'{relation}'", "'a''b'"),

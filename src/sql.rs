@@ -8333,6 +8333,60 @@ mod tests {
     }
 
     #[test]
+    fn the_key_check_of_a_draft_reads_kinds_and_table_from_the_tree() {
+        for engine in [Engine::Sqlite, Engine::Postgres, Engine::SqlServer] {
+            let update = pending_row(&[("Name", set("x"))], &[("id", "8")]);
+            let batch =
+                |deletes: &[DraftDelete], updates: &[PendingRow], inserts: &[DraftInsert]| {
+                    draft_batch(engine, deletes, updates, inserts, true).unwrap()
+                };
+            let key = |keys: &[&str], batch: &str| {
+                draft_deletes_match(engine, batch, keys, "public", "accounts")
+            };
+
+            let two = batch(
+                &[draft_delete("1"), draft_delete("2")],
+                std::slice::from_ref(&update),
+                &[draft_insert("9", None)],
+            );
+            assert_eq!(key(&["id"], &two), Some(2), "{engine:?}: {two}");
+            assert_eq!(key(&["Region", "id"], &two), None, "half a key: {two}");
+            assert_eq!(key(&["Region"], &two), None, "{two}");
+
+            let elsewhere = DraftDelete {
+                table: "other".into(),
+                ..draft_delete("3")
+            };
+            let other = batch(&[draft_delete("1"), elsewhere], &[], &[]);
+            assert_eq!(key(&["id"], &other), None, "{engine:?}: {other}");
+
+            let none = batch(
+                &[],
+                std::slice::from_ref(&update),
+                &[draft_insert("9", None)],
+            );
+            assert_eq!(key(&["id"], &none), Some(0), "{engine:?}: {none}");
+            assert_eq!(key(&["id"], "DELETE FROM WHERE (((;"), None);
+            assert_eq!(key(&["id"], ""), None);
+            // A delete whose predicate is not a one-row key is no delete to count.
+            let (table, id) = (
+                engine.qualified("public", "accounts"),
+                engine.quote_identifier("id"),
+            );
+            let wide = format!(
+                "DELETE FROM {table} WHERE {id} = '1';\nDELETE FROM {table} WHERE {id} = '1' OR 1 = 1;"
+            );
+            assert_eq!(key(&["id"], &wide), None, "{engine:?}: {wide}");
+        }
+        for engine in [Engine::MongoDb, Engine::Redis] {
+            assert_eq!(
+                draft_deletes_match(engine, "db.t.deleteOne({_id: 1})", &["_id"], "d", "t"),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn a_nulled_cell_reaches_the_batch_as_the_keyword() {
         let rows = vec![pending_row(&[("name", NewValue::Null)], &[("id", "1")])];
         assert_eq!(
