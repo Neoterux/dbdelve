@@ -24,6 +24,14 @@ impl Workspace {
         self.pending_edit_count(cx) > 0
     }
 
+    /// Whether the draft in front holds a row added in the grid, so its size
+    /// is a count of changes and not of edited cells.
+    pub(crate) fn draft_holds_rows(&self, cx: &App) -> bool {
+        self.profile()
+            .and_then(|profile| profile.session.active_results())
+            .is_some_and(|results| results.read(cx).delegate().holds_rows())
+    }
+
     pub(crate) fn pending_edit_count(&self, cx: &App) -> usize {
         self.profile()
             .and_then(|profile| profile.session.active_results())

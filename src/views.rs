@@ -2255,7 +2255,8 @@ fn render_row_inspector(
             .collect();
         (
             row_ix,
-            delegate.rows_count(cx),
+            // Rows of the result: an added row is no part of the count.
+            delegate.fetched_rows(),
             delegate.fields(row_ix),
             delegate.active(),
             delegate.row_editable(row_ix),
@@ -2372,11 +2373,16 @@ fn render_row_inspector(
                         div()
                             .text_size(px(layout::chrome(layout::TEXT_SM)))
                             .text_color(t.text_muted)
-                            .child(format!(
-                                "Row {} of {}",
-                                group_thousands(row_ix as u64 + 1),
-                                group_thousands(rows as u64)
-                            )),
+                            // A row added in the grid is past the rows the
+                            // result has, and "3 of 2" would read as a bug.
+                            .child(match row_ix < rows {
+                                true => format!(
+                                    "Row {} of {}",
+                                    group_thousands(row_ix as u64 + 1),
+                                    group_thousands(rows as u64)
+                                ),
+                                false => "New row".to_string(),
+                            }),
                     )
                     .child(
                         div()
@@ -2987,7 +2993,7 @@ pub(crate) fn render_running(
     let (rows, streaming, filled) = results.map_or((0, false, None), |results| {
         let grid = results.read(cx).delegate();
         (
-            grid.rows_count(cx),
+            grid.fetched_rows(),
             grid.streamed_set().is_some(),
             grid.filled(),
         )

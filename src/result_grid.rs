@@ -1758,7 +1758,12 @@ impl ResultGrid {
             return None;
         }
         if self.copies_rows() {
-            let rows: Vec<usize> = self.selected_rows.iter().copied().collect();
+            let rows: Vec<usize> = self
+                .selected_rows
+                .iter()
+                .copied()
+                .filter(|&row| row < self.fetched_rows())
+                .collect();
             let result = self.rows_of(&rows)?;
             let text = export::render(export::Format::Tsv, &result);
             return Some(copied_rows(text, &result));
@@ -1790,14 +1795,17 @@ impl ResultGrid {
         })
     }
 
-    /// The rows "Copy Rows As" and the row-number gutter's own highlight agree
-    /// on: every row the user has selected there, in order, or the active
-    /// cell's row alone when nothing has been.
+    /// The rows "Copy Rows As" works on: every row the user has selected in
+    /// the gutter, in order, or the active cell's row alone when nothing has
+    /// been. An added row is left out, being no row of the result.
     pub fn selected_row_indices(&self) -> Vec<usize> {
-        if self.row_selection_anchor.is_some() {
-            return self.selected_rows.iter().copied().collect();
-        }
-        self.active.map(|(row, _)| vec![row]).unwrap_or_default()
+        let rows: Vec<usize> = match self.row_selection_anchor.is_some() {
+            true => self.selected_rows.iter().copied().collect(),
+            false => self.active.map(|(row, _)| row).into_iter().collect(),
+        };
+        rows.into_iter()
+            .filter(|&row| row < self.fetched_rows())
+            .collect()
     }
 
     /// The whole value behind the active cell, which is what `cmd+c` copies —
@@ -2267,6 +2275,12 @@ impl ResultGrid {
         !self.pending.is_empty() || !self.added.is_empty()
     }
 
+    /// Whether the draft holds a change that is no staged cell: a row added
+    /// (a mark for deletion will count too). What wording that says "edits"
+    /// for cells alone asks, to say "changes" instead.
+    pub fn holds_rows(&self) -> bool {
+        !self.added.is_empty()
+    }
     /// The size of the draft: the cells staged on fetched rows and the rows
     /// added, each counted once.
     pub fn pending_count(&self) -> usize {
