@@ -5233,6 +5233,66 @@ mod tests {
     }
 
     #[test]
+    fn a_joined_sequence_of_several_steps_is_refused_before_anything_is_sent() {
+        let run = |steps: &[VerifiedStep]| {
+            let sent = std::cell::RefCell::new(Vec::<String>::new());
+            let mut send = |sql: &str, _: Sending| {
+                sent.borrow_mut().push(sql.to_string());
+                Ok(match sql.starts_with("SELECT") {
+                    true => reread(&["id"], &[&[Some("1")]]),
+                    false => QueryResult {
+                        rows_affected: Some(1),
+                        ..QueryResult::default()
+                    },
+                })
+            };
+            let outcome = run_verified(
+                Engine::Postgres,
+                steps,
+                Bracket::Joined,
+                &mut send,
+                &|| true,
+                &|_| false,
+                &|_| false,
+            );
+            (outcome, sent.into_inner())
+        };
+
+        let (outcome, sent) = run(&[update_step(), update_step()]);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Begin,
+                error: plain_error(
+                    "A transaction is open on this connection; the draft was not applied.".into()
+                ),
+            }
+        );
+        assert_eq!(
+            sent,
+            Vec::<String>::new(),
+            "not even a read went to the user's session"
+        );
+
+        let (outcome, sent) = run(&[update_step()]);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: None
+            }
+        );
+        assert_eq!(
+            sent,
+            [
+                r#"SELECT * FROM "public"."t" WHERE "id" = '1'"#,
+                r#"UPDATE "public"."t" SET "a" = 'x' WHERE "id" = '1'"#
+            ],
+            "one step runs with no BEGIN, COMMIT or ROLLBACK"
+        );
+    }
+
+    #[test]
     fn a_lost_session_at_commit_is_an_unknown_outcome_and_before_it_is_not_applied() {
         // Answers every statement but `failing`, which gets the error.
         let run = |failing: &str, lost: bool| {

@@ -20025,6 +20025,255 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
     });
 }
 
+/// What a draft of more than one statement is refused with inside a
+/// transaction the user opened, at review and at Run alike.
+const DRAFT_IN_TRANSACTION: &str =
+    "A transaction is open on this connection; the draft was not applied.";
+
+/// Whether the profile in front holds the user's open transaction.
+fn in_transaction(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().in_transaction
+    })
+}
+
+#[gpui::test]
+fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // One cell and an added row are two statements.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        add_bird(&grid, cx, "3", "robin");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+
+        // Two cells are two statements.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(in_transaction(&workspace, cx));
+
+        // Once the transaction has ended the same draft applies under its own
+        // bracket.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(pending_of(&grid, cx), 2, "still staged");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("BEGIN;"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+
+        // One statement joins the transaction the user opens next: no bracket,
+        // shown uncommitted.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is still open"
+        );
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch"),
+            "a second connection does not see it"
+        );
+        assert!(
+            open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.starts_with("UPDATE")),
+            "the write is listed with the transaction it joined"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_batch_reviewed_before_a_transaction_opened_is_refused_at_run(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        // A transaction opens in the same connection after the review was
+        // written, so its bracket would end the user's.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, Some(DRAFT_IN_TRANSACTION.into())))
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent"
+        );
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(
+            on_disk("select count(*) from birds where name in ('wren', 'tit')").as_deref(),
+            Some("2")
+        );
+
+        // The transaction is gone, and the same Run applies under its bracket.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_multi_row_edit_is_refused_inside_the_users_open_transaction_and_kept(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        grid.update(cx, |grid, _| {
+            for (row, name) in [(0, "robin"), (1, "jay")] {
+                assert!(grid.delegate_mut().set_pending(
+                    row,
+                    1,
+                    crate::result_grid::NewValue::Value(name.into())
+                ));
+            }
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent"
+        );
+        assert!(
+            transaction_state(&workspace, cx).1,
+            "the user's transaction is open"
+        );
+
+        run_in_front(&workspace, cx, "ROLLBACK");
+        assert_eq!(
+            on_disk("select count(*) from birds where name in ('wren', 'tit')").as_deref(),
+            Some("2")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_joined_write_that_counts_no_row_wrote_nothing_and_leaves_the_transaction_open(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 1, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 1 (row id = 2) affected 0 rows.")
+        );
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is still open"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft keeps its edit");
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("tit")
+        );
+        quit(workspace, cx);
+    });
+}
+
 /// What `PRAGMA cache_size` reads on `connection`, which a startup script can
 /// set and a fresh session never has.
 fn cache_size(connection: &crate::db::Connection) -> Option<String> {
