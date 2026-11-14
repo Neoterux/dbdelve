@@ -7005,6 +7005,61 @@ mod tests {
     }
 
     #[test]
+    fn an_added_row_sits_after_the_fetched_rows_and_stays_last_through_a_memory_sort() {
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("1".into()), Some("b".into())],
+                    vec![Some("2".into()), Some("c".into())],
+                    vec![Some("3".into()), Some("a".into())],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "notes".into(),
+                    columns: vec![Some("id".into()), Some("note".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert_eq!(grid.add_row(), Some(3));
+        assert!(grid.set_pending(3, 1, NewValue::Value("zz".into())));
+
+        grid.sort_in_memory(vec![(1, false)]);
+
+        assert_eq!(
+            grid.cell(0, 1),
+            Some("c"),
+            "the fetched rows were reordered"
+        );
+        assert_eq!(grid.cell(2, 1), Some("a"));
+        assert_eq!(grid.fetched_rows() + grid.added_count(), 4);
+        assert_eq!(grid.cell(3, 1), None, "never a fetched value");
+        assert_eq!(
+            grid.pending_value(3, 1),
+            Some(&NewValue::Value("zz".into())),
+            "the added row is still last, with its cell"
+        );
+
+        // Rows 0 and 3 selected: the added one is no row of the result, so
+        // neither the copy nor the label counts it.
+        grid.click_row(0, false, false);
+        grid.click_row(3, false, true);
+        assert_eq!(grid.selected_row_indices(), vec![0]);
+        let copied = grid
+            .rows_of(&grid.selected_row_indices())
+            .expect("a fetched row is selected");
+        assert_eq!(copied.rows.len(), 1);
+
+        grid.click_row(3, false, false);
+        assert!(grid.selected_row_indices().is_empty());
+        assert!(grid.copy().is_none(), "an added row alone copies nothing");
+    }
+
+    #[test]
     fn the_gutter_is_wide_enough_for_an_added_rows_number() {
         let mut grid = editable_grid();
         let narrow = grid.gutter_width();

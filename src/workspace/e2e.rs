@@ -23654,6 +23654,136 @@ fn an_added_row_is_marked_on_the_gutter(cx: &mut TestAppContext) {
     });
 }
 
+/// A draft holding only an added row is a draft: the Apply and Discard
+/// controls, the palette and the status bar count it, and it can neither be
+/// switched away into Row mode nor read over by a requery unasked.
+#[gpui::test]
+fn a_draft_holding_only_an_added_row_shows_apply_and_cannot_switch_to_row_mode(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        result_grid::NewValue,
+        session::{AfterEdits, EditMode},
+    };
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        stage(&grid, cx, 2, 1, NewValue::Value("robin".into()));
+        grid.update(cx, |_, cx| cx.notify());
+        settle(cx);
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.pending_edit_count(cx), 1);
+            assert!(workspace.has_pending_edits(cx));
+        });
+        assert_eq!(drawn(cx, &["apply-edits", "discard-edits"]), [true, true]);
+        assert!(
+            status_bar_lines(cx)
+                .iter()
+                .any(|line| line == "1 pending change"),
+            "{:?}",
+            status_bar_lines(cx)
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The draft has 1 change, so the view was not switched to Row mode.")
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Refresh)
+        ));
+        assert_eq!(front_review(&workspace, cx), None);
+        workspace.update(cx, |workspace, cx| {
+            workspace.cancel_discard_close(cx);
+        });
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().added_count(), 1, "Cancel keeps the row");
+            assert_eq!(table.delegate().fetched_rows(), 2);
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// `NewRow` as the workspace answers it, without the focus the action needs
+/// to be dispatched.
+fn new_row_directly(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.new_row(&crate::actions::NewRow, window, cx)
+    });
+}
+
+/// `NewRow` waits for the rows to arrive, and for an open review to close:
+/// a row added under either would not be the row the user is shown.
+#[gpui::test]
+fn new_row_is_refused_while_the_rows_load_or_a_review_holds_the_draft(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx).map(|(title, ..)| title),
+            Some("Apply edits")
+        );
+
+        // Called rather than dispatched: with the review's dialog up, the
+        // action would have no focused element to reach, and a refusal this
+        // test means to pin would be a dispatch that never happened.
+        new_row_directly(&workspace, cx);
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().added_count(),
+                0,
+                "a review holds the draft"
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().session.insert_form.is_none());
+        });
+
+        // Closed and discarded, so the re-read asks nothing.
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_apply_review(cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.discard_edits(&crate::actions::DiscardEdits, window, cx)
+        });
+        settle(cx);
+        assert_eq!(pending_of(&grid, cx), 0);
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        assert_eq!(state_kind(&workspace, cx), "running");
+
+        new_row_directly(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().added_count(), 0, "the rows are loading");
+        });
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The rows are still being read, so no row was added.")
+        );
+        settle(cx);
+        quit(workspace, cx);
+    });
+}
+
 /// The statements the review in the session shows.
 fn front_review_sql(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
     workspace.read_with(cx, |workspace, _| {
