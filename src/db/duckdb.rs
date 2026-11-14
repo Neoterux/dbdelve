@@ -37,10 +37,10 @@ use num_bigint::BigUint;
 use crate::sql::Projected;
 
 use super::{
-    Catalog, Column, Databases, DbError, EditTarget, Engine, Fetch, QueryResult, Reference,
-    RowBuilder, Stopped, Structure, Unpicked, assemble_catalog, assemble_foreign_keys,
-    assemble_references, assemble_sequences, assemble_structure, plain_error, required_cell,
-    terminated,
+    ApplyOutcome, ApplyStage, Bracket, Catalog, Column, Databases, DbError, EditTarget, Engine,
+    Fetch, QueryResult, Reference, RowBuilder, Sending, Stopped, Structure, Unpicked, VerifiedStep,
+    assemble_catalog, assemble_foreign_keys, assemble_references, assemble_sequences,
+    assemble_structure, plain_error, required_cell, terminated,
 };
 
 // Workaround for duckdb-rs#920, fixed upstream by #923 but unreleased past
@@ -479,6 +479,55 @@ impl Connection {
             result.edit = edit_target(&connection, sql, &result.columns);
         }
         Ok(result)
+    }
+
+    /// Applies `steps` as one verified sequence on this session, under one
+    /// acquisition of its lock, so no other statement runs between the
+    /// re-reads and the writes: see [`super::run_verified`]. `bound` is the
+    /// schema to put the session back on first, as [`Self::submit`] does. A
+    /// count is the `Count` column DuckDB answers a write with, the rows the
+    /// statement matched, and a write-write conflict surfaces at the statement
+    /// that met it, so it is a failure at that write. The statement timeout is
+    /// armed once for the sequence. `proceed` says no once a Cancel has come.
+    pub fn apply_verified(
+        &self,
+        bound: Option<Option<&str>>,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        proceed: &dyn Fn() -> bool,
+    ) -> ApplyOutcome {
+        let _deadline = self.deadline();
+        let failed = |error| ApplyOutcome::Failed {
+            stage: ApplyStage::Begin,
+            error,
+        };
+        let connection = match lock(&self.connection) {
+            Ok(connection) => connection,
+            Err(error) => return failed(error),
+        };
+        if let Some(schema) = bound
+            && let Err(error) = self.put_back(&connection, schema)
+        {
+            return failed(error);
+        }
+        // Not `rolled_back`: that reads a `BEGIN` off the statement's text and
+        // ends the transaction itself, and `run_verified` owns the rollback.
+        // `is_autocommit` answers true whatever the session is in, so the
+        // sequence knows it opened its own bracket from `bracket`, and a
+        // `ROLLBACK` with no transaction to end is an error it ignores.
+        let mut send = |sql: &str, _: Sending| run(&connection, sql, Fetch::default());
+        // A file or memory database has no socket to lose, and renders every
+        // cell the same way on both reads, so nothing is skipped and no
+        // `COMMIT` error means a lost session.
+        super::run_verified(
+            Engine::DuckDb,
+            steps,
+            bracket,
+            &mut send,
+            proceed,
+            &|_| false,
+            &|_| false,
+        )
     }
 
     /// dbdelve's own SQL, whose rows are never edited.
