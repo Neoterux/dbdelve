@@ -2152,6 +2152,9 @@ fn writes_out(value: &Value) -> bool {
     }
 }
 
+const NO_EDITS: &str = "There are no edits to apply.";
+const NO_KEY: &str = "dbdelve cannot name an edited row by its primary key.";
+
 /// Each pending row as one `updateOne` that names the document by its key
 /// and `$set`s each edited field, one statement per row, in order.
 ///
@@ -2163,7 +2166,7 @@ fn writes_out(value: &Value) -> bool {
 /// that does not read as one is the error, never a string in its place.
 pub(crate) fn update_batch(rows: &[PendingRow]) -> Result<String, String> {
     if rows.is_empty() {
-        return Err("There are no edits to apply.".into());
+        return Err(NO_EDITS.into());
     }
     let mut statements = Vec::with_capacity(rows.len());
     for row in rows {
@@ -2193,14 +2196,64 @@ pub(crate) fn update_batch(rows: &[PendingRow]) -> Result<String, String> {
     Ok(statements.join("\n"))
 }
 
-/// RED stub: the writer is not written yet.
-#[cfg(test)]
+/// A draft's marked, edited and added documents as one statement per document:
+/// the `deleteOne`s, then the `updateOne`s, then the `insertOne`s, each group in
+/// the order given. The MongoDB counterpart of [`crate::sql::draft_batch`].
+///
+/// Nothing brackets it (`Engine::transaction_start` is `None`): the statements
+/// run in this order and the run stops at the first one that fails. A document
+/// is named by its `_id` alone, so a delete whose key has a null in it cannot
+/// be written.
+///
+/// Every statement ends `;`, and the error is `There are no edits to apply.`
+/// when all three lists are empty.
+//
+// ponytail: the order is fixed (deletes, updates, inserts), not
+// dependency-sorted, as `sql::draft_batch`'s is. Each statement names its
+// document by `_id` and none reads what another wrote, so the order only has to
+// be one the review can state. A draft whose statements depend on each other
+// would need a sort by what each reads.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the collection grid's Draft apply writes it")
+)]
 pub(crate) fn draft_batch(
-    _deletes: &[crate::sql::DraftDelete],
-    _updates: &[PendingRow],
-    _inserts: &[crate::sql::DraftInsert],
+    deletes: &[crate::sql::DraftDelete],
+    updates: &[PendingRow],
+    inserts: &[crate::sql::DraftInsert],
 ) -> Result<String, String> {
-    Err("not implemented".into())
+    if deletes.is_empty() && updates.is_empty() && inserts.is_empty() {
+        return Err(NO_EDITS.into());
+    }
+    let mut statements = Vec::with_capacity(deletes.len() + updates.len() + inserts.len());
+    for row in deletes {
+        if !row.null_keys.is_empty() {
+            return Err(NO_KEY.into());
+        }
+        let keys: Vec<(&str, &str)> = row
+            .keys
+            .iter()
+            .map(|(field, text)| (field.as_str(), text.as_str()))
+            .collect();
+        statements.push(terminated(&delete_row(&row.table, &keys, &row.types)?));
+    }
+    if !updates.is_empty() {
+        statements.push(terminated(&update_batch(updates)?));
+    }
+    for row in inserts {
+        let columns: Vec<(&str, Option<&str>)> = row
+            .columns
+            .iter()
+            .map(|(field, value)| (field.as_str(), value.as_deref()))
+            .collect();
+        statements.push(terminated(&insert_row(&row.table, &columns, &row.types)?));
+    }
+    Ok(statements.join("\n"))
+}
+
+/// `statement` ending in one `;`, whether or not it came with one.
+fn terminated(statement: &str) -> String {
+    format!("{};", statement.trim_end_matches(';'))
 }
 
 /// One `insertOne` of the fields the form filled. A field left empty is left
@@ -2428,7 +2481,7 @@ fn collection(table: &str) -> String {
 /// `{_id: <value>}`, from the key's values as the server sent them.
 fn key_filter(keys: &[(String, String)], types: &[(String, String)]) -> Result<String, String> {
     if keys.is_empty() {
-        return Err("dbdelve cannot name an edited row by its primary key.".into());
+        return Err(NO_KEY.into());
     }
     let fields = keys
         .iter()
@@ -2651,7 +2704,7 @@ pub(crate) fn operator_free(value: &Value) -> bool {
 /// out of the parse rather than trusted because `update_batch`, `insert_row`
 /// or `delete_row` wrote it: `sql::is_generated_write` for MongoDB.
 ///
-/// Exactly one of four shapes, on a collection of the connected database,
+/// Exactly one of five shapes, on a collection of the connected database,
 /// with no options and no cursor:
 ///
 /// - one or more `updateOne`s on one collection, each filter exactly
@@ -2659,7 +2712,10 @@ pub(crate) fn operator_free(value: &Value) -> bool {
 ///   plain field names;
 /// - one `insertOne` of a non-empty document;
 /// - one `insertMany` of a non-empty array of non-empty documents;
-/// - one `deleteOne` whose filter is exactly `{_id: <literal>}`.
+/// - one `deleteOne` whose filter is exactly `{_id: <literal>}`;
+/// - a draft, as [`draft_batch`] writes it: two or more of the above's
+///   `deleteOne`s, then `updateOne`s, then `insertOne`s on one collection, each
+///   group possibly empty and each statement passing what it passes alone.
 ///
 /// Every value is a literal with no `$`-named field anywhere inside it, so no
 /// operator -- `$where` included -- can ride in on a value.
@@ -2699,12 +2755,48 @@ pub(crate) fn is_generated_write(text: &str) -> bool {
         [(_, call)] if call.method == Method::DeleteOne => {
             matches!(arguments(call)[..], [filter] if names_by_id(filter))
         }
+        calls
+            if calls.len() > 1
+                && calls
+                    .iter()
+                    .any(|(_, call)| call.method != Method::UpdateOne) =>
+        {
+            draft_sequence(calls)
+        }
         calls => calls.iter().all(|(_, call)| {
             call.method == Method::UpdateOne
                 && matches!(arguments(call)[..], [filter, update]
                     if names_by_id(filter) && sets_only(update))
         }),
     }
+}
+
+/// Whether `calls`, which are two or more on one collection, read as a draft:
+/// `deleteOne`s, then `updateOne`s, then `insertOne`s, each passing the test
+/// its single shape passes. Any other method, and any order but that one, is
+/// refused: a `deleteOne` after an `insertOne` would be a delete the draft
+/// never reviewed in its place.
+fn draft_sequence(calls: &[(&String, &Call<Method>)]) -> bool {
+    let rank = |method| match method {
+        Method::DeleteOne => Some(0),
+        Method::UpdateOne => Some(1),
+        Method::InsertOne => Some(2),
+        _ => None,
+    };
+    let Some(ranks) = calls
+        .iter()
+        .map(|(_, call)| rank(call.method))
+        .collect::<Option<Vec<u8>>>()
+    else {
+        return false;
+    };
+    ranks.is_sorted()
+        && calls.iter().all(|(_, call)| match call.method {
+            Method::DeleteOne => matches!(arguments(call)[..], [filter] if names_by_id(filter)),
+            Method::UpdateOne => matches!(arguments(call)[..], [filter, update]
+                if names_by_id(filter) && sets_only(update)),
+            _ => matches!(arguments(call)[..], [document] if literal_document(document)),
+        })
 }
 
 /// `sql::delete_matches_key` for MongoDB: whether `text` is one `deleteOne`
