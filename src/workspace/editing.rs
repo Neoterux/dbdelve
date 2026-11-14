@@ -1664,16 +1664,20 @@ impl Workspace {
             return;
         }
         let staged = results.read(cx).delegate().pending_count();
+        let holds_rows = results.read(cx).delegate().holds_rows();
         // Row to Draft sends the dirty row first and switches when it lands.
         if mode == EditMode::Draft && self.held_for_edits(tab, AfterEdits::EditMode(mode), cx) {
             return;
         }
         if mode == EditMode::Row && staged > 0 {
-            let edits = match staged {
-                1 => "1 edit".to_string(),
-                count => format!("{count} edits"),
+            // Cells alone are edits; a row added makes the draft's size a
+            // count of changes.
+            let noun = if holds_rows { "change" } else { "edit" };
+            let size = match staged {
+                1 => format!("1 {noun}"),
+                count => format!("{count} {noun}s"),
             };
-            self.note(format!("The draft has {edits}{}", Self::DRAFT_REFUSAL), cx);
+            self.note(format!("The draft has {size}{}", Self::DRAFT_REFUSAL), cx);
             return;
         }
         if let Some(slot) = self
