@@ -1961,27 +1961,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// What a ring move off an edited row does, called after every move the
-    /// grid made ([`ResultGrid::take_left_row`]): in a Row view the row left is
-    /// sent, in a Draft view the mark is dropped and nothing is said. The one
-    /// caller of [`Self::save_row`] besides Save.
+    /// What a ring move does about the input it closed and the row it left,
+    /// called after every move the grid made ([`ResultGrid::take_left_row`]).
+    /// The closed input is staged first, in every view and on every grid
+    /// ([`ResultGrid::commit_closed_input`]); a Row view then sends the row
+    /// left, and a Draft view sends nothing and says nothing. The one caller of
+    /// [`Self::save_row`] besides Save.
     ///
     /// A grid that is not a relation tab's of the profile in front (a query
-    /// tab's, or one of a profile behind) has no mode to ask and drops the mark.
+    /// tab's, or one of a profile behind) has no mode to ask: what was typed is
+    /// staged and the mark dropped.
     pub(crate) fn flush_left_row(
         &mut self,
         grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
         cx: &mut Context<Self>,
     ) {
-        // Both taken first and whatever comes of them, so a grid with no Row
-        // view to ask does not hold either for a later move.
-        let (left, closed, ring) = grid.update(cx, |table, cx| {
+        // The input is staged and the left row taken first and whatever comes
+        // of them, so a grid with no Row view to ask does not hold either for a
+        // later move.
+        let (left, ring) = grid.update(cx, |table, cx| {
             let grid = table.delegate_mut();
-            (
-                grid.take_left_row(),
-                grid.take_closed_input(cx),
-                grid.active().map(|(row, _)| row),
-            )
+            grid.commit_closed_input(cx);
+            (grid.take_left_row(), grid.active().map(|(row, _)| row))
         });
         let Some(row) = left.filter(|row| Some(*row) != ring) else {
             return;
@@ -2002,18 +2003,6 @@ impl Workspace {
         };
         if mode != EditMode::Row {
             return;
-        }
-        // What was typed in a cell the ring was moved off the row of is staged
-        // with the row's other edits. A mode that refuses the write leaves it
-        // unstaged.
-        if let Some((closed_row, col, text)) = closed
-            && closed_row == row
-        {
-            grid.update(cx, |table, _| {
-                table
-                    .delegate_mut()
-                    .set_pending(row, col, NewValue::Value(text))
-            });
         }
         if !grid.read(cx).delegate().row_has_pending(row) {
             return;
