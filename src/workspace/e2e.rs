@@ -221,6 +221,9 @@ fn front_review(
     })
 }
 
+/// `BIRDS` with no rows: a table whose grid has nothing to draw until a row is added.
+const EMPTY_BIRDS: &str = "create table birds (id integer primary key, name text not null);";
+
 const BIRDS: &str = "create table birds (id integer primary key, name text not null); \
                      insert into birds values (1, 'wren'), (2, 'tit');";
 
@@ -23582,6 +23585,71 @@ fn an_updated_row_is_marked_on_the_gutter_and_unmarked_when_discarded(cx: &mut T
         cx.dispatch_action(crate::actions::DiscardEdits);
         settle(cx);
         assert!(cx.debug_bounds("row-updated-0").is_none());
+        quit(workspace, cx);
+    });
+}
+
+/// A table with no rows shows its message and no grid; adding a row replaces the
+/// message with the grid, the ring on the new row, and the keyboard reaches it.
+#[gpui::test]
+fn an_empty_table_draws_its_grid_once_a_row_is_added(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, EMPTY_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        assert!(cx.debug_bounds("row-number-0").is_none());
+
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        assert!(cx.debug_bounds("row-number-0").is_some());
+        assert_eq!(ring_of(&grid, cx), Some((0, 0)));
+
+        // The grid takes a column move: an empty grid refuses it.
+        grid.update(cx, |table, _| table.delegate_mut().select_col(1));
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)));
+        grid.update_in(cx, |table, window, cx| {
+            crate::result_grid::take_keyboard(table, window, cx);
+        });
+        assert!(grid_holds_keyboard(&grid, cx));
+        assert!(
+            grid.read_with(cx, |table, _| table.selected_row())
+                .is_some(),
+            "the keyboard puts the library's selection on the added row"
+        );
+
+        stage(&grid, cx, 0, 0, NewValue::Value("1".into()));
+        stage(&grid, cx, 0, 1, NewValue::Value("wren".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
+/// An added row's draft state is on its gutter too, as an updated row's is.
+#[gpui::test]
+fn an_added_row_is_marked_on_the_gutter(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let _ = open_own_table(&workspace, cx, "birds");
+        assert!(cx.debug_bounds("row-added-2").is_none());
+
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        assert!(cx.debug_bounds("row-added-2").is_some());
+        assert!(cx.debug_bounds("row-added-1").is_none());
+
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        assert!(cx.debug_bounds("row-added-2").is_none());
         quit(workspace, cx);
     });
 }

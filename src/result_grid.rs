@@ -6973,6 +6973,18 @@ mod tests {
     }
 
     #[test]
+    fn the_gutter_is_wide_enough_for_an_added_rows_number() {
+        let mut grid = editable_grid();
+        let narrow = grid.gutter_width();
+        for _ in 0..8 {
+            assert!(grid.add_row().is_some());
+        }
+        // Ten rows in all: the last number has a digit more than nine did.
+        assert_eq!(grid.fetched_rows() + grid.added_count(), 10);
+        assert!(grid.gutter_width() > narrow);
+    }
+
+    #[test]
     fn an_added_row_writes_only_the_cells_it_touches() {
         let mut grid = editable_grid();
         assert_eq!(grid.add_row(), Some(2));
