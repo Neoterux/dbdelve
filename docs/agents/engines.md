@@ -139,6 +139,19 @@ Decided, and not to be re-litigated:
   the driver cannot be asked whether one is open, so the workspace's tracked
   state chooses the bracket. An error at `COMMIT` is an unknown outcome only
   when a ping finds the session gone.
+  SQL Server runs every statement of the apply through the same `execute` a
+  grid's edits use (`Origin::Generated`) on one held session. A write's count is
+  the `SELECT @@ROWCOUNT` asked right after that write, never after a bracket
+  or a later statement, which would read none; a re-read is projected by
+  `readable_preview` as the grid's preview was, so a CLR or `sql_variant` column
+  is not refused and not a false drift. The count is the outer statement's: an
+  `INSTEAD OF` trigger that writes nothing still counts 1, and an `AFTER`
+  trigger's writes are not counted, so on SQL Server the count does not prove the
+  write (the re-read before it still catches a changed or missing row). An
+  error at `COMMIT` is an unknown outcome only when it is a reset session
+  (`stop()`'s `The connection was reset: …`: a Cancel or the statement
+  timeout reaching the `COMMIT`); a reset before `COMMIT` is a failure, the server having rolled
+  the transaction back with the session.
 - **A batch that fails part way is rolled back, and the error says which state
   the data is in.** Without that the brackets produce a third state, neither
   applied nor discarded, and rendered as applied, because the refresh `SELECT`
