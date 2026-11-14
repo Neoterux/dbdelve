@@ -880,6 +880,21 @@ pub(crate) struct ApplyReview {
     /// Whether `sql` is the grid's draft, which a successful run clears. An
     /// `INSERT` or a `DELETE` of the New row form or Delete row sends none of it.
     pub(crate) edits: bool,
+    /// What a run of `sql` is verified against, when its target verifies an
+    /// apply (`Target::verifies_applies`). Kept for as long as the review is
+    /// open, since a refusal leaves it open and the next Run verifies again.
+    pub(crate) verify: Option<Verification>,
+}
+
+/// The rows a reviewed draft was written from, as they were fetched: one step
+/// for each statement of the batch, in the order the batch holds them, built
+/// when the review is written and handed to the apply with the run.
+#[derive(Clone)]
+pub(crate) struct Verification {
+    pub(crate) steps: Vec<crate::db::VerifiedStep>,
+    /// What each step's row is called in what the apply says of it, `rows[i]`
+    /// for step `i`: the key's `name = value` terms, or `added row N`.
+    pub(crate) rows: Vec<String>,
 }
 
 impl ApplyReview {
@@ -3645,8 +3660,13 @@ pub(crate) enum Refresh {
     /// is the user's statement and not dbdelve's, so it keeps the row limit.
     Return,
     /// A relation tab, refreshed the way its own controls refresh it — so it
-    /// picks up whatever sort and row limit the tab is now set to.
-    Relation(u64),
+    /// picks up whatever sort and row limit the tab is now set to. `verify` is
+    /// what a reviewed draft's run is checked against, which a run held by the
+    /// mode prompt keeps with it.
+    Relation {
+        id: u64,
+        verify: Option<Verification>,
+    },
     /// A Row-mode send of one row's `UPDATE`, which is followed in the same
     /// task by `read`, the row read back by its key, landing in `row` of the
     /// grid whose rows are `rows_id`. No refresh of the relation follows: the
@@ -4126,6 +4146,7 @@ mod tests {
             notes: Vec::new(),
             error: None,
             edits: true,
+            verify: None,
         }
     }
 

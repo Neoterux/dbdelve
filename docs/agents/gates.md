@@ -66,6 +66,29 @@ mode, always where the user can read it before it runs:
   user's open transaction as a single-statement edit always has (see
   Transaction control below). A Draft view sends nothing unread, and no
   agent's statement takes this path.
+- A relation tab's Draft apply on a target that verifies it
+  (`Target::verifies_applies`: SQLite so far, widened an engine at a time as
+  each one's arm of `Connection::apply_verified` lands) is not sent as the text
+  the user read. The text is still what the user reads, and it is gated as it
+  always was (`sql::is_generated_write_on`, `sql::draft_deletes_match`); the
+  apply then cuts its statements out of that text (`sql::generated_writes`,
+  which sees through the `BEGIN`/`COMMIT` brackets the text may hold) and sends
+  them one at a time on one held session: the engine's own `BEGIN`
+  (`Engine::begins_transaction`), a `SELECT * … WHERE <the statement's own
+  predicate>` for every `UPDATE` and `DELETE` (`sql::row_reread`, cut from the
+  statement's own parse tree and admitted by `sql::is_generated_select`) before
+  any write, the writes in the order the text holds them with each one's row
+  count checked, then `COMMIT`, or `ROLLBACK` on any refusal or failure before
+  it. Every re-read is compared whole, by column name and byte for byte, with
+  the row as the grid fetched it (copied by value when the review was written);
+  a row that differs or is gone writes nothing, keeps the draft and is named in
+  the review. A statement that does not count exactly one row rolls the whole
+  sequence back. Under a transaction of the user's own nothing is opened, ended
+  or rolled back. There is no `FOR UPDATE`: the pinned grammar cannot read it,
+  so the compare catches a change made between the fetch and the apply, not one
+  made in the milliseconds between the re-read and the write, and the count
+  still catches a row that vanished in that window. Targets that do not verify
+  keep `Connection::generated`.
 - Import Rows shows every statement it will send in its dialog's SQL view
   before any runs.
 - **Explain** puts the engine's `EXPLAIN` prefix on a copy of the
