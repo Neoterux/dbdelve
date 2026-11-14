@@ -2241,12 +2241,28 @@ impl Workspace {
             true => Bracket::Joined,
             false => Bracket::Own,
         };
+        // Every path that writes a grid's rows on a target that verifies
+        // applies builds a `Verification`; this keeps a future one that does
+        // not from sending the edit as the text alone, with no re-read and no
+        // count (`AGENTS.md`, rule 2). A query tab's edit on a target that
+        // does not review it (`Target::reviews_query_apply`) goes to its
+        // buffer and is not one of these.
+        let unverified = edit
+            && verification.is_none()
+            && target.verifies_applies()
+            && match tab {
+                Tab::Object(_) => true,
+                Tab::Query(_) => target.reviews_query_apply(),
+            };
         let refusal = edit
             .then(|| match &binding {
                 Some(binding) => profile.bound_write_refusal(binding),
                 None => profile.own_write_refusal(&sql),
             })
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                unverified.then(|| "dbdelve refused to send an edit it could not verify.".into())
+            });
         // An edit sent to a transactional SQL engine leaves the grid and the
         // draft where they are until the server answers, so a refusal or a
         // failure costs the user nothing. Not for a target whose batch has no

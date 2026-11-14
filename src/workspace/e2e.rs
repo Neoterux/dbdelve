@@ -16498,13 +16498,15 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
         let tab = workspace.read_with(cx, |workspace, _| {
             workspace.profile().unwrap().session.active
         });
+        let insert = generated_insert(&workspace, cx, "u", &[("id", "INTEGER", "7")]);
+        let verify = counted_inserts(&workspace, cx, &insert);
         workspace.update(cx, |workspace, cx| {
             workspace.execute_unchecked(
-                "INSERT INTO u VALUES (7)".into(),
+                insert,
                 tab,
                 Some(Refresh::Statement {
                     sql: "SELECT count(*) FROM u".into(),
-                    verify: None,
+                    verify,
                 }),
                 false,
                 None,
@@ -16523,7 +16525,7 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
     });
 }
 
-/// Applies `INSERT INTO u VALUES (7)` from the tab in front as an edit does,
+/// Applies an `INSERT` of one row into `u` from the tab in front as an edit does,
 /// and reads back what the tab holds once it lands.
 fn apply_insert_from_the_front_tab(
     workspace: &Entity<Workspace>,
@@ -16533,13 +16535,15 @@ fn apply_insert_from_the_front_tab(
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
+    let insert = generated_insert(workspace, cx, "u", &[("id", "INTEGER", "7")]);
+    let verify = counted_inserts(workspace, cx, &insert);
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
-            "INSERT INTO u VALUES (7)".into(),
+            insert,
             tab,
             Some(Refresh::Statement {
                 sql: "SELECT count(*) FROM u".into(),
-                verify: None,
+                verify,
             }),
             false,
             None,
@@ -19698,6 +19702,58 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
     });
 }
 
+/// The `INSERT` the New row form writes for one row of `table`, which is what
+/// a send of a test's own has to be to reach a target that verifies applies:
+/// an edit is cut statement by statement from text the gate admits. `row` is
+/// each column's name, type and value.
+fn generated_insert(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    table: &str,
+    row: &[(&str, &str, &str)],
+) -> String {
+    let engine = workspace.read_with(cx, |workspace, _| workspace.engine());
+    let values: Vec<_> = row
+        .iter()
+        .map(|(name, _, value)| (*name, Some(*value)))
+        .collect();
+    let types: Vec<_> = row
+        .iter()
+        .map(|(name, kind, _)| (name.to_string(), kind.to_string()))
+        .collect();
+    crate::sql::insert_row(engine, "main", table, &values, &types)
+        .expect("the New row form's INSERT is written")
+}
+
+/// What an apply of `sql`, `INSERT`s a test sends by hand as an edit, is
+/// checked against on a target that verifies applies: each statement must
+/// count one row. An edit sent with none is refused
+/// (`an_edit_of_a_verifying_target_without_its_verification_is_not_sent`).
+fn counted_inserts(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+) -> Option<crate::session::Verification> {
+    let engine = workspace.read_with(cx, |workspace, _| workspace.engine());
+    // As the review does, a statement at a time from the gated text, which
+    // leaves a batch's own `BEGIN` and `COMMIT` out. `None` where the text is
+    // not one the gate reads.
+    let steps: Vec<_> = crate::sql::generated_writes(engine, sql)?
+        .into_iter()
+        .map(|sql| crate::db::VerifiedStep {
+            sql,
+            kind: crate::db::StepKind::Insert,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        })
+        .collect();
+    Some(crate::session::Verification {
+        rows: vec!["new row".to_string(); steps.len()],
+        steps,
+    })
+}
+
 /// Applies `sql` from the tab in front as an edit does, reading back
 /// `SELECT count(*) FROM t` once it lands.
 fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
@@ -19705,13 +19761,14 @@ fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestCo
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
+    let verify = counted_inserts(workspace, cx, sql);
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
             sql.into(),
             tab,
             Some(Refresh::Statement {
                 sql: "SELECT count(*) FROM t".into(),
-                verify: None,
+                verify,
             }),
             false,
             None,
@@ -19722,16 +19779,19 @@ fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestCo
     settle(cx);
 }
 
-/// Applies `INSERT INTO t VALUES (7)` from the tab in front as an edit does.
+/// Applies an `INSERT` of one row into `t` from the tab in front as an edit
+/// does, and returns the statement.
 fn apply_insert_into_own_table_from_the_front_tab(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
-) {
-    apply_from_the_front_tab(workspace, cx, "INSERT INTO t VALUES (7)");
+) -> String {
+    let insert = generated_insert(workspace, cx, "t", &[("id", "INTEGER", "7")]);
+    apply_from_the_front_tab(workspace, cx, &insert);
     query_tab(workspace, cx, |tab, _, _| match &tab.query {
         QueryState::Complete { .. } => {}
         _ => panic!("the edit never completed"),
     });
+    insert
 }
 
 #[gpui::test]
@@ -19742,8 +19802,12 @@ fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
         let (workspace, cx) = duckdb_with_other_attached(cx);
         // As `sql::update_batch` writes a multi-row apply on an engine whose
         // statements commit on their own.
-        let batch =
-            "BEGIN TRANSACTION;\nINSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);\nCOMMIT;";
+        let (eight, nine) = (
+            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "8")]),
+            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "9")]),
+        );
+        let batch = format!("BEGIN TRANSACTION;\n{eight};\n{nine};\nCOMMIT;");
+        let batch = batch.as_str();
         manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
         let (auto_commit, open, _) = transaction_state(&workspace, cx);
         let listed = open_transaction_statements(&workspace, cx);
@@ -19793,11 +19857,11 @@ fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
         // commit on its own.
         run_in_front(&workspace, cx, "SELECT 1");
         assert!(!transaction_state(&workspace, cx).1, "nothing is open");
-        apply_from_the_front_tab(
-            &workspace,
-            cx,
-            "INSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);",
+        let (eight, nine) = (
+            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "8")]),
+            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "9")]),
         );
+        apply_from_the_front_tab(&workspace, cx, &format!("{eight};\n{nine};"));
         assert_eq!(
             edit_notice(&workspace, cx),
             "Not sent: no transaction is open on this connection, and the batch of edits \
@@ -19829,11 +19893,12 @@ fn a_joined_batch_that_fails_part_way_says_its_earlier_rows_stay_in_the_open_tra
 
         // As `sql::update_batch_joining` writes a multi-row apply; the second
         // statement collides with the first's key.
-        apply_from_the_front_tab(
-            &workspace,
-            cx,
-            "INSERT INTO birds VALUES (2, 'tit');\nINSERT INTO birds VALUES (2, 'jay');",
+        let row = |name| [("id", "INTEGER", "2"), ("name", "TEXT", name)];
+        let (tit, jay) = (
+            generated_insert(&workspace, cx, "birds", &row("tit")),
+            generated_insert(&workspace, cx, "birds", &row("jay")),
         );
+        apply_from_the_front_tab(&workspace, cx, &format!("{tit};\n{jay};"));
         let message = edit_notice(&workspace, cx);
         assert!(
             message.ends_with(
@@ -19922,12 +19987,12 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
         );
 
         run_in_front(&workspace, cx, "BEGIN");
-        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
+        let insert = apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
         assert_eq!(
             recorded_statements(&workspace, cx),
             [
                 "BEGIN",
-                "INSERT INTO t VALUES (7)",
+                insert.as_str(),
                 // The tab's own statement run again to show the change: the
                 // user's statement through the user's path, as the history has it.
                 "SELECT count(*) FROM t"
@@ -27702,10 +27767,39 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
         let (id, grid) = open_in_row_mode(&workspace, cx);
         let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
 
-        // The write is a real one; only the read it carries is not a read.
+        // The write is a real one, verified as a Row send's is; only the read
+        // it carries is not a read.
+        stage(
+            &grid,
+            cx,
+            0,
+            1,
+            crate::result_grid::NewValue::Value("robin".into()),
+        );
+        let (write, before) = grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            (
+                crate::sql::update_batch(Engine::Sqlite, &grid.pending_updates())
+                    .expect("the row's UPDATE is written"),
+                grid.fetched_cells(0),
+            )
+        });
+        let write = write.as_str();
+        // The step is the statement as the gate cuts it, without its `;`.
+        let step = write.trim_end_matches(';');
+        let verify = Some(crate::session::Verification {
+            steps: vec![crate::db::VerifiedStep {
+                sql: step.into(),
+                kind: crate::db::StepKind::Update,
+                reread: crate::sql::row_reread(Engine::Sqlite, step),
+                before,
+                read_back: None,
+            }],
+            rows: vec!["id = 1".into()],
+        });
         workspace.update(cx, |workspace, cx| {
             workspace.execute_and_then(
-                "UPDATE \"birds\" SET \"name\" = 'robin' WHERE \"id\" = 1;".into(),
+                write.into(),
                 Tab::Object(id),
                 Some(Refresh::Row {
                     row: 0,
@@ -27714,7 +27808,7 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                     sent: Vec::new(),
                     to: None,
                     then: None,
-                    verify: None,
+                    verify,
                 }),
                 false,
                 None,
