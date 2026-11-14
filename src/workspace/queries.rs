@@ -67,6 +67,27 @@ impl Workspace {
         })
     }
 
+    /// Whether the selection of a Draft view of a table holds a row that Delete
+    /// row can mark: an added row, which it removes, or a row named by its
+    /// primary key. Read off the grid for the reason
+    /// [`Workspace::has_nameable_row`] is.
+    pub(crate) fn has_markable_row(&self, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            let tab = profile.session.active;
+            matches!(tab, Tab::Object(_))
+                && profile.session.edit_mode(tab) == EditMode::Draft
+                && profile.config.target().row_edits()
+                && profile.session.active_results().is_some_and(|results| {
+                    let grid = results.read(cx).delegate();
+                    grid.insert_target().is_some()
+                        && grid
+                            .selected_draft_rows()
+                            .into_iter()
+                            .any(|row| row >= grid.fetched_rows() || grid.row_key(row).is_some())
+                })
+        })
+    }
+
     /// Whether the surface in front has a result set to write out. Columns, not
     /// rows: a statement that matched nothing still has a shape, and a
     /// header-only CSV is a truthful answer to it.

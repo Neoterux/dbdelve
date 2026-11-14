@@ -3321,6 +3321,9 @@ impl TableDelegate for ResultGrid {
         let row = row.when(self.added_row(row_ix).is_some(), |row| {
             row.child(div().absolute().size_full().bg(t.added))
         });
+        let row = row.when(self.is_marked(row_ix), |row| {
+            row.child(div().absolute().size_full().bg(t.deleted))
+        });
         if !self.selected_rows.contains(&row_ix) {
             return row;
         }
@@ -3407,7 +3410,7 @@ impl TableDelegate for ResultGrid {
         match col_ix.checked_sub(GUTTER).and_then(|p| self.column_at(p)) {
             Some(col) => self.data_td(row_ix, col, window, cx).into_any_element(),
             None => {
-                let (faint, text, selected_bg, danger, updated, added) = {
+                let (faint, text, selected_bg, danger, updated, added, deleted) = {
                     let t = theme(cx);
                     (
                         t.text_faint,
@@ -3416,11 +3419,13 @@ impl TableDelegate for ResultGrid {
                         t.danger,
                         t.updated,
                         t.added,
+                        t.deleted,
                     )
                 };
                 let selected = self.selected_rows.contains(&row_ix);
                 let changed = self.row_has_pending(row_ix);
                 let is_added = self.added_row(row_ix).is_some();
+                let is_deleted = self.is_marked(row_ix);
                 // What the server said to this row's send, on the one cell
                 // that is the row's and not a column's.
                 let refused = self
@@ -3461,6 +3466,18 @@ impl TableDelegate for ResultGrid {
                                 .bottom_0()
                                 .w(px(3.0))
                                 .bg(Rgba { a: 1.0, ..added }),
+                        )
+                    })
+                    .when(is_deleted, |cell| {
+                        cell.child(
+                            div()
+                                .debug_selector(move || format!("row-deleted-{row_ix}"))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(3.0))
+                                .bg(Rgba { a: 1.0, ..deleted }),
                         )
                     })
                     .when_some(refused.clone(), |cell, message| {
@@ -3944,14 +3961,18 @@ impl ResultGrid {
             .then(|| self.follow_group(col_ix).cloned())
             .flatten();
 
+        // A deleted row's ink is faint and struck through, so the deletion
+        // reads without the wash's colour.
+        let deleted = self.is_marked(row_ix);
         base.overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
-            .text_color(match (cell.is_some(), numeric) {
+            .text_color(match (cell.is_some() && !deleted, numeric) {
                 (false, _) => faint,
                 (true, true) => number,
                 (true, false) => text,
             })
+            .when(deleted, |cell| cell.line_through())
             // Italic so a NULL cannot be mistaken for the four-letter string.
             .when(cell.is_none(), |cell| cell.italic())
             // The whole added row is new, so no one of its cells is "edited".
