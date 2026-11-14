@@ -4665,6 +4665,97 @@ mod tests {
 
     #[test]
     #[ignore = "requires the repository development database configured through dbdelve_MONGO_URL"]
+    fn live_a_mongo_row_send_is_reread_counted_and_read_back_by_its_id() {
+        use crate::result_grid::{NewValue, PendingRow};
+
+        let connection = live();
+        let name = format!("dbdelve_test_{}", ObjectId::new());
+        let collection = format!("db.getCollection('{name}')");
+        let _ = connection.query(
+            &format!("{collection}.drop()"),
+            &CancelToken::default(),
+            Fetch::default(),
+        );
+        let _scratch = Scratch(&connection, name.clone());
+        let cancel = CancelToken::default();
+        ran(
+            &connection,
+            &format!("{collection}.insertOne({{_id: 1, name: 'a'}})"),
+        );
+        let manifest = || -> Vec<FetchedCell> {
+            let read = ran(&connection, &format!("{collection}.find({{_id: 1}})"));
+            read.columns
+                .iter()
+                .enumerate()
+                .map(|(at, column)| FetchedCell {
+                    column: column.name.clone(),
+                    text: read.rows[0].get(at).map(str::to_owned),
+                    cell_type: Some(read.cell_types[0][at].to_owned()),
+                    column_type: column.data_type.clone(),
+                })
+                .collect()
+        };
+        // The one step a Row send makes, as `Workspace::save_row` builds it: the
+        // `updateOne` the grid writes, its re-read and its read-back both the
+        // read by `_id` that `sql::row_read` cuts from it.
+        let update = crate::sql::update_batch(
+            Engine::MongoDb,
+            &[PendingRow {
+                table: name.clone(),
+                keys: vec![("_id".into(), "1".into())],
+                sets: vec![("name".into(), NewValue::Value("b".into()))],
+                types: vec![
+                    ("_id".into(), "int".to_owned()),
+                    ("name".into(), "string".to_owned()),
+                ],
+                ..PendingRow::default()
+            }],
+        )
+        .unwrap();
+        let sql = update.trim_end().trim_end_matches(';').to_owned();
+        let read = crate::sql::row_read(Engine::MongoDb, &sql).expect("a read by _id");
+        let step = |before| VerifiedStep {
+            sql: sql.clone(),
+            kind: StepKind::Update,
+            reread: Some(read.clone()),
+            before,
+            read_back: Some(read.clone()),
+        };
+        let name_of = || {
+            let read = ran(&connection, &format!("{collection}.find({{_id: 1}})"));
+            let at = read.columns.iter().position(|c| c.name == "name").unwrap();
+            read.rows[0].get(at).map(str::to_owned)
+        };
+
+        // A document changed since the grid fetched it is not written over.
+        let fetched = manifest();
+        ran(
+            &connection,
+            &format!("{collection}.updateOne({{_id: 1}}, {{$set: {{name: 'someone else'}}}})"),
+        );
+        assert_eq!(
+            connection.apply_verified(&[step(fetched)], &cancel),
+            ApplyOutcome::Drifted(vec![(0, Drift::Changed)])
+        );
+        assert_eq!(name_of().as_deref(), Some("someone else"));
+
+        // One that matches is written once, and what the server holds comes back.
+        match connection.apply_verified(&[step(manifest())], &cancel) {
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: Some(shown),
+            } => {
+                assert_eq!(shown.rows.len(), 1);
+                let at = shown.columns.iter().position(|c| c.name == "name").unwrap();
+                assert_eq!(shown.rows[0].get(at), Some("b"));
+            }
+            other => panic!("the row was expected to apply: {other:?}"),
+        }
+        assert_eq!(name_of().as_deref(), Some("b"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MONGO_URL"]
     fn live_a_cancel_stops_the_statement_on_the_server_and_the_session_carries_on() {
         let connection = live();
         let run = CancelToken::default();
