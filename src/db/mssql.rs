@@ -2404,6 +2404,19 @@ fn held_to_database(session: &mut Session, database: &str) -> Result<(), DbError
     )))
 }
 
+/// What a reset session says of itself, in the error [`Connection::stop`]
+/// returns.
+const RESET: &str = "The connection was reset: the server rolled back any transaction that was \
+                     open, and temporary tables and SET options are gone with the session.";
+
+fn lost_session(_: &DbError) -> bool {
+    false
+}
+
+fn kept_transaction(_: &str, result: QueryResult) -> Result<QueryResult, DbError> {
+    Ok(result)
+}
+
 /// Say what a failed statement did to the transactions open around it.
 ///
 /// `SET XACT_ABORT ON` is what makes a generated batch's brackets atomic:
@@ -5440,6 +5453,97 @@ mod tests {
         fn drop(&mut self) {
             self.drop_all();
         }
+    }
+
+    #[test]
+    fn a_reset_at_commit_is_an_unknown_outcome_and_before_it_is_not_applied() {
+        use crate::db::{StepKind, run_verified};
+
+        let reset = |what: &str| plain_error(format!("{what} {RESET} dbdelve reconnected."));
+        let steps = [VerifiedStep {
+            sql: "UPDATE \"dbo\".\"t\" SET \"a\" = N'x' WHERE \"id\" = '1'".into(),
+            kind: StepKind::Update,
+            reread: Some("SELECT * FROM \"dbo\".\"t\" WHERE \"id\" = '1'".into()),
+            before: Vec::new(),
+            read_back: None,
+        }];
+        // Fails the one statement `at`, the way the arm's send closure would
+        // answer it, and counts every other as the one row it wrote.
+        let fails = |at: &str, error: DbError| {
+            let mut sent = Vec::new();
+            let outcome = run_verified(
+                Engine::SqlServer,
+                &steps,
+                Bracket::Own,
+                &mut |sql, _| {
+                    sent.push(sql.to_string());
+                    match (sql == at, sql.starts_with("SELECT")) {
+                        (true, _) => Err(error.clone()),
+                        (false, true) => Ok(QueryResult {
+                            rows: vec![Row::new([Some("1")]).unwrap()],
+                            ..QueryResult::default()
+                        }),
+                        (false, false) => Ok(QueryResult {
+                            rows_affected: Some(1),
+                            ..QueryResult::default()
+                        }),
+                    }
+                },
+                &|| true,
+                &|_| false,
+                &lost_session,
+            );
+            (outcome, sent)
+        };
+
+        let error = reset("Cancel arrived.");
+        assert_eq!(
+            fails("COMMIT", error.clone()).0,
+            ApplyOutcome::Unknown(error.clone()),
+            "the answer to a COMMIT sent on a session that was reset is lost"
+        );
+        let (outcome, sent) = fails(&steps[0].sql, error.clone());
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Write(0),
+                error
+            },
+            "a reset before COMMIT rolled the transaction back"
+        );
+        assert!(!sent.iter().any(|sql| sql == "COMMIT"), "{sent:?}");
+        let server = plain_error("Violation of PRIMARY KEY constraint.".into());
+        assert_eq!(
+            fails("COMMIT", server.clone()).0,
+            ApplyOutcome::Failed {
+                stage: ApplyStage::Commit,
+                error: server
+            },
+            "a COMMIT the server refused on a live session was not applied"
+        );
+
+        // A write that finished but whose count round trip reset the session
+        // lost the transaction with it, so it is no write of this sequence.
+        let after_reset = |sql: &str, notice: &str| {
+            kept_transaction(
+                sql,
+                QueryResult {
+                    notice: Some(notice.into()),
+                    ..QueryResult::default()
+                },
+            )
+        };
+        let notice = format!("The statement finished, but Cancel arrived after that. {RESET}");
+        assert!(after_reset(&steps[0].sql, &notice).is_err());
+        assert!(after_reset("BEGIN TRANSACTION", &notice).is_err());
+        assert!(
+            after_reset("COMMIT", &notice).is_ok(),
+            "a COMMIT that finished stands, whatever came after it"
+        );
+        assert!(
+            after_reset(&steps[0].sql, "(1 row affected)").is_ok(),
+            "a message the server sent is not a reset"
+        );
     }
 
     #[test]
