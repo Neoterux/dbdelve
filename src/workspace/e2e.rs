@@ -19882,6 +19882,15 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
         let id = open_own_table(&workspace, cx, "birds");
         let grid = relation_grid(&workspace, cx, id);
 
+        // An empty draft says so, as it does outside a transaction.
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("There are no edits to apply.")
+        );
+
         // One cell and an added row are two statements.
         stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
         add_bird(&grid, cx, "3", "robin");
@@ -19992,6 +20001,119 @@ fn a_write_not_named_by_its_primary_key_is_refused_inside_the_users_open_transac
         apply_from_the_front_tab_keyed(&workspace, cx, &insert, true);
         run_in_front(&workspace, cx, "SELECT count(*) FROM t");
         assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        assert!(in_transaction(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+/// `birds` read as a target that names its rows by every column, which no
+/// engine that verifies an apply produces yet (ClickHouse does, unverified).
+fn birds_named_by_every_column() -> crate::result_grid::ResultGrid {
+    use crate::db::{Column, EditTarget, QueryResult, RowMatch, UpdateSpelling, rows};
+    let column = |name: &str| Column {
+        name: name.into(),
+        data_type: None,
+    };
+    crate::result_grid::ResultGrid::new(
+        QueryResult {
+            columns: vec![column("id"), column("name")],
+            rows: rows(vec![
+                vec![Some("1".into()), Some("wren".into())],
+                vec![Some("2".into()), Some("tit".into())],
+            ]),
+            edit: Some(EditTarget {
+                schema: "main".into(),
+                table: "birds".into(),
+                columns: vec![Some("id".into()), Some("name".into())],
+                keys: vec![0, 1],
+                row_match: RowMatch::EveryColumn { fixed: Vec::new() },
+                update: UpdateSpelling::Update,
+            }),
+            ..QueryResult::default()
+        },
+        crate::sql::Mode::ReadWrite,
+    )
+}
+
+#[gpui::test]
+fn a_grid_naming_its_rows_by_every_column_is_refused_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |table, cx| {
+            *table.delegate_mut() = birds_named_by_every_column();
+            table.refresh(cx);
+        });
+
+        // One write, but on a row that could count two: Apply edits.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+
+        // The same write as a mark in a draft that holds rows.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        grid.update(cx, |table, _| {
+            assert!(table.delegate_mut().toggle_marks(&[0]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the mark is kept");
+        assert!(in_transaction(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_on_a_grid_naming_its_rows_by_every_column_is_not_sent_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        grid.update(cx, |table, cx| {
+            *table.delegate_mut() = birds_named_by_every_column();
+            table.refresh(cx);
+        });
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    0,
+                    "A transaction is open on this connection; the row was not sent."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edits are kept");
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent"
+        );
         assert!(in_transaction(&workspace, cx));
         quit(workspace, cx);
     });
