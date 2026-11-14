@@ -4812,6 +4812,34 @@ mod tests {
     }
 
     #[test]
+    fn the_edit_walk_stops_at_added_rows_and_marked_rows() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, value("earlier")));
+        assert!(grid.toggle_marks(&[1]));
+        assert_eq!(grid.add_row(), Some(2));
+        assert!(grid.set_pending(2, 1, value("third")));
+        grid.set_active(0, 0);
+
+        let walk = |grid: &mut ResultGrid, back| {
+            let to = grid.pending_beside(back).unwrap();
+            grid.set_active(to.0, to.1);
+            to
+        };
+        assert_eq!(walk(&mut grid, false), (0, 1), "the staged cell");
+        assert_eq!(walk(&mut grid, false), (1, 0), "the marked row");
+        assert_eq!(walk(&mut grid, false), (2, 1), "the added row, at its cell");
+        assert_eq!(walk(&mut grid, false), (0, 1), "wraps");
+        assert_eq!(walk(&mut grid, true), (2, 1));
+        assert_eq!(walk(&mut grid, true), (1, 0));
+        assert_eq!(walk(&mut grid, true), (0, 1));
+
+        // An added row with nothing typed in it is still a stop.
+        assert_eq!(grid.add_row(), Some(3));
+        grid.set_active(2, 1);
+        assert_eq!(walk(&mut grid, false), (3, 0));
+    }
+
+    #[test]
     fn a_pending_edit_leaves_the_fetched_rows_alone() {
         // The grid shows changed-against-server by holding both. Writing the
         // edit into `result.rows` would lose the server's value for good.

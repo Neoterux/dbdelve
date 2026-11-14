@@ -23878,6 +23878,141 @@ fn an_added_row_and_a_deleted_row_are_marked_on_the_gutter(cx: &mut TestAppConte
     });
 }
 
+/// A mixed draft that the server refuses applies nothing: the batch's own
+/// bracket rolls the delete and the update back with the insert that failed, and
+/// the draft keeps all three parts for the person to correct.
+#[gpui::test]
+fn a_failed_draft_apply_keeps_all_three_parts_and_applies_nothing(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[2]))
+        });
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        // A duplicate key, which the table refuses.
+        add_bird(&grid, cx, "1", "jay");
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        let (_, _, error) = front_review(&workspace, cx).expect("the review stays");
+        let error = error.expect("the review says why");
+        assert!(error.contains("UNIQUE"), "{error}");
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("3"));
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("1"),
+            "the delete was rolled back"
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "the update was rolled back"
+        );
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            assert_eq!(grid.marked_count(), 1);
+            assert_eq!(grid.added_count(), 1);
+            assert_eq!(
+                grid.pending_value(0, 1),
+                Some(&NewValue::Value("robin".into()))
+            );
+        });
+        assert!(
+            !matches!(front_state(&workspace, cx), QueryState::Failed(_)),
+            "an error pane would cover the rows the draft is staged on"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The review says what it holds: `Apply edits` for staged cells, and
+/// `Apply draft` once the draft holds a row.
+#[gpui::test]
+fn the_review_is_titled_by_what_the_draft_holds(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx).map(|(title, _, _)| title),
+            Some("Apply edits")
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        grid.update(cx, |grid, _| {
+            grid.delegate_mut().discard_pending();
+            assert!(grid.delegate_mut().toggle_marks(&[1]));
+        });
+        focus_grid(&grid, cx);
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx).map(|(title, _, _)| title),
+            Some("Apply draft")
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        focus_grid(&grid, cx);
+        add_bird(&grid, cx, "3", "jay");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx).map(|(title, _, _)| title),
+            Some("Apply draft")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A row deleted and added back with its own key is the person's way to
+/// replace it, and applies: the `DELETE` runs before the `INSERT`.
+#[gpui::test]
+fn a_row_deleted_and_added_back_with_its_key_applies_delete_first(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[1]))
+        });
+        add_bird(&grid, cx, "2", "jay");
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 0));
+        quit(workspace, cx);
+    });
+}
+
 /// A draft holding only an added row is a draft: the Apply and Discard
 /// controls, the palette and the status bar count it, and it can neither be
 /// switched away into Row mode nor read over by a requery unasked.
