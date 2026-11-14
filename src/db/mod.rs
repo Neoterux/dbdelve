@@ -5162,7 +5162,7 @@ mod tests {
         for engine in Engine::ALL {
             assert_eq!(
                 engine.verifies_applies(),
-                engine == Engine::Sqlite,
+                matches!(engine, Engine::Sqlite | Engine::DuckDb),
                 "{engine:?}"
             );
         }
