@@ -2755,7 +2755,50 @@ const NOT_ONE_ROW: &str =
 
 #[cfg(test)]
 mod tests {
-    use super::typed_page;
+    use super::{lone_verification, typed_page};
+    use crate::{db::Engine, db::StepKind, sql};
+
+    /// A lone `INSERT` and a lone `DELETE` the writers produce are accepted by
+    /// `lone_verification` on every engine that verifies an apply, since a
+    /// refusal there is a New row form or a Delete row that stops working.
+    #[test]
+    fn the_new_row_insert_and_the_delete_rows_delete_are_accepted_as_one_step() {
+        for (engine, types) in [
+            (Engine::Sqlite, [("id", "integer"), ("name", "text")]),
+            (Engine::DuckDb, [("id", "INTEGER"), ("name", "VARCHAR")]),
+            (Engine::Postgres, [("id", "int4"), ("name", "text")]),
+        ] {
+            let types: Vec<(String, String)> = types
+                .iter()
+                .map(|(column, kind)| (column.to_string(), kind.to_string()))
+                .collect();
+            let insert = sql::insert_row(
+                engine,
+                "public",
+                "birds",
+                &[("id", Some("3")), ("name", Some("robin"))],
+                &types,
+            )
+            .expect("the form's INSERT is written");
+            let verify = lone_verification(engine, &insert, StepKind::Insert, None, None)
+                .unwrap_or_else(|why| panic!("{engine:?}: {insert}: {why}"));
+            assert_eq!(verify.rows, ["new row"]);
+
+            let delete =
+                sql::delete_row_matching(engine, "public", "birds", &[("id", "2")], &[], &types)
+                    .expect("Delete row's DELETE is written");
+            let verify = lone_verification(
+                engine,
+                &delete,
+                StepKind::Delete,
+                Some((Vec::new(), Some("id = 2".into()))),
+                None,
+            )
+            .unwrap_or_else(|why| panic!("{engine:?}: {delete}: {why}"));
+            assert_eq!(verify.steps.len(), 1);
+            assert!(verify.steps[0].reread.is_some(), "{engine:?}: {delete}");
+        }
+    }
 
     #[test]
     fn a_typed_page_is_the_offset_it_names() {

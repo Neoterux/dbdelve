@@ -22982,7 +22982,8 @@ fn a_row_send_a_trigger_skipped_is_refused_and_keeps_the_edits(cx: &mut TestAppC
 }
 
 /// What the grid shows after a Row send is what the server holds once its
-/// triggers ran, read inside the send's transaction, not what was typed.
+/// triggers ran, read by the send itself and not what was typed, and without
+/// the relation being read again.
 #[gpui::test]
 fn a_verified_row_send_reads_its_row_back_from_inside_the_transaction(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
@@ -22998,9 +22999,19 @@ fn a_verified_row_send_reads_its_row_back_from_inside_the_transaction(cx: &mut T
         let (_, grid) = open_in_row_mode(&workspace, cx);
 
         stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        // A read of the whole relation would show this row; the send's own
+        // read-back replaces its row in place and reads nothing else.
+        behind_the_grid("insert into birds values (3, 'jay')");
         save(&workspace, cx);
 
         assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("FINCH"));
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(
+                grid.delegate().result().rows.len(),
+                2,
+                "the relation was not read again"
+            )
+        });
         assert_eq!(pending_of(&grid, cx), 0);
         assert_eq!(refused_row(&grid, cx), None);
         assert_eq!(
