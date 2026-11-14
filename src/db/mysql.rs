@@ -1525,7 +1525,10 @@ fn describe(error: &::mysql::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ColumnDefinition, ForeignKey, IndexKind, RelationKind, RoutineKind};
+    use crate::db::{
+        ColumnDefinition, FetchedCell, ForeignKey, IndexKind, RelationKind, RoutineKind,
+        VerifiedStep,
+    };
 
     /// The server the `live_` tests talk to, from `dbdelve_MYSQL_URL` or
     /// `dbdelve_MARIADB_URL`.
@@ -3752,6 +3755,90 @@ ORDER BY 1, 2
         );
     }
 
+    /// A one-step verified `UPDATE` through the server's own session, on a row
+    /// of `conformance` of this test's alone.
+    fn live_a_same_value_update_counts_its_matched_row_in_any_server_language(engine: Engine) {
+        use crate::db::{
+            ApplyOutcome, Bracket, CancelToken, StepKind, conformance::verified_steps,
+        };
+
+        let connection = live_profile(engine);
+        let table = engine.qualified("dbdelve_dev", "conformance");
+        let run = |sql: &str| {
+            connection
+                .query(sql, &CancelToken::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("{engine:?}: `{sql}` failed: {error}"))
+        };
+        let delete = format!("DELETE FROM {table} WHERE id = 921");
+        run(&delete);
+        run(&format!(
+            "INSERT INTO {table} (id, label) VALUES (921, {})",
+            engine.quote_literal("same")
+        ));
+        let row = run(&format!("SELECT * FROM {table} WHERE id = 921"));
+        let before: Vec<FetchedCell> = row
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| FetchedCell {
+                column: column.name.clone(),
+                text: row.rows[0].get(index).map(str::to_string),
+                cell_type: None,
+                column_type: column.data_type.clone(),
+            })
+            .collect();
+        let write = |id: u32| {
+            format!(
+                "UPDATE {table} SET {} = {} WHERE {} = '{id}'",
+                engine.quote_identifier("label"),
+                engine.quote_literal("same"),
+                engine.quote_identifier("id"),
+            )
+        };
+        let steps = verified_steps(engine, &write(921), vec![(StepKind::Update, before)]);
+        // The re-read still finds the row, so the write is what counts: it
+        // names a row that is not there.
+        let missing = VerifiedStep {
+            sql: write(929),
+            ..steps[0].clone()
+        };
+        for locale in ["en_US", "ru_RU", "ja_JP"] {
+            run(&format!("SET SESSION lc_messages = '{locale}'"));
+            let outcome = connection.apply_verified(&steps, Bracket::Own, &CancelToken::default());
+            assert!(
+                matches!(outcome, ApplyOutcome::Applied { affected: 1, .. }),
+                "{engine:?} in {locale}: {outcome:?}"
+            );
+            let outcome = connection.apply_verified(
+                std::slice::from_ref(&missing),
+                Bracket::Own,
+                &CancelToken::default(),
+            );
+            assert_eq!(
+                outcome,
+                ApplyOutcome::Miscounted {
+                    step: 0,
+                    count: Some(0)
+                },
+                "{engine:?} in {locale}"
+            );
+        }
+        run("SET SESSION lc_messages = 'en_US'");
+        run(&delete);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MYSQL_URL"]
+    fn live_a_same_value_update_counts_its_matched_row_in_any_server_language_on_mysql() {
+        live_a_same_value_update_counts_its_matched_row_in_any_server_language(Engine::MySql);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MARIADB_URL"]
+    fn live_a_same_value_update_counts_its_matched_row_in_any_server_language_on_mariadb() {
+        live_a_same_value_update_counts_its_matched_row_in_any_server_language(Engine::MariaDb);
+    }
+
     fn conformance_subject(engine: Engine) -> crate::db::conformance::Subject {
         use crate::db::conformance::{COLUMNS, Fixture, Subject, sql_find, sql_read};
         Subject {
@@ -3813,6 +3900,7 @@ ORDER BY 1, 2
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
     );
 
     crate::db::conformance::suite!(
@@ -3835,6 +3923,7 @@ ORDER BY 1, 2
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
     );
 
     on_both_servers!(

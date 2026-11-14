@@ -5309,7 +5309,14 @@ mod tests {
         for engine in Engine::ALL {
             assert_eq!(
                 engine.verifies_applies(),
-                matches!(engine, Engine::Sqlite | Engine::DuckDb | Engine::Postgres),
+                matches!(
+                    engine,
+                    Engine::Sqlite
+                        | Engine::DuckDb
+                        | Engine::Postgres
+                        | Engine::MySql
+                        | Engine::MariaDb
+                ),
                 "{engine:?}"
             );
         }
