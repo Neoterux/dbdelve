@@ -146,6 +146,24 @@ pub(crate) enum DraftRow {
     Added(usize),
 }
 
+/// Which row of the draft a statement of a verified apply was written for, by
+/// what names it and not by where it sits: a marked or edited document by the
+/// key values it was fetched with (a sort in memory moves the fetched rows while
+/// an apply is out), an added row by its place among the added rows, which a
+/// sort never moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the part-way MongoDB landing (10.2-13) names rows by it"
+    )
+)]
+pub(crate) enum StepRow {
+    Fetched(Vec<(String, String)>),
+    Added(usize),
+}
+
 /// A grid's schema and table, and the columns a new row of it fills as
 /// column/type pairs — what the New row form is built from.
 pub type InsertTarget = (String, String, Vec<(String, String)>);
@@ -2719,6 +2737,25 @@ impl ResultGrid {
         marked.chain(updated).chain(added).collect()
     }
 
+    /// The identity of each statement of the draft's batch, in the order
+    /// [`Self::draft_order`] gives them, taken now so it still names the row
+    /// after a sort in memory has moved it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the manifest of a draft (10.2-13) carries it")
+    )]
+    pub(crate) fn draft_identities(&self) -> Vec<StepRow> {
+        Vec::new()
+    }
+
+    /// Takes the rows of `applied` out of the draft: each marked or edited
+    /// document found by its key values, each added row by its place.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the part-way MongoDB landing (10.2-13) calls it")
+    )]
+    pub(crate) fn drop_applied(&mut self, _applied: &[StepRow]) {}
+
     /// What the row is called in what an apply says of it: its key's terms as
     /// `name = value`, `name IS NULL` for a NULL a row named by every value
     /// holds, at most three and then an ellipsis. `None` where the key cannot
@@ -5243,6 +5280,93 @@ mod tests {
                 .cell_types
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn applied_rows_leave_a_mongo_draft_by_identity() {
+        let id = |n: u8| format!("ObjectId('65a4f1c0ffffffffffffff{n:02x}')");
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![typed("_id", "objectId"), typed("name", "string")],
+                rows: rows(
+                    (1..=6u8)
+                        .map(|n| vec![Some(id(n)), Some(format!("name {}", 7 - n))])
+                        .collect(),
+                ),
+                cell_types: vec![vec!["objectId", "string"]; 6],
+                edit: Some(EditTarget {
+                    schema: "dbdelve_dev".into(),
+                    table: "accounts".into(),
+                    columns: vec![Some("_id".into()), Some("name".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        )
+        .with_engine(db::Engine::MongoDb);
+
+        // Two marks, two edited documents, two added rows.
+        assert!(grid.toggle_marks(&[0, 1]));
+        assert!(grid.set_pending(2, 1, NewValue::Value("Three".into())));
+        assert!(grid.set_pending(3, 1, NewValue::Value("Four".into())));
+        for name in ["A", "B"] {
+            let added = grid.add_row().expect("a collection takes an added row");
+            assert!(grid.set_pending(added, 1, NewValue::Value(name.into())));
+        }
+        let identities = grid.draft_identities();
+        assert_eq!(identities.len(), 6, "{identities:?}");
+
+        // The fetched rows move while the apply is out.
+        grid.sort_in_memory(vec![(1, false)]);
+        let at = |grid: &ResultGrid, n: u8| {
+            (0..grid.fetched_rows())
+                .find(|&row| grid.cell(row, 0) == Some(id(n).as_str()))
+                .expect("the document is still in the grid")
+        };
+        assert_ne!(at(&grid, 1), 0, "the sort moved the first document");
+
+        // The first mark, the first edited document and the first added row
+        // applied.
+        let applied = [
+            identities[0].clone(),
+            identities[2].clone(),
+            identities[4].clone(),
+        ];
+        assert_eq!(applied[2], StepRow::Added(0));
+        grid.drop_applied(&applied);
+
+        assert!(!grid.is_marked(at(&grid, 1)));
+        assert!(grid.is_marked(at(&grid, 2)));
+        assert!(grid.pending_cells(at(&grid, 3)).is_empty());
+        assert!(!grid.pending_cells(at(&grid, 4)).is_empty());
+        assert_eq!(grid.added_count(), 1);
+        assert_eq!(
+            grid.pending_value(grid.fetched_rows(), 1),
+            Some(&NewValue::Value("B".into())),
+            "the second added row is the one left"
+        );
+
+        // A second Apply writes only what did not apply.
+        let batch = crate::sql::draft_batch(
+            db::Engine::MongoDb,
+            &grid.draft_deletes(),
+            &grid.pending_updates(),
+            &grid.draft_inserts().expect("the added row holds a value"),
+            true,
+        )
+        .expect("the rest of the draft is written");
+        let statements = crate::sql::generated_writes(db::Engine::MongoDb, &batch)
+            .expect("the batch is one the gate reads");
+        assert_eq!(statements.len(), 3, "{statements:?}");
+        assert!(statements[0].contains("deleteOne") && statements[0].contains("ff02"));
+        assert!(statements[1].contains("updateOne") && statements[1].contains("ff04"));
+        assert!(statements[2].contains("insertOne") && statements[2].contains("\"B\""));
+
+        // An identity no row has changes nothing.
+        grid.drop_applied(&[StepRow::Fetched(vec![("_id".into(), "nobody".into())])]);
+        assert_eq!(grid.pending_count(), 4);
     }
 
     #[test]
