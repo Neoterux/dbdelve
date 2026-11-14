@@ -4479,6 +4479,24 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_commit_is_said_as_an_unknown_outcome() {
+        let said = verified_message(
+            &ApplyOutcome::Unknown(DbError {
+                message: "connection reset by peer".into(),
+                position: None,
+            }),
+            &verification(),
+        )
+        .expect("a lost COMMIT is said");
+
+        assert_eq!(
+            said,
+            "The connection was lost during COMMIT; whether the changes were applied is not known."
+        );
+        assert!(!said.contains("Nothing was applied."), "{said}");
+    }
+
+    #[test]
     fn a_run_answered_without_its_tab_keeps_only_what_the_answer_says() {
         let entry = store::HistoryEntry::started("select 1");
         let streamed = QueryResult {

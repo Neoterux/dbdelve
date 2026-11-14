@@ -1949,6 +1949,12 @@ impl ResultGrid {
         self.send_failure = Some((row, message));
     }
 
+    pub(crate) fn mark_outcome_unknown(&mut self) {}
+
+    pub(crate) fn outcome_unknown(&self) -> bool {
+        false
+    }
+
     /// `sort_in_memory` for rows a snapshot restored already in `keys`' order.
     /// The sort is then a no-op on positions, so the restored ring still names
     /// the cell it did.
@@ -4625,6 +4631,36 @@ mod tests {
             },
             Mode::ReadWrite,
         )
+    }
+
+    #[test]
+    fn an_unknown_outcome_survives_a_memory_sort_and_clears_on_a_reread() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, value("changed")));
+        assert!(!grid.outcome_unknown());
+
+        grid.mark_outcome_unknown();
+        assert!(grid.outcome_unknown());
+
+        // Neither reordering rows the server was not asked about again nor
+        // dropping the draft tells what the server holds.
+        grid.sort_in_memory(vec![(1, true)]);
+        assert!(grid.outcome_unknown(), "a sort in memory reads nothing");
+        assert_eq!(grid.pending_count(), 1, "and the draft stays");
+        grid.discard_pending();
+        assert!(grid.outcome_unknown(), "a discarded draft is not a read");
+
+        // The rows read from the server again replace the grid whole, as the
+        // refresh does; edits carried over are the caller's.
+        let reread = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id")],
+                rows: rows(vec![vec![Some("7".into())]]),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert!(!reread.outcome_unknown());
     }
 
     #[test]
