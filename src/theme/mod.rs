@@ -2190,6 +2190,43 @@ mod tests {
     }
 
     #[test]
+    fn text_stays_legible_over_the_added_updated_and_deleted_washes_in_every_theme() {
+        // A row's state is a wash under its cells, never a colour on the
+        // values: the data is still read at the grid's own AAA.
+        for t in Theme::all() {
+            check(
+                t,
+                "text on an added row",
+                t.text,
+                t.added.flatten(t.bg),
+                AAA_TEXT,
+            );
+            check(
+                t,
+                "text on an updated row",
+                t.text,
+                t.updated.flatten(t.bg),
+                AAA_TEXT,
+            );
+            check(
+                t,
+                "text on a deleted row",
+                t.text,
+                t.deleted.flatten(t.bg),
+                AAA_TEXT,
+            );
+            // A deleted row's struck text is the faint ink.
+            check(
+                t,
+                "faint on a deleted row",
+                t.text_faint,
+                t.deleted.flatten(t.bg),
+                AA_LARGE,
+            );
+        }
+    }
+
+    #[test]
     fn a_coloured_pill_is_visible_and_legible_in_every_theme() {
         // The titlebar's connection name, filled with the connection's own
         // hue. Two things have to hold at once and they pull opposite ways: the

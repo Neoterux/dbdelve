@@ -23558,6 +23558,31 @@ fn a_refused_typed_edit_carried_down_returns_with_the_keyboard_and_the_mark_draw
     });
 }
 
+/// The row's draft state is on its gutter as well as in its wash, since a
+/// wash alone is colour and colour alone is not read the same by everyone.
+#[gpui::test]
+fn an_updated_row_is_marked_on_the_gutter_and_unmarked_when_discarded(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        settle(cx);
+        assert!(cx.debug_bounds("row-updated-0").is_none());
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        settle(cx);
+        assert!(cx.debug_bounds("row-updated-0").is_some());
+        assert!(cx.debug_bounds("row-updated-1").is_none());
+
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        assert!(cx.debug_bounds("row-updated-0").is_none());
+        quit(workspace, cx);
+    });
+}
+
 fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
     cx.update(|window, cx| {
         use gpui::Focusable;

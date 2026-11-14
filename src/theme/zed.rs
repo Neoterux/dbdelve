@@ -554,6 +554,23 @@ mod tests {
             assert_eq!(native_text(&loaded), native_text(&finished(read)));
             assert_eq!(loaded.bg != read.bg, flat.is_glass, "{}", flat.name);
         }
+
+        // The three row washes are a native file's too.
+        let own = Theme {
+            added: Srgb::from_hex(0x11aa44).alpha(0.2),
+            updated: Srgb::from_hex(0x2255dd).alpha(0.3),
+            deleted: Srgb::from_hex(0xcc2233).alpha(0.4),
+            ..Theme::dark()
+        };
+        let text = native_text(&own);
+        let read = native(&serde_json::from_str(&text).unwrap()).unwrap();
+        for (put, got) in [
+            (own.added, read.added),
+            (own.updated, read.updated),
+            (own.deleted, read.deleted),
+        ] {
+            assert_eq!(rgba_hex(got), rgba_hex(put));
+        }
     }
 
     #[test]
