@@ -10,8 +10,8 @@
 use std::ops::Range;
 
 use super::{
-    Call, CursorMethod, JS_OPERATORS, Method, Statement, Target, Value, classify, integer, parse,
-    quoted, writable_field,
+    Call, CursorMethod, JS_OPERATORS, Method, Statement, Target, Value, classify, integer,
+    is_generated_write, parse, quoted, writable_field,
 };
 use crate::filter::{Conjunction, Operator};
 use crate::sql::{SortKey, Verdict};
@@ -307,9 +307,39 @@ pub(crate) fn find_preview(
 }
 
 /// The read that finds the document one generated `updateOne` or `deleteOne`
-/// writes, as an apply reads it again before sending the write.
-pub(crate) fn row_reread(_text: &str) -> Option<String> {
-    None
+/// writes, as an apply reads it again before sending the write: the `find` of
+/// the write's own `{_id: <literal>}`, written as [`find_preview`] writes a
+/// page and handed back only when [`is_generated_read`] admits it.
+///
+/// `None` for anything but exactly one such write that
+/// [`is_generated_write`] admits alone: an `insertOne` has no document to read,
+/// and a draft of several statements is read one statement at a time.
+pub(crate) fn row_reread(text: &str) -> Option<String> {
+    if !is_generated_write(text) {
+        return None;
+    }
+    let statements = parse(text).ok()?;
+    let [
+        Statement {
+            target:
+                Target::Collection {
+                    database: None,
+                    collection,
+                    call,
+                    cursor,
+                },
+            ..
+        },
+    ] = statements.as_slice()
+    else {
+        return None;
+    };
+    if !cursor.is_empty() || !matches!(call.method, Method::UpdateOne | Method::DeleteOne) {
+        return None;
+    }
+    let filter = text.get(call.args.first()?.span.clone())?;
+    let read = find_preview(collection, filter, None, 0);
+    is_generated_read(&read).then_some(read)
 }
 
 /// The size of what [`find_preview`] pages through: `explorer::count_sql`'s

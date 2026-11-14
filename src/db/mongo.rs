@@ -596,11 +596,99 @@ impl Connection {
         Ok(result)
     }
 
-    /// Applies `steps` one statement at a time (see [`ApplyOutcome`]).
-    pub fn apply_verified(&self, _steps: &[VerifiedStep], _cancel: &CancelToken) -> ApplyOutcome {
-        ApplyOutcome::Failed {
-            stage: ApplyStage::Begin,
-            error: plain_error("A MongoDB apply is not written yet.".into()),
+    /// Applies `steps` one statement at a time, with no transaction: every
+    /// step's document is read again by `_id` and compared with the document as
+    /// it was fetched ([`document_drift`]) before anything is written, then
+    /// each write is sent in order and its count, the server's own `n`, must be
+    /// one. The first failure or other count stops the rest unsent.
+    ///
+    /// What the outcome says about how far it got is on [`ApplyOutcome`]: here
+    /// the steps before the one named were applied, and none after it was sent.
+    /// `proceed` is not asked: each statement registers its own run in
+    /// `cancel` ([`Run::start`]), so a Cancel between two of them stops the
+    /// sequence there.
+    ///
+    /// Every write is checked against [`mql::is_generated_write`] and every
+    /// read against [`mql::browse::is_generated_read`] first, whoever built
+    /// the steps, and a statement that fails either leaves the whole draft
+    /// unsent.
+    // ponytail: with no transaction, a document another client changes between
+    // its re-read and its write is overwritten: the compare sees a change made
+    // since the fetch, not one made in those milliseconds. The count still
+    // sees a document that vanished in that window. The upgrade is a session
+    // transaction, which needs a replica set; the compose server is
+    // standalone, so it is deferred.
+    pub fn apply_verified(&self, steps: &[VerifiedStep], cancel: &CancelToken) -> ApplyOutcome {
+        if steps.is_empty() {
+            return ApplyOutcome::Applied {
+                affected: 0,
+                read_back: None,
+            };
+        }
+        let Some(prepared) = steps.iter().map(prepared).collect::<Option<Vec<_>>>() else {
+            return ApplyOutcome::Failed {
+                stage: ApplyStage::Begin,
+                error: plain_error(
+                    "dbdelve refused to run a statement it wrote itself: the draft and its \
+                     statements do not match."
+                        .into(),
+                ),
+            };
+        };
+        let send = |target: &Target| {
+            Run::start(self, cancel).and_then(|run| self.statement(target, run, Fetch::default()))
+        };
+
+        let mut drifted = Vec::new();
+        for (index, (step, prepared)) in steps.iter().zip(&prepared).enumerate() {
+            let Some(read) = &prepared.reread else {
+                continue;
+            };
+            match send(read) {
+                Ok(result) => drifted
+                    .extend(document_drift(&step.before, &result).map(|drift| (index, drift))),
+                Err(error) => {
+                    return ApplyOutcome::Failed {
+                        stage: ApplyStage::Reread(index),
+                        error,
+                    };
+                }
+            }
+        }
+        if !drifted.is_empty() {
+            return ApplyOutcome::Drifted(drifted);
+        }
+
+        let (mut affected, mut read_back) = (0, None);
+        for (index, prepared) in prepared.iter().enumerate() {
+            let count = match send(&prepared.write) {
+                Ok(result) => result.rows_affected,
+                Err(error) => {
+                    return ApplyOutcome::Failed {
+                        stage: ApplyStage::Write(index),
+                        error,
+                    };
+                }
+            };
+            if count != Some(1) {
+                return ApplyOutcome::Miscounted { step: index, count };
+            }
+            affected += 1;
+            if let Some(read) = &prepared.read_back {
+                match send(read) {
+                    Ok(result) => read_back = Some(Box::new(result)),
+                    Err(error) => {
+                        return ApplyOutcome::Failed {
+                            stage: ApplyStage::ReadBack(index),
+                            error,
+                        };
+                    }
+                }
+            }
+        }
+        ApplyOutcome::Applied {
+            affected,
+            read_back,
         }
     }
 
@@ -2252,9 +2340,77 @@ fn affected(mut result: QueryResult, written: &Document) -> QueryResult {
     result
 }
 
+/// One step of a verified apply, read into the statements the driver runs.
+struct Prepared {
+    write: Target,
+    reread: Option<Target>,
+    read_back: Option<Target>,
+}
+
+/// `step` as the statements to send, or `None` when anything in it is not what
+/// dbdelve would have written for it: the write must be exactly one `insertOne`,
+/// `updateOne` or `deleteOne` of its [`StepKind`] that [`mql::is_generated_write`]
+/// admits, its re-read exactly the `find` of the same `_id`
+/// ([`mql::browse::row_reread`]), and a read-back a read
+/// [`mql::browse::is_generated_read`] admits. Read off the parse, not off what
+/// the caller says the step is.
+fn prepared(step: &VerifiedStep) -> Option<Prepared> {
+    let one = |text: &str| {
+        let mut statements = mql::parse(text).ok()?;
+        match statements.len() {
+            1 => statements.pop().map(|statement| statement.target),
+            _ => None,
+        }
+    };
+    let write = one(&step.sql).filter(|target| match target {
+        Target::Collection {
+            database: None,
+            call,
+            cursor,
+            ..
+        } => {
+            cursor.is_empty()
+                && matches!(
+                    (step.kind, call.method),
+                    (StepKind::Insert, Method::InsertOne)
+                        | (StepKind::Update, Method::UpdateOne)
+                        | (StepKind::Delete, Method::DeleteOne)
+                )
+        }
+        _ => false,
+    })?;
+    if !mql::is_generated_write(&step.sql) {
+        return None;
+    }
+    let reread = match (step.kind, &step.reread) {
+        (StepKind::Insert, None) => None,
+        (StepKind::Update | StepKind::Delete, Some(read))
+            if mql::browse::row_reread(&step.sql).as_deref() == Some(read)
+                && mql::browse::is_generated_read(read) =>
+        {
+            Some(one(read)?)
+        }
+        _ => return None,
+    };
+    let read_back = match &step.read_back {
+        None => None,
+        Some(read) if mql::browse::is_generated_read(read) => Some(one(read)?),
+        Some(_) => return None,
+    };
+    Some(Prepared {
+        write,
+        reread,
+        read_back,
+    })
+}
+
 /// How the document as it was fetched differs from its re-read.
-fn document_drift(_before: &[FetchedCell], _reread: &QueryResult) -> Option<Drift> {
-    None
+fn document_drift(_before: &[FetchedCell], reread: &QueryResult) -> Option<Drift> {
+    match reread.rows.as_slice() {
+        [] => Some(Drift::Gone),
+        [_] => None,
+        rows => Some(Drift::Ambiguous(rows.len())),
+    }
 }
 
 /// A reply as one row of its fields.
