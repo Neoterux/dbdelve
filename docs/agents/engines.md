@@ -643,18 +643,23 @@ Decided, and not to be re-litigated:
   preflight before the next statement, leave `@@ROWCOUNT` and `@@ERROR` at
   their own values, not the user's last statement's (known limitation: an
   `sp_executesql` wrapper does not shield them).
-- **A Postgres or DuckDB table with no primary key is edited by every value
-  when all its columns are of a listed type** (`RowMatch::EveryColumn`, the
-  gate and the writers as `docs/agents/gates.md` has them). The result must
-  carry every real column of the table (generated ones are matched, never set,
-  and so are `fixed`); a unique index names no row, so DuckDB's seeded
-  `contacts` and `tally` are edited by every column too. A column of another
-  type, or one the result leaves out, makes the grid read-only with
+- **A Postgres, DuckDB, MySQL, MariaDB or SQL Server table with no primary key
+  is edited by every value when all its columns are of a listed type**
+  (`RowMatch::EveryColumn`, the gate and the writers as `docs/agents/gates.md`
+  has them). The result must carry every real column of the table (generated
+  ones are matched, never set, and so are `fixed`; on SQL Server so are
+  identity and rowversion columns); a unique index names no row, so DuckDB's
+  seeded `contacts` and `tally` are edited by every column too. A column of
+  another type, or one the result leaves out, makes the grid read-only with
   `A table without a primary key is edited by matching every column, and <column>
   (<type>) cannot be matched by its value.` The lists fail closed, each type on
-  one only because a test matched it by the text the grid renders on the
-  engine's own server: `postgres::tests::live_every_listed_type_matches_its_row_by_its_rendered_text`
-  and `duckdb::tests::every_listed_type_matches_its_row_by_its_rendered_text`,
+  one only because a test matched it by the text the grid renders, written back
+  as the writer writes it, on the engine's own server:
+  `postgres::tests::live_every_listed_type_matches_its_row_by_its_rendered_text`,
+  `duckdb::tests::every_listed_type_matches_its_row_by_its_rendered_text`,
+  `mysql::tests::live_every_listed_type_matches_its_row_by_its_rendered_text_on_mysql`
+  and `_on_mariadb`, and
+  `mssql::tests::live_every_listed_type_matches_its_row_by_its_rendered_text`,
   which also pin the types left off.
   - Postgres lists `bpchar`, `varchar`, `text`, `int2`, `int4`, `int8`,
     `numeric`, `float4`, `float8`, `bool`, `bytea`, `jsonb`, `money`,
@@ -677,6 +682,31 @@ Decided, and not to be re-litigated:
     arrays, `BIGNUM`, unions and the `TIMESTAMP_*` variants. A `TIME` of
     `24:00:00` renders as an error text and is found by nothing, which refuses
     the write rather than naming another row.
+  - MySQL and MariaDB share one list, by the catalog's `DATA_TYPE`: `tinyint`,
+    `smallint`, `mediumint`, `int`, `bigint`, `decimal`, `double`, `char`,
+    `varchar`, `tinytext`, `text`, `mediumtext`, `longtext`, `date`, `time`,
+    `datetime`, `timestamp`, `year`, `enum` and `set`. Left off: `float` and
+    `json`, because an `=` against their own rendered text matches nothing (a
+    `FLOAT` is held as a single and compared as a double, a JSON value is never
+    equal to a string), so a row that is there would read as gone; the byte
+    types (`binary`, `varbinary`, the blobs, `bit`), which the grid renders as
+    `0x…` and the writer quotes as that text, which finds nothing; and
+    `geometry` and `vector`, never exercised. MariaDB has no JSON type: its
+    `JSON` is a `LONGTEXT` with a `json_valid` check named for the column, and
+    the catalog query reports such a column as `json`, so it is left off there
+    too. Only a base table qualifies; a view has no rows to write back.
+  - SQL Server lists `tinyint`, `smallint`, `int`, `bigint`, `decimal`,
+    `numeric`, `real`, `float`, `money`, `smallmoney`, `bit`, `char`,
+    `varchar`, `nchar`, `nvarchar`, `date`, `time`, `datetime`, `datetime2`,
+    `smalldatetime`, `datetimeoffset`, `uniqueidentifier`, `binary` and
+    `varbinary`, by `TYPE_NAME` of the column's user type. Left off: `xml`,
+    `text`, `ntext` and `image` (no `=`: the server answers the comparison with
+    an error, which inside the apply's transaction would be a failed write),
+    `geography`, `geometry`, `hierarchyid` and `sql_variant` (the driver
+    cannot read them: a statement that returns one is not run, and a table's
+    preview reads it as text, which leaves that grid read-only naming the
+    column), `timestamp` (rowversion), and an alias type. Only a user table
+    qualifies.
   - These targets never join a transaction the user opened
     (`Verification.keyed`), as SQLite's keyless one does not.
 - **The Structure tab reads more than one privilege level can see.** An alias

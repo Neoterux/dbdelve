@@ -35,9 +35,10 @@ use tracing::span;
 use super::ssh::{Tunnel, tunnelled};
 use super::{
     ApplyOutcome, ApplyStage, Bracket, Catalog, Cell, Column, DbError, EditTarget, Engine, Fetch,
-    QueryResult, Reference, RelationKind, Row, Sending, ServerConfig, SslMode, Stopped, Structure,
-    VerifiedStep, assemble_catalog, assemble_databases, assemble_foreign_keys, assemble_references,
-    assemble_sequences, assemble_structure, create_table, plain_error, required_cell, terminated,
+    QueryResult, Reference, RelationKind, Row, RowMatch, Sending, ServerConfig, SslMode, Stopped,
+    Structure, VerifiedStep, assemble_catalog, assemble_databases, assemble_foreign_keys,
+    assemble_references, assemble_sequences, assemble_structure, create_table, plain_error,
+    required_cell, terminated,
 };
 
 const DATABASES_SQL: &str = "
@@ -392,9 +393,11 @@ ORDER BY ic.key_ordinal
 // What a table with no primary key is edited by: each of its columns and the
 // type the catalog names. `sys.tables` is what keeps a view out: its rows are
 // no table's, and it has no primary key to have been refused for. A column
-// that is an alias type reports the alias, which is on no list.
+// that is an alias type reports the alias, which is on no list, or its base
+// type where the login cannot see the alias.
 const EDIT_COLUMNS_SQL: &str = "
-SELECT c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type
+SELECT c.name AS column_name,
+       COALESCE(TYPE_NAME(c.user_type_id), TYPE_NAME(c.system_type_id)) AS data_type
 FROM sys.tables AS t
 JOIN sys.columns AS c ON c.object_id = t.object_id
 WHERE t.object_id = {object}
@@ -2216,22 +2219,117 @@ fn table_columns(result: &QueryResult) -> Option<Vec<TableColumn>> {
 }
 
 /// Whether `=` against a column's value rendered as text finds it, for the
-/// type [`EDIT_COLUMNS_SQL`] names.
+/// type [`EDIT_COLUMNS_SQL`] names. Fail closed: only types the compose server
+/// was seen to match are listed.
+///
+/// ponytail: a type is added when
+/// `tests::live_every_listed_type_matches_its_row_by_its_rendered_text`
+/// exercises it. Left off: `xml`, `text`, `ntext` and `image`, which have no `=`
+/// (the server answers a comparison with an error, mid-transaction); `geography`,
+/// `geometry`, `hierarchyid` and `sql_variant`, which this driver cannot read;
+/// `timestamp` (rowversion) and any alias type, never exercised.
 fn is_matchable(data_type: &str) -> bool {
-    let _ = data_type;
-    false
+    matches!(
+        data_type,
+        "tinyint"
+            | "smallint"
+            | "int"
+            | "bigint"
+            | "decimal"
+            | "numeric"
+            | "real"
+            | "float"
+            | "money"
+            | "smallmoney"
+            | "bit"
+            | "char"
+            | "varchar"
+            | "nchar"
+            | "nvarchar"
+            | "date"
+            | "time"
+            | "datetime"
+            | "datetime2"
+            | "smalldatetime"
+            | "datetimeoffset"
+            | "uniqueidentifier"
+            | "binary"
+            | "varbinary"
+    )
 }
 
-/// The target of a result set over a table with no primary key, or the reason
-/// it has none.
+/// The target of a result set over a table with no primary key: every column
+/// of the table names the row, a NULL as `IS NULL`, the computed, identity and
+/// rowversion columns matched but never set. Or the reason it cannot be, when
+/// the user can do something about it.
+///
+/// Never a unique index, and never some of the columns: a column left out of
+/// the `WHERE` matches rows the user is not looking at, so a column that cannot
+/// be matched by its value, or that the result omits, makes the whole result
+/// read-only.
 fn resolve_keyless_target(
     probed: &[ProbedColumn],
     schema: &str,
     table: &str,
     columns: &[TableColumn],
 ) -> (Option<EditTarget>, Option<String>) {
-    let _ = (probed, schema, table, columns, is_matchable);
-    (None, None)
+    let refusal = |what: String| {
+        Some(format!(
+            "A table without a primary key is edited by matching every column, and {what}."
+        ))
+    };
+    // Before the shape of the result: a column the driver cannot read is sent
+    // as an expression, and the table is still the one it is a column of.
+    if let Some(column) = columns
+        .iter()
+        .find(|column| !is_matchable(&column.data_type))
+    {
+        return (
+            None,
+            refusal(format!(
+                "{} ({}) cannot be matched by its value",
+                column.name, column.data_type
+            )),
+        );
+    }
+    let column_of = |column: &ProbedColumn| column.table.as_ref().and(column.column.clone());
+    // As for a key: two result columns reading one table column are the two
+    // sides of a self-join, and a column computed beside the real ones is no
+    // table's row.
+    let mut origins = HashSet::new();
+    if !probed
+        .iter()
+        .map(column_of)
+        .all(|column| column.is_some_and(|column| origins.insert(column)))
+    {
+        return (None, None);
+    }
+    let mut keys = Vec::new();
+    let mut fixed = Vec::new();
+    for column in columns {
+        let Some(at) = probed
+            .iter()
+            .position(|probed| column_of(probed).as_deref() == Some(column.name.as_str()))
+        else {
+            return (
+                None,
+                refusal(format!("{} is not in the result", column.name)),
+            );
+        };
+        keys.push(at);
+        if !probed[at].writable {
+            fixed.push(at);
+        }
+    }
+    let target = EditTarget {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        columns: probed.iter().map(column_of).collect(),
+        keys,
+        row_match: RowMatch::EveryColumn { fixed },
+        ..Default::default()
+    };
+    (Some(target), None)
 }
 
 /// A relation name is user data and can contain a quote. `QUOTENAME` brackets
