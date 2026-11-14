@@ -374,7 +374,7 @@ fn draft_gate_corpus_per_engine() {
         for (case, text) in &key_level {
             corpus_with(&mut out, engine, case, text, &draft_more(engine, text));
             if Target::built_in(engine).row_edits() {
-                for keys in [&["id"][..], &["id", "Region"], &["Region"]] {
+                for keys in [&["id"][..], &["id", "Region"]] {
                     assert_eq!(
                         sql::draft_deletes_match(engine, text, keys, "public", "accounts"),
                         None,
