@@ -1890,6 +1890,10 @@ impl Workspace {
             self.snap_back_to(tab, row, to, cx);
             return false;
         }
+        let defaulted = pending
+            .sets
+            .iter()
+            .any(|(_, value)| matches!(value, NewValue::Default));
         let update = match update_batch(self.engine(), &[pending]) {
             Ok(update) => update,
             Err(message) => {
@@ -1905,6 +1909,21 @@ impl Workspace {
             return false;
         }
         let Some(read) = sql::row_read(self.engine(), &update) else {
+            // A row named by every value is read back by the values it now
+            // holds, and one set to DEFAULT holds none the statement spells.
+            if defaulted && names_rows_by_every_column(results.read(cx).delegate()) {
+                results.update(cx, |table, cx| {
+                    table.delegate_mut().set_send_failure(
+                        row,
+                        "The row was not sent: a value set to DEFAULT \
+                         cannot be read back on a row named by every value."
+                            .into(),
+                    );
+                    cx.notify();
+                });
+                self.snap_back_to(tab, row, to, cx);
+                return false;
+            }
             self.note(
                 "dbdelve refused to run a statement it wrote itself: it is not the read of one \
                  row."
