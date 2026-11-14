@@ -1341,11 +1341,15 @@ pub fn row_guard(engine: Engine, statement: &str) -> Option<String> {
 ///
 /// `<t>` and `<p>` are cut from the tree the write gate reads, never from the
 /// generator's word, and only from a statement the gate admits whose predicate
-/// is a conjunction of one-row terms. The assignments are not inspected: the
-/// gate has already read them, and a `DEFAULT` among them is no reason to leave
-/// the row unread. `None` for anything else -- more than one statement, a
-/// statement that is not an `UPDATE` -- and for a read [`is_generated_select`]
-/// does not admit: a caller that gets no read sends nothing.
+/// is a conjunction of one-row terms. A key column is never assigned, so on a
+/// row named by its key `<p>` is the update's own. A row named by every value
+/// is found again only by the values it now holds: each term of a column the
+/// `SET` assigns is replaced by that assignment's literal (`IS NULL` for a
+/// NULL), and a column assigned anything else that the predicate names -- a
+/// `DEFAULT` -- has no known value, so there is no read. `None` for anything
+/// else too -- more than one statement, a statement that is not an `UPDATE` --
+/// and for a read [`is_generated_select`] does not admit: a caller that gets
+/// no read sends nothing.
 ///
 /// ClickHouse's `ALTER TABLE … UPDATE` is read as the update it is, so it has a
 /// read too; no Row send is made there (`Target::row_edits`).
@@ -1360,15 +1364,85 @@ pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
     let text = as_written(spec, statement)?;
     let tree = parse_write(&text, spec.backslash_escapes)?;
     let [one] = only_statement(&tree.root_node())?;
-    let (table, _, filter) = update_parts(one)?;
+    let (table, assignments, filter) = update_parts(one)?;
     let predicate = predicate_of(filter)?;
     row_columns(spec, predicate, &text)?;
     let read = format!(
         "SELECT * FROM {} WHERE {}",
         text.get(table.byte_range())?,
-        text.get(predicate.byte_range())?
+        held_predicate(spec, predicate, &assignments, &text)?
     );
     is_generated_select(engine, &read).then_some(read)
+}
+
+/// `predicate`'s text with each term of a column `assignments` set naming the
+/// value that column now holds, or `None` where it holds none the statement
+/// spells: an assignment that is neither a literal nor `NULL`.
+fn held_predicate(
+    spec: &SqlSpec,
+    predicate: Node,
+    assignments: &[Node],
+    sql: &str,
+) -> Option<String> {
+    let mut set = Vec::new();
+    for assignment in assignments {
+        let mut cursor = assignment.walk();
+        let sides: Vec<_> = assignment.children(&mut cursor).collect();
+        let [left, _, right] = sides.as_slice() else {
+            return None;
+        };
+        let held = if literal_value(*right, sql) {
+            Some(format!(" = {}", sql.get(right.byte_range())?))
+        } else if null_literal(*right, sql) {
+            Some(" IS NULL".to_owned())
+        } else {
+            None
+        };
+        // An assignment's target is an `identifier` where a predicate's column
+        // is a `field` or a `literal`, so it is unquoted from its own text.
+        let target = sql.get(left.byte_range())?;
+        let column = match target.chars().next()? {
+            quote @ ('"' | '`') => unquote(target, quote),
+            _ => target.to_owned(),
+        };
+        set.push((column, held));
+    }
+
+    let mut terms = Vec::new();
+    conjuncts(predicate, &mut terms);
+    let (start, end) = (predicate.start_byte(), predicate.end_byte());
+    let (mut text, mut at) = (String::new(), start);
+    for term in terms {
+        let mut named = Vec::new();
+        if !equality_columns(spec, term, sql, &mut named) {
+            return None;
+        }
+        let Some((_, held)) = set.iter().find(|(column, _)| named.contains(column)) else {
+            continue;
+        };
+        let mut cursor = term.walk();
+        let left = term.children(&mut cursor).next()?;
+        text.push_str(sql.get(at..left.end_byte())?);
+        text.push_str(held.as_deref()?);
+        at = term.end_byte();
+    }
+    text.push_str(sql.get(at..end)?);
+    Some(text)
+}
+
+/// The terms of a conjunction, in the order they are written.
+fn conjuncts<'tree>(node: Node<'tree>, terms: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    match children.as_slice() {
+        [left, operator, right]
+            if node.kind() == "binary_expression" && operator.kind() == "keyword_and" =>
+        {
+            conjuncts(*left, terms);
+            conjuncts(*right, terms);
+        }
+        _ => terms.push(node),
+    }
 }
 
 /// `SELECT * FROM <t> WHERE <p>` for one generated `UPDATE` or one-row `DELETE`:
