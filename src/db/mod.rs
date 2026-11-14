@@ -668,6 +668,14 @@ impl Engine {
         }
     }
 
+    /// Whether a connection to this engine verifies an apply: has an arm of
+    /// [`Connection::apply_verified`].
+    #[cfg(test)]
+    #[allow(dead_code)] // RED stub: removed with the implementation
+    pub fn verifies_applies(self) -> bool {
+        false
+    }
+
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
     ///
     /// Where it is not, the gesture has to be withheld rather than attempted.
@@ -3858,6 +3866,119 @@ impl std::fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+/// What one statement of a verified apply writes.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// One column of a row as it was fetched: the text the grid held, by the real
+/// column's name and not by position, copied by value when the review was
+/// written, since an in-memory sort can move rows while a review is open.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FetchedCell {
+    pub column: String,
+    /// `None` for a NULL.
+    pub text: Option<String>,
+    /// The cell's own type where the result types each cell, as MongoDB's
+    /// does; `None` on every SQL engine, whose columns are typed whole.
+    pub cell_type: Option<String>,
+    /// The fetched column's [`Column::data_type`]. Never compared: an arm's
+    /// skip predicate reads it to leave out a cell the grid renders after the
+    /// fetch.
+    pub column_type: Option<String>,
+}
+
+/// One statement of a verified apply, with what proves the row it writes is
+/// still the row the user read.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedStep {
+    /// One statement [`crate::sql::generated_writes`] cut out of the gated
+    /// text, without its bracket.
+    pub sql: String,
+    pub kind: StepKind,
+    /// The read of the row an `UPDATE` or a `DELETE` names, taken inside the
+    /// apply's transaction before any write ([`crate::sql::row_reread`]).
+    /// `None` for an `INSERT`, which has no row to read.
+    pub reread: Option<String>,
+    /// The row as it was fetched, empty for an `INSERT`.
+    pub before: Vec<FetchedCell>,
+}
+
+/// Whose transaction a verified apply runs in.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bracket {
+    /// The apply opens one and ends it, and rolls it back on any exit before
+    /// its `COMMIT`.
+    Own,
+    /// The user's own is open on the session: nothing is opened, committed or
+    /// rolled back, so the writes stay in it for the user to end.
+    Joined,
+}
+
+/// Where a verified apply stopped.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyStage {
+    Begin,
+    Reread(usize),
+    Write(usize),
+    Commit,
+}
+
+/// How a row differs from the row as it was fetched.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Drift {
+    /// It is there, and a column differs or is missing.
+    Changed,
+    /// The re-read returned no row.
+    Gone,
+    /// The re-read returned this many rows, where one was named.
+    Ambiguous(usize),
+}
+
+/// What a verified apply came to.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// Every statement counted the one row it was written for, and the
+    /// transaction committed. `affected` is the rows written, all together.
+    Applied { affected: u64 },
+    /// No write was sent: these steps' rows are not the rows that were read.
+    Drifted(Vec<(usize, Drift)>),
+    /// A statement counted another number of rows than the one it names; the
+    /// whole sequence was rolled back.
+    Miscounted { step: usize, count: Option<u64> },
+    /// The server refused something before `COMMIT`: nothing the apply opened
+    /// stayed applied.
+    Failed { stage: ApplyStage, error: DbError },
+}
+
+/// Compares the row as it was fetched with the row read again.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+pub(crate) fn drift(
+    _before: &[FetchedCell],
+    _reread: &QueryResult,
+    _skipped: impl Fn(&FetchedCell) -> bool,
+) -> Option<Drift> {
+    None
+}
+
 /// The second half of the catalog: the routines, with the sequences joined
 /// in where the engine lists them.
 ///
@@ -4619,6 +4740,148 @@ mod tests {
             );
         }
         assert!(check_time_zone("").is_err() && check_time_zone("   ").is_err());
+    }
+
+    #[test]
+    fn only_the_engines_with_an_arm_verify_an_apply() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                engine.verifies_applies(),
+                engine == Engine::Sqlite,
+                "{engine:?}"
+            );
+        }
+    }
+
+    fn fetched(column: &str, text: Option<&str>) -> FetchedCell {
+        FetchedCell {
+            column: column.into(),
+            text: text.map(Into::into),
+            cell_type: None,
+            column_type: None,
+        }
+    }
+
+    fn reread(columns: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
+        QueryResult {
+            columns: columns
+                .iter()
+                .map(|name| Column {
+                    name: (*name).into(),
+                    data_type: None,
+                })
+                .collect(),
+            rows: rows
+                .iter()
+                .map(|cells| Row::new(cells.iter().copied()).unwrap())
+                .collect(),
+            ..QueryResult::default()
+        }
+    }
+
+    #[test]
+    fn a_fetched_row_matches_its_reread_by_column_name_and_a_changed_or_missing_one_is_drift() {
+        let before = [fetched("id", Some("7")), fetched("name", Some("wren"))];
+        let same = |result: &QueryResult| drift(&before, result, |_| false);
+
+        assert_eq!(
+            same(&reread(&["id", "name"], &[&[Some("7"), Some("wren")]])),
+            None
+        );
+        assert_eq!(
+            same(&reread(&["name", "id"], &[&[Some("wren"), Some("7")]])),
+            None,
+            "another column order is the same row"
+        );
+        assert_eq!(
+            same(&reread(
+                &["id", "name", "added_since"],
+                &[&[Some("7"), Some("wren"), Some("x")]]
+            )),
+            None,
+            "a column the manifest does not hold is not compared"
+        );
+        assert_eq!(
+            drift(
+                &[fetched("note", None)],
+                &reread(&["note"], &[&[None]]),
+                |_| false
+            ),
+            None,
+            "NULL equals NULL"
+        );
+        // Whole, byte for byte: no trimming, no case folding.
+        for changed in ["wren ", "Wren", "", "wrens"] {
+            assert_eq!(
+                same(&reread(&["id", "name"], &[&[Some("7"), Some(changed)]])),
+                Some(Drift::Changed),
+                "{changed:?}"
+            );
+        }
+        assert_eq!(
+            same(&reread(&["id", "name"], &[&[Some("7"), None]])),
+            Some(Drift::Changed),
+            "a value turned NULL"
+        );
+        assert_eq!(
+            drift(
+                &[fetched("note", None)],
+                &reread(&["note"], &[&[Some("")]]),
+                |_| false
+            ),
+            Some(Drift::Changed),
+            "a NULL turned the empty string"
+        );
+        assert_eq!(
+            same(&reread(&["id"], &[&[Some("7")]])),
+            Some(Drift::Changed),
+            "a manifest column the re-read lacks"
+        );
+        assert_eq!(same(&reread(&["id", "name"], &[])), Some(Drift::Gone));
+        assert_eq!(
+            same(&reread(
+                &["id", "name"],
+                &[&[Some("7"), Some("wren")], &[Some("7"), Some("wren")]]
+            )),
+            Some(Drift::Ambiguous(2))
+        );
+
+        // A cell the arm's predicate names is not compared.
+        let spatial = [
+            fetched("id", Some("7")),
+            fetched("geom", Some("POINT(1 2)")),
+        ];
+        assert_eq!(
+            drift(
+                &spatial,
+                &reread(&["id", "geom"], &[&[Some("7"), Some("0101")]]),
+                |cell| cell.column == "geom"
+            ),
+            None
+        );
+
+        // Where both sides type the cell, a different type is a different value.
+        let typed = FetchedCell {
+            cell_type: Some("int".into()),
+            ..fetched("n", Some("1"))
+        };
+        let mut result = reread(&["n"], &[&[Some("1")]]);
+        result.cell_types = vec![vec!["double"]];
+        assert_eq!(
+            drift(std::slice::from_ref(&typed), &result, |_| false),
+            Some(Drift::Changed)
+        );
+        result.cell_types = vec![vec!["int"]];
+        assert_eq!(
+            drift(std::slice::from_ref(&typed), &result, |_| false),
+            None
+        );
+        result.cell_types = Vec::new();
+        assert_eq!(
+            drift(std::slice::from_ref(&typed), &result, |_| false),
+            None,
+            "an untyped side is not compared by type"
+        );
     }
 
     #[test]

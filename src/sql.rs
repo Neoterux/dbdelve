@@ -1371,6 +1371,11 @@ pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
     is_generated_select(engine, &read).then_some(read)
 }
 
+#[cfg(test)]
+pub(crate) fn row_reread(_engine: Engine, _statement: &str) -> Option<String> {
+    None
+}
+
 /// Whether `sql` is a `SELECT` dbdelve could have written: exactly one root
 /// statement, a query, with nothing destructive anywhere under it.
 ///
@@ -8096,6 +8101,81 @@ mod tests {
             row_read(Engine::MongoDb, "db.t.updateOne({_id: 1}, {$set: {a: 1}})"),
             None
         );
+    }
+
+    #[test]
+    fn a_row_reread_is_cut_from_the_gated_update_or_delete_and_refuses_anything_else() {
+        use crate::db::Target;
+
+        let engines: Vec<_> = Engine::ALL
+            .into_iter()
+            .filter(|engine| Target::built_in(*engine).row_edits())
+            .collect();
+        assert!(engines.len() > 1, "{engines:?}");
+        for engine in engines {
+            let table = engine.spec().qualified("public", "accounts");
+            for keys in [vec![("id", "7")], vec![("id", "7"), ("rev", "2")]] {
+                let row = pending_row(&[("name", set("wren")), ("note", NewValue::Default)], &keys);
+                let update = update_batch(engine, std::slice::from_ref(&row)).unwrap();
+                let delete = delete_row(engine, "public", "accounts", &keys, &[]).unwrap();
+                for statement in [update, delete] {
+                    let predicate = statement
+                        .trim_end_matches(';')
+                        .rsplit_once(" WHERE ")
+                        .unwrap()
+                        .1
+                        .to_string();
+                    let reread = row_reread(engine, &statement)
+                        .unwrap_or_else(|| panic!("{engine:?} read nothing of {statement}"));
+                    assert_eq!(
+                        reread,
+                        format!("SELECT * FROM {table} WHERE {predicate}"),
+                        "{engine:?}"
+                    );
+                    assert!(is_generated_select(engine, &reread), "{engine:?} {reread}");
+                    // The apply sends a draft's statements one at a time, so
+                    // the unbracketed text of one is its own single statement.
+                    assert_eq!(
+                        generated_writes(engine, &statement),
+                        Some(vec![statement.trim_end_matches(';').to_string()]),
+                        "{engine:?}"
+                    );
+                }
+            }
+        }
+
+        let engine = Engine::Postgres;
+        let one = pending_row(&[("name", set("a"))], &[("id", "1")]);
+        let two = pending_row(&[("name", set("b"))], &[("id", "2")]);
+        let batch = update_batch(engine, &[one, two]).unwrap();
+        let insert = insert_row(engine, "public", "accounts", &[("name", Some("a"))], &[]).unwrap();
+        for refused in [
+            batch.as_str(),
+            insert.as_str(),
+            "BEGIN",
+            "COMMIT",
+            "DELETE FROM t",
+            "DELETE FROM t WHERE id > '7'",
+            "UPDATE t SET a = a + 1 WHERE id = 1",
+            "SELECT * FROM t WHERE id = '7'",
+        ] {
+            assert_eq!(row_reread(engine, refused), None, "{refused}");
+        }
+        // Two statements of a bracketed batch are two rows, never one read.
+        let bracketed = update_batch(
+            Engine::Sqlite,
+            &[
+                pending_row(&[("name", set("a"))], &[("id", "1")]),
+                pending_row(&[("name", set("b"))], &[("id", "2")]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(row_reread(Engine::Sqlite, &bracketed), None, "{bracketed}");
+        assert_eq!(
+            row_reread(Engine::MongoDb, "db.t.deleteOne({_id: 1})"),
+            None
+        );
+        assert_eq!(row_reread(Engine::Redis, "DEL k"), None);
     }
 
     fn set(value: &str) -> NewValue {
