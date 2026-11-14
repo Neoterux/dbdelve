@@ -3746,6 +3746,7 @@ ORDER BY 1, 2
         executable_comments_agree_with_the_server,
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
+        generated_draft_round_trip,
     );
 
     crate::db::conformance::suite!(
@@ -3767,6 +3768,7 @@ ORDER BY 1, 2
         executable_comments_agree_with_the_server,
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
+        generated_draft_round_trip,
     );
 
     on_both_servers!(
