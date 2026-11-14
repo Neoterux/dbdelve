@@ -45,12 +45,13 @@ require it, stop and raise it instead.
    `mql::format` on MongoDB), never an AST round-trip, which drops every
    comment the user wrote. Row mode is the one exception: on a relation tab
    whose view the user has put in Row mode, a row's `UPDATE` is sent when the
-   user leaves the row, presses Save, or takes an action that saves it first,
-   with no buffer and no dialog, and nothing else sends it (a read after a send
-   never sends another row). That send is the user's own act; it still
-   passes `sql::is_generated_write_on` and the connection-mode check as it is
-   sent, is written to the query history, and the last one is shown in the
-   status line. Draft, the default, sends nothing unread, and no agent's
+   user leaves the row (the ring moves off it, or a step key goes
+   past the grid's edge from a cell's input), presses Save, or takes an
+   action that saves it first, with no buffer and no dialog, and nothing
+   else sends it (a read after a send never sends another row). That send is
+   the user's own act; it still passes `sql::is_generated_write_on` and the
+   connection-mode check as it is sent, is written to the query history, and
+   the last one is shown in the status line. Draft, the default, sends nothing unread, and no agent's
    statement takes this path.
 
    It never writes `DROP` or `TRUNCATE` into a buffer or onto the wire. It

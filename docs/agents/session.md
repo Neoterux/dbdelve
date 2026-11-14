@@ -719,7 +719,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   on screen; pending edits move with their rows.
 - **A view's edit mode is its own (`session::EditMode`).** `Draft` holds every
   edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
-  row is left or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
+  row is left (a ring move off it, or a step key past the grid's edge from a
+  cell's input) or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
   send still passes). It lives on a relation tab beside `sorting`, is switched
   from the status bar chips or the palette, starts from the Default edit mode
   setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
@@ -733,8 +734,15 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   The one writer of a Row send is `Workspace::save_row`; Save and the funnel
   are its callers. The funnel is `ResultGrid::take_left_row`, which marks the
   row the ring leaves while it holds edits or an input, and
-  `Workspace::flush_left_row`, which consumes the mark in the grid's selection
-  events and sends only in a Row view. The send is `Refresh::Row`: it writes
+  `Workspace::flush_left_row`, which runs on the grid's `SelectRow`,
+  `ClearSelection` and `SelectColumn` events. It first stages the text of an
+  input the move closed (`ResultGrid::commit_closed_input`, by `commit_text`'s
+  rule, so an added row's untouched cell stays out of its `INSERT`) in every
+  view and on a query tab's grid alike, and sends only in a Row view. A step key
+  at the grid's edge with an input open is handed to the workspace as
+  `StepPastEdge`: in a Row view it commits the input and sends the row, the ring
+  left on the cell, and in a Draft view or on a query tab it leaves the input
+  open. The send is `Refresh::Row`: it writes
   the `UPDATE` and, in the same background task, reads the row back by its key
   (`sql::row_read`). The landing replaces that row where it stands
   (`ResultGrid::replace_row`) and clears the cells that were sent
