@@ -538,6 +538,13 @@ mod tests {
     fn only_mongodb_orders_its_edits_and_keeps_them_with_the_transactional_engines() {
         for engine in Engine::ALL {
             let target = Target::built_in(engine);
+            // Row mode is offered where edits are kept, and a Row send with no
+            // `Verification` is refused only on a target that verifies: so a
+            // target that keeps its edits must verify them.
+            assert!(
+                !target.keeps_edits() || target.verifies_applies(),
+                "{engine:?}"
+            );
             assert_eq!(
                 target.ordered_edits(),
                 engine == Engine::MongoDb,
