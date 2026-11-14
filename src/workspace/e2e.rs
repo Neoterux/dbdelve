@@ -19751,17 +19751,30 @@ fn counted_inserts(
     Some(crate::session::Verification {
         rows: vec!["new row".to_string(); steps.len()],
         steps,
+        keyed: true,
     })
 }
 
 /// Applies `sql` from the tab in front as an edit does, reading back
 /// `SELECT count(*) FROM t` once it lands.
 fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
+    apply_from_the_front_tab_keyed(workspace, cx, sql, true);
+}
+
+/// [`apply_from_the_front_tab`] with the write's `keyed` said: whether its row
+/// is named by a primary key, as the grid's edit target would say.
+fn apply_from_the_front_tab_keyed(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+    keyed: bool,
+) {
     use crate::session::Refresh;
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
-    let verify = counted_inserts(workspace, cx, sql);
+    let verify = counted_inserts(workspace, cx, sql)
+        .map(|verify| crate::session::Verification { keyed, ..verify });
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
             sql.into(),
@@ -19946,6 +19959,40 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
                 .any(|statement| statement.starts_with("UPDATE")),
             "the write is listed with the transaction it joined"
         );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_write_not_named_by_its_primary_key_is_refused_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        let insert = generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "7")]);
+
+        // As a write on a target that names its rows by every column is sent:
+        // one statement, but one that could count two rows.
+        apply_from_the_front_tab_keyed(&workspace, cx, &insert, false);
+        assert_eq!(edit_notice(&workspace, cx), DRAFT_IN_TRANSACTION);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("0"),
+            "nothing was sent"
+        );
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+
+        // The same write named by its key joins.
+        apply_from_the_front_tab_keyed(&workspace, cx, &insert, true);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        assert!(in_transaction(&workspace, cx));
         quit(workspace, cx);
     });
 }
@@ -27785,6 +27832,7 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                 read_back: None,
             }],
             rows: vec!["id = 1".into()],
+            keyed: true,
         });
         workspace.update(cx, |workspace, cx| {
             workspace.execute_and_then(
