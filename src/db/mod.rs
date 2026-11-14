@@ -674,12 +674,11 @@ impl Engine {
     /// [`Connection::generated`], and one added later must be decided here.
     pub fn verifies_applies(self) -> bool {
         match self {
-            Self::Sqlite => true,
+            Self::Sqlite | Self::DuckDb => true,
             Self::Postgres
             | Self::MySql
             | Self::MariaDb
             | Self::Turso
-            | Self::DuckDb
             | Self::Snowflake
             | Self::ClickHouse
             | Self::SqlServer
@@ -2253,6 +2252,32 @@ impl Connection {
         bracket: Bracket,
         cancel: &CancelToken,
     ) -> ApplyOutcome {
+        self.apply_verified_as(None, steps, bracket, cancel)
+    }
+
+    /// [`Connection::apply_verified`] for a tab bound to a database and
+    /// schema, put back in the same acquisition of the session's lock as the
+    /// sequence. SQLite has no binding to put back, so it is the unbound form.
+    pub(crate) fn apply_verified_bound(
+        &self,
+        schema: Option<&str>,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        cancel: &CancelToken,
+    ) -> ApplyOutcome {
+        self.apply_verified_as(Some(schema), steps, bracket, cancel)
+    }
+
+    /// `bound` is the schema to put the session back on first, itself `None`
+    /// for the database's default, when the apply is a bound tab's, as in
+    /// [`Connection::query_bound`].
+    fn apply_verified_as(
+        &self,
+        bound: Option<Option<&str>>,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        cancel: &CancelToken,
+    ) -> ApplyOutcome {
         running_on(cancel, self, |held| {
             // The first ask registers the run and checks for a Cancel that came
             // first; every later one only checks.
@@ -2269,11 +2294,13 @@ impl Connection {
             };
             match self {
                 Self::Sqlite(connection) => connection.apply_verified(steps, bracket, &proceed),
+                Self::DuckDb(connection) => {
+                    connection.apply_verified(bound, steps, bracket, &proceed)
+                }
                 Self::Postgres(_)
                 | Self::MySql(_)
                 | Self::SqlServer(_)
                 | Self::Turso(_)
-                | Self::DuckDb(_)
                 | Self::Snowflake(_)
                 | Self::ClickHouse(_)
                 | Self::MongoDb(_)
@@ -2281,32 +2308,6 @@ impl Connection {
                 | Self::External(_) => unverifiable(),
             }
         })
-    }
-
-    /// [`Connection::apply_verified`] for a tab bound to a database and
-    /// schema, put back in the same acquisition of the session's lock as the
-    /// sequence. SQLite has no binding to put back, so it is the unbound form.
-    pub(crate) fn apply_verified_bound(
-        &self,
-        schema: Option<&str>,
-        steps: &[VerifiedStep],
-        bracket: Bracket,
-        cancel: &CancelToken,
-    ) -> ApplyOutcome {
-        let _ = schema;
-        match self {
-            Self::Sqlite(_) => self.apply_verified(steps, bracket, cancel),
-            Self::Postgres(_)
-            | Self::MySql(_)
-            | Self::SqlServer(_)
-            | Self::Turso(_)
-            | Self::DuckDb(_)
-            | Self::Snowflake(_)
-            | Self::ClickHouse(_)
-            | Self::MongoDb(_)
-            | Self::Redis(_)
-            | Self::External(_) => unverifiable(),
-        }
     }
 
     /// [`Connection::query`] on a connection of its own, opened the way this
