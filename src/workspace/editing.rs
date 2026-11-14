@@ -2118,6 +2118,23 @@ impl Workspace {
         let Some((schema, table, _)) = relation else {
             return;
         };
+        // Before anything is written, so nothing is generated or reviewed for a
+        // draft that would not run whole. Inside a transaction the user opened,
+        // a statement that fails leaves that transaction open on an engine
+        // that keeps it, and the inserts before it stay applied in it to be
+        // committed with it; the draft is kept for when the transaction ends.
+        // A draft of one statement has no part before it, and an update-only
+        // draft joins as it always has.
+        let statements = updates.len() + inserts.len();
+        if joins && statements > 1 && engine.keeps_failed_transaction_open() {
+            self.note(
+                "The draft was not applied: a transaction is open on this connection, where a \
+                 statement that fails leaves the inserts before it applied."
+                    .into(),
+                cx,
+            );
+            return;
+        }
         let batch = match sql::draft_batch(engine, &[], &updates, &inserts, !joins) {
             Ok(batch) => batch,
             Err(message) => {
