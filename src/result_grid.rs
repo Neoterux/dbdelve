@@ -309,9 +309,10 @@ pub struct ResultGrid {
     /// it ([`Self::take_left_row`]). The grid does not know the view's edit mode,
     /// so it only records.
     left_row: Option<usize>,
-    /// The cell, and the input, a ring move off its row closed without
-    /// committing, until the workspace takes it ([`Self::take_closed_input`]):
-    /// what was typed in it is a Row view's to stage and send with its row.
+    /// The cell, and the input, a ring move closed without committing, until
+    /// the workspace stages it ([`Self::commit_closed_input`]): what was typed
+    /// in it is kept as a staged edit in every view, and a Row view sends it
+    /// with its row.
     closed_input: Option<(usize, usize, Entity<InputState>)>,
     /// The row whose send the server refused, and what it said, until that row
     /// is edited, reverted or sent.
@@ -1895,13 +1896,12 @@ impl ResultGrid {
             self.left_row = Some(old);
         }
         if closing {
-            // Kept only when the move leaves the input's row: a click on
-            // another cell of the same row drops what was typed, as it always
-            // did.
+            // Every move that closes the input records it, within the row too:
+            // a click on another cell of the row is a click away like any
+            // other, and the workspace stages what was typed.
             self.closed_input = self
                 .editing
                 .take()
-                .filter(|editing| editing.row != row)
                 .and_then(|editing| Some((editing.row, editing.col, editing.input?)));
         }
         self.active = Some((row, col));
@@ -1913,10 +1913,15 @@ impl ResultGrid {
         self.left_row.take()
     }
 
-    /// The cell a ring move closed an input on, and the text it holds, once.
-    pub(crate) fn take_closed_input(&mut self, cx: &App) -> Option<(usize, usize, SharedString)> {
-        let (row, col, input) = self.closed_input.take()?;
-        Some((row, col, input.read(cx).value().clone()))
+    /// Stage, once, the text of the input a ring move closed, by the rule Enter
+    /// commits with ([`Self::commit_text`]): an added row's untouched cell stays
+    /// out of its `INSERT`, and a mode that refuses the write stages nothing and
+    /// says nothing, as the Row path always did.
+    pub(crate) fn commit_closed_input(&mut self, cx: &App) {
+        let Some((row, col, input)) = self.closed_input.take() else {
+            return;
+        };
+        self.commit_text(row, col, input.read(cx).value().clone());
     }
 
     /// The row whose send the server refused and the words it said, drawn on
@@ -4126,8 +4131,9 @@ pub(crate) fn new_grid(
     // through it: a subscription set up at one call site would leave the other
     // grid navigating an invisible selection.
     //
-    // Every ring move ends in `SelectRow` or `ClearSelection`, so these two arms
-    // are the one consumer of the row the ring left: a Row view sends it.
+    // Every ring move ends in `SelectRow`, `ClearSelection` or `SelectColumn`, so
+    // these three arms are the one consumer of the input a move closed and of the
+    // row the ring left: the input's text is staged, and a Row view sends the row.
     cx.subscribe(
         &grid,
         |workspace, table, event: &TableEvent, cx| match event {
@@ -4168,6 +4174,10 @@ pub(crate) fn new_grid(
                     table.delegate_mut().select_col(col);
                     cx.notify();
                 });
+                // A column move inside the row closes an input too, and a
+                // record left for a later row move would stage over an edit
+                // made in between.
+                workspace.flush_left_row(&table, cx);
             }
             TableEvent::ClearSelection => {
                 table.update(cx, |table, cx| {

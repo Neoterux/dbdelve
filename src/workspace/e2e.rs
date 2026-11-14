@@ -23684,6 +23684,7 @@ fn a_cell_being_typed_in_is_kept_as_a_staged_edit_when_its_row_is_clicked_away_f
         settle(cx);
         // Tab commits the name and opens the next cell, the path UAT walked.
         press(cx, "tab");
+        cx.simulate_keystrokes("secondary-a");
         cx.simulate_input("7");
         settle(cx);
 
@@ -23719,7 +23720,6 @@ fn a_cell_being_typed_in_is_kept_when_another_cell_of_its_row_is_clicked_in_draf
     cx: &mut TestAppContext,
 ) {
     use crate::result_grid::NewValue;
-    use gpui_component::table::TableDelegate;
 
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
