@@ -1482,14 +1482,34 @@ fn rolled_back(connection: &mut Conn, sql: &str, error: DbError) -> DbError {
     }
 }
 
-/// The rows an `UPDATE` matched, read from the OK packet's info text, which is
-/// all the server says of them: `affected_rows` counts the rows that
-/// *changed*, so a statement that writes the value a row already holds counts
-/// none. RED stub.
-#[cfg_attr(not(test), expect(dead_code, reason = "RED stub"))]
+/// The rows an `UPDATE` matched, which is not what `affected_rows` says:
+/// that counts the rows that *changed*, so a statement that writes the value a
+/// row already holds counts none, and a count of none cannot be told from a
+/// statement that matched nothing. The OK packet's info text carries the
+/// matched count, as three integers (matched, changed, warnings) in the
+/// server's language, which `lc_messages` sets: Russian and Japanese keep the
+/// words different and the order the same. It is read by position, never by
+/// label.
+///
+/// The changed number must be what the server affected. A locale that
+/// reorders the numbers then fails that check and refuses the count, rather
+/// than being believed. Text that is not three integers, or one no `u64`
+/// holds, is not read, and the affected count stands only when it names a row.
+// Read by the verified apply's `UPDATE` step, which task 2 of plan 10.2-05 adds.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the verified apply reads it next")
+)]
 fn matched_count(affected: u64, info: &str) -> Option<u64> {
-    let _ = (affected, info);
-    None
+    let numbers: Option<Vec<u64>> = info
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .map(|run| run.parse().ok())
+        .collect();
+    match numbers.as_deref() {
+        Some(&[matched, changed, _warnings]) => (changed == affected).then_some(matched),
+        _ => (affected > 0).then_some(affected),
+    }
 }
 
 /// Prefer the server's own message. It is written for humans and already says
