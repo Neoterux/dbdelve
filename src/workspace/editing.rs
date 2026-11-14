@@ -2137,7 +2137,7 @@ impl Workspace {
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
     /// it: the query tab's buffer, or the review modal on a relation tab and on
-    /// a query tab whose target reviews them (`Target::reviews_query_edits`).
+    /// a query tab whose target reviews them (`Target::reviews_query_apply`).
     ///
     /// Binds to `cmd+s` -- a deliberate departure from `cmd+enter` ("run the
     /// statement under the cursor"), which stays unrelated so neither
@@ -2218,17 +2218,24 @@ impl Workspace {
         let notes = target.review_notes(&batch);
         // What the review's run is checked against, where the target verifies
         // an apply: the rows as the grid fetched them, one step to a statement.
-        let verify = match tab {
-            Tab::Object(_) if target.verifies_applies() => {
-                match verification(self.engine(), results.read(cx).delegate(), &batch) {
-                    Ok(verify) => Some(verify),
-                    Err(message) => {
-                        self.note(message, cx);
-                        return;
-                    }
+        // A query tab's is built the same way, by the real column names its
+        // edit target gives the projection. Not where its batch goes to the
+        // buffer, which has nothing to check it against.
+        let verified = target.verifies_applies()
+            && match tab {
+                Tab::Object(_) => true,
+                Tab::Query(_) => target.reviews_query_apply(),
+            };
+        let verify = if verified {
+            match verification(self.engine(), results.read(cx).delegate(), &batch) {
+                Ok(verify) => Some(verify),
+                Err(message) => {
+                    self.note(message, cx);
+                    return;
                 }
             }
-            Tab::Object(_) | Tab::Query(_) => None,
+        } else {
+            None
         };
         match tab {
             Tab::Query(_) if !target.reviews_query_apply() => {
@@ -2423,7 +2430,7 @@ impl Workspace {
                 .query_tab(id)
                 .and_then(QueryTab::apply_refresh)
             {
-                Some(refresh) => refresh,
+                Some(refresh) => refresh.verified(verify),
                 None => {
                     self.note(
                         "dbdelve does not know which statement produced these rows.".into(),

@@ -53,10 +53,15 @@ mode, always where the user can read it before it runs:
   sorted in memory reorders the rows it holds and writes nothing;
   switching it to the server is an ask, and splices its keys the same way.
 - Grid edits on a query tab are appended to the buffer
-  (`sql::appended_statement`) and run from there. On an object tab, which
-  has no buffer, the statement is shown in a review dialog before it runs,
-  as it is on a query tab of an engine without unique keys
-  (`Engine::reviews_query_edits`), whose writes run only behind the guard.
+  (`sql::appended_statement`) and run from there only where the target
+  neither guards nor verifies them (`Target::reviews_query_apply`). On an
+  object tab, which has no buffer, the statement is shown in a review dialog
+  before it runs, as it is on a query tab of an engine without unique keys
+  (`Engine::reviews_query_edits`), whose writes run only behind the guard, and
+  on one whose apply is verified (`Target::verifies_applies`: the rows are
+  re-read and compared and each write counted, which a copy left in the buffer
+  would run without). A verified query-tab apply is not kept in the history for
+  the same reason.
   The exception is a relation tab's view in Row mode, which has no buffer and
   no dialog: the row's `UPDATE` is sent as the row is left or saved
   (`Workspace::save_row`), and that is the user's own act. It is gated by

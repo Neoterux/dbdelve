@@ -31,11 +31,13 @@ require it, stop and raise it instead.
    Row mode, always where the user can read it before it runs: on a view the
    server sorts, a header sort
    splices its `ORDER BY` into the buffer (one sorted in memory reorders its
-   rows and writes nothing); grid edits are appended to the buffer (`sql::appended_statement`),
-   or shown in a review dialog on an object tab, which has no buffer, and on
-   a query tab of an engine whose rows are named by every value, or of a
-   plugin, whose writes must run behind their guard
-   (`Target::reviews_query_edits`); Import
+   rows and writes nothing); grid edits on a query tab are appended to the buffer
+   (`sql::appended_statement`) only where the target neither guards nor
+   verifies them (`Target::reviews_query_apply`); elsewhere, and always on an
+   object tab, which has no buffer, they are shown in a review dialog: on a
+   query tab of an engine whose rows are named by every value, or of a plugin,
+   whose writes must run behind their guard, and on one of an engine whose
+   apply is verified, which a copy in the buffer would run without; Import
    Rows shows every statement before any runs; Explain prefixes a copy, never
    the buffer; transaction control (Toggle Auto-commit, Commit, Roll Back)
    appends its `BEGIN`, `COMMIT` and `ROLLBACK` to the buffer and runs them

@@ -835,7 +835,13 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   Delete over a draft, an edit staged while the batch was in flight) it keeps
   them and does not re-read. On a relation tab an Insert or Delete row over a
   draft is Row mode's case, or a Draft view's added row or mark (the next
-  bullet), never a send. A reviewed relation-tab apply clears the whole draft. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
+  bullet), never a send. A reviewed relation-tab apply clears the whole draft.
+  A query tab's Apply and New row on a target answering
+  `Target::reviews_query_apply()` are reviewed and, where the target verifies
+  applies, sent through the same verified apply (the manifest is built from the
+  query's projection by real column name); nothing is appended to the buffer and
+  the history leaves out that generated run, where a recalled copy would run
+  unverified. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
   a plugin, Snowflake, Turso) an edit send clears the grid as it starts and a failure
   is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
