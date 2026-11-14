@@ -2691,7 +2691,11 @@ fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verifi
         });
         rows.push(label);
     }
-    Ok(Verification { steps, rows })
+    Ok(Verification {
+        steps,
+        rows,
+        keyed: false,
+    })
 }
 
 /// The sentence for a statement whose write cannot be checked against the
@@ -2742,6 +2746,7 @@ fn lone_verification(
             read_back,
         }],
         rows: vec![label],
+        keyed: false,
     })
 }
 

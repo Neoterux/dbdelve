@@ -4402,6 +4402,7 @@ mod tests {
                 step(db::StepKind::Insert),
             ],
             rows: vec!["id = 1".into(), "id = 2".into(), "added row 1".into()],
+            keyed: true,
         }
     }
 

@@ -890,6 +890,18 @@ pub(crate) struct Verification {
     /// What each step's row is called in what the apply says of it, `rows[i]`
     /// for step `i`: the key's `name = value` terms, or `added row N`.
     pub(crate) rows: Vec<String>,
+    /// True only when the write's `EditTarget.row_match` is `RowMatch::Key`
+    /// (its row named by its primary key). A field left false refuses to join
+    /// a transaction the user opened rather than joining it.
+    #[allow(dead_code)] // stub: read by `may_join` once it answers
+    pub(crate) keyed: bool,
+}
+
+impl Verification {
+    #[allow(dead_code)] // stub: no caller until the Run check is written
+    pub(crate) fn may_join(&self) -> bool {
+        false
+    }
 }
 
 impl ApplyReview {
@@ -5418,6 +5430,32 @@ mod tests {
             .discards(),
             running
         );
+    }
+
+    #[test]
+    fn only_one_write_on_a_row_named_by_its_primary_key_may_join_an_open_transaction() {
+        let step = || crate::db::VerifiedStep {
+            sql: String::new(),
+            kind: crate::db::StepKind::Update,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        };
+        let verification = |steps: usize, keyed: bool| Verification {
+            steps: (0..steps).map(|_| step()).collect(),
+            rows: vec!["id = 1".into(); steps],
+            keyed,
+        };
+        assert!(verification(1, true).may_join());
+        assert!(
+            !verification(2, true).may_join(),
+            "two writes would end the user's transaction when one is rolled back"
+        );
+        assert!(
+            !verification(1, false).may_join(),
+            "a row named by every column could count two"
+        );
+        assert!(!verification(0, true).may_join());
     }
 
     #[test]
