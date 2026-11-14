@@ -2323,7 +2323,10 @@ fn io_source(error: &tokio_postgres::Error) -> Option<&std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ForeignKey, IndexKind, RelationKind, RoutineKind, SslMode, result, rows};
+    use crate::db::{
+        ApplyOutcome, Bracket, CancelToken, Drift, FetchedCell, ForeignKey, IndexKind,
+        RelationKind, RoutineKind, SslMode, StepKind, result, rows,
+    };
 
     fn config() -> ServerConfig {
         ServerConfig {
@@ -4238,7 +4241,225 @@ mod tests {
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
     );
+
+    /// Drops a scratch table and its trigger function when a test ends, panicking or not.
+    struct ScratchTable<'a>(&'a crate::db::Connection, &'static str);
+
+    impl ScratchTable<'_> {
+        fn drop_all(&self) {
+            for sql in [
+                format!("DROP TABLE IF EXISTS {} CASCADE", self.1),
+                format!("DROP FUNCTION IF EXISTS {}_fn()", self.1),
+            ] {
+                let _ = self
+                    .0
+                    .query(&sql, &CancelToken::default(), Fetch::default());
+            }
+        }
+    }
+
+    impl Drop for ScratchTable<'_> {
+        fn drop(&mut self) {
+            self.drop_all();
+        }
+    }
+
+    /// The cells of the one row `select` reads, as the grid would hold them
+    /// after a fetch of its own.
+    fn read_cells(connection: &crate::db::Connection, select: &str) -> Vec<FetchedCell> {
+        let result = connection
+            .query(select, &CancelToken::default(), Fetch::default())
+            .unwrap_or_else(|error| panic!("`{select}`: {error}"));
+        let row = result.rows.first().expect("the row is there to read");
+        result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| FetchedCell {
+                column: column.name.clone(),
+                text: row.get(index).map(str::to_string),
+                cell_type: None,
+                column_type: column.data_type.clone(),
+            })
+            .collect()
+    }
+
+    fn typed(columns: &[(&str, &str)]) -> Vec<(String, String)> {
+        columns
+            .iter()
+            .map(|(column, kind)| ((*column).to_string(), (*kind).to_string()))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_verified_update_a_trigger_skipped_is_refused_and_rolled_back() {
+        let connection = live_profile();
+        let table = "verified_trigger_skip";
+        let scratch = ScratchTable(&connection, table);
+        scratch.drop_all();
+        connection
+            .query(
+                &format!(
+                    "CREATE TABLE {table} (id integer PRIMARY KEY, label text);
+                     CREATE FUNCTION {table}_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN IF OLD.id = 1 THEN RETURN NULL; END IF; RETURN NEW; END $$;
+                     CREATE TRIGGER skip BEFORE UPDATE ON {table}
+                         FOR EACH ROW EXECUTE FUNCTION {table}_fn();
+                     INSERT INTO {table} VALUES (1, 'one'), (2, 'two')"
+                ),
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the scratch table is built");
+        let types = typed(&[("id", "int4"), ("label", "text")]);
+        let batch = crate::sql::draft_batch(
+            Engine::Postgres,
+            &[crate::sql::DraftDelete {
+                schema: "public".into(),
+                table: table.into(),
+                keys: vec![("id".into(), "2".into())],
+                null_keys: Vec::new(),
+                types: types.clone(),
+            }],
+            &[crate::result_grid::PendingRow {
+                schema: "public".into(),
+                table: table.into(),
+                sets: vec![(
+                    "label".into(),
+                    crate::result_grid::NewValue::Value("changed".into()),
+                )],
+                keys: vec![("id".into(), "1".into())],
+                types,
+                ..crate::result_grid::PendingRow::default()
+            }],
+            &[],
+            false,
+        )
+        .expect("the draft is written");
+        let read = |id: u32| {
+            read_cells(
+                &connection,
+                &format!("SELECT * FROM {table} WHERE id = {id}"),
+            )
+        };
+        let steps = crate::db::conformance::verified_steps(
+            Engine::Postgres,
+            &batch,
+            vec![(StepKind::Delete, read(2)), (StepKind::Update, read(1))],
+        );
+
+        assert_eq!(
+            connection.apply_verified(&steps, Bracket::Own, &CancelToken::default()),
+            ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            }
+        );
+        let left = connection
+            .query(
+                &format!("SELECT id, label FROM {table} ORDER BY id"),
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the table is read");
+        let rows: Vec<_> = left
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0).map(str::to_string),
+                    row.get(1).map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some("1".into()), Some("one".into())),
+                (Some("2".into()), Some("two".into()))
+            ],
+            "the deleted row came back with the rollback"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_spatial_cell_rendered_after_the_fetch_is_not_compared() {
+        let connection = live_profile();
+        let table = "verified_spatial_cell";
+        let scratch = ScratchTable(&connection, table);
+        scratch.drop_all();
+        connection
+            .query(
+                &format!(
+                    "CREATE TABLE {table} (id integer PRIMARY KEY, label text, geom geometry);
+                     INSERT INTO {table} VALUES (1, 'a', ST_GeomFromText('POINT(1 2)'))"
+                ),
+                &CancelToken::default(),
+                Fetch::default(),
+            )
+            .expect("the scratch table is built");
+        let draft = |label: &str| {
+            crate::sql::draft_batch(
+                Engine::Postgres,
+                &[],
+                &[crate::result_grid::PendingRow {
+                    schema: "public".into(),
+                    table: table.into(),
+                    sets: vec![(
+                        "label".into(),
+                        crate::result_grid::NewValue::Value(label.to_string().into()),
+                    )],
+                    keys: vec![("id".into(), "1".into())],
+                    types: typed(&[("id", "int4"), ("label", "text"), ("geom", "geometry")]),
+                    ..crate::result_grid::PendingRow::default()
+                }],
+                &[],
+                false,
+            )
+            .expect("the draft is written")
+        };
+        let read = || read_cells(&connection, &format!("SELECT * FROM {table} WHERE id = 1"));
+        let apply = |before: Vec<FetchedCell>, label: &str| {
+            let steps = crate::db::conformance::verified_steps(
+                Engine::Postgres,
+                &draft(label),
+                vec![(StepKind::Update, before)],
+            );
+            connection.apply_verified(&steps, Bracket::Own, &CancelToken::default())
+        };
+
+        // What the grid shows is the WKT its own render made; the re-read
+        // inside the apply comes back as the server writes it.
+        let held = read();
+        let geom = held.iter().find(|cell| cell.column == "geom").unwrap();
+        assert_eq!(geom.column_type.as_deref(), Some("geometry"));
+        assert!(
+            geom.text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("POINT")),
+            "{geom:?}"
+        );
+        assert!(
+            matches!(apply(held, "b"), ApplyOutcome::Applied { affected: 1, .. }),
+            "an unchanged row with a spatial cell applies"
+        );
+
+        let mut stale = read();
+        stale
+            .iter_mut()
+            .find(|cell| cell.column == "label")
+            .unwrap()
+            .text = Some("stale".into());
+        assert_eq!(
+            apply(stale, "c"),
+            ApplyOutcome::Drifted(vec![(0, Drift::Changed)]),
+            "a changed non-spatial cell is still compared"
+        );
+    }
 
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
