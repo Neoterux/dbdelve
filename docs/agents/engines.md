@@ -100,12 +100,9 @@ Decided, and not to be re-litigated:
 - **A draft's batch is brackets plus `DELETE`s, `UPDATE`s and `INSERT`s, in that
   order** (`sql::draft_batch`), so a key a draft deletes is free for an insert
   in the same submission, and it is bracketed on the engines that bracket and
-  one implicit transaction on Postgres, like `sql::update_batch`.
-  `Engine::keeps_failed_transaction_open` answers what a failed statement does
-  to a transaction already open: MySQL, MariaDB and SQLite leave it open;
-  Postgres and DuckDB abort it; SQL Server's generated SQL runs with
-  `XACT_ABORT ON` and rolls all of it back. An explicit arm per engine, as for
-  `Engine::transaction_start`.
+  one implicit transaction on Postgres, like `sql::update_batch`. Inside a
+  transaction the user opened a batch of more than one statement is not written
+  at all: one write joins it and several are refused (`docs/agents/gates.md`).
 - **A verified Draft apply reads counts and cells the way each engine reports
   them** (`Connection::apply_verified`; the sequence is `db::run_verified`).
   Postgres counts the rows a statement matched, so a same-value `UPDATE` counts

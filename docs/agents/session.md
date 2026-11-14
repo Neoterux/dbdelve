@@ -815,10 +815,10 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `INSERT`s (`sql::draft_batch`), gated as a whole and checked for key and table
   by `sql::draft_deletes_match` and against `marked_count`, so a dropped mark
   refuses the draft. A successful reviewed relation-tab apply clears the whole
-  draft and re-reads; a failure keeps all of it and applies nothing. A joining
-  draft of more than one statement that inserts is refused, with a notice and
-  the draft kept, on an engine that keeps a failed transaction open
-  (`Engine::keeps_failed_transaction_open`; D-16a, see `docs/agents/gates.md`).
+  draft and re-reads; a failure keeps all of it and applies nothing. Inside a
+  transaction the user opened only one write joins it, so a draft of more than
+  one statement is refused on every engine, with a notice and the draft kept
+  (see `docs/agents/gates.md`).
   A row is washed by its state in the theme's added, updated and deleted
   tokens, and its gutter carries the `debug_selector` `row-added-N`,
   `row-updated-N` or `row-deleted-N` for the driver.

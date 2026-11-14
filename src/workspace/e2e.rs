@@ -19795,186 +19795,6 @@ fn apply_insert_into_own_table_from_the_front_tab(
 }
 
 #[gpui::test]
-fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = duckdb_with_other_attached(cx);
-        // As `sql::update_batch` writes a multi-row apply on an engine whose
-        // statements commit on their own.
-        let (eight, nine) = (
-            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "8")]),
-            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "9")]),
-        );
-        let batch = format!("BEGIN TRANSACTION;\n{eight};\n{nine};\nCOMMIT;");
-        let batch = batch.as_str();
-        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
-        let (auto_commit, open, _) = transaction_state(&workspace, cx);
-        let listed = open_transaction_statements(&workspace, cx);
-
-        apply_from_the_front_tab(&workspace, cx, batch);
-        assert_eq!(
-            edit_notice(&workspace, cx),
-            "Not sent: a transaction is open on this connection, and the batch of edits \
-             would end it with a COMMIT of its own."
-        );
-        let (auto_commit_now, open_now, _) = transaction_state(&workspace, cx);
-        assert_eq!(
-            (
-                auto_commit_now,
-                open_now,
-                open_transaction_statements(&workspace, cx)
-            ),
-            (auto_commit, open, listed),
-            "a refused batch changes nothing and is not listed"
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("1"),
-            "only the user's own INSERT ran"
-        );
-        run_in_front(&workspace, cx, "ROLLBACK");
-
-        apply_from_the_front_tab(&workspace, cx, batch);
-        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
-            QueryState::Complete { .. } => {}
-            _ => panic!("the batch never completed with no transaction open"),
-        });
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("2"));
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = duckdb_with_other_attached(cx);
-        // As `sql::update_batch_joining` writes a multi-row apply, run once
-        // the transaction it was written for is gone: each statement would
-        // commit on its own.
-        run_in_front(&workspace, cx, "SELECT 1");
-        assert!(!transaction_state(&workspace, cx).1, "nothing is open");
-        let (eight, nine) = (
-            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "8")]),
-            generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "9")]),
-        );
-        apply_from_the_front_tab(&workspace, cx, &format!("{eight};\n{nine};"));
-        assert_eq!(
-            edit_notice(&workspace, cx),
-            "Not sent: no transaction is open on this connection, and the batch of edits \
-             was written to join one."
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("0"), "no row ran");
-
-        // One statement carries no bracket and is unaffected.
-        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_joined_batch_that_fails_part_way_says_its_earlier_rows_stay_in_the_open_transaction(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(
-            cx,
-            "create table birds (id integer primary key, name text); \
-             insert into birds values (1, 'wren');",
-        );
-        run_in_front(&workspace, cx, "BEGIN");
-        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
-
-        // As `sql::update_batch_joining` writes a multi-row apply; the second
-        // statement collides with the first's key.
-        let row = |name| [("id", "INTEGER", "2"), ("name", "TEXT", name)];
-        let (tit, jay) = (
-            generated_insert(&workspace, cx, "birds", &row("tit")),
-            generated_insert(&workspace, cx, "birds", &row("jay")),
-        );
-        apply_from_the_front_tab(&workspace, cx, &format!("{tit};\n{jay};"));
-        let message = edit_notice(&workspace, cx);
-        assert!(
-            message.ends_with(
-                "Rows of the batch before the failed one were applied inside the open \
-                 transaction and stay in it, to be committed or rolled back with it."
-            ),
-            "{message}"
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM birds");
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("2"),
-            "the first row is in the open transaction, as the message says"
-        );
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_multi_row_edit_joins_the_users_open_transaction_without_brackets_of_its_own(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(
-            cx,
-            "create table birds (id integer primary key, name text); \
-             insert into birds values (1, 'wren'), (2, 'tit');",
-        );
-        run_in_front(&workspace, cx, "BEGIN");
-        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
-        run_in_front(&workspace, cx, "select * from birds order by id");
-        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
-        grid.update(cx, |grid, _| {
-            for (row, name) in [(0, "robin"), (1, "jay")] {
-                assert!(grid.delegate_mut().set_pending(
-                    row,
-                    1,
-                    crate::result_grid::NewValue::Value(name.into())
-                ));
-            }
-        });
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
-        settle(cx);
-
-        assert!(
-            transaction_state(&workspace, cx).1,
-            "the batch did not end the user's transaction"
-        );
-        let batch = open_transaction_statements(&workspace, cx)
-            .into_iter()
-            .find(|statement| statement.contains("UPDATE"))
-            .expect("the batch is listed in the open transaction");
-        assert_eq!(batch.matches("UPDATE").count(), 2, "{batch}");
-        assert!(
-            !batch.contains("BEGIN") && !batch.contains("COMMIT"),
-            "{batch}"
-        );
-
-        run_in_front(&workspace, cx, "ROLLBACK");
-        run_in_front(
-            &workspace,
-            cx,
-            "select count(*) from birds where name in ('wren', 'tit')",
-        );
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("2"),
-            "the edits rolled back with the transaction they joined"
-        );
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
 fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect_empties_it(
     cx: &mut TestAppContext,
 ) {
@@ -20167,7 +19987,8 @@ fn a_batch_reviewed_before_a_transaction_opened_is_refused_at_run(cx: &mut TestA
             !open_transaction_statements(&workspace, cx)
                 .iter()
                 .any(|statement| statement.contains("UPDATE")),
-            "nothing was sent"
+            "nothing was sent: {:?}",
+            open_transaction_statements(&workspace, cx)
         );
         run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
         assert_eq!(
@@ -22646,7 +22467,7 @@ fn a_refused_apply_keeps_the_draft(cx: &mut TestAppContext) {
 
         let (_, _, error) = front_review(&workspace, cx).expect("the review stays");
         let error = error.expect("the refusal is said in the review");
-        assert!(error.starts_with("Not sent:"), "{error}");
+        assert_eq!(error, DRAFT_IN_TRANSACTION);
         grid.read_with(cx, |grid, _| {
             assert_eq!(grid.delegate().result().rows.len(), 2);
             assert_eq!(grid.delegate().pending_count(), 2);
@@ -25957,98 +25778,6 @@ fn run_in_query_tab_then_return(
         workspace.activate_tab(Tab::Object(id), window, cx)
     });
     settle(cx);
-}
-
-/// A statement that fails inside a transaction the user opened leaves that
-/// transaction open on SQLite, with the draft's inserts before it applied in
-/// it and committed with it, so an inserting draft of more than one statement
-/// is not written there.
-#[gpui::test]
-fn a_draft_with_inserts_is_refused_inside_an_open_transaction_on_sqlite(cx: &mut TestAppContext) {
-    use crate::result_grid::NewValue;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        run_in_front(&workspace, cx, "BEGIN");
-        let id = open_own_table(&workspace, cx, "birds");
-        let grid = relation_grid(&workspace, cx, id);
-        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
-        add_bird(&grid, cx, "3", "robin");
-
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(front_review(&workspace, cx), None, "nothing is shown");
-        let notice = shown_notice(&workspace, cx).expect("the refusal is on the status line");
-        assert!(
-            notice.starts_with("The draft was not applied: a transaction is open"),
-            "{notice}"
-        );
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 2, "the draft is kept");
-        });
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.profile().unwrap().in_transaction);
-        });
-
-        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 2, "still staged");
-        });
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply draft", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(sql.starts_with("BEGIN;"), "{sql}");
-        quit(workspace, cx);
-    });
-}
-
-/// What the refusal is about is a statement that fails half way: a draft of
-/// one statement has no half, and one of updates only is what a joined apply
-/// has always been.
-#[gpui::test]
-fn an_update_only_draft_still_joins_the_open_transaction(cx: &mut TestAppContext) {
-    use crate::result_grid::NewValue;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        run_in_front(&workspace, cx, "BEGIN");
-        let id = open_own_table(&workspace, cx, "birds");
-        let grid = relation_grid(&workspace, cx, id);
-        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
-        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
-
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply edits", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
-
-        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
-        settle(cx);
-        cx.dispatch_action(crate::actions::DiscardEdits);
-        settle(cx);
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 0)
-        });
-        add_bird(&grid, cx, "3", "robin");
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply draft", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(sql.starts_with("INSERT INTO"), "{sql}");
-        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
-        quit(workspace, cx);
-    });
 }
 
 /// A sort in memory moves the fetched rows while the apply is out. The draft
