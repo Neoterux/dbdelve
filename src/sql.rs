@@ -1236,6 +1236,69 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
     }
 }
 
+/// How many `DELETE`s `batch` holds, when every one of them names exactly
+/// `keys` on `schema.table`: the readout [`is_generated_write_on`] cannot give,
+/// because no key or table reaches it. The caller compares the count with the
+/// rows the user marked.
+///
+/// A reviewed draft needs both answers. The gate reads a `DELETE`'s shape and
+/// admits any one-row `WHERE` on any table; this reads which columns and which
+/// table, so a `DELETE` of another table, or by half a composite key, is `None`
+/// here though the gate admitted it. Like [`delete_matches_key_on`] it is a
+/// readout and admits nothing.
+///
+/// Kinds are read from the same parse tree the gate reads, never from the
+/// caller's word: a statement is a `DELETE` when the tree says so, and an
+/// `UPDATE` whose `WHERE` names the key is not counted. `Some(0)` for a batch
+/// with no `DELETE`. `None` on any `DELETE` that does not match, on anything
+/// the gate's parse refuses (an empty text included), and on MongoDB and Redis,
+/// which write no draft of this shape.
+// ponytail: only a top-level `DELETE` is counted. One hidden elsewhere in the
+// tree is not found here, because the gate's whole-tree count of `delete` nodes
+// refuses it first, and a caller runs both.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the draft's apply is the first caller")
+)]
+pub fn draft_deletes_match(
+    engine: Engine,
+    batch: &str,
+    keys: &[&str],
+    schema: &str,
+    table: &str,
+) -> Option<usize> {
+    if engine.syntax() != Syntax::Sql {
+        return None;
+    }
+    let spec = engine.spec();
+    let sql = as_written(&spec.sql, batch)?;
+    let tree = parse_write(&sql, spec.sql.backslash_escapes)?;
+    let root = tree.root_node();
+    let relation = spec.qualified(schema, table);
+    let mut deletes = 0;
+    let statements = generated_statements(&root)?;
+    if statements.is_empty() {
+        return None;
+    }
+    for statement in statements {
+        if statement.kind() != "statement" {
+            return None;
+        }
+        if statement.named_child(0).map(|node| node.kind()) != Some("delete") {
+            continue;
+        }
+        let (target, predicate) = one_row_delete(statement)?;
+        let columns = row_columns(&spec.sql, predicate, &sql)?;
+        let names_key =
+            columns.len() == keys.len() && keys.iter().all(|key| columns.iter().any(|c| c == key));
+        if !names_key || sql.get(target.byte_range()) != Some(relation.as_str()) {
+            return None;
+        }
+        deletes += 1;
+    }
+    Some(deletes)
+}
+
 /// `SELECT COUNT(*) FROM <t> WHERE <p>` for one generated `UPDATE`, `DELETE`
 /// or ClickHouse `ALTER TABLE … UPDATE`: how many rows `statement` would
 /// write, counted with its own table and predicate, so a row named by every
