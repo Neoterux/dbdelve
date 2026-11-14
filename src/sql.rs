@@ -8084,6 +8084,80 @@ mod tests {
     }
 
     #[test]
+    fn a_row_read_after_an_update_names_the_row_by_the_values_it_now_holds() {
+        use crate::db::Target;
+
+        let engines: Vec<_> = Engine::ALL
+            .into_iter()
+            .filter(|engine| Target::built_in(*engine).row_edits() && engine.spec().sql.null_terms)
+            .collect();
+        assert_eq!(engines.len(), 6, "{engines:?}");
+        for engine in engines {
+            let q = engine.spec().qualified("public", "accounts");
+            let (id, bird, place) = (
+                engine.quote_identifier("id"),
+                engine.quote_identifier("bird"),
+                engine.quote_identifier("place"),
+            );
+            let read = |update: String| row_read(engine, &update);
+            let select = |predicate: &str| Some(format!("SELECT * FROM {q} WHERE {predicate}"));
+
+            // A key column is never assigned, so a keyed read is what it was.
+            assert_eq!(
+                read(format!("UPDATE {q} SET {bird} = 'x' WHERE {id} = '7'")),
+                select(&format!("{id} = '7'")),
+                "{engine:?}"
+            );
+            // A column the `SET` assigns is read by the value it now holds.
+            assert_eq!(
+                read(format!(
+                    "UPDATE {q} SET {bird} = 'finch' WHERE {bird} = 'wren' AND {place} IS NULL"
+                )),
+                select(&format!("{bird} = 'finch' AND {place} IS NULL")),
+                "{engine:?}"
+            );
+            assert_eq!(
+                read(format!(
+                    "UPDATE {q} SET {place} = NULL WHERE {bird} = 'wren' AND {place} = 'oak'"
+                )),
+                select(&format!("{bird} = 'wren' AND {place} IS NULL")),
+                "{engine:?}"
+            );
+            assert_eq!(
+                read(format!(
+                    "UPDATE {q} SET {place} = 'elm', {bird} = NULL \
+                     WHERE {place} IS NULL AND {bird} = 'wren'"
+                )),
+                select(&format!("{place} = 'elm' AND {bird} IS NULL")),
+                "{engine:?}"
+            );
+            // A column set to DEFAULT has no value to name the row by, when the
+            // predicate names it; when it does not, the predicate stands.
+            assert_eq!(
+                read(format!(
+                    "UPDATE {q} SET {place} = DEFAULT WHERE {bird} = 'wren' AND {place} IS NULL"
+                )),
+                None,
+                "{engine:?}"
+            );
+            assert_eq!(
+                read(format!("UPDATE {q} SET {place} = DEFAULT WHERE {id} = '7'")),
+                select(&format!("{id} = '7'")),
+                "{engine:?}"
+            );
+            for text in [
+                format!(
+                    "UPDATE {q} SET {bird} = 'finch' WHERE {bird} = 'wren' AND {place} IS NULL"
+                ),
+                format!("UPDATE {q} SET {place} = NULL WHERE {bird} = 'wren' AND {place} = 'oak'"),
+            ] {
+                let read = row_read(engine, &text).expect("a read");
+                assert!(is_generated_select(engine, &read), "{engine:?} {read}");
+            }
+        }
+    }
+
+    #[test]
     fn a_row_read_is_cut_from_the_gated_update() {
         use crate::db::Target;
 
