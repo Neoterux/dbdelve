@@ -22057,15 +22057,19 @@ fn a_failed_apply_from_a_query_tab_keeps_the_draft(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
         run_in_front(&workspace, cx, "select * from birds order by id");
-        let tab = workspace.read_with(cx, |workspace, _| {
-            workspace.profile().unwrap().session.active
-        });
         let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
         grid.update(cx, |grid, _| {
             // A NULL into a NOT NULL column, which the table refuses.
             assert!(grid.delegate_mut().set_pending(0, 1, NewValue::Null));
         });
         cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None)),
+            "the statement is read in the review before it runs"
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
         settle(cx);
 
         grid.read_with(cx, |grid, _| {
@@ -22076,17 +22080,179 @@ fn a_failed_apply_from_a_query_tab_keeps_the_draft(cx: &mut TestAppContext) {
             matches!(front_state(&workspace, cx), QueryState::Complete { .. }),
             "the tab is as it was, not an error pane over the rows"
         );
-        let (noticed, message) = tab_notice(&workspace, cx).expect("the failure is said");
-        assert_eq!(noticed, tab);
-        assert!(message.contains("NOT NULL"), "{message}");
-        assert!(
-            buffer(&workspace, cx).contains("UPDATE"),
-            "{}",
-            buffer(&workspace, cx)
+        let (title, _, error) = front_review(&workspace, cx).expect("the review stays");
+        assert_eq!(title, "Apply edits");
+        let error = error.expect("the failure is said in the review");
+        assert!(error.contains("NOT NULL"), "{error}");
+        assert_eq!(
+            buffer(&workspace, cx),
+            "select * from birds order by id",
+            "nothing was appended to the buffer"
         );
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A query tab's Apply on a verifying engine is read in the review, applies
+/// through the verified primitive, and leaves neither the buffer nor the
+/// history holding a copy that would run without its verification.
+#[gpui::test]
+fn a_query_tabs_apply_is_reviewed_verified_and_leaves_the_buffer_and_history_alone(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        assert_eq!(buffer(&workspace, cx), "select * from birds");
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(buffer(&workspace, cx), "select * from birds");
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            assert_eq!(grid.pending_count(), 0);
+            assert_eq!(grid.cell(0, 1), Some("finch"), "the query ran again");
+        });
+        let held = history_sql(&workspace, cx);
+        assert!(
+            held.iter().any(|sql| sql == "select * from birds"),
+            "{held:?}"
+        );
+        assert!(
+            held.iter()
+                .all(|sql| !sql.to_uppercase().contains("UPDATE")),
+            "{held:?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session changed after the query read it is not overwritten:
+/// the verified apply finds it differs, writes nothing and names the row.
+#[gpui::test]
+fn a_query_tabs_apply_over_a_row_changed_on_the_server_applies_nothing_and_names_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            )),
+            "the review stays open and names the row"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 1, "the draft is kept");
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The New row form of a query tab is counted like a table's: an `INSERT` a
+/// trigger skipped changed no row and is refused; without the trigger it
+/// applies.
+#[gpui::test]
+fn a_new_row_from_a_query_tab_is_counted_through_the_verified_apply(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger skips before insert on birds \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        run_in_front(&workspace, cx, "select * from birds");
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Insert",
+                false,
+                Some("Nothing was applied. INSERT 1 (new row) affected 0 rows.".to_string())
+            )),
+            "the review stays and says what happened"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0")
+        );
+
+        behind_the_grid("drop trigger skips");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
         );
         quit(workspace, cx);
     });

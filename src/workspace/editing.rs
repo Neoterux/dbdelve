@@ -2231,7 +2231,7 @@ impl Workspace {
             Tab::Object(_) | Tab::Query(_) => None,
         };
         match tab {
-            Tab::Query(_) if !target.reviews_query_edits() => {
+            Tab::Query(_) if !target.reviews_query_apply() => {
                 if !own_review {
                     self.apply_in_buffer(batch, window, cx);
                 }
