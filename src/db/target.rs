@@ -220,21 +220,23 @@ impl Target {
     }
 
     /// Whether a grid of this target applies its edits in order, one document
-    /// at a time with no transaction around them.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the collection grid's Draft (10.2-13) asks it")
-    )]
+    /// at a time, with no transaction around them: a built-in MongoDB target
+    /// that edits rows. An apply that stops part way has written the statements
+    /// before the one that failed, so those rows leave the draft by their
+    /// identity and the rest is kept (`ResultGrid::drop_applied`), where a
+    /// transactional engine's rolled-back draft is kept whole.
     pub fn ordered_edits(self) -> bool {
-        false
+        matches!(self.driver, Driver::BuiltIn)
+            && self.engine.syntax() == Syntax::Mongo
+            && self.edits_rows()
     }
 
-    /// Whether an edit send of this target keeps the grid and its draft until
-    /// the server answers.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the collection grid's Draft (10.2-13) asks it")
-    )]
+    /// Whether an edit sent to this target leaves the grid and the draft where
+    /// they are until the server answers: the transactional engines
+    /// ([`Self::row_edits`]), whose failure rolls the draft back, and the
+    /// ordered ones ([`Self::ordered_edits`]), whose failure removes from the
+    /// draft what applied. A target that is neither blanks the grid as the send
+    /// starts, which a draft kept behind would be sent twice from.
     pub fn keeps_edits(self) -> bool {
         self.row_edits() || self.ordered_edits()
     }

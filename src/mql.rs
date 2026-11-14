@@ -2213,13 +2213,6 @@ pub(crate) fn update_batch(rows: &[PendingRow]) -> Result<String, String> {
 // document by `_id` and none reads what another wrote, so the order only has to
 // be one the review can state. A draft whose statements depend on each other
 // would need a sort by what each reads.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the collection grid's Draft apply (10.2-13) writes it"
-    )
-)]
 pub(crate) fn draft_batch(
     deletes: &[crate::sql::DraftDelete],
     updates: &[PendingRow],
@@ -2845,13 +2838,6 @@ pub(crate) fn delete_matches_key(text: &str, keys: &[&str]) -> bool {
 /// does not parse, and text with no statement are `None`. An `updateOne` or an
 /// `insertOne` is not counted. Their shape is the gate's to check
 /// ([`is_generated_write`]), as is the order.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the collection grid's Draft apply (10.2-13) calls it"
-    )
-)]
 pub(crate) fn draft_deletes_match(text: &str, keys: &[&str], collection: &str) -> Option<usize> {
     let statements = parse(text).ok()?;
     if statements.is_empty() {

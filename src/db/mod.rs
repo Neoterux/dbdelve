@@ -652,13 +652,9 @@ impl Engine {
             | Self::Postgres
             | Self::MySql
             | Self::MariaDb
-            | Self::SqlServer => true,
-            Self::Turso
-            | Self::Snowflake
-            | Self::ClickHouse
-            | Self::MongoDb
-            | Self::Redis
-            | Self::Generic => false,
+            | Self::SqlServer
+            | Self::MongoDb => true,
+            Self::Turso | Self::Snowflake | Self::ClickHouse | Self::Redis | Self::Generic => false,
         }
     }
 
