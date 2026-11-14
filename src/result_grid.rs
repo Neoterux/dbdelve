@@ -1914,14 +1914,21 @@ impl ResultGrid {
     }
 
     /// Stage, once, the text of the input a ring move closed, by the rule Enter
-    /// commits with ([`Self::commit_text`]): an added row's untouched cell stays
-    /// out of its `INSERT`, and a mode that refuses the write stages nothing and
-    /// says nothing, as the Row path always did.
+    /// commits with ([`Self::commit_text`]), and a mode that refuses the write
+    /// stages nothing and says nothing, as the Row path always did.
+    ///
+    /// Text equal to the seed is nothing typed, on every row: a click away is
+    /// not the deliberate gesture Enter is, and a NULL or a staged keyword seeds
+    /// empty, so staging the seed would write `''` over it.
     pub(crate) fn commit_closed_input(&mut self, cx: &App) {
         let Some((row, col, input)) = self.closed_input.take() else {
             return;
         };
-        self.commit_text(row, col, input.read(cx).value().clone());
+        let text = input.read(cx).value().clone();
+        if &*text == self.edit_seed(row, col) {
+            return;
+        }
+        self.commit_text(row, col, text);
     }
 
     /// The row whose send the server refused and the words it said, drawn on
