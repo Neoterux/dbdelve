@@ -97,6 +97,15 @@ Decided, and not to be re-litigated:
   stored program. SQL Server's is `BEGIN TRANSACTION`, because a bare `BEGIN`
   opens a statement block in T-SQL; the grammar reads that spelling and
   `generated_statements` sees through its second word.
+- **A draft's batch is brackets plus `DELETE`s, `UPDATE`s and `INSERT`s, in that
+  order** (`sql::draft_batch`), so a key a draft deletes is free for an insert
+  in the same submission, and it is bracketed on the engines that bracket and
+  one implicit transaction on Postgres, like `sql::update_batch`.
+  `Engine::keeps_failed_transaction_open` answers what a failed statement does
+  to a transaction already open: MySQL, MariaDB and SQLite leave it open;
+  Postgres and DuckDB abort it; SQL Server's generated SQL runs with
+  `XACT_ABORT ON` and rolls all of it back. An explicit arm per engine, as for
+  `Engine::transaction_start`.
 - **A batch that fails part way is rolled back, and the error says which state
   the data is in.** Without that the brackets produce a third state, neither
   applied nor discarded, and rendered as applied, because the refresh `SELECT`

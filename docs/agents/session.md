@@ -778,6 +778,26 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   server since it was fetched is overwritten, and nothing detects it: a stale
   edit (`StaleEdit`) is not drift detection. Verifying that the row is as it was
   fetched is left to Phase 10.2.
+- **A draft holds added rows and marks.** In a Draft view of a relation tab on a
+  `Target::row_edits()` target, `NewRow` (Insert) adds a grid row and
+  `DeleteRow` toggles a mark on the selected rows (the palette's `Mark row for
+  deletion`, offered while `has_markable_row` holds, else `Delete row…`). Added
+  rows live beside `pending` (`ResultGrid`'s added rows) and are never sorted
+  or written into a `sort`; marks follow their rows through a sort. Deleting an
+  added row removes it. The count is cells, added rows and marks together, and
+  it drives the Apply/Discard cluster and the status bar's `N pending changes`,
+  the palette, the Draft-to-Row refusal and the requery prompt. Apply opens one
+  review titled `Apply draft`, whose text is `DELETE`s before `UPDATE`s before
+  `INSERT`s (`sql::draft_batch`), gated as a whole and checked for key and table
+  by `sql::draft_deletes_match` and against `marked_count`, so a dropped mark
+  refuses the draft. A successful reviewed relation-tab apply clears the whole
+  draft and re-reads; a failure keeps all of it and applies nothing. A joining
+  draft of more than one statement that inserts is refused, with a notice and
+  the draft kept, on an engine that keeps a failed transaction open
+  (`Engine::keeps_failed_transaction_open`; D-16a, see `docs/agents/gates.md`).
+  A row is washed by its state in the theme's added, updated and deleted
+  tokens, and its gutter carries the `debug_selector` `row-added-N`,
+  `row-updated-N` or `row-deleted-N` for the driver.
 - **An edit send keeps the grid, on a transactional SQL engine.** Where the
   target answers `Target::row_edits()`, a statement dbdelve sends for a grid
   edit (an Apply edits batch, an Insert, a Delete row) leaves the rows, the
@@ -787,9 +807,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   shown in the review (`ApplyReview::error`) or, with none over the tab, in the
   tab's notice, never as `Failed`. A success clears the cells it sent, read off
   the grid when it was sent (`ApplyReview::edits` says whether a reviewed send
-  carried the draft), and re-reads; when edits remain (an Insert or Delete over
-  a draft, an edit staged while the batch was in flight) it keeps them and does
-  not re-read. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
+  carried the draft), and re-reads; when edits remain (a query tab's Insert or
+  Delete over a draft, an edit staged while the batch was in flight) it keeps
+  them and does not re-read. On a relation tab an Insert or Delete row over a
+  draft is Row mode's case, or a Draft view's added row or mark (the next
+  bullet), never a send. A reviewed relation-tab apply clears the whole draft. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
   a plugin, Snowflake, Turso) an edit send clears the grid as it starts and a failure
   is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
