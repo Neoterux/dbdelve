@@ -34,10 +34,10 @@ use tracing::span;
 
 use super::ssh::{Tunnel, tunnelled};
 use super::{
-    Catalog, Cell, Column, DbError, EditTarget, Engine, Fetch, QueryResult, Reference,
-    RelationKind, Row, ServerConfig, SslMode, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
-    assemble_structure, create_table, plain_error, required_cell, terminated,
+    ApplyOutcome, ApplyStage, Bracket, Catalog, Cell, Column, DbError, EditTarget, Engine, Fetch,
+    QueryResult, Reference, RelationKind, Row, Sending, ServerConfig, SslMode, Stopped, Structure,
+    VerifiedStep, assemble_catalog, assemble_databases, assemble_foreign_keys, assemble_references,
+    assemble_sequences, assemble_structure, create_table, plain_error, required_cell, terminated,
 };
 
 const DATABASES_SQL: &str = "
@@ -975,6 +975,61 @@ impl Connection {
         self.run(sql, Origin::Generated, fetch)
     }
 
+    /// A draft applied as one verified sequence on the session's lock, taken
+    /// once (see [`super::run_verified`]). Every statement goes through
+    /// [`Self::execute`] as [`Origin::Generated`], the way a grid's preview
+    /// and edits do: a re-read is previewed by [`readable_preview`], so a CLR
+    /// or `sql_variant` column reads as the grid's cell did and is neither
+    /// refused nor a false drift; `BEGIN TRANSACTION` and `COMMIT` go out
+    /// bare, as `execute` sends a bracket; and a write's count is the
+    /// `SELECT @@ROWCOUNT` `execute` asks right after it, before anything
+    /// else is sent, since a bracket or a later statement would reset it.
+    ///
+    /// Counted in `in_flight` as [`Self::run`] is, so a Cancel finds it. No
+    /// binding is put back for a bound tab: a session a `USE` moved is moved
+    /// back before any run returns ([`held_to_database`]).
+    pub fn apply_verified(
+        &self,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        proceed: &dyn Fn() -> bool,
+    ) -> ApplyOutcome {
+        let failed = |error| ApplyOutcome::Failed {
+            stage: ApplyStage::Begin,
+            error,
+        };
+        let mut guard = match self.acquire(true) {
+            Ok(guard) => guard,
+            Err(error) => return failed(error),
+        };
+        // Registers the run, so a Cancel finds the session, and checks for one
+        // that came first.
+        if !proceed() {
+            return failed(plain_error("Cancelled before it was sent.".into()));
+        }
+        let mut send = |sql: &str, _: Sending| {
+            // A statement that reset the session leaves a fresh one, or none
+            // when the reconnect failed; only a `ROLLBACK` follows, whose
+            // error the sequence does not report.
+            if guard.is_none() {
+                return Err(plain_error(
+                    "The connection is unavailable after it was reset.".into(),
+                ));
+            }
+            self.run_held(&mut guard, sql, Origin::Generated, Fetch::default())
+                .map(|(result, _)| result)
+        };
+        super::run_verified(
+            Engine::SqlServer,
+            steps,
+            bracket,
+            &mut send,
+            proceed,
+            &|_| false,
+            &|_| false,
+        )
+    }
+
     /// dbdelve's own SQL. Its rows are never editable, so it does not pay for
     /// the describe that would say where they came from.
     fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
@@ -982,7 +1037,22 @@ impl Connection {
     }
 
     fn run(&self, sql: &str, origin: Origin, fetch: Fetch) -> Result<QueryResult, DbError> {
-        let cancellable = origin != Origin::Internal;
+        let mut guard = self.acquire(origin != Origin::Internal)?;
+        let (mut result, probed) = self.run_held(&mut guard, sql, origin, fetch)?;
+        if !probed.is_empty() {
+            drop(guard);
+            result.edit = self.edit_target(&probed);
+        }
+        Ok(result)
+    }
+
+    /// The session's lock, taken for a run, with a session behind it: one
+    /// stopped earlier whose reconnect failed is opened again here.
+    /// `cancellable` counts the wait in the queue a Cancel reads.
+    fn acquire(
+        &self,
+        cancellable: bool,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Session>>, DbError> {
         if cancellable {
             self.in_flight().queued += 1;
         }
@@ -999,7 +1069,7 @@ impl Connection {
             in_flight.queued -= 1;
             std::mem::take(&mut in_flight.cancel_queued)
         };
-        let mut guard = locked.map_err(|_| DbError {
+        let guard = locked.map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
         })?;
@@ -1009,7 +1079,23 @@ impl Connection {
             ));
         }
         connected?;
-        let session = guard.as_mut().expect("connected above");
+        Ok(guard)
+    }
+
+    /// One statement on the session `guard` holds, with Cancel and the timeout
+    /// reaching it, and what each does to the session settled: a stopped or
+    /// lost session is closed and replaced before this returns. The columns
+    /// are those [`Self::edit_target`] asks about, which the caller does once
+    /// it has let go of the lock.
+    fn run_held(
+        &self,
+        guard: &mut Option<Session>,
+        sql: &str,
+        origin: Origin,
+        fetch: Fetch,
+    ) -> Result<(QueryResult, Vec<ProbedColumn>), DbError> {
+        let cancellable = origin != Origin::Internal;
+        let session = guard.as_mut().expect("acquired with a session");
 
         if cancellable {
             let mut in_flight = self.in_flight();
@@ -1053,10 +1139,10 @@ impl Connection {
                         // error or as rows a cancel cut short, and the reset
                         // is said beside it.
                         Ok(mut result) => {
-                            let reset = self
-                                .stop(&mut guard, format!("The statement finished, but {after}"));
+                            let reset =
+                                self.stop(guard, format!("The statement finished, but {after}"));
                             result.notice = Some(reset.message);
-                            return Ok(result);
+                            return Ok((result, Vec::new()));
                         }
                         Err(error) => {
                             format!("{}\n\nThe statement failed, but {after}", error.message)
@@ -1064,18 +1150,13 @@ impl Connection {
                     }
                 }
             };
-            return Err(self.stop(&mut guard, what));
+            return Err(self.stop(guard, what));
         }
 
         let Some(Ran { result, probed }) = ran else {
             unreachable!("a run that did not finish was stopped or lost the session")
         };
-        let mut result = result?;
-        if !probed.is_empty() {
-            drop(guard);
-            result.edit = self.edit_target(&probed);
-        }
-        Ok(result)
+        Ok((result?, probed))
     }
 
     /// The statement and every round trip that belongs to it, all inside the
