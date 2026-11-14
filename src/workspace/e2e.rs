@@ -29180,3 +29180,64 @@ fn a_row_send_on_a_table_without_a_primary_key_reads_its_row_back_by_its_new_val
         quit(workspace, cx);
     });
 }
+
+/// What Apply edits and Save say of a grid whose last apply may have landed.
+const OUTCOME_UNKNOWN_REFUSAL: &str = "Not applied: whether the last apply reached the server is not known until the rows are read again.";
+
+#[gpui::test]
+fn an_apply_whose_outcome_is_unknown_is_refused_until_the_rows_are_read_again(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::AfterEdits};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // The SQLite arm never answers `Unknown`, so the test enters where the
+        // landing does: the grid is marked, with the draft staged on it.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+
+        for _ in 0..2 {
+            cx.dispatch_action(crate::actions::ApplyEdits);
+            settle(cx);
+            assert_eq!(front_review(&workspace, cx), None, "no review opens");
+            assert_eq!(
+                shown_notice(&workspace, cx).as_deref(),
+                Some(OUTCOME_UNKNOWN_REFUSAL)
+            );
+            assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        }
+
+        // A refresh asks about the draft first, and keeping it reads nothing.
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Refresh)
+        ));
+        workspace.update(cx, |workspace, cx| {
+            workspace.cancel_discard_close(cx);
+        });
+        settle(cx);
+        assert!(grid.read_with(cx, |table, _| table.delegate().outcome_unknown()));
+
+        // Discarding it lets the refresh read the rows again, and the grid
+        // that holds them has no mark.
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        let grid = relation_grid(&workspace, cx, id);
+        assert!(!grid.read_with(cx, |table, _| table.delegate().outcome_unknown()));
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        quit(workspace, cx);
+    });
+}
