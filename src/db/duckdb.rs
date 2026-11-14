@@ -505,6 +505,11 @@ impl Connection {
             Ok(connection) => connection,
             Err(error) => return failed(error),
         };
+        // Registers the run, so a Cancel finds the session, and checks for one
+        // that came first, as `submit` does before it touches the session.
+        if !proceed() {
+            return failed(plain_error("Cancelled before it was sent.".into()));
+        }
         if let Some(schema) = bound
             && let Err(error) = self.put_back(&connection, schema)
         {

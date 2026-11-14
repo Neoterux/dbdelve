@@ -674,9 +674,8 @@ impl Engine {
     /// [`Connection::generated`], and one added later must be decided here.
     pub fn verifies_applies(self) -> bool {
         match self {
-            Self::Sqlite | Self::DuckDb => true,
-            Self::Postgres
-            | Self::MySql
+            Self::Sqlite | Self::DuckDb | Self::Postgres => true,
+            Self::MySql
             | Self::MariaDb
             | Self::Turso
             | Self::Snowflake
@@ -2297,8 +2296,10 @@ impl Connection {
                 Self::DuckDb(connection) => {
                     connection.apply_verified(bound, steps, bracket, &proceed)
                 }
-                Self::Postgres(_)
-                | Self::MySql(_)
+                Self::Postgres(connection) => {
+                    connection.apply_verified(bound, steps, bracket, &proceed)
+                }
+                Self::MySql(_)
                 | Self::SqlServer(_)
                 | Self::Turso(_)
                 | Self::Snowflake(_)
@@ -3986,9 +3987,6 @@ pub(crate) struct FetchedCell {
     /// The fetched column's [`Column::data_type`]. Never compared: an arm's
     /// skip predicate reads it to leave out a cell the grid renders after the
     /// fetch.
-    // The Postgres arm's skip predicate reads it (plan 10.2-03); SQLite
-    // skips nothing.
-    #[allow(dead_code)]
     pub column_type: Option<String>,
 }
 
@@ -4214,7 +4212,7 @@ pub(super) fn run_verified(
             let _ = send("ROLLBACK", Sending::Bracket);
         }
     };
-    let cancelled = || plain_error("Cancelled between statements.".into());
+    let cancelled = || plain_error("Cancelled before it was sent.".into());
 
     if let Some(word) = opening {
         if !proceed() {

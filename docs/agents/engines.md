@@ -106,6 +106,26 @@ Decided, and not to be re-litigated:
   Postgres and DuckDB abort it; SQL Server's generated SQL runs with
   `XACT_ABORT ON` and rolls all of it back. An explicit arm per engine, as for
   `Engine::transaction_start`.
+- **A verified Draft apply reads counts and cells the way each engine reports
+  them** (`Connection::apply_verified`; the sequence is `db::run_verified`).
+  Postgres counts the rows a statement matched, so a same-value `UPDATE` counts
+  one, and a `BEFORE` row trigger returning NULL or a rule `DO INSTEAD NOTHING`
+  counts none: the write is refused and the sequence rolled back, and the row
+  keeps what the trigger left it. Postgres's text carries no bracket, so the
+  apply sends its own `BEGIN` after putting a bound tab's schema back (a
+  `search_path` cannot move inside a transaction block), and none of its
+  statements is described, because a refused describe aborts the transaction.
+  Spatial cells (`geometry`, `geography`) are left out of the compare: the grid
+  shows the WKT it rendered after the fetch, the re-read returns the server's
+  EWKB, and the two are different text for one value, so a change confined to a
+  spatial column is not seen while the key and the count still hold. An error at
+  `COMMIT` is an unknown outcome only when the session is gone (`Unknown`); one
+  on a live session, and any error before `COMMIT`, is a failure that rolled back.
+  DuckDB counts the rows a statement matched too (its `Count` column), takes no
+  lock beyond its own connection's, and raises a write-write conflict at the
+  statement that met it, so a conflict is a failure at that write. Its
+  `is_autocommit` answers true whatever the state, so the apply knows it opened
+  its own transaction from its own bracket.
 - **A batch that fails part way is rolled back, and the error says which state
   the data is in.** Without that the brackets produce a third state, neither
   applied nor discarded, and rendered as applied, because the refresh `SELECT`
