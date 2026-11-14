@@ -1594,7 +1594,8 @@ fn deletes_anything(node: tree_sitter::Node) -> bool {
 /// tree, and so all arrive here as `None`.
 ///
 /// On an engine that names a row by every value (`row_terms`), a term may also
-/// be `toString(<column>) = '…'` or `<column> IS NULL` ([`equality_columns`]).
+/// be `toString(<column>) = '…'` or `<column> IS NULL`, and under `null_terms`
+/// `<column> IS NULL` alone ([`equality_columns`]).
 ///
 /// `sql` is as [`as_written`] gives it.
 fn delete_key_columns(spec: &SqlSpec, sql: &str) -> Option<Vec<String>> {
@@ -1743,9 +1744,10 @@ fn distinct(columns: &[String]) -> Option<()> {
 ///
 /// Under `row_terms`, two more terms name a column: `toString(<column>) = '…'`
 /// (the server's own text of a value no literal matches exactly, a float or a
-/// `DateTime64`) and `<column> IS NULL`. Nothing else: not `IS NOT NULL`, not a
-/// second argument to `toString` (a time zone changes its text), not any
-/// other function.
+/// `DateTime64`) and `<column> IS NULL`; under `null_terms` the second alone,
+/// which is how a row with a NULL cell is named by every value. Nothing else:
+/// not `IS NOT NULL`, not a second argument to `toString` (a time zone changes
+/// its text), not any other function.
 fn equality_columns(
     spec: &SqlSpec,
     node: tree_sitter::Node,
@@ -1770,7 +1772,9 @@ fn equality_columns(
             "invocation" if spec.row_terms && quoted(*right, sql) => stringified(*left, sql),
             _ => column_name(*left, sql),
         },
-        "keyword_is" if spec.row_terms && null_literal(*right, sql) => column_name(*left, sql),
+        "keyword_is" if (spec.row_terms || spec.null_terms) && null_literal(*right, sql) => {
+            column_name(*left, sql)
+        }
         _ => None,
     };
     match column {

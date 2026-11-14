@@ -174,9 +174,9 @@ mode, always where the user can read it before it runs:
 
 Limits on what DBDelve may write. It never writes `DROP` or `TRUNCATE`
 into a buffer or onto the wire, whatever the user asked for. It writes
-`DELETE` only as the explicit deletion of one named row: by primary key (on
-an engine without unique keys, by all of the row's values as read, and only
-when exactly one row matches), from a direct ask, with the statement shown before it runs
+`DELETE` only as the explicit deletion of one named row: by primary key (on a
+table with no primary key, by all of the row's values as read, a NULL as
+`IS NULL`, and only when exactly one row matches), from a direct ask, with the statement shown before it runs
 (`sql::delete_row`), or as one `DELETE` per row the user marked in a reviewed
 draft, each naming that row's key and shown with the rest of the draft before it
 runs. The one exception to both is the explorer's
@@ -208,10 +208,15 @@ passes first. It admits exactly five shapes:
   distinct, unqualified columns against single-quoted literals (or a bare
   `0x…` hex literal, SQL Server's spelling of bytes): no `OR`, no
   other operator, no subquery, no function call, no CTE beside it, no
-  `RETURNING`, no `LIMIT`, and nothing else in the submission. ClickHouse,
-  which has no unique key, is the one exception to the terms: a row is named
-  by every value, and a term may also be `toString(col) = '…'` (the only
-  function call admitted, over a bare column) or `col IS NULL`;
+  `RETURNING`, no `LIMIT`, and nothing else in the submission. A row with no
+  primary key is named by every value, so a term may also be `col IS NULL`
+  (never `IS NOT NULL`) on Postgres, MySQL, MariaDB, SQLite, DuckDB and SQL
+  Server (`SqlSpec::null_terms`); ClickHouse, whose drafts are not verified,
+  also admits `toString(col) = '…'` (the only function call admitted, over a
+  bare column) under `SqlSpec::row_terms`. The `IS NULL` term is read through
+  the spoken engine's spec, so a plugin that speaks one of those dialects is
+  admitted it too (`generated_writes`); its driver holds each statement to
+  exactly one row or saves nothing;
 - a draft: more than one statement, optionally bracketed as the first shape
   is, each an `UPDATE`, an `INSERT` of exactly one row with no skip tail
   (otherwise as the second shape reads it) or a `DELETE` of the third shape,
@@ -294,18 +299,22 @@ counts are the marks the grid holds.
 
 A cell is editable only when DBDelve can name its row by primary key; when
 it cannot, the grid stays read-only and says why, and never guesses at a
-predicate. An `INSERT` has no existing row to name, so a table without a
-primary key can be inserted into and not edited. That asymmetry is
-deliberate and belongs in anything that documents either feature.
+predicate.
 
-The one exception is an engine without unique keys (ClickHouse): a row is
-named by all of its values as read, and a write runs only when exactly one row
-matches. Before each `UPDATE`, `DELETE` or `ALTER` write, an exactly-one-row
-`COUNT(*)` with the identical predicate (`sql::row_guard`) must return one. An
-update on a table lacking the block columns is spelled `ALTER TABLE <t> UPDATE
-<assignments> WHERE <predicate> SETTINGS mutations_sync = 2`, exactly, with
-the setting last. A row that cannot be matched exactly stays read-only and says
-why.
+The one exception is a table with no primary key: a row is named by all of its
+values as read, a NULL as `IS NULL`, and a write runs only when exactly one row
+matches. On the six verified engines the re-read must return one row and the
+write must count one, inside the apply's transaction
+(`sql::draft_deletes_match` holds a `DELETE` to every column of the grid's
+key, as a set). On ClickHouse, before each `UPDATE`, `DELETE` or `ALTER` write,
+an exactly-one-row `COUNT(*)` with the identical predicate (`sql::row_guard`)
+must return one. An update on a table lacking the block columns is spelled
+`ALTER TABLE <t> UPDATE <assignments> WHERE <predicate> SETTINGS
+mutations_sync = 2`, exactly, with the setting last. A column that cannot be
+matched by equality (on SQLite, any declared type outside the INTEGER, TEXT,
+REAL and BLOB affinities) leaves the grid read-only and says why; it is never
+left out of the `WHERE`, and no unique key, rowid or subset of the columns
+names the row in its place.
 
 ## Agent statements
 
