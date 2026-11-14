@@ -1380,10 +1380,15 @@ pub fn row_guard(engine: Engine, statement: &str) -> Option<String> {
 /// no read sends nothing.
 ///
 /// ClickHouse's `ALTER TABLE … UPDATE` is read as the update it is, so it has a
-/// read too; no Row send is made there (`Target::row_edits`).
+/// read too; no Row send is made there (`Target::row_edits`). MongoDB's is the
+/// `find` of the `_id` ([`crate::mql::browse::row_reread`]); Redis has none.
 pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
-    if engine.syntax() != Syntax::Sql {
-        return None;
+    match engine.syntax() {
+        Syntax::Sql => {}
+        // An `updateOne` never changes `_id`, so the read by the `_id` the write
+        // names finds the document it wrote.
+        Syntax::Mongo => return crate::mql::browse::row_reread(statement),
+        Syntax::Redis => return None,
     }
     let spec = &engine.spec().sql;
     if is_transaction_bracket(statement) || !generated_write(spec, statement) {
@@ -8339,7 +8344,7 @@ mod tests {
         let read = row_read(Engine::MongoDb, &update).expect("a read");
         assert_eq!(Some(read.clone()), crate::mql::browse::row_reread(&update));
         assert!(is_generated_select(Engine::MongoDb, &read), "{read}");
-        assert!(read.contains(oid), "{read}");
+        assert!(read.contains("65a4f1c0ffffffffffffff03"), "{read}");
 
         let insert = insert_row(
             Engine::MongoDb,
