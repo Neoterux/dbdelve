@@ -1482,6 +1482,16 @@ fn rolled_back(connection: &mut Conn, sql: &str, error: DbError) -> DbError {
     }
 }
 
+/// The rows an `UPDATE` matched, read from the OK packet's info text, which is
+/// all the server says of them: `affected_rows` counts the rows that
+/// *changed*, so a statement that writes the value a row already holds counts
+/// none. RED stub.
+#[cfg_attr(not(test), expect(dead_code, reason = "RED stub"))]
+fn matched_count(affected: u64, info: &str) -> Option<u64> {
+    let _ = (affected, info);
+    None
+}
+
 /// Prefer the server's own message. It is written for humans and already says
 /// the useful part; the driver's wrapper adds an error code and a SQLSTATE that
 /// mostly repeat it.
@@ -1519,6 +1529,42 @@ mod tests {
             engine,
         )
         .expect("connection should open")
+    }
+
+    #[test]
+    fn a_mysql_count_is_the_matched_number_read_by_position_and_refuses_when_changed_disagrees() {
+        // Matched, changed and warnings, in that order, whatever the language.
+        let english = "Rows matched: 1  Changed: 0  Warnings: 0";
+        let russian = "Совпало записей: 1  Изменено: 0  Предупреждений: 0";
+        let japanese = "該当した行: 1  変更: 0  警告: 0";
+        for info in [english, russian, japanese] {
+            assert_eq!(matched_count(0, info), Some(1), "{info}");
+        }
+        // A changed row is a matched one, and the changed count must be what
+        // the server said it affected.
+        let changed = "Rows matched: 1  Changed: 1  Warnings: 0";
+        assert_eq!(matched_count(1, changed), Some(1));
+        assert_eq!(matched_count(0, changed), None);
+        // Two rows matched is two, never read as one, whether or not the
+        // second differs.
+        let two = "Rows matched: 2  Changed: 1  Warnings: 0";
+        assert_eq!(matched_count(1, two), Some(2));
+        assert_eq!(matched_count(2, two), None);
+        assert_eq!(
+            matched_count(0, "Rows matched: 0  Changed: 0  Warnings: 0"),
+            Some(0)
+        );
+        // No text to read: the affected count stands when it names a row, and
+        // none at all is a count that cannot be told from a miss.
+        assert_eq!(matched_count(0, ""), None);
+        assert_eq!(matched_count(1, ""), Some(1));
+        // Not three numbers: not the text this reads.
+        assert_eq!(matched_count(1, "Records: 1  Duplicates: 0"), Some(1));
+        assert_eq!(matched_count(0, "Records: 1  Duplicates: 0"), None);
+        // A run of digits no `u64` holds is not a count.
+        let long = "Rows matched: 99999999999999999999999  Changed: 1  Warnings: 0";
+        assert_eq!(matched_count(1, long), Some(1));
+        assert_eq!(matched_count(0, long), None);
     }
 
     #[test]
