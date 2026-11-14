@@ -23888,6 +23888,120 @@ fn an_added_rows_cell_closed_by_a_click_is_staged_only_when_typed_in(cx: &mut Te
     });
 }
 
+/// A wren with no count, beside a tit with one: a fetched NULL to open.
+const NULL_BIRDS: &str = "create table birds (id integer primary key, name text not null, n integer); \
+     insert into birds values (1, 'wren', null), (2, 'tit', 2);";
+
+#[gpui::test]
+fn an_untouched_input_closed_by_a_click_stages_nothing_over_a_null(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+
+        // A fetched NULL, opened and left with nothing typed.
+        ring_on(&grid, cx, 0, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        click_cell_of_row(cx, 1);
+        assert_eq!(pending_of(&grid, cx), 0, "the NULL is not turned into ''");
+
+        // A staged NULL, the same.
+        stage(&grid, cx, 1, 2, NewValue::Null);
+        ring_on(&grid, cx, 1, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        click_cell_of_row(cx, 0);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(1, 2),
+                Some(&NewValue::Null),
+                "the staged NULL stays"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_untouched_input_on_a_null_closed_by_a_click_sends_nothing_in_row_mode(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        click_cell_of_row(cx, 1);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert!(
+            !history_sql(&workspace, cx)
+                .iter()
+                .any(|sql| sql.contains("UPDATE")),
+            "leaving the row sends nothing"
+        );
+        assert_eq!(
+            on_disk("select n is null from birds where id = 1").as_deref(),
+            Some("1")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn go_to_column_stages_the_input_it_closes_so_a_later_edit_of_the_cell_stands(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("x");
+        settle(cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.reveal_column(2, window, cx)
+        });
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("x".into())),
+                "staged by the move itself"
+            );
+        });
+
+        ring_on(&grid, cx, 0, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("y");
+        settle(cx);
+        press(cx, "enter");
+        click_cell_of_row(cx, 1);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Value("y".into())),
+                "the newer value is the one staged"
+            );
+        });
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_step_key_past_the_grids_edge_commits_the_input_and_sends_the_row_in_row_mode(
     cx: &mut TestAppContext,
