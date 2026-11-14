@@ -389,6 +389,18 @@ WHERE i.object_id = {object} AND i.is_primary_key = 1
 ORDER BY ic.key_ordinal
 ";
 
+// What a table with no primary key is edited by: each of its columns and the
+// type the catalog names. `sys.tables` is what keeps a view out: its rows are
+// no table's, and it has no primary key to have been refused for. A column
+// that is an alias type reports the alias, which is on no list.
+const EDIT_COLUMNS_SQL: &str = "
+SELECT c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type
+FROM sys.tables AS t
+JOIN sys.columns AS c ON c.object_id = t.object_id
+WHERE t.object_id = {object}
+ORDER BY c.column_id
+";
+
 // Mode 2 describes a view as the view, as a cursor would, rather than seeing
 // through it to its base tables: a row read through a view is edited through
 // the view's own key, which it has none of. `is_hidden` columns are keys the
@@ -1047,7 +1059,7 @@ impl Connection {
         let (mut result, probed) = self.run_held(&mut guard, sql, origin, fetch)?;
         if !probed.is_empty() {
             drop(guard);
-            result.edit = self.edit_target(&probed);
+            (result.edit, result.read_only_reason) = self.edit_target(&probed);
         }
         Ok(result)
     }
@@ -1354,27 +1366,44 @@ impl Connection {
         plain_error(format!("{what} {RESET} {reconnected}"))
     }
 
-    /// Which table these rows can be written back to, if any.
+    /// Which table these rows can be written back to, if any, and when the
+    /// answer is no for a reason the user can act on, that reason.
     ///
     /// Every step is allowed to answer "no": an undescribable statement, a
-    /// join, a computed column, a table without a primary key, a key the select
-    /// omitted. A failure answers "no" too -- this runs after the user's
-    /// statement already succeeded, and must not turn that into an error.
-    fn edit_target(&self, probed: &[ProbedColumn]) -> Option<EditTarget> {
-        let (schema, table) = sole_table(probed)?;
+    /// join, a computed column, a key the select omitted. A failure answers
+    /// "no" too -- this runs after the user's statement already succeeded, and
+    /// must not turn that into an error.
+    fn edit_target(&self, probed: &[ProbedColumn]) -> (Option<EditTarget>, Option<String>) {
+        let Some((schema, table)) = sole_table(probed) else {
+            return (None, None);
+        };
         // ponytail: one catalog round trip per result set, no cache. A map from
         // table to key held on the connection is the upgrade path if the trip
         // shows up in query timings.
-        let key = self
-            .internal_query(&structure_sql(PRIMARY_KEY_SQL, &schema, &table))
-            .ok()?;
-        let key = key
+        let Ok(key) = self.internal_query(&structure_sql(PRIMARY_KEY_SQL, &schema, &table)) else {
+            return (None, None);
+        };
+        let Ok(key) = key
             .rows
             .iter()
             .map(|row| required_cell(&key, row, "column_name").map(str::to_string))
             .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        resolve_edit_target(probed, &schema, &table, &key)
+        else {
+            return (None, None);
+        };
+        if !key.is_empty() {
+            return (resolve_edit_target(probed, &schema, &table, &key), None);
+        }
+        // No primary key: the table's rows are named by every column, which
+        // takes the columns' types.
+        let Ok(catalog) = self.internal_query(&structure_sql(EDIT_COLUMNS_SQL, &schema, &table))
+        else {
+            return (None, None);
+        };
+        match table_columns(&catalog) {
+            Some(columns) => resolve_keyless_target(probed, &schema, &table, &columns),
+            None => (None, None),
+        }
     }
 
     pub fn databases(&self) -> Result<super::Databases, DbError> {
@@ -2161,6 +2190,48 @@ fn resolve_edit_target(
         keys,
         ..Default::default()
     })
+}
+
+/// One column of a table as [`EDIT_COLUMNS_SQL`] describes it.
+struct TableColumn {
+    name: String,
+    /// The catalog's type name, which [`is_matchable`] is asked about.
+    data_type: String,
+}
+
+/// The table's columns in order, or `None` where the catalog said none (a view,
+/// or a table that is not there) or an answer was malformed.
+fn table_columns(result: &QueryResult) -> Option<Vec<TableColumn>> {
+    let columns = result
+        .rows
+        .iter()
+        .map(|row| {
+            Some(TableColumn {
+                name: required_cell(result, row, "column_name").ok()?.to_string(),
+                data_type: required_cell(result, row, "data_type").ok()?.to_string(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!columns.is_empty()).then_some(columns)
+}
+
+/// Whether `=` against a column's value rendered as text finds it, for the
+/// type [`EDIT_COLUMNS_SQL`] names.
+fn is_matchable(data_type: &str) -> bool {
+    let _ = data_type;
+    false
+}
+
+/// The target of a result set over a table with no primary key, or the reason
+/// it has none.
+fn resolve_keyless_target(
+    probed: &[ProbedColumn],
+    schema: &str,
+    table: &str,
+    columns: &[TableColumn],
+) -> (Option<EditTarget>, Option<String>) {
+    let _ = (probed, schema, table, columns, is_matchable);
+    (None, None)
 }
 
 /// A relation name is user data and can contain a quote. `QUOTENAME` brackets
@@ -3144,6 +3215,180 @@ mod tests {
                 &["id".to_string()],
             )
             .is_none()
+        );
+    }
+
+    fn keyless(columns: &[(&str, &str)]) -> Vec<TableColumn> {
+        columns
+            .iter()
+            .map(|(name, data_type)| TableColumn {
+                name: (*name).to_string(),
+                data_type: (*data_type).to_string(),
+            })
+            .collect()
+    }
+
+    /// A result over `sightings` carrying these columns, in this order.
+    fn sightings(columns: &[&str]) -> Vec<ProbedColumn> {
+        probed(
+            &columns
+                .iter()
+                .map(|column| (Some("sightings"), Some(*column)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn a_table_without_a_primary_key_is_matched_by_every_column_or_read_only_with_a_reason() {
+        use crate::db::RowMatch;
+        let table = keyless(&[
+            ("bird", "nvarchar"),
+            ("place", "varchar"),
+            ("seen", "int"),
+            ("weight", "float"),
+            ("at", "datetime2"),
+        ]);
+        let whole = sightings(&["bird", "place", "seen", "weight", "at"]);
+        let (target, reason) = resolve_keyless_target(&whole, "dbo", "sightings", &table);
+        let target = target.expect("every column is of a listed type");
+        assert_eq!(target.schema, "dbo");
+        assert_eq!(target.table, "sightings");
+        assert_eq!(target.keys, [0, 1, 2, 3, 4]);
+        assert_eq!(
+            target.columns,
+            ["bird", "place", "seen", "weight", "at"].map(|name| Some(name.to_string()))
+        );
+        assert_eq!(target.row_match, RowMatch::EveryColumn { fixed: vec![] });
+        assert_eq!(reason, None);
+
+        // Table order, whatever order the result lists them in.
+        let (reordered, _) = resolve_keyless_target(
+            &sightings(&["place", "bird", "seen", "weight", "at"]),
+            "dbo",
+            "sightings",
+            &table,
+        );
+        assert_eq!(reordered.expect("reordered").keys, [1, 0, 2, 3, 4]);
+
+        // A computed, identity or rowversion column is matched and never set.
+        let mut columns = sightings(&["bird", "label", "n"]);
+        columns[1].writable = false;
+        let (computed, _) = resolve_keyless_target(
+            &columns,
+            "dbo",
+            "sightings",
+            &keyless(&[("bird", "nvarchar"), ("label", "nvarchar"), ("n", "int")]),
+        );
+        let computed = computed.expect("a computed column is matched");
+        assert_eq!(computed.row_match, RowMatch::EveryColumn { fixed: vec![1] });
+        assert_eq!(computed.keys, [0, 1, 2]);
+
+        let refused = |column: &str| {
+            Some(format!(
+                "A table without a primary key is edited by matching every column, \
+                 and {column} cannot be matched by its value."
+            ))
+        };
+        // The types `=` errors on, the CLR ones the driver cannot read at all,
+        // and rowversion, which no test matched.
+        for data_type in [
+            "xml",
+            "text",
+            "ntext",
+            "image",
+            "geography",
+            "geometry",
+            "hierarchyid",
+            "sql_variant",
+            "timestamp",
+            "sysname",
+            "",
+        ] {
+            let (target, reason) = resolve_keyless_target(
+                &sightings(&["bird", "shape"]),
+                "dbo",
+                "sightings",
+                &keyless(&[("bird", "nvarchar"), ("shape", data_type)]),
+            );
+            assert!(target.is_none(), "{data_type}");
+            assert_eq!(
+                reason,
+                refused(&format!("shape ({data_type})")),
+                "{data_type}"
+            );
+        }
+        // A column the preview reads as text for the driver is computed beside
+        // the real ones, and the table's own type is still what is said.
+        let (target, reason) = resolve_keyless_target(
+            &probed(&[(Some("sightings"), Some("bird")), (None, None)]),
+            "dbo",
+            "sightings",
+            &keyless(&[("bird", "nvarchar"), ("shape", "geography")]),
+        );
+        assert!(target.is_none());
+        assert_eq!(reason, refused("shape (geography)"));
+        for data_type in [
+            "tinyint",
+            "smallint",
+            "int",
+            "bigint",
+            "decimal",
+            "numeric",
+            "real",
+            "float",
+            "money",
+            "smallmoney",
+            "bit",
+            "char",
+            "varchar",
+            "nchar",
+            "nvarchar",
+            "date",
+            "time",
+            "datetime",
+            "datetime2",
+            "smalldatetime",
+            "datetimeoffset",
+            "uniqueidentifier",
+            "binary",
+            "varbinary",
+        ] {
+            let (target, reason) = resolve_keyless_target(
+                &sightings(&["one"]),
+                "dbo",
+                "sightings",
+                &keyless(&[("one", data_type)]),
+            );
+            assert!(target.is_some(), "{data_type}");
+            assert_eq!(reason, None, "{data_type}");
+        }
+
+        // A column the result leaves out would be left out of the WHERE.
+        let (target, reason) =
+            resolve_keyless_target(&sightings(&["bird"]), "dbo", "sightings", &table);
+        assert!(target.is_none());
+        assert_eq!(
+            reason,
+            Some(
+                "A table without a primary key is edited by matching every column, \
+                 and place is not in the result."
+                    .to_string()
+            )
+        );
+        // Computed beside real columns, and a self-join, are no table's rows.
+        let one = keyless(&[("bird", "nvarchar")]);
+        assert_eq!(
+            resolve_keyless_target(
+                &probed(&[(Some("sightings"), Some("bird")), (None, None)]),
+                "dbo",
+                "sightings",
+                &one,
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            resolve_keyless_target(&sightings(&["bird", "bird"]), "dbo", "sightings", &one),
+            (None, None)
         );
     }
 
@@ -5445,7 +5690,208 @@ mod tests {
         generated_writes_round_trip,
         generated_draft_round_trip,
         verified_draft_round_trip,
+        verified_keyless_round_trip,
     );
+
+    /// Drops scratch tables and views when a test ends, panicking or not.
+    struct Scratch<'a>(&'a Connection, &'a [&'a str]);
+
+    impl Scratch<'_> {
+        fn drop_all(&self) {
+            for name in self.1 {
+                for kind in ["VIEW", "TABLE"] {
+                    let _ = self.0.query(
+                        &format!("DROP {kind} IF EXISTS dbo.{name}"),
+                        Fetch::default(),
+                    );
+                }
+            }
+        }
+    }
+
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            self.drop_all();
+        }
+    }
+
+    /// One column of each listed type, with a value that shows how it renders.
+    const TYPE_SAMPLES: &[(&str, &str)] = &[
+        ("tinyint", "200"),
+        ("smallint", "-300"),
+        ("int", "42"),
+        ("bigint", "9007199254740993"),
+        ("decimal(10,2)", "-12.50"),
+        ("numeric(5,1)", "3.5"),
+        ("real", "0.1"),
+        ("float", "0.30000000000000004"),
+        ("money", "1234.5"),
+        ("smallmoney", "-3.25"),
+        ("bit", "1"),
+        ("char(3)", "'ab'"),
+        ("varchar(32)", "'h''e llo, \\ {a: 1}'"),
+        ("nchar(3)", "N'ab'"),
+        ("nvarchar(64)", "N'h''e llo, \u{fc}n\u{ef} \u{2603} {a: 1}'"),
+        ("nvarchar(max)", "N'long'"),
+        ("varchar(max)", "'long'"),
+        ("date", "'2024-02-29'"),
+        ("time(6)", "'12:34:56.123456'"),
+        ("datetime", "'2024-02-29 12:34:56.123'"),
+        ("datetime2(6)", "'2024-02-29 12:34:56.123456'"),
+        ("smalldatetime", "'2024-02-29 12:34:00'"),
+        ("datetimeoffset(3)", "'2024-06-01 00:00:00.500 -07:00'"),
+        ("uniqueidentifier", "'8F1F4D3A-1B2C-4D5E-8F90-123456789ABC'"),
+        ("binary(4)", "0x61626364"),
+        ("varbinary(8)", "0xdeadbeef"),
+        ("varbinary(max)", "0x00ff"),
+    ];
+
+    /// Types left off the list because they have no `=` of their own, which the
+    /// server answers with an error rather than a count. The CLR types and
+    /// `sql_variant` are left off with them, and cannot be read by this driver
+    /// to be exercised.
+    const UNMATCHED_SAMPLES: &[(&str, &str)] = &[
+        ("xml", "'<a/>'"),
+        ("text", "'abc'"),
+        ("ntext", "N'abc'"),
+        ("image", "0x00ff"),
+    ];
+
+    /// Types left off the list that nothing was matched with: the grid is
+    /// read-only and says which column is why.
+    const UNLISTED_SAMPLES: &[(&str, &str)] = &[("sysname", "N'x'")];
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MSSQL_URL"]
+    fn live_every_listed_type_matches_its_row_by_its_rendered_text() {
+        let connection = live();
+        let scratch = Scratch(
+            &connection,
+            &[
+                "dbdelve_keyless_types",
+                "dbdelve_keyless_probe",
+                "dbdelve_keyless_view",
+            ],
+        );
+        scratch.drop_all();
+        let run = |sql: &str| connection.query(sql, Fetch::default());
+        let columns: Vec<String> = TYPE_SAMPLES
+            .iter()
+            .enumerate()
+            .map(|(index, (declared, _))| format!("c{index} {declared}"))
+            .collect();
+        let values: Vec<&str> = TYPE_SAMPLES.iter().map(|(_, value)| *value).collect();
+        run(&format!(
+            "CREATE TABLE dbo.dbdelve_keyless_types ({})",
+            columns.join(", ")
+        ))
+        .expect("the scratch table is built");
+        run(&format!(
+            "INSERT INTO dbo.dbdelve_keyless_types VALUES ({})",
+            values.join(", ")
+        ))
+        .expect("the scratch row is inserted");
+
+        let read = run("SELECT * FROM dbo.dbdelve_keyless_types").expect("the row reads");
+        let edit = read.edit.clone().unwrap_or_else(|| {
+            panic!(
+                "every column is of a listed type: {:?}",
+                read.read_only_reason
+            )
+        });
+        assert_eq!(
+            edit.row_match,
+            crate::db::RowMatch::EveryColumn { fixed: vec![] }
+        );
+        assert_eq!(edit.keys.len(), TYPE_SAMPLES.len());
+        for (index, (declared, value)) in TYPE_SAMPLES.iter().enumerate() {
+            let column = &read.columns[index];
+            let rendered = read.rows[0].get(index).expect("a value");
+            // The literal the keyless WHERE writes for it.
+            let literal = Engine::SqlServer.quote_value(rendered, column.data_type.as_deref());
+            let counted = run(&format!(
+                "SELECT COUNT(*) FROM dbo.dbdelve_keyless_types WHERE {} = {literal}",
+                Engine::SqlServer.quote_identifier(&column.name)
+            ))
+            .map(|result| result.rows[0].get(0).unwrap_or("NULL").to_string())
+            .map_err(|error| error.message);
+            assert_eq!(
+                counted.as_deref(),
+                Ok("1"),
+                "{declared}: {value} -> {rendered}"
+            );
+        }
+
+        for (declared, value) in UNMATCHED_SAMPLES.iter().chain(UNLISTED_SAMPLES) {
+            scratch.drop_all();
+            run(&format!(
+                "CREATE TABLE dbo.dbdelve_keyless_probe (c {declared})"
+            ))
+            .expect("the scratch table is built");
+            run(&format!(
+                "INSERT INTO dbo.dbdelve_keyless_probe VALUES ({value})"
+            ))
+            .expect("the scratch row is inserted");
+            let read = run("SELECT * FROM dbo.dbdelve_keyless_probe").expect("the row reads");
+            assert!(read.edit.is_none(), "{declared}");
+            let kind = declared.split('(').next().unwrap_or(declared);
+            assert!(
+                read.read_only_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(&format!("c ({kind})"))),
+                "{declared}: {:?}",
+                read.read_only_reason
+            );
+        }
+        for (declared, _) in UNMATCHED_SAMPLES {
+            scratch.drop_all();
+            run(&format!(
+                "CREATE TABLE dbo.dbdelve_keyless_probe (c {declared})"
+            ))
+            .expect("the scratch table is built");
+            run("INSERT INTO dbo.dbdelve_keyless_probe VALUES (NULL)").expect("a row");
+            let counted = run(&format!(
+                "SELECT COUNT(*) FROM dbo.dbdelve_keyless_probe WHERE c = {}",
+                Engine::SqlServer.quote_literal("abc")
+            ))
+            .map(|result| result.rows[0].get(0).unwrap_or("NULL").to_string());
+            assert!(counted.is_err(), "{declared} has an `=`: {counted:?}");
+        }
+
+        // A column the server computes is matched and never set; a unique
+        // index is no primary key.
+        scratch.drop_all();
+        run("CREATE TABLE dbo.dbdelve_keyless_probe (
+                a int NOT NULL UNIQUE,
+                i int IDENTITY(1,1),
+                k AS (a + 1),
+                p AS (a + 2) PERSISTED,
+                n int
+            )")
+        .expect("the table is built");
+        run("INSERT INTO dbo.dbdelve_keyless_probe (a, n) VALUES (1, 4)").expect("a row");
+        let computed = run("SELECT * FROM dbo.dbdelve_keyless_probe").expect("the row reads");
+        assert_eq!(
+            computed
+                .edit
+                .expect("a unique index alone is no key")
+                .row_match,
+            crate::db::RowMatch::EveryColumn {
+                fixed: vec![1, 2, 3]
+            },
+            "{:?}",
+            computed.read_only_reason
+        );
+        scratch.drop_all();
+
+        // A view over a table with no primary key names no row of its own.
+        run("CREATE TABLE dbo.dbdelve_keyless_probe (c int)").expect("the table is built");
+        run("CREATE VIEW dbo.dbdelve_keyless_view AS SELECT c FROM dbo.dbdelve_keyless_probe")
+            .expect("the view is built");
+        let viewed = run("SELECT * FROM dbo.dbdelve_keyless_view").expect("the view reads");
+        assert!(viewed.edit.is_none());
+        assert_eq!(viewed.read_only_reason, None);
+    }
 
     /// Drops a scratch table when a test ends, panicking or not.
     struct ScratchTable<'a>(&'a crate::db::Connection, &'static str);
