@@ -674,10 +674,8 @@ impl Engine {
     /// [`Connection::generated`], and one added later must be decided here.
     pub fn verifies_applies(self) -> bool {
         match self {
-            Self::Sqlite | Self::DuckDb | Self::Postgres => true,
-            Self::MySql
-            | Self::MariaDb
-            | Self::Turso
+            Self::Sqlite | Self::DuckDb | Self::Postgres | Self::MySql | Self::MariaDb => true,
+            Self::Turso
             | Self::Snowflake
             | Self::ClickHouse
             | Self::SqlServer
@@ -2299,8 +2297,10 @@ impl Connection {
                 Self::Postgres(connection) => {
                     connection.apply_verified(bound, steps, bracket, &proceed)
                 }
-                Self::MySql(_)
-                | Self::SqlServer(_)
+                Self::MySql(connection) => {
+                    connection.apply_verified(bound.is_some(), steps, bracket, &proceed)
+                }
+                Self::SqlServer(_)
                 | Self::Turso(_)
                 | Self::Snowflake(_)
                 | Self::ClickHouse(_)
@@ -4046,9 +4046,6 @@ pub(crate) enum Drift {
 /// What a statement of a verified apply is, handed to the arm's statement
 /// closure with the statement so an arm reads a write's count by its kind and
 /// leaves a bracket's or a read's alone.
-// The MySQL and SQL Server arms read the kind (plans 10.2-05 and 10.2-08);
-// SQLite counts every write the same way.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Sending {
     Bracket,
