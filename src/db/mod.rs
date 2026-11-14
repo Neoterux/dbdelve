@@ -3962,7 +3962,7 @@ pub(crate) enum StepKind {
 
 impl StepKind {
     /// The keyword a generated statement of this kind opens with.
-    fn keyword(self) -> &'static str {
+    pub(crate) fn keyword(self) -> &'static str {
         match self {
             Self::Insert => "INSERT",
             Self::Update => "UPDATE",
@@ -4007,7 +4007,6 @@ pub(crate) struct VerifiedStep {
     pub before: Vec<FetchedCell>,
     /// A read of the row, run after this statement's write inside the same
     /// transaction, so a Row-mode send shows what the server now holds.
-    #[allow(dead_code)] // RED stub: read by the implementation
     pub read_back: Option<String>,
 }
 
@@ -4023,9 +4022,6 @@ pub(crate) enum Bracket {
 }
 
 /// Where a verified apply stopped.
-// The stage names the refusal's place for the outcome-unknown wording of
-// plan 10.2-16; nothing before it reads one.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyStage {
     Begin,
@@ -4070,13 +4066,21 @@ pub(crate) enum ApplyOutcome {
     /// outcomes that carry no rows stay small.
     Applied {
         affected: u64,
-        #[allow(dead_code)] // RED stub: read by the implementation
         read_back: Option<Box<QueryResult>>,
     },
     /// No write was sent: these steps' rows are not the rows that were read.
     Drifted(Vec<(usize, Drift)>),
     /// A statement counted another number of rows than the one it names; the
-    /// whole sequence was rolled back.
+    /// whole sequence was rolled back. An `UPDATE` and an `INSERT` must count
+    /// one. A `DELETE` must count one, or none when a second read of its row
+    /// inside the transaction finds it gone, which an earlier `DELETE` of the
+    /// draft taking it along would leave; none with the row still there is a
+    /// statement something skipped. `count` is `None` when the driver gave no
+    /// count at all.
+    ///
+    /// The count is the server's own for that statement, and SQLite's
+    /// `changes()` excludes what a trigger or a foreign key wrote, so a
+    /// trigger's own writes never raise a count.
     Miscounted { step: usize, count: Option<u64> },
     /// The server refused something before `COMMIT`, or the apply refused to
     /// send: nothing the apply opened stayed applied.
@@ -4183,7 +4187,11 @@ pub(super) fn run_verified(
                 crate::sql::is_generated_select(engine, read)
             }
         };
-        if !writes_one || !names_kind || !reads {
+        let reads_back = step
+            .read_back
+            .as_deref()
+            .is_none_or(|read| crate::sql::is_generated_select(engine, read));
+        if !writes_one || !names_kind || !reads || !reads_back {
             return refused(
                 "dbdelve refused to run a statement it wrote itself: the draft and its \
                  statements do not match.",
@@ -4252,7 +4260,7 @@ pub(super) fn run_verified(
         return ApplyOutcome::Drifted(drifted);
     }
 
-    let mut affected = 0;
+    let (mut affected, mut read_back) = (0, None);
     for (index, step) in steps.iter().enumerate() {
         if !proceed() {
             roll_back(send);
@@ -4271,11 +4279,53 @@ pub(super) fn run_verified(
                 };
             }
         };
-        if count != Some(1) {
+        let counted = match (step.kind, count) {
+            (_, Some(1)) => true,
+            // A `DELETE` an earlier one of the draft took the row of counts
+            // none, and so does one something skipped. The second read of its
+            // row tells them apart: "cascaded" is observed, not inferred.
+            (StepKind::Delete, Some(0)) => {
+                let Some(read) = &step.reread else {
+                    roll_back(send);
+                    return ApplyOutcome::Miscounted { step: index, count };
+                };
+                if !proceed() {
+                    roll_back(send);
+                    return ApplyOutcome::Failed {
+                        stage: ApplyStage::Confirm(index),
+                        error: cancelled(),
+                    };
+                }
+                match send(read, Sending::Read) {
+                    Ok(result) => result.rows.is_empty(),
+                    Err(error) => {
+                        roll_back(send);
+                        return ApplyOutcome::Failed {
+                            stage: ApplyStage::Confirm(index),
+                            error,
+                        };
+                    }
+                }
+            }
+            _ => false,
+        };
+        if !counted {
             roll_back(send);
             return ApplyOutcome::Miscounted { step: index, count };
         }
-        affected += 1;
+        affected += count.unwrap_or_default();
+        if let Some(read) = &step.read_back {
+            match send(read, Sending::Read) {
+                Ok(result) => read_back = Some(Box::new(result)),
+                Err(error) => {
+                    roll_back(send);
+                    return ApplyOutcome::Failed {
+                        stage: ApplyStage::ReadBack(index),
+                        error,
+                    };
+                }
+            }
+        }
     }
 
     if opening.is_some()
@@ -4292,7 +4342,7 @@ pub(super) fn run_verified(
     }
     ApplyOutcome::Applied {
         affected,
-        read_back: None,
+        read_back,
     }
 }
 

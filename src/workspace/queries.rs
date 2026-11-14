@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use gpui_component::table::TableState;
 
-use crate::db::{ApplyOutcome, ApplyStage, Bracket, Drift, Feed, Fetch, QueryResult, Row, Stopped};
+use crate::db::{
+    ApplyOutcome, ApplyStage, Bracket, Drift, Feed, Fetch, QueryResult, Row, StepKind, Stopped,
+};
 use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
@@ -4288,12 +4290,23 @@ fn verified_message(outcome: &ApplyOutcome, verify: &Verification) -> Option<Str
                 }
             })
             .collect(),
-        ApplyOutcome::Miscounted { step, count } => vec![format!(
-            "Statement {} ({}) affected {} rows.",
-            step + 1,
-            row(*step),
-            count.map_or("no".to_string(), |count| count.to_string())
-        )],
+        ApplyOutcome::Miscounted { step, count } => {
+            // An added row is named as it is, an existing one by its key.
+            let kind = verify.steps.get(*step).map(|step| step.kind);
+            let named = match kind {
+                Some(StepKind::Insert) => row(*step).to_string(),
+                Some(StepKind::Update | StepKind::Delete) | None => format!("row {}", row(*step)),
+            };
+            let what = match count {
+                Some(count) => format!("affected {count} rows"),
+                None => "did not say how many rows it affected".to_string(),
+            };
+            vec![format!(
+                "{} {} ({named}) {what}.",
+                kind.map_or("Statement", StepKind::keyword),
+                step + 1
+            )]
+        }
         ApplyOutcome::Applied { .. } | ApplyOutcome::Failed { .. } | ApplyOutcome::Unknown(_) => {
             return None;
         }
