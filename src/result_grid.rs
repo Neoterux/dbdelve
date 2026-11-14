@@ -2803,7 +2803,7 @@ enum Step {
 
 /// Take an open input's value and hand the keyboard back to the grid. `false`
 /// when the mode refused the write.
-fn commit_from_input(
+pub(crate) fn commit_from_input(
     table: &mut TableState<ResultGrid>,
     window: &mut Window,
     cx: &mut Context<TableState<ResultGrid>>,
@@ -2822,8 +2822,9 @@ fn commit_from_input(
 }
 
 /// Commit, then carry the edit one cell along, the way a spreadsheet does:
-/// `up`/`down` by row, `tab`/`shift-tab` by column. At an edge there is nowhere
-/// to go, and the key does nothing, the same as `left` at the caret's start.
+/// `up`/`down` by row, `tab`/`shift-tab` by column. At an edge there is no cell
+/// to step to and no wrap, and what the key does with the input is the view's:
+/// the grid hands it to the workspace as [`crate::actions::StepPastEdge`].
 ///
 /// Stepped from the active cell rather than handed to the table's own
 /// `SelectDown` or `SelectNextColumn`: the grid runs the library in row and
@@ -2838,6 +2839,7 @@ fn commit_and_step(
     cx.stop_propagation();
     let grid = table.delegate();
     let Some(to) = grid.step_from_active(&step, grid.rows_count(cx)) else {
+        window.dispatch_action(Box::new(crate::actions::StepPastEdge), cx);
         return;
     };
     if !commit_from_input(table, window, cx) {
@@ -6273,8 +6275,8 @@ mod tests {
 
     #[test]
     fn a_step_off_the_edge_of_the_grid_goes_nowhere() {
-        // At an edge the key has to do nothing rather than close the edit or
-        // wrap: the input stays open on the cell the user is typing into.
+        // At an edge the ring goes nowhere and never wraps; what an edge key
+        // does with the input is `Workspace::step_past_edge`'s.
         assert_eq!(step_target((1, 1), &Step::Rows(1), 3, 3), Some((2, 1)));
         assert_eq!(step_target((1, 1), &Step::Cols(-1), 3, 3), Some((1, 0)));
         assert_eq!(step_target((0, 1), &Step::Rows(-1), 3, 3), None);

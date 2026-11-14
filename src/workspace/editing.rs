@@ -4,6 +4,7 @@
 //! impl live in as many modules as it has concerns; they moved out whole.
 
 use super::*;
+use crate::actions::StepPastEdge;
 use crate::session::{AfterEdits, ReviewSlot, StaleEdit, StaleResume, refreshing};
 
 impl Workspace {
@@ -2004,6 +2005,20 @@ impl Workspace {
         if mode != EditMode::Row {
             return;
         }
+        self.send_row_if_idle(tab, grid, row, ring, cx);
+    }
+
+    /// The send both ways of leaving a Row view's row end in: nothing when the
+    /// row holds no edit, and a note, the row staying staged, while the tab's
+    /// last send is still running.
+    fn send_row_if_idle(
+        &mut self,
+        tab: u64,
+        grid: &Entity<gpui_component::table::TableState<ResultGrid>>,
+        row: usize,
+        to: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if !grid.read(cx).delegate().row_has_pending(row) {
             return;
         }
@@ -2016,7 +2031,49 @@ impl Workspace {
             self.note("The previous row is still being saved.".into(), cx);
             return;
         }
-        self.save_row(tab, row, ring, None, cx);
+        self.save_row(tab, row, to, None, cx);
+    }
+
+    /// A step key at the grid's edge with a cell's input open
+    /// ([`result_grid::commit_and_step`] found no cell to step to). In a Row view
+    /// the key is the row losing the keyboard, which there is leaving the row:
+    /// the input commits by Enter's rule and the row is sent as a ring move off
+    /// it sends it, with no `to` because the ring did not move. The ring stays
+    /// on the cell and the grid has the keyboard; the cell is not reopened. A
+    /// mode that refuses the write raises the Read-write prompt as Enter does
+    /// and sends nothing.
+    ///
+    /// A Draft view and a query tab (Draft only) return before any commit: the
+    /// input stays open and nothing is staged. Click-away is what keeps that
+    /// text.
+    pub(crate) fn step_past_edge(
+        &mut self,
+        _: &StepPastEdge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((tab, grid)) = self.profile().and_then(|profile| {
+            let tab = profile.session.active_object()?;
+            match &tab.body {
+                ObjectBody::Relation {
+                    results,
+                    edit_mode: EditMode::Row,
+                    ..
+                } => Some((tab.id, results.clone())),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        let Some(row) = grid.read(cx).delegate().active().map(|(row, _)| row) else {
+            return;
+        };
+        if !grid.update(cx, |table, cx| {
+            result_grid::commit_from_input(table, window, cx)
+        }) {
+            return;
+        }
+        self.send_row_if_idle(tab, &grid, row, None, cx);
     }
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
