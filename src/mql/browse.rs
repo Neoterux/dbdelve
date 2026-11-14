@@ -306,6 +306,12 @@ pub(crate) fn find_preview(
     statement
 }
 
+/// The read that finds the document one generated `updateOne` or `deleteOne`
+/// writes, as an apply reads it again before sending the write.
+pub(crate) fn row_reread(_text: &str) -> Option<String> {
+    None
+}
+
 /// The size of what [`find_preview`] pages through: `explorer::count_sql`'s
 /// Mongo arm.
 pub(crate) fn count_documents(collection: &str, filter: &str) -> String {
@@ -619,6 +625,47 @@ mod tests {
 
     fn sorted(text: &str, keys: &[SortKey]) -> String {
         with_order_by(text, keys).unwrap_or_else(|| panic!("{text} was refused"))
+    }
+
+    #[test]
+    fn a_mongo_reread_finds_the_document_its_write_names_by_id() {
+        use super::super::{delete_row, update_batch};
+        use crate::result_grid::{NewValue, PendingRow};
+
+        let id = "65a4f1c0ffffffffffffff01";
+        let types = vec![("_id".to_owned(), "objectId".to_owned())];
+        let delete = delete_row("accounts", &[("_id", id)], &types).unwrap();
+        let update = update_batch(&[PendingRow {
+            table: "accounts".into(),
+            keys: vec![("_id".into(), id.into())],
+            sets: vec![("name".into(), NewValue::Value("Ada".into()))],
+            types: types.clone(),
+            ..PendingRow::default()
+        }])
+        .unwrap();
+        let expected = find_preview("accounts", &format!("{{_id: ObjectId(\"{id}\")}}"), None, 0);
+        for write in [
+            delete.clone(),
+            format!("{delete};"),
+            update.clone(),
+            format!("{update};"),
+        ] {
+            let read = row_reread(&write).unwrap_or_else(|| panic!("{write} has no re-read"));
+            assert_eq!(read, expected, "{write}");
+            assert!(is_generated_read(&read), "{read}");
+        }
+        for refused in [
+            "db.getCollection(\"accounts\").insertOne({name: \"Ada\"})".to_owned(),
+            format!("{update}\n{update}"),
+            format!("{delete};\n{delete};"),
+            "db.getCollection(\"accounts\").deleteMany({_id: 1})".to_owned(),
+            "db.getCollection(\"accounts\").deleteOne({name: \"Ada\"})".to_owned(),
+            "db.getCollection(\"accounts\").deleteOne({_id: {$gt: 1}})".to_owned(),
+            "db.getCollection(\"accounts\").find({_id: 1})".to_owned(),
+            "not a statement".to_owned(),
+        ] {
+            assert_eq!(row_reread(&refused), None, "{refused}");
+        }
     }
 
     #[test]
