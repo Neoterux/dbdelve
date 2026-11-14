@@ -2226,7 +2226,7 @@ impl Workspace {
         // again inside the apply's transaction. Cloned, as the refresh that
         // carries it goes on to the landing.
         let verification = match &refresh {
-            Some(Refresh::Relation { verify, .. }) => verify.clone(),
+            Some(Refresh::Relation { verify, .. } | Refresh::Row { verify, .. }) => verify.clone(),
             _ => None,
         };
         // Whether the apply runs in the user's own open transaction, as the
@@ -2723,13 +2723,16 @@ impl Workspace {
                 reads_only,
                 held: None,
             };
+            // A verified Row send's row, read inside the transaction that
+            // wrote it.
+            let mut verified_read = None;
             let result = match (&verification, generated, alongside, binding.as_ref()) {
-                // A reviewed draft of a target that verifies an apply: its
-                // rows read again and compared inside one transaction, each
-                // write counted. Never `generated`, which sends the text as it
-                // is.
-                (Some(verify), _, _, binding) => verified_result(
-                    match binding {
+                // A reviewed draft, or a Row send, of a target that verifies an
+                // apply: its rows read again and compared inside one
+                // transaction, each write counted. Never `generated`, which
+                // sends the text as it is.
+                (Some(verify), _, _, binding) => {
+                    let mut outcome = match binding {
                         Some(binding) => connection.apply_verified_bound(
                             binding.schema.as_deref(),
                             &verify.steps,
@@ -2737,10 +2740,12 @@ impl Workspace {
                             &cancel,
                         ),
                         None => connection.apply_verified(&verify.steps, bracket, &cancel),
-                    },
-                    verify,
-                    bracket,
-                ),
+                    };
+                    if let ApplyOutcome::Applied { read_back, .. } = &mut outcome {
+                        verified_read = read_back.take().map(|rows| Ok(*rows));
+                    }
+                    verified_result(outcome, verify, bracket)
+                }
                 // An edit applied from a bound tab's grid belongs to its
                 // database whichever way the session has been moved.
                 (None, true, _, Some(binding)) => connection.generated_bound(
@@ -2762,9 +2767,11 @@ impl Workspace {
                 }
             };
             // Through the call the write used, with no feed and no row limit:
-            // the one row is the whole answer.
+            // the one row is the whole answer. A verified send has its row
+            // already, read in the transaction.
             let read_back = match (&result, &row_read) {
-                (Ok(_), Some(read)) => Some(match binding.as_ref() {
+                _ if verified_read.is_some() => verified_read,
+                (Ok(_), Some(read)) if verification.is_none() => Some(match binding.as_ref() {
                     Some(binding) => connection.generated_bound(
                         binding.schema.as_deref(),
                         read,
@@ -3267,20 +3274,9 @@ impl Workspace {
                                 if let Some(previous) = restored {
                                     *state = previous;
                                 }
-                                // The row says what the server said to it, and
-                                // keeps its edits.
-                                if let Some((row, rows_id, _, _)) = &row_sent {
-                                    results.update(cx, |table, cx| {
-                                        let grid = table.delegate_mut();
-                                        if grid.rows_id() == *rows_id {
-                                            grid.set_send_failure(*row, error.message.clone());
-                                        }
-                                        cx.notify();
-                                    });
-                                }
                                 // A refused row is left dirty and marked, and the
-                                // tab's controls ask before they leave it, so the
-                                // notice says what gets it back.
+                                // tab's controls ask before they leave it, so what
+                                // is said says what gets it back.
                                 let said = match row_sent.is_some() {
                                     true => format!(
                                         "{}{} {}",
@@ -3293,6 +3289,17 @@ impl Workspace {
                                     ),
                                     false => error.message,
                                 };
+                                // The row says what the server said to it, and
+                                // keeps its edits.
+                                if let Some((row, rows_id, _, _)) = &row_sent {
+                                    results.update(cx, |table, cx| {
+                                        let grid = table.delegate_mut();
+                                        if grid.rows_id() == *rows_id {
+                                            grid.set_send_failure(*row, said.clone());
+                                        }
+                                        cx.notify();
+                                    });
+                                }
                                 (false, false, None, Vec::new(), Some(said), landed)
                             }
                             Err(mut error) => {

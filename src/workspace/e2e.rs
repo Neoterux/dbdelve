@@ -27304,6 +27304,7 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                     sent: Vec::new(),
                     to: None,
                     then: None,
+                    verify: None,
                 }),
                 false,
                 None,

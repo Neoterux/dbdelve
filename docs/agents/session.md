@@ -721,7 +721,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
   row is left (a ring move off it, or a step key past the grid's edge from a
   cell's input) or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
-  send still passes). It lives on a relation tab beside `sorting`, is switched
+  send still passes). On a target that verifies applies the send is
+  re-read and compared before its `UPDATE` (`Refresh::Row::verify`, the one
+  step of `lone_verification`). It lives on a relation tab beside `sorting`, is switched
   from the status bar chips or the palette, starts from the Default edit mode
   setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
   this that is persisted), and is offered only where `Target::row_edits()`
@@ -730,6 +732,13 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   next bullet. Draft is never turned into Row sends by a switch: Draft to Row is
   refused while the grid holds edits, so a multi-row draft is not sent
   unreviewed one row at a time (`Workspace::set_edit_mode`).
+
+  A Row send that is refused, whether its row drifted, was gone, or its
+  `UPDATE` counted other than one row, keeps the row's edits and the ring,
+  says what happened (`Nothing was applied. Row id = 1 does not match the row
+  as it was read.`) before `ROW_KEPT`'s sentence, and Esc puts the row back as
+  it was read. A success replaces the row from the read-back taken inside the
+  transaction.
 
   The one writer of a Row send is `Workspace::save_row`; Save and the funnel
   are its callers. The funnel is `ResultGrid::take_left_row`, which marks the

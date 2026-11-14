@@ -62,10 +62,19 @@ mode, always where the user can read it before it runs:
   (`Workspace::save_row`), and that is the user's own act. It is gated by
   `sql::is_generated_write_on`, mode-checked in `execute_and_then` as it is
   sent, read back by `sql::row_read` under `sql::is_generated_select`, written
-  to history, and the last one is shown in the status line. It joins the
-  user's open transaction as a single-statement edit always has (see
-  Transaction control below). A Draft view sends nothing unread, and no
-  agent's statement takes this path.
+  to history, and the last one is shown in the status line. On a target that
+  verifies applies (`Target::verifies_applies`) the send is one verified step:
+  the row is re-read and compared with the row as it was fetched before its
+  `UPDATE`, the `UPDATE` must count one row, and the read-back is taken inside
+  the same transaction. A row that drifted, or an `UPDATE` that counted any
+  other number, applies nothing and the row keeps its edits. It joins the
+  user's open transaction as a single-statement edit always has, sending no
+  `BEGIN`, `COMMIT` or `ROLLBACK` of its own (see Transaction control below). A
+  Draft view sends nothing unread, and no agent's statement takes this path.
+  The New row form's `INSERT` and a lone Delete row's `DELETE` are reviewed as
+  before and run through the same verified apply on such a target: the
+  `INSERT` must count one row, and the `DELETE` re-reads its row first and
+  must count one.
 - A relation tab's Draft apply on a target that verifies it
   (`Target::verifies_applies`: SQLite, DuckDB and Postgres so far, widened an
   engine at a time as each one's arm of `Connection::apply_verified` lands) is not sent as the text

@@ -3685,6 +3685,11 @@ pub(crate) enum Refresh {
         /// What the user asked for that this row had to be saved before: a page
         /// turn, a sort, a tab switch. Carried out only when the send lands.
         then: Option<AfterEdits>,
+        /// The row's one verified step when its target verifies applies: the
+        /// row read again and compared before the `UPDATE`, the write counted,
+        /// and `read` taken inside the same transaction. `None` sends the
+        /// `UPDATE` as it is and reads the row after it.
+        verify: Option<Verification>,
     },
 }
 
