@@ -2242,14 +2242,70 @@ CREATE TRIGGER accounts_touch AFTER INSERT ON Accounts BEGIN SELECT 1; END;"
     }
 
     #[test]
-    fn a_table_without_a_primary_key_is_not_editable() {
-        // There is a rowid that would identify the row, but it is not in the
-        // result set, so there is no predicate dbdelve can read off the grid.
-        let result = memory("CREATE TABLE unkeyed (value INTEGER, label TEXT); INSERT INTO unkeyed VALUES (1, 'a');")
-            .query("SELECT value, label FROM unkeyed", Fetch::default())
-            .expect("query should succeed");
+    fn a_table_without_a_primary_key_is_matched_by_every_column_or_read_only_with_a_reason() {
+        use crate::db::RowMatch;
 
-        assert!(result.edit.is_none());
+        let connection = memory(
+            "create table sightings (bird text, place text, seen integer, weight real, photo blob);
+             create table tagged (bird text, place text,
+                 label text generated always as (bird || place) virtual);
+             create table measured (bird text, amount numeric);
+             create table untyped (bird text, anything);",
+        );
+        let edit = |sql: &str| connection.query(sql, Fetch::default()).expect("a read");
+
+        let sightings = edit("SELECT * FROM sightings");
+        let target = sightings.edit.expect("every column is of a matchable type");
+        assert_eq!(target.keys, vec![0, 1, 2, 3, 4]);
+        assert_eq!(target.row_match, RowMatch::EveryColumn { fixed: vec![] });
+        assert_eq!(sightings.read_only_reason, None);
+
+        let tagged = edit("SELECT * FROM tagged")
+            .edit
+            .expect("a generated column is matched");
+        assert_eq!(tagged.keys, vec![0, 1, 2]);
+        assert_eq!(tagged.row_match, RowMatch::EveryColumn { fixed: vec![2] });
+
+        for (sql, column) in [
+            ("SELECT * FROM measured", "amount (numeric)"),
+            ("SELECT bird FROM measured", "amount (numeric)"),
+            ("SELECT * FROM untyped", "anything (no declared type)"),
+        ] {
+            let read = edit(sql);
+            assert!(read.edit.is_none(), "{sql}");
+            assert_eq!(
+                read.read_only_reason,
+                Some(format!(
+                    "A table without a primary key is edited by matching every column, \
+                     and {column} cannot be matched by its value."
+                )),
+                "{sql}"
+            );
+        }
+
+        // A column the result leaves out would be left out of the WHERE.
+        let partial = edit("SELECT bird FROM sightings");
+        assert!(partial.edit.is_none());
+        assert_eq!(
+            partial.read_only_reason.as_deref(),
+            Some(
+                "A table without a primary key is edited by matching every column, \
+                 and place is not in the result."
+            )
+        );
+        // Computed beside real columns, and a self-join, are no table's rows.
+        assert!(edit("SELECT *, 1 AS one FROM sightings").edit.is_none());
+        assert!(
+            edit("SELECT a.bird, a.place, a.seen, a.weight, a.photo, b.bird FROM sightings a, sightings b")
+                .edit
+                .is_none()
+        );
+
+        let keyed = memory(ACCOUNTS)
+            .query("SELECT * FROM accounts", Fetch::default())
+            .expect("a read");
+        assert_eq!(keyed.edit.expect("keyed").row_match, RowMatch::Key);
+        assert_eq!(keyed.read_only_reason, None);
     }
 
     #[test]

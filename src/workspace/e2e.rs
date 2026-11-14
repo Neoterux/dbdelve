@@ -28901,3 +28901,64 @@ fn the_notice_takes_the_width_the_status_bar_has_free(cx: &mut TestAppContext) {
         quit(workspace, cx);
     });
 }
+
+const SIGHTINGS: &str = "create table sightings (bird text, place text); \
+     insert into sightings values ('wren', NULL), ('tit', ''), ('jay', 'oak');";
+
+/// A table with no primary key is edited by every value its row was read
+/// with: a NULL is matched with `IS NULL` and an empty string with `= ''`, so
+/// the row named is the one shown and no other.
+#[gpui::test]
+fn a_table_without_a_primary_key_is_edited_by_every_value_and_a_null_is_matched_with_is_null(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[2]));
+        });
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(
+            sql.contains(r#"WHERE "bird" = 'wren' AND "place" IS NULL;"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                r#"DELETE FROM "main"."sightings" WHERE "bird" = 'jay' AND "place" = 'oak';"#
+            ),
+            "{sql}"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(
+            on_disk("select bird from sightings where place = ''").as_deref(),
+            Some("tit")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'jay'").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2")
+        );
+        quit(workspace, cx);
+    });
+}
