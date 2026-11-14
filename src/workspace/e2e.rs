@@ -24002,6 +24002,239 @@ fn go_to_column_stages_the_input_it_closes_so_a_later_edit_of_the_cell_stands(
     });
 }
 
+/// A wren and a kite around a bird with no name and no count: a NULL in a
+/// nullable text column that has a column on each side of it, and a NULL in the
+/// last column, so a forward Tab, a Shift-Tab, Up, Down and an edge key are all
+/// reachable from one.
+const NULL_NAMES: &str = "create table birds (id integer primary key, name text, n integer); \
+     insert into birds values (1, 'wren', 1), (2, null, null), (3, 'kite', 3);";
+
+/// Opens the input on `ring`, presses `key` with nothing typed and, when the
+/// key opened the next cell's input, closes that one too.
+fn open_and_close_untouched(
+    grid: &Grid,
+    cx: &mut VisualTestContext,
+    ring: (usize, usize),
+    key: &str,
+) {
+    ring_on(grid, cx, ring.0, ring.1);
+    cx.dispatch_action(crate::actions::EditCell);
+    settle(cx);
+    press(cx, key);
+    if key != "enter" {
+        press(cx, "escape");
+    }
+}
+
+#[gpui::test]
+fn an_untouched_input_over_a_null_stages_nothing_however_it_is_closed_in_draft_mode(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_NAMES);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+
+        for (ring, key) in [
+            ((1, 1), "enter"),
+            ((1, 1), "tab"),
+            ((1, 2), "shift-tab"),
+            ((1, 1), "up"),
+            ((1, 1), "down"),
+        ] {
+            open_and_close_untouched(&grid, cx, ring, key);
+            assert_eq!(
+                pending_of(&grid, cx),
+                0,
+                "{key} on {ring:?} staged what nobody typed"
+            );
+            grid.read_with(cx, |table, _| {
+                for col in [1, 2] {
+                    assert_eq!(
+                        table.delegate().pending_value(1, col),
+                        None,
+                        "{key} on {ring:?} left a value on column {col}"
+                    );
+                }
+            });
+        }
+
+        // The control: typed text still stages.
+        ring_on(&grid, cx, 1, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("owl");
+        settle(cx);
+        press(cx, "enter");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(1, 1),
+                Some(&NewValue::Value("owl".into())),
+                "typed text is staged"
+            );
+        });
+
+        assert_eq!(
+            on_disk("select name is null and n is null from birds where id = 2").as_deref(),
+            Some("1")
+        );
+        assert!(
+            !history_sql(&workspace, cx)
+                .iter()
+                .any(|sql| sql.contains("UPDATE")),
+            "a Draft view sends nothing"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_untouched_input_over_a_staged_null_or_default_keeps_the_keyword_when_enter_or_tab_closes_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_NAMES);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+
+        stage(&grid, cx, 0, 1, NewValue::Null);
+        open_and_close_untouched(&grid, cx, (0, 1), "enter");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 1),
+                Some(&NewValue::Null),
+                "Enter left the staged NULL"
+            );
+        });
+
+        stage(&grid, cx, 2, 1, NewValue::Default);
+        open_and_close_untouched(&grid, cx, (2, 1), "tab");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(2, 1),
+                Some(&NewValue::Default),
+                "Tab left the staged DEFAULT"
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 2);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn an_untouched_input_over_a_null_sends_nothing_in_row_mode_when_enter_or_an_edge_key_closes_it(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_NAMES);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+
+        // Enter, then the row is left by a click.
+        ring_on(&grid, cx, 1, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        press(cx, "enter");
+        click_cell_of_row(cx, 0);
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert!(
+            !history_sql(&workspace, cx)
+                .iter()
+                .any(|sql| sql.contains("UPDATE")),
+            "Enter then leaving the row sends nothing"
+        );
+        assert_eq!(
+            on_disk("select name is null from birds where id = 2").as_deref(),
+            Some("1")
+        );
+
+        // The last column, where the step key has no cell to carry the edit to.
+        ring_on(&grid, cx, 1, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        press(cx, "tab");
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert!(grid_holds_keyboard(&grid, cx));
+        assert!(
+            !history_sql(&workspace, cx)
+                .iter()
+                .any(|sql| sql.contains("UPDATE")),
+            "the edge key sends nothing"
+        );
+        assert_eq!(
+            on_disk("select n is null from birds where id = 2").as_deref(),
+            Some("1")
+        );
+
+        // The control, so the test can see a send.
+        ring_on(&grid, cx, 1, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("owl");
+        settle(cx);
+        click_cell_of_row(cx, 0);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("owl")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn set_value_to_empty_still_stages_the_empty_string_over_a_null(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, NULL_NAMES);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+
+        ring_on(&grid, cx, 1, 1);
+        grid.read_with(cx, |table, _| {
+            assert!(table.delegate().offers_empty(1), "the cell menu offers it");
+        });
+        cx.dispatch_action(crate::actions::SetEmpty);
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(1, 1),
+                Some(&NewValue::Value("".into()))
+            );
+        });
+
+        // Reopened and closed untouched, it is still there.
+        ring_on(&grid, cx, 1, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        press(cx, "enter");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(1, 1),
+                Some(&NewValue::Value("".into())),
+                "an untouched reopen keeps the empty string"
+            );
+        });
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        let sql = front_review_sql(&workspace, cx).expect("the draft is in review");
+        assert!(sql.contains("\"name\" = ''"), "the review shows it: {sql}");
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        settle(cx);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_step_key_past_the_grids_edge_commits_the_input_and_sends_the_row_in_row_mode(
     cx: &mut TestAppContext,

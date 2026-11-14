@@ -7362,6 +7362,39 @@ mod tests {
     }
 
     #[test]
+    fn an_input_closed_as_it_opened_records_nothing_on_a_fetched_row_and_asks_no_mode() {
+        let mut grid = grid_with_a_null();
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.commit_text(0, 1, "".into()));
+        assert_eq!(grid.pending_value(0, 1), None, "a NULL stays a NULL");
+
+        assert!(grid.set_pending(0, 1, NewValue::Default));
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.commit_text(0, 1, "".into()));
+        assert_eq!(grid.pending_value(0, 1), Some(&NewValue::Default));
+
+        // `set_pending` takes nulling a fetched NULL for no edit, so the staged
+        // NULL it has to be kept over sits on a cell with a value.
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, NewValue::Null));
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.commit_text(0, 1, "".into()));
+        assert_eq!(grid.pending_value(0, 1), Some(&NewValue::Null));
+
+        let mut grid = grid_with_a_null();
+        grid.set_mode(Mode::ReadOnly);
+        assert!(
+            grid.commit_text(0, 1, "".into()),
+            "nothing was typed, so no mode is asked for"
+        );
+        assert_eq!(grid.pending_count(), 0);
+        assert!(
+            !grid.commit_text(0, 1, "x".into()),
+            "typed text still meets the mode"
+        );
+    }
+
+    #[test]
     fn an_added_row_with_no_touched_cell_blocks_the_draft() {
         let mut grid = editable_grid();
         assert_eq!(grid.add_row(), Some(2));
