@@ -22276,6 +22276,17 @@ fn a_query_tabs_apply_over_a_row_changed_on_the_server_applies_nothing_and_names
             on_disk("select name from birds where id = 1").as_deref(),
             Some("kite")
         );
+
+        // A second Run reads the rows again and does not replay the refusal:
+        // with the row as it was read, the same review applies.
+        behind_the_grid("update birds set name = 'wren' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
         quit(workspace, cx);
     });
 }
