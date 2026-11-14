@@ -2215,7 +2215,10 @@ pub(crate) fn update_batch(rows: &[PendingRow]) -> Result<String, String> {
 // would need a sort by what each reads.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the collection grid's Draft apply writes it")
+    expect(
+        dead_code,
+        reason = "the collection grid's Draft apply (10.2-13) writes it"
+    )
 )]
 pub(crate) fn draft_batch(
     deletes: &[crate::sql::DraftDelete],
@@ -2831,10 +2834,66 @@ pub(crate) fn delete_matches_key(text: &str, keys: &[&str]) -> bool {
             .all(|(field, _)| keys.contains(&field.as_str()))
 }
 
-/// RED stub: the key check is not written yet.
-#[cfg(test)]
-pub(crate) fn draft_deletes_match(_text: &str, _keys: &[&str], _collection: &str) -> Option<usize> {
-    None
+/// How many `deleteOne`s `text`, a draft, holds, when each names exactly `keys`
+/// as a set on `collection` of the connected database: the readout the gate
+/// cannot give (which documents, on which collection), for the caller to compare
+/// with the documents it marked. The MongoDB counterpart of
+/// [`crate::sql::draft_deletes_match`].
+///
+/// Every statement's method is read from the parse, never from the caller, and
+/// only the three a draft holds are read at all: any other method, text that
+/// does not parse, and text with no statement are `None`. An `updateOne` or an
+/// `insertOne` is not counted. Their shape is the gate's to check
+/// ([`is_generated_write`]), as is the order.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the collection grid's Draft apply (10.2-13) calls it"
+    )
+)]
+pub(crate) fn draft_deletes_match(text: &str, keys: &[&str], collection: &str) -> Option<usize> {
+    let statements = parse(text).ok()?;
+    if statements.is_empty() {
+        return None;
+    }
+    let mut deletes = 0;
+    for statement in &statements {
+        let Target::Collection {
+            database,
+            collection: named,
+            call,
+            ..
+        } = &statement.target
+        else {
+            return None;
+        };
+        match call.method {
+            Method::UpdateOne | Method::InsertOne => {}
+            Method::DeleteOne => {
+                let [
+                    Arg {
+                        value: Value::Document(fields),
+                        ..
+                    },
+                ] = call.args.as_slice()
+                else {
+                    return None;
+                };
+                let names_keys = distinct(fields)
+                    && fields.len() == keys.len()
+                    && fields
+                        .iter()
+                        .all(|(field, _)| keys.contains(&field.as_str()));
+                if database.is_some() || named != collection || !names_keys {
+                    return None;
+                }
+                deletes += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(deletes)
 }
 
 /// A non-empty document of distinct fields with no operator anywhere in it.
@@ -5179,7 +5238,7 @@ mod tests {
         }
         // Text that does not parse, or holds no statement, is not a draft.
         assert_eq!(
-            draft_deletes_match("{c}.deleteOne({_id: ", &["_id"], "accounts"),
+            draft_deletes_match("db.accounts.deleteOne({_id: ", &["_id"], "accounts"),
             None
         );
         assert_eq!(draft_deletes_match("", &["_id"], "accounts"), None);
