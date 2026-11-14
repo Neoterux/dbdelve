@@ -803,7 +803,7 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   edit (`StaleEdit`) is not drift detection. Verifying that the row is as it was
   fetched is left to Phase 10.2.
 - **A draft holds added rows and marks.** In a Draft view of a relation tab on a
-  `Target::row_edits()` target, `NewRow` (Insert) adds a grid row and
+  `Target::keeps_edits()` target (`row_edits()`, or MongoDB below), `NewRow` (Insert) adds a grid row and
   `DeleteRow` toggles a mark on the selected rows (the palette's `Mark row for
   deletion`, offered while `has_markable_row` holds, else `Delete row…`). Added
   rows live beside `pending` (`ResultGrid`'s added rows) and are never sorted
@@ -815,13 +815,52 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `INSERT`s (`sql::draft_batch`), gated as a whole and checked for key and table
   by `sql::draft_deletes_match` and against `marked_count`, so a dropped mark
   refuses the draft. A successful reviewed relation-tab apply clears the whole
-  draft and re-reads; a failure keeps all of it and applies nothing. Inside a
+  draft and re-reads; a failure keeps all of it and applies nothing (a MongoDB
+  one keeps what did not apply, below). Inside a
   transaction the user opened only one write joins it, so a draft of more than
   one statement is refused on every engine, with a notice and the draft kept
   (see `docs/agents/gates.md`).
   A row is washed by its state in the theme's added, updated and deleted
   tokens, and its gutter carries the `debug_selector` `row-added-N`,
   `row-updated-N` or `row-deleted-N` for the driver.
+- **A MongoDB collection has a Draft view too (`ordered_edits`).** On a
+  built-in MongoDB target that edits rows (`Target::ordered_edits()`, and so
+  `Target::keeps_edits()`, which is `row_edits() || ordered_edits()`), a Draft
+  view of a collection takes added documents (`NewRow`), marked documents
+  (`DeleteRow`) and staged cells like a table's, and Apply opens the same
+  `Apply draft` review, written by `mql::draft_batch` through
+  `sql::draft_batch` and checked by `sql::draft_deletes_match` against the
+  marks. The four call sites that decided by `row_edits()` (`kept` in
+  `execute_unchecked`, `has_markable_row`, `new_row`'s in-grid row, `delete_row`'s
+  marks) ask `keeps_edits()`; `EditMode::on`, the Row control and the
+  conformance filters stay on `row_edits()`, since Row mode sends a SQL
+  `UPDATE` with a read-back and a MongoDB view has none. The review carries a
+  `Verification` (`Engine::verifies_applies` is true for MongoDB): each fetched
+  cell with its `$type` tag, each `updateOne` and `deleteOne` with the `find` of
+  its `_id`, applied by `Connection::apply_verified`'s MongoDB arm, which has no
+  transaction. The apply is therefore ordered and not atomic: `deleteOne`s,
+  `updateOne`s, `insertOne`s, one at a time, stopping at the first the server
+  refuses or counts other than one. Phase 10's rule that a MongoDB send blanks
+  the grid (D-21) is lifted with a removal by identity: a send keeps the grid, a
+  success clears the draft and reads the collection again, and a stop part way
+  has the statements before the failed one on the server, so those rows leave
+  the draft (`ResultGrid::drop_applied`, by the `_id` a marked or edited
+  document was fetched with, or by the place of an added row among the added
+  ones, since inserts run last and the applied ones are a prefix) and the rest
+  is kept. The identities are taken when the review is written
+  (`Verification::identities`), so a sort in memory while the apply was out
+  cannot point the removal at another row. The review is dropped with them,
+  because its text still holds the statements that applied; Apply writes the
+  rest afresh. The error says which applied and which did not: `Statements 1 to
+  2 were applied and have left the draft. Statement 3 (added row 1) failed:
+  <server text>. Statements 4 to 5 were not sent.`, `INSERT`, `UPDATE` or
+  `DELETE` and the count for a wrong count, and `Nothing was applied.` when the
+  first stopped it. A drift wrote nothing and says what a SQL draft's does. The
+  grid still shows an applied document as it was fetched until the collection is
+  read again. A MongoDB query tab's Apply is unchanged
+  (`reviews_query_apply()` is false there) and is appended to its buffer, but
+  its send now keeps its grid and staged cells on a failure, as `kept` is the
+  target's.
 - **An edit send keeps the grid, on a transactional SQL engine.** Where the
   target answers `Target::row_edits()`, a statement dbdelve sends for a grid
   edit (an Apply edits batch, an Insert, a Delete row) leaves the rows, the
@@ -841,10 +880,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   applies, sent through the same verified apply (the manifest is built from the
   query's projection by real column name); nothing is appended to the buffer and
   the history leaves out that generated run, where a recalled copy would run
-  unverified. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
-  a plugin, Snowflake, Turso) an edit send clears the grid as it starts and a failure
+  unverified. On every other target (ClickHouse, Redis, Generic SQL, a plugin,
+  Snowflake, Turso) an edit send clears the grid as it starts and a failure
   is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
+  MongoDB's is the exception the bullet above describes.
   Snowflake and Turso are out of the Row-mode set (no Draft or Row control on
   their tables) because their results are never editable: Snowflake's keys are
   not enforced, and Turso's driver names no column's table.

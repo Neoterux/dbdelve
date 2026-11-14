@@ -152,13 +152,6 @@ pub(crate) enum DraftRow {
 /// an apply is out), an added row by its place among the added rows, which a
 /// sort never moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the part-way MongoDB landing (10.2-13) names rows by it"
-    )
-)]
 pub(crate) enum StepRow {
     Fetched(Vec<(String, String)>),
     Added(usize),
@@ -2740,21 +2733,78 @@ impl ResultGrid {
     /// The identity of each statement of the draft's batch, in the order
     /// [`Self::draft_order`] gives them, taken now so it still names the row
     /// after a sort in memory has moved it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the manifest of a draft (10.2-13) carries it")
-    )]
     pub(crate) fn draft_identities(&self) -> Vec<StepRow> {
-        Vec::new()
+        self.draft_order()
+            .into_iter()
+            .filter_map(|row| match row {
+                DraftRow::Marked(row) | DraftRow::Updated(row) => self
+                    .row_key(row)
+                    .map(|(_, _, keys, _)| StepRow::Fetched(keys)),
+                DraftRow::Added(place) => Some(StepRow::Added(place)),
+            })
+            .collect()
     }
 
     /// Takes the rows of `applied` out of the draft: each marked or edited
-    /// document found by its key values, each added row by its place.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the part-way MongoDB landing (10.2-13) calls it")
-    )]
-    pub(crate) fn drop_applied(&mut self, _applied: &[StepRow]) {}
+    /// document found by the key values it was fetched with, so a sort in
+    /// memory while the apply was out cannot point it at another row, and each
+    /// added row by its place among the added rows. An added row is never moved
+    /// by a sort, and inserts run last and in order, so the ones that applied
+    /// are a prefix of them; the review holds the grid against staging while an
+    /// apply is out, so no row was added or removed since the places were
+    /// taken. What `applied` does not name stays.
+    pub(crate) fn drop_applied(&mut self, applied: &[StepRow]) {
+        let fetched: Vec<&Vec<(String, String)>> = applied
+            .iter()
+            .filter_map(|step| match step {
+                StepRow::Fetched(keys) => Some(keys),
+                StepRow::Added(_) => None,
+            })
+            .collect();
+        // Only a marked row or one holding staged cells is in the draft.
+        let drafted: std::collections::BTreeSet<usize> = self
+            .marked
+            .iter()
+            .copied()
+            .chain(self.pending.iter().map(|edit| edit.row))
+            .collect();
+        for row in drafted {
+            if self
+                .row_key(row)
+                .is_some_and(|(_, _, keys, _)| fetched.contains(&&keys))
+            {
+                self.marked.remove(&row);
+                self.discard_row(row);
+            }
+        }
+        let mut places: Vec<usize> = applied
+            .iter()
+            .filter_map(|step| match step {
+                StepRow::Added(place) => Some(*place),
+                StepRow::Fetched(_) => None,
+            })
+            .filter(|place| *place < self.added.len())
+            .collect();
+        places.sort_unstable();
+        places.dedup();
+        // Highest first: each removal moves the added rows after it down one.
+        for place in places.iter().rev() {
+            self.added.remove(*place);
+        }
+        if !places.is_empty() {
+            // The ring, the selection and an open input may name a row that is
+            // gone or now another's, as when Delete row removes an added row.
+            self.editing = None;
+            self.clear_row_selection();
+            self.selected_row = None;
+            let rows_left = self.rows_total();
+            if let Some((row, col)) = self.active
+                && row >= rows_left
+            {
+                self.active = rows_left.checked_sub(1).map(|row| (row, col));
+            }
+        }
+    }
 
     /// What the row is called in what an apply says of it: its key's terms as
     /// `name = value`, `name IS NULL` for a NULL a row named by every value
@@ -5319,7 +5369,7 @@ mod tests {
         assert_eq!(identities.len(), 6, "{identities:?}");
 
         // The fetched rows move while the apply is out.
-        grid.sort_in_memory(vec![(1, false)]);
+        grid.sort_in_memory(vec![(1, true)]);
         let at = |grid: &ResultGrid, n: u8| {
             (0..grid.fetched_rows())
                 .find(|&row| grid.cell(row, 0) == Some(id(n).as_str()))
@@ -5366,7 +5416,11 @@ mod tests {
 
         // An identity no row has changes nothing.
         grid.drop_applied(&[StepRow::Fetched(vec![("_id".into(), "nobody".into())])]);
-        assert_eq!(grid.pending_count(), 4);
+        assert_eq!(
+            grid.pending_count(),
+            3,
+            "a mark, an edited cell and an added row"
+        );
     }
 
     #[test]

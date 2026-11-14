@@ -3691,6 +3691,63 @@ mod tests {
         );
     }
 
+    /// The workspace builds a collection's draft with `sql::draft_batch`, cuts
+    /// it with `sql::generated_writes` and pairs each write with
+    /// `sql::row_reread`: the apply must accept the steps those make, which the
+    /// hand-cut steps of the live test above never exercise.
+    #[test]
+    fn a_draft_cut_by_the_sql_entry_points_is_accepted_step_by_step() {
+        use crate::result_grid::{NewValue, PendingRow};
+        use crate::sql::{self, DraftDelete, DraftInsert};
+
+        let types = vec![
+            ("_id".to_owned(), "objectId".to_owned()),
+            ("name".to_owned(), "string".to_owned()),
+        ];
+        let id = |n: u8| format!("ObjectId('65a4f1c0ffffffffffffff{n:02x}')");
+        let deletes = [DraftDelete {
+            schema: String::new(),
+            table: "accounts".into(),
+            keys: vec![("_id".into(), id(1))],
+            null_keys: Vec::new(),
+            types: types.clone(),
+        }];
+        let updates = [PendingRow {
+            table: "accounts".into(),
+            keys: vec![("_id".into(), id(2))],
+            sets: vec![("name".into(), NewValue::Value("bee".into()))],
+            types: types.clone(),
+            ..PendingRow::default()
+        }];
+        let inserts = [DraftInsert {
+            schema: String::new(),
+            table: "accounts".into(),
+            columns: vec![("name".into(), Some("c".into()))],
+            types,
+        }];
+        let draft = sql::draft_batch(Engine::MongoDb, &deletes, &updates, &inserts, true)
+            .expect("the draft is written");
+        let statements =
+            sql::generated_writes(Engine::MongoDb, &draft).expect("the draft is cut into steps");
+        let kinds = [StepKind::Delete, StepKind::Update, StepKind::Insert];
+        assert_eq!(statements.len(), kinds.len(), "{statements:?}");
+        for (sql, kind) in statements.into_iter().zip(kinds) {
+            let step = VerifiedStep {
+                reread: sql::row_reread(Engine::MongoDb, &sql),
+                sql,
+                kind,
+                before: Vec::new(),
+                read_back: None,
+            };
+            let prepared = prepared(&step);
+            assert!(prepared.is_some(), "{kind:?}: {}", step.sql);
+            assert_eq!(
+                prepared.is_some_and(|prepared| prepared.reread.is_some()),
+                kind != StepKind::Insert
+            );
+        }
+    }
+
     /// The server the `live_` tests talk to, from `dbdelve_MONGO_URL`.
     fn live_config() -> MongoConfig {
         let url = std::env::var("dbdelve_MONGO_URL").expect("dbdelve_MONGO_URL is required");

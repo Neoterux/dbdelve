@@ -893,7 +893,6 @@ pub(crate) struct Verification {
     /// The draft row each step was written for, by what names it, `identities[i]`
     /// for step `i` (`ResultGrid::draft_identities`). Empty for the one step of
     /// a Row send or a form, whose failure applies nothing.
-    #[expect(dead_code, reason = "the part-way MongoDB landing (10.2-13) reads it")]
     pub(crate) identities: Vec<crate::result_grid::StepRow>,
     /// True only when the write's `EditTarget.row_match` is `RowMatch::Key`
     /// (its row named by its primary key), so a builder that does not say

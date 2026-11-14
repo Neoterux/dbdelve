@@ -2758,7 +2758,8 @@ pub(super) fn verification(
 ) -> Result<Verification, String> {
     let statements = sql::generated_writes(engine, batch).ok_or(UNPAIRED)?;
     let order = grid.draft_order();
-    if statements.len() != order.len() {
+    let identities = grid.draft_identities();
+    if statements.len() != order.len() || identities.len() != order.len() {
         return Err(UNPAIRED.into());
     }
     let (mut steps, mut rows) = (Vec::new(), Vec::new());
@@ -2789,7 +2790,7 @@ pub(super) fn verification(
     Ok(Verification {
         steps,
         rows,
-        identities: Vec::new(),
+        identities,
         keyed: names_rows_by_key(grid),
     })
 }
