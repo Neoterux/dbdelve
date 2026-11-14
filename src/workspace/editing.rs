@@ -1871,6 +1871,17 @@ impl Workspace {
         let Some(pending) = pending else {
             return false;
         };
+        // The row's edits stay as they are: the last apply may have landed.
+        if results.read(cx).delegate().outcome_unknown() {
+            results.update(cx, |table, cx| {
+                table
+                    .delegate_mut()
+                    .set_send_failure(row, OUTCOME_UNKNOWN_REFUSAL.into());
+                cx.notify();
+            });
+            self.snap_back_to(tab, row, to, cx);
+            return false;
+        }
         // One row is one statement, which carries no bracket of its own, so on
         // the connection's own session it joins the user's open transaction as
         // it stands, when its row is named by its primary key. Not sent
@@ -2213,6 +2224,12 @@ impl Workspace {
             if let Some(row) = results.read(cx).delegate().row_to_send() {
                 self.save_row(object, row, None, None, cx);
             }
+            return;
+        }
+        // A draft is applied again only once the rows are read: the last
+        // `COMMIT` may have landed, and a second would write it twice.
+        if results.read(cx).delegate().outcome_unknown() {
+            self.note(OUTCOME_UNKNOWN_REFUSAL.into(), cx);
             return;
         }
         let own_review = profile.session.apply_review_covers(tab);
@@ -2705,6 +2722,10 @@ fn names_rows_by_key(grid: &ResultGrid) -> bool {
         .as_ref()
         .is_some_and(|edit| edit.row_match == db::RowMatch::Key)
 }
+
+/// What Apply edits, Save and the review's Run say while a grid's last apply
+/// may have landed: the draft is sent again only once the rows are read.
+pub(super) const OUTCOME_UNKNOWN_REFUSAL: &str = "Not applied: whether the last apply reached the server is not known until the rows are read again.";
 
 /// Whether `grid` names the rows it writes back by every column they were read
 /// with: the write that never joins a transaction the user opened. Asked

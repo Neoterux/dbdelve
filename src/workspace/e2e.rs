@@ -29241,3 +29241,66 @@ fn an_apply_whose_outcome_is_unknown_is_refused_until_the_rows_are_read_again(
         quit(workspace, cx);
     });
 }
+
+#[gpui::test]
+fn a_review_that_was_open_and_a_row_save_are_refused_while_the_outcome_is_unknown(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // A review opened before the answer to a COMMIT was lost still holds
+        // its draft, and its Run would write it a second time.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(OUTCOME_UNKNOWN_REFUSAL.to_string())
+            )),
+            "the review stays, with the sentence"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((0, OUTCOME_UNKNOWN_REFUSAL))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+}
