@@ -23586,6 +23586,120 @@ fn an_updated_row_is_marked_on_the_gutter_and_unmarked_when_discarded(cx: &mut T
     });
 }
 
+/// The statements the review in the session shows.
+fn front_review_sql(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    workspace.read_with(cx, |workspace, _| {
+        Some(
+            workspace
+                .profile()?
+                .session
+                .apply_review
+                .as_ref()?
+                .sql
+                .clone(),
+        )
+    })
+}
+
+/// In a Draft view, Insert is a row of the grid: nothing is asked, nothing is
+/// sent, and the ring is on its first cell.
+#[gpui::test]
+fn new_row_in_a_draft_view_adds_a_grid_row(cx: &mut TestAppContext) {
+    use gpui_component::table::TableDelegate;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        assert_eq!(
+            edit_mode_of(&workspace, cx, id),
+            crate::session::EditMode::Draft
+        );
+
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().session.insert_form.is_none());
+        });
+        grid.read_with(cx, |table, cx| {
+            let grid = table.delegate();
+            assert_eq!(grid.fetched_rows(), 2);
+            assert_eq!(grid.added_count(), 1);
+            assert_eq!(grid.rows_count(cx), 3);
+            assert_eq!(grid.active(), Some((2, 0)));
+            assert_eq!(table.selected_row(), Some(2));
+        });
+        assert_eq!(front_review(&workspace, cx), None);
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+        quit(workspace, cx);
+    });
+}
+
+/// The tracer: a row added in the grid is typed, read in `Apply draft`, inserted
+/// by Run, and the draft is empty and the table read again.
+#[gpui::test]
+fn an_added_row_is_inserted_by_apply_draft_and_the_draft_clears(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        stage(&grid, cx, 2, 0, NewValue::Value("3".into()));
+        stage(&grid, cx, 2, 1, NewValue::Value("robin".into()));
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("INSERT INTO"), "{sql}");
+        assert!(
+            !sql.contains("BEGIN"),
+            "one statement is not bracketed: {sql}"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("2"),
+            "nothing is sent before Run"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |table, _| {
+            let grid = table.delegate();
+            assert_eq!(grid.pending_count(), 0);
+            assert_eq!(grid.added_count(), 0);
+            assert_eq!(grid.fetched_rows(), 3, "the table was read again");
+        });
+        assert_eq!(cell_of(&grid, cx, 2, 1).as_deref(), Some("robin"));
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            None,
+            "an empty draft opens none"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("3"),
+            "inserted once"
+        );
+        quit(workspace, cx);
+    });
+}
+
 fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
     cx.update(|window, cx| {
         use gpui::Focusable;

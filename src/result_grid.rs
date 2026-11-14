@@ -6761,4 +6761,168 @@ mod tests {
             Some(r#"{"dbdelve":2,"columns":[{"name":"v","type":null}],"header":false}"#)
         );
     }
+
+    #[test]
+    fn an_added_row_writes_only_the_cells_it_touches() {
+        let mut grid = editable_grid();
+        assert_eq!(grid.add_row(), Some(2));
+        assert!(grid.set_pending(2, 1, NewValue::Value("third".into())));
+        // Default is the server's own, so it is no more a value than leaving
+        // the cell alone.
+        assert!(grid.set_pending(2, 0, NewValue::Default));
+
+        let inserts = grid.draft_inserts().expect("the row holds a touched cell");
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(
+            (inserts[0].schema.as_str(), inserts[0].table.as_str()),
+            ("public", "measurements")
+        );
+        assert_eq!(
+            inserts[0].columns,
+            [("body".to_string(), Some("third".to_string()))]
+        );
+
+        assert!(grid.set_pending(2, 0, NewValue::Null));
+        let inserts = grid.draft_inserts().expect("the row holds touched cells");
+        assert_eq!(
+            inserts[0].columns,
+            [
+                ("id".to_string(), None),
+                ("body".to_string(), Some("third".to_string()))
+            ],
+            "column order, NULL as None"
+        );
+
+        assert_eq!(
+            grid.pending_value(2, 1),
+            Some(&NewValue::Value("third".into()))
+        );
+        assert_eq!(grid.cell(2, 1), None, "never a fetched value");
+        assert_eq!(grid.fetched_rows(), 2);
+        assert_eq!(grid.added_count(), 1);
+        assert!(grid.pending_updates().is_empty(), "no fetched row changed");
+    }
+
+    #[test]
+    fn a_key_column_takes_a_value_on_an_added_row_and_a_generated_column_does_not() {
+        let mut grid = editable_grid();
+        assert!(!grid.editable(0, 0), "a fetched row's key stays fixed");
+        assert_eq!(grid.add_row(), Some(2));
+        assert!(grid.editable(2, 0), "the user types an added row's key");
+        assert!(
+            !grid.editable(2, 2),
+            "a computed column names no real column"
+        );
+
+        grid.mark_generated(&["id".to_string()]);
+        assert!(!grid.editable(2, 0));
+        assert!(!grid.set_pending(2, 0, NewValue::Value("9".into())));
+        assert!(grid.editable(2, 1));
+        assert!(grid.set_pending(2, 1, NewValue::Value("third".into())));
+
+        grid.set_mode(Mode::ReadOnly);
+        assert!(!grid.set_pending(2, 1, NewValue::Value("fourth".into())));
+        assert_eq!(grid.add_row(), None, "a Read-only grid adds nothing");
+        assert_eq!(grid.added_count(), 1);
+    }
+
+    #[test]
+    fn closing_an_untouched_added_cell_without_typing_does_not_touch_it() {
+        let mut grid = editable_grid();
+        grid.add_row();
+        assert!(grid.begin_edit(2, 1));
+        // The input seeds empty and closes empty: that is not a value, so the
+        // column stays out of the INSERT and the server's default applies.
+        assert!(grid.commit_text(2, 1, "".into()));
+        assert_eq!(grid.pending_value(2, 1), None);
+        assert_eq!(grid.draft_inserts().err(), Some(2));
+
+        // Set Value to Empty is the one way to write the empty string.
+        assert!(grid.stage(2, 1, NewValue::Value("".into())));
+        assert_eq!(grid.pending_value(2, 1), Some(&NewValue::Value("".into())));
+        let inserts = grid.draft_inserts().expect("the cell is now touched");
+        assert_eq!(
+            inserts[0].columns,
+            [("body".to_string(), Some(String::new()))]
+        );
+
+        // Reopened and closed unchanged, a staged NULL stays one.
+        assert!(grid.set_pending(2, 1, NewValue::Null));
+        assert!(grid.begin_edit(2, 1));
+        assert!(grid.commit_text(2, 1, "".into()));
+        assert_eq!(grid.pending_value(2, 1), Some(&NewValue::Null));
+    }
+
+    #[test]
+    fn an_added_row_with_no_touched_cell_blocks_the_draft() {
+        let mut grid = editable_grid();
+        assert_eq!(grid.add_row(), Some(2));
+        assert_eq!(grid.add_row(), Some(3));
+        assert!(grid.set_pending(3, 1, NewValue::Value("fourth".into())));
+        assert_eq!(
+            grid.draft_inserts().err(),
+            Some(2),
+            "the first added row's display index"
+        );
+        assert!(grid.set_pending(2, 1, NewValue::Value("third".into())));
+        assert_eq!(
+            grid.draft_inserts().expect("both rows are touched").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_by_default_identity_takes_a_value_on_an_added_row() {
+        let definition = |name: &str, default: &str| db::ColumnDefinition {
+            name: name.into(),
+            data_type: "int4".into(),
+            nullable: false,
+            default: Some(default.into()),
+        };
+        let generated = |engine: db::Engine, columns: &[db::ColumnDefinition]| -> Vec<String> {
+            columns
+                .iter()
+                .filter(|column| engine.generates(column))
+                .map(|column| column.name.clone())
+                .collect()
+        };
+        let postgres = generated(
+            db::Engine::Postgres,
+            &[
+                definition("id", "GENERATED BY DEFAULT AS IDENTITY"),
+                definition("total", "GENERATED ALWAYS AS (a + 1) STORED"),
+            ],
+        );
+        assert_eq!(postgres, ["total"]);
+
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("total")],
+                rows: rows(vec![vec![Some("7".into()), Some("8".into())]]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("total".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        )
+        .with_engine(db::Engine::Postgres);
+        grid.mark_generated(&postgres);
+        assert_eq!(grid.add_row(), Some(1));
+        assert!(grid.editable(1, 0), "BY DEFAULT takes a value");
+        assert!(!grid.editable(1, 1), "GENERATED ALWAYS does not");
+
+        let mysql = generated(
+            db::Engine::MySql,
+            &[
+                definition("id", "AUTO_INCREMENT"),
+                definition("body", "'none'"),
+            ],
+        );
+        assert_eq!(mysql, ["id"]);
+    }
 }
