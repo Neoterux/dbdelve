@@ -219,6 +219,26 @@ impl Target {
         self.reviews_query_edits() || (self.row_edits() && self.verifies_applies())
     }
 
+    /// Whether a grid of this target applies its edits in order, one document
+    /// at a time with no transaction around them.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the collection grid's Draft (10.2-13) asks it")
+    )]
+    pub fn ordered_edits(self) -> bool {
+        false
+    }
+
+    /// Whether an edit send of this target keeps the grid and its draft until
+    /// the server answers.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the collection grid's Draft (10.2-13) asks it")
+    )]
+    pub fn keeps_edits(self) -> bool {
+        self.row_edits() || self.ordered_edits()
+    }
+
     /// Whether this target is one of the transactional SQL engines dbdelve
     /// drives itself: a built-in driver speaking SQL that edits rows and names
     /// a row by its key in the statement text. An edit sent to one keeps the
@@ -510,6 +530,40 @@ mod tests {
             !plugin.row_edits(),
             "a plugin's batch runs behind its driver's own guard"
         );
+    }
+
+    #[test]
+    fn only_mongodb_orders_its_edits_and_keeps_them_with_the_transactional_engines() {
+        for engine in Engine::ALL {
+            let target = Target::built_in(engine);
+            assert_eq!(
+                target.ordered_edits(),
+                engine == Engine::MongoDb,
+                "{engine:?}"
+            );
+            assert_eq!(
+                target.keeps_edits(),
+                matches!(
+                    engine,
+                    Engine::Postgres
+                        | Engine::MySql
+                        | Engine::MariaDb
+                        | Engine::Sqlite
+                        | Engine::DuckDb
+                        | Engine::SqlServer
+                        | Engine::MongoDb
+                ),
+                "{engine:?}"
+            );
+        }
+        for engine in [Engine::Postgres, Engine::MongoDb] {
+            let plugin = Target {
+                engine,
+                driver: Driver::Plugin(odbc()),
+            };
+            assert!(!plugin.ordered_edits(), "{engine:?}");
+            assert!(!plugin.keeps_edits(), "{engine:?}");
+        }
     }
 
     #[test]

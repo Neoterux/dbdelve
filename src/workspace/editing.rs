@@ -2751,7 +2751,11 @@ const UNPAIRED: &str = "dbdelve refused to run a statement it wrote itself: the 
 /// pair up, or when a row an `UPDATE` or `DELETE` names has no re-read or no
 /// name: an apply that cannot be verified is not offered for a target that
 /// verifies.
-fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verification, String> {
+pub(super) fn verification(
+    engine: Engine,
+    grid: &ResultGrid,
+    batch: &str,
+) -> Result<Verification, String> {
     let statements = sql::generated_writes(engine, batch).ok_or(UNPAIRED)?;
     let order = grid.draft_order();
     if statements.len() != order.len() {

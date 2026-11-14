@@ -5371,6 +5371,7 @@ mod tests {
                         | Engine::MySql
                         | Engine::MariaDb
                         | Engine::SqlServer
+                        | Engine::MongoDb
                 ),
                 "{engine:?}"
             );
