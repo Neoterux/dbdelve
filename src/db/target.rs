@@ -226,6 +226,17 @@ impl Target {
             && !self.reviews_query_edits()
     }
 
+    /// Whether an edit of this target's rows is applied through
+    /// `Connection::apply_verified`: a built-in driver whose engine has an arm
+    /// of it ([`Engine::verifies_applies`]) and whose rows are written back at
+    /// all. Every other target applies through `Connection::generated` as it
+    /// did, so no apply is refused for want of an arm.
+    pub fn verifies_applies(self) -> bool {
+        matches!(self.driver, Driver::BuiltIn)
+            && self.engine.verifies_applies()
+            && self.edits_rows()
+    }
+
     /// What the review of a generated write says beyond its statements.
     pub fn review_notes(self, sql: &str) -> Vec<String> {
         match self.driver {

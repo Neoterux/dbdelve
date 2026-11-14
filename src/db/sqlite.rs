@@ -25,10 +25,10 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Batch, InterruptHandle, OpenFlags};
 
 use super::{
-    Catalog, Column, DbError, EditTarget, Engine, Fetch, ForeignKey, Index, IndexKind,
-    NamedDefinition, QueryResult, Reference, RowBuilder, Stopped, Structure, assemble_catalog,
-    assemble_references, assemble_structure, non_utf8_error, optional_cell, percent_decoded,
-    plain_error, required_cell,
+    ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Fetch,
+    ForeignKey, Index, IndexKind, NamedDefinition, QueryResult, Reference, RowBuilder, Sending,
+    Stopped, Structure, VerifiedStep, assemble_catalog, assemble_references, assemble_structure,
+    non_utf8_error, optional_cell, percent_decoded, plain_error, required_cell,
 };
 
 /// The path out of a `sqlite:` or `file:` URL.
@@ -220,18 +220,42 @@ impl Connection {
         self.run(sql, false, Fetch::default())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)] // RED stub: removed with the implementation
+    /// Applies `steps` as one verified sequence on this connection, which it
+    /// holds for the whole of it ([`super::run_verified`]): there is one
+    /// writer on a SQLite file, so nothing of this session's lands between the
+    /// re-reads and the writes. A count is `changes()`, which excludes what a
+    /// trigger or a foreign key wrote. The statement timeout is armed once for
+    /// the sequence. `proceed` says no once a Cancel has come.
     pub fn apply_verified(
         &self,
-        _steps: &[super::VerifiedStep],
-        _bracket: super::Bracket,
-        _proceed: &dyn Fn() -> bool,
-    ) -> super::ApplyOutcome {
-        super::ApplyOutcome::Failed {
-            stage: super::ApplyStage::Begin,
-            error: plain_error("not implemented".into()),
-        }
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        proceed: &dyn Fn() -> bool,
+    ) -> ApplyOutcome {
+        let _deadline = self.deadline();
+        let Ok(connection) = self.connection.lock() else {
+            return ApplyOutcome::Failed {
+                stage: ApplyStage::Begin,
+                error: plain_error(
+                    "The connection is unavailable after an earlier internal failure.".into(),
+                ),
+            };
+        };
+        let mut send = |sql: &str, _: Sending| {
+            ran(&connection, sql, Fetch::default()).map(|(result, _)| result)
+        };
+        // A SQLite file has no socket to lose, and renders every cell the same
+        // way on both reads, so nothing is skipped and no `COMMIT` error means
+        // a lost session.
+        super::run_verified(
+            Engine::Sqlite,
+            steps,
+            bracket,
+            &mut send,
+            proceed,
+            &|_| false,
+            &|_| false,
+        )
     }
 
     fn run(&self, sql: &str, editable: bool, fetch: Fetch) -> Result<QueryResult, DbError> {
@@ -245,145 +269,7 @@ impl Connection {
         })?;
         fetch.hold()?;
 
-        let mut result = QueryResult::default();
-        let mut probed = Vec::new();
-        // How long the kept rows took, once there were as many as the limit.
-        let mut filled = None;
-        let mut past_limit = false;
-
-        // Whether this submission is the one that opened a transaction, asked
-        // before it runs: a transaction the user began in an earlier run is
-        // theirs to finish, not dbdelve's to discard on their next typo.
-        let outside_a_transaction = connection.is_autocommit();
-
-        let outcome = (|| -> Result<(), DbError> {
-            // SQLite splits the submission itself, using the tail its own
-            // parser reports. dbdelve's tree-sitter grammar could have done it,
-            // but then a statement SQLite accepts and the grammar does not
-            // would become a statement dbdelve refuses to send — and what the
-            // user types goes to the engine verbatim.
-            let mut batch = Batch::new(&connection, sql);
-
-            // Timed from here, not from the call: one connection serialises a
-            // profile's queries, and time spent waiting behind the catalog load
-            // is not time spent on this statement.
-            let started = Instant::now();
-            let mut builder = RowBuilder::default();
-            while let Some(mut statement) =
-                batch.next().map_err(|error| query_error(&error, sql))?
-            {
-                // Both borrow the statement, and running it needs it mutably,
-                // so everything the description says is taken first.
-                let columns: Vec<Column> = statement
-                    .columns()
-                    .iter()
-                    .map(|column| Column {
-                        name: column.name().to_string(),
-                        // Lowercased because Postgres names its types in lower
-                        // case and both engines' tags appear in the same grid;
-                        // SQLite's is whatever case the `CREATE TABLE` used.
-                        data_type: column.decl_type().map(str::to_lowercase),
-                    })
-                    .collect();
-                let described: Vec<ProbedColumn> = statement
-                    .columns_with_metadata()
-                    .iter()
-                    .map(|column| ProbedColumn {
-                        schema: column.database_name().map(str::to_string),
-                        table: column.table_name().map(str::to_string),
-                        column: column.origin_name().map(str::to_string),
-                    })
-                    .collect();
-
-                // No columns is a command rather than a query, and only a
-                // command has rows to have affected.
-                if columns.is_empty() {
-                    statement
-                        .execute([])
-                        .map_err(|error| query_error(&error, sql))?;
-                    result.rows_affected = Some(connection.changes());
-                    continue;
-                }
-
-                // One selection can carry several statements, and the grid shows
-                // one result set, so each new description starts the kept set
-                // over and the last statement wins. The declared types came
-                // with the description, so the rows are shown by type from the
-                // first.
-                if let Some(feed) = fetch.feed {
-                    feed.begin(columns.clone());
-                }
-                let mut rows = Vec::new();
-                let mut bytes = 0;
-                // This set's rows, kept or not, and kept: a fed row is not in
-                // `rows` to be counted.
-                let (mut returned, mut kept) = (0, 0);
-                filled = None;
-                let mut stepped = statement
-                    .query([])
-                    .map_err(|error| query_error(&error, sql))?;
-                while let Some(row) = stepped.next().map_err(|error| query_error(&error, sql))? {
-                    returned += 1;
-                    if fetch.limit.is_some_and(|limit| kept >= limit) {
-                        // There is no server to tell: a read is stopped by
-                        // stepping it no further. Dropping `stepped` resets the
-                        // statement, which ends the read transaction it opened
-                        // and leaves one the user began as it was.
-                        if fetch.reads_only {
-                            result.stopped = Some(Stopped::AtLimit);
-                            break;
-                        }
-                        continue;
-                    }
-                    kept += 1;
-                    if fetch.limit == Some(kept) {
-                        filled = Some(started.elapsed());
-                        if let Some(feed) = fetch.feed {
-                            feed.fill();
-                        }
-                    }
-                    for index in 0..columns.len() {
-                        let value = row
-                            .get_ref(index)
-                            .map_err(|error| query_error(&error, sql))?;
-                        let cell = render(value, &columns, index)?;
-                        builder.push(cell.as_deref());
-                    }
-                    let cells = builder.finish()?;
-                    bytes += cells.text_len();
-                    match fetch.feed {
-                        Some(feed) => feed.push(cells),
-                        None => rows.push(cells),
-                    }
-                }
-
-                // A query's count is the rows it returned. `changes()` would
-                // report whatever the statement before it modified, since
-                // SQLite does not reset it for a select.
-                result.rows_affected = Some(returned as u64);
-                result.capped_from =
-                    (result.stopped.is_none() && returned > kept).then_some(returned);
-                past_limit = returned > kept;
-                result.columns = columns;
-                result.rows = rows;
-                result.bytes = bytes;
-                probed = described;
-                if result.stopped.is_some() {
-                    break;
-                }
-            }
-            // Timed to the last kept row when rows past the limit came after
-            // it: draining the statement is not the wait for these.
-            result.elapsed = match filled {
-                Some(filled) if past_limit => filled,
-                _ => started.elapsed(),
-            };
-            Ok(())
-        })();
-
-        if let Err(error) = outcome {
-            return Err(rolled_back(&connection, outside_a_transaction, error));
-        }
+        let (mut result, probed) = ran(&connection, sql, fetch)?;
 
         // The mutex is not reentrant and `edit_target` runs a pragma through it,
         // so the lock has to go before the question is asked.
@@ -1187,6 +1073,156 @@ pub(super) fn journal_is_wal(path: &str) -> Option<bool> {
         return None;
     }
     Some(header[18] == 2 && header[19] == 2)
+}
+
+/// One submission run on a session already held: the statements, stepped as
+/// SQLite splits them, and what `fetch` asks of the last one's rows, with the
+/// columns that statement was read from. Everything [`Connection::run`] does
+/// under its lock, which is not reentrant: a sequence that holds the lock for
+/// itself ([`Connection::apply_verified`]) sends each statement through this.
+fn ran(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    fetch: Fetch,
+) -> Result<(QueryResult, Vec<ProbedColumn>), DbError> {
+    let mut result = QueryResult::default();
+    let mut probed = Vec::new();
+    // How long the kept rows took, once there were as many as the limit.
+    let mut filled = None;
+    let mut past_limit = false;
+
+    // Whether this submission is the one that opened a transaction, asked
+    // before it runs: a transaction the user began in an earlier run is
+    // theirs to finish, not dbdelve's to discard on their next typo.
+    let outside_a_transaction = connection.is_autocommit();
+
+    let outcome = (|| -> Result<(), DbError> {
+        // SQLite splits the submission itself, using the tail its own
+        // parser reports. dbdelve's tree-sitter grammar could have done it,
+        // but then a statement SQLite accepts and the grammar does not
+        // would become a statement dbdelve refuses to send — and what the
+        // user types goes to the engine verbatim.
+        let mut batch = Batch::new(connection, sql);
+
+        // Timed from here, not from the call: one connection serialises a
+        // profile's queries, and time spent waiting behind the catalog load
+        // is not time spent on this statement.
+        let started = Instant::now();
+        let mut builder = RowBuilder::default();
+        while let Some(mut statement) = batch.next().map_err(|error| query_error(&error, sql))? {
+            // Both borrow the statement, and running it needs it mutably,
+            // so everything the description says is taken first.
+            let columns: Vec<Column> = statement
+                .columns()
+                .iter()
+                .map(|column| Column {
+                    name: column.name().to_string(),
+                    // Lowercased because Postgres names its types in lower
+                    // case and both engines' tags appear in the same grid;
+                    // SQLite's is whatever case the `CREATE TABLE` used.
+                    data_type: column.decl_type().map(str::to_lowercase),
+                })
+                .collect();
+            let described: Vec<ProbedColumn> = statement
+                .columns_with_metadata()
+                .iter()
+                .map(|column| ProbedColumn {
+                    schema: column.database_name().map(str::to_string),
+                    table: column.table_name().map(str::to_string),
+                    column: column.origin_name().map(str::to_string),
+                })
+                .collect();
+
+            // No columns is a command rather than a query, and only a
+            // command has rows to have affected.
+            if columns.is_empty() {
+                statement
+                    .execute([])
+                    .map_err(|error| query_error(&error, sql))?;
+                result.rows_affected = Some(connection.changes());
+                continue;
+            }
+
+            // One selection can carry several statements, and the grid shows
+            // one result set, so each new description starts the kept set
+            // over and the last statement wins. The declared types came
+            // with the description, so the rows are shown by type from the
+            // first.
+            if let Some(feed) = fetch.feed {
+                feed.begin(columns.clone());
+            }
+            let mut rows = Vec::new();
+            let mut bytes = 0;
+            // This set's rows, kept or not, and kept: a fed row is not in
+            // `rows` to be counted.
+            let (mut returned, mut kept) = (0, 0);
+            filled = None;
+            let mut stepped = statement
+                .query([])
+                .map_err(|error| query_error(&error, sql))?;
+            while let Some(row) = stepped.next().map_err(|error| query_error(&error, sql))? {
+                returned += 1;
+                if fetch.limit.is_some_and(|limit| kept >= limit) {
+                    // There is no server to tell: a read is stopped by
+                    // stepping it no further. Dropping `stepped` resets the
+                    // statement, which ends the read transaction it opened
+                    // and leaves one the user began as it was.
+                    if fetch.reads_only {
+                        result.stopped = Some(Stopped::AtLimit);
+                        break;
+                    }
+                    continue;
+                }
+                kept += 1;
+                if fetch.limit == Some(kept) {
+                    filled = Some(started.elapsed());
+                    if let Some(feed) = fetch.feed {
+                        feed.fill();
+                    }
+                }
+                for index in 0..columns.len() {
+                    let value = row
+                        .get_ref(index)
+                        .map_err(|error| query_error(&error, sql))?;
+                    let cell = render(value, &columns, index)?;
+                    builder.push(cell.as_deref());
+                }
+                let cells = builder.finish()?;
+                bytes += cells.text_len();
+                match fetch.feed {
+                    Some(feed) => feed.push(cells),
+                    None => rows.push(cells),
+                }
+            }
+
+            // A query's count is the rows it returned. `changes()` would
+            // report whatever the statement before it modified, since
+            // SQLite does not reset it for a select.
+            result.rows_affected = Some(returned as u64);
+            result.capped_from = (result.stopped.is_none() && returned > kept).then_some(returned);
+            past_limit = returned > kept;
+            result.columns = columns;
+            result.rows = rows;
+            result.bytes = bytes;
+            probed = described;
+            if result.stopped.is_some() {
+                break;
+            }
+        }
+        // Timed to the last kept row when rows past the limit came after
+        // it: draining the statement is not the wait for these.
+        result.elapsed = match filled {
+            Some(filled) if past_limit => filled,
+            _ => started.elapsed(),
+        };
+        Ok(())
+    })();
+
+    if let Err(error) = outcome {
+        return Err(rolled_back(connection, outside_a_transaction, error));
+    }
+
+    Ok((result, probed))
 }
 
 /// End the transaction a failed batch left open, and say so in the error.

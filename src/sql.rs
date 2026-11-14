@@ -1371,9 +1371,41 @@ pub(crate) fn row_read(engine: Engine, statement: &str) -> Option<String> {
     is_generated_select(engine, &read).then_some(read)
 }
 
-#[cfg(test)]
-pub(crate) fn row_reread(_engine: Engine, _statement: &str) -> Option<String> {
-    None
+/// `SELECT * FROM <t> WHERE <p>` for one generated `UPDATE` or one-row `DELETE`:
+/// the read of the row it writes, taken inside the apply's transaction before
+/// any write so the row can be compared with the one the user read.
+///
+/// Cut as [`row_read`] is, from the tree the write gate reads and never from
+/// the generator's word, and returned only when [`is_generated_select`] admits
+/// it. Unlike [`row_guard`], an `UPDATE`'s assignments are not inspected: a
+/// `DEFAULT` among them is no reason to leave the row unread. `None` for an
+/// `INSERT`, which has no row to read, for a bracket, for more than one
+/// statement, for a `DELETE` or `UPDATE` whose `WHERE` is not a conjunction of
+/// one-row terms, and for MongoDB and Redis: a caller that gets no read sends
+/// nothing, so a draft whose write has no re-read is not reviewed.
+pub(crate) fn row_reread(engine: Engine, statement: &str) -> Option<String> {
+    if engine.syntax() != Syntax::Sql {
+        return None;
+    }
+    let spec = &engine.spec().sql;
+    if is_transaction_bracket(statement) || !generated_write(spec, statement) {
+        return None;
+    }
+    let text = as_written(spec, statement)?;
+    let tree = parse_write(&text, spec.backslash_escapes)?;
+    let [one] = only_statement(&tree.root_node())?;
+    let (table, predicate) = one_row_delete(one)
+        .or_else(|| {
+            let (table, _, filter) = update_parts(one)?;
+            Some((table, predicate_of(filter)?))
+        })
+        .filter(|(_, predicate)| row_columns(spec, *predicate, &text).is_some())?;
+    let read = format!(
+        "SELECT * FROM {} WHERE {}",
+        text.get(table.byte_range())?,
+        text.get(predicate.byte_range())?
+    );
+    is_generated_select(engine, &read).then_some(read)
 }
 
 /// Whether `sql` is a `SELECT` dbdelve could have written: exactly one root

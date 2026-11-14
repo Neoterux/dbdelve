@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::actions::StepPastEdge;
-use crate::session::{AfterEdits, ReviewSlot, StaleEdit, StaleResume, refreshing};
+use crate::db::{StepKind, VerifiedStep};
+use crate::result_grid::DraftRow;
+use crate::session::{AfterEdits, ReviewSlot, StaleEdit, StaleResume, Verification, refreshing};
 
 impl Workspace {
     /// Open the "Insert" form over the preview in front, one field per column
@@ -255,6 +257,7 @@ impl Workspace {
                 sql: statement,
                 error: None,
                 edits: false,
+                verify: None,
             });
         }
         cx.notify();
@@ -1384,6 +1387,7 @@ impl Workspace {
                 sql: statement,
                 error: None,
                 edits: false,
+                verify: None,
             });
         }
         cx.notify();
@@ -2158,6 +2162,20 @@ impl Workspace {
         }
 
         let notes = target.review_notes(&batch);
+        // What the review's run is checked against, where the target verifies
+        // an apply: the rows as the grid fetched them, one step to a statement.
+        let verify = match tab {
+            Tab::Object(_) if target.verifies_applies() => {
+                match verification(self.engine(), results.read(cx).delegate(), &batch) {
+                    Ok(verify) => Some(verify),
+                    Err(message) => {
+                        self.note(message, cx);
+                        return;
+                    }
+                }
+            }
+            Tab::Object(_) | Tab::Query(_) => None,
+        };
         match tab {
             Tab::Query(_) if !target.reviews_query_edits() => {
                 if !own_review {
@@ -2174,6 +2192,7 @@ impl Workspace {
                         sql: batch,
                         error: None,
                         edits: true,
+                        verify,
                     });
                     cx.notify();
                 }
@@ -2263,6 +2282,17 @@ impl Workspace {
             );
             return;
         }
+        let verify = if target.verifies_applies() {
+            match verification(engine, results.read(cx).delegate(), &batch) {
+                Ok(verify) => Some(verify),
+                Err(message) => {
+                    self.note(message, cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.review_slot_free(tab, true, window, cx) {
             return;
         }
@@ -2275,6 +2305,7 @@ impl Workspace {
                 sql: batch,
                 error: None,
                 edits: true,
+                verify,
             });
             cx.notify();
         }
@@ -2326,10 +2357,13 @@ impl Workspace {
             return;
         };
         let (tab, sql) = (review.tab, review.sql.clone());
+        // Cloned, never taken: a refusal leaves the review open and the next
+        // Run reads the rows again.
+        let verify = review.verify.clone();
         // Without the refresh the grid would show the UPDATE's empty result set
         // and the user would watch their table vanish.
         let refresh = match tab {
-            Tab::Object(id) => Refresh::Relation(id),
+            Tab::Object(id) => Refresh::Relation { id, verify },
             Tab::Query(id) => match profile
                 .session
                 .query_tab(id)
@@ -2562,6 +2596,51 @@ impl Short {
         };
         format!("{} {remedy} before {doing}.", self.situation())
     }
+}
+
+/// The sentence for a draft whose statements cannot be paired with its rows.
+const UNPAIRED: &str = "dbdelve refused to run a statement it wrote itself: the draft and its statements do not match.";
+
+/// What a reviewed draft's run is verified against: `batch`'s statements, cut
+/// from the text the gate admitted, each paired with the row it was written for
+/// ([`ResultGrid::draft_order`]), the row as the grid fetched it, and the read
+/// that brings it back ([`sql::row_reread`]).
+///
+/// Refused, so nothing is reviewed, when the statements and the draft do not
+/// pair up, or when a row an `UPDATE` or `DELETE` names has no re-read or no
+/// name: an apply that cannot be verified is not offered for a target that
+/// verifies.
+fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verification, String> {
+    let statements = sql::generated_writes(engine, batch).ok_or(UNPAIRED)?;
+    let order = grid.draft_order();
+    if statements.len() != order.len() {
+        return Err(UNPAIRED.into());
+    }
+    let (mut steps, mut rows) = (Vec::new(), Vec::new());
+    for (statement, row) in statements.into_iter().zip(order) {
+        let (kind, fetched) = match row {
+            DraftRow::Marked(row) => (StepKind::Delete, Some(row)),
+            DraftRow::Updated(row) => (StepKind::Update, Some(row)),
+            DraftRow::Added(_) => (StepKind::Insert, None),
+        };
+        let (reread, before, label) = match (row, fetched) {
+            (DraftRow::Added(index), _) => (None, Vec::new(), format!("added row {}", index + 1)),
+            (_, Some(fetched)) => (
+                Some(sql::row_reread(engine, &statement).ok_or(UNPAIRED)?),
+                grid.fetched_cells(fetched),
+                grid.row_label(fetched).ok_or(UNPAIRED)?,
+            ),
+            (_, None) => return Err(UNPAIRED.into()),
+        };
+        steps.push(VerifiedStep {
+            sql: statement,
+            kind,
+            reread,
+            before,
+        });
+        rows.push(label);
+    }
+    Ok(Verification { steps, rows })
 }
 
 #[cfg(test)]

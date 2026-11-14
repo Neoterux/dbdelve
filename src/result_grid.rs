@@ -136,12 +136,13 @@ type KeyValues = (Vec<(String, String)>, Vec<String>);
 
 /// Which row of the grid a statement of the draft's batch is written for, in the
 /// order [`crate::sql::draft_batch`] writes them.
-#[cfg(test)]
-#[allow(dead_code)] // RED stub: removed with the implementation
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DraftRow {
+    /// A `DELETE` of this fetched row.
     Marked(usize),
+    /// An `UPDATE` of this fetched row.
     Updated(usize),
+    /// An `INSERT` of this added row, counted from 0 among the added rows.
     Added(usize),
 }
 
@@ -2395,17 +2396,28 @@ impl ResultGrid {
     /// which `toggle_marks` never lets be marked; the caller compares the count
     /// with [`Self::marked_count`].
     pub fn draft_deletes(&self) -> Vec<crate::sql::DraftDelete> {
+        self.deletable()
+            .into_iter()
+            .map(|(_, delete)| delete)
+            .collect()
+    }
+
+    /// [`Self::draft_deletes`] with the row each `DELETE` is written for.
+    fn deletable(&self) -> Vec<(usize, crate::sql::DraftDelete)> {
         self.marked
             .iter()
             .filter_map(|&row| {
                 let (schema, table, keys, null_keys) = self.row_key(row)?;
-                Some(crate::sql::DraftDelete {
-                    schema,
-                    table,
-                    keys,
-                    null_keys,
-                    types: self.row_types(row),
-                })
+                Some((
+                    row,
+                    crate::sql::DraftDelete {
+                        schema,
+                        table,
+                        keys,
+                        null_keys,
+                        types: self.row_types(row),
+                    },
+                ))
             })
             .collect()
     }
@@ -2552,6 +2564,14 @@ impl ResultGrid {
 
     /// [`Self::pending_updates`] over the rows `wanted` names.
     fn pending_rows(&self, wanted: impl Fn(usize) -> bool) -> Vec<PendingRow> {
+        self.pending_rows_with_row(wanted)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect()
+    }
+
+    /// [`Self::pending_rows`] with the grid row each `UPDATE` is written for.
+    fn pending_rows_with_row(&self, wanted: impl Fn(usize) -> bool) -> Vec<(usize, PendingRow)> {
         let Some(edit) = &self.result.edit else {
             return Vec::new();
         };
@@ -2583,24 +2603,27 @@ impl ResultGrid {
                     return None;
                 }
                 let (keys, null_keys) = self.key_values(edit, row)?;
-                Some(PendingRow {
-                    schema: edit.schema.clone(),
-                    table: edit.table.clone(),
-                    sets,
-                    keys,
-                    null_keys,
-                    update: edit.update,
-                    types: self.row_types(row),
-                    held: self
-                        .pending
-                        .iter()
-                        .filter(|pending| pending.row == row)
-                        .filter_map(|pending| {
-                            let name = edit.columns.get(pending.col)?.clone()?;
-                            Some((name, self.cell(row, pending.col)?.to_string()))
-                        })
-                        .collect(),
-                })
+                Some((
+                    row,
+                    PendingRow {
+                        schema: edit.schema.clone(),
+                        table: edit.table.clone(),
+                        sets,
+                        keys,
+                        null_keys,
+                        update: edit.update,
+                        types: self.row_types(row),
+                        held: self
+                            .pending
+                            .iter()
+                            .filter(|pending| pending.row == row)
+                            .filter_map(|pending| {
+                                let name = edit.columns.get(pending.col)?.clone()?;
+                                Some((name, self.cell(row, pending.col)?.to_string()))
+                            })
+                            .collect(),
+                    },
+                ))
             })
             .collect()
     }
@@ -2661,22 +2684,77 @@ impl ResultGrid {
             .collect()
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)] // RED stub: removed with the implementation
+    /// The row each statement of the draft's batch is written for, in the order
+    /// [`crate::sql::draft_batch`] writes them: the marks, then the edited
+    /// rows, then the added rows. Read from the sequences [`Self::draft_deletes`],
+    /// [`Self::pending_updates`] and [`Self::draft_inserts`] read, so the n-th
+    /// statement of the batch is the n-th entry here whichever rows each of
+    /// them leaves out.
     pub(crate) fn draft_order(&self) -> Vec<DraftRow> {
-        Vec::new()
+        let marked = self
+            .deletable()
+            .into_iter()
+            .map(|(row, _)| DraftRow::Marked(row));
+        let updated = self
+            .pending_rows_with_row(|_| true)
+            .into_iter()
+            .map(|(row, _)| DraftRow::Updated(row));
+        let added = (0..self.added.len()).map(DraftRow::Added);
+        marked.chain(updated).chain(added).collect()
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)] // RED stub: removed with the implementation
-    pub(crate) fn row_label(&self, _row: usize) -> Option<String> {
-        None
+    /// What the row is called in what an apply says of it: its key's terms as
+    /// `name = value`, `name IS NULL` for a NULL a row named by every value
+    /// holds, at most three and then an ellipsis. `None` where the key cannot
+    /// be read, as [`Self::row_key`] is.
+    pub(crate) fn row_label(&self, row: usize) -> Option<String> {
+        let edit = self.result.edit.as_ref()?;
+        if row >= self.result.rows.len() {
+            return None;
+        }
+        let every_column = matches!(edit.row_match, db::RowMatch::EveryColumn { .. });
+        let mut terms = Vec::new();
+        for &col in &edit.keys {
+            let name = edit.columns.get(col)?.as_ref()?;
+            terms.push(match self.cell(row, col) {
+                Some(value) => format!("{name} = {value}"),
+                None if every_column => format!("{name} IS NULL"),
+                None => return None,
+            });
+        }
+        let more = terms.len() > 3;
+        terms.truncate(3);
+        if more {
+            terms.push("\u{2026}".into());
+        }
+        Some(terms.join(", "))
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)] // RED stub: removed with the implementation
-    pub(crate) fn fetched_cells(&self, _row: usize) -> Vec<db::FetchedCell> {
-        Vec::new()
+    /// The row as it was fetched, by value: every result column that is a real
+    /// column of the edit target, under that column's name. What the apply
+    /// compares the row's re-read with, so it must not move with the rows if
+    /// they are sorted while a review is open.
+    pub(crate) fn fetched_cells(&self, row: usize) -> Vec<db::FetchedCell> {
+        let Some(edit) = &self.result.edit else {
+            return Vec::new();
+        };
+        edit.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(col, name)| {
+                Some(db::FetchedCell {
+                    column: name.clone()?,
+                    text: self.cell(row, col).map(str::to_owned),
+                    cell_type: self
+                        .result
+                        .cell_types
+                        .get(row)
+                        .and_then(|types| types.get(col))
+                        .map(|tag| (*tag).to_owned()),
+                    column_type: self.column_type(col).map(str::to_owned),
+                })
+            })
+            .collect()
     }
 
     /// Each edit target column's real name against the type the result gave

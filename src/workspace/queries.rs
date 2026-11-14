@@ -7,13 +7,14 @@ use std::ops::Range;
 
 use gpui_component::table::TableState;
 
-use crate::db::{Feed, Fetch, QueryResult, Row, Stopped};
+use crate::db::{ApplyOutcome, ApplyStage, Bracket, Drift, Feed, Fetch, QueryResult, Row, Stopped};
 use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
     AfterEdits, Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename,
-    Queue, Resume, Routed, Step, TabKey, next_step, query_name_refusal, reveals_results,
+    Queue, Resume, Routed, Step, TabKey, Verification, next_step, query_name_refusal,
+    reveals_results,
 };
 
 impl Workspace {
@@ -2214,10 +2215,25 @@ impl Workspace {
             Some(
                 Refresh::Statement(_)
                     | Refresh::Earlier { .. }
-                    | Refresh::Relation(_)
+                    | Refresh::Relation { .. }
                     | Refresh::Row { .. }
             )
         );
+        // What the run is checked against, where its edit was reviewed for a
+        // target that verifies an apply: the rows as they were fetched, read
+        // again inside the apply's transaction. Cloned, as the refresh that
+        // carries it goes on to the landing.
+        let verification = match &refresh {
+            Some(Refresh::Relation { verify, .. }) => verify.clone(),
+            _ => None,
+        };
+        // Whether the apply runs in the user's own open transaction, as the
+        // batch it was written for does (`Workspace::apply_edits`): then
+        // nothing is opened, committed or rolled back for it.
+        let bracket = match binding.is_none() && profile.in_transaction {
+            true => Bracket::Joined,
+            false => Bracket::Own,
+        };
         let refusal = edit
             .then(|| match &binding {
                 Some(binding) => profile.bound_write_refusal(binding),
@@ -2579,7 +2595,10 @@ impl Workspace {
             // Without brackets of its own it is not all-or-nothing: on an
             // engine where a failed statement leaves the transaction open,
             // the rows before the failure stay in it.
-            joined_batch = profile.in_transaction
+            // A verified run says so itself, by the step that failed
+            // (`verified_result`).
+            joined_batch = verification.is_none()
+                && profile.in_transaction
                 && engine.transaction_start().is_some()
                 && sql::Buffer::for_engine(engine, &sql).statements().len() > 1;
         }
@@ -2702,22 +2721,43 @@ impl Workspace {
                 reads_only,
                 held: None,
             };
-            let result = match (generated, alongside, binding.as_ref()) {
+            let result = match (&verification, generated, alongside, binding.as_ref()) {
+                // A reviewed draft of a target that verifies an apply: its
+                // rows read again and compared inside one transaction, each
+                // write counted. Never `generated`, which sends the text as it
+                // is.
+                (Some(verify), _, _, binding) => verified_result(
+                    match binding {
+                        Some(binding) => connection.apply_verified_bound(
+                            binding.schema.as_deref(),
+                            &verify.steps,
+                            bracket,
+                            &cancel,
+                        ),
+                        None => connection.apply_verified(&verify.steps, bracket, &cancel),
+                    },
+                    verify,
+                    bracket,
+                ),
                 // An edit applied from a bound tab's grid belongs to its
                 // database whichever way the session has been moved.
-                (true, _, Some(binding)) => connection.generated_bound(
+                (None, true, _, Some(binding)) => connection.generated_bound(
                     binding.schema.as_deref(),
                     &sql,
                     &cancel,
                     fed.as_ref(),
                     preview_limit,
                 ),
-                (true, ..) => connection.generated(&sql, &cancel, fed.as_ref(), preview_limit),
-                (false, false, Some(binding)) if !ends_transaction => {
+                (None, true, ..) => {
+                    connection.generated(&sql, &cancel, fed.as_ref(), preview_limit)
+                }
+                (None, false, false, Some(binding)) if !ends_transaction => {
                     connection.query_bound(binding.schema.as_deref(), &sql, &cancel, fetch)
                 }
-                (false, false, _) => connection.query(&sql, &cancel, fetch),
-                (false, true, _) => connection.query_alongside(&sql, &cancel, fetch, read_only),
+                (None, false, false, _) => connection.query(&sql, &cancel, fetch),
+                (None, false, true, _) => {
+                    connection.query_alongside(&sql, &cancel, fetch, read_only)
+                }
             };
             // Through the call the write used, with no feed and no row limit:
             // the one row is the whole answer.
@@ -3508,7 +3548,7 @@ impl Workspace {
                     } else if succeeded
                         && !in_front
                         && let Some(
-                            Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation(_),
+                            Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation { .. },
                         ) = &refresh
                     {
                         workspace.give_back(&id, generation, tab);
@@ -3541,7 +3581,7 @@ impl Workspace {
                             Refresh::Return => {}
                             // Landed where it stands, above.
                             Refresh::Row { .. } => {}
-                            Refresh::Relation(id) => workspace.refresh_relation(id, cx),
+                            Refresh::Relation { id, .. } => workspace.refresh_relation(id, cx),
                         }
                     }
                     // A refresh belongs to a generated edit, so the run that
@@ -4180,6 +4220,85 @@ fn pour(
         render_aside(results, engine, cx);
     }
     changed
+}
+
+/// What a verified apply's outcome is to the run that sent it: the write's own
+/// answer, or the error the landing shows where the statement is.
+///
+/// Under a transaction of the user's nothing is rolled back, so the writes
+/// before the statement that failed stay in it, which the error says.
+fn verified_result(
+    outcome: ApplyOutcome,
+    verify: &Verification,
+    bracket: Bracket,
+) -> Result<QueryResult, DbError> {
+    let stays = |step: usize| bracket == Bracket::Joined && step > 0;
+    let partial = |message: &mut String| {
+        message.push_str(
+            " Rows of the batch before the failed one were applied inside the open \
+             transaction and stay in it, to be committed or rolled back with it.",
+        )
+    };
+    match outcome {
+        ApplyOutcome::Applied { affected } => Ok(QueryResult {
+            rows_affected: Some(affected),
+            ..QueryResult::default()
+        }),
+        ApplyOutcome::Failed { stage, mut error } => {
+            if let ApplyStage::Write(step) = stage
+                && stays(step)
+            {
+                partial(&mut error.message);
+            }
+            Err(error)
+        }
+        // Whether `COMMIT` landed is not known, so nothing is said of it here.
+        ApplyOutcome::Unknown(error) => Err(error),
+        refused => {
+            let mut message = verified_message(&refused, verify).unwrap_or_default();
+            if let ApplyOutcome::Miscounted { step, .. } = refused
+                && stays(step)
+            {
+                partial(&mut message);
+            }
+            Err(DbError {
+                message,
+                position: None,
+            })
+        }
+    }
+}
+
+/// What the review says of a verified apply that wrote nothing, naming the
+/// rows: `Nothing was applied.` and then one sentence for each row that is not
+/// the row that was read. `None` for an outcome that carries no such sentence,
+/// the write that landed and the errors a driver words itself.
+fn verified_message(outcome: &ApplyOutcome, verify: &Verification) -> Option<String> {
+    let row = |step: usize| verify.rows.get(step).map_or("?", String::as_str);
+    let sentences: Vec<String> = match outcome {
+        ApplyOutcome::Drifted(drifted) => drifted
+            .iter()
+            .map(|(step, drift)| match drift {
+                Drift::Changed => {
+                    format!("Row {} does not match the row as it was read.", row(*step))
+                }
+                Drift::Gone => format!("Row {} is no longer on the server.", row(*step)),
+                Drift::Ambiguous(rows) => {
+                    format!("Row {} matches {rows} rows on the server.", row(*step))
+                }
+            })
+            .collect(),
+        ApplyOutcome::Miscounted { step, count } => vec![format!(
+            "Statement {} ({}) affected {} rows.",
+            step + 1,
+            row(*step),
+            count.map_or("no".to_string(), |count| count.to_string())
+        )],
+        ApplyOutcome::Applied { .. } | ApplyOutcome::Failed { .. } | ApplyOutcome::Unknown(_) => {
+            return None;
+        }
+    };
+    Some(format!("Nothing was applied. {}", sentences.join(" ")))
 }
 
 /// What a Row send's landing does to the grid, and what it says. The row the
