@@ -7216,16 +7216,19 @@ mod tests {
 
     #[test]
     fn the_gate_refuses_an_insert_carrying_something_else() {
-        // One insert, alone. A batch of them is a shape nothing generates, and
-        // a `DELETE` riding along in a CTE is the shape an injected value takes.
+        // One insert, alone, or one row each in a reviewed draft. A `DELETE`
+        // riding along in a CTE is the shape an injected value takes.
         for sql in [
             "INSERT INTO t (a) VALUES ('1'); DROP TABLE t",
             "INSERT INTO t (a) VALUES ('1'); TRUNCATE t",
             "WITH x AS (DELETE FROM t RETURNING *) INSERT INTO u (a) VALUES ('1')",
-            "INSERT INTO t (a) VALUES ('1'); INSERT INTO t (a) VALUES ('2')",
+            "INSERT INTO t (a) VALUES ('1'), ('2'); INSERT INTO t (a) VALUES ('3')",
+            "INSERT INTO t (a) VALUES ('1') ON CONFLICT DO NOTHING; INSERT INTO t (a) VALUES ('2')",
         ] {
             assert!(!is_generated_write(sql), "{sql} passed the gate");
         }
+        let draft = "INSERT INTO t (a) VALUES ('1'); INSERT INTO t (a) VALUES ('2')";
+        assert!(is_generated_write(draft), "{draft} was refused");
     }
 
     #[test]
@@ -7880,15 +7883,23 @@ mod tests {
             "WITH x AS (SELECT 1) DELETE FROM t WHERE id = '1'",
             "DELETE FROM t WHERE id = '1' LIMIT 1",
             "DELETE FROM t WHERE id = '1' RETURNING *",
-            "DELETE FROM t WHERE id = '1'; DELETE FROM t WHERE id = '2'",
             "DELETE FROM t WHERE id = '1'; DROP TABLE t",
-            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t WHERE id = '3'",
+            "DELETE FROM t WHERE id = '1'; DELETE FROM t WHERE id = '2' OR id = '3'",
+            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t",
             r#"DELETE FROM t WHERE "id" = "other""#,
             "DELETE FROM t WHERE t.id = '1'",
             "WITH x AS (DROP TABLE u) DELETE FROM t WHERE id = '1'",
             "WITH x AS (DROP TABLE u) UPDATE t SET a = '1' WHERE id = '2'",
         ] {
             assert!(!is_generated_write(sql), "{sql:?} passed the gate");
+        }
+        // Each of several is one named row, which is what a reviewed draft
+        // holds: one `DELETE` per marked row, never one predicate over several.
+        for sql in [
+            "DELETE FROM t WHERE id = '1'; DELETE FROM t WHERE id = '2'",
+            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t WHERE id = '3'",
+        ] {
+            assert!(is_generated_write(sql), "{sql:?} was refused");
         }
     }
 
