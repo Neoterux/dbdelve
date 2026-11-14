@@ -75,17 +75,14 @@ impl Workspace {
     pub(crate) fn has_markable_row(&self, cx: &App) -> bool {
         self.profile().is_some_and(|profile| {
             let tab = profile.session.active;
-            matches!(tab, Tab::Object(_))
-                && profile.session.edit_mode(tab) == EditMode::Draft
-                && profile.config.target().row_edits()
-                && profile.session.active_results().is_some_and(|results| {
-                    let grid = results.read(cx).delegate();
-                    grid.insert_target().is_some()
-                        && grid
-                            .selected_draft_rows()
-                            .into_iter()
-                            .any(|row| row >= grid.fetched_rows() || grid.row_key(row).is_some())
-                })
+            profile.session.active_results().is_some_and(|results| {
+                markable_row(
+                    profile.config.target(),
+                    tab,
+                    profile.session.edit_mode(tab),
+                    results.read(cx).delegate(),
+                )
+            })
         })
     }
 
@@ -4261,6 +4258,20 @@ fn pour(
     changed
 }
 
+/// [`Workspace::has_markable_row`] over what it reads: a Draft view of a
+/// relation's rows on a target whose edits stay in the grid until the server
+/// answers, whose selection holds an added row or a row named by its key.
+fn markable_row(target: Target, tab: Tab, mode: EditMode, grid: &ResultGrid) -> bool {
+    matches!(tab, Tab::Object(_))
+        && mode == EditMode::Draft
+        && target.row_edits()
+        && grid.insert_target().is_some()
+        && grid
+            .selected_draft_rows()
+            .into_iter()
+            .any(|row| row >= grid.fetched_rows() || grid.row_key(row).is_some())
+}
+
 /// What a verified apply's outcome is to the run that sent it: the write's own
 /// answer, or the error the landing shows where the statement is.
 fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<QueryResult, DbError> {
@@ -4441,6 +4452,101 @@ mod tests {
             rows: vec!["id = 1".into(), "id = 2".into(), "added row 1".into()],
             keyed: true,
         }
+    }
+
+    /// A collection's three documents keyed by `_id`, as a `find` on it reads
+    /// them, each cell carrying its own `$type` tag.
+    fn mongo_grid() -> ResultGrid {
+        let id = |n: u8| Some(format!("ObjectId('65a4f1c0ffffffffffffff{n:02x}')"));
+        let column = |name: &str, data_type: &str| db::Column {
+            name: name.into(),
+            data_type: Some(data_type.into()),
+        };
+        ResultGrid::new(
+            QueryResult {
+                columns: vec![column("_id", "objectId"), column("name", "string")],
+                rows: db::rows(vec![
+                    vec![id(1), Some("Ann".into())],
+                    vec![id(2), Some("Bo".into())],
+                    vec![id(3), Some("Cy".into())],
+                ]),
+                cell_types: vec![vec!["objectId", "string"]; 3],
+                edit: Some(db::EditTarget {
+                    schema: "dbdelve_dev".into(),
+                    table: "accounts".into(),
+                    columns: vec![Some("_id".into()), Some("name".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            crate::sql::Mode::ReadWrite,
+        )
+        .with_engine(Engine::MongoDb)
+    }
+
+    #[test]
+    fn a_mongo_collection_tab_offers_draft_rows_and_marks() {
+        let mut grid = mongo_grid();
+        let (mongo, object) = (Target::built_in(Engine::MongoDb), Tab::Object(0));
+        assert!(grid.toggle_marks(&[0]), "a document is marked by its _id");
+        assert!(grid.set_pending(1, 1, NewValue::Value("Boris".into())));
+        let added = grid
+            .add_row()
+            .expect("a collection takes an added document");
+        assert!(grid.set_pending(added, 1, NewValue::Value("Di".into())));
+
+        // The row the ring is on is the added one, which Delete row removes.
+        assert!(markable_row(mongo, object, EditMode::Draft, &grid));
+        assert!(!markable_row(mongo, object, EditMode::Row, &grid));
+        assert!(!markable_row(mongo, Tab::Query(0), EditMode::Draft, &grid));
+        assert!(!markable_row(
+            Target::built_in(Engine::Redis),
+            object,
+            EditMode::Draft,
+            &grid
+        ));
+
+        // The manifest of its draft, as Apply draft builds it.
+        let batch = sql::draft_batch(
+            Engine::MongoDb,
+            &grid.draft_deletes(),
+            &grid.pending_updates(),
+            &grid
+                .draft_inserts()
+                .expect("the added document holds a value"),
+            true,
+        )
+        .expect("the draft is written");
+        let verify = super::super::editing::verification(Engine::MongoDb, &grid, &batch)
+            .expect("a collection's draft can be verified");
+        let kinds: Vec<_> = verify.steps.iter().map(|step| step.kind).collect();
+        assert_eq!(
+            kinds,
+            [StepKind::Delete, StepKind::Update, StepKind::Insert]
+        );
+        assert_eq!(
+            verify.rows,
+            [
+                "_id = ObjectId('65a4f1c0ffffffffffffff01')",
+                "_id = ObjectId('65a4f1c0ffffffffffffff02')",
+                "added row 1"
+            ]
+        );
+        for step in &verify.steps[..2] {
+            assert!(step.reread.is_some(), "{}", step.sql);
+            let tags: Vec<_> = step
+                .before
+                .iter()
+                .map(|cell| (cell.column.as_str(), cell.cell_type.as_deref()))
+                .collect();
+            assert_eq!(
+                tags,
+                [("_id", Some("objectId")), ("name", Some("string"))],
+                "each fetched cell carries its $type tag"
+            );
+        }
+        assert!(verify.steps[2].reread.is_none() && verify.steps[2].before.is_empty());
     }
 
     #[test]

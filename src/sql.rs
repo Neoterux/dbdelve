@@ -8366,6 +8366,103 @@ mod tests {
         assert_eq!(row_reread(Engine::Redis, "DEL k"), None);
     }
 
+    #[test]
+    fn a_mongo_draft_is_written_key_checked_and_reread_through_the_sql_entry_points() {
+        let oid = |n: u8| format!("ObjectId('65a4f1c0ffffffffffffff{n:02x}')");
+        let delete = |n: u8| DraftDelete {
+            schema: "dbdelve_dev".into(),
+            table: "accounts".into(),
+            keys: vec![("_id".into(), oid(n))],
+            null_keys: Vec::new(),
+            types: vec![("_id".into(), "objectId".into())],
+        };
+        let deletes = [delete(1), delete(2)];
+        let updates = [PendingRow {
+            table: "accounts".into(),
+            sets: vec![("name".into(), set("Ada"))],
+            keys: vec![("_id".into(), oid(3))],
+            types: vec![
+                ("_id".into(), "objectId".into()),
+                ("name".into(), "string".into()),
+            ],
+            ..Default::default()
+        }];
+        let inserts = [DraftInsert {
+            schema: "dbdelve_dev".into(),
+            table: "accounts".into(),
+            columns: vec![("name".into(), Some("Cy".into()))],
+            types: vec![("name".into(), "string".into())],
+        }];
+
+        // MongoDB has no bracket, so `own_brackets` changes nothing there.
+        for own_brackets in [true, false] {
+            assert_eq!(
+                draft_batch(Engine::MongoDb, &deletes, &updates, &inserts, own_brackets),
+                crate::mql::draft_batch(&deletes, &updates, &inserts),
+            );
+        }
+        let batch = draft_batch(Engine::MongoDb, &deletes, &updates, &inserts, true)
+            .expect("a mongo draft is written");
+        assert!(is_generated_write_on(Engine::MongoDb, &batch), "{batch}");
+        assert_eq!(
+            draft_deletes_match(Engine::MongoDb, &batch, &["_id"], "dbdelve_dev", "accounts"),
+            Some(2)
+        );
+        assert_eq!(
+            draft_deletes_match(Engine::MongoDb, &batch, &["_id"], "dbdelve_dev", "other"),
+            None,
+            "a delete of another collection is not the marked documents'"
+        );
+
+        let statements = generated_writes(Engine::MongoDb, &batch).expect("a draft splits");
+        assert_eq!(statements.len(), 4, "{statements:?}");
+        for (statement, method) in
+            statements
+                .iter()
+                .zip(["deleteOne", "deleteOne", "updateOne", "insertOne"])
+        {
+            assert!(statement.contains(method), "{statement}");
+            assert!(!statement.ends_with(';'), "{statement}");
+            assert!(
+                is_generated_write_on(Engine::MongoDb, statement),
+                "{statement}"
+            );
+        }
+        for (statement, wanted) in statements.iter().zip([true, true, true, false]) {
+            assert_eq!(
+                row_reread(Engine::MongoDb, statement),
+                crate::mql::browse::row_reread(statement)
+            );
+            assert_eq!(
+                row_reread(Engine::MongoDb, statement).is_some(),
+                wanted,
+                "{statement}"
+            );
+        }
+        for refused in [
+            "db.getCollection(\"accounts\").deleteMany({})",
+            "db.getCollection(\"accounts\").find({})",
+            "db.getCollection(\"accounts\").deleteOne({_id: 1});\ndb.dropDatabase();",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(
+                generated_writes(Engine::MongoDb, refused),
+                None,
+                "{refused}"
+            );
+        }
+
+        // Redis writes no draft of this shape.
+        assert!(draft_batch(Engine::Redis, &deletes, &updates, &inserts, true).is_err());
+        assert_eq!(
+            draft_deletes_match(Engine::Redis, &batch, &["_id"], "d", "accounts"),
+            None
+        );
+        assert_eq!(row_reread(Engine::Redis, &statements[0]), None);
+        assert_eq!(generated_writes(Engine::Redis, &statements[0]), None);
+    }
+
     fn set(value: &str) -> NewValue {
         NewValue::Value(value.into())
     }
