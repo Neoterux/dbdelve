@@ -2831,6 +2831,12 @@ pub(crate) fn delete_matches_key(text: &str, keys: &[&str]) -> bool {
             .all(|(field, _)| keys.contains(&field.as_str()))
 }
 
+/// RED stub: the key check is not written yet.
+#[cfg(test)]
+pub(crate) fn draft_deletes_match(_text: &str, _keys: &[&str], _collection: &str) -> Option<usize> {
+    None
+}
+
 /// A non-empty document of distinct fields with no operator anywhere in it.
 fn literal_document(document: &Value) -> bool {
     matches!(document, Value::Document(fields)
@@ -5118,6 +5124,68 @@ mod tests {
             let refused = refused.replace("{c}", c);
             assert!(!is_generated_write(&refused), "{refused} passed the gate");
         }
+    }
+
+    #[test]
+    fn the_key_check_of_a_mongo_draft_reads_methods_and_collection_from_the_parse() {
+        let deletes = [draft_delete(&oid(1)), draft_delete(&oid(2))];
+        let updates = [draft_update(&oid(3), "Ada")];
+        let inserts = [draft_insert(&[("name", Some("Cy"))])];
+        let mixed = draft_batch(&deletes, &updates, &inserts).unwrap();
+        assert_eq!(draft_deletes_match(&mixed, &["_id"], "accounts"), Some(2));
+        // The keys are read as a set, and the collection by name.
+        assert_eq!(
+            draft_deletes_match(&mixed, &["_id", "email"], "accounts"),
+            None
+        );
+        assert_eq!(draft_deletes_match(&mixed, &["email"], "accounts"), None);
+        assert_eq!(draft_deletes_match(&mixed, &[], "accounts"), None);
+        assert_eq!(draft_deletes_match(&mixed, &["_id"], "other"), None);
+        // An `updateOne` that names `_id` is not a delete and is not counted.
+        let no_deletes = draft_batch(&[], &updates, &inserts).unwrap();
+        assert_eq!(
+            draft_deletes_match(&no_deletes, &["_id"], "accounts"),
+            Some(0)
+        );
+        // Another collection, or another database, is not the marked document.
+        let c = r#"db.getCollection("accounts")"#;
+        let on_other = format!(
+            r#"{c}.deleteOne({{_id: 1}});{}"#,
+            "\ndb.getCollection(\"other\").deleteOne({_id: 2});"
+        );
+        assert_eq!(draft_deletes_match(&on_other, &["_id"], "accounts"), None);
+        let sibling = r#"db.getSiblingDB("x").accounts.deleteOne({_id: 1});"#;
+        assert_eq!(draft_deletes_match(sibling, &["_id"], "accounts"), None);
+        // Methods are read from the parse: only the three a draft holds.
+        for text in [
+            "{c}.deleteOne({_id: 1});\n{c}.deleteMany({});",
+            "{c}.deleteMany({_id: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.updateMany({_id: 1}, {$set: {a: 1}});",
+            "{c}.deleteOne({_id: 1});\n{c}.replaceOne({_id: 2}, {a: 1});",
+            "{c}.deleteOne({_id: 1});\n{c}.findOneAndDelete({_id: 2});",
+            "{c}.deleteOne({_id: 1});\n{c}.insertMany([{a: 1}]);",
+            "{c}.deleteOne({_id: 1});\n{c}.find({});",
+            "{c}.deleteOne({_id: 1, a: 2});",
+            "{c}.deleteOne({});",
+            "{c}.deleteOne({_id: 1}, {_id: 1});",
+            "{c}.deleteOne({_id: 1});\ndb.dropDatabase();",
+        ] {
+            let text = text.replace("{c}", c);
+            assert_eq!(
+                draft_deletes_match(&text, &["_id"], "accounts"),
+                None,
+                "{text}"
+            );
+        }
+        // Text that does not parse, or holds no statement, is not a draft.
+        assert_eq!(
+            draft_deletes_match("{c}.deleteOne({_id: ", &["_id"], "accounts"),
+            None
+        );
+        assert_eq!(draft_deletes_match("", &["_id"], "accounts"), None);
+        // Each statement is read for what it is, not for where it stands.
+        let one = r#"db.accounts.deleteOne({_id: 1})"#;
+        assert_eq!(draft_deletes_match(one, &["_id"], "accounts"), Some(1));
     }
 
     #[test]
