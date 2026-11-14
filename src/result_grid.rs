@@ -22,7 +22,11 @@ use crate::{
     icons::icon,
     sql::{Mode, SortKey},
     store::{GRID_ROW_CAP, StoredGrid, captured_at},
-    theme::{ConnectionColor, color::Srgb, fonts, layout, theme},
+    theme::{
+        ConnectionColor,
+        color::{Rgba, Srgb},
+        fonts, layout, theme,
+    },
     ui::{Control, Tone, icon_button},
 };
 
@@ -2975,6 +2979,12 @@ impl TableDelegate for ResultGrid {
             .id(("row", row_ix))
             .relative()
             .max_w(px(content_width));
+        // The row's state wash first, so the selection paints over it: a
+        // selected row with changes still reads as selected, and the two
+        // stay apart (`theme::tests`) with one over the other.
+        let row = row.when(self.row_has_pending(row_ix), |row| {
+            row.child(div().absolute().size_full().bg(t.updated))
+        });
         if !self.selected_rows.contains(&row_ix) {
             return row;
         }
@@ -3061,11 +3071,12 @@ impl TableDelegate for ResultGrid {
         match col_ix.checked_sub(GUTTER).and_then(|p| self.column_at(p)) {
             Some(col) => self.data_td(row_ix, col, window, cx).into_any_element(),
             None => {
-                let (faint, text, selected_bg, danger) = {
+                let (faint, text, selected_bg, danger, updated) = {
                     let t = theme(cx);
-                    (t.text_faint, t.text, t.selection, t.danger)
+                    (t.text_faint, t.text, t.selection, t.danger, t.updated)
                 };
                 let selected = self.selected_rows.contains(&row_ix);
+                let changed = self.row_has_pending(row_ix);
                 // What the server said to this row's send, on the one cell
                 // that is the row's and not a column's.
                 let refused = self
@@ -3078,8 +3089,24 @@ impl TableDelegate for ResultGrid {
                     .debug_selector(move || format!("row-number-{row_ix}"))
                     .size_full()
                     .justify_end()
+                    .relative()
                     .when(selected, |cell| cell.bg(selected_bg))
                     .text_color(if selected { text } else { faint })
+                    // A strip on the leading edge, in the wash's own hue at
+                    // full strength: the wash alone is colour, and where it
+                    // is faint a row with changes must still be told.
+                    .when(changed, |cell| {
+                        cell.child(
+                            div()
+                                .debug_selector(move || format!("row-updated-{row_ix}"))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(3.0))
+                                .bg(Rgba { a: 1.0, ..updated }),
+                        )
+                    })
                     .when_some(refused.clone(), |cell, message| {
                         cell.text_color(danger).tooltip(move |window, cx| {
                             Tooltip::new(message.clone()).build(window, cx)
