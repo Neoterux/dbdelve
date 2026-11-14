@@ -12,9 +12,9 @@ use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
 use crate::session::{
-    AfterEdits, Binding, Finished, Lane, PendingDelete, PendingDiscard, PendingRun, QueryRename,
-    Queue, Resume, Routed, Step, TabKey, Verification, next_step, query_name_refusal,
-    reveals_results,
+    AfterEdits, Binding, DRAFT_IN_TRANSACTION, Finished, Lane, PendingDelete, PendingDiscard,
+    PendingRun, QueryRename, Queue, Resume, Routed, Step, TabKey, Verification, next_step,
+    query_name_refusal, reveals_results,
 };
 
 impl Workspace {
@@ -2252,12 +2252,20 @@ impl Workspace {
                 Tab::Object(_) => true,
                 Tab::Query(_) => target.reviews_query_apply(),
             };
+        // A run that would join the user's open transaction without being one
+        // write on a row named by its primary key: a review written before the
+        // transaction opened, or a write on a table with no primary key.
+        let unfit_to_join = bracket == Bracket::Joined
+            && verification
+                .as_ref()
+                .is_some_and(|verify| !verify.may_join());
         let refusal = edit
             .then(|| match &binding {
                 Some(binding) => profile.bound_write_refusal(binding),
                 None => profile.own_write_refusal(&sql),
             })
             .flatten()
+            .or_else(|| unfit_to_join.then(|| DRAFT_IN_TRANSACTION.into()))
             .or_else(|| {
                 unverified.then(|| "dbdelve refused to send an edit it could not verify.".into())
             });

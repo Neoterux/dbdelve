@@ -412,8 +412,8 @@ impl Profile {
     /// Why an edit of dbdelve's is not sent on the connection's own session.
     ///
     /// A transaction of the user's is open, and inside it exactly one write
-    /// joins: a single statement carries no bracket and runs as the user's own
-    /// would. A submission of several is refused on every engine, whether it
+    /// joins ([`Verification::may_join`]): a single statement carries no
+    /// bracket and runs as the user's own would. A submission of several is refused on every engine, whether it
     /// brackets itself (its `COMMIT` would end the user's transaction, and on
     /// MySQL and MariaDB its opening `START TRANSACTION` would commit it first)
     /// or not (rolling a draft back when a statement fails would end the user's
@@ -891,16 +891,22 @@ pub(crate) struct Verification {
     /// for step `i`: the key's `name = value` terms, or `added row N`.
     pub(crate) rows: Vec<String>,
     /// True only when the write's `EditTarget.row_match` is `RowMatch::Key`
-    /// (its row named by its primary key). A field left false refuses to join
-    /// a transaction the user opened rather than joining it.
-    #[allow(dead_code)] // stub: read by `may_join` once it answers
-    pub(crate) keyed: bool,
+    /// (its row named by its primary key), so a builder that does not say
+    /// refuses to join a transaction the user opened rather than joining it.
+    pub keyed: bool,
 }
 
 impl Verification {
-    #[allow(dead_code)] // stub: no caller until the Run check is written
+    /// Whether this run may join a transaction the user opened: one write, on
+    /// a row named by its primary key (`keyed`).
+    ///
+    /// Rolling several writes back would end the user's transaction, and a
+    /// write on a table with no primary key names its rows by every column, so
+    /// it could count two where nothing can be rolled back without ending that
+    /// transaction. A key is shared by no two rows, so a joined count is one or
+    /// none, and a none wrote nothing.
     pub(crate) fn may_join(&self) -> bool {
-        false
+        self.keyed && self.steps.len() == 1
     }
 }
 

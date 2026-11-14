@@ -246,8 +246,12 @@ impl Workspace {
             return;
         }
         // The `INSERT` must count the one row it adds.
+        let keyed = self
+            .profile()
+            .and_then(|profile| profile.session.results(tab))
+            .is_some_and(|results| names_rows_by_key(results.read(cx).delegate()));
         let verify = if self.target().verifies_applies() {
-            match lone_verification(engine, &statement, StepKind::Insert, None, None) {
+            match lone_verification(engine, &statement, StepKind::Insert, None, None, keyed) {
                 Ok(verify) => Some(verify),
                 Err(message) => {
                     self.note(message, cx);
@@ -1399,6 +1403,7 @@ impl Workspace {
                 StepKind::Delete,
                 Some((grid.fetched_cells(row), grid.row_label(row))),
                 None,
+                names_rows_by_key(grid),
             ) {
                 Ok(verify) => Some(verify),
                 Err(message) => {
@@ -1868,7 +1873,24 @@ impl Workspace {
         };
         // One row is one statement, which carries no bracket of its own, so on
         // the connection's own session it joins the user's open transaction as
-        // it stands.
+        // it stands, when its row is named by its primary key. Not sent
+        // otherwise: a row named by every column could count two where the
+        // user's transaction cannot be rolled back without ending it.
+        if profile.binding_of(tab).is_none()
+            && profile.in_transaction
+            && target.verifies_applies()
+            && !names_rows_by_key(results.read(cx).delegate())
+        {
+            results.update(cx, |table, cx| {
+                table.delegate_mut().set_send_failure(
+                    row,
+                    "A transaction is open on this connection; the row was not sent.".into(),
+                );
+                cx.notify();
+            });
+            self.snap_back_to(tab, row, to, cx);
+            return false;
+        }
         let update = match update_batch(self.engine(), &[pending]) {
             Ok(update) => update,
             Err(message) => {
@@ -1903,6 +1925,7 @@ impl Workspace {
                 StepKind::Update,
                 Some((grid.fetched_cells(row), grid.row_label(row))),
                 Some(read.clone()),
+                names_rows_by_key(grid),
             ) {
                 Ok(verify) => Some(verify),
                 Err(message) => {
@@ -2188,7 +2211,12 @@ impl Workspace {
             return;
         }
         let pending = results.read(cx).delegate().pending_updates();
-        if joins && pending.len() > 1 {
+        // Only one write on a row named by its primary key joins the user's
+        // transaction; the draft is kept for when it ends.
+        if joins
+            && (pending.len() > 1
+                || (target.verifies_applies() && !names_rows_by_key(results.read(cx).delegate())))
+        {
             self.note(DRAFT_IN_TRANSACTION.into(), cx);
             return;
         }
@@ -2306,8 +2334,12 @@ impl Workspace {
         // Before anything is written, so nothing is generated or reviewed for a
         // draft that would not run whole. Rolling several statements back when
         // one fails would end the transaction the user opened, so inside it
-        // only one joins; the draft is kept for when the transaction ends.
-        if joins && deletes.len() + updates.len() + inserts.len() > 1 {
+        // only one write on a row named by its primary key joins; the draft is
+        // kept for when the transaction ends.
+        if joins
+            && (deletes.len() + updates.len() + inserts.len() > 1
+                || (target.verifies_applies() && !names_rows_by_key(results.read(cx).delegate())))
+        {
             self.note(DRAFT_IN_TRANSACTION.into(), cx);
             return;
         }
@@ -2648,6 +2680,17 @@ impl Short {
     }
 }
 
+/// Whether `grid` names the rows it writes back by their primary key, which is
+/// what lets a write join a transaction the user opened
+/// ([`Verification::may_join`]). Asked of the grid's `EditTarget`, never of the
+/// engine: a result that writes back nowhere names nothing.
+fn names_rows_by_key(grid: &ResultGrid) -> bool {
+    grid.result()
+        .edit
+        .as_ref()
+        .is_some_and(|edit| edit.row_match == db::RowMatch::Key)
+}
+
 /// The sentence for a draft whose statements cannot be paired with its rows.
 const UNPAIRED: &str = "dbdelve refused to run a statement it wrote itself: the draft and its statements do not match.";
 
@@ -2694,7 +2737,7 @@ fn verification(engine: Engine, grid: &ResultGrid, batch: &str) -> Result<Verifi
     Ok(Verification {
         steps,
         rows,
-        keyed: false,
+        keyed: names_rows_by_key(grid),
     })
 }
 
@@ -2711,6 +2754,8 @@ const UNCHECKABLE: &str =
 /// `INSERT` has no row to read and is called `new row` in what the apply says
 /// of it.
 /// `read_back` is the read a Row send takes of its row inside the transaction.
+/// `keyed` is whether the grid it was built against names its rows by their
+/// primary key ([`names_rows_by_key`]).
 ///
 /// Refused, so nothing is sent, when the statement is not exactly one of the
 /// kind named or its row cannot be read again or named: an apply that cannot
@@ -2721,6 +2766,7 @@ fn lone_verification(
     kind: StepKind,
     row: Option<(Vec<db::FetchedCell>, Option<String>)>,
     read_back: Option<String>,
+    keyed: bool,
 ) -> Result<Verification, String> {
     let written = sql::generated_writes(engine, statement);
     let Some([one]) = written.as_deref() else {
@@ -2746,7 +2792,7 @@ fn lone_verification(
             read_back,
         }],
         rows: vec![label],
-        keyed: false,
+        keyed,
     })
 }
 
@@ -2781,7 +2827,7 @@ mod tests {
                 &types,
             )
             .expect("the form's INSERT is written");
-            let verify = lone_verification(engine, &insert, StepKind::Insert, None, None)
+            let verify = lone_verification(engine, &insert, StepKind::Insert, None, None, true)
                 .unwrap_or_else(|why| panic!("{engine:?}: {insert}: {why}"));
             assert_eq!(verify.rows, ["new row"]);
 
@@ -2794,6 +2840,7 @@ mod tests {
                 StepKind::Delete,
                 Some((Vec::new(), Some("id = 2".into()))),
                 None,
+                true,
             )
             .unwrap_or_else(|why| panic!("{engine:?}: {delete}: {why}"));
             assert_eq!(verify.steps.len(), 1);
