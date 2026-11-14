@@ -199,6 +199,17 @@ fn on_disk(sql: &str) -> Option<String> {
     }
 }
 
+/// Runs `sql` against `e2e.db` on a connection of its own, as another session
+/// would, so a test changes a row behind a grid that has already read it.
+fn behind_the_grid(sql: &str) {
+    let path = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(path)
+        .and_then(|connection| connection.execute_batch(sql))
+        .expect("the other session's statement applies");
+}
+
 /// The state of the tab in front, whichever kind it is.
 fn front_state(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> QueryState {
     workspace.read_with(cx, |workspace, _| {
@@ -22278,6 +22289,55 @@ fn applying_a_draft_runs_its_deletes_updates_and_inserts_in_one_transaction_and_
             assert_eq!(grid.fetched_rows(), 3, "the table was read again");
         });
         assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session changed after the grid read it is not overwritten:
+/// the apply re-reads it inside its transaction, finds it differs, writes
+/// nothing and says which row.
+#[gpui::test]
+fn a_row_changed_on_the_server_since_it_was_read_applies_nothing_and_is_named_in_the_review(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            )),
+            "the review stays open and names the row"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 1, "the draft is kept");
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite"),
+            "the other session's value stands"
+        );
         quit(workspace, cx);
     });
 }

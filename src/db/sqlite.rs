@@ -220,6 +220,20 @@ impl Connection {
         self.run(sql, false, Fetch::default())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // RED stub: removed with the implementation
+    pub fn apply_verified(
+        &self,
+        _steps: &[super::VerifiedStep],
+        _bracket: super::Bracket,
+        _proceed: &dyn Fn() -> bool,
+    ) -> super::ApplyOutcome {
+        super::ApplyOutcome::Failed {
+            stage: super::ApplyStage::Begin,
+            error: plain_error("not implemented".into()),
+        }
+    }
+
     fn run(&self, sql: &str, editable: bool, fetch: Fetch) -> Result<QueryResult, DbError> {
         // Armed before the lock rather than after it, so time spent queued
         // behind another statement on this connection counts against the limit
@@ -1235,6 +1249,116 @@ mod tests {
         let connection = rusqlite::Connection::open_in_memory().expect("in-memory should open");
         connection.execute_batch(setup).expect("setup should apply");
         Connection::wrap(connection, statement_timeout, false)
+    }
+
+    /// A step of a verified apply as `sql::draft_batch` writes it, over `birds`.
+    fn step(
+        kind: crate::db::StepKind,
+        sql: &str,
+        id: &str,
+        before: &[(&str, Option<&str>)],
+    ) -> crate::db::VerifiedStep {
+        crate::db::VerifiedStep {
+            sql: sql.into(),
+            kind,
+            reread: Some(format!(
+                r#"SELECT * FROM "main"."birds" WHERE "id" = '{id}'"#
+            )),
+            before: before
+                .iter()
+                .map(|(column, text)| crate::db::FetchedCell {
+                    column: (*column).into(),
+                    text: text.map(Into::into),
+                    cell_type: None,
+                    column_type: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn name_of(connection: &Connection, id: i64) -> Option<String> {
+        connection
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("select name from birds where id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .ok()
+    }
+
+    #[test]
+    fn a_verified_sequence_reads_every_row_before_it_writes_any() {
+        use crate::db::{ApplyOutcome, Bracket, Drift, StepKind};
+
+        // The delete of row 1 rewrites row 2 behind it: a row read after that
+        // write would be called changed, which is the draft's own cascade and
+        // not a drift.
+        let setup = "create table birds (id integer primary key, name text not null); \
+                     insert into birds values (1, 'wren'), (2, 'tit'); \
+                     create trigger cascades after delete on birds \
+                     begin update birds set name = 'cascaded' where id = 2; end;";
+        let delete = r#"DELETE FROM "main"."birds" WHERE "id" = '1'"#;
+        let update = r#"UPDATE "main"."birds" SET "name" = 'robin' WHERE "id" = '2'"#;
+        // The manifest of row 2 lists its columns in another order than the table.
+        let steps = |second: &str| {
+            [
+                step(
+                    StepKind::Delete,
+                    delete,
+                    "1",
+                    &[("id", Some("1")), ("name", Some("wren"))],
+                ),
+                step(
+                    StepKind::Update,
+                    update,
+                    "2",
+                    &[("name", Some(second)), ("id", Some("2"))],
+                ),
+            ]
+        };
+
+        let connection = memory(setup);
+        assert_eq!(
+            connection.apply_verified(&steps("tit"), Bracket::Own, &|| true),
+            ApplyOutcome::Applied { affected: 2 }
+        );
+        assert_eq!(name_of(&connection, 1), None);
+        assert_eq!(name_of(&connection, 2).as_deref(), Some("robin"));
+
+        // The second row was changed after it was read: nothing is written, the
+        // first row stays, and the session is left outside a transaction.
+        let connection = memory(setup);
+        assert_eq!(
+            connection.apply_verified(&steps("tit, changed"), Bracket::Own, &|| true),
+            ApplyOutcome::Drifted(vec![(1, Drift::Changed)])
+        );
+        assert_eq!(name_of(&connection, 1).as_deref(), Some("wren"));
+        assert_eq!(name_of(&connection, 2).as_deref(), Some("tit"));
+        assert!(connection.connection.lock().unwrap().is_autocommit());
+
+        // Every drifted row is named, not the first alone.
+        let connection = memory(setup);
+        let mut both = steps("tit, changed");
+        both[0].before[1].text = Some("wren, changed".into());
+        assert_eq!(
+            connection.apply_verified(&both, Bracket::Own, &|| true),
+            ApplyOutcome::Drifted(vec![(0, Drift::Changed), (1, Drift::Changed)])
+        );
+
+        // A row another session deleted is gone, not changed.
+        let connection = memory(setup);
+        connection
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("delete from birds where id = 2")
+            .unwrap();
+        assert_eq!(
+            connection.apply_verified(&steps("tit"), Bracket::Own, &|| true),
+            ApplyOutcome::Drifted(vec![(1, Drift::Gone)])
+        );
+        assert_eq!(name_of(&connection, 1).as_deref(), Some("wren"));
     }
 
     /// The built-in list as the bundled build answers it: every built-in

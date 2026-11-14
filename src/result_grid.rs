@@ -134,6 +134,17 @@ pub type RowKey = (String, String, Vec<(String, String)>, Vec<String>);
 /// row named by every value that were NULL.
 type KeyValues = (Vec<(String, String)>, Vec<String>);
 
+/// Which row of the grid a statement of the draft's batch is written for, in the
+/// order [`crate::sql::draft_batch`] writes them.
+#[cfg(test)]
+#[allow(dead_code)] // RED stub: removed with the implementation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DraftRow {
+    Marked(usize),
+    Updated(usize),
+    Added(usize),
+}
+
 /// A grid's schema and table, and the columns a new row of it fills as
 /// column/type pairs — what the New row form is built from.
 pub type InsertTarget = (String, String, Vec<(String, String)>);
@@ -2648,6 +2659,24 @@ impl ResultGrid {
                 })
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // RED stub: removed with the implementation
+    pub(crate) fn draft_order(&self) -> Vec<DraftRow> {
+        Vec::new()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // RED stub: removed with the implementation
+    pub(crate) fn row_label(&self, _row: usize) -> Option<String> {
+        None
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // RED stub: removed with the implementation
+    pub(crate) fn fetched_cells(&self, _row: usize) -> Vec<db::FetchedCell> {
+        Vec::new()
     }
 
     /// Each edit target column's real name against the type the result gave
@@ -7467,6 +7496,141 @@ mod tests {
             ],
         );
         assert_eq!(mysql, ["id"]);
+    }
+
+    #[test]
+    fn the_draft_order_names_each_statement_of_the_batch_in_turn() {
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("7".into()), Some("first".into())],
+                    vec![Some("8".into()), Some("second".into())],
+                    vec![Some("9".into()), Some("third".into())],
+                    vec![Some("10".into()), None],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("body".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        // Staged in an order that is not the grid's.
+        assert!(grid.toggle_marks(&[3]));
+        assert!(grid.toggle_marks(&[1]));
+        assert!(grid.set_pending(2, 1, NewValue::Value("edited".into())));
+        assert!(grid.set_pending(0, 1, NewValue::Value("also".into())));
+        assert_eq!(grid.add_row(), Some(4));
+        assert!(grid.set_pending(4, 1, NewValue::Value("new".into())));
+
+        let order = grid.draft_order();
+        let id = |row: usize| ["7", "8", "9", "10"][row];
+        let deletes: Vec<_> = grid
+            .draft_deletes()
+            .iter()
+            .map(|delete| delete.keys[0].1.clone())
+            .collect();
+        let updates: Vec<_> = grid
+            .pending_updates()
+            .iter()
+            .map(|update| update.keys[0].1.clone())
+            .collect();
+        let marked: Vec<usize> = order
+            .iter()
+            .filter_map(|row| match row {
+                DraftRow::Marked(row) => Some(*row),
+                _ => None,
+            })
+            .collect();
+        let updated: Vec<usize> = order
+            .iter()
+            .filter_map(|row| match row {
+                DraftRow::Updated(row) => Some(*row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marked.iter().map(|&row| id(row)).collect::<Vec<_>>(),
+            deletes,
+            "each mark is the row its DELETE names"
+        );
+        assert_eq!(
+            updated.iter().map(|&row| id(row)).collect::<Vec<_>>(),
+            updates,
+            "each edited row is the row its UPDATE names"
+        );
+        assert_eq!(updated, [2, 0], "in the order the rows were first edited");
+        assert_eq!(marked.len(), 2);
+        let mut sequence = order.iter();
+        for row in &marked {
+            assert_eq!(sequence.next(), Some(&DraftRow::Marked(*row)));
+        }
+        for row in &updated {
+            assert_eq!(sequence.next(), Some(&DraftRow::Updated(*row)));
+        }
+        assert_eq!(sequence.next(), Some(&DraftRow::Added(0)));
+        assert_eq!(sequence.next(), None);
+        assert_eq!(
+            order.len(),
+            deletes.len() + updates.len() + grid.draft_inserts().unwrap().len()
+        );
+
+        assert_eq!(grid.row_label(0).as_deref(), Some("id = 7"));
+        assert_eq!(grid.row_label(4), None, "an added row has no key");
+    }
+
+    #[test]
+    fn a_fetched_row_is_copied_by_real_column_name_and_a_row_is_named_by_its_key() {
+        let grid = editable_grid();
+        let cells = grid.fetched_cells(1);
+        assert_eq!(
+            cells
+                .iter()
+                .map(|cell| (cell.column.as_str(), cell.text.as_deref()))
+                .collect::<Vec<_>>(),
+            [("id", Some("8")), ("body", Some("second"))],
+            "the computed column is not in it, the alias is the real name"
+        );
+        assert!(grid.fetched_cells(9).iter().all(|cell| cell.text.is_none()));
+
+        let mut keyless = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("a"), column("b"), column("c"), column("d")],
+                rows: rows(vec![vec![
+                    Some("1".into()),
+                    None,
+                    Some("3".into()),
+                    Some("4".into()),
+                ]]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "t".into(),
+                    columns: vec![
+                        Some("a".into()),
+                        Some("b".into()),
+                        Some("c".into()),
+                        Some("d".into()),
+                    ],
+                    keys: vec![0, 1, 2, 3],
+                    row_match: db::RowMatch::EveryColumn { fixed: Vec::new() },
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert_eq!(
+            keyless.row_label(0).as_deref(),
+            Some("a = 1, b IS NULL, c = 3, \u{2026}"),
+            "at most three terms, then an ellipsis"
+        );
+        keyless.result.edit.as_mut().unwrap().keys = vec![1];
+        assert_eq!(keyless.row_label(0).as_deref(), Some("b IS NULL"));
     }
 
     #[test]
