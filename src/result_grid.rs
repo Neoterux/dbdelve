@@ -329,6 +329,11 @@ pub struct ResultGrid {
     /// The row whose send the server refused, and what it said, until that row
     /// is edited, reverted or sent.
     send_failure: Option<(usize, String)>,
+    /// Set when `COMMIT` of an apply was sent and its answer was lost: whether
+    /// the draft landed is not known. Only a read of the rows from the server
+    /// clears it, and that replaces the grid whole (a new grid is never
+    /// marked); a sort in memory and a discarded draft read nothing.
+    outcome_unknown: bool,
     /// When these rows were snapshotted, for a grid that came off disk.
     ///
     /// Held here rather than on the tab because a completed run replaces the
@@ -606,6 +611,7 @@ impl ResultGrid {
             left_row: None,
             closed_input: None,
             send_failure: None,
+            outcome_unknown: false,
             captured: None,
             streamed: None,
             filled: None,
@@ -1949,10 +1955,14 @@ impl ResultGrid {
         self.send_failure = Some((row, message));
     }
 
-    pub(crate) fn mark_outcome_unknown(&mut self) {}
+    /// Records that whether the last apply reached the server is not known,
+    /// so nothing is sent from this grid again before its rows are read.
+    pub(crate) fn mark_outcome_unknown(&mut self) {
+        self.outcome_unknown = true;
+    }
 
     pub(crate) fn outcome_unknown(&self) -> bool {
-        false
+        self.outcome_unknown
     }
 
     /// `sort_in_memory` for rows a snapshot restored already in `keys`' order.

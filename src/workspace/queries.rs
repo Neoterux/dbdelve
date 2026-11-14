@@ -2259,12 +2259,23 @@ impl Workspace {
             && verification
                 .as_ref()
                 .is_some_and(|verify| !verify.may_join());
-        let refusal = edit
-            .then(|| match &binding {
-                Some(binding) => profile.bound_write_refusal(binding),
-                None => profile.own_write_refusal(&sql),
+        // A review that was open when a `COMMIT` went unanswered still holds
+        // its draft, and running it again could write it twice. A run with no
+        // verification is a read of the rows, which is what clears the mark.
+        let outcome_unknown = verification.is_some()
+            && profile
+                .session
+                .results(tab)
+                .is_some_and(|results| results.read(cx).delegate().outcome_unknown());
+        let refusal = outcome_unknown
+            .then(|| super::editing::OUTCOME_UNKNOWN_REFUSAL.to_string())
+            .or_else(|| {
+                edit.then(|| match &binding {
+                    Some(binding) => profile.bound_write_refusal(binding),
+                    None => profile.own_write_refusal(&sql),
+                })
+                .flatten()
             })
-            .flatten()
             .or_else(|| unfit_to_join.then(|| DRAFT_IN_TRANSACTION.into()))
             .or_else(|| {
                 unverified.then(|| "dbdelve refused to send an edit it could not verify.".into())
@@ -2747,6 +2758,9 @@ impl Workspace {
             // A verified Row send's row, read inside the transaction that
             // wrote it.
             let mut verified_read = None;
+            // A verified apply whose `COMMIT` has no answer: the grid is
+            // marked when this lands.
+            let mut unknown = false;
             let result = match (&verification, generated, alongside, binding.as_ref()) {
                 // A reviewed draft, or a Row send, of a target that verifies an
                 // apply: its rows read again and compared inside one
@@ -2765,6 +2779,7 @@ impl Workspace {
                     if let ApplyOutcome::Applied { read_back, .. } = &mut outcome {
                         verified_read = read_back.take().map(|rows| Ok(*rows));
                     }
+                    unknown = matches!(outcome, ApplyOutcome::Unknown(_));
                     verified_result(outcome, verify)
                 }
                 // An edit applied from a bound tab's grid belongs to its
@@ -2808,7 +2823,7 @@ impl Workspace {
             // says nothing about the profile's.
             let failed = result.is_err() || matches!(read_back, Some(Err(_)));
             let lost = !alongside && failed && connection.is_lost();
-            (result, lost, read_back)
+            (result, lost, read_back, unknown)
         };
         let number = crate::logging::connection_number(&id);
         // The database to open a session for, when none is open for it.
@@ -2870,11 +2885,11 @@ impl Workspace {
             // Blocks for as long as the server takes, and statements queued
             // behind it on the same session block on its lock, so none of them
             // may hold one of the executor's threads (`spawn_blocking`).
-            let (result, lost, read_back) = match ready {
+            let (result, lost, read_back, unknown) = match ready {
                 Ok(connection) => {
                     spawn_blocking(cx.background_executor(), move || work(connection)).await
                 }
-                Err(error) => (Err(error), false, None),
+                Err(error) => (Err(error), false, None, false),
             };
             // Outcome and duration only. Not even at debug the server's text:
             // some engines quote the statement back in a syntax error.
@@ -3060,6 +3075,14 @@ impl Workspace {
                             }
                             result => result,
                         };
+                        // Marked whichever way the landing goes: the draft may
+                        // have landed, and the grid says so until its rows are
+                        // read again.
+                        if unknown {
+                            results.update(cx, |table, _| {
+                                table.delegate_mut().mark_outcome_unknown()
+                            });
+                        }
                         match result {
                             // An `EXPLAIN` describes a statement rather than
                             // returning its rows, so nothing here reaches the
@@ -4246,8 +4269,7 @@ fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<Query
             rows_affected: Some(affected),
             ..QueryResult::default()
         }),
-        // Whether `COMMIT` landed is not known, so nothing is said of it here.
-        ApplyOutcome::Failed { error, .. } | ApplyOutcome::Unknown(error) => Err(error),
+        ApplyOutcome::Failed { error, .. } => Err(error),
         refused => Err(DbError {
             message: verified_message(&refused, verify).unwrap_or_default(),
             position: None,
@@ -4257,8 +4279,10 @@ fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<Query
 
 /// What the review says of a verified apply that wrote nothing, naming the
 /// rows: `Nothing was applied.` and then one sentence for each row that is not
-/// the row that was read. `None` for an outcome that carries no such sentence,
-/// the write that landed and the errors a driver words itself.
+/// the row that was read. A `COMMIT` whose answer was lost is said as that
+/// alone, since nothing is known of what it did. `None` for an outcome that
+/// carries no such sentence, the write that landed and the errors a driver
+/// words itself.
 fn verified_message(outcome: &ApplyOutcome, verify: &Verification) -> Option<String> {
     let row = |step: usize| verify.rows.get(step).map_or("?", String::as_str);
     let sentences: Vec<String> = match outcome {
@@ -4291,9 +4315,14 @@ fn verified_message(outcome: &ApplyOutcome, verify: &Verification) -> Option<Str
                 step + 1
             )]
         }
-        ApplyOutcome::Applied { .. } | ApplyOutcome::Failed { .. } | ApplyOutcome::Unknown(_) => {
-            return None;
+        ApplyOutcome::Unknown(_) => {
+            return Some(
+                "The connection was lost during COMMIT; whether the changes were applied is not \
+                 known."
+                    .into(),
+            );
         }
+        ApplyOutcome::Applied { .. } | ApplyOutcome::Failed { .. } => return None,
     };
     Some(format!("Nothing was applied. {}", sentences.join(" ")))
 }
