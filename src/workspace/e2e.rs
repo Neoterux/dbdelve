@@ -23700,6 +23700,244 @@ fn an_added_row_is_inserted_by_apply_draft_and_the_draft_clears(cx: &mut TestApp
     });
 }
 
+/// Adds a row to the table in front and types its id and name.
+fn add_bird(grid: &Grid, cx: &mut VisualTestContext, id: &str, name: &str) {
+    use crate::result_grid::NewValue;
+
+    cx.dispatch_action(crate::actions::NewRow);
+    settle(cx);
+    let row = grid.read_with(cx, |table, _| {
+        table.delegate().fetched_rows() + table.delegate().added_count() - 1
+    });
+    stage(grid, cx, row, 0, NewValue::Value(id.to_string().into()));
+    stage(grid, cx, row, 1, NewValue::Value(name.to_string().into()));
+}
+
+/// Brings the query tab forward, runs `sql` in it, and returns to relation tab
+/// `id`.
+fn run_in_query_tab_then_return(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    id: u64,
+    sql: &str,
+) {
+    let query = workspace.read_with(cx, |workspace, _| {
+        Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate_tab(query, window, cx)
+    });
+    settle(cx);
+    run_in_front(workspace, cx, sql);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate_tab(Tab::Object(id), window, cx)
+    });
+    settle(cx);
+}
+
+/// A statement that fails inside a transaction the user opened leaves that
+/// transaction open on SQLite, with the draft's inserts before it applied in
+/// it and committed with it, so an inserting draft of more than one statement
+/// is not written there.
+#[gpui::test]
+fn a_draft_with_inserts_is_refused_inside_an_open_transaction_on_sqlite(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        add_bird(&grid, cx, "3", "robin");
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "nothing is shown");
+        let notice = shown_notice(&workspace, cx).expect("the refusal is on the status line");
+        assert!(
+            notice.starts_with("The draft was not applied: a transaction is open"),
+            "{notice}"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 2, "the draft is kept");
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().in_transaction);
+        });
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 2, "still staged");
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("BEGIN;"), "{sql}");
+        quit(workspace, cx);
+    });
+}
+
+/// What the refusal is about is a statement that fails half way: a draft of
+/// one statement has no half, and one of updates only is what a joined apply
+/// has always been.
+#[gpui::test]
+fn an_update_only_draft_still_joins_the_open_transaction(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        settle(cx);
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 0)
+        });
+        add_bird(&grid, cx, "3", "robin");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("INSERT INTO"), "{sql}");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+        quit(workspace, cx);
+    });
+}
+
+/// A sort in memory moves the fetched rows while the apply is out. The draft
+/// it sent is cleared whole, so no `INSERT` is left staged to be sent twice,
+/// and the table is read again.
+#[gpui::test]
+fn a_draft_sorted_in_memory_while_its_apply_is_out_is_cleared_whole_and_read_again(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        add_bird(&grid, cx, "3", "robin");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Running { .. }
+        ));
+        let before = grid.read_with(cx, |table, _| table.delegate().rows_id());
+        grid.update(cx, |table, _| {
+            table.delegate_mut().sort_in_memory(vec![(1, false)])
+        });
+        assert_ne!(
+            grid.read_with(cx, |table, _| table.delegate().rows_id()),
+            before
+        );
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 0);
+            assert_eq!(table.delegate().fetched_rows(), 3, "read again");
+        });
+        assert_ne!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(
+                "The change was applied. The rows were not read again: this tab has unapplied edits."
+            )
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A second Run while the first is out is the same `INSERT` twice, which the
+/// tab's one-run-at-a-time guard refuses.
+#[gpui::test]
+fn a_second_run_while_an_added_rows_insert_is_out_sends_nothing_more(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        // Only the name is typed: the id is the server's, so a second INSERT
+        // would succeed and add a second row, which is what the count sees.
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        stage(
+            &grid,
+            cx,
+            2,
+            1,
+            crate::result_grid::NewValue::Value("robin".into()),
+        );
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Running { .. }
+        ));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("3"),
+            "one row added, not two"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where name = 'robin'").as_deref(),
+            Some("1"),
+            "inserted once"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 0);
+        });
+        assert_eq!(front_review(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
 fn grid_holds_keyboard(grid: &Grid, cx: &mut VisualTestContext) -> bool {
     cx.update(|window, cx| {
         use gpui::Focusable;
