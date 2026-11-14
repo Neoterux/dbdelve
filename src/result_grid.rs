@@ -1913,22 +1913,14 @@ impl ResultGrid {
         self.left_row.take()
     }
 
-    /// Stage, once, the text of the input a ring move closed, by the rule Enter
-    /// commits with ([`Self::commit_text`]), and a mode that refuses the write
-    /// stages nothing and says nothing, as the Row path always did.
-    ///
-    /// Text equal to the seed is nothing typed, on every row: a click away is
-    /// not the deliberate gesture Enter is, and a NULL or a staged keyword seeds
-    /// empty, so staging the seed would write `''` over it.
+    /// Stage, once, the text of the input a ring move closed, by the rule every
+    /// close commits with ([`Self::commit_text`]), and a mode that refuses the
+    /// write stages nothing and says nothing, as the Row path always did.
     pub(crate) fn commit_closed_input(&mut self, cx: &App) {
         let Some((row, col, input)) = self.closed_input.take() else {
             return;
         };
-        let text = input.read(cx).value().clone();
-        if &*text == self.edit_seed(row, col) {
-            return;
-        }
-        self.commit_text(row, col, text);
+        self.commit_text(row, col, input.read(cx).value().clone());
     }
 
     /// The row whose send the server refused and the words it said, drawn on
@@ -2776,11 +2768,17 @@ impl ResultGrid {
     /// Take `text`, what an input opened on the cell holds, into the draft.
     /// `false` when the mode refused the write.
     ///
-    /// On an added row, text equal to what the input was seeded with is
-    /// nothing typed: an untouched cell seeds empty, and writing that back would
-    /// put `''` in the `INSERT` over the server's default.
+    /// Every close of a cell's input commits by this rule: Enter; Tab,
+    /// Shift-Tab, Up and Down through [`commit_and_step`]; a Row view's edge
+    /// key through `Workspace::step_past_edge`; a click away through
+    /// [`Self::commit_closed_input`]. Text equal to what the input was seeded
+    /// with is nothing typed, on every row: a NULL, a staged NULL or DEFAULT and
+    /// an added row's untouched cell all seed empty, and writing that back would
+    /// put `''` over them or in the `INSERT` over the server's default. Nothing
+    /// staged asks nothing of the mode. The empty string over a NULL is
+    /// `SetEmpty`'s, which stages through [`Self::set_pending`] and not here.
     fn commit_text(&mut self, row: usize, col: usize, text: SharedString) -> bool {
-        if self.added_index(row).is_some() && &*text == self.edit_seed(row, col) {
+        if &*text == self.edit_seed(row, col) {
             return true;
         }
         self.set_pending(row, col, NewValue::Value(text))
@@ -5665,10 +5663,10 @@ mod tests {
     #[test]
     fn the_empty_string_over_a_null_is_an_edit() {
         // It was not, while the two were the same three characters of SQL.
-        // What now keeps an untouched input on a NULL from writing an empty
-        // string over it is the editor -- `begin_edit` is a deliberate gesture
-        // and `cancel_edit` records nothing -- not `set_pending`, which can no
-        // longer tell a typed empty string from a seeded one and must not try.
+        // What keeps an untouched input on a NULL from writing an empty string
+        // over it is `commit_text`'s seed rule, on every row, not `set_pending`,
+        // which cannot tell a typed empty string from a seeded one and must not
+        // try: it records the empty string over a NULL, as `SetEmpty` needs.
         let mut grid = grid_with_a_null();
 
         assert!(grid.set_pending(0, 1, value("")));

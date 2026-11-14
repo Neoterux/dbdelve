@@ -898,8 +898,9 @@ impl Workspace {
     }
 
     /// The empty string, which is a different write from a `NULL` and the one
-    /// an input cannot produce: committing an emptied input on a cell that came
-    /// back empty is the no-op `set_pending` drops.
+    /// an input cannot produce: an input closed as it opened records nothing
+    /// (`ResultGrid::commit_text`), and a NULL or a staged keyword opens empty,
+    /// so this action is the one way to write the empty string over them.
     pub(crate) fn set_empty(&mut self, _: &SetEmpty, window: &mut Window, cx: &mut Context<Self>) {
         self.stage_value(NewValue::Value(gpui::SharedString::default()), window, cx);
     }
