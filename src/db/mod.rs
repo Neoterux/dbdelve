@@ -641,33 +641,6 @@ impl Engine {
                 .contains("no transaction is active")
     }
 
-    /// Whether a statement that fails inside a transaction the user opened
-    /// leaves that transaction open, with the statements before it still
-    /// applied in it.
-    ///
-    /// MySQL, MariaDB and SQLite do, whatever the server is set to:
-    /// `innodb_rollback_on_timeout` covers a lock-wait timeout only, and a
-    /// duplicate key or a constraint rolls back the failing statement alone.
-    /// Postgres and DuckDB abort the whole transaction, and SQL Server, where
-    /// dbdelve's generated SQL runs with `XACT_ABORT ON`, rolls all of it back.
-    /// The engines that are not row-edit targets answer false: nothing asks
-    /// them. An explicit arm per engine for the reason
-    /// [`Engine::transaction_start`] has one.
-    pub fn keeps_failed_transaction_open(self) -> bool {
-        match self {
-            Self::MySql | Self::MariaDb | Self::Sqlite => true,
-            Self::Postgres
-            | Self::Turso
-            | Self::DuckDb
-            | Self::Snowflake
-            | Self::ClickHouse
-            | Self::SqlServer
-            | Self::MongoDb
-            | Self::Redis
-            | Self::Generic => false,
-        }
-    }
-
     /// Whether a connection to this engine verifies an apply: has an arm of
     /// [`Connection::apply_verified`]. An explicit arm per engine for the reason
     /// [`Engine::transaction_start`] has one: the engines without one keep
@@ -4016,7 +3989,9 @@ pub(crate) enum Bracket {
     /// its `COMMIT`.
     Own,
     /// The user's own is open on the session: nothing is opened, committed or
-    /// rolled back, so the writes stay in it for the user to end.
+    /// rolled back, so the write stays in it for the user to end. Only one step
+    /// joins, and it names its row by its primary key, so its count is one or
+    /// none and a none wrote nothing; a sequence of several is refused.
     Joined,
 }
 
@@ -4133,7 +4108,8 @@ pub(crate) fn drift(
 /// Under [`Bracket::Own`] it opens the engine's own transaction
 /// ([`Engine::begins_transaction`]) and every exit before `COMMIT` sends
 /// `ROLLBACK`, so nothing it opened stays half applied. Under
-/// [`Bracket::Joined`] it sends no `BEGIN`, `COMMIT` or `ROLLBACK`.
+/// [`Bracket::Joined`] it sends no `BEGIN`, `COMMIT` or `ROLLBACK`, and refuses
+/// more than one step.
 ///
 /// Every statement is gated again here, whoever built the steps: each write by
 /// [`crate::sql::is_generated_write_on`] as the one statement it must be, and
@@ -4166,6 +4142,13 @@ pub(super) fn run_verified(
     };
     if steps.is_empty() {
         return refused("There are no statements to apply.");
+    }
+    // Rolling several writes back would end the transaction they joined, so
+    // only one joins. The sentence is `session::DRAFT_IN_TRANSACTION`'s, which
+    // the caller refuses with before it gets here; this is the apply's own
+    // check that does not rely on it.
+    if bracket == Bracket::Joined && steps.len() > 1 {
+        return refused("A transaction is open on this connection; the draft was not applied.");
     }
     for step in steps {
         let writes_one = matches!(
@@ -5263,9 +5246,7 @@ mod tests {
             outcome,
             ApplyOutcome::Failed {
                 stage: ApplyStage::Begin,
-                error: plain_error(
-                    "A transaction is open on this connection; the draft was not applied.".into()
-                ),
+                error: plain_error(crate::session::DRAFT_IN_TRANSACTION.into()),
             }
         );
         assert_eq!(
@@ -5548,17 +5529,6 @@ mod tests {
         ] {
             assert!(
                 !engine.failed_end_keeps_transaction("could not commit"),
-                "{engine:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_mysql_mariadb_and_sqlite_keep_a_failed_transaction_open() {
-        for engine in Engine::ALL {
-            assert_eq!(
-                engine.keeps_failed_transaction_open(),
-                matches!(engine, Engine::MySql | Engine::MariaDb | Engine::Sqlite),
                 "{engine:?}"
             );
         }

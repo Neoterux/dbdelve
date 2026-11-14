@@ -7,7 +7,9 @@ use super::*;
 use crate::actions::StepPastEdge;
 use crate::db::{StepKind, VerifiedStep};
 use crate::result_grid::DraftRow;
-use crate::session::{AfterEdits, ReviewSlot, StaleEdit, StaleResume, Verification, refreshing};
+use crate::session::{
+    AfterEdits, DRAFT_IN_TRANSACTION, ReviewSlot, StaleEdit, StaleResume, Verification, refreshing,
+};
 
 impl Workspace {
     /// Open the "Insert" form over the preview in front, one field per column
@@ -1864,15 +1866,10 @@ impl Workspace {
         let Some(pending) = pending else {
             return false;
         };
-        // As `apply_edits` chooses: a bound tab's edit is refused outright
-        // while its session holds a transaction, and on the connection's own
-        // session the edit joins the user's open one.
-        let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
-        let written = match joins {
-            true => sql::update_batch_joining(self.engine(), &[pending]),
-            false => update_batch(self.engine(), &[pending]),
-        };
-        let update = match written {
+        // One row is one statement, which carries no bracket of its own, so on
+        // the connection's own session it joins the user's open transaction as
+        // it stands.
+        let update = match update_batch(self.engine(), &[pending]) {
             Ok(update) => update,
             Err(message) => {
                 self.note(message, cx);
@@ -2180,7 +2177,8 @@ impl Workspace {
         let own_review = profile.session.apply_review_covers(tab);
         // A bound tab's edit is refused outright while its session holds a
         // transaction (`Profile::bound_write_refusal`); on the connection's own
-        // session the edit joins the user's open one, as a single row's does.
+        // session a single write joins the user's open one, as a single row's
+        // does, and a draft of several is refused.
         let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
         // A draft holding an added row or a marked one is written by the
         // draft's own writer, for a relation tab alone: only there can a row be
@@ -2190,13 +2188,13 @@ impl Workspace {
             return;
         }
         let pending = results.read(cx).delegate().pending_updates();
+        if joins && pending.len() > 1 {
+            self.note(DRAFT_IN_TRANSACTION.into(), cx);
+            return;
+        }
         // Nothing partial runs: a batch missing one of its rows is not the
         // change the user made.
-        let written = match joins {
-            true => sql::update_batch_joining(self.engine(), &pending),
-            false => update_batch(self.engine(), &pending),
-        };
-        let batch = match written {
+        let batch = match update_batch(self.engine(), &pending) {
             Ok(batch) => batch,
             Err(message) => {
                 self.note(message, cx);
@@ -2306,20 +2304,11 @@ impl Workspace {
             return;
         };
         // Before anything is written, so nothing is generated or reviewed for a
-        // draft that would not run whole. Inside a transaction the user opened,
-        // a statement that fails leaves that transaction open on an engine
-        // that keeps it, and the inserts before it stay applied in it to be
-        // committed with it; the draft is kept for when the transaction ends.
-        // A draft of one statement has no part before it, and an update-only
-        // draft joins as it always has.
-        let statements = deletes.len() + updates.len() + inserts.len();
-        if joins && statements > 1 && engine.keeps_failed_transaction_open() {
-            self.note(
-                "The draft was not applied: a transaction is open on this connection, where a \
-                 statement that fails leaves the inserts before it applied."
-                    .into(),
-                cx,
-            );
+        // draft that would not run whole. Rolling several statements back when
+        // one fails would end the transaction the user opened, so inside it
+        // only one joins; the draft is kept for when the transaction ends.
+        if joins && deletes.len() + updates.len() + inserts.len() > 1 {
+            self.note(DRAFT_IN_TRANSACTION.into(), cx);
             return;
         }
         let batch = match sql::draft_batch(engine, &deletes, &updates, &inserts, !joins) {

@@ -7,9 +7,7 @@ use std::ops::Range;
 
 use gpui_component::table::TableState;
 
-use crate::db::{
-    ApplyOutcome, ApplyStage, Bracket, Drift, Feed, Fetch, QueryResult, Row, StepKind, Stopped,
-};
+use crate::db::{ApplyOutcome, Bracket, Drift, Feed, Fetch, QueryResult, Row, StepKind, Stopped};
 use crate::result_grid::{ColumnView, ColumnWidth};
 
 use super::*;
@@ -2607,7 +2605,6 @@ impl Workspace {
         // An edit dbdelve applies on the connection's own session runs inside
         // the user's open transaction and is committed or rolled back with it,
         // so the prompt that ends it lists it. Its reads stay out.
-        let mut joined_batch = false;
         // Whether a Row send runs inside the user's open transaction, which a
         // ROLLBACK would undo under a grid that shows it as saved.
         let mut joined_row = false;
@@ -2619,15 +2616,6 @@ impl Workspace {
         {
             profile.record_sent(&sql, None);
             joined_row = row_sent.is_some() && profile.in_transaction;
-            // Without brackets of its own it is not all-or-nothing: on an
-            // engine where a failed statement leaves the transaction open,
-            // the rows before the failure stay in it.
-            // A verified run says so itself, by the step that failed
-            // (`verified_result`).
-            joined_batch = verification.is_none()
-                && profile.in_transaction
-                && engine.transaction_start().is_some()
-                && sql::Buffer::for_engine(engine, &sql).statements().len() > 1;
         }
         // A plan is never cut short: its rows are the plan, not data.
         let limit = match tab {
@@ -2769,7 +2757,7 @@ impl Workspace {
                     if let ApplyOutcome::Applied { read_back, .. } = &mut outcome {
                         verified_read = read_back.take().map(|rows| Ok(*rows));
                     }
-                    verified_result(outcome, verify, bracket)
+                    verified_result(outcome, verify)
                 }
                 // An edit applied from a bound tab's grid belongs to its
                 // database whichever way the session has been moved.
@@ -3285,17 +3273,10 @@ impl Workspace {
                             }
                             // Rows and edits stay and the tab is as it was; the
                             // message is said where the statement is.
-                            Err(mut error) if kept => {
+                            Err(error) if kept => {
                                 let landed = recorded.as_ref().map(|entry| {
                                     entry.failed(&error, started.elapsed(), cancel_landed)
                                 });
-                                if joined_batch {
-                                    error.message.push_str(
-                                        " Rows of the batch before the failed one were applied \
-                                         inside the open transaction and stay in it, to be \
-                                         committed or rolled back with it.",
-                                    );
-                                }
                                 if let Some(previous) = restored {
                                     *state = previous;
                                 }
@@ -3351,13 +3332,6 @@ impl Workspace {
                                 error.position = error
                                     .position
                                     .and_then(|position| position.checked_sub(prefix));
-                                if joined_batch {
-                                    error.message.push_str(
-                                        " Rows of the batch before the failed one were applied \
-                                         inside the open transaction and stay in it, to be \
-                                         committed or rolled back with it.",
-                                    );
-                                }
                                 *state = match restored {
                                     Some(previous) if cancelled => previous,
                                     _ => QueryState::Failed(error),
@@ -4258,48 +4232,18 @@ fn pour(
 
 /// What a verified apply's outcome is to the run that sent it: the write's own
 /// answer, or the error the landing shows where the statement is.
-///
-/// Under a transaction of the user's nothing is rolled back, so the writes
-/// before the statement that failed stay in it, which the error says.
-fn verified_result(
-    outcome: ApplyOutcome,
-    verify: &Verification,
-    bracket: Bracket,
-) -> Result<QueryResult, DbError> {
-    let stays = |step: usize| bracket == Bracket::Joined && step > 0;
-    let partial = |message: &mut String| {
-        message.push_str(
-            " Rows of the batch before the failed one were applied inside the open \
-             transaction and stay in it, to be committed or rolled back with it.",
-        )
-    };
+fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<QueryResult, DbError> {
     match outcome {
         ApplyOutcome::Applied { affected, .. } => Ok(QueryResult {
             rows_affected: Some(affected),
             ..QueryResult::default()
         }),
-        ApplyOutcome::Failed { stage, mut error } => {
-            if let ApplyStage::Write(step) = stage
-                && stays(step)
-            {
-                partial(&mut error.message);
-            }
-            Err(error)
-        }
         // Whether `COMMIT` landed is not known, so nothing is said of it here.
-        ApplyOutcome::Unknown(error) => Err(error),
-        refused => {
-            let mut message = verified_message(&refused, verify).unwrap_or_default();
-            if let ApplyOutcome::Miscounted { step, .. } = refused
-                && stays(step)
-            {
-                partial(&mut message);
-            }
-            Err(DbError {
-                message,
-                position: None,
-            })
-        }
+        ApplyOutcome::Failed { error, .. } | ApplyOutcome::Unknown(error) => Err(error),
+        refused => Err(DbError {
+            message: verified_message(&refused, verify).unwrap_or_default(),
+            position: None,
+        }),
     }
 }
 

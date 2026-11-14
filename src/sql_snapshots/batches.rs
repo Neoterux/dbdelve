@@ -631,11 +631,6 @@ fn a_row_sends_update_is_one_gated_statement_wherever_row_mode_is_offered() {
             let at = format!("{engine:?} {case}");
             let text = sql::update_batch(engine, &row).unwrap_or_else(|why| panic!("{at}: {why}"));
             assert_eq!(
-                sql::update_batch_joining(engine, &row).as_deref(),
-                Ok(text.as_str()),
-                "{at}: one row is bracketed by neither writer"
-            );
-            assert_eq!(
                 sql::Buffer::for_engine(engine, &text).statements().len(),
                 1,
                 "{at}: {text}"

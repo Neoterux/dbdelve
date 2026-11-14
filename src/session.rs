@@ -411,40 +411,28 @@ impl Profile {
 
     /// Why an edit of dbdelve's is not sent on the connection's own session.
     ///
-    /// A transaction of the user's is open and the batch brackets itself
-    /// (`sql::update_batch` on MySQL, MariaDB, SQLite and SQL Server), so its
-    /// `COMMIT` would end the user's -- and on MySQL and MariaDB its opening
-    /// `START TRANSACTION` would commit it first. A single statement carries
-    /// no bracket and joins the transaction, as the user's own would.
-    ///
-    /// Or none is open and the batch was written to join one
-    /// (`sql::update_batch_joining`): its statements would each commit on
-    /// their own, and a failure on row N would leave rows 1..N-1 committed,
-    /// the outcome the brackets exist to rule out.
+    /// A transaction of the user's is open, and inside it exactly one write
+    /// joins: a single statement carries no bracket and runs as the user's own
+    /// would. A submission of several is refused on every engine, whether it
+    /// brackets itself (its `COMMIT` would end the user's transaction, and on
+    /// MySQL and MariaDB its opening `START TRANSACTION` would commit it first)
+    /// or not (rolling a draft back when a statement fails would end the user's
+    /// transaction too, and a savepoint cannot pass the gate). A review written
+    /// before the transaction opened is caught here, at Run.
     pub(crate) fn own_write_refusal(&self, sql: &str) -> Option<String> {
-        let engine = self.config.engine();
-        let ends = crate::sql::ends_transaction(engine, sql);
-        if self.in_transaction && ends {
-            return Some(
-                "Not sent: a transaction is open on this connection, and the batch of edits \
-                 would end it with a COMMIT of its own."
-                    .into(),
-            );
+        if !self.in_transaction {
+            return None;
         }
-        // A batch opening with its own bracket is one the parse above could
-        // not read the end of, not one written to join.
-        let bracketed = engine
-            .transaction_start()
-            .is_none_or(|opening| sql.trim_start().starts_with(opening));
+        let engine = self.config.engine();
+        // The grammar reads `BEGIN; …; COMMIT` as one statement, so a batch
+        // that brackets itself is counted by its brackets: they are written
+        // only round more than one.
         let several = crate::sql::Buffer::for_engine(engine, sql)
             .statements()
             .len()
-            > 1;
-        (!self.in_transaction && !ends && !bracketed && several).then(|| {
-            "Not sent: no transaction is open on this connection, and the batch of edits \
-             was written to join one."
-                .into()
-        })
+            > 1
+            || crate::sql::ends_transaction(engine, sql);
+        several.then(|| DRAFT_IN_TRANSACTION.into())
     }
 
     /// The connection a Cancel for `tab` is sent over: the session its
@@ -861,6 +849,13 @@ pub(crate) struct Session {
     pub(crate) structure_requests: HashMap<u64, u64>,
     pub(crate) last_structure_request: u64,
 }
+
+/// What an apply of more than one statement is refused with while a
+/// transaction the user opened is open on the connection, at review and at Run
+/// alike. Rolling the draft back when a statement fails would end the user's
+/// transaction.
+pub(crate) const DRAFT_IN_TRANSACTION: &str =
+    "A transaction is open on this connection; the draft was not applied.";
 
 /// A generated statement waiting to be read and run.
 pub(crate) struct ApplyReview {
