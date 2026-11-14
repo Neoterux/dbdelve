@@ -5339,5 +5339,146 @@ mod tests {
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
     );
+
+    /// Drops a scratch table when a test ends, panicking or not.
+    struct ScratchTable<'a>(&'a crate::db::Connection, &'static str);
+
+    impl ScratchTable<'_> {
+        fn drop_all(&self) {
+            let _ = self.0.query(
+                &format!("DROP TABLE IF EXISTS dbo.{}", self.1),
+                &crate::db::CancelToken::default(),
+                Fetch::default(),
+            );
+        }
+    }
+
+    impl Drop for ScratchTable<'_> {
+        fn drop(&mut self) {
+            self.drop_all();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through dbdelve_MSSQL_URL"]
+    fn live_each_write_of_a_verified_sequence_is_counted_apart() {
+        use crate::db::{
+            ApplyOutcome, Bracket, CancelToken, FetchedCell, StepKind, VerifiedStep,
+            conformance::verified_steps,
+        };
+
+        let connection =
+            crate::db::Connection::open(crate::db::ConnectionConfig::SqlServer(live_config()))
+                .expect("connection should open");
+        let table = "verified_counted_apart";
+        let scratch = ScratchTable(&connection, table);
+        scratch.drop_all();
+        let run = |sql: &str| {
+            connection
+                .query(sql, &CancelToken::default(), Fetch::default())
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+        };
+        let fill = || {
+            run(&format!(
+                "DELETE FROM dbo.{table}; INSERT INTO dbo.{table} VALUES (1, N'one'), (2, N'two')"
+            ))
+        };
+        run(&format!(
+            "CREATE TABLE dbo.{table} (id int PRIMARY KEY, label nvarchar(50))"
+        ));
+        fill();
+        let read = |id: u32| -> Vec<FetchedCell> {
+            let row = run(&format!("SELECT * FROM dbo.{table} WHERE id = {id}"));
+            row.columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| FetchedCell {
+                    column: column.name.clone(),
+                    text: row.rows[0].get(index).map(str::to_string),
+                    cell_type: None,
+                    column_type: column.data_type.clone(),
+                })
+                .collect()
+        };
+        let types: Vec<(String, String)> = [("id", "int"), ("label", "nvarchar")]
+            .iter()
+            .map(|(column, kind)| ((*column).to_string(), (*kind).to_string()))
+            .collect();
+        let batch = sql::draft_batch(
+            Engine::SqlServer,
+            &[sql::DraftDelete {
+                schema: "dbo".into(),
+                table: table.into(),
+                keys: vec![("id".into(), "2".into())],
+                null_keys: Vec::new(),
+                types: types.clone(),
+            }],
+            &[PendingRow {
+                schema: "dbo".into(),
+                table: table.into(),
+                sets: vec![("label".into(), NewValue::Value("changed".into()))],
+                keys: vec![("id".into(), "1".into())],
+                types,
+                ..PendingRow::default()
+            }],
+            &[],
+            false,
+        )
+        .expect("the draft is written");
+        let steps = verified_steps(
+            Engine::SqlServer,
+            &batch,
+            vec![(StepKind::Delete, read(2)), (StepKind::Update, read(1))],
+        );
+        let rows = || {
+            run(&format!("SELECT id, label FROM dbo.{table} ORDER BY id"))
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.get(0).map(str::to_string),
+                        row.get(1).map(str::to_string),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The re-read still finds row 1, so the write is what counts: it names
+        // a row that is not there. The `DELETE` before it counted one and a
+        // bracket after it would read none, and the update's count is neither.
+        let update = steps[1].sql.clone();
+        let missing = VerifiedStep {
+            sql: update.replace("= '1'", "= '999'"),
+            ..steps[1].clone()
+        };
+        assert_ne!(missing.sql, update, "{update}");
+        assert_eq!(
+            connection.apply_verified(
+                &[steps[0].clone(), missing],
+                Bracket::Own,
+                &CancelToken::default()
+            ),
+            ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            }
+        );
+        assert_eq!(
+            rows(),
+            [
+                (Some("1".into()), Some("one".into())),
+                (Some("2".into()), Some("two".into()))
+            ],
+            "the deleted row came back with the rollback"
+        );
+
+        let outcome = connection.apply_verified(&steps, Bracket::Own, &CancelToken::default());
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { affected: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(rows(), [(Some("1".into()), Some("changed".into()))]);
+    }
 }
