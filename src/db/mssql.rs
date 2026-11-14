@@ -5338,5 +5338,6 @@ mod tests {
         read_only_session_refuses_a_write,
         comment_forms_agree_with_the_server,
         generated_writes_round_trip,
+        generated_draft_round_trip,
     );
 }
