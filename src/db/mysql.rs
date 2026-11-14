@@ -30,8 +30,8 @@ use ::mysql::{Conn, OptsBuilder, SslOpts, Value};
 use super::ssh::{Tunnel, tunnelled};
 use super::{
     ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Fetch, Index,
-    IndexKind, QueryResult, Reference, RowBuilder, Sending, ServerConfig, Shown, Sizes, SslMode,
-    StepKind, Stopped, Structure, VerifiedStep, assemble_catalog, assemble_databases,
+    IndexKind, QueryResult, Reference, RowBuilder, RowMatch, Sending, ServerConfig, Shown, Sizes,
+    SslMode, StepKind, Stopped, Structure, VerifiedStep, assemble_catalog, assemble_databases,
     assemble_foreign_keys, assemble_references, assemble_sequences, assemble_sizes,
     assemble_structure, non_utf8_error, optional_cell, plain_error, required_cell,
 };
@@ -1513,22 +1513,113 @@ fn table_columns(result: &QueryResult) -> Option<Vec<TableColumn>> {
 }
 
 /// Whether `=` against a column's value rendered as text finds it, for the
-/// type [`EDIT_COLUMNS_SQL`] names.
+/// type [`EDIT_COLUMNS_SQL`] names. Fail closed: only types the compose servers
+/// were seen to match, MySQL's and MariaDB's alike, are listed.
+///
+/// ponytail: a type is added when
+/// `tests::live_every_listed_type_matches_its_row_by_its_rendered_text_on_mysql`
+/// and `_on_mariadb` both exercise it. Left off: `float` and `json`, whose `=`
+/// against their own text finds nothing (a `FLOAT` is held as a single and
+/// compared as a double; a `JSON` value is never equal to a string), so a
+/// matched row would read as gone; the byte types (`binary`, `varbinary`, the
+/// blobs, `bit`), which the grid renders as `0x…` and the writer quotes as that
+/// text; and `geometry` and `vector`, never exercised.
 fn is_matchable(data_type: &str) -> bool {
-    let _ = data_type;
-    false
+    matches!(
+        data_type,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "bigint"
+            | "decimal"
+            | "double"
+            | "char"
+            | "varchar"
+            | "tinytext"
+            | "text"
+            | "mediumtext"
+            | "longtext"
+            | "date"
+            | "time"
+            | "datetime"
+            | "timestamp"
+            | "year"
+            | "enum"
+            | "set"
+    )
 }
 
-/// The target of a result set over a table with no primary key, or the reason
-/// it has none.
+/// The target of a result set over a table with no primary key: every column
+/// of the table names the row, a NULL as `IS NULL`, the computed columns
+/// matched but never set. Or the reason it cannot be, when the user can do
+/// something about it.
+///
+/// Never a unique index, and never some of the columns: a column left out of
+/// the `WHERE` matches rows the user is not looking at, so a column that cannot
+/// be matched by its value, or that the result omits, makes the whole result
+/// read-only.
 fn resolve_keyless_target(
     probed: &[ProbedColumn],
     schema: &str,
     table: &str,
     columns: &[TableColumn],
 ) -> (Option<EditTarget>, Option<String>) {
-    let _ = (probed, schema, table, columns, is_matchable);
-    (None, None)
+    let column_of = |column: &ProbedColumn| column.table.as_ref().and(column.column.clone());
+    // As for a key: two result columns reading one table column are the two
+    // sides of a self-join, and a column computed beside the real ones is no
+    // table's row.
+    let mut origins = HashSet::new();
+    if !probed
+        .iter()
+        .map(column_of)
+        .all(|column| column.is_some_and(|column| origins.insert(column)))
+    {
+        return (None, None);
+    }
+    let refusal = |what: String| {
+        Some(format!(
+            "A table without a primary key is edited by matching every column, and {what}."
+        ))
+    };
+    if let Some(column) = columns
+        .iter()
+        .find(|column| !is_matchable(&column.data_type))
+    {
+        return (
+            None,
+            refusal(format!(
+                "{} ({}) cannot be matched by its value",
+                column.name, column.data_type
+            )),
+        );
+    }
+    let mut keys = Vec::new();
+    let mut fixed = Vec::new();
+    for column in columns {
+        let Some(at) = probed
+            .iter()
+            .position(|probed| column_of(probed).as_deref() == Some(column.name.as_str()))
+        else {
+            return (
+                None,
+                refusal(format!("{} is not in the result", column.name)),
+            );
+        };
+        keys.push(at);
+        if column.generated {
+            fixed.push(at);
+        }
+    }
+    let target = EditTarget {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        columns: probed.iter().map(column_of).collect(),
+        keys,
+        row_match: RowMatch::EveryColumn { fixed },
+        ..Default::default()
+    };
+    (Some(target), None)
 }
 
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
@@ -4250,29 +4341,32 @@ ORDER BY 1, 2
         ("set('x','y')", "'x,y'"),
     ];
 
-    /// Types left off the list because `=` against their own rendered text finds
-    /// nothing, and the engines it holds on: a `FLOAT` is compared to the text
-    /// as a double, which it is not, and a `JSON` value is never equal to a
-    /// string. MariaDB's `JSON` is a `LONGTEXT` the catalog query tells by its
+    /// Types left off the list because `=` against the text the grid renders for
+    /// them finds nothing, on the engines it holds on: a `FLOAT` is compared to
+    /// the text as a double, which it is not, a `JSON` value is never equal to a
+    /// string, and the byte types render as `0x…` and are written back as that
+    /// text. MariaDB's `JSON` is a `LONGTEXT` the catalog query tells by its
     /// check; the text equals itself there, and the type is left off all the
     /// same.
     const UNMATCHED_SAMPLES: &[(&str, &str, &[Engine])] = &[
         ("float", "0.1", &[Engine::MySql, Engine::MariaDb]),
         ("json", "'{\"a\": [1,   2]}'", &[Engine::MySql]),
+        ("bit(8)", "b'101'", &[Engine::MySql, Engine::MariaDb]),
+        ("binary(4)", "0x6162", &[Engine::MySql, Engine::MariaDb]),
+        (
+            "varbinary(8)",
+            "0xdeadbeef",
+            &[Engine::MySql, Engine::MariaDb],
+        ),
+        ("tinyblob", "0x00ff", &[Engine::MySql, Engine::MariaDb]),
+        ("blob", "0x00ff", &[Engine::MySql, Engine::MariaDb]),
+        ("mediumblob", "0x00ff", &[Engine::MySql, Engine::MariaDb]),
+        ("longblob", "0x00ff", &[Engine::MySql, Engine::MariaDb]),
     ];
 
     /// Types left off the list that nothing was matched with: the grid is
     /// read-only and says which column is why.
-    const UNLISTED_SAMPLES: &[(&str, &str)] = &[
-        ("bit(8)", "b'101'"),
-        ("binary(4)", "0x6162"),
-        ("varbinary(8)", "0xdeadbeef"),
-        ("tinyblob", "0x00ff"),
-        ("blob", "0x00ff"),
-        ("mediumblob", "0x00ff"),
-        ("longblob", "0x00ff"),
-        ("geometry", "ST_GeomFromText('POINT(1 2)')"),
-    ];
+    const UNLISTED_SAMPLES: &[(&str, &str)] = &[("geometry", "ST_GeomFromText('POINT(1 2)')")];
 
     fn live_every_listed_type_matches_its_row_by_its_rendered_text(engine: Engine) {
         let connection = live(engine);
@@ -4348,10 +4442,11 @@ ORDER BY 1, 2
             .expect("the scratch row is inserted");
             let read = run("SELECT * FROM dbdelve_keyless_probe").expect("the row reads");
             assert!(read.edit.is_none(), "{declared}");
+            let kind = declared.split('(').next().unwrap_or(declared);
             assert!(
                 read.read_only_reason
                     .as_deref()
-                    .is_some_and(|reason| reason.contains(&format!("c ({declared})"))),
+                    .is_some_and(|reason| reason.contains(&format!("c ({kind})"))),
                 "{declared}: {:?}",
                 read.read_only_reason
             );
@@ -4389,6 +4484,30 @@ ORDER BY 1, 2
                 read.read_only_reason
             );
         }
+
+        // A column the server computes is matched and never set; a default it
+        // computes is an ordinary column. A unique index is no primary key.
+        scratch.drop_all();
+        run("CREATE TABLE dbdelve_keyless_probe (
+                a int NOT NULL UNIQUE,
+                g int AS (a + 1) STORED,
+                v int AS (a + 2) VIRTUAL,
+                d datetime DEFAULT CURRENT_TIMESTAMP,
+                x int DEFAULT (3)
+            )")
+        .expect("the table is built");
+        run("INSERT INTO dbdelve_keyless_probe (a, x) VALUES (1, 4)").expect("a row");
+        let computed = run("SELECT * FROM dbdelve_keyless_probe").expect("the row reads");
+        assert_eq!(
+            computed
+                .edit
+                .expect("a unique index alone is no key")
+                .row_match,
+            crate::db::RowMatch::EveryColumn { fixed: vec![1, 2] },
+            "{:?}",
+            computed.read_only_reason
+        );
+        scratch.drop_all();
 
         // A view over a table with no primary key names no row of its own.
         run("CREATE TABLE dbdelve_keyless_probe (c int)").expect("the table is built");
