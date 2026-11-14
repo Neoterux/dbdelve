@@ -27926,10 +27926,46 @@ fn dropping_the_prompts_puts_back_the_bars_of_an_action_waiting_to_resume(cx: &m
     });
 }
 
+/// With the unverified Row path gone, a Row send that reaches the send with no
+/// verification is the one thing left to refuse.
 #[gpui::test]
-fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_read(
-    cx: &mut TestAppContext,
-) {
+fn a_row_send_without_its_verification_is_not_sent(cx: &mut TestAppContext) {
+    use crate::session::Refresh;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_and_then(
+                "UPDATE \"birds\" SET \"name\" = 'finch' WHERE \"id\" = 1;".into(),
+                Tab::Object(id),
+                Some(Refresh::Row {
+                    row: 0,
+                    rows_id,
+                    sent: Vec::new(),
+                    to: None,
+                    then: None,
+                    verify: None,
+                }),
+                false,
+                None,
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing reached the file"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_whose_read_back_is_not_a_select_writes_nothing(cx: &mut TestAppContext) {
     use crate::session::Refresh;
 
     store::tests::with_home(|| {
@@ -27937,8 +27973,8 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
         let (id, grid) = open_in_row_mode(&workspace, cx);
         let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
 
-        // The write is a real one, verified as a Row send's is; only the read
-        // it carries is not a read.
+        // The write is a real one, verified as a Row send's is; only the
+        // read-back its step carries is not a read.
         stage(
             &grid,
             cx,
@@ -27963,7 +27999,7 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                 kind: crate::db::StepKind::Update,
                 reread: crate::sql::row_reread(Engine::Sqlite, step),
                 before,
-                read_back: None,
+                read_back: Some("DELETE FROM birds".into()),
             }],
             rows: vec!["id = 1".into()],
             identities: Vec::new(),
@@ -27976,7 +28012,6 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                 Some(Refresh::Row {
                     row: 0,
                     rows_id,
-                    read: "DELETE FROM birds".into(),
                     sent: Vec::new(),
                     to: None,
                     then: None,
@@ -27991,20 +28026,14 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
 
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
-            Some("robin"),
-            "the write ran"
+            Some("wren"),
+            "the write was not sent"
         );
         assert_eq!(
             on_disk("select count(*) from birds").as_deref(),
             Some("2"),
-            "the carried statement did not"
+            "the carried statement did not run either"
         );
-        let notice = shown_notice(&workspace, cx).expect("the status line says what happened");
-        assert!(
-            notice.contains("refused to run a read it wrote itself"),
-            "{notice}"
-        );
-        assert!(relation_is_stale(&workspace, cx, id));
         quit(workspace, cx);
     });
 }

@@ -3696,14 +3696,12 @@ pub(crate) enum Refresh {
         id: u64,
         verify: Option<Verification>,
     },
-    /// A Row-mode send of one row's `UPDATE`, which is followed in the same
-    /// task by `read`, the row read back by its key, landing in `row` of the
-    /// grid whose rows are `rows_id`. No refresh of the relation follows: the
-    /// row is replaced where it stands.
+    /// A Row-mode send of one row's `UPDATE`, whose verified step reads the row
+    /// back by its key, landing in `row` of the grid whose rows are `rows_id`.
+    /// No refresh of the relation follows: the row is replaced where it stands.
     Row {
         row: usize,
         rows_id: u64,
-        read: String,
         /// The cells that went with the send, by column, which the landing
         /// clears: an edit staged on the row while it was out is not among them.
         sent: Vec<(usize, NewValue)>,
@@ -3714,10 +3712,10 @@ pub(crate) enum Refresh {
         /// What the user asked for that this row had to be saved before: a page
         /// turn, a sort, a tab switch. Carried out only when the send lands.
         then: Option<AfterEdits>,
-        /// The row's one verified step when its target verifies applies: the
-        /// row read again and compared before the `UPDATE`, the write counted,
-        /// and `read` taken inside the same transaction. `None` sends the
-        /// `UPDATE` as it is and reads the row after it.
+        /// The row's one verified step: the row read again and compared before
+        /// the `UPDATE`, the write counted, and the row read back inside the
+        /// same transaction. A Row send without one is refused
+        /// (`Workspace::execute_and_then`).
         verify: Option<Verification>,
     },
 }

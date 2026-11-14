@@ -1943,17 +1943,18 @@ impl Workspace {
             );
             return false;
         };
-        // On a target that verifies an apply the send is one step: the row
-        // read again and compared before the `UPDATE`, the write counted, and
-        // `read` taken inside the same transaction.
-        let verify = if target.verifies_applies() {
+        // The send is one step: the row read again and compared before the
+        // `UPDATE`, the write counted, and `read` taken inside the same
+        // transaction. Row is offered only where every apply is verified
+        // (`Target::keeps_edits`), so there is no send of the text alone.
+        let verify = {
             let grid = results.read(cx).delegate();
             match lone_verification(
                 self.engine(),
                 &update,
                 StepKind::Update,
                 Some((grid.fetched_cells(row), grid.row_label(row))),
-                Some(read.clone()),
+                Some(read),
                 names_rows_by_key(grid),
             ) {
                 Ok(verify) => Some(verify),
@@ -1962,8 +1963,6 @@ impl Workspace {
                     return false;
                 }
             }
-        } else {
-            None
         };
         self.execute_and_then(
             update,
@@ -1971,7 +1970,6 @@ impl Workspace {
             Some(Refresh::Row {
                 row,
                 rows_id,
-                read,
                 sent,
                 to,
                 then,
