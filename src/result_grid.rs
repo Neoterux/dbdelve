@@ -2395,14 +2395,22 @@ impl ResultGrid {
             .collect()
     }
 
-    /// The pending cell after the ring in reading order (before it, when
-    /// `back`), wrapping at either end. Reading order rather than edit order:
-    /// the walk should move through the grid the way the eye does.
+    /// The change after the ring in reading order (before it, when `back`),
+    /// wrapping at either end: each staged cell, each marked row at its first
+    /// column and each added row at its first touched column. Reading order
+    /// rather than edit order: the walk should move through the grid the way
+    /// the eye does.
     fn pending_beside(&self, back: bool) -> Option<(usize, usize)> {
+        let fetched = self.fetched_rows();
         let mut cells: Vec<_> = self
             .pending
             .iter()
             .map(|edit| (edit.row, edit.col))
+            .chain(self.marked.iter().map(|&row| (row, 0)))
+            .chain(self.added.iter().enumerate().map(|(place, added)| {
+                let first = added.cells.iter().map(|(col, _)| *col).min();
+                (fetched + place, first.unwrap_or(0))
+            }))
             .collect();
         cells.sort_unstable();
         let found = self.active.and_then(|here| match back {
