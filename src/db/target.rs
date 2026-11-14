@@ -205,11 +205,18 @@ impl Target {
         }
     }
 
-    /// Whether a query tab's Apply is shown in the review dialog rather than
-    /// appended to its buffer. A stub of [`Self::reviews_query_edits`] until the
-    /// verified apply is routed to query tabs.
+    /// Whether a query tab's Apply is shown in the review dialog, as an object
+    /// tab's is, rather than appended to its buffer: where what runs is not the
+    /// text alone, because of a guard ([`Self::reviews_query_edits`]) or because
+    /// the apply is verified (the rows re-read and the writes counted,
+    /// [`Self::verifies_applies`]). A copy left in the buffer, or recalled from
+    /// the history, would run without either.
+    ///
+    /// [`Self::reviews_query_edits`] is not widened to say this: it also decides
+    /// whether a query tab takes Delete row ([`Self::edits_query_rows`]), which a
+    /// verified target does not offer there.
     pub fn reviews_query_apply(self) -> bool {
-        self.reviews_query_edits()
+        self.reviews_query_edits() || (self.row_edits() && self.verifies_applies())
     }
 
     /// Whether this target is one of the transactional SQL engines dbdelve

@@ -2215,7 +2215,7 @@ impl Workspace {
         let edit = matches!(
             refresh,
             Some(
-                Refresh::Statement(_)
+                Refresh::Statement { .. }
                     | Refresh::Earlier { .. }
                     | Refresh::Relation { .. }
                     | Refresh::Row { .. }
@@ -2226,7 +2226,12 @@ impl Workspace {
         // again inside the apply's transaction. Cloned, as the refresh that
         // carries it goes on to the landing.
         let verification = match &refresh {
-            Some(Refresh::Relation { verify, .. } | Refresh::Row { verify, .. }) => verify.clone(),
+            Some(
+                Refresh::Relation { verify, .. }
+                | Refresh::Row { verify, .. }
+                | Refresh::Statement { verify, .. }
+                | Refresh::Earlier { verify, .. },
+            ) => verify.clone(),
             _ => None,
         };
         // Whether the apply runs in the user's own open transaction, as the
@@ -2517,8 +2522,12 @@ impl Workspace {
         // rather than appended: recalled into a buffer, it would run without
         // the count that guards it. Its outcome is written as it lands, under
         // the same rules, since only a run recorded here has one to record.
+        // Only a query tab's: a Row send is the user's edit sent unreviewed and
+        // stays recorded.
         let recorded = match &statement {
-            Some(statement) if !(generated && target.reviews_query_edits()) => {
+            Some(statement)
+                if !(generated && matches!(tab, Tab::Query(_)) && target.reviews_query_apply()) =>
+            {
                 self.issued_to(&id, generation).map(|profile| {
                     let entry = store::HistoryEntry::started(statement.as_str());
                     // A line that could not be written is not worth a notice
@@ -3557,7 +3566,7 @@ impl Workspace {
                     } else if succeeded
                         && !in_front
                         && let Some(
-                            Refresh::Statement(_) | Refresh::Earlier { .. } | Refresh::Relation { .. },
+                            Refresh::Statement { .. } | Refresh::Earlier { .. } | Refresh::Relation { .. },
                         ) = &refresh
                     {
                         workspace.give_back(&id, generation, tab);
@@ -3568,7 +3577,7 @@ impl Workspace {
                         }
                     } else if succeeded && let Some(refresh) = refresh {
                         match refresh {
-                            Refresh::Statement(sql) => workspace.execute_sql(sql, tab, cx),
+                            Refresh::Statement { sql, .. } => workspace.execute_sql(sql, tab, cx),
                             Refresh::Earlier { sql, .. } => {
                                 workspace.execute_and_then(
                                     sql,

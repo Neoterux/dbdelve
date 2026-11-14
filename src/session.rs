@@ -2912,9 +2912,12 @@ fn apply_refresh<G: Clone + PartialEq>(
             (queue.lane(finished.start) == Some(queue.showing)).then(|| Refresh::Earlier {
                 index: queue.showing,
                 sql: finished.sql.clone(),
+                verify: None,
             })
         }
-        None => last_query.cloned().map(Refresh::Statement),
+        None => last_query
+            .cloned()
+            .map(|sql| Refresh::Statement { sql, verify: None }),
     }
 }
 
@@ -3647,15 +3650,23 @@ pub(crate) fn restored_state(grid: &store::StoredGrid) -> QueryState {
 
 /// What runs once a generated batch has succeeded.
 pub(crate) enum Refresh {
-    /// The query tab's stashed `SELECT`.
-    Statement(String),
+    /// The query tab's stashed `SELECT`. `verify` is what an applied edit's run
+    /// is checked against (see `Relation`); `None` for the tab's own re-run.
+    Statement {
+        sql: String,
+        verify: Option<Verification>,
+    },
     /// A queue's earlier result, `index` in `done`, which the batch runs in:
     /// it is lent the slot as the batch starts, and `sql`, its own statement,
     /// reads it again there. On the profile's own connection rather than one
     /// of its own, which would see neither the session's settings and
     /// temporary tables nor a transaction the batch wrote into, and in its
     /// own grid, so the last result is never blanked for it.
-    Earlier { index: usize, sql: String },
+    Earlier {
+        index: usize,
+        sql: String,
+        verify: Option<Verification>,
+    },
     /// `Earlier`'s re-read, which gives the slot back once it lands. That run
     /// is the user's statement and not dbdelve's, so it keeps the row limit.
     Return,
@@ -3694,6 +3705,15 @@ pub(crate) enum Refresh {
 }
 
 impl Refresh {
+    /// The refresh of a query tab's edit, carrying what the run is checked
+    /// against. Any other refresh is returned as it is.
+    pub(crate) fn verified(mut self, check: Option<Verification>) -> Self {
+        if let Self::Statement { verify, .. } | Self::Earlier { verify, .. } = &mut self {
+            *verify = check;
+        }
+        self
+    }
+
     /// The action a Row send was carrying, for a send that is dropped before
     /// it runs: its owner puts back what the action had changed.
     pub(crate) fn into_parked(self) -> Option<AfterEdits> {
@@ -4850,18 +4870,18 @@ mod tests {
         let last = Some("SELECT 40".to_string());
         assert!(matches!(
             apply_refresh(Some(&finished_queue(0)), &12, last.as_ref()),
-            Some(Refresh::Earlier { index: 0, sql }) if sql == "SELECT 0"
+            Some(Refresh::Earlier { index: 0, sql, .. }) if sql == "SELECT 0"
         ));
         // A batch's later set has no statement of its own to ask again, and
         // the slot's is not it.
         assert!(apply_refresh(Some(&finished_queue(1)), &12, last.as_ref()).is_none());
         assert!(matches!(
             apply_refresh(Some(&finished_queue(2)), &12, last.as_ref()),
-            Some(Refresh::Statement(sql)) if sql == "SELECT 40"
+            Some(Refresh::Statement { sql, .. }) if sql == "SELECT 40"
         ));
         assert!(matches!(
             apply_refresh(None::<&Queue<usize>>, &12, last.as_ref()),
-            Some(Refresh::Statement(_))
+            Some(Refresh::Statement { .. })
         ));
         assert!(apply_refresh(Some(&finished_queue(2)), &12, None).is_none());
     }

@@ -16502,7 +16502,10 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
             workspace.execute_unchecked(
                 "INSERT INTO u VALUES (7)".into(),
                 tab,
-                Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+                Some(Refresh::Statement {
+                    sql: "SELECT count(*) FROM u".into(),
+                    verify: None,
+                }),
                 false,
                 None,
                 None,
@@ -16534,7 +16537,10 @@ fn apply_insert_from_the_front_tab(
         workspace.execute_unchecked(
             "INSERT INTO u VALUES (7)".into(),
             tab,
-            Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+            Some(Refresh::Statement {
+                sql: "SELECT count(*) FROM u".into(),
+                verify: None,
+            }),
             false,
             None,
             None,
@@ -19703,7 +19709,10 @@ fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestCo
         workspace.execute_unchecked(
             sql.into(),
             tab,
-            Some(Refresh::Statement("SELECT count(*) FROM t".into())),
+            Some(Refresh::Statement {
+                sql: "SELECT count(*) FROM t".into(),
+                verify: None,
+            }),
             false,
             None,
             None,
@@ -21771,7 +21780,10 @@ fn an_edit_send_on_clickhouse_still_clears_the_grid_and_ends_failed(cx: &mut Tes
                 workspace.execute_unchecked(
                     "INSERT INTO orders VALUES (3, 'jay')".into(),
                     tab,
-                    Some(Refresh::Statement(read.into())),
+                    Some(Refresh::Statement {
+                        sql: read.into(),
+                        verify: None,
+                    }),
                     false,
                     None,
                     None,
@@ -21958,14 +21970,14 @@ fn an_edit_staged_while_an_apply_is_in_flight_stays_staged(cx: &mut TestAppConte
             });
         };
         stage(cx, 0, "robin");
-        // SQLite does not review a query tab's edits, so the append sends at
-        // once. Not through the action, which would run the executor to the
-        // answer before the test can stage anything.
+        // Not through the action, which would run the executor to the answer
+        // before the test can stage anything.
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
             })
         });
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
         assert!(
             matches!(front_state(&workspace, cx), QueryState::Running { .. }),
             "the batch is in flight"
@@ -22007,21 +22019,30 @@ fn an_edit_staged_while_an_apply_is_in_flight_stays_staged(cx: &mut TestAppConte
             );
         });
 
+        // The rows were not read again, so the grid still holds row 1 as it
+        // was before the first batch: the second apply finds the server's row
+        // is not the one it was written for, and sends nothing.
         cx.dispatch_action(crate::actions::ApplyEdits);
         settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
         assert_eq!(
-            on_disk("select name from birds where id = 1").as_deref(),
-            Some("finch")
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            ))
         );
         assert_eq!(
             on_disk("select name from birds where id = 2").as_deref(),
-            Some("jay")
+            Some("tit")
         );
         grid.read_with(cx, |grid, _| {
-            let grid = grid.delegate();
-            assert_eq!(grid.pending_count(), 0);
-            assert_eq!(grid.cell(0, 1), Some("finch"));
-            assert_eq!(grid.cell(1, 1), Some("jay"), "the re-read ran");
+            assert_eq!(grid.delegate().pending_count(), 2, "the edits are kept");
         });
         quit(workspace, cx);
     });
