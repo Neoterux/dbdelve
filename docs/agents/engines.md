@@ -643,6 +643,42 @@ Decided, and not to be re-litigated:
   preflight before the next statement, leave `@@ROWCOUNT` and `@@ERROR` at
   their own values, not the user's last statement's (known limitation: an
   `sp_executesql` wrapper does not shield them).
+- **A Postgres or DuckDB table with no primary key is edited by every value
+  when all its columns are of a listed type** (`RowMatch::EveryColumn`, the
+  gate and the writers as `docs/agents/gates.md` has them). The result must
+  carry every real column of the table (generated ones are matched, never set,
+  and so are `fixed`); a unique index names no row, so DuckDB's seeded
+  `contacts` and `tally` are edited by every column too. A column of another
+  type, or one the result leaves out, makes the grid read-only with
+  `A table without a primary key is edited by matching every column, and <column>
+  (<type>) cannot be matched by its value.` The lists fail closed, each type on
+  one only because a test matched it by the text the grid renders on the
+  engine's own server: `postgres::tests::live_every_listed_type_matches_its_row_by_its_rendered_text`
+  and `duckdb::tests::every_listed_type_matches_its_row_by_its_rendered_text`,
+  which also pin the types left off.
+  - Postgres lists `bpchar`, `varchar`, `text`, `int2`, `int4`, `int8`,
+    `numeric`, `float4`, `float8`, `bool`, `bytea`, `jsonb`, `money`,
+    `interval`, `uuid`, `date`, `time`, `timetz`, `timestamp` and
+    `timestamptz`, by the catalog's `typname`, schema-qualified for a type that
+    is not a built-in. Left off: `json`, `xml`, `point` and `polygon` (no `=`
+    of their own: `operator does not exist`), `box`, `circle` and `path` (an
+    `=` that compares size, so a row is found with others it is not), `line`
+    and `lseg`, the PostGIS types (the grid shows a WKT with no SRID),
+    `cidr`, and every array, range, enum and domain. Only an ordinary table
+    qualifies; a view or a foreign table has no rows to write back.
+  - DuckDB lists `TINYINT` to `UHUGEINT`, `BOOLEAN`, `VARCHAR`, `FLOAT`,
+    `DOUBLE`, `DECIMAL`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITH TIME
+    ZONE`, `TIME WITH TIME ZONE`, `INTERVAL`, `UUID`, `JSON`, `BIT`,
+    `INTEGER[]` and `BIGINT[]`, by `duckdb_columns().data_type`. Left off,
+    because the pinned engine does not find them by their rendered text: `BLOB`
+    (rendered as hex, which reads back as its characters), lists of text,
+    structs and maps (rendered unquoted, so a comma splits a value and a struct
+    or a map does not read back); and, never exercised, enums, fixed-size
+    arrays, `BIGNUM`, unions and the `TIMESTAMP_*` variants. A `TIME` of
+    `24:00:00` renders as an error text and is found by nothing, which refuses
+    the write rather than naming another row.
+  - These targets never join a transaction the user opened
+    (`Verification.keyed`), as SQLite's keyless one does not.
 - **The Structure tab reads more than one privilege level can see.** An alias
   type's `TYPE_NAME(user_type_id)` is null when the login cannot see it, and
   falls back to `TYPE_NAME(system_type_id)`, its base type. A computed column's
@@ -734,7 +770,8 @@ Decided, and not to be re-litigated:
   and every connection it hands out (`alongside`, so `query_alongside` and
   `apart` too) runs the `USE` before anything else. Nothing picked runs
   nothing, and the session's `search_path` stays DuckDB's own. **A
-  DuckDB result is editable only as a plain select of one keyed table**: the
+  DuckDB result is editable only as a plain select of one table, named by its
+  primary key or by every column (see the keyless bullet above)**: the
   driver names no column's table, so `sql::table_read` reads the statement
   for one base table (no join, subquery, table function, CTE, set operation,
   `DISTINCT`, grouping, window clause or renaming alias) whose columns are
