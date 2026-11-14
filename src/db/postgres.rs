@@ -18,11 +18,12 @@ use crate::tls;
 
 use super::ssh::{self, Bridged, SocketBridge, Tunnel, tunnelled};
 use super::{
-    Catalog, Column, DbError, EditTarget, Engine, Feed, Fetch, Properties, QueryResult, Reference,
-    RelationKind, Row, RowBuilder, ServerConfig, Sizes, Stopped, Structure, assemble_catalog,
-    assemble_databases, assemble_foreign_keys, assemble_references, assemble_sequences,
-    assemble_sizes, assemble_structure, create_table, non_utf8_error, optional_cell, plain_error,
-    required_cell, terminated, time_zone_statement,
+    ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Feed, Fetch,
+    Properties, QueryResult, Reference, RelationKind, Row, RowBuilder, Sending, ServerConfig,
+    Sizes, Stopped, Structure, VerifiedStep, assemble_catalog, assemble_databases,
+    assemble_foreign_keys, assemble_references, assemble_sequences, assemble_sizes,
+    assemble_structure, create_table, non_utf8_error, optional_cell, plain_error, required_cell,
+    terminated, time_zone_statement,
 };
 
 mod pgpass;
@@ -1380,29 +1381,35 @@ impl Connection {
         self.run(sql, false, Fetch::default(), None)
     }
 
-    /// `bound` is the schema to put the session back on first, itself `None`
-    /// for its own default, when the run is a bound tab's.
-    fn run(
+    /// `bound` as [`Connection::run`] takes it, applied on the session `client`
+    /// holds: `schema` first on the `search_path`, or the session put back on the
+    /// one it held after its startup script ran.
+    fn put_back_binding(
         &self,
+        client: &mut Client,
+        bound: Option<Option<&str>>,
+    ) -> Result<(), DbError> {
+        match bound {
+            Some(Some(schema)) => set_search_path(client, schema).map_err(super::unplaced),
+            Some(None) => put_back_search_path(client, self.after_startup_search_path.as_deref())
+                .map_err(super::unplaced),
+            None => Ok(()),
+        }
+    }
+
+    /// Sends `sql` on the session `client` holds and reads what comes back, with
+    /// the number of commands the submission held. The lock-free core of
+    /// [`Connection::run`], which is also what a verified apply sends every
+    /// statement of its sequence through under the one lock it holds. It does
+    /// no describe of its own: a refused `Parse` aborts an open transaction.
+    fn ran(
+        &self,
+        client: &mut Client,
         sql: &str,
         typed: bool,
         fetch: Fetch,
         bound: Option<Option<&str>>,
-    ) -> Result<QueryResult, DbError> {
-        let mut client = self.client.lock().map_err(|_| DbError {
-            message: "The connection is unavailable after an earlier internal failure.".into(),
-            position: None,
-        })?;
-        fetch.hold()?;
-        match bound {
-            Some(Some(schema)) => set_search_path(&mut client, schema).map_err(super::unplaced)?,
-            Some(None) => {
-                put_back_search_path(&mut client, self.after_startup_search_path.as_deref())
-                    .map_err(super::unplaced)?
-            }
-            None => {}
-        }
-
+    ) -> Result<(QueryResult, usize), DbError> {
         // Timed from here, not from the call: one client serialises a profile's
         // queries, and time spent waiting behind the catalog load is not time
         // the server spent on this statement.
@@ -1411,7 +1418,7 @@ impl Connection {
             client: inner,
             driver,
             ..
-        } = &mut *client;
+        } = client;
         let failed = |error: Error| query_error(&error, sql);
         driver.notices.clear();
         let mut messages = Box::pin(
@@ -1449,6 +1456,88 @@ impl Connection {
         if typed {
             result.messages = notices;
         }
+        Ok((result, commands))
+    }
+
+    /// Applies `steps` as one verified sequence on this session, under one
+    /// acquisition of its lock, so no other tab's statement runs between the
+    /// re-reads and the writes: see [`super::run_verified`]. `bound` is the
+    /// schema to put the session back on first, before the `BEGIN` it sends
+    /// itself, since a `search_path` cannot be moved inside a transaction
+    /// block. Every statement goes through [`Self::ran`] untyped, so no
+    /// describe runs inside the transaction. A count is the command tag's, the
+    /// rows the statement matched, so a write a `BEFORE` row trigger or a rule
+    /// skipped counts none. `proceed` says no once a Cancel has come.
+    pub fn apply_verified(
+        &self,
+        bound: Option<Option<&str>>,
+        steps: &[VerifiedStep],
+        bracket: Bracket,
+        proceed: &dyn Fn() -> bool,
+    ) -> ApplyOutcome {
+        let failed = |error| ApplyOutcome::Failed {
+            stage: ApplyStage::Begin,
+            error,
+        };
+        let mut client = match self.client.lock() {
+            Ok(client) => client,
+            Err(_) => {
+                return failed(plain_error(
+                    "The connection is unavailable after an earlier internal failure.".into(),
+                ));
+            }
+        };
+        // Registers the run, so a Cancel finds the session, and checks for one
+        // that came first, as `run` does before it touches the session.
+        if !proceed() {
+            return failed(plain_error("Cancelled before it was sent.".into()));
+        }
+        if let Err(error) = self.put_back_binding(&mut client, bound) {
+            return failed(error);
+        }
+        // Read off the held client after each statement and handed to the
+        // lost test, which cannot take the lock `send` holds: only an error at
+        // `COMMIT` with the socket gone is an outcome nobody can know.
+        let closed = std::cell::Cell::new(false);
+        let mut send = |sql: &str, _: Sending| {
+            let result = self
+                .ran(&mut client, sql, false, Fetch::default(), bound)
+                .map(|(result, _)| result);
+            closed.set(client.client.is_closed());
+            result
+        };
+        // ponytail: a spatial cell is left out of the compare. The grid shows
+        // it as the WKT it rendered after the fetch, and an untyped re-read
+        // returns the server's EWKB, so the two cannot be compared as text.
+        // A change confined to a spatial column is not seen; the key and the
+        // count still hold. The upgrade is a re-read that renders the same way.
+        super::run_verified(
+            Engine::Postgres,
+            steps,
+            bracket,
+            &mut send,
+            proceed,
+            &|cell| cell.column_type.as_deref().is_some_and(is_spatial),
+            &|_| closed.get(),
+        )
+    }
+
+    /// `bound` is the schema to put the session back on first, itself `None`
+    /// for its own default, when the run is a bound tab's.
+    fn run(
+        &self,
+        sql: &str,
+        typed: bool,
+        fetch: Fetch,
+        bound: Option<Option<&str>>,
+    ) -> Result<QueryResult, DbError> {
+        let mut client = self.client.lock().map_err(|_| DbError {
+            message: "The connection is unavailable after an earlier internal failure.".into(),
+            position: None,
+        })?;
+        fetch.hold()?;
+        self.put_back_binding(&mut client, bound)?;
+        let (mut result, commands) = self.ran(&mut client, sql, typed, fetch, bound)?;
 
         // Types are learned after the statement ran, and only from a single
         // statement that returned columns. A refused `Parse` is an error
