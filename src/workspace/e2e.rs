@@ -19751,6 +19751,7 @@ fn counted_inserts(
     Some(crate::session::Verification {
         rows: vec!["new row".to_string(); steps.len()],
         steps,
+        identities: Vec::new(),
         keyed: true,
     })
 }
@@ -27965,6 +27966,7 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
                 read_back: None,
             }],
             rows: vec!["id = 1".into()],
+            identities: Vec::new(),
             keyed: true,
         });
         workspace.update(cx, |workspace, cx| {

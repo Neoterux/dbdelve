@@ -2789,6 +2789,7 @@ pub(super) fn verification(
     Ok(Verification {
         steps,
         rows,
+        identities: Vec::new(),
         keyed: names_rows_by_key(grid),
     })
 }
@@ -2844,6 +2845,7 @@ fn lone_verification(
             read_back,
         }],
         rows: vec![label],
+        identities: Vec::new(),
         keyed,
     })
 }

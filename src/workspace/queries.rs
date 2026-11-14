@@ -2286,6 +2286,9 @@ impl Workspace {
         // kept draft is never sent twice. Not for a target that is neither
         // (`Target::keeps_edits`).
         let kept = edit && target.keeps_edits();
+        // Whether a failed apply of this target has written the statements before
+        // the one that failed (`Target::ordered_edits`).
+        let ordered = target.ordered_edits();
         // Whether the batch is the grid's staged cells: Apply edits, from its
         // review or appended to a query tab's buffer. An Insert or a Delete
         // row sends none of them, and a relation tab's send without a review
@@ -2779,7 +2782,7 @@ impl Workspace {
                         verified_read = read_back.take().map(|rows| Ok(*rows));
                     }
                     unknown = matches!(outcome, ApplyOutcome::Unknown(_));
-                    verified_result(outcome, verify)
+                    verified_result(outcome, verify, ordered)
                 }
                 // An edit applied from a bound tab's grid belongs to its
                 // database whichever way the session has been moved.
@@ -4276,7 +4279,11 @@ fn markable_row(target: Target, tab: Tab, mode: EditMode, grid: &ResultGrid) -> 
 
 /// What a verified apply's outcome is to the run that sent it: the write's own
 /// answer, or the error the landing shows where the statement is.
-fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<QueryResult, DbError> {
+fn verified_result(
+    outcome: ApplyOutcome,
+    verify: &Verification,
+    ordered: bool,
+) -> Result<QueryResult, DbError> {
     match outcome {
         ApplyOutcome::Applied { affected, .. } => Ok(QueryResult {
             rows_affected: Some(affected),
@@ -4284,7 +4291,7 @@ fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<Query
         }),
         ApplyOutcome::Failed { error, .. } => Err(error),
         refused => Err(DbError {
-            message: verified_message(&refused, verify).unwrap_or_default(),
+            message: verified_message(&refused, verify, ordered).unwrap_or_default(),
             position: None,
         }),
     }
@@ -4296,7 +4303,11 @@ fn verified_result(outcome: ApplyOutcome, verify: &Verification) -> Result<Query
 /// alone, since nothing is known of what it did. `None` for an outcome that
 /// carries no such sentence, the write that landed and the errors a driver
 /// words itself.
-fn verified_message(outcome: &ApplyOutcome, verify: &Verification) -> Option<String> {
+fn verified_message(
+    outcome: &ApplyOutcome,
+    verify: &Verification,
+    _ordered: bool,
+) -> Option<String> {
     let row = |step: usize| verify.rows.get(step).map_or("?", String::as_str);
     let sentences: Vec<String> = match outcome {
         ApplyOutcome::Drifted(drifted) => drifted
@@ -4452,6 +4463,7 @@ mod tests {
                 step(db::StepKind::Insert),
             ],
             rows: vec!["id = 1".into(), "id = 2".into(), "added row 1".into()],
+            identities: Vec::new(),
             keyed: true,
         }
     }
@@ -4554,7 +4566,7 @@ mod tests {
     #[test]
     fn a_verified_outcome_names_each_row_in_what_happened() {
         let verify = verification();
-        let said = |outcome: ApplyOutcome| verified_message(&outcome, &verify);
+        let said = |outcome: ApplyOutcome| verified_message(&outcome, &verify, false);
 
         assert_eq!(
             said(ApplyOutcome::Drifted(vec![
@@ -4616,6 +4628,126 @@ mod tests {
     }
 
     #[test]
+    fn a_mongo_apply_that_stops_part_way_says_which_statements_were_applied() {
+        let step = |kind| db::VerifiedStep {
+            sql: String::new(),
+            kind,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        };
+        // A delete, an update and three added documents, as a draft orders them.
+        let verify = Verification {
+            steps: vec![
+                step(db::StepKind::Delete),
+                step(db::StepKind::Update),
+                step(db::StepKind::Insert),
+                step(db::StepKind::Insert),
+                step(db::StepKind::Insert),
+            ],
+            rows: vec![
+                "_id = 1".into(),
+                "_id = 2".into(),
+                "added row 1".into(),
+                "added row 2".into(),
+                "added row 3".into(),
+            ],
+            identities: Vec::new(),
+            keyed: true,
+        };
+        let failed = |stage| ApplyOutcome::Failed {
+            stage,
+            error: DbError {
+                message: "duplicate key".into(),
+                position: None,
+            },
+        };
+        let said = |outcome: ApplyOutcome| verified_message(&outcome, &verify, true);
+
+        assert_eq!(
+            said(failed(db::ApplyStage::Write(2))).as_deref(),
+            Some(
+                "Statements 1 to 2 were applied and have left the draft. Statement 3 \
+                 (added row 1) failed: duplicate key. Statements 4 to 5 were not sent."
+            )
+        );
+        assert_eq!(
+            said(failed(db::ApplyStage::Write(3))).as_deref(),
+            Some(
+                "Statements 1 to 3 were applied and have left the draft. Statement 4 \
+                 (added row 2) failed: duplicate key. Statement 5 was not sent."
+            ),
+            "one statement left reads in the singular"
+        );
+        assert_eq!(
+            said(failed(db::ApplyStage::Write(4))).as_deref(),
+            Some(
+                "Statements 1 to 4 were applied and have left the draft. Statement 5 \
+                 (added row 3) failed: duplicate key."
+            ),
+            "nothing after the failure, so nothing is said was not sent"
+        );
+        assert_eq!(
+            said(failed(db::ApplyStage::Write(1))).as_deref(),
+            Some(
+                "Statement 1 was applied and has left the draft. Statement 2 (row _id = 2) \
+                 failed: duplicate key. Statements 3 to 5 were not sent."
+            )
+        );
+        assert_eq!(
+            said(failed(db::ApplyStage::Write(0))).as_deref(),
+            Some(
+                "Nothing was applied. Statement 1 (row _id = 1) failed: duplicate key. \
+                 Statements 2 to 5 were not sent."
+            )
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 0,
+                count: Some(0)
+            })
+            .as_deref(),
+            Some(
+                "Nothing was applied. DELETE 1 (row _id = 1) affected 0 rows. \
+                 Statements 2 to 5 were not sent."
+            )
+        );
+        assert_eq!(
+            said(ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(2)
+            })
+            .as_deref(),
+            Some(
+                "Statement 1 was applied and has left the draft. UPDATE 2 (row _id = 2) \
+                 affected 2 rows. Statements 3 to 5 were not sent."
+            )
+        );
+        // A failure before any write, and a drift, wrote nothing and keep the
+        // sentences of a transactional engine.
+        assert_eq!(said(failed(db::ApplyStage::Reread(1))), None);
+        assert_eq!(
+            said(ApplyOutcome::Drifted(vec![(1, Drift::Gone)])).as_deref(),
+            Some("Nothing was applied. Row _id = 2 is no longer on the server.")
+        );
+        // A transactional target rolled it all back, whichever step it was.
+        let rolled_back = |outcome: ApplyOutcome| verified_message(&outcome, &verify, false);
+        assert_eq!(rolled_back(failed(db::ApplyStage::Write(2))), None);
+        assert_eq!(
+            rolled_back(ApplyOutcome::Miscounted {
+                step: 1,
+                count: Some(0)
+            })
+            .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row _id = 2) affected 0 rows.")
+        );
+        // What lands in the draft's notice is the same sentence.
+        let landed = verified_result(failed(db::ApplyStage::Write(2)), &verify, true)
+            .expect_err("a part-way failure is an error");
+        assert!(landed.message.starts_with("Statements 1 to 2 were applied"));
+    }
+
+    #[test]
     fn a_lost_commit_is_said_as_an_unknown_outcome() {
         let said = verified_message(
             &ApplyOutcome::Unknown(DbError {
@@ -4623,6 +4755,7 @@ mod tests {
                 position: None,
             }),
             &verification(),
+            false,
         )
         .expect("a lost COMMIT is said");
 
