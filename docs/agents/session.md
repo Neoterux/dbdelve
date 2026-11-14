@@ -736,9 +736,16 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   row the ring leaves while it holds edits or an input, and
   `Workspace::flush_left_row`, which runs on the grid's `SelectRow`,
   `ClearSelection` and `SelectColumn` events. It first stages the text of an
-  input the move closed (`ResultGrid::commit_closed_input`, by `commit_text`'s
-  rule, so an added row's untouched cell stays out of its `INSERT`) in every
-  view and on a query tab's grid alike, and sends only in a Row view. A step key
+  input the move closed (`ResultGrid::commit_closed_input`) in every view and on
+  a query tab's grid alike, and sends only in a Row view. Every close of a
+  cell's input (Enter, Tab, Shift-Tab, Up or Down, a Row view's edge key, a click
+  away) commits by `ResultGrid::commit_text`, where text equal to the input's
+  seed (`edit_seed`) is nothing typed, on every row: an untouched input leaves a
+  NULL, a staged NULL or DEFAULT (each seeds empty) and an added row's untouched
+  cell alone, stages nothing, sends nothing in a Row view and asks nothing of
+  the mode. The empty string over a NULL is written by `SetEmpty`
+  (`Set Value to Empty` in the cell menu where `offers_empty` holds,
+  `Set cell to empty` in the palette). A step key
   at the grid's edge with an input open is handed to the workspace as
   `StepPastEdge`: in a Row view it commits the input and sends the row, the ring
   left on the cell, and in a Draft view or on a query tab it leaves the input
