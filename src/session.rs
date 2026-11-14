@@ -4494,6 +4494,47 @@ mod tests {
     }
 
     #[test]
+    fn row_mode_is_offered_on_mongodb_through_the_target_predicate() {
+        assert_eq!(
+            EditMode::Row.on(Target::built_in(Engine::MongoDb)),
+            EditMode::Row
+        );
+        for engine in [
+            Engine::Redis,
+            Engine::ClickHouse,
+            Engine::Snowflake,
+            Engine::Turso,
+        ] {
+            assert_eq!(
+                EditMode::Row.on(Target::built_in(engine)),
+                EditMode::Draft,
+                "{engine:?}"
+            );
+        }
+        let odbc = Box::leak(Box::new(crate::db::Plugin {
+            id: "odbc".into(),
+            name: "ODBC".into(),
+            version: "1".into(),
+            executable: "dbdelve-odbc".into(),
+        }));
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: crate::db::Driver::Plugin(odbc),
+        };
+        assert_eq!(EditMode::Row.on(plugin), EditMode::Draft);
+        for engine in Engine::ALL
+            .into_iter()
+            .filter(|engine| Target::built_in(*engine).row_edits())
+        {
+            assert_eq!(
+                EditMode::Row.on(Target::built_in(engine)),
+                EditMode::Row,
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_views_sorting_survives_its_snapshot_and_an_unsorted_client_view_stays_client() {
         for sorting in [
             Sorting::Server,

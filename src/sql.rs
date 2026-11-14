@@ -8320,10 +8320,46 @@ mod tests {
         ] {
             assert_eq!(row_read(engine, refused), None, "{refused}");
         }
-        assert_eq!(
-            row_read(Engine::MongoDb, "db.t.updateOne({_id: 1}, {$set: {a: 1}})"),
-            None
-        );
+    }
+
+    #[test]
+    fn a_mongo_row_send_is_read_back_by_its_id() {
+        let oid = "ObjectId('65a4f1c0ffffffffffffff03')";
+        let row = PendingRow {
+            table: "accounts".into(),
+            sets: vec![("name".into(), set("Ada"))],
+            keys: vec![("_id".into(), oid.into())],
+            types: vec![
+                ("_id".into(), "objectId".into()),
+                ("name".into(), "string".into()),
+            ],
+            ..Default::default()
+        };
+        let update = update_batch(Engine::MongoDb, std::slice::from_ref(&row)).unwrap();
+        let read = row_read(Engine::MongoDb, &update).expect("a read");
+        assert_eq!(Some(read.clone()), crate::mql::browse::row_reread(&update));
+        assert!(is_generated_select(Engine::MongoDb, &read), "{read}");
+        assert!(read.contains(oid), "{read}");
+
+        let insert = insert_row(
+            Engine::MongoDb,
+            "dbdelve_dev",
+            "accounts",
+            &[("name", Some("Cy"))],
+            &[("name".to_string(), "string".to_string())],
+        )
+        .unwrap();
+        assert_eq!(row_read(Engine::MongoDb, &insert), None, "{insert}");
+        // A batch of two documents is read one statement at a time.
+        let other = PendingRow {
+            table: "accounts".into(),
+            sets: vec![("name".into(), set("Bo"))],
+            keys: vec![("_id".into(), "ObjectId('65a4f1c0ffffffffffffff04')".into())],
+            types: vec![("_id".into(), "objectId".into())],
+            ..PendingRow::default()
+        };
+        let two = update_batch(Engine::MongoDb, &[row, other]).unwrap();
+        assert_eq!(row_read(Engine::MongoDb, &two), None, "{two}");
     }
 
     #[test]
