@@ -23889,6 +23889,102 @@ fn an_added_rows_cell_closed_by_a_click_is_staged_only_when_typed_in(cx: &mut Te
 }
 
 #[gpui::test]
+fn a_step_key_past_the_grids_edge_commits_the_input_and_sends_the_row_in_row_mode(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("7");
+        settle(cx);
+
+        // The last column: there is no cell to carry the edit to.
+        press(cx, "tab");
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("7"),
+            "the row was sent"
+        );
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(ring_of(&grid, cx), Some((0, 2)));
+        assert!(grid_holds_keyboard(&grid, cx));
+        assert!(
+            history_sql(&workspace, cx)
+                .iter()
+                .any(|sql| sql.contains("UPDATE")),
+            "the send is in the history"
+        );
+
+        // The last row, from a cell of another column.
+        ring_on(&grid, cx, 2, 1);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("owl");
+        settle(cx);
+        press(cx, "down");
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("owl")
+        );
+        assert_eq!(ring_of(&grid, cx).map(|(row, _)| row), Some(2));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_step_key_past_the_grids_edge_leaves_the_input_open_in_draft_mode(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, THREE_BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 2);
+        cx.dispatch_action(crate::actions::EditCell);
+        settle(cx);
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("7");
+        settle(cx);
+
+        press(cx, "tab");
+        assert_eq!(pending_of(&grid, cx), 0, "nothing is staged by the key");
+        assert!(
+            !grid_holds_keyboard(&grid, cx),
+            "the input keeps the keyboard"
+        );
+        press(cx, "up");
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert!(!grid_holds_keyboard(&grid, cx));
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("1")
+        );
+
+        // The click is what keeps the text.
+        click_cell_of_row(cx, 1);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().pending_value(0, 2),
+                Some(&NewValue::Value("7".into()))
+            );
+        });
+        assert_eq!(
+            on_disk("select n from birds where id = 1").as_deref(),
+            Some("1")
+        );
+        assert!(history_sql(&workspace, cx).is_empty());
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_refused_typed_edit_carried_down_returns_with_the_keyboard_and_the_mark_drawn(
     cx: &mut TestAppContext,
 ) {
