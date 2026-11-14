@@ -1209,8 +1209,16 @@ pub fn is_generated_write_on(engine: Engine, statement: &str) -> bool {
 ///
 /// Cut from the tree the gate reads, since the grammar holds `BEGIN; …;
 /// COMMIT` as one statement a splitter of the buffer would never separate.
+/// For MongoDB, which has no bracket, the statements are the spans of
+/// `mql::parse`, and each passes `mql::is_generated_write` alone as a
+/// one-statement write. Redis writes no batch of this shape.
 pub(crate) fn generated_writes(engine: Engine, sql: &str) -> Option<Vec<String>> {
-    if engine.syntax() != Syntax::Sql || is_transaction_bracket(sql) {
+    match engine.syntax() {
+        Syntax::Sql => {}
+        Syntax::Mongo => return mongo_writes(sql),
+        Syntax::Redis => return None,
+    }
+    if is_transaction_bracket(sql) {
         return None;
     }
     let spec = &engine.spec().sql;
@@ -1231,6 +1239,23 @@ pub(crate) fn generated_writes(engine: Engine, sql: &str) -> Option<Vec<String>>
     statements
         .iter()
         .all(|statement| !is_transaction_bracket(statement) && generated_write(spec, statement))
+        .then_some(statements)
+}
+
+/// [`generated_writes`] for MongoDB: refused where the gate refuses, and
+/// otherwise each statement's own text from the parse, without its `;`.
+fn mongo_writes(text: &str) -> Option<Vec<String>> {
+    if !crate::mql::is_generated_write(text) {
+        return None;
+    }
+    let statements: Vec<String> = crate::mql::parse(text)
+        .ok()?
+        .iter()
+        .map(|statement| text.get(statement.span.clone()).map(str::to_owned))
+        .collect::<Option<_>>()?;
+    statements
+        .iter()
+        .all(|statement| crate::mql::is_generated_write(statement))
         .then_some(statements)
 }
 
@@ -1258,8 +1283,9 @@ pub fn delete_matches_key_on(engine: Engine, statement: &str, keys: &[&str]) -> 
 /// caller's word: a statement is a `DELETE` when the tree says so, and an
 /// `UPDATE` whose `WHERE` names the key is not counted. `Some(0)` for a batch
 /// with no `DELETE`. `None` on any `DELETE` that does not match, on anything
-/// the gate's parse refuses (an empty text included), and on MongoDB and Redis,
-/// which write no draft of this shape.
+/// the gate's parse refuses (an empty text included), and on Redis, which
+/// writes no draft of this shape. MongoDB's is read by
+/// [`crate::mql::draft_deletes_match`], whose collection is `table`.
 // ponytail: only a top-level `DELETE` is counted. One hidden elsewhere in the
 // tree is not found here, because the gate's whole-tree count of `delete` nodes
 // refuses it first, and a caller runs both.
@@ -1270,8 +1296,10 @@ pub fn draft_deletes_match(
     schema: &str,
     table: &str,
 ) -> Option<usize> {
-    if engine.syntax() != Syntax::Sql {
-        return None;
+    match engine.syntax() {
+        Syntax::Sql => {}
+        Syntax::Mongo => return crate::mql::draft_deletes_match(batch, keys, table),
+        Syntax::Redis => return None,
     }
     let spec = engine.spec();
     let sql = as_written(&spec.sql, batch)?;
@@ -1455,11 +1483,15 @@ fn conjuncts<'tree>(node: Node<'tree>, terms: &mut Vec<Node<'tree>>) {
 /// `DEFAULT` among them is no reason to leave the row unread. `None` for an
 /// `INSERT`, which has no row to read, for a bracket, for more than one
 /// statement, for a `DELETE` or `UPDATE` whose `WHERE` is not a conjunction of
-/// one-row terms, and for MongoDB and Redis: a caller that gets no read sends
-/// nothing, so a draft whose write has no re-read is not reviewed.
+/// one-row terms, and for Redis: a caller that gets no read sends
+/// nothing, so a draft whose write has no re-read is not reviewed. MongoDB's is
+/// the `find` of the `_id` the write names ([`crate::mql::browse::row_reread`]);
+/// Redis has none.
 pub(crate) fn row_reread(engine: Engine, statement: &str) -> Option<String> {
-    if engine.syntax() != Syntax::Sql {
-        return None;
+    match engine.syntax() {
+        Syntax::Sql => {}
+        Syntax::Mongo => return crate::mql::browse::row_reread(statement),
+        Syntax::Redis => return None,
     }
     let spec = &engine.spec().sql;
     if is_transaction_bracket(statement) || !generated_write(spec, statement) {
@@ -2642,8 +2674,10 @@ pub(crate) struct DraftInsert {
 /// opened, whose `COMMIT` the batch's would end. Postgres writes none.
 ///
 /// An error when the draft is empty, and when any row cannot be written, so a
-/// draft is never sent shorter than it was made. A draft that adds or deletes
-/// rows is not written for MongoDB or Redis, which never offer one.
+/// draft is never sent shorter than it was made. MongoDB's is written by
+/// [`crate::mql::draft_batch`], which has no bracket, so `own_brackets` changes
+/// nothing there. A draft that adds or deletes rows is not written for Redis,
+/// which never offers one.
 ///
 /// The text is not trusted for being written here: the apply passes it through
 /// [`is_generated_write_on`] and [`draft_deletes_match`] before it is shown.
@@ -2661,7 +2695,8 @@ pub(crate) fn draft_batch(
 ) -> Result<String, String> {
     match engine.syntax() {
         Syntax::Sql => sql_draft_batch(engine.spec(), deletes, updates, inserts, own_brackets),
-        Syntax::Mongo | Syntax::Redis => {
+        Syntax::Mongo => crate::mql::draft_batch(deletes, updates, inserts),
+        Syntax::Redis => {
             Err("A draft that adds or deletes rows is not written for this engine.".into())
         }
     }
@@ -8359,10 +8394,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(row_reread(Engine::Sqlite, &bracketed), None, "{bracketed}");
-        assert_eq!(
-            row_reread(Engine::MongoDb, "db.t.deleteOne({_id: 1})"),
-            None
-        );
         assert_eq!(row_reread(Engine::Redis, "DEL k"), None);
     }
 
@@ -8804,12 +8835,16 @@ mod tests {
             );
             assert_eq!(key(&["id"], &wide), None, "{engine:?}: {wide}");
         }
-        for engine in [Engine::MongoDb, Engine::Redis] {
-            assert_eq!(
-                draft_deletes_match(engine, "db.t.deleteOne({_id: 1})", &["_id"], "d", "t"),
-                None
-            );
-        }
+        assert_eq!(
+            draft_deletes_match(
+                Engine::Redis,
+                "db.t.deleteOne({_id: 1})",
+                &["_id"],
+                "d",
+                "t"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ impl Workspace {
                 // the row in the grid, where it is typed in place and read in
                 // the draft's review; every other view takes the form.
                 if profile.session.edit_mode(active) == EditMode::Draft
-                    && self.target().row_edits()
+                    && self.target().keeps_edits()
                     && results.read(cx).delegate().insert_target().is_some()
                 {
                     let results = results.clone();
@@ -1317,7 +1317,7 @@ impl Workspace {
         // `apply_edits` writes it. Every other view reviews the one `DELETE`.
         if matches!(tab, Tab::Object(_))
             && profile.session.edit_mode(tab) == EditMode::Draft
-            && target.row_edits()
+            && target.keeps_edits()
             && let Some(results) = profile.session.active_results().cloned()
             && results.read(cx).delegate().insert_target().is_some()
         {
@@ -2430,7 +2430,7 @@ impl Workspace {
     ///
     /// The append is what keeps a failure readable: the statement that was
     /// attempted is still in the buffer. On a target that answers
-    /// `Target::row_edits` a failure leaves the edits staged as well; elsewhere
+    /// `Target::keeps_edits` a failure leaves the edits staged as well; elsewhere
     /// `execute_sql` clears the grid as it starts and they go with it.
     pub(crate) fn apply_in_buffer(
         &mut self,

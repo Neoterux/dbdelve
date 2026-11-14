@@ -2279,11 +2279,13 @@ impl Workspace {
             });
         // An edit sent to a transactional SQL engine leaves the grid and the
         // draft where they are until the server answers, so a refusal or a
-        // failure costs the user nothing. Not for a target whose batch has no
-        // transaction (`Target::row_edits`): what failed part way there has
-        // already applied some of the draft, and keeping it would send those
-        // rows again.
-        let kept = edit && target.row_edits();
+        // failure costs the user nothing. So does one sent to an ordered
+        // target, MongoDB, whose batch has no transaction: what failed part way
+        // there has applied some of the draft, and the landing removes exactly
+        // those rows from it by identity (`ResultGrid::drop_applied`), so the
+        // kept draft is never sent twice. Not for a target that is neither
+        // (`Target::keeps_edits`).
+        let kept = edit && target.keeps_edits();
         // Whether the batch is the grid's staged cells: Apply edits, from its
         // review or appended to a query tab's buffer. An Insert or a Delete
         // row sends none of them, and a relation tab's send without a review
@@ -4264,7 +4266,7 @@ fn pour(
 fn markable_row(target: Target, tab: Tab, mode: EditMode, grid: &ResultGrid) -> bool {
     matches!(tab, Tab::Object(_))
         && mode == EditMode::Draft
-        && target.row_edits()
+        && target.keeps_edits()
         && grid.insert_target().is_some()
         && grid
             .selected_draft_rows()
