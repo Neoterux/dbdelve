@@ -845,9 +845,10 @@ impl Workspace {
         // and one it can has this column alone refused.
         // A snapshot written before edit targets were kept has none, so it
         // would read as untraceable too.
-        let (traced, snapshot, reason) = {
+        let (marked, traced, snapshot, reason) = {
             let grid = results.read(cx).delegate();
             (
+                grid.is_marked(row),
                 grid.row_editable(row),
                 grid.captured().is_some(),
                 grid.read_only_reason().map(str::to_string),
@@ -866,6 +867,7 @@ impl Workspace {
             });
         self.note(
             match (traced, reason, wrote, snapshot) {
+                _ if marked => "This row is marked for deletion.".into(),
                 (true, _, _, _) => "This column cannot be edited.".into(),
                 // The engine's own word on why, where it gave one.
                 (false, Some(reason), _, _) => reason,
@@ -1287,6 +1289,18 @@ impl Workspace {
             self.note("Close the new row form before deleting a row.".into(), cx);
             return;
         }
+        // In a Draft view of a table whose rows are written back, Delete row
+        // marks the rows in the grid, where the mark is part of the draft and
+        // `apply_edits` writes it. Every other view reviews the one `DELETE`.
+        if matches!(tab, Tab::Object(_))
+            && profile.session.edit_mode(tab) == EditMode::Draft
+            && target.row_edits()
+            && let Some(results) = profile.session.active_results().cloned()
+            && results.read(cx).delegate().insert_target().is_some()
+        {
+            self.toggle_row_marks(tab, results, cx);
+            return;
+        }
         // Browsing surfaces only. A query tab's grid is a view of the user's own
         // statement, and a delete there would be dbdelve writing into a buffer to
         // destroy rows -- bar an engine that takes them there
@@ -1371,6 +1385,45 @@ impl Workspace {
             });
         }
         cx.notify();
+    }
+
+    /// Delete row in a Draft view: toggle the deletion mark of the rows picked.
+    /// Nothing is sent and nothing is asked; the mark is part of the draft.
+    ///
+    /// Held back as staging a cell is: not while a review holds the draft, whose
+    /// statement a mark would no longer describe.
+    fn toggle_row_marks(
+        &mut self,
+        tab: Tab,
+        results: Entity<gpui_component::table::TableState<ResultGrid>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        if !profile.session.may_stage_into(tab) {
+            return;
+        }
+        if !self.confirm_stale(StaleResume::Delete, cx) {
+            return;
+        }
+        let unnameable = results.read(cx).delegate().read_only_reason().map_or_else(
+            || {
+                "dbdelve cannot name this row by its primary key, so it will not delete it."
+                    .to_string()
+            },
+            str::to_string,
+        );
+        let marked = results.update(cx, |table, cx| {
+            let grid = table.delegate_mut();
+            let rows = grid.selected_draft_rows();
+            let marked = grid.toggle_marks(&rows);
+            table.refresh(cx);
+            marked
+        });
+        if !marked {
+            self.note(unnameable, cx);
+        }
     }
 
     /// `cmd+c` on the active cell, whole value and all.
@@ -2024,9 +2077,10 @@ impl Workspace {
         // transaction (`Profile::bound_write_refusal`); on the connection's own
         // session the edit joins the user's open one, as a single row's does.
         let joins = profile.binding_of(tab).is_none() && profile.in_transaction;
-        // A draft holding an added row is written by the draft's own writer,
-        // for a relation tab alone: only there can a row be added.
-        if matches!(tab, Tab::Object(_)) && results.read(cx).delegate().added_count() > 0 {
+        // A draft holding an added row or a marked one is written by the
+        // draft's own writer, for a relation tab alone: only there can a row be
+        // added or marked.
+        if matches!(tab, Tab::Object(_)) && results.read(cx).delegate().holds_rows() {
             self.apply_draft(tab, &results, joins, window, cx);
             return;
         }
@@ -2097,11 +2151,13 @@ impl Workspace {
     ) {
         let engine = self.engine();
         let target = self.target();
-        let (inserts, updates, keys, relation) = {
+        let (inserts, updates, deletes, marks, keys, relation) = {
             let grid = results.read(cx).delegate();
             (
                 grid.draft_inserts(),
                 grid.pending_updates(),
+                grid.draft_deletes(),
+                grid.marked_count(),
                 grid.key_columns(),
                 grid.insert_target(),
             )
@@ -2129,7 +2185,7 @@ impl Workspace {
         // committed with it; the draft is kept for when the transaction ends.
         // A draft of one statement has no part before it, and an update-only
         // draft joins as it always has.
-        let statements = updates.len() + inserts.len();
+        let statements = deletes.len() + updates.len() + inserts.len();
         if joins && statements > 1 && engine.keeps_failed_transaction_open() {
             self.note(
                 "The draft was not applied: a transaction is open on this connection, where a \
@@ -2139,7 +2195,7 @@ impl Workspace {
             );
             return;
         }
-        let batch = match sql::draft_batch(engine, &[], &updates, &inserts, !joins) {
+        let batch = match sql::draft_batch(engine, &deletes, &updates, &inserts, !joins) {
             Ok(batch) => batch,
             Err(message) => {
                 self.note(message, cx);
@@ -2150,7 +2206,7 @@ impl Workspace {
         // dbdelve rather than a user error, so it is said and not run.
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         if !sql::is_generated_write_on(engine, &batch)
-            || sql::draft_deletes_match(engine, &batch, &keys, &schema, &table) != Some(0)
+            || sql::draft_deletes_match(engine, &batch, &keys, &schema, &table) != Some(marks)
         {
             self.note(
                 "dbdelve refused to run a statement it wrote itself: it is not a draft of \

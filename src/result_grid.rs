@@ -352,6 +352,11 @@ pub struct ResultGrid {
     /// and `result.rows` is never written, so discarding the draft is dropping
     /// this and `pending`.
     added: Vec<AddedRow>,
+    /// The fetched rows the user marked for deletion in a Draft view, by index
+    /// into `result.rows`: remapped by a sort in memory as `pending`'s rows
+    /// are, so a mark stays on the row it was put on. An added row is never
+    /// marked, it is removed (`toggle_marks`).
+    marked: std::collections::BTreeSet<usize>,
     /// The columns the server fills itself on an insert and refuses a value
     /// for (`Engine::generates`), by index into `columns`, marked where the
     /// structure arrives. An added row takes no value in them.
@@ -596,6 +601,7 @@ impl ResultGrid {
             not_nullable: Vec::new(),
             has_default: Vec::new(),
             added: Vec::new(),
+            marked: std::collections::BTreeSet::new(),
             generated: Vec::new(),
             follow_groups: Vec::new(),
             reference_menus: Vec::new(),
@@ -1663,6 +1669,7 @@ impl ResultGrid {
         for edit in &mut self.pending {
             edit.row = moved(edit.row);
         }
+        self.marked = self.marked.iter().map(|&row| moved(row)).collect();
         // Every field that names a row by its index goes through the same
         // permutation: a refused row's mark and Esc's target would otherwise
         // sit on whichever row is now at the old position.
@@ -1799,13 +1806,19 @@ impl ResultGrid {
     /// the gutter, in order, or the active cell's row alone when nothing has
     /// been. An added row is left out, being no row of the result.
     pub fn selected_row_indices(&self) -> Vec<usize> {
-        let rows: Vec<usize> = match self.row_selection_anchor.is_some() {
-            true => self.selected_rows.iter().copied().collect(),
-            false => self.active.map(|(row, _)| row).into_iter().collect(),
-        };
-        rows.into_iter()
+        self.selected_draft_rows()
+            .into_iter()
             .filter(|&row| row < self.fetched_rows())
             .collect()
+    }
+
+    /// [`Self::selected_row_indices`] with the added rows kept: what Delete
+    /// row acts on in a Draft view, where an added row is removed.
+    pub fn selected_draft_rows(&self) -> Vec<usize> {
+        match self.row_selection_anchor.is_some() {
+            true => self.selected_rows.iter().copied().collect(),
+            false => self.active.map(|(row, _)| row).into_iter().collect(),
+        }
     }
 
     /// The whole value behind the active cell, which is what `cmd+c` copies —
@@ -1953,6 +1966,12 @@ impl ResultGrid {
     /// back would be written as the text it looks like — see
     /// [`db::Engine::writes_back`].
     pub fn editable(&self, row: usize, col: usize) -> bool {
+        // Before every structural rule, and not in `set_pending`, whose `false`
+        // reads as a mode refusal and raises the mode prompt: a marked row is
+        // deleted, so a value staged on it would be written beside its `DELETE`.
+        if self.is_marked(row) {
+            return false;
+        }
         // Structural only: the mode lives one step further in, on `set_pending`.
         // A Read-only connection still opens its cells, because an open input is
         // how a value is selected and copied out of one -- what it refuses is
@@ -2272,19 +2291,108 @@ impl ResultGrid {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty() || !self.added.is_empty()
+        !self.pending.is_empty() || !self.added.is_empty() || !self.marked.is_empty()
     }
 
-    /// Whether the draft holds a change that is no staged cell: a row added
-    /// (a mark for deletion will count too). What wording that says "edits"
-    /// for cells alone asks, to say "changes" instead.
+    /// Whether the draft holds a change that is no staged cell: a row added or
+    /// a row marked for deletion. What wording that says "edits" for cells
+    /// alone asks, to say "changes" instead.
     pub fn holds_rows(&self) -> bool {
-        !self.added.is_empty()
+        !self.added.is_empty() || !self.marked.is_empty()
     }
-    /// The size of the draft: the cells staged on fetched rows and the rows
-    /// added, each counted once.
+
+    /// The size of the draft: the cells staged on fetched rows, the rows added
+    /// and the rows marked, each counted once.
     pub fn pending_count(&self) -> usize {
-        self.pending.len() + self.added.len()
+        self.pending.len() + self.added_count() + self.marked_count()
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marked.len()
+    }
+
+    pub fn is_marked(&self, row: usize) -> bool {
+        self.marked.contains(&row)
+    }
+
+    /// Toggle the deletion mark of the rows picked, an added row among them
+    /// being removed instead (it was never on the server). Then, when every
+    /// fetched row picked is marked they are unmarked, otherwise each unmarked
+    /// one is marked. A newly marked row drops its staged cells, which
+    /// unmarking does not bring back: only its `DELETE` is sent.
+    ///
+    /// `false`, with nothing changed, when the mode is below Read-write, the
+    /// rows await the stale-rows prompt, nothing was picked, or a fetched row
+    /// picked cannot be named by its key: a `DELETE` of it would reach another
+    /// row or none.
+    pub fn toggle_marks(&mut self, rows: &[usize]) -> bool {
+        if self.unconfirmed
+            || self.mode < Mode::ReadWrite
+            || self.result.edit.is_none()
+            || rows.is_empty()
+        {
+            return false;
+        }
+        let fetched = self.fetched_rows();
+        let picked: std::collections::BTreeSet<usize> = rows.iter().copied().collect();
+        if picked
+            .iter()
+            .any(|&row| row < fetched && self.row_key(row).is_none())
+        {
+            return false;
+        }
+        // Highest first: each removal moves the added rows after it down one.
+        for &row in picked.iter().rev().filter(|&&row| row >= fetched) {
+            if row - fetched < self.added.len() {
+                self.added.remove(row - fetched);
+            }
+        }
+        let rows_left = self.rows_total();
+        if picked.iter().any(|&row| row >= fetched) {
+            // The ring, the selection and an open input may name a row that is
+            // gone or now another's.
+            self.editing = None;
+            self.clear_row_selection();
+            self.selected_row = None;
+            if let Some((row, col)) = self.active
+                && row >= rows_left
+            {
+                self.active = rows_left.checked_sub(1).map(|row| (row, col));
+            }
+        }
+        let fetched_picked: Vec<usize> = picked.into_iter().filter(|&row| row < fetched).collect();
+        if fetched_picked.iter().all(|row| self.marked.contains(row)) {
+            for row in &fetched_picked {
+                self.marked.remove(row);
+            }
+        } else {
+            for row in fetched_picked {
+                if self.marked.insert(row) {
+                    self.discard_row(row);
+                }
+            }
+        }
+        true
+    }
+
+    /// The `DELETE` each marked row is written as, in grid order, each named by
+    /// the key it was fetched with. A row whose key cannot be read is left out,
+    /// which `toggle_marks` never lets be marked; the caller compares the count
+    /// with [`Self::marked_count`].
+    pub fn draft_deletes(&self) -> Vec<crate::sql::DraftDelete> {
+        self.marked
+            .iter()
+            .filter_map(|&row| {
+                let (schema, table, keys, null_keys) = self.row_key(row)?;
+                Some(crate::sql::DraftDelete {
+                    schema,
+                    table,
+                    keys,
+                    null_keys,
+                    types: self.row_types(row),
+                })
+            })
+            .collect()
     }
 
     /// The pending cell after the ring in reading order (before it, when
@@ -2313,6 +2421,7 @@ impl ResultGrid {
     pub fn discard_pending(&mut self) {
         self.pending.clear();
         self.added.clear();
+        self.marked.clear();
         self.editing = None;
         self.send_failure = None;
     }
@@ -7335,7 +7444,11 @@ mod tests {
 
         grid.sort_in_memory(vec![(0, false)]);
 
-        assert_eq!(grid.cell(1, 0), Some("8"), "the marked row moved to the middle");
+        assert_eq!(
+            grid.cell(1, 0),
+            Some("8"),
+            "the marked row moved to the middle"
+        );
         assert!(grid.is_marked(1) && !grid.is_marked(0) && !grid.is_marked(2));
         let deletes = grid.draft_deletes();
         assert_eq!(deletes.len(), 1);

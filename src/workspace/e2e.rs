@@ -22148,54 +22148,6 @@ fn a_refused_apply_keeps_the_draft(cx: &mut TestAppContext) {
     });
 }
 
-#[gpui::test]
-fn a_reviewed_delete_leaves_other_rows_edits_staged(cx: &mut TestAppContext) {
-    use crate::result_grid::NewValue;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        let id = open_own_table(&workspace, cx, "birds");
-        let grid = relation_grid(&workspace, cx, id);
-        grid.update(cx, |grid, _| {
-            assert!(
-                grid.delegate_mut()
-                    .set_pending(0, 1, NewValue::Value("robin".into()))
-            );
-            grid.delegate_mut().select_row(1);
-        });
-        cx.dispatch_action(crate::actions::DeleteRow);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Delete row", false, None))
-        );
-        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
-        settle(cx);
-
-        assert_eq!(
-            on_disk("select count(*) from birds").as_deref(),
-            Some("1"),
-            "row 2 is gone"
-        );
-        grid.read_with(cx, |grid, _| {
-            assert_eq!(grid.delegate().result().rows.len(), 2);
-            assert_eq!(
-                grid.delegate().pending_value(0, 1),
-                Some(&NewValue::Value("robin".into())),
-                "the other row's edit is not the delete's to drop"
-            );
-            assert_eq!(grid.delegate().pending_count(), 1);
-        });
-        workspace.read_with(cx, |workspace, _| {
-            assert_eq!(
-                workspace.profile().unwrap().session.shown_notice(),
-                Some("The change was applied. The rows were not read again: this tab has unapplied edits.")
-            );
-        });
-        quit(workspace, cx);
-    });
-}
-
 /// In a Draft view Delete row is a mark on the selected rows: nothing is
 /// asked and nothing is sent, and pressing it again takes the mark back.
 #[gpui::test]
