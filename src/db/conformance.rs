@@ -2067,6 +2067,220 @@ pub(super) fn verified_draft_round_trip(subject: &Subject) {
     assert!(subject.label_of(scenario, "911").is_empty(), "{at}");
 }
 
+/// A table with no primary key, read through the driver and written back by
+/// every value it holds: its target names every column, a draft that updates a
+/// row whose cell is NULL and deletes another applies with `IS NULL` in its
+/// predicate, and two identical rows make an edit refuse before anything is
+/// written, naming the step. The scratch table is the scenario's own, dropped
+/// before it starts and when it ends. Steps are built the way the workspace
+/// builds them, as in [`verified_draft_round_trip`].
+pub(super) fn verified_keyless_round_trip(subject: &Subject) {
+    let scenario = "verified_keyless_round_trip";
+    let at = format!("{scenario} on {:?}", subject.target.engine);
+    let engine = subject.target.engine;
+    if !subject.target.verifies_applies() {
+        return;
+    }
+    let (schema, relation) = (subject.schema, "dbdelve_keyless_scratch");
+    let table = engine.qualified(schema, relation);
+    let drop = format!("DROP TABLE IF EXISTS {table}");
+    let _cleanup = Cleanup {
+        connection: &subject.connection,
+        statements: vec![drop.clone()],
+        rollback: true,
+        read_write: false,
+    };
+    subject.run(scenario, &drop, Fetch::default());
+    subject.run(
+        scenario,
+        &format!(
+            "CREATE TABLE {table} ({} VARCHAR(32), {} INTEGER)",
+            engine.quote_identifier("label"),
+            engine.quote_identifier("n")
+        ),
+        Fetch::default(),
+    );
+    let types = vec![
+        ("label".to_string(), "varchar".to_string()),
+        ("n".to_string(), "integer".to_string()),
+    ];
+    for (label, n) in [
+        ("alpha", None),
+        ("beta", Some("2")),
+        ("dup", Some("3")),
+        ("dup", Some("3")),
+    ] {
+        let insert = sql::insert_row(
+            engine,
+            schema,
+            relation,
+            &[("label", Some(label)), ("n", n)],
+            &types,
+        )
+        .unwrap_or_else(|error| panic!("{at}: insert_row: {error}"));
+        assert!(
+            sql::is_generated_write_on(engine, &insert),
+            "{at}: {insert}"
+        );
+        subject.run(scenario, &insert, Fetch::default());
+    }
+
+    let read = || {
+        subject.run(
+            scenario,
+            &format!("SELECT * FROM {table}"),
+            Fetch::default(),
+        )
+    };
+    let held = |result: &QueryResult, row: usize| -> Vec<FetchedCell> {
+        result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| FetchedCell {
+                column: column.name.clone(),
+                text: result.rows[row].get(index).map(str::to_string),
+                cell_type: None,
+                column_type: column.data_type.clone(),
+            })
+            .collect()
+    };
+    let rows_now = || -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<_> = read()
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0).unwrap_or_default().to_string(),
+                    row.get(1).map(str::to_string),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let first = read();
+    let target = first
+        .edit
+        .clone()
+        .unwrap_or_else(|| panic!("{at}: no edit target: {:?}", first.read_only_reason));
+    assert_eq!(
+        target.row_match,
+        crate::db::RowMatch::EveryColumn { fixed: vec![] },
+        "{at}"
+    );
+    assert_eq!(target.keys, [0, 1], "{at}");
+    assert_eq!(
+        target.columns,
+        [Some("label".to_string()), Some("n".to_string())],
+        "{at}"
+    );
+    // The row at `result`'s index `row`, named the way the grid names it: the
+    // cells it has by value, the NULL ones apart.
+    let named = |result: &QueryResult, row: usize| -> (Vec<(String, String)>, Vec<String>) {
+        let mut keys = Vec::new();
+        let mut nulls = Vec::new();
+        for (index, name) in ["label", "n"].into_iter().enumerate() {
+            match result.rows[row].get(index) {
+                Some(value) => keys.push((name.to_string(), value.to_string())),
+                None => nulls.push(name.to_string()),
+            }
+        }
+        (keys, nulls)
+    };
+    let index_of = |result: &QueryResult, label: &str| {
+        result
+            .rows
+            .iter()
+            .position(|row| row.get(0) == Some(label))
+            .unwrap_or_else(|| panic!("{at}: no row {label}"))
+    };
+    let delete = |result: &QueryResult, row: usize| {
+        let (keys, null_keys) = named(result, row);
+        sql::DraftDelete {
+            schema: schema.into(),
+            table: relation.into(),
+            keys,
+            null_keys,
+            types: types.clone(),
+        }
+    };
+    let update = |result: &QueryResult, row: usize, text: &str| {
+        let (keys, null_keys) = named(result, row);
+        PendingRow {
+            schema: schema.into(),
+            table: relation.into(),
+            sets: vec![("label".into(), NewValue::Value(text.to_string().into()))],
+            keys,
+            null_keys,
+            types: types.clone(),
+            ..PendingRow::default()
+        }
+    };
+    let apply = |steps: &[VerifiedStep]| {
+        subject
+            .connection
+            .apply_verified(steps, Bracket::Own, &CancelToken::default())
+    };
+
+    // (a) One row whose `n` is NULL is updated and another is deleted, each
+    // named by every value it was read with.
+    let (alpha, beta) = (index_of(&first, "alpha"), index_of(&first, "beta"));
+    let batch = sql::draft_batch(
+        engine,
+        &[delete(&first, beta)],
+        &[update(&first, alpha, "gamma")],
+        &[],
+        false,
+    )
+    .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"));
+    let steps = verified_steps(
+        engine,
+        &batch,
+        vec![
+            (StepKind::Delete, held(&first, beta)),
+            (StepKind::Update, held(&first, alpha)),
+        ],
+    );
+    assert!(
+        steps.iter().any(|step| step.sql.contains("IS NULL")),
+        "{at}: the NULL cell is not matched with IS NULL: {batch}"
+    );
+    let outcome = apply(&steps);
+    assert!(
+        matches!(outcome, ApplyOutcome::Applied { affected: 2, .. }),
+        "{at}: {outcome:?}"
+    );
+    let dup = || ("dup".to_string(), Some("3".to_string()));
+    assert_eq!(
+        rows_now(),
+        [dup(), dup(), ("gamma".to_string(), None)],
+        "{at}"
+    );
+
+    // (b) Two rows alike in every value: the edit is refused before any write
+    // and names the step, and both rows are as they were.
+    let second = read();
+    let twin = index_of(&second, "dup");
+    let batch = sql::draft_batch(engine, &[], &[update(&second, twin, "merged")], &[], false)
+        .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"));
+    let steps = verified_steps(
+        engine,
+        &batch,
+        vec![(StepKind::Update, held(&second, twin))],
+    );
+    assert_eq!(
+        apply(&steps),
+        ApplyOutcome::Drifted(vec![(0, Drift::Ambiguous(2))]),
+        "{at}"
+    );
+    assert_eq!(
+        rows_now(),
+        [dup(), dup(), ("gamma".to_string(), None)],
+        "{at}: a refused draft wrote"
+    );
+}
+
 /// What DBDelve writes for a browsing surface, run on the subject: a paged
 /// preview, a header sort spliced into it, a count, and every filter operator
 /// the engine offers, each passing the gate and narrowing the fixture to the
