@@ -1878,8 +1878,7 @@ impl Workspace {
         // user's transaction cannot be rolled back without ending it.
         if profile.binding_of(tab).is_none()
             && profile.in_transaction
-            && target.verifies_applies()
-            && !names_rows_by_key(results.read(cx).delegate())
+            && names_rows_by_every_column(results.read(cx).delegate())
         {
             results.update(cx, |table, cx| {
                 table.delegate_mut().set_send_failure(
@@ -2213,10 +2212,7 @@ impl Workspace {
         let pending = results.read(cx).delegate().pending_updates();
         // Only one write on a row named by its primary key joins the user's
         // transaction; the draft is kept for when it ends.
-        if joins
-            && (pending.len() > 1
-                || (target.verifies_applies() && !names_rows_by_key(results.read(cx).delegate())))
-        {
+        if joins && (pending.len() > 1 || names_rows_by_every_column(results.read(cx).delegate())) {
             self.note(DRAFT_IN_TRANSACTION.into(), cx);
             return;
         }
@@ -2338,7 +2334,7 @@ impl Workspace {
         // kept for when the transaction ends.
         if joins
             && (deletes.len() + updates.len() + inserts.len() > 1
-                || (target.verifies_applies() && !names_rows_by_key(results.read(cx).delegate())))
+                || names_rows_by_every_column(results.read(cx).delegate()))
         {
             self.note(DRAFT_IN_TRANSACTION.into(), cx);
             return;
@@ -2689,6 +2685,18 @@ fn names_rows_by_key(grid: &ResultGrid) -> bool {
         .edit
         .as_ref()
         .is_some_and(|edit| edit.row_match == db::RowMatch::Key)
+}
+
+/// Whether `grid` names the rows it writes back by every column they were read
+/// with: the write that never joins a transaction the user opened. Asked
+/// positively, so a grid with no edit target, which has no write to refuse,
+/// says no, and a target that does not verify applies is refused as one that
+/// does.
+fn names_rows_by_every_column(grid: &ResultGrid) -> bool {
+    grid.result()
+        .edit
+        .as_ref()
+        .is_some_and(|edit| matches!(edit.row_match, db::RowMatch::EveryColumn { .. }))
 }
 
 /// The sentence for a draft whose statements cannot be paired with its rows.
