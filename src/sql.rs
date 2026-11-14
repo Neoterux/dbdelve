@@ -793,8 +793,9 @@ fn sql_match(spec: &EngineSpec, row: Match, types: &[(String, String)]) -> Optio
 }
 
 /// Whether `sql` is a statement dbdelve could have written: one or more `UPDATE`s,
-/// a single `INSERT` of literals, a single `DELETE` naming one row, or a lone
-/// transaction bracket, and nothing else at all.
+/// a single `INSERT` of literals, a single `DELETE` naming one row, a draft of
+/// several of those (one-row `INSERT`s and `DELETE`s among them, see
+/// [`draft_sequence`]), or a lone transaction bracket, and nothing else at all.
 ///
 /// The one gate every dbdelve-generated statement passes before anything runs,
 /// and the code half of hard rule 1 — dbdelve never writes a `DROP` or a
@@ -802,6 +803,10 @@ fn sql_match(spec: &EngineSpec, row: Match, types: &[(String, String)]) -> Optio
 /// conjunction of equalities over distinct, unqualified columns. A whitelist,
 /// because a blocklist of keywords is only a list of the spellings someone
 /// thought of.
+///
+/// A draft's `DELETE`s are each one named row, and the draft is reviewed in full
+/// before it runs: hard rule 1 admits a `DELETE` only as the deletion of one
+/// named row, however many a reviewed draft holds.
 ///
 /// The delete's shape is read out of the parse tree rather than trusted because
 /// `delete_row` produced it. A gate that trusts its caller is a comment, and the
@@ -868,6 +873,17 @@ pub(crate) fn generated_write(spec: &SqlSpec, sql: &str) -> bool {
         return delete_key_columns(spec, sql).is_some();
     }
 
+    // A reviewed draft: several statements of the three kinds the grid writes,
+    // holding at least one that a batch of updates does not.
+    if kinds.len() > 1
+        && kinds
+            .iter()
+            .all(|kind| matches!(*kind, "update" | "insert" | "delete"))
+        && kinds.iter().any(|kind| *kind != "update")
+    {
+        return draft_sequence(spec, root, &statements, &kinds, sql);
+    }
+
     // A row named by every value is written only through a predicate the
     // exactly-one guard can count, so each update must be that shape too.
     let updates = !kinds.is_empty()
@@ -884,6 +900,54 @@ pub(crate) fn generated_write(spec: &SqlSpec, sql: &str) -> bool {
     // checks below read only by kind.
     ((kinds == ["insert"] && literal_insert(statements[0], sql) && !commented(root)) || updates)
         && !deletes_anything(root)
+}
+
+/// Whether a submission of several `UPDATE`s, `INSERT`s and `DELETE`s is a
+/// draft dbdelve could have written: every statement one row, and no `DELETE`
+/// anywhere but in a statement of its own.
+///
+/// Each top-level statement is read from the tree: an `INSERT` is one row of
+/// literals with no tail, and a `DELETE` is [`one_row_delete`] over a
+/// conjunction of equalities. The count of `delete` nodes in the whole tree
+/// must equal the count of those statements, so one hidden in a CTE beside an
+/// `UPDATE` finds no statement to account for it. No comment is admitted
+/// anywhere (MySQL runs `/*! … */` as SQL), and not on a spec that names a row
+/// by every value, whose one-row guard a sequence cannot carry.
+///
+/// Reads a `DELETE`'s shape and never its key or table, as the lone `DELETE`
+/// does: those are [`draft_deletes_match`]'s to answer.
+fn draft_sequence(
+    spec: &SqlSpec,
+    root: Node,
+    statements: &[Node],
+    kinds: &[&str],
+    sql: &str,
+) -> bool {
+    if spec.row_terms || commented(root) {
+        return false;
+    }
+    let one_row = |statement: &Node, kind: &&str| match *kind {
+        // The `UPDATE` arm of a batch reads the kind alone on a spec that
+        // names rows by key (see `updates` in `generated_write`), and a
+        // sequence inherits that rather than tightening it.
+        "update" => true,
+        "insert" => one_row_literal_insert(*statement, sql),
+        _ => one_row_delete(*statement)
+            .is_some_and(|(_, predicate)| row_columns(spec, predicate, sql).is_some()),
+    };
+    let deletes = kinds.iter().filter(|kind| **kind == "delete").count();
+    statements.iter().zip(kinds).all(|(s, k)| one_row(s, k))
+        && count_kind(root, "delete") == deletes
+}
+
+/// How many nodes of `kind` the tree holds, at any depth.
+fn count_kind(node: Node, kind: &str) -> usize {
+    let mut cursor = node.walk();
+    usize::from(node.kind() == kind)
+        + node
+            .children(&mut cursor)
+            .map(|child| count_kind(child, kind))
+            .sum::<usize>()
 }
 
 /// `sql` as the write gate reads it: unchanged, except on ClickHouse, where
@@ -975,17 +1039,37 @@ pub(crate) fn is_transaction_bracket(sql: &str) -> bool {
 /// and `ON DUPLICATE KEY UPDATE a = VALUES(a)` are real clauses nothing
 /// generates.
 fn literal_insert(statement: Node, sql: &str) -> bool {
+    literal_insert_shape(statement, sql).is_some()
+}
+
+/// [`literal_insert`] for a draft's `INSERT`: one row, and nothing after it.
+/// A row-skipping tail is Import Rows' clause and a second row is its chunk,
+/// and neither is something the grid writes.
+fn one_row_literal_insert(statement: Node, sql: &str) -> bool {
+    literal_insert_shape(statement, sql)
+        == Some(InsertShape {
+            rows: 1,
+            tail: false,
+        })
+}
+
+/// What [`literal_insert`] admitted: how many rows of literals the statement
+/// holds and whether a row-skipping tail follows them.
+#[derive(PartialEq, Eq)]
+struct InsertShape {
+    rows: usize,
+    tail: bool,
+}
+
+fn literal_insert_shape(statement: Node, sql: &str) -> Option<InsertShape> {
     // `RETURNING` hangs beside the insert, not under it.
-    let Some(insert) = statement
+    let insert = statement
         .named_child(0)
-        .filter(|_| statement.named_child_count() == 1)
-    else {
-        return false;
-    };
+        .filter(|_| statement.named_child_count() == 1)?;
     let mut cursor = insert.walk();
     let children: Vec<_> = insert.named_children(&mut cursor).collect();
     let [keyword, into, target, columns, values, rest @ ..] = children.as_slice() else {
-        return false;
+        return None;
     };
     let kinds = [keyword, into, target, columns, values].map(|node| node.kind());
     if kinds
@@ -998,7 +1082,7 @@ fn literal_insert(statement: Node, sql: &str) -> bool {
         ]
         || !plain_columns(*columns, sql)
     {
-        return false;
+        return None;
     }
 
     let rows = rest.iter().take_while(|node| node.kind() == "list").count();
@@ -1011,13 +1095,8 @@ fn literal_insert(statement: Node, sql: &str) -> bool {
                 .iter()
                 .all(|value| literal_value(*value, sql) || null_literal(*value, sql))
     });
-    let Some(last) = rows.last() else {
-        return false;
-    };
-    let Some(text) = sql.get(last.end_byte()..insert.end_byte()) else {
-        return false;
-    };
-    let text = text.trim();
+    let last = rows.last()?;
+    let text = sql.get(last.end_byte()..insert.end_byte())?.trim();
     let tail_kinds: Vec<_> = tail.iter().map(|node| node.kind()).collect();
     let skip = match tail_kinds.as_slice() {
         [] => text.is_empty(),
@@ -1037,7 +1116,10 @@ fn literal_insert(statement: Node, sql: &str) -> bool {
             .is_some_and(|column| text == format!("ON DUPLICATE KEY UPDATE {column} = {column}")),
         _ => false,
     };
-    literal_rows && skip
+    (literal_rows && skip).then_some(InsertShape {
+        rows: rows.len(),
+        tail: !tail.is_empty(),
+    })
 }
 
 /// A column list whose every entry is a plain or quoted name. A `"…"` name is a
@@ -2297,23 +2379,44 @@ fn sql_statements(
     own_brackets: bool,
 ) -> Result<String, String> {
     if rows.is_empty() {
-        return Err("There are no edits to apply.".into());
+        return Err(NO_EDITS.into());
     }
+    let statements = update_statements(spec, rows).ok_or(NO_KEY)?;
+    Ok(bracketed(
+        spec,
+        statements.join("\n"),
+        statements.len(),
+        own_brackets,
+    ))
+}
 
-    fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
-        pairs
-            .iter()
-            .map(|(column, value)| (column.as_str(), value.as_str()))
-            .collect()
-    }
-    fn borrowed_sets(pairs: &[(String, NewValue)]) -> Vec<(&str, NewValue)> {
-        pairs
-            .iter()
-            .map(|(column, value)| (column.as_str(), value.clone()))
-            .collect()
-    }
-    let statements: Option<Vec<String>> = rows
+const NO_EDITS: &str = "There are no edits to apply.";
+const NO_KEY: &str = "dbdelve cannot name an edited row by its primary key.";
+
+fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+    pairs
         .iter()
+        .map(|(column, value)| (column.as_str(), value.as_str()))
+        .collect()
+}
+
+fn borrowed_sets(pairs: &[(String, NewValue)]) -> Vec<(&str, NewValue)> {
+    pairs
+        .iter()
+        .map(|(column, value)| (column.as_str(), value.clone()))
+        .collect()
+}
+
+fn borrowed_names(names: &[String]) -> Vec<&str> {
+    names.iter().map(String::as_str).collect()
+}
+
+/// Each row's `UPDATE`, or `None` when any row cannot be named by its key.
+///
+/// Terminated, not separated: the last statement carries its semicolon too, so
+/// appending to a buffer cannot fuse it onto whatever the user writes next.
+fn update_statements(spec: &EngineSpec, rows: &[PendingRow]) -> Option<Vec<String>> {
+    rows.iter()
         .map(|row| {
             sql_update_statement(
                 spec,
@@ -2322,29 +2425,142 @@ fn sql_statements(
                 &borrowed_sets(&row.sets),
                 Match {
                     keys: &borrowed(&row.keys),
-                    nulls: &row.null_keys.iter().map(String::as_str).collect::<Vec<_>>(),
+                    nulls: &borrowed_names(&row.null_keys),
                 },
                 row.update,
                 &row.types,
             )
-            // Terminated, not separated: the last statement carries its
-            // semicolon too, so appending to a buffer cannot fuse it onto
-            // whatever the user writes next.
             .map(|statement| format!("{statement};"))
         })
-        .collect();
+        .collect()
+}
 
-    let batch = statements
-        .ok_or("dbdelve cannot name an edited row by its primary key.")?
-        .join("\n");
+/// `batch` inside the engine's own transaction words, when it holds more than
+/// one statement and the caller has no transaction of its own open. Postgres
+/// has no words: one submission is already atomic there.
+fn bracketed(spec: &EngineSpec, batch: String, statements: usize, own_brackets: bool) -> String {
     let opening = spec
         .sql
         .transaction_opening()
-        .filter(|_| own_brackets && rows.len() > 1);
-    Ok(match opening {
+        .filter(|_| own_brackets && statements > 1);
+    match opening {
         Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
         None => batch,
-    })
+    }
+}
+
+/// A marked row, named by the key it was fetched with: what the grid hands over
+/// for a draft's `DELETE`. `null_keys` are the columns of a row named by every
+/// value that read NULL, as on [`PendingRow`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the draft's apply is the first caller")
+)]
+pub(crate) struct DraftDelete {
+    pub schema: String,
+    pub table: String,
+    pub keys: Vec<(String, String)>,
+    pub null_keys: Vec<String>,
+    pub types: Vec<(String, String)>,
+}
+
+/// An added row's touched cells, which is every column its `INSERT` names: an
+/// untouched column is left out, so the server's default applies to it. `None`
+/// is `NULL`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the draft's apply is the first caller")
+)]
+pub(crate) struct DraftInsert {
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<(String, Option<String>)>,
+    pub types: Vec<(String, String)>,
+}
+
+/// A draft's `DELETE`s, `UPDATE`s and `INSERT`s as one string, in that order,
+/// each group in the order given.
+///
+/// Brackets as [`update_batch`] has them, from the engine's own words: more
+/// than one statement and `own_brackets`, never joining a transaction the user
+/// opened, whose `COMMIT` the batch's would end. Postgres writes none.
+///
+/// An error when the draft is empty, and when any row cannot be written, so a
+/// draft is never sent shorter than it was made. A draft that adds or deletes
+/// rows is not written for MongoDB or Redis, which never offer one.
+///
+/// The text is not trusted for being written here: the apply passes it through
+/// [`is_generated_write_on`] and [`draft_deletes_match`] before it is shown.
+// ponytail: the order is fixed, deletes then updates then inserts, and not
+// dependency-sorted. A parent marked above its child under an immediate
+// foreign key, an existing row re-pointed at a new parent, and a two-row unique
+// swap fail with the server's own error; the bracket rolls the batch back and
+// the draft is kept. The upgrade is ordering by the relation's keys.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the draft's apply is the first caller")
+)]
+pub(crate) fn draft_batch(
+    engine: Engine,
+    deletes: &[DraftDelete],
+    updates: &[PendingRow],
+    inserts: &[DraftInsert],
+    own_brackets: bool,
+) -> Result<String, String> {
+    match engine.syntax() {
+        Syntax::Sql => sql_draft_batch(engine.spec(), deletes, updates, inserts, own_brackets),
+        Syntax::Mongo | Syntax::Redis => {
+            Err("A draft that adds or deletes rows is not written for this engine.".into())
+        }
+    }
+}
+
+/// [`draft_batch`] for a spec of its own, which `src/sql_snapshots` writes.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the draft's apply is the first caller")
+)]
+pub(crate) fn sql_draft_batch(
+    spec: &EngineSpec,
+    deletes: &[DraftDelete],
+    updates: &[PendingRow],
+    inserts: &[DraftInsert],
+    own_brackets: bool,
+) -> Result<String, String> {
+    if deletes.is_empty() && updates.is_empty() && inserts.is_empty() {
+        return Err(NO_EDITS.into());
+    }
+    let mut statements = Vec::new();
+    for row in deletes {
+        let statement = sql_delete_row(
+            spec,
+            &row.schema,
+            &row.table,
+            Match {
+                keys: &borrowed(&row.keys),
+                nulls: &borrowed_names(&row.null_keys),
+            },
+            &row.types,
+        )
+        .ok_or(NO_KEY)?;
+        statements.push(format!("{statement};"));
+    }
+    statements.extend(update_statements(spec, updates).ok_or(NO_KEY)?);
+    for row in inserts {
+        let columns: Vec<(&str, Option<&str>)> = row
+            .columns
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_deref()))
+            .collect();
+        let statement = sql_insert_row(spec, &row.schema, &row.table, &columns, &row.types)?;
+        statements.push(format!("{statement};"));
+    }
+    Ok(bracketed(
+        spec,
+        statements.join("\n"),
+        statements.len(),
+        own_brackets,
+    ))
 }
 
 /// One row's `UPDATE`: every column in `sets` assigned, every column in `keys`
@@ -7964,7 +8180,7 @@ mod tests {
     #[test]
     fn a_mixed_draft_is_admitted_with_or_without_its_brackets_on_every_row_edit_engine() {
         for engine in draft_row_edit_engines() {
-            let shapes: [(&str, Vec<DraftDelete>, Vec<PendingRow>, Vec<DraftInsert>); 6] = [
+            let shapes = [
                 (
                     "delete, update, insert",
                     vec![draft_delete("7")],
@@ -8026,10 +8242,14 @@ mod tests {
 
         // ClickHouse names a row by every value, which a sequence cannot count.
         let engine = Engine::ClickHouse;
+        let typed = DraftDelete {
+            types: vec![("id".into(), "Int32".into())],
+            ..draft_delete("7")
+        };
         for own_brackets in [true, false] {
             let batch = draft_batch(
                 engine,
-                &[draft_delete("7")],
+                std::slice::from_ref(&typed),
                 &[],
                 &[draft_insert("9", None)],
                 own_brackets,
