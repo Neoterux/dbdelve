@@ -1275,7 +1275,7 @@ impl ResultGrid {
     /// Wide enough for the last row's number and no wider, padded the same on
     /// both sides.
     fn gutter_width(&self) -> f32 {
-        let digits = self.result.rows.len().max(1).to_string().len() as f32;
+        let digits = self.rows_total().max(1).to_string().len() as f32;
         layout::grid(digits * DIGIT_WIDTH) + 2.0 * layout::SPACE_SM
     }
 
@@ -1843,7 +1843,7 @@ impl ResultGrid {
     pub fn select_col(&mut self, col: usize) {
         // A result with no rows has no cell for the ring to sit on, and every
         // reader of `active` takes its row to be one that exists.
-        if self.result.rows.is_empty() && self.added.is_empty() {
+        if self.rows_total() == 0 {
             return;
         }
         self.set_active(self.active.map_or(0, |(row, _)| row), col);
@@ -1994,6 +1994,11 @@ impl ResultGrid {
 
     pub fn added_count(&self) -> usize {
         self.added.len()
+    }
+
+    /// Every row the grid draws: the fetched ones and the ones added after them.
+    fn rows_total(&self) -> usize {
+        self.fetched_rows() + self.added.len()
     }
 
     /// Add an empty row at the end of the grid and put the ring on its first
@@ -2925,7 +2930,7 @@ pub(crate) fn take_keyboard(
     cx: &mut Context<TableState<ResultGrid>>,
 ) {
     table.focus_handle(cx).focus(window, cx);
-    if table.delegate().result.rows.is_empty() || table.selected_row().is_some() {
+    if table.delegate().rows_total() == 0 || table.selected_row().is_some() {
         return;
     }
     let row = match table.delegate().active {
@@ -3150,7 +3155,7 @@ impl TableDelegate for ResultGrid {
     }
 
     fn rows_count(&self, _: &App) -> usize {
-        self.fetched_rows() + self.added.len()
+        self.rows_total()
     }
 
     /// A wash across the row, for one the gutter has picked out. Painted here
@@ -3189,6 +3194,9 @@ impl TableDelegate for ResultGrid {
         // stay apart (`theme::tests`) with one over the other.
         let row = row.when(self.row_has_pending(row_ix), |row| {
             row.child(div().absolute().size_full().bg(t.updated))
+        });
+        let row = row.when(self.added_row(row_ix).is_some(), |row| {
+            row.child(div().absolute().size_full().bg(t.added))
         });
         if !self.selected_rows.contains(&row_ix) {
             return row;
@@ -3276,12 +3284,20 @@ impl TableDelegate for ResultGrid {
         match col_ix.checked_sub(GUTTER).and_then(|p| self.column_at(p)) {
             Some(col) => self.data_td(row_ix, col, window, cx).into_any_element(),
             None => {
-                let (faint, text, selected_bg, danger, updated) = {
+                let (faint, text, selected_bg, danger, updated, added) = {
                     let t = theme(cx);
-                    (t.text_faint, t.text, t.selection, t.danger, t.updated)
+                    (
+                        t.text_faint,
+                        t.text,
+                        t.selection,
+                        t.danger,
+                        t.updated,
+                        t.added,
+                    )
                 };
                 let selected = self.selected_rows.contains(&row_ix);
                 let changed = self.row_has_pending(row_ix);
+                let is_added = self.added_row(row_ix).is_some();
                 // What the server said to this row's send, on the one cell
                 // that is the row's and not a column's.
                 let refused = self
@@ -3310,6 +3326,18 @@ impl TableDelegate for ResultGrid {
                                 .bottom_0()
                                 .w(px(3.0))
                                 .bg(Rgba { a: 1.0, ..updated }),
+                        )
+                    })
+                    .when(is_added, |cell| {
+                        cell.child(
+                            div()
+                                .debug_selector(move || format!("row-added-{row_ix}"))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(3.0))
+                                .bg(Rgba { a: 1.0, ..added }),
                         )
                     })
                     .when_some(refused.clone(), |cell, message| {
@@ -3771,9 +3799,12 @@ impl ResultGrid {
         // `shown`, so it falls into the same branch a fetched NULL does while
         // still wearing the edited wash — but it must say which keyword, or a
         // staged `DEFAULT` would read as a staged `NULL`. An added row's
-        // untouched cell holds nothing yet, which is not a NULL.
+        // untouched cell holds nothing yet, which is not a NULL: it says what
+        // the server will do where the column has a default, and nothing where
+        // it has none.
         let keyword = match staged {
             Some(NewValue::Default) => DEFAULT_LABEL,
+            None if added && self.offers_default(col_ix) => DEFAULT_LABEL,
             None if added || self.missing(row_ix, col_ix) => SharedString::default(),
             _ => NULL_LABEL,
         };
@@ -3800,7 +3831,8 @@ impl ResultGrid {
             })
             // Italic so a NULL cannot be mistaken for the four-letter string.
             .when(cell.is_none(), |cell| cell.italic())
-            .when(staged.is_some(), |cell| cell.bg(edited_bg))
+            // The whole added row is new, so no one of its cells is "edited".
+            .when(staged.is_some() && !added, |cell| cell.bg(edited_bg))
             // The value is the child that gives way, beside an arrow or not.
             // Bare text in a row does not shrink and a flex container does not
             // ellipsise its own text, so a value as wide as its column -- every
