@@ -2316,6 +2316,68 @@ mod tests {
         }
     }
 
+    /// What a row's washes have to hold in: every built-in theme and the Zed
+    /// defaults as the importer converts them, which is the one place a wash
+    /// is not tuned by hand.
+    fn every_theme_and_the_zed_defaults() -> Vec<Theme> {
+        let mut all = Theme::all();
+        all.extend(zed::bundled());
+        all
+    }
+
+    #[test]
+    fn the_updated_wash_stands_off_selection_even_with_selection_over_it() {
+        // A row with changes is read against a selected one, and a selected
+        // row with changes is read against the same row unselected.
+        for t in every_theme_and_the_zed_defaults() {
+            let updated = t.updated.flatten(t.bg);
+            let step = updated.distance(t.selection.flatten(t.bg));
+            assert!(
+                step >= ROW_WASH_FROM_SELECTION,
+                "{}: an updated row is {step:.1} off a selected one",
+                t.name
+            );
+            let step = t.selection.flatten(updated).distance(updated);
+            assert!(
+                step >= ROW_WASH_FROM_SELECTION,
+                "{}: selection over an updated row moves it {step:.1}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_edited_cell_stands_off_an_updated_row_in_every_theme() {
+        for t in every_theme_and_the_zed_defaults() {
+            let updated = t.updated.flatten(t.bg);
+            let step = t.edited.flatten(updated).distance(updated);
+            assert!(
+                step >= ROW_WASH_FROM_SELECTION,
+                "{}: an edited cell is {step:.1} off the updated row it is in",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_row_washes_stand_off_each_other_in_every_theme() {
+        for t in every_theme_and_the_zed_defaults() {
+            let [added, updated, deleted] =
+                [t.added, t.updated, t.deleted].map(|w| w.flatten(t.bg));
+            for (pair, step) in [
+                ("added and updated", added.distance(updated)),
+                ("added and deleted", added.distance(deleted)),
+                ("updated and deleted", updated.distance(deleted)),
+            ] {
+                assert!(
+                    step >= ROW_WASHES_APART,
+                    "{}: {pair} rows are {step:.1} apart",
+                    t.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_coloured_pill_is_visible_and_legible_in_every_theme() {
         // The titlebar's connection name, filled with the connection's own
@@ -2757,6 +2819,9 @@ mod tests {
                     for (wash, over) in [
                         ("selected", t.selection),
                         ("edited", t.edited),
+                        ("added", t.added),
+                        ("updated", t.updated),
+                        ("deleted", t.deleted),
                         ("hovered", t.element_hover),
                         ("highlighted", t.element_active),
                     ] {
