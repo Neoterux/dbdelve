@@ -2795,6 +2795,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::copy_plan_action))
                     .on_action(cx.listener(Self::set_row_limit))
                     .on_action(cx.listener(Self::set_query_limit))
+                    .on_action(cx.listener(Self::pick_edit_mode))
                     .on_action(cx.listener(Self::custom_row_limit))
                     .on_action(cx.listener(Self::refresh_active_relation))
                     .on_action(cx.listener(Self::next_page))

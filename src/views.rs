@@ -40,9 +40,9 @@ use crate::{
         AcceptCompletion, AddFilter, CancelQuery, CommitTransaction, CopyCell, CopySelection,
         CustomRowLimit, ExplainQuery, FormatQuery, ImportRows, ImportRowsFromClipboard,
         LimitTarget, NewQuery, NewRow, NextPage, PreviousPage, RemoveFilter, RollbackTransaction,
-        RunQuery, SaveQuery, SetDefaultRowLimit, SetFilterColumn, SetFilterOperator, SetFilterRaw,
-        SetQueryLimit, SetRowLimit, ToggleAutoCommit, ToggleComment, ToggleFilterJoin,
-        ToggleNextJoin, ToggleResults, ToggleRowPanel,
+        RunQuery, SaveQuery, SetDefaultRowLimit, SetEditMode, SetFilterColumn, SetFilterOperator,
+        SetFilterRaw, SetQueryLimit, SetRowLimit, ToggleAutoCommit, ToggleComment,
+        ToggleFilterJoin, ToggleNextJoin, ToggleResults, ToggleRowPanel,
     },
     db,
     db::{Engine, ExplainMode, RoutineKind, Target},
@@ -3281,24 +3281,27 @@ pub(crate) fn render_edit_mode(
                     .text_color(t.text_faint)
                     .child("Edit"),
             )
-            .children(EditMode::ALL.map(|choice| {
-                div()
-                    .debug_selector(move || {
-                        match choice {
-                            EditMode::Classic => "edit-mode-classic",
-                            EditMode::Draft => "edit-mode-draft",
-                            EditMode::Row => "edit-mode-row",
-                        }
-                        .into()
-                    })
-                    .child(choice_chip(
-                        ("edit-mode", choice as usize),
-                        choice.label(),
-                        choice == mode,
-                        cx,
-                        move |workspace, _, cx| workspace.set_edit_mode(choice, cx),
-                    ))
-            }))
+            // One menu rather than a chip per mode: three chips cost the bar
+            // the room its Apply and Discard buttons need on a narrow window.
+            .child(
+                div().debug_selector(|| "edit-mode".into()).child(
+                    button("edit-mode", mode.label(), Tone::Quiet, Control::Compact, t)
+                        .child(
+                            icon(icon::CHEVRON_DOWN)
+                                .size(px(layout::chrome(layout::ICON_SIZE)))
+                                .text_color(t.text_faint),
+                        )
+                        .dropdown_menu(move |menu, _, _| {
+                            EditMode::ALL.into_iter().fold(menu, |menu, choice| {
+                                menu.menu_with_check(
+                                    choice.label(),
+                                    choice == mode,
+                                    Box::new(SetEditMode { mode: choice }),
+                                )
+                            })
+                        }),
+                ),
+            )
             .into_any_element()
     })
 }

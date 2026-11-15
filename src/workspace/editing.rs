@@ -1822,6 +1822,15 @@ impl Workspace {
     /// Classic and Draft with no prompt, since both review the same `UPDATE`s.
     /// Leaving Row over edited rows sends them first, as any action that leaves
     /// them would (`held_for_edits`), and does not switch if one is refused.
+    pub(crate) fn pick_edit_mode(
+        &mut self,
+        action: &crate::actions::SetEditMode,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_edit_mode(action.mode, cx);
+    }
+
     pub(crate) fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
         let mode = mode.on(self.target());
         let Some(profile) = self.profile() else {

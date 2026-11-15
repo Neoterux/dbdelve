@@ -2565,7 +2565,7 @@ impl Sorting {
 /// table the user is correcting row by row and a result they are drafting a
 /// batch against want different answers; a new view starts from the Edit mode
 /// setting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub(crate) enum EditMode {
     Classic,
     #[default]

@@ -17591,6 +17591,23 @@ fn an_unbound_tab_in_complex_mode_keeps_its_transaction_controls(cx: &mut TestAp
 }
 
 /// Clicks the control drawn under `selector` where it is, as a person does.
+/// Pick an edit mode from the status bar's menu: the button must be drawn,
+/// and the pick is the action its menu rows carry.
+fn pick_edit_mode(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    mode: crate::session::EditMode,
+) {
+    assert!(
+        cx.debug_bounds("edit-mode").is_some(),
+        "the edit mode menu is not drawn"
+    );
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.pick_edit_mode(&crate::actions::SetEditMode { mode }, window, cx)
+    });
+    settle(cx);
+}
+
 fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx
         .debug_bounds(selector)
@@ -24394,11 +24411,10 @@ fn the_status_bar_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
         });
         let id = open_own_table(&workspace, cx, "birds");
         let grid = relation_grid(&workspace, cx, id);
-        let chips = ["edit-mode-draft", "edit-mode-row"];
-        assert_eq!(drawn(cx, &chips), [true, true]);
+        assert_eq!(drawn(cx, &["edit-mode"]), [true]);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
 
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
         save(&workspace, cx);
@@ -24411,17 +24427,17 @@ fn the_status_bar_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
 
         // The mode the view already has: nothing changes and nothing is said.
         workspace.update(cx, |workspace, _| workspace.clear_notice());
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         assert_eq!(shown_notice(&workspace, cx), None);
 
-        click_selector(cx, "edit-mode-draft");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Draft);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
 
         // A draft is never sent by switching: the Row chip refuses and says so.
         stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
         stage(&grid, cx, 1, 1, NewValue::Value("owl".into()));
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
         grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 2));
         assert_eq!(
@@ -24444,7 +24460,7 @@ fn the_status_bar_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
             });
         });
         settle(cx);
-        assert_eq!(drawn(cx, &chips), [false, false]);
+        assert_eq!(drawn(cx, &["edit-mode"]), [false]);
         assert_eq!(front_edit_mode(&workspace, cx), None);
         quit(workspace, cx);
     });
@@ -25067,10 +25083,9 @@ fn the_status_bar_and_the_palette_put_a_table_in_classic_mode(cx: &mut TestAppCo
         });
         let has = |rows: &[String], label: &str| rows.iter().any(|row| row == label);
         open_own_table(&workspace, cx, "birds");
-        let chips = ["edit-mode-classic", "edit-mode-draft", "edit-mode-row"];
-        assert_eq!(drawn(cx, &chips), [true, true, true]);
+        assert_eq!(drawn(cx, &["edit-mode"]), [true]);
 
-        click_selector(cx, "edit-mode-classic");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Classic);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Classic));
         let rows = palette_listing(&workspace, cx);
         assert!(has(&rows, "Edit in Draft mode"), "{rows:?}");
@@ -25100,7 +25115,7 @@ fn the_status_bar_and_the_palette_put_a_table_in_classic_mode(cx: &mut TestAppCo
             });
         });
         settle(cx);
-        assert_eq!(drawn(cx, &chips), [false, false, false]);
+        assert_eq!(drawn(cx, &["edit-mode"]), [false]);
         quit(workspace, cx);
     });
 }
@@ -28361,7 +28376,7 @@ fn row_to_draft_saves_the_dirty_row_first(cx: &mut TestAppContext) {
 
         // A row the server refuses leaves the view in Row.
         stage(&grid, cx, 0, 1, NewValue::Null);
-        click_selector(cx, "edit-mode-draft");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Draft);
         settle_through(cx);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         assert_eq!(pending_of(&grid, cx), 1);
@@ -28373,7 +28388,7 @@ fn row_to_draft_saves_the_dirty_row_first(cx: &mut TestAppContext) {
         });
 
         stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
-        click_selector(cx, "edit-mode-draft");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Draft);
         settle_through(cx);
         assert_no_discard_prompt(&workspace, cx);
         assert_eq!(
@@ -28737,14 +28752,14 @@ fn switching_to_draft_from_a_row_the_server_refused_asks_to_discard_the_row(
         let (_, grid) = refused_row_view(&workspace, cx);
         let history = history_sql(&workspace, cx).len();
 
-        click_selector(cx, "edit-mode-draft");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Draft);
         assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         answer_discard(&workspace, cx, false);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         assert_eq!(pending_of(&grid, cx), 1, "Cancel keeps everything");
 
-        click_selector(cx, "edit-mode-draft");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Draft);
         assert_asks_about_the_refused_row(&workspace, cx, &grid, history);
         answer_discard(&workspace, cx, true);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
@@ -29472,10 +29487,7 @@ fn a_snowflake_table_offers_no_edit_mode(cx: &mut TestAppContext) {
         });
 
         assert_eq!(front_edit_mode(&workspace, cx), None);
-        assert_eq!(
-            drawn(cx, &["edit-mode-draft", "edit-mode-row"]),
-            [false, false]
-        );
+        assert_eq!(drawn(cx, &["edit-mode"]), [false]);
         let rows = palette_listing(&workspace, cx);
         for label in ["Edit in Row mode", "Edit in Draft mode"] {
             assert!(!rows.iter().any(|row| row == label), "{label}: {rows:?}");
@@ -29514,10 +29526,7 @@ fn a_turso_table_offers_no_edit_mode(cx: &mut TestAppContext) {
         });
 
         assert_eq!(front_edit_mode(&workspace, cx), None);
-        assert_eq!(
-            drawn(cx, &["edit-mode-draft", "edit-mode-row"]),
-            [false, false]
-        );
+        assert_eq!(drawn(cx, &["edit-mode"]), [false]);
         let rows = palette_listing(&workspace, cx);
         for label in ["Edit in Row mode", "Edit in Draft mode"] {
             assert!(!rows.iter().any(|row| row == label), "{label}: {rows:?}");
@@ -29543,7 +29552,7 @@ fn the_refusal_to_leave_draft_is_taken_down_with_the_draft_and_with_the_switch(
         let grid = relation_grid(&workspace, cx, id);
 
         stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(REFUSAL));
 
         // Discard is the condition the refusal reported going away.
@@ -29557,10 +29566,10 @@ fn the_refusal_to_leave_draft_is_taken_down_with_the_draft_and_with_the_switch(
 
         // And the switch that follows says nothing of the refusal it replaces.
         stage(&grid, cx, 0, 1, NewValue::Value("jay".into()));
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(shown_notice(&workspace, cx).as_deref(), Some(REFUSAL));
         grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
-        click_selector(cx, "edit-mode-row");
+        pick_edit_mode(&workspace, cx, crate::session::EditMode::Row);
         assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Row));
         assert_eq!(shown_notice(&workspace, cx), None);
         quit(workspace, cx);
@@ -29586,12 +29595,11 @@ fn crowded_status_bar(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut Visua
 /// What the status bar items paint, each with the box of the group that
 /// clips it (an item taller or wider than its group is cut at the group's
 /// edge, not drawn over what is next to it).
-const STATUS_ITEMS: [(&str, &str); 17] = [
+const STATUS_ITEMS: [(&str, &str); 16] = [
     ("status-connection", "status-bar"),
     ("transaction-commit", "status-bar"),
     ("transaction-rollback", "status-bar"),
-    ("edit-mode-draft", "status-chips"),
-    ("edit-mode-row", "status-chips"),
+    ("edit-mode", "status-chips"),
     ("uncommitted-rows", "status-chips"),
     ("status-pending-count", "status-bar"),
     ("discard-edits", "status-pending"),
@@ -29684,7 +29692,7 @@ fn drawn_whole(cx: &mut VisualTestContext, selector: &'static str) -> bool {
 fn draft_with_a_pending_edit(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
     use crate::result_grid::NewValue;
 
-    click_selector(cx, "edit-mode-draft");
+    pick_edit_mode(workspace, cx, crate::session::EditMode::Draft);
     settle_through(cx);
     let id = workspace.read_with(cx, |workspace, _| {
         match workspace.profile().unwrap().session.active {
@@ -29737,7 +29745,7 @@ fn no_status_bar_item_draws_over_another_at_any_width(cx: &mut TestAppContext) {
 /// item is never whole while one above it is not.
 const KEPT_IN_ORDER: [&str; 9] = [
     "transaction-rollback",
-    "edit-mode-row",
+    "edit-mode",
     "uncommitted-rows",
     "apply-edits",
     "status-pending-count",
@@ -29786,13 +29794,13 @@ fn the_staged_edit_buttons_are_drawn_whole_where_the_transaction_leaves_room(
 ) {
     store::tests::with_home(|| {
         // No transaction: Discard and Apply edits are drawn whole at 700 px,
-        // with the sidebar open and closed, beside the Edit chips.
+        // with the sidebar open and closed, beside the Edit menu.
         let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
         open_own_table(&workspace, cx, "birds");
         draft_with_a_pending_edit(&workspace, cx);
         for hidden in [false, true] {
             resize_to(&workspace, cx, 700., hidden);
-            for item in ["edit-mode-row", "discard-edits", "apply-edits"] {
+            for item in ["edit-mode", "discard-edits", "apply-edits"] {
                 assert!(
                     drawn_whole(cx, item),
                     "{item} is cut off at 700px, sidebar hidden {hidden}"
@@ -29812,7 +29820,7 @@ fn the_staged_edit_buttons_are_drawn_whole_where_the_transaction_leaves_room(
             resize_to(&workspace, cx, width, hidden);
             for item in [
                 "transaction-rollback",
-                "edit-mode-row",
+                "edit-mode",
                 "uncommitted-rows",
                 "discard-edits",
                 "apply-edits",
