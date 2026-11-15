@@ -19903,6 +19903,10 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
             Some(DRAFT_IN_TRANSACTION)
         );
         assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            uncommitted_tabs(&workspace, cx).is_empty(),
+            "a refusal wrote nothing"
+        );
         cx.dispatch_action(crate::actions::DiscardEdits);
         settle(cx);
 
@@ -19917,6 +19921,10 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
             Some(DRAFT_IN_TRANSACTION)
         );
         assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            uncommitted_tabs(&workspace, cx).is_empty(),
+            "a refusal wrote nothing"
+        );
         assert!(in_transaction(&workspace, cx));
 
         // Once the transaction has ended the same draft applies under its own
@@ -19937,6 +19945,12 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
             on_disk("select name from birds where id = 2").as_deref(),
             Some("jay")
         );
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "an apply under its own bracket is committed as it lands"
+        );
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
 
         // One statement joins the transaction the user opens next: no bracket,
         // shown uncommitted.
@@ -19969,6 +19983,39 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
                 .any(|statement| statement.starts_with("UPDATE")),
             "the write is listed with the transaction it joined"
         );
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [true],
+            "a write inside the user's transaction is shown uncommitted"
+        );
+        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+
+        // A COMMIT ends it.
+        run_in_query_tab_then_return(&workspace, cx, id, "COMMIT");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+
+        // So does a ROLLBACK, and the grid is read again as the server has it.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        stage(&grid, cx, 1, 1, NewValue::Value("sparrow".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some("jay"));
         quit(workspace, cx);
     });
 }
@@ -23627,6 +23674,88 @@ fn delete_row_over_a_row_deleted_on_the_server_applies_nothing_and_says_it_is_go
             "the review stays and says the row is gone"
         );
         assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
+/// A New row form's `INSERT` and a lone Delete row each join the user's open
+/// transaction as one verified write, so a `ROLLBACK` would undo them under a
+/// grid that shows them applied.
+#[gpui::test]
+fn a_new_row_form_and_a_lone_delete_row_inside_the_open_transaction_are_shown_uncommitted(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (id, _) = open_in_row_mode(&workspace, cx);
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "nothing sent yet"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0"),
+            "a second connection does not see it"
+        );
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("2"),
+            "a second connection does not see it"
+        );
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
         quit(workspace, cx);
     });
 }
@@ -28173,12 +28302,11 @@ fn rolling_back_reads_again_the_rows_saved_inside_the_transaction(cx: &mut TestA
 
 #[gpui::test]
 fn a_row_send_outside_a_transaction_shows_no_badge(cx: &mut TestAppContext) {
-    use crate::{result_grid::NewValue, session::EditMode};
+    use crate::result_grid::NewValue;
 
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        let query = front_query_id(&workspace, cx);
-        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
         stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
         save(&workspace, cx);
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
@@ -28188,27 +28316,6 @@ fn a_row_send_outside_a_transaction_shows_no_badge(cx: &mut TestAppContext) {
             Some("robin"),
             "committed as it landed"
         );
-
-        // A Draft apply inside a transaction is not a Row write.
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_edit_mode(EditMode::Draft, cx)
-        });
-        bring_forward(&workspace, cx, Tab::Query(query));
-        run_in_front(&workspace, cx, "BEGIN");
-        bring_forward(&workspace, cx, Tab::Object(id));
-        stage(&grid, cx, 1, 1, NewValue::Value("sparrow".into()));
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
-        settle(cx);
-        assert!(
-            open_transaction_statements(&workspace, cx)
-                .iter()
-                .any(|statement| statement.starts_with("UPDATE")),
-            "the apply joined the transaction"
-        );
-        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
-        assert!(uncommitted_tabs(&workspace, cx).is_empty());
         quit(workspace, cx);
     });
 }
