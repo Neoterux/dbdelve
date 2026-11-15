@@ -199,6 +199,17 @@ fn on_disk(sql: &str) -> Option<String> {
     }
 }
 
+/// Runs `sql` against `e2e.db` on a connection of its own, as another session
+/// would, so a test changes a row behind a grid that has already read it.
+fn behind_the_grid(sql: &str) {
+    let path = store::dbdelve_directory()
+        .expect("the test home has a data directory")
+        .join("e2e.db");
+    rusqlite::Connection::open(path)
+        .and_then(|connection| connection.execute_batch(sql))
+        .expect("the other session's statement applies");
+}
+
 /// The state of the tab in front, whichever kind it is.
 fn front_state(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> QueryState {
     workspace.read_with(cx, |workspace, _| {
@@ -16487,11 +16498,16 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
         let tab = workspace.read_with(cx, |workspace, _| {
             workspace.profile().unwrap().session.active
         });
+        let insert = generated_insert(&workspace, cx, "u", &[("id", "INTEGER", "7")]);
+        let verify = counted_inserts(&workspace, cx, &insert);
         workspace.update(cx, |workspace, cx| {
             workspace.execute_unchecked(
-                "INSERT INTO u VALUES (7)".into(),
+                insert,
                 tab,
-                Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+                Some(Refresh::Statement {
+                    sql: "SELECT count(*) FROM u".into(),
+                    verify,
+                }),
                 false,
                 None,
                 None,
@@ -16509,7 +16525,7 @@ fn an_edit_applied_in_a_bound_tab_writes_to_its_database(cx: &mut TestAppContext
     });
 }
 
-/// Applies `INSERT INTO u VALUES (7)` from the tab in front as an edit does,
+/// Applies an `INSERT` of one row into `u` from the tab in front as an edit does,
 /// and reads back what the tab holds once it lands.
 fn apply_insert_from_the_front_tab(
     workspace: &Entity<Workspace>,
@@ -16519,11 +16535,16 @@ fn apply_insert_from_the_front_tab(
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
+    let insert = generated_insert(workspace, cx, "u", &[("id", "INTEGER", "7")]);
+    let verify = counted_inserts(workspace, cx, &insert);
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
-            "INSERT INTO u VALUES (7)".into(),
+            insert,
             tab,
-            Some(Refresh::Statement("SELECT count(*) FROM u".into())),
+            Some(Refresh::Statement {
+                sql: "SELECT count(*) FROM u".into(),
+                verify,
+            }),
             false,
             None,
             None,
@@ -19681,18 +19702,88 @@ fn a_begin_inside_an_open_transaction_keeps_its_statements_unless_the_transactio
     });
 }
 
+/// The `INSERT` the New row form writes for one row of `table`, which is what
+/// a send of a test's own has to be to reach a target that verifies applies:
+/// an edit is cut statement by statement from text the gate admits. `row` is
+/// each column's name, type and value.
+fn generated_insert(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    table: &str,
+    row: &[(&str, &str, &str)],
+) -> String {
+    let engine = workspace.read_with(cx, |workspace, _| workspace.engine());
+    let values: Vec<_> = row
+        .iter()
+        .map(|(name, _, value)| (*name, Some(*value)))
+        .collect();
+    let types: Vec<_> = row
+        .iter()
+        .map(|(name, kind, _)| (name.to_string(), kind.to_string()))
+        .collect();
+    crate::sql::insert_row(engine, "main", table, &values, &types)
+        .expect("the New row form's INSERT is written")
+}
+
+/// What an apply of `sql`, `INSERT`s a test sends by hand as an edit, is
+/// checked against on a target that verifies applies: each statement must
+/// count one row. An edit sent with none is refused
+/// (`an_edit_of_a_verifying_target_without_its_verification_is_not_sent`).
+fn counted_inserts(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+) -> Option<crate::session::Verification> {
+    let engine = workspace.read_with(cx, |workspace, _| workspace.engine());
+    // As the review does, a statement at a time from the gated text, which
+    // leaves a batch's own `BEGIN` and `COMMIT` out. `None` where the text is
+    // not one the gate reads.
+    let steps: Vec<_> = crate::sql::generated_writes(engine, sql)?
+        .into_iter()
+        .map(|sql| crate::db::VerifiedStep {
+            sql,
+            kind: crate::db::StepKind::Insert,
+            reread: None,
+            before: Vec::new(),
+            read_back: None,
+        })
+        .collect();
+    Some(crate::session::Verification {
+        rows: vec!["new row".to_string(); steps.len()],
+        steps,
+        identities: Vec::new(),
+        keyed: true,
+    })
+}
+
 /// Applies `sql` from the tab in front as an edit does, reading back
 /// `SELECT count(*) FROM t` once it lands.
 fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, sql: &str) {
+    apply_from_the_front_tab_keyed(workspace, cx, sql, true);
+}
+
+/// [`apply_from_the_front_tab`] with the write's `keyed` said: whether its row
+/// is named by a primary key, as the grid's edit target would say.
+fn apply_from_the_front_tab_keyed(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+    sql: &str,
+    keyed: bool,
+) {
     use crate::session::Refresh;
     let tab = workspace.read_with(cx, |workspace, _| {
         workspace.profile().unwrap().session.active
     });
+    let verify = counted_inserts(workspace, cx, sql)
+        .map(|verify| crate::session::Verification { keyed, ..verify });
     workspace.update(cx, |workspace, cx| {
         workspace.execute_unchecked(
             sql.into(),
             tab,
-            Some(Refresh::Statement("SELECT count(*) FROM t".into())),
+            Some(Refresh::Statement {
+                sql: "SELECT count(*) FROM t".into(),
+                verify,
+            }),
             false,
             None,
             None,
@@ -19702,191 +19793,19 @@ fn apply_from_the_front_tab(workspace: &Entity<Workspace>, cx: &mut VisualTestCo
     settle(cx);
 }
 
-/// Applies `INSERT INTO t VALUES (7)` from the tab in front as an edit does.
+/// Applies an `INSERT` of one row into `t` from the tab in front as an edit
+/// does, and returns the statement.
 fn apply_insert_into_own_table_from_the_front_tab(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
-) {
-    apply_from_the_front_tab(workspace, cx, "INSERT INTO t VALUES (7)");
+) -> String {
+    let insert = generated_insert(workspace, cx, "t", &[("id", "INTEGER", "7")]);
+    apply_from_the_front_tab(workspace, cx, &insert);
     query_tab(workspace, cx, |tab, _, _| match &tab.query {
         QueryState::Complete { .. } => {}
         _ => panic!("the edit never completed"),
     });
-}
-
-#[gpui::test]
-fn a_batch_that_brackets_itself_is_not_sent_into_the_users_open_transaction(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = duckdb_with_other_attached(cx);
-        // As `sql::update_batch` writes a multi-row apply on an engine whose
-        // statements commit on their own.
-        let batch =
-            "BEGIN TRANSACTION;\nINSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);\nCOMMIT;";
-        manual_with_open_transaction(&workspace, cx, "INSERT INTO t VALUES (7)");
-        let (auto_commit, open, _) = transaction_state(&workspace, cx);
-        let listed = open_transaction_statements(&workspace, cx);
-
-        apply_from_the_front_tab(&workspace, cx, batch);
-        assert_eq!(
-            edit_notice(&workspace, cx),
-            "Not sent: a transaction is open on this connection, and the batch of edits \
-             would end it with a COMMIT of its own."
-        );
-        let (auto_commit_now, open_now, _) = transaction_state(&workspace, cx);
-        assert_eq!(
-            (
-                auto_commit_now,
-                open_now,
-                open_transaction_statements(&workspace, cx)
-            ),
-            (auto_commit, open, listed),
-            "a refused batch changes nothing and is not listed"
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("1"),
-            "only the user's own INSERT ran"
-        );
-        run_in_front(&workspace, cx, "ROLLBACK");
-
-        apply_from_the_front_tab(&workspace, cx, batch);
-        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
-            QueryState::Complete { .. } => {}
-            _ => panic!("the batch never completed with no transaction open"),
-        });
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("2"));
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_batch_written_to_join_a_transaction_that_ended_is_not_sent_unbracketed(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = duckdb_with_other_attached(cx);
-        // As `sql::update_batch_joining` writes a multi-row apply, run once
-        // the transaction it was written for is gone: each statement would
-        // commit on its own.
-        run_in_front(&workspace, cx, "SELECT 1");
-        assert!(!transaction_state(&workspace, cx).1, "nothing is open");
-        apply_from_the_front_tab(
-            &workspace,
-            cx,
-            "INSERT INTO t VALUES (8);\nINSERT INTO t VALUES (9);",
-        );
-        assert_eq!(
-            edit_notice(&workspace, cx),
-            "Not sent: no transaction is open on this connection, and the batch of edits \
-             was written to join one."
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("0"), "no row ran");
-
-        // One statement carries no bracket and is unaffected.
-        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
-        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
-        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_joined_batch_that_fails_part_way_says_its_earlier_rows_stay_in_the_open_transaction(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(
-            cx,
-            "create table birds (id integer primary key, name text); \
-             insert into birds values (1, 'wren');",
-        );
-        run_in_front(&workspace, cx, "BEGIN");
-        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
-
-        // As `sql::update_batch_joining` writes a multi-row apply; the second
-        // statement collides with the first's key.
-        apply_from_the_front_tab(
-            &workspace,
-            cx,
-            "INSERT INTO birds VALUES (2, 'tit');\nINSERT INTO birds VALUES (2, 'jay');",
-        );
-        let message = edit_notice(&workspace, cx);
-        assert!(
-            message.ends_with(
-                "Rows of the batch before the failed one were applied inside the open \
-                 transaction and stay in it, to be committed or rolled back with it."
-            ),
-            "{message}"
-        );
-        run_in_front(&workspace, cx, "SELECT count(*) FROM birds");
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("2"),
-            "the first row is in the open transaction, as the message says"
-        );
-        quit(workspace, cx);
-    });
-}
-
-#[gpui::test]
-fn a_multi_row_edit_joins_the_users_open_transaction_without_brackets_of_its_own(
-    cx: &mut TestAppContext,
-) {
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(
-            cx,
-            "create table birds (id integer primary key, name text); \
-             insert into birds values (1, 'wren'), (2, 'tit');",
-        );
-        run_in_front(&workspace, cx, "BEGIN");
-        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
-        run_in_front(&workspace, cx, "select * from birds order by id");
-        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
-        grid.update(cx, |grid, _| {
-            for (row, name) in [(0, "robin"), (1, "jay")] {
-                assert!(grid.delegate_mut().set_pending(
-                    row,
-                    1,
-                    crate::result_grid::NewValue::Value(name.into())
-                ));
-            }
-        });
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
-        settle(cx);
-
-        assert!(
-            transaction_state(&workspace, cx).1,
-            "the batch did not end the user's transaction"
-        );
-        let batch = open_transaction_statements(&workspace, cx)
-            .into_iter()
-            .find(|statement| statement.contains("UPDATE"))
-            .expect("the batch is listed in the open transaction");
-        assert_eq!(batch.matches("UPDATE").count(), 2, "{batch}");
-        assert!(
-            !batch.contains("BEGIN") && !batch.contains("COMMIT"),
-            "{batch}"
-        );
-
-        run_in_front(&workspace, cx, "ROLLBACK");
-        run_in_front(
-            &workspace,
-            cx,
-            "select count(*) from birds where name in ('wren', 'tit')",
-        );
-        assert_eq!(
-            answer(&workspace, cx).as_deref(),
-            Some("2"),
-            "the edits rolled back with the transaction they joined"
-        );
-        quit(workspace, cx);
-    });
+    insert
 }
 
 #[gpui::test]
@@ -19902,12 +19821,12 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
         );
 
         run_in_front(&workspace, cx, "BEGIN");
-        apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
+        let insert = apply_insert_into_own_table_from_the_front_tab(&workspace, cx);
         assert_eq!(
             recorded_statements(&workspace, cx),
             [
                 "BEGIN",
-                "INSERT INTO t VALUES (7)",
+                insert.as_str(),
                 // The tab's own statement run again to show the change: the
                 // user's statement through the user's path, as the history has it.
                 "SELECT count(*) FROM t"
@@ -19936,6 +19855,531 @@ fn an_edit_joins_the_recorded_transaction_only_while_one_is_open_and_a_reconnect
                 "a disconnect empties the record with the transaction"
             );
         });
+        quit(workspace, cx);
+    });
+}
+
+/// What a draft of more than one statement is refused with inside a
+/// transaction the user opened, at review and at Run alike.
+const DRAFT_IN_TRANSACTION: &str =
+    "A transaction is open on this connection; the draft was not applied.";
+
+/// Whether the profile in front holds the user's open transaction.
+fn in_transaction(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, _| {
+        workspace.profile().unwrap().in_transaction
+    })
+}
+
+#[gpui::test]
+fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // An empty draft says so, as it does outside a transaction.
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("There are no edits to apply.")
+        );
+
+        // One cell and an added row are two statements.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        add_bird(&grid, cx, "3", "robin");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            uncommitted_tabs(&workspace, cx).is_empty(),
+            "a refusal wrote nothing"
+        );
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+
+        // Two cells are two statements.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            uncommitted_tabs(&workspace, cx).is_empty(),
+            "a refusal wrote nothing"
+        );
+        assert!(in_transaction(&workspace, cx));
+
+        // Once the transaction has ended the same draft applies under its own
+        // bracket.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(pending_of(&grid, cx), 2, "still staged");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.starts_with("BEGIN;"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "an apply under its own bracket is committed as it lands"
+        );
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+
+        // One statement joins the transaction the user opens next: no bracket,
+        // shown uncommitted.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is still open"
+        );
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch"),
+            "a second connection does not see it"
+        );
+        assert!(
+            open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.starts_with("UPDATE")),
+            "the write is listed with the transaction it joined"
+        );
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [true],
+            "a write inside the user's transaction is shown uncommitted"
+        );
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
+
+        // A COMMIT ends it.
+        run_in_query_tab_then_return(&workspace, cx, id, "COMMIT");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+
+        // So does a ROLLBACK, and the grid is read again as the server has it.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        stage(&grid, cx, 1, 1, NewValue::Value("sparrow".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some("jay"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_write_not_named_by_its_primary_key_is_refused_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = duckdb_with_other_attached(cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        let insert = generated_insert(&workspace, cx, "t", &[("id", "INTEGER", "7")]);
+
+        // As a write on a target that names its rows by every column is sent:
+        // one statement, but one that could count two rows.
+        apply_from_the_front_tab_keyed(&workspace, cx, &insert, false);
+        assert_eq!(edit_notice(&workspace, cx), DRAFT_IN_TRANSACTION);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(
+            answer(&workspace, cx).as_deref(),
+            Some("0"),
+            "nothing was sent"
+        );
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+
+        // The same write named by its key joins.
+        apply_from_the_front_tab_keyed(&workspace, cx, &insert, true);
+        run_in_front(&workspace, cx, "SELECT count(*) FROM t");
+        assert_eq!(answer(&workspace, cx).as_deref(), Some("1"));
+        assert!(in_transaction(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+/// `birds` read as a target that names its rows by every column, which no
+/// engine that verifies an apply produces yet (ClickHouse does, unverified).
+fn birds_named_by_every_column() -> crate::result_grid::ResultGrid {
+    use crate::db::{Column, EditTarget, QueryResult, RowMatch, UpdateSpelling, rows};
+    let column = |name: &str| Column {
+        name: name.into(),
+        data_type: None,
+    };
+    crate::result_grid::ResultGrid::new(
+        QueryResult {
+            columns: vec![column("id"), column("name")],
+            rows: rows(vec![
+                vec![Some("1".into()), Some("wren".into())],
+                vec![Some("2".into()), Some("tit".into())],
+            ]),
+            edit: Some(EditTarget {
+                schema: "main".into(),
+                table: "birds".into(),
+                columns: vec![Some("id".into()), Some("name".into())],
+                keys: vec![0, 1],
+                row_match: RowMatch::EveryColumn { fixed: Vec::new() },
+                update: UpdateSpelling::Update,
+            }),
+            ..QueryResult::default()
+        },
+        crate::sql::Mode::ReadWrite,
+    )
+}
+
+#[gpui::test]
+fn a_grid_naming_its_rows_by_every_column_is_refused_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |table, cx| {
+            *table.delegate_mut() = birds_named_by_every_column();
+            table.refresh(cx);
+        });
+
+        // One write, but on a row that could count two: Apply edits.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+
+        // The same write as a mark in a draft that holds rows.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        grid.update(cx, |table, _| {
+            assert!(table.delegate_mut().toggle_marks(&[0]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the mark is kept");
+        assert!(in_transaction(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_on_a_grid_naming_its_rows_by_every_column_is_not_sent_inside_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        grid.update(cx, |table, cx| {
+            *table.delegate_mut() = birds_named_by_every_column();
+            table.refresh(cx);
+        });
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    0,
+                    "A transaction is open on this connection; the row was not sent."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edits are kept");
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent"
+        );
+        assert!(in_transaction(&workspace, cx));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_batch_reviewed_before_a_transaction_opened_is_refused_at_run(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        // A transaction opens in the same connection after the review was
+        // written, so its bracket would end the user's.
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, Some(DRAFT_IN_TRANSACTION.into())))
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent: {:?}",
+            open_transaction_statements(&workspace, cx)
+        );
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(
+            on_disk("select count(*) from birds where name in ('wren', 'tit')").as_deref(),
+            Some("2")
+        );
+
+        // The transaction is gone, and the same Run applies under its bracket.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("jay")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_multi_row_edit_is_refused_inside_the_users_open_transaction_and_kept(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(transaction_state(&workspace, cx).1, "the BEGIN ran");
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        grid.update(cx, |grid, _| {
+            for (row, name) in [(0, "robin"), (1, "jay")] {
+                assert!(grid.delegate_mut().set_pending(
+                    row,
+                    1,
+                    crate::result_grid::NewValue::Value(name.into())
+                ));
+            }
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert!(
+            !open_transaction_statements(&workspace, cx)
+                .iter()
+                .any(|statement| statement.contains("UPDATE")),
+            "nothing was sent"
+        );
+        assert!(
+            transaction_state(&workspace, cx).1,
+            "the user's transaction is open"
+        );
+
+        run_in_front(&workspace, cx, "ROLLBACK");
+        assert_eq!(
+            on_disk("select count(*) from birds where name in ('wren', 'tit')").as_deref(),
+            Some("2")
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_joined_write_that_counts_no_row_wrote_nothing_and_leaves_the_transaction_open(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 1, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 1 (row id = 2) affected 0 rows.")
+        );
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is still open"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft keeps its edit");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(
+            on_disk("select name from birds where id = 2").as_deref(),
+            Some("tit")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A joined apply the server answered with drift or with a refusal wrote
+/// nothing into the user's transaction, so nothing is shown uncommitted.
+#[gpui::test]
+fn a_joined_apply_that_drifts_or_fails_is_not_shown_uncommitted(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // The row changes inside the session the apply joins, between the
+        // review and Run: a second connection cannot write while this one's
+        // transaction holds the lock.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        run_in_query_tab_then_return(
+            &workspace,
+            cx,
+            id,
+            "update birds set name = 'eagle' where id = 1",
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert!(in_transaction(&workspace, cx));
+        assert_eq!(pending_of(&grid, cx), 1, "the draft keeps its edit");
+
+        // A write the server refuses: a second row with a taken key.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        add_bird(&grid, cx, "1", "dup");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        let error = front_review(&workspace, cx)
+            .and_then(|(_, _, error)| error)
+            .expect("the review says what the server refused");
+        assert!(error.contains("UNIQUE constraint failed"), "{error}");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert!(in_transaction(&workspace, cx));
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
         quit(workspace, cx);
     });
 }
@@ -21760,7 +22204,10 @@ fn an_edit_send_on_clickhouse_still_clears_the_grid_and_ends_failed(cx: &mut Tes
                 workspace.execute_unchecked(
                     "INSERT INTO orders VALUES (3, 'jay')".into(),
                     tab,
-                    Some(Refresh::Statement(read.into())),
+                    Some(Refresh::Statement {
+                        sql: read.into(),
+                        verify: None,
+                    }),
                     false,
                     None,
                     None,
@@ -21947,14 +22394,14 @@ fn an_edit_staged_while_an_apply_is_in_flight_stays_staged(cx: &mut TestAppConte
             });
         };
         stage(cx, 0, "robin");
-        // SQLite does not review a query tab's edits, so the append sends at
-        // once. Not through the action, which would run the executor to the
-        // answer before the test can stage anything.
+        // Not through the action, which would run the executor to the answer
+        // before the test can stage anything.
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
             })
         });
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
         assert!(
             matches!(front_state(&workspace, cx), QueryState::Running { .. }),
             "the batch is in flight"
@@ -21996,21 +22443,30 @@ fn an_edit_staged_while_an_apply_is_in_flight_stays_staged(cx: &mut TestAppConte
             );
         });
 
+        // The rows were not read again, so the grid still holds row 1 as it
+        // was before the first batch: the second apply finds the server's row
+        // is not the one it was written for, and sends nothing.
         cx.dispatch_action(crate::actions::ApplyEdits);
         settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
         assert_eq!(
-            on_disk("select name from birds where id = 1").as_deref(),
-            Some("finch")
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            ))
         );
         assert_eq!(
             on_disk("select name from birds where id = 2").as_deref(),
-            Some("jay")
+            Some("tit")
         );
         grid.read_with(cx, |grid, _| {
-            let grid = grid.delegate();
-            assert_eq!(grid.pending_count(), 0);
-            assert_eq!(grid.cell(0, 1), Some("finch"));
-            assert_eq!(grid.cell(1, 1), Some("jay"), "the re-read ran");
+            assert_eq!(grid.delegate().pending_count(), 2, "the edits are kept");
         });
         quit(workspace, cx);
     });
@@ -22046,15 +22502,19 @@ fn a_failed_apply_from_a_query_tab_keeps_the_draft(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
         run_in_front(&workspace, cx, "select * from birds order by id");
-        let tab = workspace.read_with(cx, |workspace, _| {
-            workspace.profile().unwrap().session.active
-        });
         let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
         grid.update(cx, |grid, _| {
             // A NULL into a NOT NULL column, which the table refuses.
             assert!(grid.delegate_mut().set_pending(0, 1, NewValue::Null));
         });
         cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None)),
+            "the statement is read in the review before it runs"
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
         settle(cx);
 
         grid.read_with(cx, |grid, _| {
@@ -22065,17 +22525,190 @@ fn a_failed_apply_from_a_query_tab_keeps_the_draft(cx: &mut TestAppContext) {
             matches!(front_state(&workspace, cx), QueryState::Complete { .. }),
             "the tab is as it was, not an error pane over the rows"
         );
-        let (noticed, message) = tab_notice(&workspace, cx).expect("the failure is said");
-        assert_eq!(noticed, tab);
-        assert!(message.contains("NOT NULL"), "{message}");
-        assert!(
-            buffer(&workspace, cx).contains("UPDATE"),
-            "{}",
-            buffer(&workspace, cx)
+        let (title, _, error) = front_review(&workspace, cx).expect("the review stays");
+        assert_eq!(title, "Apply edits");
+        let error = error.expect("the failure is said in the review");
+        assert!(error.contains("NOT NULL"), "{error}");
+        assert_eq!(
+            buffer(&workspace, cx),
+            "select * from birds order by id",
+            "nothing was appended to the buffer"
         );
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A query tab's Apply on a verifying engine is read in the review, applies
+/// through the verified primitive, and leaves neither the buffer nor the
+/// history holding a copy that would run without its verification.
+#[gpui::test]
+fn a_query_tabs_apply_is_reviewed_verified_and_leaves_the_buffer_and_history_alone(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        assert_eq!(buffer(&workspace, cx), "select * from birds");
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(buffer(&workspace, cx), "select * from birds");
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            assert_eq!(grid.pending_count(), 0);
+            assert_eq!(grid.cell(0, 1), Some("finch"), "the query ran again");
+        });
+        let held = history_sql(&workspace, cx);
+        assert!(
+            held.iter().any(|sql| sql == "select * from birds"),
+            "{held:?}"
+        );
+        assert!(
+            held.iter()
+                .all(|sql| !sql.to_uppercase().contains("UPDATE")),
+            "{held:?}"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session changed after the query read it is not overwritten:
+/// the verified apply finds it differs, writes nothing and names the row.
+#[gpui::test]
+fn a_query_tabs_apply_over_a_row_changed_on_the_server_applies_nothing_and_names_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            )),
+            "the review stays open and names the row"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 1, "the draft is kept");
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
+
+        // A second Run reads the rows again and does not replay the refusal:
+        // with the row as it was read, the same review applies.
+        behind_the_grid("update birds set name = 'wren' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The New row form of a query tab is counted like a table's: an `INSERT` a
+/// trigger skipped changed no row and is refused; without the trigger it
+/// applies.
+#[gpui::test]
+fn a_new_row_from_a_query_tab_is_counted_through_the_verified_apply(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger skips before insert on birds \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        run_in_front(&workspace, cx, "select * from birds");
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Insert",
+                false,
+                Some("Nothing was applied. INSERT 1 (new row) affected 0 rows.".to_string())
+            )),
+            "the review stays and says what happened"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0")
+        );
+
+        behind_the_grid("drop trigger skips");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
         );
         quit(workspace, cx);
     });
@@ -22123,7 +22756,7 @@ fn a_refused_apply_keeps_the_draft(cx: &mut TestAppContext) {
 
         let (_, _, error) = front_review(&workspace, cx).expect("the review stays");
         let error = error.expect("the refusal is said in the review");
-        assert!(error.starts_with("Not sent:"), "{error}");
+        assert_eq!(error, DRAFT_IN_TRANSACTION);
         grid.read_with(cx, |grid, _| {
             assert_eq!(grid.delegate().result().rows.len(), 2);
             assert_eq!(grid.delegate().pending_count(), 2);
@@ -22278,6 +22911,275 @@ fn applying_a_draft_runs_its_deletes_updates_and_inserts_in_one_transaction_and_
             assert_eq!(grid.fetched_rows(), 3, "the table was read again");
         });
         assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session changed after the grid read it is not overwritten:
+/// the apply re-reads it inside its transaction, finds it differs, writes
+/// nothing and says which row.
+#[gpui::test]
+fn a_row_changed_on_the_server_since_it_was_read_applies_nothing_and_is_named_in_the_review(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(
+                    "Nothing was applied. Row id = 1 does not match the row as it was read."
+                        .to_string()
+                )
+            )),
+            "the review stays open and names the row"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().pending_count(), 1, "the draft is kept");
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite"),
+            "the other session's value stands"
+        );
+
+        // A second Run reads the rows again, so it refuses again while they
+        // still differ, and the draft is still there for it to refuse.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(pending_of(&grid, cx), 1);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session deleted after the grid read it is not written over:
+/// it is named as gone.
+#[gpui::test]
+fn a_row_deleted_on_the_server_since_it_was_read_is_named_as_gone(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 1, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        behind_the_grid("delete from birds where id = 2");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 2 is no longer on the server.")
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 2").as_deref(),
+            Some("0")
+        );
+        quit(workspace, cx);
+    });
+}
+
+const BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT: &str = "create table birds (id integer primary key, \
+     name text not null); insert into birds values (1, 'wren'), (2, 'tit'); \
+     create trigger keeps before update on birds when old.id = 2 \
+     begin select raise(ignore); end;";
+
+/// An `UPDATE` a trigger skipped changed no row, which the server answers as
+/// a success. The count refuses it, with the draft's `DELETE` undone.
+#[gpui::test]
+fn an_update_a_trigger_skipped_rolls_the_whole_draft_back_and_is_named(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WITH_A_TRIGGER_THAT_KEEPS_TIT);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0]))
+        });
+        stage(&grid, cx, 1, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 1").as_deref(),
+            Some("1"),
+            "the DELETE before it is undone"
+        );
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().marked_count(), 1);
+            assert_eq!(table.delegate().pending_count(), 2, "the mark and the edit");
+        });
+
+        // The rollback left the server's rows as they were, so a second Run
+        // counts them again and refuses the same statement.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. UPDATE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+        quit(workspace, cx);
+    });
+}
+
+const BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD: &str = "create table birds (id integer primary key, \
+     name text not null, parent integer); \
+     insert into birds values (1, 'wren', null), (2, 'tit', 1), (3, 'jay', null); \
+     create trigger cascades after delete on birds \
+     begin delete from birds where parent = old.id; end;";
+
+/// A draft that marks a row and the child a trigger deletes with it: the
+/// child's own `DELETE` counts none, because the row was taken already, and
+/// the second read of it finds it gone.
+#[gpui::test]
+fn a_delete_that_counts_zero_applies_only_when_its_row_is_gone(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0, 1]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(front_review(&workspace, cx), None, "it applied");
+        assert_eq!(
+            on_disk("select group_concat(id) from birds").as_deref(),
+            Some("3")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The same draft where a trigger keeps the child: its `DELETE` counts none
+/// and the row is still there, which is a refusal.
+#[gpui::test]
+fn a_delete_that_counts_zero_with_its_row_still_there_is_refused_and_named(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            &format!(
+                "{BIRDS_WHERE_A_DELETE_TAKES_ITS_CHILD} create trigger keeps before delete \
+                 on birds when old.id = 2 begin select raise(ignore); end;"
+            ),
+        );
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[0, 1]))
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. DELETE 2 (row id = 2) affected 0 rows.")
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("3"),
+            "the first DELETE is undone"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A run the mode prompt held is still a verified one when it is let go.
+#[gpui::test]
+fn a_verified_apply_held_by_the_mode_prompt_still_reads_its_rows_when_resumed(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, sql::Mode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        workspace.update(cx, |workspace, cx| workspace.set_mode(Mode::ReadOnly, cx));
+        settle(cx);
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.profile().unwrap().session.pending_run.is_some());
+        });
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        workspace.update(cx, |workspace, cx| workspace.approve_pending_run(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite")
+        );
         quit(workspace, cx);
     });
 }
@@ -22608,6 +23510,324 @@ fn a_row_that_is_gone_after_its_update_says_so_and_rereads(cx: &mut TestAppConte
             assert_eq!(grid.delegate().pending_count(), 0);
         });
         assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
+/// A row another session changed after the grid read it is not written over by
+/// a Row send: it is read again inside the send's transaction, found to differ,
+/// and the row keeps its edits and its ring.
+#[gpui::test]
+fn a_row_send_over_a_row_changed_on_the_server_keeps_the_edits_and_the_ring(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        focus_grid(&grid, cx);
+        ring_on(&grid, cx, 0, 1);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+
+        behind_the_grid("update birds set name = 'kite' where id = 1");
+        press(cx, "down");
+
+        let (row, message) = refused_row(&grid, cx).expect("the row says why it was refused");
+        assert_eq!(row, 0);
+        assert!(
+            message.starts_with(
+                "Nothing was applied. Row id = 1 does not match the row as it was read."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("The row keeps its edits; Esc puts it back as it was read."),
+            "{message}"
+        );
+        assert_eq!(ring_of(&grid, cx), Some((0, 1)), "the ring is back");
+        grid.read_with(cx, |grid, _| {
+            assert!(matches!(
+                grid.delegate().pending_cells(0).as_slice(),
+                [(1, NewValue::Value(name))] if name == "finch"
+            ));
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("kite"),
+            "the other session's value stands"
+        );
+
+        // The row is read again by the next Save, not judged by the first one.
+        behind_the_grid("update birds set name = 'wren' where id = 1");
+        save(&workspace, cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(pending_of(&grid, cx), 0);
+        quit(workspace, cx);
+    });
+}
+
+/// An `UPDATE` a trigger skipped changed no row, which the server answers as a
+/// success; the count refuses it and the row keeps its edit.
+#[gpui::test]
+fn a_row_send_a_trigger_skipped_is_refused_and_keeps_the_edits(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger keeps before update on birds when old.id = 1 \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+
+        let (row, message) = refused_row(&grid, cx).expect("the row says why it was refused");
+        assert_eq!(row, 0);
+        assert!(
+            message.starts_with("Nothing was applied. UPDATE 1 (row id = 1) affected 0 rows."),
+            "{message}"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the edit is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// What the grid shows after a Row send is what the server holds once its
+/// triggers ran, read by the send itself and not what was typed, and without
+/// the relation being read again.
+#[gpui::test]
+fn a_verified_row_send_reads_its_row_back_from_inside_the_transaction(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        // SQLite cannot change `new` in a trigger, so the row is written again
+        // after its update, as a `BEFORE` trigger would have it written.
+        let schema = format!(
+            "{BIRDS} create trigger shouts after update of name on birds \
+             begin update birds set name = upper(new.name) where id = new.id; end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        // A read of the whole relation would show this row; the send's own
+        // read-back replaces its row in place and reads nothing else.
+        behind_the_grid("insert into birds values (3, 'jay')");
+        save(&workspace, cx);
+
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("FINCH"));
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(
+                grid.delegate().result().rows.len(),
+                2,
+                "the relation was not read again"
+            )
+        });
+        assert_eq!(pending_of(&grid, cx), 0);
+        assert_eq!(refused_row(&grid, cx), None);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("FINCH")
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// The New row form's `INSERT` is counted like any write of a verifying
+/// target: one a trigger skipped changed no row, and the review stays.
+#[gpui::test]
+fn a_new_row_whose_insert_a_trigger_skipped_is_refused_and_the_form_review_stays(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let schema = format!(
+            "{BIRDS} create trigger skips before insert on birds \
+             begin select raise(ignore); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        // What the first keystroke does to a field, which `set_value` does
+        // not raise an event for.
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Insert",
+                false,
+                Some("Nothing was applied. INSERT 1 (new row) affected 0 rows.".to_string())
+            )),
+            "the review stays and says what happened"
+        );
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0")
+        );
+
+        // Without the trigger the same Run applies and the grid shows the row.
+        behind_the_grid("drop trigger skips");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review is gone");
+        assert_eq!(
+            on_disk("select name from birds where id = 3").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 3)
+        });
+        quit(workspace, cx);
+    });
+}
+
+/// A lone Delete row reads its row again before the `DELETE`: one another
+/// session already deleted is found gone and nothing runs.
+#[gpui::test]
+fn delete_row_over_a_row_deleted_on_the_server_applies_nothing_and_says_it_is_gone(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+
+        behind_the_grid("delete from birds where id = 2");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Delete row",
+                false,
+                Some("Nothing was applied. Row id = 2 is no longer on the server.".to_string())
+            )),
+            "the review stays and says the row is gone"
+        );
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        quit(workspace, cx);
+    });
+}
+
+/// A New row form's `INSERT` and a lone Delete row each join the user's open
+/// transaction as one verified write, so a `ROLLBACK` would undo them under a
+/// grid that shows them applied.
+#[gpui::test]
+fn a_new_row_form_and_a_lone_delete_row_inside_the_open_transaction_are_shown_uncommitted(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let (id, _) = open_in_row_mode(&workspace, cx);
+
+        new_row_directly(&workspace, cx);
+        let fields: Vec<_> = workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            form.expect("the form is open")
+                .fields
+                .iter()
+                .map(|field| field.input.clone())
+                .collect()
+        });
+        cx.update(|window, cx| {
+            for (input, text) in fields.iter().zip(["3", "robin"]) {
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        workspace.update(cx, |workspace, _| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.confirm_new_row(window, cx)
+        });
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), Some(("Insert", false, None)));
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "nothing sent yet"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
+        assert_eq!(
+            on_disk("select count(*) from birds where id = 3").as_deref(),
+            Some("0"),
+            "a second connection does not see it"
+        );
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
+        assert_eq!(
+            on_disk("select count(*) from birds").as_deref(),
+            Some("2"),
+            "a second connection does not see it"
+        );
+
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
         quit(workspace, cx);
     });
 }
@@ -22957,14 +24177,14 @@ fn the_palette_switches_a_tables_edit_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_table_without_a_key_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
+fn a_table_whose_column_cannot_be_matched_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
     use crate::{result_grid::NewValue, session::EditMode};
 
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(
             cx,
-            "create table logs (note text, at text); \
-             insert into logs values ('a', 'x');",
+            "create table logs (note text, at numeric); \
+             insert into logs values ('a', 1);",
         );
         let id = open_own_table(&workspace, cx, "logs");
         let grid = relation_grid(&workspace, cx, id);
@@ -22983,7 +24203,18 @@ fn a_table_without_a_key_stays_read_only_in_row_mode(cx: &mut TestAppContext) {
             })
         };
         let in_draft = staged(cx);
-        assert_eq!(in_draft, (vec![false, false], None, 0));
+        assert_eq!(
+            in_draft,
+            (
+                vec![false, false],
+                Some(
+                    "A table without a primary key is edited by matching every column, \
+                     and at (numeric) cannot be matched by its value."
+                        .to_string()
+                ),
+                0
+            )
+        );
 
         workspace.update(cx, |workspace, cx| {
             workspace.set_edit_mode(EditMode::Row, cx)
@@ -24931,98 +26162,6 @@ fn run_in_query_tab_then_return(
     settle(cx);
 }
 
-/// A statement that fails inside a transaction the user opened leaves that
-/// transaction open on SQLite, with the draft's inserts before it applied in
-/// it and committed with it, so an inserting draft of more than one statement
-/// is not written there.
-#[gpui::test]
-fn a_draft_with_inserts_is_refused_inside_an_open_transaction_on_sqlite(cx: &mut TestAppContext) {
-    use crate::result_grid::NewValue;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        run_in_front(&workspace, cx, "BEGIN");
-        let id = open_own_table(&workspace, cx, "birds");
-        let grid = relation_grid(&workspace, cx, id);
-        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
-        add_bird(&grid, cx, "3", "robin");
-
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(front_review(&workspace, cx), None, "nothing is shown");
-        let notice = shown_notice(&workspace, cx).expect("the refusal is on the status line");
-        assert!(
-            notice.starts_with("The draft was not applied: a transaction is open"),
-            "{notice}"
-        );
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 2, "the draft is kept");
-        });
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.profile().unwrap().in_transaction);
-        });
-
-        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 2, "still staged");
-        });
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply draft", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(sql.starts_with("BEGIN;"), "{sql}");
-        quit(workspace, cx);
-    });
-}
-
-/// What the refusal is about is a statement that fails half way: a draft of
-/// one statement has no half, and one of updates only is what a joined apply
-/// has always been.
-#[gpui::test]
-fn an_update_only_draft_still_joins_the_open_transaction(cx: &mut TestAppContext) {
-    use crate::result_grid::NewValue;
-
-    store::tests::with_home(|| {
-        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        run_in_front(&workspace, cx, "BEGIN");
-        let id = open_own_table(&workspace, cx, "birds");
-        let grid = relation_grid(&workspace, cx, id);
-        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
-        stage(&grid, cx, 1, 1, NewValue::Value("jay".into()));
-
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply edits", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
-
-        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
-        settle(cx);
-        cx.dispatch_action(crate::actions::DiscardEdits);
-        settle(cx);
-        grid.read_with(cx, |table, _| {
-            assert_eq!(table.delegate().pending_count(), 0)
-        });
-        add_bird(&grid, cx, "3", "robin");
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        assert_eq!(
-            front_review(&workspace, cx),
-            Some(("Apply draft", true, None))
-        );
-        let sql = front_review_sql(&workspace, cx).expect("a review is open");
-        assert!(sql.starts_with("INSERT INTO"), "{sql}");
-        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
-        quit(workspace, cx);
-    });
-}
-
 /// A sort in memory moves the fetched rows while the apply is out. The draft
 /// it sent is cleared whole, so no `INSERT` is left staged to be sent twice,
 /// and the table is read again.
@@ -25130,6 +26269,112 @@ fn a_second_run_while_an_added_rows_insert_is_out_sends_nothing_more(cx: &mut Te
             assert_eq!(table.delegate().pending_count(), 0);
         });
         assert_eq!(front_review(&workspace, cx), None);
+        quit(workspace, cx);
+    });
+}
+
+/// An edit that reaches the send with no verification, for a target that
+/// verifies applies, is not sent: every path that writes a grid's rows builds
+/// one, and this is what stops a future one that forgets.
+#[gpui::test]
+fn an_edit_of_a_verifying_target_without_its_verification_is_not_sent(cx: &mut TestAppContext) {
+    use crate::session::Refresh;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_and_then(
+                "UPDATE \"birds\" SET \"name\" = 'finch' WHERE \"id\" = 1;".into(),
+                Tab::Object(id),
+                Some(Refresh::Relation { id, verify: None }),
+                false,
+                None,
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing reached the file"
+        );
+        let said = match (front_review(&workspace, cx), tab_notice(&workspace, cx)) {
+            (Some((_, _, Some(error))), _) => error,
+            (_, Some((_, notice))) => notice,
+            other => panic!("the refusal was not said: {other:?}"),
+        };
+        assert_eq!(said, "dbdelve refused to send an edit it could not verify.");
+        quit(workspace, cx);
+    });
+}
+
+/// A second Apply while the first is out is the same `UPDATE` twice, and a
+/// re-run of the tab's query while it is out would read rows the apply is
+/// still changing; the tab's one-run-at-a-time guard refuses both.
+#[gpui::test]
+fn a_second_apply_from_a_query_tab_while_the_first_is_out_sends_nothing_more(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        // Every UPDATE that reaches the table leaves a line, so a second one
+        // shows even though it would write the same name.
+        let schema = format!(
+            "{BIRDS} create table log (n integer); create trigger logs after update on birds \
+             begin insert into log values (1); end;"
+        );
+        let (workspace, cx) = launch_on_sqlite_holding(cx, &schema);
+        run_in_front(&workspace, cx, "select * from birds");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx)
+            })
+        });
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        assert!(matches!(
+            front_state(&workspace, cx),
+            QueryState::Running { .. }
+        ));
+        let reviewing = front_review_sql(&workspace, cx);
+        // Neither a second Run, nor a second Apply, nor a re-run of the query
+        // sends anything while the first is out.
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_edits(&crate::actions::ApplyEdits, window, cx);
+                workspace.run_query(&crate::actions::RunQuery, window, cx);
+            })
+        });
+        assert_eq!(
+            front_review_sql(&workspace, cx),
+            reviewing,
+            "no other statement was put up for review"
+        );
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select count(*) from log").as_deref(),
+            Some("1"),
+            "one UPDATE reached the table"
+        );
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(front_review(&workspace, cx), None);
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().pending_count(), 0);
+        });
         quit(workspace, cx);
     });
 }
@@ -26882,10 +28127,46 @@ fn dropping_the_prompts_puts_back_the_bars_of_an_action_waiting_to_resume(cx: &m
     });
 }
 
+/// With the unverified Row path gone, a Row send that reaches the send with no
+/// verification is the one thing left to refuse.
 #[gpui::test]
-fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_read(
-    cx: &mut TestAppContext,
-) {
+fn a_row_send_without_its_verification_is_not_sent(cx: &mut TestAppContext) {
+    use crate::session::Refresh;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
+        workspace.update(cx, |workspace, cx| {
+            workspace.execute_and_then(
+                "UPDATE \"birds\" SET \"name\" = 'finch' WHERE \"id\" = 1;".into(),
+                Tab::Object(id),
+                Some(Refresh::Row {
+                    row: 0,
+                    rows_id,
+                    sent: Vec::new(),
+                    to: None,
+                    then: None,
+                    verify: None,
+                }),
+                false,
+                None,
+                cx,
+            );
+        });
+        settle(cx);
+
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing reached the file"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_row_send_whose_read_back_is_not_a_select_writes_nothing(cx: &mut TestAppContext) {
     use crate::session::Refresh;
 
     store::tests::with_home(|| {
@@ -26893,18 +28174,49 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
         let (id, grid) = open_in_row_mode(&workspace, cx);
         let rows_id = grid.read_with(cx, |grid, _| grid.delegate().rows_id());
 
-        // The write is a real one; only the read it carries is not a read.
+        // The write is a real one, verified as a Row send's is; only the
+        // read-back its step carries is not a read.
+        stage(
+            &grid,
+            cx,
+            0,
+            1,
+            crate::result_grid::NewValue::Value("robin".into()),
+        );
+        let (write, before) = grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            (
+                crate::sql::update_batch(Engine::Sqlite, &grid.pending_updates())
+                    .expect("the row's UPDATE is written"),
+                grid.fetched_cells(0),
+            )
+        });
+        let write = write.as_str();
+        // The step is the statement as the gate cuts it, without its `;`.
+        let step = write.trim_end_matches(';');
+        let verify = Some(crate::session::Verification {
+            steps: vec![crate::db::VerifiedStep {
+                sql: step.into(),
+                kind: crate::db::StepKind::Update,
+                reread: crate::sql::row_reread(Engine::Sqlite, step),
+                before,
+                read_back: Some("DELETE FROM birds".into()),
+            }],
+            rows: vec!["id = 1".into()],
+            identities: Vec::new(),
+            keyed: true,
+        });
         workspace.update(cx, |workspace, cx| {
             workspace.execute_and_then(
-                "UPDATE \"birds\" SET \"name\" = 'robin' WHERE \"id\" = 1;".into(),
+                write.into(),
                 Tab::Object(id),
                 Some(Refresh::Row {
                     row: 0,
                     rows_id,
-                    read: "DELETE FROM birds".into(),
                     sent: Vec::new(),
                     to: None,
                     then: None,
+                    verify,
                 }),
                 false,
                 None,
@@ -26915,27 +28227,21 @@ fn a_row_send_read_back_that_is_not_a_select_is_not_run_and_the_tab_is_owed_a_re
 
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
-            Some("robin"),
-            "the write ran"
+            Some("wren"),
+            "the write was not sent"
         );
         assert_eq!(
             on_disk("select count(*) from birds").as_deref(),
             Some("2"),
-            "the carried statement did not"
+            "the carried statement did not run either"
         );
-        let notice = shown_notice(&workspace, cx).expect("the status line says what happened");
-        assert!(
-            notice.contains("refused to run a read it wrote itself"),
-            "{notice}"
-        );
-        assert!(relation_is_stale(&workspace, cx, id));
         quit(workspace, cx);
     });
 }
 
-/// The relation tabs of the profile in front whose Row-mode writes sit inside
-/// its open transaction.
-fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<u64> {
+/// The tabs of the profile in front whose verified writes sit inside its open
+/// transaction.
+fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Tab> {
     workspace.read_with(cx, |workspace, _| {
         workspace
             .profile()
@@ -27006,7 +28312,7 @@ fn a_row_send_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppC
             Some("wren"),
             "a second connection does not see it"
         );
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
         assert!(
             open_transaction_statements(&workspace, cx)
                 .iter()
@@ -27028,6 +28334,70 @@ fn a_row_send_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppC
             on_disk("select name from birds where id = 1").as_deref(),
             Some("robin")
         );
+        quit(workspace, cx);
+    });
+}
+
+/// A query tab's Apply of one keyed cell joins the user's open transaction as
+/// a Row send does, so it is shown uncommitted too. What the tab shows after a
+/// rollback is the ceiling: its rows are its statement's and are not read
+/// again until it is run.
+#[gpui::test]
+fn a_query_tabs_apply_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = front_query_id(&workspace, cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "nothing sent yet"
+        );
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().set_pending(
+                0,
+                1,
+                crate::result_grid::NewValue::Value("robin".into())
+            ));
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Query(query)]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "a second connection does not see it"
+        );
+
+        // A rollback from another tab ends it.
+        new_query_tab(&workspace, cx);
+        run_in_front(&workspace, cx, "ROLLBACK");
+        bring_forward(&workspace, cx, Tab::Query(query));
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(
+            cell_of(&grid, cx, 0, 1).as_deref(),
+            Some("robin"),
+            "the rows the tab last read, until its statement is run again"
+        );
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("wren"));
         quit(workspace, cx);
     });
 }
@@ -27068,12 +28438,11 @@ fn rolling_back_reads_again_the_rows_saved_inside_the_transaction(cx: &mut TestA
 
 #[gpui::test]
 fn a_row_send_outside_a_transaction_shows_no_badge(cx: &mut TestAppContext) {
-    use crate::{result_grid::NewValue, session::EditMode};
+    use crate::result_grid::NewValue;
 
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
-        let query = front_query_id(&workspace, cx);
-        let (id, grid) = open_in_row_mode(&workspace, cx);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
         stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
         save(&workspace, cx);
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
@@ -27083,27 +28452,6 @@ fn a_row_send_outside_a_transaction_shows_no_badge(cx: &mut TestAppContext) {
             Some("robin"),
             "committed as it landed"
         );
-
-        // A Draft apply inside a transaction is not a Row write.
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_edit_mode(EditMode::Draft, cx)
-        });
-        bring_forward(&workspace, cx, Tab::Query(query));
-        run_in_front(&workspace, cx, "BEGIN");
-        bring_forward(&workspace, cx, Tab::Object(id));
-        stage(&grid, cx, 1, 1, NewValue::Value("sparrow".into()));
-        cx.dispatch_action(crate::actions::ApplyEdits);
-        settle(cx);
-        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
-        settle(cx);
-        assert!(
-            open_transaction_statements(&workspace, cx)
-                .iter()
-                .any(|statement| statement.starts_with("UPDATE")),
-            "the apply joined the transaction"
-        );
-        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
-        assert!(uncommitted_tabs(&workspace, cx).is_empty());
         quit(workspace, cx);
     });
 }
@@ -27834,6 +29182,496 @@ fn the_notice_takes_the_width_the_status_bar_has_free(cx: &mut TestAppContext) {
         assert!(
             width(cx) < wide,
             "the notice gives way as the window narrows"
+        );
+        quit(workspace, cx);
+    });
+}
+
+const SIGHTINGS: &str = "create table sightings (bird text, place text); \
+     insert into sightings values ('wren', NULL), ('tit', ''), ('jay', 'oak');";
+
+/// A table with no primary key is edited by every value its row was read
+/// with: a NULL is matched with `IS NULL` and an empty string with `= ''`, so
+/// the row named is the one shown and no other.
+#[gpui::test]
+fn a_table_without_a_primary_key_is_edited_by_every_value_and_a_null_is_matched_with_is_null(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().toggle_marks(&[2]));
+        });
+
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(
+            sql.contains(r#"WHERE "bird" = 'wren' AND "place" IS NULL;"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                r#"DELETE FROM "main"."sightings" WHERE "bird" = 'jay' AND "place" = 'oak';"#
+            ),
+            "{sql}"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
+        );
+        assert_eq!(
+            on_disk("select bird from sightings where place = ''").as_deref(),
+            Some("tit")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'jay'").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2")
+        );
+        quit(workspace, cx);
+    });
+}
+
+const TWO_IDENTICAL_SIGHTINGS: &str = "create table sightings (bird text, place text); \
+     insert into sightings values ('wren', 'oak'), ('wren', 'oak');";
+
+const DUPLICATE_SENTENCE: &str =
+    "Nothing was applied. Row bird = wren, place = oak matches 2 rows on the server.";
+
+/// Two rows alike in every column cannot be told apart by their values, so an
+/// edit of one is refused before any write and says which row, and neither
+/// changes.
+#[gpui::test]
+fn a_duplicate_row_without_a_primary_key_is_refused_and_named(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, TWO_IDENTICAL_SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'wren'").as_deref(),
+            Some("2"),
+            "neither row changed"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A duplicate another session inserted after the grid read its row makes the
+/// re-read return two rows, so the apply is refused with nothing written.
+#[gpui::test]
+fn a_duplicate_inserted_behind_the_grid_is_caught_before_the_write(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table sightings (bird text, place text); \
+             insert into sightings values ('wren', 'oak');",
+        );
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+
+        behind_the_grid("insert into sightings values ('wren', 'oak')");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'wren'").as_deref(),
+            Some("2"),
+            "nothing was written"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// Delete row in a Row view of a table with no primary key names its row by
+/// every value and removes that row alone; over two rows alike it is refused
+/// by the re-read.
+#[gpui::test]
+fn delete_row_on_a_table_without_a_primary_key_deletes_exactly_its_row(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(sql.contains(r#""bird" = 'tit' AND "place" = ''"#), "{sql}");
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where bird = 'tit'").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings where place is null").as_deref(),
+            Some("1"),
+            "the NULL row is still there"
+        );
+        quit(workspace, cx);
+    });
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, TWO_IDENTICAL_SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(0));
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some(DUPLICATE_SENTENCE)
+        );
+        assert_eq!(
+            on_disk("select count(*) from sightings").as_deref(),
+            Some("2"),
+            "neither row was deleted"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A Row send on a table with no primary key reads its row back by the values
+/// it now holds, since the values it was named by are gone; a value set to
+/// DEFAULT leaves no value to name it by, so that send is refused and kept.
+#[gpui::test]
+fn a_row_send_on_a_table_without_a_primary_key_reads_its_row_back_by_its_new_values(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        let id = open_own_table(&workspace, cx, "sightings");
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        let grid = relation_grid(&workspace, cx, id);
+
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+        // Not "The row was not found after the update.", which a read by the
+        // values the row had says before the grid reads the table again.
+        assert!(
+            shown_notice(&workspace, cx).is_some_and(|notice| notice.starts_with("1 row updated")),
+            "{:?}",
+            shown_notice(&workspace, cx)
+        );
+        assert_eq!(cell_of(&grid, cx, 0, 0).as_deref(), Some("finch"));
+        assert_eq!(cell_of(&grid, cx, 0, 1), None, "the NULL is still NULL");
+        assert_eq!(cell_of(&grid, cx, 1, 1).as_deref(), Some(""));
+        grid.read_with(cx, |table, _| {
+            assert_eq!(table.delegate().send_failure(), None);
+            assert_eq!(table.delegate().pending_count(), 0);
+        });
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
+        );
+
+        stage(&grid, cx, 1, 1, NewValue::Default);
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    1,
+                    "The row was not sent: a value set to DEFAULT cannot be read back on a row \
+                     named by every value."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+        assert_eq!(
+            on_disk("select count(*) from sightings where place = ''").as_deref(),
+            Some("1"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// What Apply edits and Save say of a grid whose last apply may have landed.
+const OUTCOME_UNKNOWN_REFUSAL: &str = "Not applied: whether the last apply reached the server is not known until the rows are read again.";
+
+#[gpui::test]
+fn an_apply_whose_outcome_is_unknown_is_refused_until_the_rows_are_read_again(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::AfterEdits};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // The SQLite arm never answers `Unknown`, so the test enters where the
+        // landing does: the grid is marked, with the draft staged on it.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+
+        for _ in 0..2 {
+            cx.dispatch_action(crate::actions::ApplyEdits);
+            settle(cx);
+            assert_eq!(front_review(&workspace, cx), None, "no review opens");
+            assert_eq!(
+                shown_notice(&workspace, cx).as_deref(),
+                Some(OUTCOME_UNKNOWN_REFUSAL)
+            );
+            assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        }
+
+        // A refresh asks about the draft first, and keeping it reads nothing.
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        assert!(matches!(
+            discard_holds(&workspace, cx),
+            Some(AfterEdits::Refresh)
+        ));
+        workspace.update(cx, |workspace, cx| {
+            workspace.cancel_discard_close(cx);
+        });
+        settle(cx);
+        assert!(grid.read_with(cx, |table, _| table.delegate().outcome_unknown()));
+
+        // Discarding it lets the refresh read the rows again, and the grid
+        // that holds them has no mark.
+        workspace.update(cx, |workspace, cx| workspace.refresh_relation(id, cx));
+        settle(cx);
+        confirm_discard(&workspace, cx);
+        let grid = relation_grid(&workspace, cx, id);
+        assert!(!grid.read_with(cx, |table, _| table.delegate().outcome_unknown()));
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_review_that_was_open_and_a_row_save_are_refused_while_the_outcome_is_unknown(
+    cx: &mut TestAppContext,
+) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // A review opened before the answer to a COMMIT was lost still holds
+        // its draft, and its Run would write it a second time.
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some((
+                "Apply edits",
+                true,
+                Some(OUTCOME_UNKNOWN_REFUSAL.to_string())
+            )),
+            "the review stays, with the sentence"
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_row_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("finch".into()));
+        grid.update(cx, |table, _| table.delegate_mut().mark_outcome_unknown());
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((0, OUTCOME_UNKNOWN_REFUSAL))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "nothing was sent"
+        );
+        quit(workspace, cx);
+    });
+}
+
+/// A write on a table with no primary key names its row by every value, so it
+/// could count two where the user's open transaction cannot be rolled back
+/// without ending it: it never runs inside that transaction, whichever way it
+/// leaves the grid, and what the user typed stays.
+#[gpui::test]
+fn a_write_on_a_table_without_a_primary_key_never_joins_the_users_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, SIGHTINGS);
+        run_in_front(&workspace, cx, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        let id = open_own_table(&workspace, cx, "sightings");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // Apply edits: no review, and the draft stays.
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "no review opens");
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some(DRAFT_IN_TRANSACTION)
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+
+        // A Row view's Save: nothing is sent and the row keeps its edit.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Row, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+        let grid = relation_grid(&workspace, cx, id);
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        save(&workspace, cx);
+        grid.read_with(cx, |table, _| {
+            assert_eq!(
+                table.delegate().send_failure(),
+                Some((
+                    0,
+                    "A transaction is open on this connection; the row was not sent."
+                ))
+            );
+        });
+        assert_eq!(pending_of(&grid, cx), 1, "the row's edit is kept");
+
+        // A review written before the transaction opened, and run after.
+        cx.dispatch_action(crate::actions::DiscardEdits);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Draft, cx)
+        });
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        let grid = relation_grid(&workspace, cx, id);
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert!(!in_transaction(&workspace, cx));
+        stage(&grid, cx, 0, 0, NewValue::Value("finch".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        assert!(in_transaction(&workspace, cx));
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, Some(DRAFT_IN_TRANSACTION.into())))
+        );
+        assert_eq!(pending_of(&grid, cx), 1, "the draft is kept");
+        assert!(
+            in_transaction(&workspace, cx),
+            "the user's transaction is untouched"
+        );
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("wren"),
+            "nothing was written"
+        );
+
+        // Once the transaction has ended the same draft applies under its own
+        // bracket.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select bird from sightings where place is null").as_deref(),
+            Some("finch")
         );
         quit(workspace, cx);
     });

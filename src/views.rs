@@ -3242,8 +3242,8 @@ pub(crate) fn render_view_sorting(
 pub(crate) fn view_edit_mode(profile: &Profile) -> Option<EditMode> {
     let session = &profile.session;
     // The target is asked, never the engine: Row is offered where an edit's
-    // send keeps the grid and the statement carries its own one-row guard.
-    (relation_preview(session).is_some() && profile.config.target().row_edits())
+    // send keeps the grid and is verified (the row read again, the write counted).
+    (relation_preview(session).is_some() && profile.config.target().keeps_edits())
         .then(|| session.edit_mode(session.active))
 }
 
@@ -3296,16 +3296,13 @@ pub(crate) fn apply_label(mode: Option<EditMode>) -> &'static str {
     }
 }
 
-/// Says that the rows saved on the table in front sit inside the open
+/// Says that the rows written from the tab in front sit inside the open
 /// transaction: the grid shows them, and a rollback undoes them.
 pub(crate) fn render_uncommitted(
     profile: &Profile,
     cx: &mut Context<Workspace>,
 ) -> Option<AnyElement> {
-    let Tab::Object(object) = profile.session.active else {
-        return None;
-    };
-    (profile.in_transaction && profile.uncommitted.contains(&object)).then(|| {
+    (profile.in_transaction && profile.uncommitted.contains(&profile.session.active)).then(|| {
         open_indicator_chip("uncommitted-rows", "Uncommitted", *theme(cx))
             .tooltip(|window, cx| {
                 Tooltip::new(

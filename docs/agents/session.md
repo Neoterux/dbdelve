@@ -721,15 +721,27 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
   row is left (a ring move off it, or a step key past the grid's edge from a
   cell's input) or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
-  send still passes). It lives on a relation tab beside `sorting`, is switched
+  send still passes). The send is re-read and compared before its `UPDATE`
+  (`Refresh::Row::verify`, the one step of `lone_verification`). It lives on a relation tab beside `sorting`, is switched
   from the status bar chips or the palette, starts from the Default edit mode
   setting (`StoredSettings::edit_mode`, `Draft` unless chosen, and the only part of
-  this that is persisted), and is offered only where `Target::row_edits()`
-  holds (`EditMode::on`): Postgres, MySQL, MariaDB, SQLite, DuckDB and
-  SQL Server. A Snowflake or Turso table has no control, for the reason in the
-  next bullet. Draft is never turned into Row sends by a switch: Draft to Row is
+  this that is persisted), and is offered only where `Target::keeps_edits()`
+  holds (`EditMode::on`, `views::view_edit_mode`): Postgres, MySQL, MariaDB,
+  SQLite, DuckDB, SQL Server and a MongoDB collection (the verified send is one
+  `updateOne` re-read by its `_id`, `sql::row_read`'s MongoDB arm). Every
+  target that offers Row verifies its applies, so a Row send has one path: a
+  `Refresh::Row` with no `Verification` is refused in `execute_unchecked` and
+  nothing is sent. A Snowflake or Turso table has no control, for the reason in the
+  next bullet, and neither has a MongoDB query tab, which never offers Row. Draft is never turned into Row sends by a switch: Draft to Row is
   refused while the grid holds edits, so a multi-row draft is not sent
   unreviewed one row at a time (`Workspace::set_edit_mode`).
+
+  A Row send that is refused, whether its row drifted, was gone, or its
+  `UPDATE` counted other than one row, keeps the row's edits and the ring,
+  says what happened (`Nothing was applied. Row id = 1 does not match the row
+  as it was read.`) before `ROW_KEPT`'s sentence, and Esc puts the row back as
+  it was read. A success replaces the row from the read-back taken inside the
+  transaction.
 
   The one writer of a Row send is `Workspace::save_row`; Save and the funnel
   are its callers. The funnel is `ResultGrid::take_left_row`, which marks the
@@ -750,16 +762,16 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `StepPastEdge`: in a Row view it commits the input and sends the row, the ring
   left on the cell, and in a Draft view or on a query tab it leaves the input
   open. The send is `Refresh::Row`: it writes
-  the `UPDATE` and, in the same background task, reads the row back by its key
+  the `UPDATE` and, in the same verified step, reads the row back by its key
   (`sql::row_read`). The landing replaces that row where it stands
   (`ResultGrid::replace_row`) and clears the cells that were sent
   (`clear_sent`), so a cell staged while the send was out stays staged. A
   vanished or unreadable row reads the table again instead, unless another
   row of the tab still holds edits: that read would send them, and nothing is
   sent without the user's act, so those rows are kept, the tab is marked stale
-  and the status line says the rows were not read again. A read-back is
-  checked with `sql::is_generated_select` where it runs; one that fails the
-  gate is not run and leaves the tab stale. A send is refused while a review
+  and the status line says the rows were not read again. A step's read-back
+  is checked with `sql::is_generated_select` before anything is sent; one that
+  fails the gate refuses the whole step, so the `UPDATE` does not run either. A send is refused while a review
   covers the tab, and a tab sends one row at a time.
 
   A refused send (the server's, the gate's, or a mode that stopped it) never
@@ -789,12 +801,13 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   back. A Row write inside the open transaction is shown as uncommitted (see
   that bullet).
 
-  An `UPDATE` matches on the key alone, in both modes. A row changed on the
-  server since it was fetched is overwritten, and nothing detects it: a stale
-  edit (`StaleEdit`) is not drift detection. Verifying that the row is as it was
-  fetched is left to Phase 10.2.
+  An `UPDATE` matches on the key alone, in both modes, but the apply that
+  sends it first reads the row again and compares it with the row as it was
+  fetched, so a row changed on the server since is refused and not overwritten
+  (`Verification`). A stale edit (`StaleEdit`) is a different check, on a
+  restored grid.
 - **A draft holds added rows and marks.** In a Draft view of a relation tab on a
-  `Target::row_edits()` target, `NewRow` (Insert) adds a grid row and
+  `Target::keeps_edits()` target (`row_edits()`, or MongoDB below), `NewRow` (Insert) adds a grid row and
   `DeleteRow` toggles a mark on the selected rows (the palette's `Mark row for
   deletion`, offered while `has_markable_row` holds, else `Delete row…`). Added
   rows live beside `pending` (`ResultGrid`'s added rows) and are never sorted
@@ -806,13 +819,52 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   `INSERT`s (`sql::draft_batch`), gated as a whole and checked for key and table
   by `sql::draft_deletes_match` and against `marked_count`, so a dropped mark
   refuses the draft. A successful reviewed relation-tab apply clears the whole
-  draft and re-reads; a failure keeps all of it and applies nothing. A joining
-  draft of more than one statement that inserts is refused, with a notice and
-  the draft kept, on an engine that keeps a failed transaction open
-  (`Engine::keeps_failed_transaction_open`; D-16a, see `docs/agents/gates.md`).
+  draft and re-reads; a failure keeps all of it and applies nothing (a MongoDB
+  one keeps what did not apply, below). Inside a
+  transaction the user opened only one write joins it, so a draft of more than
+  one statement is refused on every engine, with a notice and the draft kept
+  (see `docs/agents/gates.md`).
   A row is washed by its state in the theme's added, updated and deleted
   tokens, and its gutter carries the `debug_selector` `row-added-N`,
   `row-updated-N` or `row-deleted-N` for the driver.
+- **A MongoDB collection has a Draft view too (`ordered_edits`).** On a
+  built-in MongoDB target that edits rows (`Target::ordered_edits()`, and so
+  `Target::keeps_edits()`, which is `row_edits() || ordered_edits()`), a Draft
+  view of a collection takes added documents (`NewRow`), marked documents
+  (`DeleteRow`) and staged cells like a table's, and Apply opens the same
+  `Apply draft` review, written by `mql::draft_batch` through
+  `sql::draft_batch` and checked by `sql::draft_deletes_match` against the
+  marks. The four call sites that decided by `row_edits()` (`kept` in
+  `execute_unchecked`, `has_markable_row`, `new_row`'s in-grid row, `delete_row`'s
+  marks) ask `keeps_edits()`, and so do `EditMode::on` and the Row control
+  (a MongoDB `updateOne` is read back by its `_id`); only the
+  conformance filters stay on `row_edits()`. The review carries a
+  `Verification` (`Engine::verifies_applies` is true for MongoDB): each fetched
+  cell with its `$type` tag, each `updateOne` and `deleteOne` with the `find` of
+  its `_id`, applied by `Connection::apply_verified`'s MongoDB arm, which has no
+  transaction. The apply is therefore ordered and not atomic: `deleteOne`s,
+  `updateOne`s, `insertOne`s, one at a time, stopping at the first the server
+  refuses or counts other than one. Phase 10's rule that a MongoDB send blanks
+  the grid (D-21) is lifted with a removal by identity: a send keeps the grid, a
+  success clears the draft and reads the collection again, and a stop part way
+  has the statements before the failed one on the server, so those rows leave
+  the draft (`ResultGrid::drop_applied`, by the `_id` a marked or edited
+  document was fetched with, or by the place of an added row among the added
+  ones, since inserts run last and the applied ones are a prefix) and the rest
+  is kept. The identities are taken when the review is written
+  (`Verification::identities`), so a sort in memory while the apply was out
+  cannot point the removal at another row. The review is dropped with them,
+  because its text still holds the statements that applied; Apply writes the
+  rest afresh. The error says which applied and which did not: `Statements 1 to
+  2 were applied and have left the draft. Statement 3 (added row 1) failed:
+  <server text>. Statements 4 to 5 were not sent.`, `INSERT`, `UPDATE` or
+  `DELETE` and the count for a wrong count, and `Nothing was applied.` when the
+  first stopped it. A drift wrote nothing and says what a SQL draft's does. The
+  grid still shows an applied document as it was fetched until the collection is
+  read again. A MongoDB query tab's Apply is unchanged
+  (`reviews_query_apply()` is false there) and is appended to its buffer, but
+  its send now keeps its grid and staged cells on a failure, as `kept` is the
+  target's.
 - **An edit send keeps the grid, on a transactional SQL engine.** Where the
   target answers `Target::row_edits()`, a statement dbdelve sends for a grid
   edit (an Apply edits batch, an Insert, a Delete row) leaves the rows, the
@@ -826,10 +878,17 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   Delete over a draft, an edit staged while the batch was in flight) it keeps
   them and does not re-read. On a relation tab an Insert or Delete row over a
   draft is Row mode's case, or a Draft view's added row or mark (the next
-  bullet), never a send. A reviewed relation-tab apply clears the whole draft. On every other target (ClickHouse, MongoDB, Redis, Generic SQL,
-  a plugin, Snowflake, Turso) an edit send clears the grid as it starts and a failure
+  bullet), never a send. A reviewed relation-tab apply clears the whole draft.
+  A query tab's Apply and New row on a target answering
+  `Target::reviews_query_apply()` are reviewed and, where the target verifies
+  applies, sent through the same verified apply (the manifest is built from the
+  query's projection by real column name); nothing is appended to the buffer and
+  the history leaves out that generated run, where a recalled copy would run
+  unverified. On every other target (ClickHouse, Redis, Generic SQL, a plugin,
+  Snowflake, Turso) an edit send clears the grid as it starts and a failure
   is `QueryState::Failed`: a batch with no transaction that failed part way has
   already applied some of a draft, and keeping it would send those rows again.
+  MongoDB's is the exception the bullet above describes.
   Snowflake and Turso are out of the Row-mode set (no Draft or Row control on
   their tables) because their results are never editable: Snowflake's keys are
   not enforced, and Turso's driver names no column's table.
@@ -855,22 +914,28 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   leaving `stale` set). `execute_and_then` is the fallback: a run with no
   refresh and no explain over a grid holding edits is not sent and the tab's
   notice says so, so a path nobody guarded costs a notice, not a draft.
-- **A Row-mode write inside the open transaction is shown as uncommitted.**
-  A Row send from a relation tab of the connection's own session that lands
-  while `Profile::in_transaction` holds is recorded in `Profile::uncommitted`
-  (tab ids, in memory only, written by the row landing in `execute_unchecked`),
-  and the status bar draws `Uncommitted` (`views::render_uncommitted`) while
-  that tab is in front, because a ROLLBACK undoes the row the grid shows. The
-  record ends wherever `transaction_statements` clears or restarts
-  (`Profile::record_sent`, a disconnect, a reconnect) through
-  `Profile::end_uncommitted`, and a failed `COMMIT` that keeps the transaction
-  puts it back with the statements (`ended`). Ending it marks every listed tab
-  `stale`, commit and rollback alike, since which it was is not read off the
-  statement: the table is read again on its next visit. A Draft apply and a Row
-  send outside a transaction draw nothing. A tab bound to another database
-  never joins: while that session holds a transaction the send is refused
-  (`Profile::bound_write_refusal`) and the row stays edited, and otherwise it
-  is written to that database.
+- **A verified write inside the open transaction is shown as uncommitted.**
+  A Row send, a one-statement draft, a New row form, a lone Delete row or a
+  query tab's Apply that joins the connection's own session
+  (`Bracket::Joined`) and lands while `Profile::in_transaction` holds is
+  recorded in `Profile::uncommitted` (tabs, in memory only), by one condition
+  decided when it is sent (`joined` in `execute_unchecked`: a verified apply
+  under `Bracket::Joined`, not refused) and the run having landed. The status
+  bar draws `Uncommitted` (`views::render_uncommitted`) while that tab is in
+  front, because a ROLLBACK undoes the write the grid shows. A refusal, a
+  drift, a miscount or a failure records nothing, and an unknown outcome
+  cannot arise there because a joined apply sends no `COMMIT`. The record ends
+  wherever `transaction_statements` clears or restarts (`Profile::record_sent`,
+  a disconnect, a reconnect) through `Profile::end_uncommitted`, and a failed
+  `COMMIT` that keeps the transaction puts it back with the statements
+  (`ended`). Ending it marks every listed relation tab `stale`, commit and
+  rollback alike, since which it was is not read off the statement: the table
+  is read again on its next visit. A query tab is not read again: its rows are
+  its statement's, so after a rollback it shows what it last read until it is
+  run again. A write outside a transaction, or one that did not land, draws
+  nothing. A tab bound to another database never joins: while that session
+  holds a transaction the send is refused (`Profile::bound_write_refusal`) and
+  the row stays edited, and otherwise it is written to that database.
 - **`queries` can be empty.** Any buffer can be closed, the last one
   included, and a profile with no tab open shows an empty pane and relaunches
   that way. A new connection, and one written before buffers were tabs, opens
