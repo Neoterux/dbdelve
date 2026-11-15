@@ -3007,6 +3007,10 @@ impl Workspace {
                         // this field -- but the mode a result lands under has to
                         // be the mode at landing time, not a stale default.
                         let mode = profile.mode;
+                        // A Classic view paints no row washes; a query tab
+                        // answers Draft and keeps them.
+                        let row_washes =
+                            profile.session.edit_mode(tab) != crate::session::EditMode::Classic;
                         // Read before `slot` for the same reason. A view sorted
                         // in memory is sorted again as its rows land: a page
                         // turn or a re-run hands them back in the server's order.
@@ -3315,6 +3319,7 @@ impl Workspace {
                                         .with_client_sort(client_keys.as_deref())
                                         .with_layout(&carried_names, &carried_widths)
                                         .with_column_view(&column_view);
+                                    table.delegate_mut().set_row_washes(row_washes);
                                     // Streamed rows are the finished result's
                                     // first rows, in order, so what was picked
                                     // out of them as they came still names
@@ -4654,6 +4659,7 @@ mod tests {
         // The row the ring is on is the added one, which Delete row removes.
         assert!(markable_row(mongo, object, EditMode::Draft, &grid));
         assert!(!markable_row(mongo, object, EditMode::Row, &grid));
+        assert!(!markable_row(mongo, object, EditMode::Classic, &grid));
         assert!(!markable_row(mongo, Tab::Query(0), EditMode::Draft, &grid));
         assert!(!markable_row(
             Target::built_in(Engine::Redis),

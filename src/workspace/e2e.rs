@@ -24916,6 +24916,113 @@ fn switching_into_and_out_of_classic_keeps_reviewed_edits_and_sends_a_row_first(
     });
 }
 
+/// Whether the grid of `tab` washes whole rows.
+fn row_washes_of(grid: &Grid, cx: &mut VisualTestContext) -> bool {
+    grid.read_with(cx, |grid, _| grid.delegate().row_washes())
+}
+
+#[gpui::test]
+fn a_classic_view_paints_no_row_washes_and_keeps_none_across_a_reread(cx: &mut TestAppContext) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_default_edit_mode(EditMode::Classic, cx)
+        });
+        let id = open_own_table(&workspace, cx, "birds");
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Classic);
+        let grid = relation_grid(&workspace, cx, id);
+        assert!(!row_washes_of(&grid, cx), "set by the first load");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(EditMode::Draft, cx)
+        });
+        assert!(row_washes_of(&grid, cx));
+        go_classic(&workspace, cx);
+        assert!(!row_washes_of(&grid, cx));
+
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        let grid = relation_grid(&workspace, cx, id);
+        assert!(!row_washes_of(&grid, cx), "kept on the re-read grid");
+
+        let query_grid = workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            session
+                .results(Tab::Query(session.queries[0].id))
+                .expect("the query tab has a grid")
+                .clone()
+        });
+        assert!(
+            row_washes_of(&query_grid, cx),
+            "a query tab keeps its washes"
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_classic_table_restored_from_its_snapshot_paints_no_row_washes(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_default_edit_mode(EditMode::Classic, cx)
+        });
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        let stored = grid.read_with(cx, |grid, _| grid.delegate().stored());
+        store::write_grid(
+            "e2e",
+            &store::object_grid_key_in(None, "main", "birds", ""),
+            &stored,
+        )
+        .expect("the snapshot is written");
+        // The tab as a relaunch leaves it before its snapshot is looked for.
+        workspace.update(cx, |workspace, _| {
+            let profile = workspace.profile_mut().unwrap();
+            let object = profile
+                .session
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .unwrap();
+            let ObjectBody::Relation {
+                query, hydrated, ..
+            } = &mut object.body
+            else {
+                panic!("the tab is a relation");
+            };
+            *hydrated = false;
+            *query = QueryState::Idle;
+        });
+        grid.update(cx, |grid, _| {
+            *grid.delegate_mut() = crate::result_grid::ResultGrid::empty();
+        });
+        assert!(row_washes_of(&grid, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.hydrate_tab(Tab::Object(id), window, cx)
+        });
+        // Not settled: the restored grid is what is under test, and a re-read
+        // would build the grid again through the completion handler.
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 2)
+        });
+        assert!(!row_washes_of(&grid, cx));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_row_save_does_not_send_over_an_open_review(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;

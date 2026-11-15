@@ -428,6 +428,11 @@ pub struct ResultGrid {
     /// own double-click handler, which has no route back to the profile.
     /// `Workspace::set_mode` is the only thing that writes it after construction.
     mode: Mode,
+    /// Whether a row holding a staged cell, an added row or a delete mark is
+    /// washed as a whole. A Classic view paints the per-cell edited wash alone,
+    /// and the grid cannot see its tab's mode, so the completion handler,
+    /// `hydrate_tab` and `Workspace::set_edit_mode` write it here.
+    row_washes: bool,
     /// Asked, never matched on, which of the column types is bytes.
     engine: db::Engine,
     /// Whether the rows are a table's that Import Rows writes into, marked the
@@ -639,12 +644,24 @@ impl ResultGrid {
             selected_row: None,
             reference_anchor: None,
             mode,
+            row_washes: true,
             engine: db::Engine::default(),
             takes_imports: false,
             focus: None,
         };
         grid.refit();
         grid
+    }
+
+    /// Turns the whole-row washes (updated, added, deleted) on or off; see
+    /// the field.
+    pub fn set_row_washes(&mut self, on: bool) {
+        self.row_washes = on;
+    }
+
+    #[cfg(test)]
+    pub fn row_washes(&self) -> bool {
+        self.row_washes
     }
 
     pub fn with_engine(mut self, engine: db::Engine) -> Self {
@@ -3459,13 +3476,14 @@ impl TableDelegate for ResultGrid {
         // The row's state wash first, so the selection paints over it: a
         // selected row with changes still reads as selected, and the two
         // stay apart (`theme::tests`) with one over the other.
-        let row = row.when(self.row_has_pending(row_ix), |row| {
+        let washes = self.row_washes;
+        let row = row.when(washes && self.row_has_pending(row_ix), |row| {
             row.child(div().absolute().size_full().bg(t.updated))
         });
-        let row = row.when(self.added_row(row_ix).is_some(), |row| {
+        let row = row.when(washes && self.added_row(row_ix).is_some(), |row| {
             row.child(div().absolute().size_full().bg(t.added))
         });
-        let row = row.when(self.is_marked(row_ix), |row| {
+        let row = row.when(washes && self.is_marked(row_ix), |row| {
             row.child(div().absolute().size_full().bg(t.deleted))
         });
         if !self.selected_rows.contains(&row_ix) {

@@ -1828,7 +1828,7 @@ impl Workspace {
             return;
         };
         let tab = profile.session.active;
-        let Some(results) = profile.session.results(tab) else {
+        let Some(results) = profile.session.results(tab).cloned() else {
             return;
         };
         let current = profile.session.edit_mode(tab);
@@ -1864,6 +1864,12 @@ impl Workspace {
             .and_then(|profile| profile.session.edit_mode_mut(tab))
         {
             *slot = mode;
+            results.update(cx, |table, cx| {
+                table
+                    .delegate_mut()
+                    .set_row_washes(mode != EditMode::Classic);
+                table.refresh(cx);
+            });
             self.clear_draft_refusal();
             cx.notify();
         }

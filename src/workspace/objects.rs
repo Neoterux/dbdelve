@@ -2336,14 +2336,22 @@ impl Workspace {
         let Some(snapshot) = store::read_grid(&profile_id, &key) else {
             return;
         };
-        let Some((results, mode)) = self
-            .profile()
-            .and_then(|profile| Some((profile.session.results(tab)?.clone(), profile.mode)))
-        else {
+        let Some((results, mode, row_washes)) = self.profile().and_then(|profile| {
+            Some((
+                profile.session.results(tab)?.clone(),
+                profile.mode,
+                // A restored table starts from the default mode, and its grid
+                // takes edits once the stale rows are confirmed.
+                profile.session.edit_mode(tab) != crate::session::EditMode::Classic,
+            ))
+        }) else {
             return;
         };
         let engine = self.engine();
         show_snapshot(&results, &snapshot, mode, engine, cx);
+        results.update(cx, |table, _| {
+            table.delegate_mut().set_row_washes(row_washes)
+        });
         // The snapshot holds the rows already in this order. Sorted again so
         // the headers take a click, which a restored grid's do not.
         let sorting = Sorting::restored(snapshot.client_sort.as_deref()).on(engine);
