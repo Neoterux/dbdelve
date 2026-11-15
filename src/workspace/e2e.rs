@@ -612,7 +612,7 @@ fn a_prompt_takes_the_keyboard_and_hands_it_back_once_answered(cx: &mut TestAppC
             "the buffer behind took a key"
         );
 
-        for (keystroke, ringed) in [("left", 1), ("right", 0), ("tab", 1), ("shift-tab", 0)] {
+        for (keystroke, ringed) in [("left", 1), ("right", 0), ("tab", 2), ("shift-tab", 0)] {
             cx.simulate_keystrokes(keystroke);
             settle(cx);
             assert_eq!(ringed_button(&workspace, cx), ringed, "after {keystroke}");
@@ -646,7 +646,7 @@ fn a_prompt_dismissed_from_the_keyboard_hands_it_back_to_the_editor(cx: &mut Tes
         let (workspace, cx) = launch_on_sqlite(cx);
         cx.simulate_input("selec 1");
 
-        for (dismiss, typed) in [("tab enter", "x"), ("escape", "y")] {
+        for (dismiss, typed) in [("tab tab enter", "x"), ("escape", "y")] {
             raise_run_once_prompt(&workspace, cx);
             let before = buffer(&workspace, cx);
             cx.simulate_keystrokes(dismiss);
@@ -916,6 +916,80 @@ fn the_sidebar_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppConte
         cx.simulate_input("x");
         settle(cx);
         assert_eq!(buffer(&workspace, cx), "x");
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn a_schema_folded_without_a_filter_is_saved_and_collapse_all_closes_it(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");
+        let filter_to = |text: &'static str, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let profile = workspace.profile().unwrap();
+                    let (id, filter) =
+                        (profile.id.clone(), profile.session.explorer_filter.clone());
+                    filter.update(cx, |input, cx| input.set_value(text, window, cx));
+                    workspace.refresh_explorer(&id, cx);
+                });
+            });
+        };
+        let fold_schema = |cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes("secondary-k e");
+            settle(cx);
+            cx.simulate_keystrokes("enter");
+            settle(cx);
+        };
+        let schema_open = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let tree = &workspace.read(cx).profile().unwrap().session.explorer_tree;
+                tree.read(cx).entry(0).unwrap().is_expanded()
+            })
+        };
+        let saved = || {
+            store::peek_profiles(&[]).unwrap().profiles[0]
+                .folds
+                .get("schema-main")
+                .copied()
+        };
+
+        filter_to("birds", cx);
+        fold_schema(cx);
+        assert!(!schema_open(cx));
+        assert_eq!(saved(), None);
+        filter_to("", cx);
+        assert!(schema_open(cx), "the only schema, opened by default");
+
+        fold_schema(cx);
+        assert!(!schema_open(cx));
+        assert_eq!(saved(), Some(false));
+
+        // Picked as the active schema while folded under a filter, it opens
+        // there and then, not once the filter is cleared.
+        filter_to("birds", cx);
+        fold_schema(cx);
+        assert!(!schema_open(cx));
+        workspace.update(cx, |workspace, cx| workspace.set_schema("main".into(), cx));
+        settle(cx);
+        assert!(schema_open(cx));
+        assert_eq!(saved(), Some(true));
+
+        cx.dispatch_action(crate::actions::CollapseAllSchemas);
+        settle(cx);
+        let filter = cx.update(|_, cx| {
+            let session = &workspace.read(cx).profile().unwrap().session;
+            session.explorer_filter.read(cx).value().to_string()
+        });
+        assert_eq!(filter, "", "a filter would have held the schema open");
+        assert!(!schema_open(cx));
+        assert_eq!(saved(), Some(false));
+
+        cx.dispatch_action(crate::actions::ExpandAllSchemas);
+        settle(cx);
+        assert!(schema_open(cx));
+        assert_eq!(saved(), Some(true));
 
         quit(workspace, cx);
     });
@@ -1741,6 +1815,90 @@ fn own_database(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> St
         .flatten()
         .map(str::to_string)
         .expect("a database is named")
+}
+
+/// The opt-in coming into force under a prompt already up -- switched on, or
+/// a Read-only hold landing -- must not take the prompt down with its
+/// statement neither run nor cancelled.
+#[gpui::test]
+fn a_run_once_prompt_already_up_stays_up_when_the_opt_in_applies(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("selec 1");
+        raise_run_once_prompt(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_run_unreadable(true, cx));
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("pending-run"));
+
+        press(cx, "enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(matches!(tab.query, QueryState::Failed(_)), "Run once ran");
+        });
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn ticking_run_once_s_box_runs_the_next_unreadable_statement_unasked(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, "create table t (a integer);");
+        cx.executor().allow_parking();
+        cx.simulate_input("selec 1");
+        raise_run_once_prompt(&workspace, cx);
+
+        cx.simulate_keystrokes("left left");
+        settle(cx);
+        assert_eq!(ringed_button(&workspace, cx), 2, "the ring reaches the box");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            assert!(session.pending_run.as_ref().unwrap().dont_ask);
+            assert!(!workspace.settings.run_unreadable, "ticking alone set it");
+        });
+
+        cx.simulate_keystrokes("right right enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None);
+        query_tab(&workspace, cx, |tab, _, _| {
+            assert!(matches!(tab.query, QueryState::Failed(_)), "Run once ran");
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.settings.run_unreadable)
+        });
+        let saved =
+            std::fs::read_to_string(store::dbdelve_directory().unwrap().join("profiles.toml"))
+                .unwrap();
+        assert!(saved.contains("run_unreadable = true"), "{saved}");
+
+        // Unreadable to sqlparser, and a read SQLite answers with rows.
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("PRAGMA table_info(t)");
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), None, "it asked again");
+        query_tab(&workspace, cx, |tab, _, _| match &tab.query {
+            QueryState::Complete { rows, .. } => assert_eq!(*rows, 1),
+            QueryState::Failed(error) => panic!("the pragma failed: {error}"),
+            _ => panic!("the pragma never ran"),
+        });
+
+        // What an edit's refresh reruns, unasked: that still asks, and offers
+        // no box, because nobody pressed Run.
+        workspace.update(cx, |workspace, cx| {
+            let tab = workspace.profile().unwrap().session.active;
+            workspace.execute_sql("PRAGMA table_info(t)".into(), tab, cx);
+        });
+        settle(cx);
+        assert_eq!(front_dialog(&workspace, cx), Some("pending-run"));
+        workspace.read_with(cx, |workspace, _| assert!(!workspace.dialog_checkbox()));
+
+        quit(workspace, cx);
+    });
 }
 
 /// The DuckDB profile of `launch_duckdb`, connected and holding `other`
@@ -6453,6 +6611,7 @@ fn an_odbc_profile_saves_and_restores_as_it_was(cx: &mut TestAppContext) {
                         user: "me".into(),
                         identity_file: None,
                         run_as: None,
+                        passphrase: String::new(),
                     })
                 ),
             ]
@@ -6502,6 +6661,103 @@ fn an_odbc_profile_saves_and_restores_as_it_was(cx: &mut TestAppContext) {
     });
 }
 
+/// Through the real restore, the edit form and the real save: a password
+/// command comes back as written, disables the Password field while it is
+/// there, and is dropped from an engine whose login never runs one.
+#[gpui::test]
+fn a_password_command_restores_into_the_edit_form_and_saves_back(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let directory = store::dbdelve_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        // A SQLite profile in front, since launching connects the active one
+        // and a server profile would reach for its login.
+        let database = directory.join("e2e.db");
+        std::fs::write(&database, b"").unwrap();
+        let command = "aws rds generate-db-auth-token --hostname %HOSTNAME% --username %USERNAME%";
+        let server = |id: &str, engine: &str| {
+            format!(
+                "[[profiles]]\nid = \"{id}\"\nname = \"{id}\"\nhost = \"db.internal\"\n\
+                 database = \"d\"\nuser = \"u\"\nengine = \"{engine}\"\n\
+                 password_command = {command:?}\npassword_expires = 900\n"
+            )
+        };
+        std::fs::write(
+            directory.join("profiles.toml"),
+            format!(
+                "active = \"e2e\"\n\
+                 [settings]\ncheck_for_updates = false\n\
+                 [[profiles]]\nid = \"e2e\"\nname = \"E2E\"\nhost = \"\"\ndatabase = \"\"\n\
+                 user = \"\"\nengine = \"sqlite\"\npath = {:?}\n{}{}",
+                database.display().to_string(),
+                server("rds", "postgres"),
+                server("mongo", "mongodb"),
+            ),
+        )
+        .unwrap();
+
+        let (workspace, cx) = launch(cx);
+        let rds = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .profiles
+                .iter()
+                .position(|profile| profile.id == "rds")
+                .unwrap()
+        });
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.edit_profile(rds, window, cx));
+        });
+        settle(cx);
+        cx.update(|_, cx| {
+            let form = workspace.read(cx).form.as_ref().expect("the form is open");
+            assert_eq!(form.password_command.read(cx).value(), command);
+            assert_eq!(form.password_expires.read(cx).value(), "900");
+            let password = form.password.read(cx).presentation();
+            assert!(password.is_disabled());
+            assert_eq!(password.placeholder(), "From the command");
+            let (_, config) = form.config(cx).unwrap();
+            assert_eq!(
+                config.password_command(),
+                Some(&crate::db::PasswordCommand {
+                    command: command.into(),
+                    expires: 900,
+                })
+            );
+            assert_eq!(config.password(), Some(""));
+        });
+
+        // Cleared, the Password field is the profile's own again.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let form = workspace.form.as_ref().unwrap();
+                form.password_command
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+            });
+        });
+        settle(cx);
+        cx.update(|_, cx| {
+            let form = workspace.read(cx).form.as_ref().unwrap();
+            let password = form.password.read(cx).presentation();
+            assert!(!password.is_disabled());
+            assert_eq!(password.placeholder(), "Unchanged");
+            assert_eq!(form.config(cx).unwrap().1.password_command(), None);
+        });
+
+        cx.update(|_, cx| workspace.update(cx, |workspace, cx| workspace.remember_profiles(cx)));
+        let saved = std::fs::read_to_string(directory.join("profiles.toml")).unwrap();
+        let list = store::decode_profiles(&saved, &[]).unwrap();
+        let written = |id: &str| {
+            let stored = list.profiles.iter().find(|stored| stored.id == id).unwrap();
+            (stored.password_command.as_deref(), stored.password_expires)
+        };
+        assert_eq!(written("rds"), (Some(command), Some(900)));
+        assert_eq!(written("mongo"), (None, None));
+
+        quit(workspace, cx);
+    });
+}
+
 /// A duplicate has no Keychain entry of its own, so its Password field carries
 /// the original's, for an ODBC profile as for a server.
 #[gpui::test]
@@ -6536,7 +6792,7 @@ fn duplicating_an_odbc_profile_keeps_its_password(cx: &mut TestAppContext) {
                 let form = ConnectionForm::duplicating(
                     profile,
                     "DSN copy".into(),
-                    Some("hunter2".into()),
+                    [Some("hunter2".into()), None],
                     window,
                     cx,
                 );
@@ -6588,8 +6844,13 @@ fn the_forms_save_and_test_refuse_run_as_without_a_socket_directory(cx: &mut Tes
                         .iter()
                         .find(|profile| profile.id == id)
                         .unwrap();
-                    let form =
-                        ConnectionForm::duplicating(profile, "Copy".into(), None, window, cx);
+                    let form = ConnectionForm::duplicating(
+                        profile,
+                        "Copy".into(),
+                        [None, None],
+                        window,
+                        cx,
+                    );
                     form.config(cx).map(|_| ())
                 })
             })
@@ -6598,6 +6859,58 @@ fn the_forms_save_and_test_refuse_run_as_without_a_socket_directory(cx: &mut Tes
         assert!(refused.starts_with("Run as needs Host"), "{refused}");
         assert_eq!(read_as(cx, "socket"), Ok(()));
         assert_eq!(read_as(cx, "service"), Ok(()));
+        quit(workspace, cx);
+    });
+}
+
+/// Turning the tunnel off with the keyboard in Key passphrase takes that row
+/// away, so the keyboard goes to Password rather than nowhere, and typing
+/// lands there.
+#[gpui::test]
+fn turning_the_tunnel_off_from_key_passphrase_hands_the_keyboard_to_password(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch(cx);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.new_connection_in(None, window, cx);
+            });
+        });
+        settle(cx);
+        let toggle_tunnel = |cx: &mut VisualTestContext| {
+            let switch = cx
+                .debug_bounds("ssh-tunnel")
+                .expect("the switch is drawn")
+                .center();
+            cx.simulate_click(switch, gpui::Modifiers::default());
+            settle(cx);
+        };
+        let field = |cx: &mut VisualTestContext,
+                     field: fn(&ConnectionForm) -> &Entity<InputState>| {
+            cx.update(|_, cx| field(workspace.read(cx).form.as_ref().unwrap()).clone())
+        };
+
+        toggle_tunnel(cx);
+        let passphrase = field(cx, |form| &form.ssh_passphrase);
+        cx.update(|window, cx| passphrase.focus_handle(cx).focus(window, cx));
+        settle(cx);
+        cx.simulate_input("correct horse");
+        assert_eq!(
+            cx.update(|_, cx| passphrase.read(cx).unmask_value().to_string()),
+            "correct horse"
+        );
+
+        toggle_tunnel(cx);
+        let password = field(cx, |form| &form.password);
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.form.as_ref().unwrap().ssh));
+        assert!(cx.update(|window, cx| password.focus_handle(cx).is_focused(window)));
+        cx.simulate_input("hunter2");
+        assert_eq!(
+            cx.update(|_, cx| password.read(cx).unmask_value().to_string()),
+            "hunter2"
+        );
+
         quit(workspace, cx);
     });
 }
@@ -22677,8 +22990,8 @@ fn a_new_row_from_a_query_tab_is_counted_through_the_verified_apply(cx: &mut Tes
                 input.update(cx, |input, cx| input.set_value(text, window, cx));
             }
         });
-        workspace.update(cx, |workspace, _| {
-            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        workspace.update_in(cx, |workspace, window, cx| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index, window, cx))
         });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.confirm_new_row(window, cx)
@@ -23674,8 +23987,8 @@ fn a_new_row_whose_insert_a_trigger_skipped_is_refused_and_the_form_review_stays
         });
         // What the first keystroke does to a field, which `set_value` does
         // not raise an event for.
-        workspace.update(cx, |workspace, _| {
-            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        workspace.update_in(cx, |workspace, window, cx| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index, window, cx))
         });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.confirm_new_row(window, cx)
@@ -23776,8 +24089,8 @@ fn a_new_row_form_and_a_lone_delete_row_inside_the_open_transaction_are_shown_un
                 input.update(cx, |input, cx| input.set_value(text, window, cx));
             }
         });
-        workspace.update(cx, |workspace, _| {
-            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index))
+        workspace.update_in(cx, |workspace, window, cx| {
+            (0..fields.len()).for_each(|index| workspace.touch_insert_field(index, window, cx))
         });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.confirm_new_row(window, cx)
@@ -29673,6 +29986,137 @@ fn a_write_on_a_table_without_a_primary_key_never_joins_the_users_open_transacti
             on_disk("select bird from sightings where place is null").as_deref(),
             Some("finch")
         );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_default_chip_puts_a_typed_then_emptied_insert_field_back_out_of_the_statement(
+    cx: &mut TestAppContext,
+) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text, wing text);",
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            let leaf = workspace.profile().unwrap().session.explorer_leaves
+                [&explorer::relation_row("main", "birds")];
+            workspace.open_explorer_target(leaf.target, window, cx);
+        });
+        settle(cx);
+        // The insert form is Row's: Draft, the default, adds a grid row instead.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_edit_mode(crate::session::EditMode::Row, cx)
+        });
+        let open_form = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.new_row(&crate::actions::NewRow, window, cx);
+            });
+            settle(cx);
+        };
+        let input = |index: usize, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let form = workspace.profile().unwrap().session.insert_form.as_ref();
+                form.unwrap().fields[index].input.clone()
+            })
+        };
+        let focus = |index: usize, cx: &mut VisualTestContext| {
+            let input = input(index, cx);
+            cx.update(|window, cx| input.focus_handle(cx).focus(window, cx));
+            settle(cx);
+        };
+        let typing_in = |index: usize, cx: &mut VisualTestContext| {
+            let input = input(index, cx);
+            cx.update(|window, cx| input.focus_handle(cx).is_focused(window))
+        };
+        let state = |index: usize, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let form = workspace.profile().unwrap().session.insert_form.as_ref();
+                let field = &form.unwrap().fields[index];
+                let input = field.input.read(cx);
+                (
+                    field.nulled,
+                    field.touched,
+                    input.value().to_string(),
+                    input.presentation().placeholder().to_string(),
+                )
+            })
+        };
+        let statement = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.confirm_new_row(window, cx);
+            });
+            settle(cx);
+            workspace.read_with(cx, |workspace, _| {
+                let review = workspace.profile().unwrap().session.apply_review.as_ref();
+                review.unwrap().sql.clone()
+            })
+        };
+        let left_out = || (false, false, String::new(), "DEFAULT".to_string());
+        let nulled = || (true, false, String::new(), "NULL".to_string());
+        let typed = |text: &str| (false, true, text.to_string(), "empty string".to_string());
+
+        open_form(cx);
+        focus(0, cx);
+        cx.simulate_input("7");
+        settle(cx);
+        assert_eq!(state(0, cx), typed("7"));
+        cx.simulate_keystrokes("backspace");
+        settle(cx);
+        assert_eq!(state(0, cx), typed(""), "emptying keeps the field a value");
+
+        // Each field is its DEFAULT, its NULL, then its box.
+        cx.simulate_keystrokes("shift-tab shift-tab");
+        settle(cx);
+        assert!(!typing_in(0, cx));
+        press(cx, "enter");
+        assert_eq!(state(0, cx), left_out(), "DEFAULT puts the field back out");
+        cx.simulate_keystrokes("tab");
+        settle(cx);
+        press(cx, "space");
+        assert_eq!(state(0, cx), nulled());
+        cx.simulate_keystrokes("tab");
+        settle(cx);
+        assert!(typing_in(0, cx));
+        cx.simulate_input("9");
+        settle(cx);
+        assert_eq!(state(0, cx), typed("9"), "typing turns the NULL off");
+        cx.simulate_keystrokes("shift-tab");
+        settle(cx);
+        press(cx, "space");
+        assert_eq!(state(0, cx), nulled(), "NULL clears the box");
+        press(cx, "space");
+        assert_eq!(state(0, cx), left_out());
+
+        cx.simulate_keystrokes("tab tab tab tab");
+        settle(cx);
+        assert!(typing_in(1, cx));
+        cx.simulate_input("robin");
+        cx.simulate_keystrokes("tab tab tab");
+        settle(cx);
+        assert!(typing_in(2, cx));
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("backspace");
+        settle(cx);
+        assert_eq!(state(1, cx), typed("robin"));
+        assert_eq!(state(2, cx), typed(""));
+        let sql = statement(cx);
+        assert!(!sql.contains("\"id\""), "{sql}");
+        assert!(sql.contains("\"name\"") && sql.contains("'robin'"), "{sql}");
+        assert!(sql.contains("\"wing\"") && sql.contains("''"), "{sql}");
+
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        open_form(cx);
+        focus(1, cx);
+        cx.simulate_input("robin");
+        cx.simulate_keystrokes("shift-tab");
+        settle(cx);
+        press(cx, "space");
+        assert_eq!(state(1, cx), nulled());
+        let sql = statement(cx);
+        assert!(sql.contains("NULL") && !sql.contains("robin"), "{sql}");
+
         quit(workspace, cx);
     });
 }

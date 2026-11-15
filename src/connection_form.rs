@@ -7,6 +7,7 @@
 //! This was a plain type at the crate root. It moved out whole; nothing changed
 //! but its visibility.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use gpui::{App, AppContext, Context, Entity, SharedString, Subscription, Task, TextAlign, Window};
@@ -15,9 +16,9 @@ use gpui_component::input::{InputEvent, InputState, TextareaState};
 use crate::{
     Workspace,
     db::{
-        ConnectionConfig, Driver, Engine, ExternalConfig, Fields, MongoConfig, Plugin,
-        PostgresConfig, Properties, ServerConfig, SnowflakeConfig, SshTunnel, SslMode, Target,
-        check_time_zone, odbc_string,
+        ConnectionConfig, Driver, Engine, ExternalConfig, Fields, MongoConfig, PasswordCommand,
+        Plugin, PostgresConfig, Properties, ServerConfig, SnowflakeConfig, SshTunnel, SslMode,
+        Target, check_time_zone, odbc_string,
     },
     explorer::Shortcuts,
     session::{Behaviour, Depth, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, Profile},
@@ -51,6 +52,13 @@ pub(crate) struct ConnectionForm {
     pub(crate) database: Entity<InputState>,
     pub(crate) user: Entity<InputState>,
     pub(crate) password: Entity<InputState>,
+    /// Run for the password at every login, where
+    /// `Target::takes_password_command`. While it holds anything the Password
+    /// field is disabled and not read, but keeps what was typed in it.
+    pub(crate) password_command: Entity<InputState>,
+    /// Seconds the command's output is reused for. Blank is 0: every login
+    /// runs it.
+    pub(crate) password_expires: Entity<InputState>,
     pub(crate) sslmode: SslMode,
     /// Only reachable while the mode consults one, so the field cannot sit
     /// there filled in and doing nothing.
@@ -62,6 +70,9 @@ pub(crate) struct ConnectionForm {
     pub(crate) ssh_port: Entity<InputState>,
     pub(crate) ssh_user: Entity<InputState>,
     pub(crate) ssh_identity_file: Entity<InputState>,
+    /// A secret, kept in the Keychain like the password and, like it, never
+    /// read back onto the screen of an edited profile.
+    pub(crate) ssh_passphrase: Entity<InputState>,
     pub(crate) ssh_run_as: Entity<InputState>,
     /// What an account has that a server does not. `host`, `database` and
     /// `user` are shared with the server fields: they mean the same thing, and
@@ -130,13 +141,15 @@ pub(crate) struct ConnectionForm {
     /// the same ones, are there from the start rather than fading in again.
     pub(crate) backdrop_shown: bool,
     /// The target the target-dependent placeholders were last written for,
-    /// whether a service was typed then, and the root certificate's.
-    pub(crate) placeholders_for: Option<(Target, bool, &'static str)>,
+    /// whether a service was typed then, the root certificate's, and the
+    /// password's.
+    pub(crate) placeholders_for: Option<(Target, bool, &'static str, &'static str)>,
     /// The URL field as of its last change, to tell a URL pasted whole from
     /// one being typed.
     pub(crate) last_url: SharedString,
     /// What a duplicate takes from the connection it copies, given on save.
     pub(crate) shortcuts: Shortcuts,
+    pub(crate) folds: BTreeMap<String, bool>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -281,6 +294,22 @@ impl ConnectionForm {
                 .masked(true)
         });
 
+        let command = server.and_then(|server| server.password_command.as_ref());
+        let password_command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("May use %HOSTNAME% %PORT% %USERNAME%")
+                .default_value(value(command.map(|command| command.command.as_str())))
+        });
+        let password_expires = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("0").default_value(
+                command
+                    .map(|command| command.expires)
+                    .filter(|seconds| *seconds > 0)
+                    .map(|seconds| seconds.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+
         let root_certificate = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("System trust store")
@@ -302,6 +331,12 @@ impl ConnectionForm {
         let ssh_user = input("Optional", ssh_user);
         let ssh_identity_file = input("SSH agent", ssh_identity_file);
         let ssh_run_as = input("SSH user", ssh_run_as);
+        let ssh_passphrase = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Optional")
+                .default_value(value(ssh.map(|ssh| ssh.passphrase.as_str())))
+                .masked(true)
+        });
         let account_name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Account identifier")
@@ -361,7 +396,9 @@ impl ConnectionForm {
                 )
         });
 
-        statement_timeout.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
+        for seconds in [&statement_timeout, &password_expires] {
+            seconds.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
+        }
         let keep_alive = cx.new(|cx| InputState::new(window, cx).placeholder("120"));
         keep_alive.update(cx, |input, cx| input.set_text_align(TextAlign::Right, cx));
         let idle_timeout = cx.new(|cx| InputState::new(window, cx).placeholder("30"));
@@ -389,6 +426,8 @@ impl ConnectionForm {
             &service,
             &ssh_host,
             &account_name,
+            // And the Password field, disabled while a command is typed.
+            &password_command,
         ] {
             subscriptions.push(cx.subscribe(input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -412,6 +451,8 @@ impl ConnectionForm {
             database,
             user,
             password,
+            password_command,
+            password_expires,
             sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
             root_certificate,
             ssh: ssh.is_some(),
@@ -419,6 +460,7 @@ impl ConnectionForm {
             ssh_port,
             ssh_user,
             ssh_identity_file,
+            ssh_passphrase,
             ssh_run_as,
             account: account_name,
             private_key,
@@ -447,6 +489,7 @@ impl ConnectionForm {
             placeholders_for: None,
             last_url: SharedString::default(),
             shortcuts: Shortcuts::default(),
+            folds: BTreeMap::new(),
             _subscriptions: subscriptions,
         };
         // The form is the whole window while it is open, and a window with
@@ -503,20 +546,22 @@ impl ConnectionForm {
         form.name.update(cx, |name, cx| {
             name.set_value(profile.name.clone(), window, cx);
         });
-        form.password.update(cx, |password, cx| {
-            password.set_value("", window, cx);
-            password.set_placeholder("Unchanged", window, cx);
-        });
+        for secret in [&form.password, &form.ssh_passphrase] {
+            secret.update(cx, |secret, cx| {
+                secret.set_value("", window, cx);
+            });
+        }
         form
     }
 
     /// Seeded from `profile` but never bound to it: no `editing` id, so saving
-    /// creates a new profile. Unlike `editing`, the password is prefilled,
-    /// because a duplicate has no Keychain entry of its own to fall back to.
+    /// creates a new profile. Unlike `editing`, the password and the key
+    /// passphrase are prefilled, because a duplicate has no Keychain entry of
+    /// its own to fall back to.
     pub(crate) fn duplicating(
         profile: &Profile,
         name: String,
-        password: Option<String>,
+        [password, passphrase]: [Option<String>; 2],
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
@@ -525,6 +570,11 @@ impl ConnectionForm {
             && let Some(slot) = config.password_mut()
         {
             *slot = password;
+        }
+        if let Some(passphrase) = passphrase
+            && let Some(ssh) = config.ssh_mut()
+        {
+            ssh.passphrase = passphrase;
         }
         let mut form = Self::new(Some(&config), window, cx);
         form.color = profile.color;
@@ -556,6 +606,7 @@ impl ConnectionForm {
         });
         form.mode = starting_mode(Some(profile.mode));
         form.shortcuts = profile.shortcuts.duplicated();
+        form.folds = profile.folds.clone();
         form.name.update(cx, |input, cx| {
             input.set_value(name, window, cx);
         });
@@ -665,7 +716,7 @@ impl ConnectionForm {
 
     fn ssh_tunnel(&self, cx: &App) -> Result<Option<SshTunnel>, String> {
         let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
-        ssh_tunnel(
+        let tunnel = ssh_tunnel(
             self.ssh,
             self.target().reaches_socket_over_ssh(),
             [
@@ -675,7 +726,12 @@ impl ConnectionForm {
                 read(&self.ssh_identity_file),
                 read(&self.ssh_run_as),
             ],
-        )
+        )?;
+        // Untrimmed, as the password is: a space can be part of either.
+        Ok(tunnel.map(|ssh| SshTunnel {
+            passphrase: self.ssh_passphrase.read(cx).unmask_value().to_string(),
+            ..ssh
+        }))
     }
 
     /// What the tunnel will do to the connection string, while it is on and
@@ -693,7 +749,11 @@ impl ConnectionForm {
     pub(crate) fn sync_placeholders(&mut self, window: &mut Window, cx: &mut App) {
         let beside_a_service = self.typed_service(cx).is_some();
         let root_certificate = root_certificate_placeholder(self.sslmode, beside_a_service);
-        let written = (self.target(), beside_a_service, root_certificate);
+        let password = password_placeholder(
+            self.typed_password_command(cx).is_some(),
+            self.editing.is_some(),
+        );
+        let written = (self.target(), beside_a_service, root_certificate, password);
         if self.placeholders_for == Some(written) {
             return;
         }
@@ -703,8 +763,11 @@ impl ConnectionForm {
         } else {
             placeholders(self.target())
         };
+        let passphrase = password_placeholder(false, self.editing.is_some());
         for (input, placeholder) in [
             (&self.root_certificate, SharedString::from(root_certificate)),
+            (&self.password, password.into()),
+            (&self.ssh_passphrase, passphrase.into()),
             (&self.name, SharedString::from(blank.name)),
             (&self.host, blank.host.into()),
             (&self.port, blank.port.into()),
@@ -726,6 +789,11 @@ impl ConnectionForm {
     pub(crate) fn typed_service(&self, cx: &App) -> Option<String> {
         Some(self.service.read(cx).value().trim().to_string())
             .filter(|service| self.target().takes_service() && !service.is_empty())
+    }
+
+    /// The command typed, where the target runs one.
+    pub(crate) fn typed_password_command(&self, cx: &App) -> Option<String> {
+        typed_command(self.target(), &self.password_command.read(cx).value())
     }
 
     /// Whether the root certificate field means anything for what is typed.
@@ -846,12 +914,18 @@ impl ConnectionForm {
             .then(|| read(&self.root_certificate))
             .filter(|path| !path.is_empty());
 
+        let (password, password_command) = login(
+            self.password.read(cx).unmask_value().to_string(),
+            self.typed_password_command(cx),
+            self.password_expires.read(cx).value().trim(),
+        )?;
         let server = ServerConfig {
             host,
             port,
             database,
             user,
-            password: self.password.read(cx).unmask_value().to_string(),
+            password,
+            password_command,
             sslmode: self.sslmode,
             root_certificate,
             statement_timeout: self.statement_timeout(cx)?,
@@ -1166,6 +1240,7 @@ fn ssh_tunnel(
         user,
         identity_file,
         run_as: Some(run_as).filter(|user| takes_run_as && !user.is_empty()),
+        passphrase: String::new(),
     }))
 }
 
@@ -1226,6 +1301,43 @@ fn typed_driver_properties(target: Target, text: &str) -> Result<Properties, Str
         return Ok(Properties::default());
     }
     Properties::from_lines(target.engine, text)
+}
+
+/// A command left typed under an engine whose login runs none is not read,
+/// the way another engine's fields are not.
+fn typed_command(target: Target, typed: &str) -> Option<String> {
+    let command = typed.trim();
+    (target.takes_password_command() && !command.is_empty()).then(|| command.to_string())
+}
+
+/// The password a login sends and the command it runs instead, if any. Beside
+/// a command the typed password is dropped, so it is neither sent nor saved to
+/// the Keychain. Blank expiry is 0: every login runs the command.
+fn login(
+    password: String,
+    command: Option<String>,
+    expires: &str,
+) -> Result<(String, Option<PasswordCommand>), String> {
+    let Some(command) = command else {
+        return Ok((password, None));
+    };
+    let expires = match expires {
+        "" => 0,
+        seconds => seconds
+            .parse()
+            .map_err(|_| "Expires after must be a whole number of seconds.".to_string())?,
+    };
+    Ok((String::new(), Some(PasswordCommand { command, expires })))
+}
+
+/// What a blank Password field means: an edited profile's blank keeps the
+/// password saved for it.
+fn password_placeholder(from_command: bool, editing: bool) -> &'static str {
+    match (from_command, editing) {
+        (true, _) => "From the command",
+        (false, true) => "Unchanged",
+        (false, false) => "Optional",
+    }
 }
 
 /// Blank is the default port.
@@ -1322,6 +1434,15 @@ pub(crate) fn file_stem(path: &str) -> &str {
 pub(crate) enum Origin {
     Environment,
     Form,
+}
+
+/// The key passphrase that earns a Keychain entry, if any: one typed, since
+/// blank is none.
+pub(crate) fn passphrase_to_persist(config: &ConnectionConfig) -> Option<&str> {
+    config
+        .ssh()
+        .map(|ssh| ssh.passphrase.as_str())
+        .filter(|passphrase| !passphrase.is_empty())
 }
 
 /// The password that earns a Keychain entry, if any.
@@ -1599,6 +1720,7 @@ mod tests {
                 user: String::new(),
                 identity_file: None,
                 run_as: None,
+                passphrase: String::new(),
             }))
         );
         assert_eq!(
@@ -1639,6 +1761,7 @@ mod tests {
             user: "deploy".into(),
             identity_file: Some("~/.ssh/id_ed25519".into()),
             run_as: Some("postgres".into()),
+            passphrase: String::new(),
         };
         assert_eq!(
             ssh_tunnel(true, true, ssh_fields(Some(&saved))),
@@ -1841,6 +1964,69 @@ mod tests {
     }
 
     #[test]
+    fn a_password_command_is_read_only_where_the_login_runs_one_and_blank_is_none() {
+        let typed = |engine| typed_command(Target::built_in(engine), " printf %s token ");
+        assert_eq!(typed(Engine::Postgres).as_deref(), Some("printf %s token"));
+        assert_eq!(typed(Engine::Redis).as_deref(), Some("printf %s token"));
+        assert_eq!(typed(Engine::MongoDb), None);
+        assert_eq!(typed(Engine::Sqlite), None);
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: Driver::Plugin(odbc()),
+        };
+        assert_eq!(typed_command(plugin, "printf %s token"), None);
+        assert_eq!(
+            typed_command(Target::built_in(Engine::Postgres), "  "),
+            None
+        );
+    }
+
+    #[test]
+    fn a_password_command_takes_the_place_of_the_password_and_its_keychain_entry() {
+        let command = || Some("printf %s token".to_string());
+        let (password, with) = login("hunter2".into(), command(), "").unwrap();
+        // Blank expiry runs it at every login.
+        assert_eq!(
+            with,
+            Some(PasswordCommand {
+                command: "printf %s token".into(),
+                expires: 0,
+            })
+        );
+        let config = ConnectionConfig::postgres(ServerConfig {
+            password,
+            password_command: with,
+            ..ServerConfig::default()
+        });
+        assert_eq!(password_to_persist(&config, Origin::Form), None);
+
+        assert_eq!(
+            login(String::new(), command(), "900")
+                .unwrap()
+                .1
+                .unwrap()
+                .expires,
+            900
+        );
+        assert_eq!(
+            login(String::new(), command(), "15m"),
+            Err("Expires after must be a whole number of seconds.".into())
+        );
+        // Without a command the expiry is not read, and the password is kept.
+        assert_eq!(
+            login("hunter2".into(), None, "15m"),
+            Ok(("hunter2".into(), None))
+        );
+    }
+
+    #[test]
+    fn a_blank_password_says_what_blank_means() {
+        assert_eq!(password_placeholder(false, false), "Optional");
+        assert_eq!(password_placeholder(false, true), "Unchanged");
+        assert_eq!(password_placeholder(true, true), "From the command");
+    }
+
+    #[test]
     fn the_environment_password_is_never_copied_into_the_keychain() {
         let server = |password: &str| ServerConfig {
             host: "db.example".to_string(),
@@ -1848,6 +2034,7 @@ mod tests {
             database: "app".to_string(),
             user: "dbdelve".to_string(),
             password: password.to_string(),
+            password_command: None,
             sslmode: SslMode::default(),
             root_certificate: None,
             statement_timeout: 0,
@@ -1886,6 +2073,29 @@ mod tests {
         });
         assert_eq!(password_to_persist(&account, Origin::Form), None);
         assert_eq!(default_profile_name(&account), "ANALYTICS");
+    }
+
+    #[test]
+    fn a_typed_key_passphrase_goes_to_the_keychain_and_blank_is_none() {
+        let tunnelled = |passphrase: &str| {
+            ConnectionConfig::MySql(ServerConfig {
+                ssh: Some(SshTunnel {
+                    host: "bastion".into(),
+                    passphrase: passphrase.into(),
+                    ..SshTunnel::default()
+                }),
+                ..ServerConfig::default()
+            })
+        };
+        assert_eq!(
+            passphrase_to_persist(&tunnelled("correct horse")),
+            Some("correct horse")
+        );
+        assert_eq!(passphrase_to_persist(&tunnelled("")), None);
+        assert_eq!(
+            passphrase_to_persist(&ConnectionConfig::MySql(ServerConfig::default())),
+            None
+        );
     }
 
     #[test]

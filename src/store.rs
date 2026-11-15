@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -111,6 +111,13 @@ pub struct StoredProfile {
     /// no limit is exactly what it was running with.
     #[serde(default)]
     pub statement_timeout: Option<u32>,
+    /// The command a login runs for its password, as typed, and for how many
+    /// seconds its output is reused (absent or 0: every login runs it). Both
+    /// absent for a profile without one. The output is never written anywhere.
+    #[serde(default, deserialize_with = "readable_or_none")]
+    pub password_command: Option<String>,
+    #[serde(default, deserialize_with = "readable_or_none")]
+    pub password_expires: Option<u32>,
     /// The id the next query buffer will be given. Persisted rather than
     /// derived from the open buffers, because deriving it hands a closed tab's
     /// id back out -- and a new buffer with a dead tab's id reads that tab's
@@ -216,7 +223,7 @@ pub struct StoredProfile {
     /// The SSH tunnel this profile dials through, or absent for a direct
     /// connection -- which is every profile written before tunnels existed. A
     /// table, so it has to come after every scalar above. Nothing secret is in
-    /// it: no password field, keys and ssh-agent only.
+    /// it: the key's passphrase is skipped here and kept in the Keychain.
     #[serde(default)]
     pub ssh: Option<SshTunnel>,
     /// The query buffers this profile had open, in strip order.
@@ -239,6 +246,11 @@ pub struct StoredProfile {
         deserialize_with = "readable_entries"
     )]
     pub pins: Vec<StoredShortcut>,
+    /// Whether each of the explorer's top-level rows was left open, by row
+    /// id. A table, so last; left out when empty. A row it does not name
+    /// opens as `explorer::root_folds` says.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub folds: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -273,6 +285,25 @@ where
             Entry::Unread(_) => None,
         })
         .collect())
+}
+
+/// The value, or none when this build cannot read it: a bad value costs its
+/// one field, not every connection in the file.
+fn readable_or_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value<T> {
+        Read(T),
+        Unread(IgnoredAny),
+    }
+    Ok(match Value::<T>::deserialize(deserializer)? {
+        Value::Read(value) => Some(value),
+        Value::Unread(_) => None,
+    })
 }
 
 /// One entry in a folder or the pins: a saved query by `query`, a folder by
@@ -568,6 +599,9 @@ pub struct StoredSettings {
     pub client_sort: Option<bool>,
     #[serde(default)]
     pub qualify_completions: Option<bool>,
+    #[serde(default)]
+    pub alias_completions: Option<bool>,
+    pub run_unreadable: Option<bool>,
     #[serde(default)]
     pub verbose_logging: Option<bool>,
     /// Whether the first-run greeting has played. Absent in a file written
@@ -1223,35 +1257,96 @@ pub fn profile_id(name: &str, existing: &[String]) -> String {
 /// blank password is valid, so none of them can be inferred from the connect
 /// attempt that would follow.
 pub fn password(profile_id: &str) -> Result<Option<String>, String> {
-    match keychain_entry(profile_id)?.get_password() {
-        Ok(password) => Ok(Some(password)),
+    secret(Secret::Password, profile_id)
+}
+
+pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
+    set_secret(Secret::Password, profile_id, password)
+}
+
+/// The passphrase of the key a profile's SSH tunnel logs in with, read as
+/// [`password`] is.
+pub fn ssh_passphrase(profile_id: &str) -> Result<Option<String>, String> {
+    secret(Secret::SshPassphrase, profile_id)
+}
+
+pub fn set_ssh_passphrase(profile_id: &str, passphrase: &str) -> Result<(), String> {
+    set_secret(Secret::SshPassphrase, profile_id, passphrase)
+}
+
+/// Both of a profile's keychain items, the password and the key passphrase.
+pub fn delete_secrets(profile_id: &str) {
+    for kind in [Secret::Password, Secret::SshPassphrase] {
+        if let Ok(entry) = keychain_entry(kind, profile_id) {
+            let _ = entry.delete_credential();
+        }
+    }
+}
+
+/// What a profile keeps in the keychain, each under the profile id as its
+/// account and a service of its own.
+#[derive(Clone, Copy)]
+enum Secret {
+    Password,
+    SshPassphrase,
+}
+
+impl Secret {
+    fn what(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::SshPassphrase => "SSH key passphrase",
+        }
+    }
+
+    fn service(self) -> Result<String, String> {
+        let variant = variant_name()?;
+        Ok(match self {
+            Self::Password => variant,
+            Self::SshPassphrase => passphrase_service(&variant),
+        })
+    }
+}
+
+/// A service apart from the passwords', so no profile id, however
+/// hand-edited, names another profile's passphrase as its password. A `/`,
+/// which `unsafe_component` refuses in a variant, so no variant's own
+/// service can spell this one either.
+fn passphrase_service(variant: &str) -> String {
+    format!("{variant}/ssh-passphrase")
+}
+
+fn secret(kind: Secret, profile_id: &str) -> Result<Option<String>, String> {
+    let what = kind.what();
+    match keychain_entry(kind, profile_id)?.get_password() {
+        Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(keyring::Error::BadEncoding(_)) => {
-            Err("The keychain password is not valid text.".to_string())
+            Err(format!("The keychain {what} is not valid text."))
         }
         Err(error) => Err(format!(
-            "Could not read the password from the keychain: {error}"
+            "Could not read the {what} from the keychain: {error}"
         )),
     }
 }
 
-pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
-    keychain_entry(profile_id)?
-        .set_password(password)
-        .map_err(|error| format!("Could not save the password to the keychain: {error}"))
-}
-
-pub fn delete_password(profile_id: &str) {
-    if let Ok(entry) = keychain_entry(profile_id) {
-        let _ = entry.delete_credential();
-    }
+fn set_secret(kind: Secret, profile_id: &str, secret: &str) -> Result<(), String> {
+    keychain_entry(kind, profile_id)?
+        .set_password(secret)
+        .map_err(|error| {
+            format!(
+                "Could not save the {} to the keychain: {error}",
+                kind.what()
+            )
+        })
 }
 
 /// Keychain Services on macOS, Secret Service on Linux, Credential Manager on
-/// Windows. The service is the variant name and the account the profile id,
-/// which is what keeps a dev build's passwords apart from a release build's.
-fn keychain_entry(profile_id: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(&variant_name()?, profile_id)
+/// Windows. The account is the profile id and the service comes from the
+/// variant name, which is what keeps a dev build's passwords apart from a
+/// release build's.
+fn keychain_entry(kind: Secret, profile_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(&kind.service()?, profile_id)
         .map_err(|error| format!("Could not reach the keychain: {error}"))
 }
 
@@ -1804,6 +1899,13 @@ fn variant_name() -> Result<String, String> {
         return Err(format!("DBDELVE_VARIANT {reason}."));
     }
     Ok(format!("{NAME}-{variant}"))
+}
+
+/// Whether this is the release's own data and keychain, rather than a dev or
+/// other variant's.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(crate) fn is_release_variant() -> bool {
+    variant_name().is_ok_and(|name| name == NAME)
 }
 
 /// macOS keeps Application Support, where every install before this already
@@ -2409,6 +2511,49 @@ pub(crate) mod tests {
                 1,
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_password_command_or_expiry_costs_only_that_field() {
+        for (extra, command, expires) in [
+            (
+                "password_command = 'aws'\npassword_expires = -1",
+                Some("aws"),
+                None,
+            ),
+            (
+                "password_command = 'aws'\npassword_expires = 4294967296",
+                Some("aws"),
+                None,
+            ),
+            (
+                "password_command = 'aws'\npassword_expires = '900'",
+                Some("aws"),
+                None,
+            ),
+            (
+                "password_command = 123\npassword_expires = 900",
+                None,
+                Some(900),
+            ),
+        ] {
+            let text = format!(
+                "{}{}",
+                supported_stub(Some("postgres"), extra),
+                supported_stub(Some("mysql"), "").replace("'a'", "'b'")
+            );
+            let list = decode_profiles(&text, &[]).expect(extra);
+            let ids: Vec<&str> = list
+                .profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect();
+            assert_eq!(ids, ["a", "b"], "{extra}");
+            let profile = &list.profiles[0];
+            assert_eq!(profile.password_command.as_deref(), command, "{extra}");
+            assert_eq!(profile.password_expires, expires, "{extra}");
+            assert_eq!(profile.host, "h", "{extra}");
         }
     }
 
@@ -3381,6 +3526,8 @@ user = "shayan"
                 service: None,
                 editor_font_size: None,
                 statement_timeout: Some(30),
+                password_command: None,
+                password_expires: None,
                 next_query_id: Some(1),
                 color: None,
                 mode: Some("full".into()),
@@ -3402,6 +3549,7 @@ user = "shayan"
                 open_objects: Vec::new(),
                 folders: Vec::new(),
                 pins: Vec::new(),
+                folds: BTreeMap::new(),
             };
 
             save_profiles(&ProfileList {
@@ -3447,6 +3595,8 @@ user = "shayan"
             service: None,
             editor_font_size: Some(16.0),
             statement_timeout: Some(30),
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(7),
             color: None,
             mode: None,
@@ -3497,6 +3647,7 @@ user = "shayan"
             ],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -3562,6 +3713,9 @@ open_objects = []
         assert_eq!(profile.color, None);
         // No limit, which is what it was running with.
         assert_eq!(profile.statement_timeout, None);
+        // Signed in with the keychain's password, and still does.
+        assert_eq!(profile.password_command, None);
+        assert_eq!(profile.password_expires, None);
         // A profile predating tunnels connected directly, and still does.
         assert_eq!(profile.ssh, None);
         // And on the server's own search_path.
@@ -3594,6 +3748,8 @@ open_objects = []
             service: None,
             editor_font_size: None,
             statement_timeout: None,
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(0),
             color: None,
             mode: None,
@@ -3615,6 +3771,7 @@ open_objects = []
             open_objects: Vec::new(),
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         }
     }
 
@@ -4008,6 +4165,32 @@ open_objects = []
     }
 
     #[test]
+    fn explorer_folds_are_left_out_until_there_are_some_and_survive_the_round_trip() {
+        let text = written_alone(a_stored_profile());
+        assert!(!text.contains("folds"), "{text}");
+        let old = decode_profiles(&text, &[]).unwrap().profiles.remove(0);
+        assert!(old.folds.is_empty());
+
+        let profile = StoredProfile {
+            folders: vec![StoredFolder {
+                name: "a/b".into(),
+                members: Vec::new(),
+            }],
+            folds: BTreeMap::from([
+                ("schema-public".into(), false),
+                ("folder:3:a/b".into(), true),
+            ]),
+            ..a_stored_profile()
+        };
+        let text = written_alone(profile.clone());
+        assert!(
+            text.contains("[profiles.folds]\n\"folder:3:a/b\" = true\nschema-public = false\n"),
+            "{text}"
+        );
+        assert_eq!(decode_profiles(&text, &[]).unwrap().profiles, [profile]);
+    }
+
+    #[test]
     fn a_folder_or_pin_this_build_cannot_read_costs_that_entry_alone() {
         let text = r#"
 [[profiles]]
@@ -4101,6 +4284,7 @@ folder = "Hot"
                 user: "tunnel".into(),
                 identity_file: None,
                 run_as: None,
+                passphrase: String::new(),
             }),
             open_objects: vec![StoredObject {
                 database: None,
@@ -4136,6 +4320,7 @@ folder = "Hot"
                 user: "tunnel".into(),
                 identity_file: Some("/home/dbdelve/.ssh/id_ed25519".into()),
                 run_as: Some("postgres".into()),
+                passphrase: String::new(),
             }),
             ..a_stored_profile()
         };
@@ -4164,6 +4349,7 @@ folder = "Hot"
                 user: String::new(),
                 identity_file: None,
                 run_as: None,
+                passphrase: String::new(),
             }),
             ..a_stored_profile()
         };
@@ -4181,6 +4367,39 @@ folder = "Hot"
         assert_eq!(decoded.profiles, vec![profile]);
         // So a tunnel without Run as saves as it did before the field existed.
         assert!(!text.contains("run_as"), "{text}");
+    }
+
+    #[test]
+    fn a_key_passphrase_is_never_written() {
+        let tunnel = SshTunnel {
+            host: "dbdelve-bastion".into(),
+            identity_file: Some("/home/dbdelve/.ssh/id_ed25519".into()),
+            passphrase: "correct horse".into(),
+            ..SshTunnel::default()
+        };
+        let file = ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            projects: Vec::new(),
+            profiles: vec![StoredProfile {
+                ssh: Some(tunnel.clone()),
+                ..a_stored_profile()
+            }],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        assert!(!text.contains("correct horse"), "{text}");
+        assert!(!text.contains("passphrase"), "{text}");
+
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+        assert_eq!(
+            decoded.profiles[0].ssh,
+            Some(SshTunnel {
+                passphrase: String::new(),
+                ..tunnel
+            })
+        );
     }
 
     #[test]
@@ -4215,6 +4434,37 @@ folder = "Hot"
             host: String::new(),
             user: String::new(),
             service: Some("harness".into()),
+            ..a_stored_profile()
+        };
+        let file = ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            projects: Vec::new(),
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn a_password_command_survives_the_round_trip_through_toml_beside_a_tunnel() {
+        // Scalars, so declared after `ssh` they would encode and then fail to
+        // decode.
+        let profile = StoredProfile {
+            password_command: Some("printf %s \"$TOKEN\" # %USERNAME%".into()),
+            password_expires: Some(900),
+            ssh: Some(SshTunnel {
+                host: "bastion".into(),
+                port: None,
+                user: "tunnel".into(),
+                identity_file: None,
+                run_as: None,
+                passphrase: String::new(),
+            }),
             ..a_stored_profile()
         };
         let file = ProfileFile {
@@ -4274,6 +4524,8 @@ folder = "Hot"
             service: None,
             editor_font_size: None,
             statement_timeout: None,
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(0),
             color: Some(ConnectionColor::Purple.slug().to_string()),
             mode: None,
@@ -4308,6 +4560,7 @@ folder = "Hot"
             }],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -4365,6 +4618,8 @@ folder = "Hot"
             service: None,
             editor_font_size: Some(14.0),
             statement_timeout: None,
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(7),
             color: None,
             mode: None,
@@ -4399,6 +4654,7 @@ folder = "Hot"
             }],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let file = ProfileFile {
             active: None,
@@ -4442,6 +4698,8 @@ folder = "Hot"
             service: None,
             editor_font_size: None,
             statement_timeout: Some(60),
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(1),
             color: None,
             mode: None,
@@ -4463,6 +4721,7 @@ folder = "Hot"
             open_objects: Vec::new(),
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let file = ProfileFile {
             active: None,
@@ -4567,6 +4826,8 @@ open_objects = []
             service: None,
             editor_font_size: None,
             statement_timeout: Some(30),
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(7),
             color: None,
             mode: None,
@@ -4601,6 +4862,7 @@ open_objects = []
             }],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             active: None,
@@ -4663,6 +4925,8 @@ open_objects = []
                 color_titlebar: Some(false),
                 client_sort: Some(true),
                 qualify_completions: Some(true),
+                alias_completions: Some(true),
+                run_unreadable: Some(true),
                 verbose_logging: Some(true),
                 welcomed: Some(true),
                 agent_access: Some(true),
@@ -4717,6 +4981,8 @@ open_objects = []
                     service: None,
                     editor_font_size: None,
                     statement_timeout: Some(30),
+                    password_command: None,
+                    password_expires: None,
                     next_query_id: Some(2),
                     color: None,
                     mode: None,
@@ -4738,6 +5004,7 @@ open_objects = []
                     open_objects: Vec::new(),
                     folders: Vec::new(),
                     pins: Vec::new(),
+                    folds: BTreeMap::new(),
                 },
                 StoredProfile {
                     id: "local".into(),
@@ -4763,6 +5030,8 @@ open_objects = []
                     service: None,
                     editor_font_size: None,
                     statement_timeout: None,
+                    password_command: None,
+                    password_expires: None,
                     next_query_id: None,
                     color: None,
                     mode: None,
@@ -4784,6 +5053,7 @@ open_objects = []
                     open_objects: Vec::new(),
                     folders: Vec::new(),
                     pins: Vec::new(),
+                    folds: BTreeMap::new(),
                 },
             ],
         };
@@ -4988,6 +5258,16 @@ open_objects = []
     /// Inside `with_home` for its lock rather than for its directory:
     /// `DBDELVE_VARIANT` is process-wide too, and every other test here reads
     /// it through `dbdelve_directory`.
+    #[test]
+    fn no_variant_is_named_like_another_variants_passphrase_service() {
+        for variant in ["dbdelve", "dbdelve-dev", "dbdelve-x.ssh-passphrase"] {
+            let service = passphrase_service(variant);
+            assert_ne!(service, variant);
+            let suffix = service.strip_prefix("dbdelve-").unwrap_or(&service);
+            assert!(unsafe_component(suffix).is_some(), "{service}");
+        }
+    }
+
     #[test]
     fn the_variant_moves_the_directory_and_the_keychain_together() {
         with_home(|| {
@@ -5546,6 +5826,8 @@ open_objects = []
             service: None,
             editor_font_size: Some(15.0),
             statement_timeout: Some(30),
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(7),
             color: None,
             mode: None,
@@ -5597,6 +5879,7 @@ open_objects = []
             }],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             active: Some("dev".into()),
@@ -5928,6 +6211,8 @@ name = \"accounts\"
             service: None,
             editor_font_size: None,
             statement_timeout: None,
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(0),
             color: None,
             mode: None,
@@ -5984,6 +6269,7 @@ name = \"accounts\"
             ],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let file = ProfileFile {
             fonts: None,
@@ -6057,6 +6343,8 @@ name = \"accounts\"
             service: None,
             editor_font_size: None,
             statement_timeout: None,
+            password_command: None,
+            password_expires: None,
             next_query_id: Some(0),
             color: None,
             mode: None,
@@ -6078,6 +6366,7 @@ name = \"accounts\"
             open_objects: vec![object],
             folders: Vec::new(),
             pins: Vec::new(),
+            folds: BTreeMap::new(),
         };
         let text = toml::to_string_pretty(&ProfileFile {
             fonts: None,

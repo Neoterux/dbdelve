@@ -1,4 +1,4 @@
-# DuckDB v2.0.0-dev88614 duckdb_functions(): internal scalar, aggregate and macro functions without side effects, plus grammar-defined names,
+# DuckDB v2.0.0 duckdb_functions(): internal scalar, aggregate and macro functions without side effects, plus grammar-defined names,
 # minus denied_functions and egress_functions. Written by the_built_in_list_is_written_from_the_bundled_catalog.
 __between
 __cast

@@ -837,6 +837,10 @@ impl Workspace {
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::FocusSidebar => self.focus_sidebar(&FocusSidebar, window, cx),
+            Command::ExpandAllSchemas => self.expand_all_schemas(&ExpandAllSchemas, window, cx),
+            Command::CollapseAllSchemas => {
+                self.collapse_all_schemas(&CollapseAllSchemas, window, cx)
+            }
             Command::ToggleResultsFocus => {
                 self.toggle_results_focus(&ToggleResultsFocus, window, cx)
             }
@@ -933,6 +937,8 @@ impl Workspace {
             Command::CopyPlan => self.copy_plan(cx),
             Command::ShowStructureSection(section) => self.show_structure_section(section, cx),
             Command::DownloadUpdate(url) => cx.open_url(&url),
+            Command::InstallUpdate => self.install_update(cx),
+            Command::RestartIntoUpdate(installed) => restart_into(installed, cx),
         }
     }
 }

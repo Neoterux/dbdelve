@@ -5,16 +5,21 @@
 Apple Silicon, macOS 12 or later — that's what it's built and tested on. Intel
 and older macOS aren't blocked by anything in the code, they're just untested.
 
-Homebrew is the recommended way. It handles installing and upgrading:
+Homebrew is the recommended way to install it:
 
 ```sh
 brew install --cask ShayanAbbas1/dbdelve/dbdelve
-xattr -dr com.apple.quarantine /Applications/DBDelve.app
 ```
 
-Don't skip the second line, or macOS will refuse to open the app. DBDelve is
-signed ad-hoc: there's no Developer ID behind it and nothing is notarized, so
-Gatekeeper declines until the quarantine flag is cleared.
+DBDelve is signed ad-hoc: there's no Developer ID behind it and nothing is
+notarized, so Gatekeeper declines to open it while the download's quarantine
+flag is set. The cask clears that flag as it installs.
+
+After that it updates itself: when a release is out, the titlebar says so, and
+**Update and restart** in its menu downloads it, checks its signature, replaces
+the app and opens the new one. That needs the app to live somewhere you can
+write to, such as `/Applications` on an administrator account; one run from the
+`.dmg`, or from a folder you can't write to, links to the release instead.
 
 Your connections and query history are kept outside the app and survive updates.
 macOS will ask once more for the saved passwords in your Keychain after each
@@ -22,8 +27,26 @@ update, because each release carries a different ad-hoc signature. I'll
 pay for a Developer ID if enough people end up using this, which removes all of
 the above.
 
-Failing Homebrew, take the `.dmg` from [the latest release][releases] and drag
-DBDelve to Applications. Same quarantine step and you have to update manually.
+Without Homebrew, one line installs the latest release into `/Applications`
+(or `~/Applications` when that isn't yours to write to):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ShayanAbbas1/dbdelve/main/install.sh | sh
+```
+
+Nothing it downloads is quarantined, so the app just opens. If `minisign` is
+installed it also checks the release's signature, and installs nothing that
+fails the check.
+
+Or take the `.dmg` from [the latest release][releases] and drag DBDelve to
+Applications. A browser quarantines what it downloads and nothing clears that
+for you this way, so do it once before opening the app:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/DBDelve.app
+```
+
+From then on it updates itself the same way.
 
 To build it yourself instead, `DBDELVE_CHANNEL=release dev/bundle.sh` produces
 `target/DBDelve.app` with the release build, icon and signature. Drag that to
@@ -31,7 +54,19 @@ Applications; the quarantine step doesn't apply here.
 
 ## Linux
 
-Install from the AUR:
+One line installs the latest release for your architecture under `~/.local`,
+with no root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ShayanAbbas1/dbdelve/main/install.sh | sh
+```
+
+It downloads the tarball described below and runs the `install.sh` inside it.
+If `minisign` is installed it also checks the release's signature, and installs
+nothing that fails the check. It needs `curl`, `tar` and `bash`. An install made
+this way updates itself, see [Updating](#updating).
+
+Or install from the AUR:
 
 ```sh
 yay -S dbdelve-bin
@@ -59,9 +94,10 @@ cd dbdelve-*-linux-*/
 Everything goes under `~/.local`, so no root: the binary to `~/.local/bin`, the
 icons and the desktop entry where your desktop looks for them, which is what
 puts DBDelve in the app menu. Make sure `~/.local/bin` is on your PATH —
-`install.sh` says so if it isn't. Updating means unpacking the next release and
-running it again; `./install.sh --uninstall` reverses it and leaves your
-connections and query history alone.
+`install.sh` says so if it isn't. The installed app updates itself, and
+running the next release's `install.sh` over it works too;
+`./install.sh --uninstall` reverses it and leaves your connections and query
+history alone.
 
 Or take `dbdelve-<version>-<arch>.AppImage` from the same release, which is one
 file that runs where it lands:
@@ -83,7 +119,14 @@ What it does not do is put DBDelve in the app menu: an AppImage on its own is
 just a file you run, so there is no desktop entry and no icon until you
 integrate it — Gear Lever and AppImageLauncher both do that, or you copy the
 entry out by hand. The tarball does it for you, which is still the reason to
-prefer it. Updating either way is downloading the next one.
+prefer it. An AppImage in a folder you can write to updates itself in place,
+see [Updating](#updating).
+
+One unpacked with `--appimage-extract` does not: to update it, download the
+next release and unpack that. Nor does one started with
+`--appimage-extract-and-run`, since its restart would need the FUSE it ran
+without; `APPIMAGE_EXTRACT_AND_RUN=1` in the environment does the same job
+and does update, because the restart keeps it.
 
 To build it yourself instead, on Debian or Ubuntu the build needs:
 
@@ -183,15 +226,37 @@ The agent integration is not available on Windows.
 
 ## Updating
 
-`brew upgrade --cask dbdelve`, if you installed it that way. If you used the
-Windows installer, run the next one over it; it upgrades in place. The zip has
-no upgrade: each version unzips to its own folder, so delete the old one.
-Connections and any plugins you added live in `%APPDATA%\dbdelve`, not there.
-Otherwise the
-status bar links to [the latest release][releases] once there is a newer one.
+On macOS, Linux and Windows, **Update and restart** in the titlebar's update
+menu (or "Update to dbdelve … and restart" in the command palette) does it in
+one click. It downloads the release from GitHub, checks its signature against
+the key built into the app, replaces the app and opens the new one. On macOS that is
+described [above](#macos). Homebrew leaves a self-updating app to update
+itself, so `brew upgrade` skips DBDelve unless you add `--greedy`.
 
-There is no telemetry. The only request DBDelve makes on its own is one to
-GitHub at startup to check for updates, which you can turn off in Settings.
+On Linux it works for an install at `~/.local/bin/dbdelve`, which is what the
+tarball's `install.sh` and the one-liner make, and for a running AppImage whose
+folder you can write to. Installs from the AUR or another package manager, a
+tarball run from where it was unpacked, a build run from the source tree, and
+any dev or variant build don't update themselves; the titlebar links to
+[the latest release][releases] instead, and your package manager is the way to
+update.
+
+On Windows it works for an install the installer made, and for the unzipped
+portable build in a folder you can write to. An install for all users (in
+Program Files) asks for administrator rights through the usual Windows prompt;
+saying no leaves the update to try again. The portable build is updated in
+its folder, which keeps the name of the version you first unzipped. Anything
+you put in that folder yourself is left alone, except inside
+`plugins\odbc`, which the release replaces whole. Connections and any plugins
+you added in `%APPDATA%\dbdelve` are untouched either way. A dev or variant
+build, or a `dbdelve.exe` anywhere else, links to [the latest
+release][releases] instead: run the next installer over the old install, or
+unzip the next zip.
+
+There is no telemetry. The only requests DBDelve makes on its own are to
+GitHub, to check for a newer release at startup and every six hours after,
+which you can turn off in Settings, and to download the release you asked to
+update to.
 
 [releases]: https://github.com/ShayanAbbas1/dbdelve/releases/latest
 [Inno Setup]: https://jrsoftware.org/isinfo.php

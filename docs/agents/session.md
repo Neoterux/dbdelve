@@ -491,7 +491,8 @@ The shape a change to the main pane has to fit (`session.rs`, with the
 - **A dialog's keyboard is its ring** (`Workspace::dialog_layer`): the layer
   holds focus, and `left`/`right`/`tab` step a ring across its buttons and
   then its one other control, the "Don't ask again" box (`enter` or `space`
-  ticks it) or the import question's project (`enter` lists the projects in
+  ticks it; on the unreadable prompt it is the app-wide opt-in, set only when
+  Run once is pressed with it ticked) or the import question's project (`enter` lists the projects in
   the palette). `space` never presses a button: a space typed on as a prompt
   takes the keyboard would otherwise press Run. Import Rows has fields and
   lists of its own, so it has no ring: Tab moves real focus through it,
@@ -1013,6 +1014,35 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   lands where no row takes it, and an object dragged while its database is
   unknown carries nothing. The Pinned group exists only while something is
   pinned, so pinning the first thing is the menu's.
+- **The sidebar opens on the active schema and keeps the user's folds.** A
+  schema row starts open only when it is the schema the connection works in
+  (`Profile::explorer_opens_on`): `Profile::active_schema`, or, where
+  `Target::catalog_lists_databases` (MySQL, MariaDB, ClickHouse, whose
+  schema rows are databases), the row named like `Profile::active_database`.
+  Gated on that ability rather than matched by name everywhere, so a schema
+  sharing the database's name on another engine is not taken for it. When
+  neither names a listed row, the only schema there is opens. So a database
+  of many schemas is not a wall of open trees, and one of a single schema is
+  not a lone closed row. Every other schema starts closed, and every row
+  that is not a schema (Pinned, folders, Queries) open
+  (`explorer::root_folds`). Opening or closing a top-level row (a schema, a
+  folder, Pinned, Queries) is recorded from the tree's own `TreeEvent` (`Workspace::remember_fold`), keyboard, click and
+  `reveal_item` alike, in the profile's `folds`, row id to open, saved as
+  `[profiles.folds]` and left out when empty. A row it does not name gets the
+  default, so a schema created since stays closed and a new folder opens.
+  Every rebuild without a filter puts `folds` over what was kept, which is
+  how Collapse All and Expand All Schemas (the filter row's buttons and the
+  palette, no default chords) and Set as Active Schema show at once: Set as Active Schema
+  records the schema it picks as open and the one it leaves as it was, since
+  that one was open only for being active, and its rebuild opens the picked
+  row over what was kept, so it opens under a filter too. Nothing is recorded while the
+  filter has text: a filter opens every row it keeps so that matches show,
+  and those are not the user's folds. Clearing it rebuilds from `folds` and
+  the defaults; Collapse All Schemas clears it first, or nothing would close;
+  Expand All leaves it.
+  Category folds are kept across a refresh but not saved. Stale ids are left
+  in `folds`: harmless, and a dropped schema may come back. A duplicate takes
+  the folds with the folders.
 - **A named buffer persists to its query file, an unnamed one to its own
   `.scratch-{id}.sql`.** Edits stay in memory until Save, a connection switch,
   opening another query, or normal quit/window close persists the buffers.
@@ -1047,8 +1077,9 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   every visible cell of every frame. Nothing clipped is kept: a stored second
   copy of every cell (up to 300 characters each) was built for all of them
   before the first frame. A line break early in a mostly blank value stops the
-  scan at `CLIP_SCAN_LIMIT` bytes, and a number longer than the limit is shown
-  ungrouped, so neither walks a whole value per frame. `clip` used to scan each whole value for line
+  scan at `CLIP_SCAN_LIMIT` bytes, so it never walks a whole value per frame.
+  Numbers paint as stored, with no thousands separators: the row panel, where
+  a value is edited, shows it that way too. `clip` used to scan each whole value for line
   breaks before keeping `CELL_DISPLAY_LIMIT` (300) characters, so a result of
   large documents (5,000 rows of 51 columns, 206 MB, values up to 1.85 M
   characters) cost 11 s in a debug build and 0.15 s in release. `clip` now
@@ -1092,6 +1123,21 @@ duplicate round trip per relation. And **a failed fetch is retried, but only
 timeout) kill completion for a relation for the rest of the connection; always
 retrying puts a describe on the wire per keystroke, each queued behind the last
 on the connection mutex, which freezes the profile rather than degrading it.
+
+A relation completed after `FROM` or `JOIN` is written with an alias, the
+initials of its name (`order_items oi`), numbered when the statement already
+uses them or they spell a keyword. After `JOIN` the relations a foreign key
+ties to the ones the statement already holds lead the list, written with the
+condition (`order_items oi ON oi.order_id = o.id`). Both are one setting,
+`alias_completions`, on by default, and neither reaches a filter bar. No alias
+is written after `DELETE FROM`, `UPDATE` or `INTO`, nor in front of text that
+already is one. The keys ride in the column cache, as `Described`, so a join
+costs no fetch the statement's columns had not already made; who points back at
+a relation is `Connection::references`, a second query the fetch only makes
+while the setting is on, which is why turning it on clears the cache. A
+`ForeignKey` is one column and does not name its key, so `foreign_keys` in
+`completion.rs` guesses where one key ends: see its comment before trusting it
+with something new.
 
 Two rules it exists under. **It is a lexer, not a parser**: half-typed SQL is a
 parse error by definition, and `SELECT * FROM ` is both the text a user most
@@ -1152,7 +1198,8 @@ one waiting on a column ignores whatever is typed into it.
   carry, or the string's `storable()` refusal for a hand-edited secret; a
   `generic` engine with no plugin gets the Generic refusal.
 - **Passwords** go through `keyring`, never into `profiles.toml`: Keychain on
-  macOS, Secret Service on Linux, Credential Manager on Windows.
+  macOS, Secret Service on Linux, Credential Manager on Windows. So does an
+  SSH key's passphrase, as an item per profile in a service of its own.
 - **Keybindings** are spelled `secondary-`, which GPUI reads as Cmd on macOS and
   Ctrl elsewhere. Never `cmd-`: on Linux that is Super, which the window manager
   takes first. Every binding is rebindable from Settings (`keybindings.rs`), and
@@ -1177,6 +1224,13 @@ the form first, finds no handler there and lets it through
 (`keybindings::INERT_IN` is what tells the conflict check so). **Test** opens
 the connection the way **Connect** would (keychain password, Read-only hold)
 and throws it away, so a profile can be checked before it is saved.
+Where `Target::takes_password_command`, Password command and Expires after
+sit under Password, always drawn for those engines so neither leaves the screen
+holding focus. While the command holds anything, Password is disabled with
+"From the command" as its placeholder; what was typed in it stays but is not
+read, so the config's password is blank and nothing reaches the Keychain. The
+command is stored as typed (`password_command`, `password_expires` in
+`profiles.toml`), and restore drops one from an engine that does not take it.
 
 **The ODBC tile** is one tile per discovered plugin (`Target::tiles`, after the
 built-ins, wearing one generic plug icon), shown only when the bridge is

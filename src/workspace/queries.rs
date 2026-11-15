@@ -250,7 +250,11 @@ impl Workspace {
         cx.spawn(async move |workspace, cx| {
             if let Err(error) = cancel_task.await {
                 tracing::warn!(connection = number, engine, "cancel failed");
-                tracing::debug!(connection = number, "cancel failed: {}", error.message);
+                tracing::debug!(
+                    connection = number,
+                    "cancel failed: {}",
+                    crate::db::loggable_error(&error.message)
+                );
                 _ = workspace.update(cx, |workspace, cx| workspace.note(error.message, cx));
             }
         })
@@ -495,7 +499,7 @@ impl Workspace {
             }
         }
         self.sent_from(tab, start, &sql);
-        self.execute_sql(sql, tab, cx);
+        self.execute_own(sql, tab, None, cx);
     }
 
     /// Say why nothing ran, where the result would have gone. A refusal is the
@@ -580,7 +584,7 @@ impl Workspace {
             query.queue = Some(queue);
         }
         self.sent_from(tab, first.start, &sql);
-        self.execute_sql(sql, tab, cx);
+        self.execute_own(sql, tab, None, cx);
     }
 
     /// Run a selection's statements all at once, each on a connection of its
@@ -977,7 +981,7 @@ impl Workspace {
             query.results = grid;
         }
         query.sent_from = Some((range.start, sql.clone()));
-        self.execute_sql(sql, tab, cx);
+        self.execute_own(sql, tab, None, cx);
     }
 
     /// Show one of a queue's results. `index` is a position in `done`, or
@@ -1292,7 +1296,7 @@ impl Workspace {
         };
         self.sent_from(tab, start, &sql);
 
-        self.execute_and_then(statement, tab, None, false, Some(action.mode), cx);
+        self.execute_own(statement, tab, Some(action.mode), cx);
     }
 
     /// Flip the query tab's results pane between its rows and its plan.
@@ -2040,6 +2044,33 @@ impl Workspace {
         self.execute_and_then(sql, tab, None, false, None, cx);
     }
 
+    /// A statement the user just asked to run: Run, the rest of the queue a
+    /// Run started, and Explain. The only runs `Settings::run_unreadable` may
+    /// let through unasked; everything that runs without being asked --
+    /// previews, edits, refreshes -- goes through `execute_and_then` and keeps
+    /// failing closed.
+    pub(crate) fn execute_own(
+        &mut self,
+        sql: String,
+        tab: Tab,
+        explain: Option<ExplainMode>,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_gated(sql, tab, None, false, explain, true, cx);
+    }
+
+    pub(crate) fn execute_and_then(
+        &mut self,
+        sql: String,
+        tab: Tab,
+        refresh: Option<Refresh>,
+        keep_rows: bool,
+        explain: Option<ExplainMode>,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_gated(sql, tab, refresh, keep_rows, explain, false, cx);
+    }
+
     /// Runs a statement, if the connection's mode allows it.
     ///
     /// The check lives here rather than in each caller because every path that
@@ -2050,13 +2081,15 @@ impl Workspace {
     /// held on `pending_run` rather than run: nothing here sets
     /// `QueryState::Running` or appends to history, because a statement that
     /// did not run is not history and must not leave a spinner behind.
-    pub(crate) fn execute_and_then(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_gated(
         &mut self,
         sql: String,
         tab: Tab,
         refresh: Option<Refresh>,
         keep_rows: bool,
         explain: Option<ExplainMode>,
+        own_run: bool,
         cx: &mut Context<Self>,
     ) {
         // ponytail: the entry points are the guard (`held_for_edits`), because
@@ -2101,7 +2134,7 @@ impl Workspace {
         let verdict = sql::classify(self.engine(), &sql);
         let stopped = self
             .profile()
-            .and_then(|profile| sql::gate(&verdict, profile.mode, &profile.confirmed));
+            .and_then(|profile| self.gate_run(profile, &verdict, own_run));
 
         if stopped.is_some() {
             // What a Row send was to be followed by does not wait on the
@@ -2125,6 +2158,7 @@ impl Workspace {
                     verdict,
                     dont_ask: false,
                     commit_cell: false,
+                    own_run,
                 });
             }
             cx.notify();

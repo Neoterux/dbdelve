@@ -565,6 +565,7 @@ pub fn config_from_url(url: &str) -> Result<PostgresConfig, String> {
             database,
             user,
             password,
+            password_command: None,
             sslmode,
             root_certificate,
             // A URL has nowhere to say it; the form is where it is set.
@@ -747,9 +748,10 @@ fn dbname(server: &ServerConfig) -> &str {
 }
 
 /// The profile's own host and port, not the tunnel's local end: those are
-/// what a `.pgpass` line written for the server names.
+/// what a `.pgpass` line written for the server names. Never consulted for a
+/// password command, whose output is the password even when it is stale.
 fn password_file(server: &ServerConfig) -> Option<pgpass::Lookup> {
-    server.password.is_empty().then(|| {
+    (server.password.is_empty() && server.password_command.is_none()).then(|| {
         pgpass::lookup(
             &server.host,
             server.port.unwrap_or(DEFAULT_PORT),
@@ -1051,6 +1053,10 @@ impl Connection {
     }
 
     fn connect(server: &ServerConfig, route: Route, startup: &[String]) -> Result<Self, DbError> {
+        server.forgetting_on_failure(Engine::Postgres, Self::sign_in(server, route, startup))
+    }
+
+    fn sign_in(server: &ServerConfig, route: Route, startup: &[String]) -> Result<Self, DbError> {
         let connector = tls::connector(server.sslmode, server.root_certificate.as_deref())
             .map_err(|message| DbError {
                 message,
@@ -1062,6 +1068,10 @@ impl Connection {
         let signing_in = match &password_file {
             Some(pgpass::Lookup::Found { password, .. }) => &ServerConfig {
                 password: password.clone(),
+                ..server.clone()
+            },
+            _ if server.password_command.is_some() => &ServerConfig {
+                password: server.login_password(Engine::Postgres)?.into_owned(),
                 ..server.clone()
             },
             _ => server,
@@ -2589,6 +2599,7 @@ mod tests {
             database: "dbdelve_test".into(),
             user: "someone".into(),
             password: String::new(),
+            password_command: None,
             sslmode: SslMode::default(),
             root_certificate: None,
             statement_timeout: 0,
@@ -2633,6 +2644,7 @@ mod tests {
             password: std::env::var("PGPASSWORD").unwrap_or_default(),
             // The compose database speaks no TLS, and these tests are the one
             // place a plaintext connection is the point.
+            password_command: None,
             sslmode: SslMode::Disable,
             root_certificate: None,
             statement_timeout: 0,
@@ -3143,6 +3155,60 @@ mod tests {
         );
     }
 
+    /// Run again in a child process, `PGSERVICEFILE` set before it starts, as
+    /// the live service test below is. No server: the port is closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_open_forgets_the_output_cached_under_its_services_username() {
+        const CHILD: &str = "DBDELVE_PGSERVICE_FORGET_CHILD";
+        let name = "db::postgres::tests::a_failed_open_forgets_the_output_cached_under_its_services_username";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let directory = std::env::temp_dir()
+                .join(format!("dbdelve-pgservice-forget-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let closed = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let file = directory.join("pg_service.conf");
+            std::fs::write(
+                &file,
+                format!("[svc]\nhost=127.0.0.1\nport={closed}\nuser=svcuser\nsslmode=disable\n"),
+            )
+            .unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([name, "--exact", "--nocapture"])
+                .env(CHILD, &directory)
+                .env("PGSERVICEFILE", file);
+            for variable in ["PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD"] {
+                child.env_remove(variable);
+            }
+            let status = child.status().unwrap();
+            let _ = std::fs::remove_dir_all(&directory);
+            assert!(status.success());
+            return;
+        };
+
+        let runs = std::path::Path::new(&directory).join("runs");
+        let config = crate::db::ConnectionConfig::Postgres(PostgresConfig {
+            service: Some("svc".into()),
+            server: ServerConfig {
+                password_command: Some(crate::db::PasswordCommand {
+                    command: format!("printf %s %USERNAME% >> {}; printf token", runs.display()),
+                    expires: 60,
+                }),
+                ..ServerConfig::default()
+            },
+        });
+        for _ in 0..2 {
+            assert!(crate::db::Connection::open(config.clone()).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "svcusersvcuser");
+    }
+
     /// Run again in a child process, for the same reason as the password file
     /// test below: `PGSERVICEFILE` has to be set before it starts, and the file
     /// holds the live password.
@@ -3315,6 +3381,27 @@ mod tests {
         write("never-read", 0o644);
         let skipped = failure();
         assert!(skipped.contains("is readable by other users"), "{skipped}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_password_command_signs_in_in_place_of_the_typed_password() {
+        let config = live_config();
+        let printing = |password: &str| ServerConfig {
+            password: String::new(),
+            password_command: Some(crate::db::PasswordCommand {
+                command: format!("printf %s '{}'", password.replace('\'', r"'\''")),
+                expires: 0,
+            }),
+            ..config.clone()
+        };
+        let connection = Connection::open(&printing(&config.password))
+            .expect("the command's password should sign in");
+        connection
+            .alongside()
+            .expect("a second session should sign in with it too");
+        assert!(Connection::open(&printing("not-the-password")).is_err());
     }
 
     /// The Generic File Access functions are pinned by shape against the
@@ -3729,6 +3816,7 @@ mod tests {
                     database: "dbdelve_test".into(),
                     user: "person@example.com".into(),
                     password: String::new(),
+                    password_command: None,
                     sslmode: SslMode::default(),
                     root_certificate: None,
                     statement_timeout: 0,
@@ -5199,6 +5287,30 @@ mod tests {
             .expect_err("the statement should be cancelled");
         assert!(error.message.contains("cancel"), "{}", error.message);
         assert!(connection.query("SELECT 1", Fetch::default()).is_ok());
+    }
+
+    // Where the test binary can stand in as ssh's askpass.
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+    #[test]
+    #[ignore = "requires the dev bastions and Postgres configured through dbdelve_SSH_CONFIG and PG*"]
+    fn live_ssh_every_login_over_the_socket_is_given_the_key_passphrase() {
+        let (ssh, _key) = crate::db::ssh::live_bastion_with_a_passphrase("socket", "correct horse");
+        let server = ServerConfig {
+            ssh: Some(ssh),
+            ..live_socket("dbdelve-bastion", Some("postgres"))
+        };
+        let connection = Connection::open(&server).expect("connection should open");
+        let canceller = connection.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            canceller.cancel().expect("the cancel request should send");
+        });
+
+        // The cancel is a login of its own.
+        let error = connection
+            .query("SELECT pg_sleep(30)", Fetch::default())
+            .expect_err("the statement should be cancelled");
+        assert!(error.message.contains("cancel"), "{}", error.message);
     }
 
     #[test]

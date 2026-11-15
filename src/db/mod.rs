@@ -31,6 +31,7 @@ mod mongo;
 mod mssql;
 mod mysql;
 pub(crate) mod odbc_string;
+mod password_command;
 pub(crate) mod plugin;
 mod postgres;
 mod properties;
@@ -52,10 +53,12 @@ pub use external::ExternalConfig;
 pub(crate) use external::echo;
 pub(crate) use include::same_name;
 pub use include::{Include, Shown};
+pub use password_command::{PasswordCommand, loggable_error};
 pub use plugin::Plugin;
 pub use properties::{Properties, Property};
 #[cfg(test)]
 pub(crate) use snowflake::mock as snowflake_mock;
+pub use ssh::askpass;
 
 pub use mongo::MongoConfig;
 pub use postgres::PostgresConfig;
@@ -689,6 +692,17 @@ impl Engine {
         }
     }
 
+    /// Whether New row sends a field typed into and emptied again as an empty
+    /// string. MongoDB leaves an empty field out of the document, and Redis
+    /// leaves out an empty one that is not text.
+    pub fn new_row_sends_empty(self, column: &str) -> bool {
+        match self.syntax() {
+            Syntax::Sql => true,
+            Syntax::Mongo => false,
+            Syntax::Redis => !crate::redis_cmd::edit::empty_is_none(column),
+        }
+    }
+
     /// What the review of a generated batch says beyond its statements: how
     /// the engine matches rows, what it cannot undo, what it cannot write.
     /// Empty for every engine that has nothing to add.
@@ -1160,6 +1174,7 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
             .map(percent_decoded)
             .transpose()?
             .unwrap_or_default(),
+        password_command: None,
         sslmode,
         root_certificate,
         // A URL has nowhere to say it; the form is where it is set.
@@ -1174,9 +1189,9 @@ pub(super) fn server_from_url(url: &str, engine: &str) -> Result<ServerConfig, S
 }
 
 /// A local port forward opened over the system `ssh` binary before the engine
-/// dials in. Nothing here is a secret: the private key stays on disk and the
-/// password, if any, stays with ssh-agent.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// dials in. The one secret is the key's passphrase, which the Keychain holds,
+/// never `profiles.toml`; the private key stays on disk or with ssh-agent.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTunnel {
     /// A hostname, or an alias `~/.ssh/config` resolves.
     pub host: String,
@@ -1186,14 +1201,31 @@ pub struct SshTunnel {
     /// Blank defers to `~/.ssh/config`, or the local user.
     #[serde(default)]
     pub user: String,
-    /// None defers to `~/.ssh/config`, or ssh-agent. No password field: v1 is
-    /// keys and agent only.
+    /// None defers to `~/.ssh/config`, or ssh-agent. No password field: a
+    /// host is reached by key, never by password.
     #[serde(default)]
     pub identity_file: Option<String>,
     /// The OS user `sudo` opens a Unix socket as on the SSH host, for peer
     /// authentication. None, or blank, opens it as the SSH user.
     #[serde(default)]
     pub run_as: Option<String>,
+    /// What decrypts the key, filled in from the Keychain at connect as the
+    /// password is. Blank is none, and ssh runs exactly as it does without one.
+    #[serde(skip)]
+    pub passphrase: String,
+}
+
+/// By hand, so the passphrase reaches no log line or panic message.
+impl std::fmt::Debug for SshTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTunnel")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("identity_file", &self.identity_file)
+            .field("run_as", &self.run_as)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SshTunnel {
@@ -1216,6 +1248,9 @@ pub struct ServerConfig {
     /// Blank is valid and must never be warned about — cloud IAM auth issues a
     /// short-lived token as the password, or none at all.
     pub password: String,
+    /// Run for the password in its place at every login, where the target
+    /// [`Target::takes_password_command`].
+    pub password_command: Option<PasswordCommand>,
     pub sslmode: SslMode,
     /// libpq's `sslrootcert`. Replaces the platform's trust store rather than
     /// adding to it, and only consulted by the two verifying modes.
@@ -1496,6 +1531,20 @@ impl ConnectionConfig {
             Self::External(external) => external.ssh.as_ref(),
             _ => self.server()?.ssh.as_ref(),
         }
+    }
+
+    /// The same, for the callers that fill its passphrase in from the Keychain
+    /// or take it out to save there.
+    pub fn ssh_mut(&mut self) -> Option<&mut SshTunnel> {
+        match self {
+            Self::External(external) => external.ssh.as_mut(),
+            _ => self.server_mut()?.ssh.as_mut(),
+        }
+    }
+
+    /// The command a login runs in place of the Keychain's password.
+    pub fn password_command(&self) -> Option<&PasswordCommand> {
+        self.server()?.password_command.as_ref()
     }
 
     /// The password the Keychain holds for this profile, where it has one.
@@ -1786,13 +1835,18 @@ impl ConnectionConfig {
     /// what the Keychain holds, so blank there means "leave it alone" -- taken
     /// literally it would drop and reopen the connection every time a colour
     /// was saved. A password that was typed does count, since applying it is
-    /// the only reason to type one.
+    /// the only reason to type one. The same goes for the key passphrase.
     pub fn needs_reconnect(&self, edited: &Self) -> bool {
         let mut current = self.clone();
         if let Some(password) = current.password_mut()
             && edited.password().is_some_and(str::is_empty)
         {
             password.clear();
+        }
+        if let Some(ssh) = current.ssh_mut()
+            && edited.ssh().is_some_and(|ssh| ssh.passphrase.is_empty())
+        {
+            ssh.passphrase.clear();
         }
         current != *edited
     }
@@ -3429,9 +3483,9 @@ pub struct Structure {
     pub constraints: Vec<NamedDefinition>,
     pub foreign_keys: Vec<ForeignKey>,
     /// The single-column foreign keys of other relations that point at this one.
-    /// Filled by `load_structure` from [`Connection::references`], not by
-    /// [`Connection::structure`]: completion calls that one per relation it
-    /// sees, and has no use for who points back.
+    /// Filled from [`Connection::references`] by the callers that want it, not
+    /// by [`Connection::structure`]: completion calls that one per relation it
+    /// sees, and only wants who points back while it is suggesting joins.
     pub referenced_by: Vec<Reference>,
 }
 
@@ -5954,6 +6008,19 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_new_row_field_is_sent_only_where_the_engine_writes_one() {
+        for engine in Target::tiles(&[]).map(|target| target.engine) {
+            let sends = engine.new_row_sends_empty("name");
+            assert_eq!(sends, engine != Engine::MongoDb, "{engine:?}");
+        }
+        assert!(Engine::Redis.new_row_sends_empty("value"));
+        assert!(Engine::Redis.new_row_sends_empty("member"));
+        for column in ["ttl", "index", "score"] {
+            assert!(!Engine::Redis.new_row_sends_empty(column), "{column}");
+        }
+    }
+
+    #[test]
     fn clickhouse_brackets_no_batch_and_says_why_an_import_has_no_transaction() {
         let spec = Engine::ClickHouse.spec();
         assert_eq!(spec.sql.transaction_opening(), None);
@@ -6148,6 +6215,42 @@ mod tests {
             path: "/tmp/dbdelve.db".into(),
             statement_timeout: 0
         }));
+    }
+
+    #[test]
+    fn a_key_passphrase_is_left_out_of_debug_output() {
+        let tunnel = SshTunnel {
+            host: "bastion".into(),
+            passphrase: "correct horse".into(),
+            ..SshTunnel::default()
+        };
+        let config = ConnectionConfig::MySql(ServerConfig {
+            ssh: Some(tunnel),
+            ..ServerConfig::default()
+        });
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(printed.contains("bastion"), "{printed}");
+            assert!(!printed.contains("correct horse"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn an_edit_reconnects_for_a_typed_key_passphrase_but_not_a_blank_one() {
+        let tunnelled = |passphrase: &str| {
+            ConnectionConfig::MySql(ServerConfig {
+                host: "db.internal".into(),
+                ssh: Some(SshTunnel {
+                    host: "bastion".into(),
+                    passphrase: passphrase.into(),
+                    ..SshTunnel::default()
+                }),
+                ..ServerConfig::default()
+            })
+        };
+        let stored = tunnelled("secret");
+
+        assert!(!stored.needs_reconnect(&tunnelled("")));
+        assert!(stored.needs_reconnect(&tunnelled("typed")));
     }
 
     #[test]

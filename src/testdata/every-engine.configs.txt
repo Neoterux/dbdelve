@@ -8,6 +8,7 @@ legacy Postgres(
             database: "app",
             user: "ada",
             password: "",
+            password_command: None,
             sslmode: Prefer,
             root_certificate: None,
             statement_timeout: 0,
@@ -33,6 +34,7 @@ pg Postgres(
             database: "orders",
             user: "ada",
             password: "",
+            password_command: None,
             sslmode: VerifyFull,
             root_certificate: Some(
                 "/certs/ca.pem",
@@ -49,6 +51,7 @@ pg Postgres(
                         "~/.ssh/id_ed25519",
                     ),
                     run_as: None,
+                    ..
                 },
             ),
             schema: Some(
@@ -72,6 +75,7 @@ alias Postgres(
             database: "postgres",
             user: "postgres",
             password: "",
+            password_command: None,
             sslmode: Prefer,
             root_certificate: None,
             statement_timeout: 0,
@@ -98,6 +102,7 @@ mysql MySql(
         database: "shop",
         user: "root",
         password: "",
+        password_command: None,
         sslmode: Require,
         root_certificate: None,
         statement_timeout: 0,
@@ -120,6 +125,7 @@ maria MariaDb(
         database: "dbdelve_dev",
         user: "dbdelve",
         password: "",
+        password_command: None,
         sslmode: Prefer,
         root_certificate: None,
         statement_timeout: 0,
@@ -177,6 +183,7 @@ mssql SqlServer(
         database: "dbdelve_dev",
         user: "sa",
         password: "",
+        password_command: None,
         sslmode: VerifyCa,
         root_certificate: Some(
             "/certs/mssql.pem",
@@ -202,6 +209,7 @@ mongo MongoDb(
             database: "app",
             user: "ada",
             password: "",
+            password_command: None,
             sslmode: Require,
             root_certificate: None,
             statement_timeout: 0,
@@ -230,6 +238,7 @@ redis Redis(
         database: "2",
         user: "default",
         password: "",
+        password_command: None,
         sslmode: Disable,
         root_certificate: None,
         statement_timeout: 0,
@@ -252,6 +261,7 @@ clk ClickHouse(
         database: "analytics",
         user: "ada",
         password: "",
+        password_command: None,
         sslmode: VerifyFull,
         root_certificate: Some(
             "/certs/ch.pem",
@@ -264,6 +274,7 @@ clk ClickHouse(
                 user: "jump",
                 identity_file: None,
                 run_as: None,
+                ..
             },
         ),
         schema: None,

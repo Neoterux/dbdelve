@@ -10,11 +10,14 @@
 //! changed but their visibility.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use gpui::{App, AppContext, Context, Entity, SharedString, Window};
@@ -22,7 +25,7 @@ use gpui_component::{
     input::{CompletionProvider, EditorState, InputEvent, InputState},
     resizable::ResizableState,
     table::TableState,
-    tree::TreeState,
+    tree::{TreeEvent, TreeState},
 };
 
 use crate::{
@@ -101,6 +104,12 @@ pub(crate) struct Profile {
     pub(crate) confirmed_stale: bool,
     pub(crate) generation: u64,
     pub(crate) state: ProfileState,
+    /// Whether the server is known to hold this connection as `mode` says
+    /// (`Connection::set_read_only`): set when a connect lands, which fails
+    /// rather than open unheld, and by the latest hold `set_mode` sent, once
+    /// it lands. Cleared while one is on its way or after one failed.
+    pub(crate) held: bool,
+    pub(crate) holds: Arc<HoldLine>,
     /// Whether the user's statements on this connection have left a
     /// transaction open (`sql::Leaves`), which a fresh one opened for a
     /// queue's reads would not see. Read off what was sent, not asked of the
@@ -165,7 +174,54 @@ pub(crate) struct Profile {
     /// loaded waits for it; the tree owns a row once it holds it.
     pub(crate) open_rows: Vec<String>,
     pub(crate) selected_rows: Vec<String>,
+    /// Whether the user left each of the explorer's top-level rows open, by
+    /// row id (`store::StoredProfile::folds`).
+    pub(crate) folds: BTreeMap<String, bool>,
     pub(crate) session: Session,
+}
+
+/// Orders `set_mode`'s holds, which go out on tasks nothing else orders and
+/// meet on a connection mutex that is not first come, first served: each
+/// takes its turn here, and one a newer hold has overtaken is skipped rather
+/// than land after it and leave the session held the opposite way.
+#[derive(Default)]
+pub(crate) struct HoldLine {
+    latest: AtomicU64,
+    turn: Mutex<()>,
+}
+
+impl HoldLine {
+    /// Stamps a new hold, overtaking every one stamped before it.
+    pub(crate) fn stamp(&self) -> u64 {
+        self.latest.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn is_latest(&self, stamp: u64) -> bool {
+        self.latest.load(Ordering::SeqCst) == stamp
+    }
+
+    /// Sends the hold stamped `stamp` unless a newer one has been stamped
+    /// since; `Ok(false)` when it was skipped.
+    pub(crate) fn send(
+        &self,
+        stamp: u64,
+        hold: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<bool, DbError> {
+        let _turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.is_latest(stamp) {
+            return Ok(false);
+        }
+        hold().map(|()| true)
+    }
+}
+
+/// Whether `Settings::run_unreadable` lets a statement dbdelve cannot parse
+/// skip the run-once prompt: only one the user just asked to run, and in
+/// Read-only only once the server's hold is known to be in place. With no
+/// prompt left, that hold is all that stands between such a statement and a
+/// write.
+pub(crate) fn skips_run_once(opted_in: bool, own_run: bool, mode: Mode, held: bool) -> bool {
+    opted_in && own_run && (mode != Mode::ReadOnly || held)
 }
 
 /// See [`Profile::shortcut_database`]. The shown catalog's own word comes
@@ -183,6 +239,19 @@ fn shortcut_database(
         .and_then(|catalog| catalog.database.clone())
         .or_else(active)
         .map_or(ShortcutDatabase::Unknown, ShortcutDatabase::On)
+}
+
+/// See [`Profile::explorer_opens_on`].
+fn explorer_opens_on(
+    target: Target,
+    active_schema: Option<&str>,
+    database: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match active_schema {
+        Some(schema) => Some(schema.to_string()),
+        None if target.catalog_lists_databases() => database(),
+        None => None,
+    }
 }
 
 impl Profile {
@@ -248,6 +317,17 @@ impl Profile {
                 Tab::Query(_) => {}
             }
         }
+    }
+
+    /// The schema the sidebar starts with open (`explorer::root_folds`): the
+    /// active one, or where the catalog lists each database as a schema, the
+    /// database the connection is on. Gated rather than matched by name
+    /// alone, so a schema that happens to share the database's name elsewhere
+    /// is not taken for it.
+    pub(crate) fn explorer_opens_on(&self) -> Option<String> {
+        explorer_opens_on(self.config.target(), self.active_schema(), || {
+            self.active_database()
+        })
     }
 
     /// Why a queue of reads on this connection runs in turn rather than at
@@ -540,6 +620,7 @@ impl Profile {
         // path, rather than either writing a blank the loader would have to
         // decide the meaning of.
         let server = self.config.server();
+        let password_command = server.and_then(|server| server.password_command.as_ref());
         let snowflake = match &self.config {
             ConnectionConfig::Snowflake(account) => Some(account),
             _ => None,
@@ -596,6 +677,8 @@ impl Profile {
             // the migration to read on the next upgrade.
             editor_font_size: None,
             statement_timeout: Some(self.config.statement_timeout()),
+            password_command: password_command.map(|command| command.command.clone()),
+            password_expires: password_command.map(|command| command.expires),
             next_query_id: Some(self.session.next_query_id),
             color: self.color.map(|color| color.slug().to_string()),
             mode: Some(self.mode.slug().to_string()),
@@ -659,6 +742,7 @@ impl Profile {
                     },
                 })
                 .collect(),
+            folds: self.folds.clone(),
         }
     }
 }
@@ -1006,12 +1090,16 @@ pub(crate) struct InsertField {
     pub(crate) column: String,
     pub(crate) data_type: String,
     pub(crate) input: Entity<InputState>,
-    /// The `NULL` chip. Wins over typed text, because the chip is the later
-    /// word.
+    /// The `NULL` chip is on. Exclusive with `touched`: whichever happened
+    /// last wins, and NULL clears the box.
     pub(crate) nulled: bool,
-    /// Whether this field has been typed into. The reason `insert_value`
-    /// answers three ways rather than two.
+    /// Typed into since the last DEFAULT or NULL, so the text is sent even
+    /// when empty. The reason `insert_value` answers three ways rather than
+    /// two.
     pub(crate) touched: bool,
+    /// `Engine::new_row_sends_empty`: whether an emptied field is `''` or left
+    /// out.
+    pub(crate) sends_empty: bool,
 }
 
 /// Rows on their way into a table.
@@ -1117,6 +1205,22 @@ pub(crate) enum ImportPhase {
     },
 }
 
+/// What an empty box says will be sent. An emptied field is an empty string
+/// only where the engine writes one; elsewhere it is left out after all.
+pub(crate) fn insert_placeholder(nulled: bool, touched: bool, sends_empty: bool) -> &'static str {
+    match (nulled, touched && sends_empty) {
+        (true, _) => "NULL",
+        (false, true) => "empty string",
+        (false, false) => "DEFAULT",
+    }
+}
+
+/// Whether the statement leaves the column out, so it keeps its default:
+/// what the DEFAULT chip shows.
+pub(crate) fn insert_left_out(nulled: bool, touched: bool, sends_empty: bool, typed: &str) -> bool {
+    !nulled && (!touched || (!sends_empty && typed.is_empty()))
+}
+
 /// What one field contributes to the `INSERT`. The outer `None` is a column
 /// left out of the statement entirely, so the server's default applies; the
 /// inner `None` is a `NULL` the user asked for.
@@ -1149,11 +1253,14 @@ pub(crate) struct PendingRun {
     /// there is nothing to resume, and the dialog offers only the mode change.
     pub(crate) resume: Option<Resume>,
     pub(crate) verdict: Verdict,
-    /// The "don't ask again" tick, which only the Confirm shape shows.
+    /// The "don't ask again" tick, shown by the Confirm shape and, as the
+    /// app-wide opt-in to run what dbdelve cannot parse, by RunOnce.
     pub(crate) dont_ask: bool,
     /// The mode refused a grid cell's commit, whose input waits open behind
     /// the prompt: raising the mode carries the commit through.
     pub(crate) commit_cell: bool,
+    /// Raised by `execute_own`, so `Settings::run_unreadable` applies to it.
+    pub(crate) own_run: bool,
 }
 
 /// Export over a grid holding less than its result, waiting on the dialog
@@ -1259,6 +1366,15 @@ impl Session {
         })
         .detach();
 
+        let explorer_tree = cx.new(|cx| TreeState::new(cx));
+        cx.subscribe(&explorer_tree, {
+            let id = id.clone();
+            move |workspace, tree, event: &TreeEvent, cx| {
+                workspace.remember_fold(&id, &tree, event, cx);
+            }
+        })
+        .detach();
+
         let save_name = cx.new(|cx| InputState::new(window, cx).placeholder("Query name"));
         // Subscribed with the window, because confirming a save can swap the
         // editor's buffer and that cannot be done without one.
@@ -1318,7 +1434,7 @@ impl Session {
             completion_columns: completion::ColumnCache::default(),
             completions: None,
             explorer_filter,
-            explorer_tree: cx.new(|cx| TreeState::new(cx)),
+            explorer_tree,
             explorer_leaves: Arc::new(HashMap::new()),
             explorer_highlights: Arc::new(HashMap::new()),
             explorer_shortcuts: Arc::new(HashMap::new()),
@@ -3992,6 +4108,48 @@ pub(crate) fn reveals_results(landed: &QueryState, produced_grid: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hold_overtaken_by_a_newer_one_is_skipped_and_the_newer_one_sent() {
+        let holds = HoldLine::default();
+        let read_only = holds.stamp();
+        let read_write = holds.stamp();
+        let mut sent = Vec::new();
+        assert!(matches!(
+            holds.send(read_write, || {
+                sent.push("read-write");
+                Ok(())
+            }),
+            Ok(true)
+        ));
+        assert!(matches!(
+            holds.send(read_only, || {
+                sent.push("read-only");
+                Ok(())
+            }),
+            Ok(false)
+        ));
+        assert_eq!(sent, ["read-write"]);
+        assert!(holds.is_latest(read_write) && !holds.is_latest(read_only));
+    }
+
+    #[test]
+    fn read_only_runs_the_unreadable_unasked_only_once_its_hold_has_landed() {
+        let unreadable = sql::classify(Engine::Postgres, "SELCT 1");
+        let gate = |own_run, mode, held| {
+            sql::gate_own_run(
+                &unreadable,
+                mode,
+                &[],
+                skips_run_once(true, own_run, mode, held),
+            )
+        };
+        assert_eq!(gate(true, Mode::ReadOnly, true), None);
+        // On its way, or failed: the prompt, as if nobody had opted in.
+        assert_eq!(gate(true, Mode::ReadOnly, false), Some(sql::Stop::RunOnce));
+        assert_eq!(gate(true, Mode::ReadWrite, false), None);
+        assert_eq!(gate(false, Mode::ReadWrite, true), Some(sql::Stop::RunOnce));
+    }
     use crate::sql;
 
     fn complete() -> QueryState {
@@ -4236,6 +4394,26 @@ mod tests {
                 opened_on
             ),
             ShortcutDatabase::Unnamed
+        );
+    }
+
+    #[test]
+    fn the_sidebar_opens_on_the_active_schema_or_where_databases_are_schemas_the_database() {
+        let database = || Some("dbdelve_dev".to_string());
+        assert_eq!(
+            explorer_opens_on(Target::built_in(Engine::Postgres), Some("public"), database),
+            Some("public".into())
+        );
+        for listing_databases in [Engine::MySql, Engine::MariaDb, Engine::ClickHouse] {
+            assert_eq!(
+                explorer_opens_on(Target::built_in(listing_databases), None, database),
+                Some("dbdelve_dev".into())
+            );
+        }
+        // Its schemas are `dbo` and the like, never the database it is on.
+        assert_eq!(
+            explorer_opens_on(Target::built_in(Engine::SqlServer), None, database),
+            None
         );
     }
 
@@ -4572,6 +4750,7 @@ mod tests {
             toml::from_str("color_titlebar = true").expect("older settings must still decode");
         assert_eq!(settings.client_sort, None);
         assert_eq!(settings.qualify_completions, None);
+        assert_eq!(settings.alias_completions, None);
         assert_eq!(
             Sorting::new(settings.client_sort.unwrap_or(false)),
             Sorting::Server
@@ -5182,9 +5361,20 @@ mod tests {
             insert_value(false, true, "42"),
             Some(Some("42".to_string()))
         );
-        // The chip is the later word: a field nulled after being typed into is
-        // a NULL.
+        // The form keeps the two exclusive; if both were ever set, NULL is the
+        // answer that cannot send stray text.
         assert_eq!(insert_value(true, true, "42"), Some(None));
+    }
+
+    #[test]
+    fn an_emptied_field_reads_as_left_out_where_the_engine_drops_it() {
+        assert_eq!(insert_placeholder(false, true, true), "empty string");
+        assert!(!insert_left_out(false, true, true, ""));
+        assert_eq!(insert_placeholder(false, true, false), "DEFAULT");
+        assert!(insert_left_out(false, true, false, ""));
+        assert!(!insert_left_out(false, true, false, "42"));
+        assert_eq!(insert_placeholder(true, false, false), "NULL");
+        assert!(!insert_left_out(true, false, false, ""));
     }
 
     #[test]

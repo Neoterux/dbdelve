@@ -337,6 +337,12 @@ impl Workspace {
                         .into_any_element(),
                     );
                 }
+                let from_command = form.typed_password_command(cx).is_some();
+                let password_input = if from_command {
+                    bare(&form.password).disabled(true)
+                } else {
+                    bare(&form.password).mask_toggle()
+                };
                 connection.extend(
                     [
                         field_row(
@@ -347,16 +353,37 @@ impl Workspace {
                             t,
                         ),
                         field_row("user", "User", &form.user, bare(&form.user), t),
-                        field_row(
-                            "password",
-                            "Password",
-                            &form.password,
-                            bare(&form.password).mask_toggle(),
-                            t,
-                        ),
+                        field_row("password", "Password", &form.password, password_input, t),
                     ]
                     .map(IntoElement::into_any_element),
                 );
+                // Shown for every engine that takes one rather than only once
+                // typed, so no row leaves the screen with the focus in it.
+                if form.target().takes_password_command() {
+                    connection.push(
+                        field_row(
+                            "password-command",
+                            "Password command",
+                            &form.password_command,
+                            mono_field(&form.password_command),
+                            t,
+                        )
+                        .into_any_element(),
+                    );
+                    connection.push(
+                        ui::option_row(
+                            "Expires after",
+                            Some(
+                                "How long the command's password is reused for. 0 runs it \
+                                 at every login."
+                                    .into(),
+                            ),
+                            number_box(&form.password_expires, "s", t),
+                            t,
+                        )
+                        .into_any_element(),
+                    );
+                }
                 if form.engine.takes_service() {
                     connection.push(
                         field_row("service", "Service", &form.service, bare(&form.service), t)
@@ -490,6 +517,7 @@ impl Workspace {
                     "SSH tunnel",
                     Some(hint.into()),
                     ui::switch("ssh-tunnel", form.ssh, t)
+                        .debug_selector(|| "ssh-tunnel".into())
                         .on_click(cx.listener(Self::toggle_ssh_tunnel)),
                     t,
                 )
@@ -519,6 +547,12 @@ impl Workspace {
                         t,
                         cx,
                     )),
+                    nested(
+                        "ssh-passphrase",
+                        "Key passphrase",
+                        &form.ssh_passphrase,
+                        bare(&form.ssh_passphrase).mask_toggle(),
+                    ),
                 ];
                 if socket {
                     rows.push(nested(
@@ -668,37 +702,13 @@ impl Workspace {
         behaviour
             .push(ui::option_row("Project", None, self.project_dropdown(cx), t).into_any_element());
         // The same box for each row that is a whole number of a unit.
-        let number_box = |input: &Entity<InputState>, unit: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
-                .h(px(Control::Compact.height()))
-                .px(px(layout::SPACE_SM))
-                .rounded(px(layout::RADIUS_CONTROL))
-                .border_1()
-                .border_color(t.border)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(gpui_component::Sizable::small(bare(input))),
-                )
-                .child(
-                    div()
-                        .text_size(px(layout::chrome(layout::TEXT_SM)))
-                        .text_color(t.text_faint)
-                        .child(unit),
-                )
-        };
         // Every engine can stop a statement, and this is the only place a
         // profile has to say for how long.
         behaviour.push(
             ui::option_row(
                 "Statement timeout",
                 None,
-                number_box(&form.statement_timeout, "s"),
+                number_box(&form.statement_timeout, "s", t),
                 t,
             )
             .into_any_element(),
@@ -714,7 +724,7 @@ impl Workspace {
                          between here and the server does not close them. Off when blank."
                             .into(),
                     ),
-                    number_box(&form.keep_alive, "s"),
+                    number_box(&form.keep_alive, "s", t),
                     t,
                 )
                 .into_any_element(),
@@ -729,7 +739,7 @@ impl Workspace {
                      use, never while work is unfinished. Off when blank."
                         .into(),
                 ),
-                number_box(&form.idle_timeout, "min"),
+                number_box(&form.idle_timeout, "min", t),
                 t,
             )
             .into_any_element(),
@@ -961,6 +971,7 @@ impl Workspace {
             &form.ssh_port,
             &form.ssh_user,
             &form.ssh_identity_file,
+            &form.ssh_passphrase,
             &form.ssh_run_as,
         ]
         .iter()
@@ -1220,18 +1231,20 @@ impl Workspace {
     }
 
     /// Whether the dialog in front offers to stop asking: the run prompt over
-    /// a kind that can be silenced, and the stale-edit prompt over an edit.
+    /// a kind that can be silenced or a statement dbdelve cannot parse, and the
+    /// stale-edit prompt over an edit.
     pub(crate) fn dialog_checkbox(&self) -> bool {
         let Some(profile) = self.profile() else {
             return false;
         };
         match self.dialog_in_front.get() {
-            Some("pending-run") => profile
-                .session
-                .pending_run
-                .as_ref()
-                .and_then(|pending| sql::gate(&pending.verdict, profile.mode, &profile.confirmed))
-                .is_some_and(|stop| matches!(stop, Stop::Confirm(kind) if kind.suppressible())),
+            Some("pending-run") => profile.session.pending_run.as_ref().is_some_and(|pending| {
+                match sql::gate(&pending.verdict, profile.mode, &profile.confirmed) {
+                    Some(Stop::Confirm(kind)) => kind.suppressible(),
+                    Some(Stop::RunOnce) => pending.own_run,
+                    _ => false,
+                }
+            }),
             Some("stale-edit") => profile
                 .session
                 .stale_edit
@@ -2709,7 +2722,10 @@ impl Workspace {
         let pending = profile.session.pending_run.as_ref()?;
         // Re-derived rather than trusted from when the prompt was raised: the
         // mode or the silenced list may have changed underneath it (the
-        // upgrade arm changes the mode itself, mid-prompt).
+        // upgrade arm changes the mode itself, mid-prompt). With the plain
+        // gate, not `gate_run`: the opt-in decides whether a prompt goes up,
+        // and one already up that it later waved through would vanish with
+        // its statement neither run nor cancelled.
         let stop = sql::gate(&pending.verdict, profile.mode, &profile.confirmed)?;
         let name = profile.name.clone();
         let current_mode = profile.mode.label();
@@ -2720,6 +2736,7 @@ impl Workspace {
             .map(|resume| code_lines(&resume.sql, syntax, &cx.theme().highlight_theme));
         let code = fonts(cx).editor.clone();
         let dont_ask = pending.dont_ask;
+        let own_run = pending.own_run;
 
         let (title, message, confirm, tone) = match stop {
             Stop::Upgrade(needed) => (
@@ -2807,21 +2824,28 @@ impl Workspace {
                                 .text_color(t.text)
                                 .children(sql.into_iter().map(|line| div().child(line)))
                         }))
-                        // Never for `Unreadable`: silencing it would cover
-                        // every future typo along with it, on the strength of
-                        // one decision about one of them.
-                        .children(match stop {
-                            Stop::Confirm(kind) if kind.suppressible() => Some(
+                        // An unreadable statement's box turns on the app-wide
+                        // setting, never this connection's silenced list: it
+                        // silences every future typo, not one kind, so it is a
+                        // setting the panel shows and can take back.
+                        .children(
+                            match stop {
+                                Stop::Confirm(kind) if kind.suppressible() => {
+                                    Some(format!("Don't ask again for {} on {name}", kind.label()))
+                                }
+                                Stop::RunOnce if own_run => Some(
+                                    "Run statements dbdelve can't parse without asking".to_string(),
+                                ),
+                                _ => None,
+                            }
+                            .map(|label| {
                                 self.choice(
                                     "pending-run",
                                     2,
                                     Checkbox::new("dont-ask-again")
                                         .text_size(px(layout::chrome(layout::TEXT_SM)))
                                         .font_weight(FontWeight::BOLD)
-                                        .label(format!(
-                                            "Don't ask again for {} on {name}",
-                                            kind.label()
-                                        ))
+                                        .label(label)
                                         .checked(dont_ask)
                                         .on_click(move |_, _, cx| {
                                             _ = tick.update(cx, |workspace, cx| {
@@ -2829,10 +2853,9 @@ impl Workspace {
                                             });
                                         }),
                                     t,
-                                ),
-                            ),
-                            _ => None,
-                        })
+                                )
+                            }),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -3610,6 +3633,10 @@ impl Workspace {
             CatalogState::Loaded(..) => None,
         };
         let show_sizes = self.settings.show_sizes;
+        let lists_schemas = matches!(
+            &profile.catalog,
+            CatalogState::Loaded(catalog, _) if !catalog.schemas.is_empty()
+        );
         let tree = explorer_drawn(profile).then(|| {
             render_tree(
                 &profile.session.explorer_tree,
@@ -4026,9 +4053,42 @@ impl Workspace {
                                 .min_w_0()
                                 .appearance(false),
                         ),
-                    ),
+                    )
+                    .when(lists_schemas, |row| {
+                        row.child(self.render_fold_schemas(true, t))
+                            .child(self.render_fold_schemas(false, t))
+                    }),
             )
             .child(div().flex_1().min_h_0().child(content))
+    }
+
+    /// Dispatches what a bound shortcut does, so the two cannot come apart.
+    fn render_fold_schemas(&self, open: bool, t: Theme) -> Button {
+        let (id, glyph, label, chord) = match open {
+            true => (
+                "expand-schemas",
+                icon::EXPAND_ALL,
+                "Expand all schemas",
+                "expand_all_schemas",
+            ),
+            false => (
+                "collapse-schemas",
+                icon::COLLAPSE_ALL,
+                "Collapse all schemas",
+                "collapse_all_schemas",
+            ),
+        };
+        let hint = ui::chord_hint(chord, &self.settings.custom_keybindings);
+        let tooltip = match hint.is_empty() {
+            true => label.to_string(),
+            false => format!("{label}  {hint}"),
+        };
+        icon_button(id, glyph, Tone::Quiet, Control::Inline, t)
+            .tooltip(tooltip)
+            .on_click(move |_, window, cx| match open {
+                true => window.dispatch_action(Box::new(ExpandAllSchemas), cx),
+                false => window.dispatch_action(Box::new(CollapseAllSchemas), cx),
+            })
     }
 }
 
@@ -4886,6 +4946,32 @@ fn nested_field_row(
                 .flex()
                 .items_center()
                 .child(control),
+        )
+}
+
+/// A small boxed field for a number, its unit after it.
+fn number_box(input: &Entity<InputState>, unit: &'static str, t: Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(layout::SPACE_XS))
+        .w(px(layout::chrome(layout::FORM_TIMEOUT_WIDTH)))
+        .h(px(Control::Compact.height()))
+        .px(px(layout::SPACE_SM))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .border_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(gpui_component::Sizable::small(bare(input))),
+        )
+        .child(
+            div()
+                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                .text_color(t.text_faint)
+                .child(unit),
         )
 }
 

@@ -60,22 +60,22 @@ use gpui_component::{
 };
 
 use actions::{
-    AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette, CommitTransaction,
-    CopyCell, CopyDiagnostics, CopyPlan, CopyResults, CopyRow, CopyRows, CopySelection,
-    CustomRowLimit, CycleMode, DeleteRow, DiscardEdits, Disconnect, EditCell, ExplainQuery,
-    FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn, HideColumn, ImportConnections,
-    ImportRows, ImportRowsFromClipboard, LimitTarget, MenuImportRowsFromClipboard, Minimize,
-    MoveTabLeft, MoveTabRight, NewConnection, NewProject, NewQuery, NewRow, NextEdit, NextPage,
-    NextProfile, NextResult, NextTab, OpenLogsFolder, OpenReference, OpenSettings, PreviousEdit,
-    PreviousPage, PreviousProfile, PreviousResult, PreviousTab, Quit, RefreshConnection,
-    RefreshRelation, RemoveFilter, RequestWriteMode, ResetConfirmations, ResetEditorZoom,
-    RollbackTransaction, RunQuery, SaveQuery, SearchEverything, SelectDatabase, SelectTheme,
-    SetDefault, SetDefaultRowLimit, SetEmpty, SetFilterColumn, SetFilterOperator, SetFilterRaw,
-    SetMode, SetNull, SetQueryLimit, SetRowLimit, ShowAllColumns, ShowEditor, ShowMessages,
-    ShowReferences, SortActiveColumn, SortColumn, SubmitConnection, SwitchConnection,
-    ToggleAutoCommit, ToggleComment, ToggleFilterJoin, ToggleNextJoin, TogglePinColumn,
-    ToggleResults, ToggleRowEdit, ToggleRowPanel, ToggleSidebar, ToggleStructure, ZoomEditorIn,
-    ZoomEditorOut,
+    AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CollapseAllSchemas, CommandPalette,
+    CommitTransaction, CopyCell, CopyDiagnostics, CopyPlan, CopyResults, CopyRow, CopyRows,
+    CopySelection, CustomRowLimit, CycleMode, DeleteRow, DiscardEdits, Disconnect, EditCell,
+    ExpandAllSchemas, ExplainQuery, FollowForeignKey, FormatQuery, FuzzyOpen, GoToColumn,
+    HideColumn, ImportConnections, ImportRows, ImportRowsFromClipboard, LimitTarget,
+    MenuImportRowsFromClipboard, Minimize, MoveTabLeft, MoveTabRight, NewConnection, NewProject,
+    NewQuery, NewRow, NextEdit, NextPage, NextProfile, NextResult, NextTab, OpenLogsFolder,
+    OpenReference, OpenSettings, PreviousEdit, PreviousPage, PreviousProfile, PreviousResult,
+    PreviousTab, Quit, RefreshConnection, RefreshRelation, RemoveFilter, RequestWriteMode,
+    ResetConfirmations, ResetEditorZoom, RollbackTransaction, RunQuery, SaveQuery,
+    SearchEverything, SelectDatabase, SelectTheme, SetDefault, SetDefaultRowLimit, SetEmpty,
+    SetFilterColumn, SetFilterOperator, SetFilterRaw, SetMode, SetNull, SetQueryLimit, SetRowLimit,
+    ShowAllColumns, ShowEditor, ShowMessages, ShowReferences, SortActiveColumn, SortColumn,
+    SubmitConnection, SwitchConnection, ToggleAutoCommit, ToggleComment, ToggleFilterJoin,
+    ToggleNextJoin, TogglePinColumn, ToggleResults, ToggleRowEdit, ToggleRowPanel, ToggleSidebar,
+    ToggleStructure, ZoomEditorIn, ZoomEditorOut,
 };
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
@@ -197,6 +197,7 @@ fn connection_config_from(
         database,
         user,
         password: variable("PGPASSWORD").unwrap_or_default(),
+        password_command: None,
         sslmode,
         root_certificate,
         // No `PG*` variable means it, and dbdelve is not inventing one.
@@ -210,6 +211,11 @@ fn connection_config_from(
 }
 
 fn main() {
+    // ssh runs this executable as its askpass to fetch a key's passphrase,
+    // which must answer and exit before anything else starts.
+    if let Some(status) = db::askpass(std::env::args_os().nth(1).as_deref()) {
+        std::process::exit(status);
+    }
     // The agent shim speaks MCP on stdio and must never open a window or reach
     // GPUI, on any OS, so it is decided before anything else starts.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
@@ -221,6 +227,7 @@ fn main() {
     }
     logging::install_panic_log();
     logging::install();
+    update::remember_install();
     // Manifests only, ahead of the profiles that name them: no plugin process
     // starts until one of its connections opens.
     let plugins = db::plugin::discover();

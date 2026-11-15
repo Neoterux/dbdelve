@@ -13,7 +13,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    InteractiveElementExt, POPOVER_BLUR,
+    InteractiveElementExt, POPOVER_BLUR, Selectable,
     button::{Button, ButtonCustomVariant, ButtonVariants},
     highlighter::{HighlightTheme, SyntaxHighlighter},
     input::{Input, InputState, Rope},
@@ -488,7 +488,8 @@ pub(crate) fn mode_pill(t: Theme, mode: Mode) -> Button {
 }
 
 /// A newer release, quiet at the far end of the titlebar: news, not an alarm.
-pub(crate) fn update_pill(t: Theme, version: &str) -> Button {
+/// It reads as the update's progress while one is being installed.
+pub(crate) fn update_pill(t: Theme, label: String) -> Button {
     control("newer-release", Tone::Quiet, Control::Compact)
         .px(px(layout::SPACE_SM))
         .rounded(px(layout::RADIUS_CONTROL))
@@ -499,7 +500,7 @@ pub(crate) fn update_pill(t: Theme, version: &str) -> Button {
                 .gap(px(layout::SPACE_XS))
                 .text_size(px(layout::chrome(layout::TEXT_XS)))
                 .text_color(t.text_muted)
-                .child(format!("DBDelve {version} available"))
+                .child(label)
                 .child(row_icon(t, icon::CHEVRON_DOWN)),
         )
 }
@@ -1316,6 +1317,36 @@ pub(crate) fn accent_button(
         )
 }
 
+/// The status bar's choice chip as a button, for a form the keyboard has to
+/// reach: a tab stop that Enter and Space press. The chosen one is filled, the
+/// rest are muted ink that the hover washes, as on the chip.
+pub(crate) fn choice_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    t: Theme,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .hover(t.element_hover.into())
+                .active(t.element_active.into()),
+        )
+        // Paints the variant's `active` and skips its hover while chosen.
+        .selected(selected)
+        .toggled(selected)
+        .h(px(layout::chrome(24.)))
+        .px(px(layout::SPACE_SM))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .text_size(px(layout::chrome(layout::TEXT_SM)))
+                .text_color(if selected { t.text } else { t.text_muted })
+                .child(label.into()),
+        )
+}
+
 /// [`keycaps`], for a chord drawn on the accent.
 pub(crate) fn keycaps_on_accent(chord: &str, t: Theme) -> Div {
     div()
@@ -1492,8 +1523,7 @@ pub(crate) fn group_thousands(value: u64) -> String {
     group_digits(&value.to_string())
 }
 
-/// A run of ASCII digits in threes. Taken as text so a `NUMERIC` wider than
-/// any integer type still groups.
+/// A run of ASCII digits in threes.
 pub(crate) fn group_digits(digits: &str) -> String {
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {

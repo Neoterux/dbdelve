@@ -10,9 +10,6 @@ introduce limits.
 
 Ideas and discussion on [Discord](https://discord.gg/7PegWzwqCm).
 
-Like DBDelve? [Support its development](https://www.patreon.com/cw/ShayanAbbas1).
-Support is voluntary and does not provide any additional benefits.
-
 
 ![DBDelve in Gruvbox Dark Glass: a SELECT on the events table in the editor and its result grid below](assets/screenshots/query-dark.png)
 
@@ -36,14 +33,18 @@ I wanted something which is performant, modern and consumes little ram. The exis
 
 ```sh
 brew install --cask ShayanAbbas1/dbdelve/dbdelve
-xattr -dr com.apple.quarantine /Applications/DBDelve.app
 ```
 
-Don't skip the second line: the app isn't notarized, so macOS won't open it
-until the quarantine flag is cleared.
+The app isn't notarized, so the cask clears the quarantine flag macOS would
+otherwise refuse it over. Without Homebrew:
 
-**Linux** (x86_64 or aarch64): `yay -S dbdelve-bin` from the AUR, or the
-tarball or AppImage from [the latest release][releases].
+```sh
+curl -fsSL https://raw.githubusercontent.com/ShayanAbbas1/dbdelve/main/install.sh | sh
+```
+
+**Linux** (x86_64 or aarch64): the same one-liner installs it under `~/.local`
+with no root, or `yay -S dbdelve-bin` from the AUR, or the tarball or AppImage
+from [the latest release][releases].
 
 **Windows** (x86_64): run the installer from [the latest release][releases],
 or unzip the zip and run `dbdelve.exe`. The installer asks for AppData (just
@@ -63,8 +64,7 @@ Any other database with an ODBC driver is reachable through the bundled ODBC
 bridge, with that driver installed: IBM Db2, Oracle, SAP HANA, SAP ASE
 (Sybase), Informix, Teradata, Vertica, Exasol, Firebird, Amazon Redshift,
 Google BigQuery, Databricks, Apache Hive, Trino and Presto, Dremio,
-InterSystems IRIS, Microsoft Access and more. Grid editing is off, and
-statements you type run under the connection's mode. See
+InterSystems IRIS, Microsoft Access and more. See
 [Connecting through ODBC](docs/odbc.md).
 
 
@@ -116,7 +116,8 @@ statements you type run under the connection's mode. See
   ![An Explain Analyze plan for a join: each node with its actual and estimated rows and time, and a ×76 misestimate flagged](assets/screenshots/query-plan.png)
 
 - **Completion that knows your schema:** tables, and a table's columns after
-  its name and a dot.
+  its name and a dot. A table is written with an alias, and after `JOIN` with
+  the condition its foreign keys imply.
 
   ![Completing accounts. to its columns in a join](assets/screenshots/completion.png)
 
@@ -131,6 +132,22 @@ statements you type run under the connection's mode. See
   Unix socket on the SSH host, optionally as another user (Run as); the server
   needs `socat`, and passwordless `sudo` for it when Run as is set. TLS modes
   other than `disable` and `prefer` are refused there.
+- **Sign in with a short-lived token.** On Postgres, MySQL, MariaDB, SQL
+  Server, Redis and ClickHouse, a profile's Password command prints the
+  password at every login, so cloud IAM auth keeps working after the token
+  expires. For Amazon RDS:
+
+  ```sh
+  /opt/homebrew/bin/aws rds generate-db-auth-token --hostname %HOSTNAME% --port %PORT% --username %USERNAME% --region <region>
+  ```
+
+  `%HOSTNAME%`, `%PORT%` and `%USERNAME%` are the profile's own. DBDelve
+  quotes them itself, so write them unquoted: one inside quotes stops the
+  command from running. Give the program's full path (`which aws` prints it):
+  an app opened from the Finder or a desktop launcher does not see the PATH
+  your shell sets. Expires after
+  reuses the output for that many seconds, in memory only; blank runs the
+  command at every login.
 
 Free and open source, nothing behind a paywall, and no telemetry: the only
 request DBDelve makes on its own is an update check, which you can turn off.
@@ -167,3 +184,17 @@ Copyright (C) 2026 Shayan Abbas and contributors, licensed under the
 [GPL-3.0](LICENSE). Code contributed before the switch was released under the
 [MIT License](licenses/MIT-dbdelve.txt), and that notice still applies to it.
 Third-party font and theme licenses are in [NOTICES.md](NOTICES.md).
+
+## Sponsors
+
+Support DBDelve on [Patreon](https://www.patreon.com/membership/30003257). Sponsors are listed here and on the site.
+
+<a href="https://dbdelve.github.io/#sponsors"><img src="https://dbdelve.github.io/sponsors/sponsors.svg" alt="DBDelve's sponsors"></a>
+
+## Contributors
+
+Thank you to everyone who has contributed to DBDelve.
+
+<a href="https://github.com/ShayanAbbas1/dbdelve/graphs/contributors"><img src="https://contrib.rocks/image?repo=ShayanAbbas1/dbdelve" alt="DBDelve's contributors"></a>
+
+Want to join them? Read [CONTRIBUTING.md](CONTRIBUTING.md).
