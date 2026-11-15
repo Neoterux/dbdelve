@@ -4317,6 +4317,11 @@ mod tests {
     }
 
     #[test]
+    fn the_apply_button_says_apply_edits_in_a_classic_view() {
+        assert_eq!(apply_label(Some(EditMode::Classic)), "Apply edits");
+    }
+
+    #[test]
     fn a_parallel_chip_for_the_largest_worker_count_counts_the_leader_without_overflow() {
         assert_eq!(
             parallel_tooltip(u32::MAX),

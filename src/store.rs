@@ -702,7 +702,7 @@ pub struct StoredSettings {
     /// project in front). Absent reads as `all`. A scalar, above the tables.
     #[serde(default)]
     pub listing_scope: Option<String>,
-    /// The edit mode a new table tab starts in, `draft` or `row`. Absent reads
+    /// The edit mode a new table tab starts in: `classic`, `draft` or `row`. Absent reads
     /// as draft, which is what every file written before it did, and a slug
     /// this build cannot read reads as draft too. Not written while the
     /// default is draft. A scalar, so it stays above the tables.

@@ -25024,6 +25024,88 @@ fn a_classic_table_restored_from_its_snapshot_paints_no_row_washes(cx: &mut Test
 }
 
 #[gpui::test]
+fn a_new_table_tab_starts_in_classic_when_it_is_the_default(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(
+            cx,
+            "create table birds (id integer primary key, name text); \
+             create table nests (id integer primary key, owner text);",
+        );
+        let birds = open_own_table(&workspace, cx, "birds");
+        assert_eq!(edit_mode_of(&workspace, cx, birds), EditMode::Draft);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_default_edit_mode(EditMode::Classic, cx)
+        });
+        assert!(saved_profiles_text().contains("edit_mode = \"classic\""));
+        assert_eq!(
+            edit_mode_of(&workspace, cx, birds),
+            EditMode::Draft,
+            "each open tab holds its own"
+        );
+        let nests = open_own_table(&workspace, cx, "nests");
+        assert_eq!(edit_mode_of(&workspace, cx, nests), EditMode::Classic);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_default_edit_mode(EditMode::Draft, cx)
+        });
+        assert!(!saved_profiles_text().contains("edit_mode"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn the_status_bar_and_the_palette_put_a_table_in_classic_mode(cx: &mut TestAppContext) {
+    use crate::session::EditMode;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query_tab = workspace.read_with(cx, |workspace, _| {
+            Tab::Query(workspace.profile().unwrap().session.queries[0].id)
+        });
+        let has = |rows: &[String], label: &str| rows.iter().any(|row| row == label);
+        open_own_table(&workspace, cx, "birds");
+        let chips = ["edit-mode-classic", "edit-mode-draft", "edit-mode-row"];
+        assert_eq!(drawn(cx, &chips), [true, true, true]);
+
+        click_selector(cx, "edit-mode-classic");
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Classic));
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Edit in Draft mode"), "{rows:?}");
+        assert!(has(&rows, "Edit in Row mode"), "{rows:?}");
+        assert!(!has(&rows, "Edit in Classic mode"), "{rows:?}");
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Edit in Draft mode");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Draft));
+        let rows = palette_listing(&workspace, cx);
+        assert!(has(&rows, "Edit in Classic mode"), "{rows:?}");
+        assert!(!has(&rows, "Edit in Draft mode"), "{rows:?}");
+
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        cx.simulate_input("Edit in Classic mode");
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(front_edit_mode(&workspace, cx), Some(EditMode::Classic));
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_tab(query_tab, window, cx)
+            });
+        });
+        settle(cx);
+        assert_eq!(drawn(cx, &chips), [false, false, false]);
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn a_row_save_does_not_send_over_an_open_review(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
 

@@ -721,7 +721,14 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   must not reach the server unasked. Rows are reordered in place rather than
   through a display permutation, so every row index in the grid names the row
   on screen; pending edits move with their rows.
-- **A view's edit mode is its own (`session::EditMode`).** `Draft` holds every
+- **A view's edit mode is its own (`session::EditMode`).** `Classic` is
+  upstream's editing: cell edits are held until Save shows their `UPDATE`s (the
+  buffer on a query tab, the review on a table), New row opens the insert form,
+  and Delete row reviews one `DELETE`; it adds no rows, marks none and paints no
+  row washes (`ResultGrid::set_row_washes`). It is offered on every target,
+  because `EditMode::on` passes it through, and it keeps every check a Draft
+  apply passes: the gate, the key check, the verified apply, the
+  outcome-unknown refusal and the transaction rule. `Draft` holds every
   edit until Apply goes through the review; `Row` sends a row's `UPDATE` as the
   row is left (a ring move off it, or a step key past the grid's edge from a
   cell's input) or saved, with no dialog (`AGENTS.md` hard rule 1 says what that
@@ -738,7 +745,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   nothing is sent. A Snowflake or Turso table has no control, for the reason in the
   next bullet, and neither has a MongoDB query tab, which never offers Row. Draft is never turned into Row sends by a switch: Draft to Row is
   refused while the grid holds edits, so a multi-row draft is not sent
-  unreviewed one row at a time (`Workspace::set_edit_mode`).
+  unreviewed one row at a time (`Workspace::set_edit_mode`). Classic refuses a
+  switch to Row over staged edits as Draft does, and Draft to Classic is
+  refused while the draft holds an added row or a mark. Leaving Row for Draft
+  or Classic sends the edited row first; cell edits carry between Draft and
+  Classic with no prompt.
 
   A Row send that is refused, whether its row drifted, was gone, or its
   `UPDATE` counted other than one row, keeps the row's edits and the ring,
@@ -881,7 +892,7 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   carried the draft), and re-reads; when edits remain (a query tab's Insert or
   Delete over a draft, an edit staged while the batch was in flight) it keeps
   them and does not re-read. On a relation tab an Insert or Delete row over a
-  draft is Row mode's case, or a Draft view's added row or mark (the next
+  draft is Row or Classic mode's case, or a Draft view's added row or mark (the next
   bullet), never a send. A reviewed relation-tab apply clears the whole draft.
   A query tab's Apply and New row on a target answering
   `Target::reviews_query_apply()` are reviewed and, where the target verifies
