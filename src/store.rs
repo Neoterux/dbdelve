@@ -590,6 +590,12 @@ pub struct StoredSettings {
     /// project in front). Absent reads as `all`. A scalar, above the tables.
     #[serde(default)]
     pub listing_scope: Option<String>,
+    /// The edit mode a new table tab starts in, `draft` or `row`. Absent reads
+    /// as draft, which is what every file written before it did, and a slug
+    /// this build cannot read reads as draft too. Not written while the
+    /// default is draft. A scalar, so it stays above the tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_mode: Option<String>,
     /// How tall the connections tree's rows are: `compact`, `standard` or
     /// `comfortable`. Absent reads as standard, and is not written back until
     /// a save has a value. A scalar, above the tables.
@@ -4662,6 +4668,7 @@ open_objects = []
                 agent_access: Some(true),
                 view_mode: Some("complex".into()),
                 listing_scope: Some("current".into()),
+                edit_mode: Some("row".into()),
                 sidebar_density: Some("compact".into()),
                 sidebar_show_host: Some(false),
                 sidebar_show_sizes: Some(false),

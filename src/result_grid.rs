@@ -12,6 +12,7 @@ use gpui_component::{
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     table::TableEvent,
     table::{Column, TableDelegate, TableState},
+    tooltip::Tooltip,
 };
 
 use crate::{
@@ -300,6 +301,17 @@ pub struct ResultGrid {
     /// The one cell showing an input, if any. At most one: an input is a far
     /// heavier thing to draw than the text every other cell paints.
     editing: Option<Editing>,
+    /// The row the ring last left while it held edits, until the workspace takes
+    /// it ([`Self::take_left_row`]). The grid does not know the view's edit mode,
+    /// so it only records.
+    left_row: Option<usize>,
+    /// The cell, and the input, a ring move off its row closed without
+    /// committing, until the workspace takes it ([`Self::take_closed_input`]):
+    /// what was typed in it is a Row view's to stage and send with its row.
+    closed_input: Option<(usize, usize, Entity<InputState>)>,
+    /// The row whose send the server refused, and what it said, until that row
+    /// is edited, reverted or sent.
+    send_failure: Option<(usize, String)>,
     /// When these rows were snapshotted, for a grid that came off disk.
     ///
     /// Held here rather than on the tab because a completed run replaces the
@@ -539,6 +551,9 @@ impl ResultGrid {
             painted_x: Pixels::ZERO,
             pending: Vec::new(),
             editing: None,
+            left_row: None,
+            closed_input: None,
+            send_failure: None,
             captured: None,
             streamed: None,
             filled: None,
@@ -1577,8 +1592,9 @@ impl ResultGrid {
     /// this is a view sorted in memory, which a header click there and every
     /// result landing in it both come through.
     ///
-    /// Pending edits move with their rows, since they are what the user typed
-    /// against those rows. The ring, the row selection and an open input are
+    /// Pending edits, a refused row's mark and the row the ring left move with
+    /// their rows, since they are what the user typed against those rows. The
+    /// ring, the row selection and an open input are
     /// dropped, as a sort the server runs drops them by replacing the grid:
     /// each names a position, and a different row is there now.
     pub fn rows_id(&self) -> u64 {
@@ -1599,6 +1615,18 @@ impl ResultGrid {
         }
         for edit in &mut self.pending {
             edit.row = moved_to[edit.row];
+        }
+        // Every field that names a row by its index goes through the same
+        // permutation: a refused row's mark and Esc's target would otherwise
+        // sit on whichever row is now at the old position.
+        if let Some((row, _)) = &mut self.send_failure {
+            *row = moved_to[*row];
+        }
+        if let Some(row) = &mut self.left_row {
+            *row = moved_to[*row];
+        }
+        if let Some((row, _, _)) = &mut self.closed_input {
+            *row = moved_to[*row];
         }
         self.active = None;
         self.editing = None;
@@ -1777,15 +1805,64 @@ impl ResultGrid {
     /// Move the ring to a cell. An input open on some other cell goes with it:
     /// one cell holding a focused input while another wears the ring `Enter`
     /// follows is two cells claiming the keyboard.
+    ///
+    /// The one place the ring moves, so it is also the one place a row is left:
+    /// a ring that goes off a row holding edits, or an input, marks that row for
+    /// the workspace ([`Self::take_left_row`]), which decides what the view's
+    /// edit mode does about it.
     fn set_active(&mut self, row: usize, col: usize) {
-        if self
+        let closing = self
             .editing
             .as_ref()
-            .is_some_and(|editing| (editing.row, editing.col) != (row, col))
+            .is_some_and(|editing| (editing.row, editing.col) != (row, col));
+        if let Some((old, _)) = self.active
+            && old != row
+            && self.left_row.is_none()
+            && (self.row_has_pending(old)
+                || self
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editing| closing && editing.row == old))
         {
-            self.editing = None;
+            self.left_row = Some(old);
+        }
+        if closing {
+            // Kept only when the move leaves the input's row: a click on
+            // another cell of the same row drops what was typed, as it always
+            // did.
+            self.closed_input = self
+                .editing
+                .take()
+                .filter(|editing| editing.row != row)
+                .and_then(|editing| Some((editing.row, editing.col, editing.input?)));
         }
         self.active = Some((row, col));
+    }
+
+    /// The row the ring left while it held edits, once: what the workspace asks
+    /// after a ring move to decide whether a Row view sends it.
+    pub(crate) fn take_left_row(&mut self) -> Option<usize> {
+        self.left_row.take()
+    }
+
+    /// The cell a ring move closed an input on, and the text it holds, once.
+    pub(crate) fn take_closed_input(&mut self, cx: &App) -> Option<(usize, usize, SharedString)> {
+        let (row, col, input) = self.closed_input.take()?;
+        Some((row, col, input.read(cx).value().clone()))
+    }
+
+    /// The row whose send the server refused and the words it said, drawn on
+    /// that row's gutter cell.
+    pub fn send_failure(&self) -> Option<(usize, &str)> {
+        self.send_failure
+            .as_ref()
+            .map(|(row, message)| (*row, message.as_str()))
+    }
+
+    /// Marks `row` as the one the server refused, until it is edited, reverted
+    /// or sent.
+    pub fn set_send_failure(&mut self, row: usize, message: String) {
+        self.send_failure = Some((row, message));
     }
 
     /// `sort_in_memory` for rows a snapshot restored already in `keys`' order.
@@ -1992,6 +2069,7 @@ impl ResultGrid {
         if self.unconfirmed || !self.editable(row, col) {
             return false;
         }
+        self.forget_failure(row);
 
         // An input seeds itself with the value as fetched, so opening an edit
         // and closing it without typing arrives here carrying the server's own
@@ -2099,6 +2177,98 @@ impl ResultGrid {
     pub fn discard_pending(&mut self) {
         self.pending.clear();
         self.editing = None;
+        self.send_failure = None;
+    }
+
+    /// Drops the failure mark when it is `row`'s.
+    fn forget_failure(&mut self, row: usize) {
+        self.send_failure.take_if(|(marked, _)| *marked == row);
+    }
+
+    /// The staged edits of `row`, by column, as a send carries them.
+    pub fn pending_cells(&self, row: usize) -> Vec<(usize, NewValue)> {
+        self.pending
+            .iter()
+            .filter(|edit| edit.row == row)
+            .map(|edit| (edit.col, edit.value.clone()))
+            .collect()
+    }
+
+    /// Removes from `row` only the staged edits whose column and value are in
+    /// `sent`: an edit staged after `sent` was taken, or staged again with
+    /// another value, stays. The row's failure mark goes with them: it was sent.
+    pub fn clear_sent(&mut self, row: usize, sent: &[(usize, NewValue)]) {
+        self.forget_failure(row);
+        self.pending.retain(|edit| {
+            edit.row != row
+                || !sent
+                    .iter()
+                    .any(|(col, value)| *col == edit.col && *value == edit.value)
+        });
+    }
+
+    /// `row`'s edits as the one `UPDATE` a Row-mode send writes, `None` when
+    /// the row has none or dbdelve cannot name it by its key
+    /// (`pending_updates` drops such a row too). `Workspace::save_row` is the
+    /// caller.
+    pub fn pending_row(&self, row: usize) -> Option<PendingRow> {
+        self.pending_rows(|edited| edited == row).pop()
+    }
+
+    /// Whether `row` holds a staged edit: what Save asks to choose the row it
+    /// sends, the ring's before any other.
+    pub fn row_has_pending(&self, row: usize) -> bool {
+        self.pending.iter().any(|edit| edit.row == row)
+    }
+
+    /// The row edited first, the row Save sends when the ring is not on an
+    /// edited one.
+    pub fn first_pending_row(&self) -> Option<usize> {
+        self.pending.first().map(|edit| edit.row)
+    }
+
+    /// The row a Row view sends next, whether Save asks or an action that would
+    /// leave the rows does: the ring's when it holds edits, else the one edited
+    /// first. `None` when nothing is staged.
+    pub fn row_to_send(&self) -> Option<usize> {
+        self.active()
+            .map(|(row, _)| row)
+            .filter(|row| self.row_has_pending(*row))
+            .or_else(|| self.first_pending_row())
+    }
+
+    /// Drops every staged edit of `row` and an input open on it, leaving the
+    /// other rows' edits. For a row the server no longer has, or one whose
+    /// relation is read again.
+    pub fn discard_row(&mut self, row: usize) {
+        self.forget_failure(row);
+        self.pending.retain(|edit| edit.row != row);
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.row == row)
+        {
+            self.editing = None;
+        }
+    }
+
+    /// Swaps the cells of `row` for `fetched`, the row as the server now holds
+    /// it. `false`, with nothing changed, when there is no such row or
+    /// `fetched` has another number of cells. The ring, the scroll, the
+    /// selection, the other rows and every staged edit stay: the caller clears
+    /// the edits it sent. The `Workspace` landing of a Row send is the caller.
+    pub fn replace_row(&mut self, row: usize, fetched: db::Row) -> bool {
+        let Some(held) = self.result.rows.get_mut(row) else {
+            return false;
+        };
+        if held.len() != fetched.len() {
+            return false;
+        }
+        *held = fetched;
+        self.forget_failure(row);
+        // A value may now be longer or shorter than the width fitted to it.
+        self.refit_from_the_top();
+        true
     }
 
     /// One entry per changed row, in the order the rows were first edited, with
@@ -2108,12 +2278,22 @@ impl ResultGrid {
     /// a `NULL` in a key column, or a key column the result set does not carry,
     /// leaves dbdelve unable to name the row.
     pub fn pending_updates(&self) -> Vec<PendingRow> {
+        self.pending_rows(|_| true)
+    }
+
+    /// [`Self::pending_updates`] over the rows `wanted` names.
+    fn pending_rows(&self, wanted: impl Fn(usize) -> bool) -> Vec<PendingRow> {
         let Some(edit) = &self.result.edit else {
             return Vec::new();
         };
 
         let mut rows: Vec<usize> = Vec::new();
-        for row in self.pending.iter().map(|edit| edit.row) {
+        for row in self
+            .pending
+            .iter()
+            .map(|edit| edit.row)
+            .filter(|row| wanted(*row))
+        {
             if !rows.contains(&row) {
                 rows.push(row);
             }
@@ -2386,6 +2566,28 @@ pub(crate) fn step_pending(
     table.delegate_mut().set_active(row, col);
     table.set_selected_row(row, cx);
     scroll_to_drawn_col(table, col, cx);
+}
+
+/// Puts the ring back on `row`, keeping its column, and tells the library, as
+/// `step_pending` does. For a send that was refused or stopped by the mode,
+/// whose row is still dirty: the user's own move off it has already happened.
+///
+/// A programmatic move, not the user leaving a row: the ring is written
+/// directly, so the move marks nothing for the workspace to send. An input the
+/// move into the other row opened is dropped. True when it was one, whose
+/// focus the caller hands back to the grid.
+pub(crate) fn snap_back(
+    table: &mut TableState<ResultGrid>,
+    row: usize,
+    cx: &mut Context<TableState<ResultGrid>>,
+) -> bool {
+    let grid = table.delegate_mut();
+    let first = grid.view.first().copied().unwrap_or(0);
+    let col = grid.active.map_or(first, |(_, col)| col);
+    let dropped = grid.editing.take().is_some();
+    grid.active = Some((row, col));
+    table.set_selected_row(row, cx);
+    dropped
 }
 
 /// A header's menu: hide, pin or unpin that column, and bring back the
@@ -2859,11 +3061,18 @@ impl TableDelegate for ResultGrid {
         match col_ix.checked_sub(GUTTER).and_then(|p| self.column_at(p)) {
             Some(col) => self.data_td(row_ix, col, window, cx).into_any_element(),
             None => {
-                let (faint, text, selected_bg) = {
+                let (faint, text, selected_bg, danger) = {
                     let t = theme(cx);
-                    (t.text_faint, t.text, t.selection)
+                    (t.text_faint, t.text, t.selection, t.danger)
                 };
                 let selected = self.selected_rows.contains(&row_ix);
+                // What the server said to this row's send, on the one cell
+                // that is the row's and not a column's.
+                let refused = self
+                    .send_failure()
+                    .filter(|(row, _)| *row == row_ix)
+                    .map(|(_, message)| SharedString::from(message.to_string()));
+                let number = (row_ix + 1).to_string();
                 gutter_cell()
                     .id(("row-number", row_ix))
                     .debug_selector(move || format!("row-number-{row_ix}"))
@@ -2871,7 +3080,20 @@ impl TableDelegate for ResultGrid {
                     .justify_end()
                     .when(selected, |cell| cell.bg(selected_bg))
                     .text_color(if selected { text } else { faint })
-                    .child((row_ix + 1).to_string())
+                    .when_some(refused.clone(), |cell, message| {
+                        cell.text_color(danger).tooltip(move |window, cx| {
+                            Tooltip::new(message.clone()).build(window, cx)
+                        })
+                    })
+                    .child(match refused {
+                        // Its own name, so a driver can tell a refused row
+                        // from the colour alone.
+                        Some(_) => div()
+                            .debug_selector(move || format!("row-send-failed-{row_ix}"))
+                            .child(number)
+                            .into_any_element(),
+                        None => number.into_any_element(),
+                    })
                     // Left click only: a right click still opens the cell
                     // menu the row's own cells offer, and a gutter with two
                     // different rules for the two buttons would be a gutter
@@ -3482,52 +3704,60 @@ pub(crate) fn new_grid(
     // Hooked in the constructor because every relation tab builds its grid
     // through it: a subscription set up at one call site would leave the other
     // grid navigating an invisible selection.
-    cx.subscribe(&grid, |_, table, event: &TableEvent, cx| match event {
-        TableEvent::SelectRow(row) => {
-            let row = *row;
-            table.update(cx, |table, cx| {
-                table.delegate_mut().select_row(row);
-                cx.notify();
-            });
-        }
-        TableEvent::ColumnWidthsChanged(widths) => {
-            let widths = widths.get(GUTTER..).unwrap_or_default().to_vec();
-            table.update(cx, |table, _| {
-                table.delegate_mut().set_drawn_widths(&widths)
-            });
-        }
-        TableEvent::SelectColumn(col) => {
-            let col = *col;
-            table.update(cx, |table, cx| {
-                // Selecting a fixed column (the gutter or a pinned one) makes
-                // the library scroll to the first column that scrolls instead.
-                // A fixed column is always in view, so put the offset back
-                // before the frame that would show the jump. Caught here
-                // because arrows, tab and header clicks all select inside the
-                // library, past any hook of ours.
-                if col < GUTTER + table.delegate().pinned {
-                    let mut offset = table.horizontal_scroll_handle.offset();
-                    offset.x = table.delegate().painted_x;
-                    table.horizontal_scroll_handle.set_offset(offset);
-                }
-                let Some(col) = col
-                    .checked_sub(GUTTER)
-                    .and_then(|position| table.delegate().column_at(position))
-                else {
-                    return;
-                };
-                table.delegate_mut().select_col(col);
-                cx.notify();
-            });
-        }
-        TableEvent::ClearSelection => {
-            table.update(cx, |table, cx| {
-                table.delegate_mut().selected_row = None;
-                cx.notify();
-            });
-        }
-        _ => {}
-    })
+    //
+    // Every ring move ends in `SelectRow` or `ClearSelection`, so these two arms
+    // are the one consumer of the row the ring left: a Row view sends it.
+    cx.subscribe(
+        &grid,
+        |workspace, table, event: &TableEvent, cx| match event {
+            TableEvent::SelectRow(row) => {
+                let row = *row;
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().select_row(row);
+                    cx.notify();
+                });
+                workspace.flush_left_row(&table, cx);
+            }
+            TableEvent::ColumnWidthsChanged(widths) => {
+                let widths = widths.get(GUTTER..).unwrap_or_default().to_vec();
+                table.update(cx, |table, _| {
+                    table.delegate_mut().set_drawn_widths(&widths)
+                });
+            }
+            TableEvent::SelectColumn(col) => {
+                let col = *col;
+                table.update(cx, |table, cx| {
+                    // Selecting a fixed column (the gutter or a pinned one) makes
+                    // the library scroll to the first column that scrolls instead.
+                    // A fixed column is always in view, so put the offset back
+                    // before the frame that would show the jump. Caught here
+                    // because arrows, tab and header clicks all select inside the
+                    // library, past any hook of ours.
+                    if col < GUTTER + table.delegate().pinned {
+                        let mut offset = table.horizontal_scroll_handle.offset();
+                        offset.x = table.delegate().painted_x;
+                        table.horizontal_scroll_handle.set_offset(offset);
+                    }
+                    let Some(col) = col
+                        .checked_sub(GUTTER)
+                        .and_then(|position| table.delegate().column_at(position))
+                    else {
+                        return;
+                    };
+                    table.delegate_mut().select_col(col);
+                    cx.notify();
+                });
+            }
+            TableEvent::ClearSelection => {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().selected_row = None;
+                    cx.notify();
+                });
+                workspace.flush_left_row(&table, cx);
+            }
+            _ => {}
+        },
+    )
     .detach();
 
     grid
@@ -3852,6 +4082,52 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_ring_leaving_a_row_with_edits_is_marked_once() {
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(vec![
+                    vec![Some("7".into()), Some("first".into())],
+                    vec![Some("8".into()), Some("second".into())],
+                    vec![Some("9".into()), Some("third".into())],
+                ]),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("body".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        grid.select_row(0);
+        assert!(grid.set_pending(0, 1, NewValue::Value("edited".into())));
+
+        // A column move on one row leaves nothing behind.
+        grid.select_col(1);
+        assert_eq!(grid.take_left_row(), None);
+
+        grid.select_row(1);
+        assert_eq!(grid.take_left_row(), Some(0));
+        assert_eq!(grid.take_left_row(), None, "taken once");
+
+        // Row 1 holds no edit, so leaving it marks nothing.
+        grid.select_row(2);
+        assert_eq!(grid.take_left_row(), None);
+
+        // A mark waiting for the workspace is not overwritten by a later move.
+        grid.select_row(0);
+        assert!(grid.set_pending(0, 1, NewValue::Value("again".into())));
+        assert!(grid.set_pending(1, 1, NewValue::Value("also".into())));
+        grid.select_row(1);
+        grid.select_row(2);
+        assert_eq!(grid.take_left_row(), Some(0));
+        assert_eq!(grid.take_left_row(), None);
+    }
+
     /// A grid whose columns have been told what the relation's structure says
     /// about them: `note` is `NOT NULL`, `depth` is a number with a default.
     fn marked_grid() -> ResultGrid {
@@ -4133,6 +4409,47 @@ mod tests {
         assert_eq!(grid.shown(0, 1).as_deref(), Some("first"));
         assert_eq!(grid.cell(0, 1), Some("first"));
         assert!(grid.has_pending());
+    }
+
+    #[test]
+    fn replacing_a_row_leaves_every_other_row_and_its_edits_alone() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, value("one")));
+        assert!(grid.set_pending(1, 1, value("two")));
+        grid.set_active(1, 1);
+
+        assert_eq!(grid.first_pending_row(), Some(0));
+        assert!(grid.row_has_pending(0) && grid.row_has_pending(1));
+        assert!(!grid.row_has_pending(2));
+        let held = grid.pending_row(0).expect("row 0 is edited");
+        assert_eq!(held.sets, vec![("body".to_string(), value("one"))]);
+        assert_eq!(held.keys, vec![("id".to_string(), "7".to_string())]);
+        assert!(grid.pending_row(2).is_none());
+
+        let fetched = db::Row::new([Some("7"), Some("fresh"), Some("9")]).unwrap();
+        assert!(grid.replace_row(0, fetched));
+        assert_eq!(grid.result.rows[0].get(1), Some("fresh"));
+        assert_eq!(grid.result.rows[0].get(2), Some("9"));
+        assert_eq!(grid.cell(1, 1), Some("second"), "row 1 is as it was");
+        assert_eq!(grid.active(), Some((1, 1)), "the ring stays");
+        assert_eq!(grid.pending_value(1, 1), Some(&value("two")));
+        assert_eq!(
+            grid.pending_value(0, 1),
+            Some(&value("one")),
+            "the caller clears the edits it sent"
+        );
+
+        grid.discard_row(0);
+        assert!(!grid.row_has_pending(0));
+        assert_eq!(grid.pending_count(), 1);
+        assert_eq!(grid.first_pending_row(), Some(1));
+
+        let before = grid.result.rows.clone();
+        let short = db::Row::new([Some("7")]).unwrap();
+        assert!(!grid.replace_row(1, short));
+        let fetched = db::Row::new([Some("7"), Some("x"), Some("y")]).unwrap();
+        assert!(!grid.replace_row(2, fetched));
+        assert_eq!(grid.result.rows, before);
     }
 
     #[test]
@@ -6316,6 +6633,43 @@ mod tests {
         assert_eq!(grid.sort, vec![(0, false)]);
         assert!(grid.sortable);
         assert_eq!(grid.cell(0, 0), Some("3"));
+    }
+
+    #[test]
+    fn an_in_memory_sort_moves_a_refused_rows_mark_and_the_row_the_ring_left_with_the_row() {
+        // Both name a row by its index, so each follows the row through the
+        // permutation as its staged edits do.
+        let mut grid = ResultGrid::new(
+            QueryResult {
+                columns: vec![column("id"), column("note")],
+                rows: rows(
+                    (0..4)
+                        .map(|row| vec![Some(row.to_string()), Some("n".into())])
+                        .collect(),
+                ),
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("body".into())],
+                    keys: vec![0],
+                    ..Default::default()
+                }),
+                ..QueryResult::default()
+            },
+            Mode::ReadWrite,
+        );
+        assert!(grid.set_pending(0, 1, NewValue::Value("x".into())));
+        grid.set_send_failure(0, "refused".into());
+        grid.left_row = Some(0);
+
+        grid.sort_in_memory(vec![(0, false)]);
+
+        assert_eq!(grid.cell(3, 0), Some("0"), "row 0 is now last");
+        assert!(grid.row_has_pending(3));
+        assert_eq!(grid.send_failure(), Some((3, "refused")));
+        assert_eq!(grid.take_left_row(), Some(3));
+        grid.discard_row(3);
+        assert_eq!(grid.send_failure(), None, "the mark went with its row");
     }
 
     #[test]

@@ -205,6 +205,27 @@ impl Target {
         }
     }
 
+    /// Whether this target is one of the transactional SQL engines dbdelve
+    /// drives itself: a built-in driver speaking SQL that edits rows and names
+    /// a row by its key in the statement text. An edit sent to one keeps the
+    /// grid and the draft until the server answers; the others apply as they
+    /// always have, because a batch there has no transaction and a draft kept
+    /// after a part-way failure would be sent twice.
+    pub fn row_edits(self) -> bool {
+        // ClickHouse reviews a query tab's edits (`reviews_query_edits`): its
+        // one-row guard is not in the statement text, so a batch there is not
+        // one the draft can be kept behind. Snowflake's keys are declared and
+        // not enforced, so no result of it is editable (`QueryResult::edit` is
+        // always `None`) and there is no row for Row mode to send. Turso's
+        // driver names no column's table (`docs/agents/engines.md`), so none of
+        // its results is editable either.
+        matches!(self.driver, Driver::BuiltIn)
+            && self.engine.syntax() == Syntax::Sql
+            && !matches!(self.engine, Engine::Snowflake | Engine::Turso)
+            && self.edits_rows()
+            && !self.reviews_query_edits()
+    }
+
     /// What the review of a generated write says beyond its statements.
     pub fn review_notes(self, sql: &str) -> Vec<String> {
         match self.driver {
@@ -414,6 +435,33 @@ mod tests {
             version: "1".into(),
             executable: "dbdelve-odbc".into(),
         }))
+    }
+
+    #[test]
+    fn only_transactional_sql_targets_offer_row_mode() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                Target::built_in(engine).row_edits(),
+                matches!(
+                    engine,
+                    Engine::Postgres
+                        | Engine::MySql
+                        | Engine::MariaDb
+                        | Engine::Sqlite
+                        | Engine::DuckDb
+                        | Engine::SqlServer
+                ),
+                "{engine:?}"
+            );
+        }
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: Driver::Plugin(odbc()),
+        };
+        assert!(
+            !plugin.row_edits(),
+            "a plugin's batch runs behind its driver's own guard"
+        );
     }
 
     #[test]

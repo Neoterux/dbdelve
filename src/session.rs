@@ -10,7 +10,7 @@
 //! changed but their visibility.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -113,6 +113,11 @@ pub(crate) struct Profile {
     /// history file, `profiles.toml` or any log, since it is SQL text that
     /// ends with its session. Emptied with [`Profile::in_transaction`].
     pub(crate) transaction_statements: Vec<String>,
+    /// The relation tabs, by id, whose Row-mode writes joined the open
+    /// transaction, for the status bar to say they are not committed. Held in
+    /// memory only and ended with [`Profile::transaction_statements`]
+    /// ([`Profile::end_uncommitted`]).
+    pub(crate) uncommitted: BTreeSet<u64>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
     /// `BEGIN` into the buffer where they can read it -- never onto the wire
@@ -192,7 +197,10 @@ impl Profile {
     /// transaction was open before it.
     pub(crate) fn record_sent(&mut self, sql: &str, transaction: Option<bool>) {
         match transaction {
-            Some(false) => self.transaction_statements.clear(),
+            Some(false) => {
+                self.transaction_statements.clear();
+                self.end_uncommitted();
+            }
             // The record must hold everything the next COMMIT ends, so it
             // restarts only when the open transaction really ended: none was
             // open, this submission ends one before opening the next, or the
@@ -203,6 +211,7 @@ impl Profile {
             Some(true) => {
                 let engine = self.config.engine();
                 if crate::sql::ends_transaction(engine, sql) {
+                    self.end_uncommitted();
                     // Only what follows the last end belongs to the new
                     // transaction: the `COMMIT;` Manual sends ahead of its
                     // `BEGIN;` closed the one before.
@@ -212,6 +221,7 @@ impl Profile {
                         false => vec![rest.to_string()],
                     };
                 } else if !self.in_transaction || engine.begin_ends_open_transaction() {
+                    self.end_uncommitted();
                     self.transaction_statements = vec![sql.to_string()];
                 } else {
                     self.transaction_statements.push(sql.to_string());
@@ -219,6 +229,16 @@ impl Profile {
             }
             None if self.in_transaction => self.transaction_statements.push(sql.to_string()),
             None => {}
+        }
+    }
+
+    /// The transaction the Row-mode writes of [`Profile::uncommitted`] were
+    /// in has ended, so the tabs that showed them are owed a re-read: a
+    /// rollback undid what their grids show, and which way it ended is not
+    /// read off the statement.
+    pub(crate) fn end_uncommitted(&mut self) {
+        for id in std::mem::take(&mut self.uncommitted) {
+            self.session.mark_stale(id);
         }
     }
 
@@ -792,6 +812,9 @@ pub(crate) struct Session {
     /// The tab a close is asking about, because it holds cell edits nobody
     /// has applied.
     pub(crate) pending_discard: Option<PendingDiscard>,
+    /// An action a landed row send released, waiting for render, which has the
+    /// `Window` its handler needs (`Workspace::resume_parked`).
+    pub(crate) resume_after: Option<(Tab, AfterEdits)>,
     /// The question turning auto-commit back on asks while a transaction is
     /// open: commit it, roll it back, or leave it.
     pub(crate) auto_commit_prompt: Option<AutoCommitPrompt>,
@@ -851,6 +874,12 @@ pub(crate) struct ApplyReview {
     pub(crate) sql: String,
     /// What the engine adds about running `sql`, one paragraph each.
     pub(crate) notes: Vec<String>,
+    /// What the last run of `sql` came to when it failed or was refused,
+    /// drawn where the statement is. Cleared when it runs again.
+    pub(crate) error: Option<String>,
+    /// Whether `sql` is the grid's pending edits, which a successful run
+    /// clears. An `INSERT` or a `DELETE` sends none of them.
+    pub(crate) edits: bool,
 }
 
 impl ApplyReview {
@@ -1264,6 +1293,7 @@ impl Session {
             query_rename: None,
             query_rename_needs_focus: false,
             pending_discard: None,
+            resume_after: None,
             auto_commit_prompt: None,
             auto_after_end: None,
             notice,
@@ -1290,6 +1320,20 @@ impl Session {
                 .filter(|(tab, _)| *tab == self.active)
                 .map(|(_, notice)| notice.as_str())
         })
+    }
+
+    /// Says what became of an edit send that failed or was refused, where the
+    /// statement is: in the review when one covers `tab`, otherwise in the
+    /// tab's notice, beside the statement appended to its buffer.
+    pub(crate) fn edit_failed(&mut self, tab: Tab, message: String) {
+        match self
+            .apply_review
+            .as_mut()
+            .filter(|review| review.covers(tab))
+        {
+            Some(review) => review.error = Some(message),
+            None => self.tab_notice = Some((tab, message)),
+        }
     }
 
     pub(crate) fn query_tab(&self, id: u64) -> Option<&QueryTab> {
@@ -1339,6 +1383,45 @@ impl Session {
         match tab {
             Tab::Query(id) => self.query_tab(id).is_some(),
             Tab::Object(id) => self.objects.iter().any(|object| object.id == id),
+        }
+    }
+
+    /// Undoes what an action that is not going ahead changed before it asked:
+    /// a filter bar the user edited goes back to what it was. Every way a
+    /// parked [`AfterEdits`] can be dropped ends here, so the bars never show
+    /// a filter that did not run.
+    pub(crate) fn put_back(&mut self, tab: Tab, then: AfterEdits) {
+        if let (Tab::Object(id), AfterEdits::Filter { before: Some(rows) }) = (tab, then)
+            && let Some(ObjectBody::Relation { filters, .. }) = self
+                .objects
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .map(|tab| &mut tab.body)
+        {
+            *filters = rows;
+        }
+    }
+
+    /// Holds `then` for render to carry out once a landed send has released
+    /// it. One slot: an action already waiting is the user's own, and this
+    /// one is put back instead.
+    pub(crate) fn park_resume(&mut self, tab: Tab, then: AfterEdits) {
+        match self.resume_after {
+            Some(_) => self.put_back(tab, then),
+            None => self.resume_after = Some((tab, then)),
+        }
+    }
+
+    /// Owes relation tab `id` a read of its rows on its next visit, for rows
+    /// that no longer say what the server holds.
+    pub(crate) fn mark_stale(&mut self, id: u64) {
+        if let Some(ObjectBody::Relation { stale, .. }) = self
+            .objects
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .map(|tab| &mut tab.body)
+        {
+            *stale = true;
         }
     }
 
@@ -1545,6 +1628,26 @@ impl Session {
         }
     }
 
+    /// Every grid one named tab keeps rows in: its slot, the slot's own grid
+    /// while a queue's earlier result stands in for it, and each finished
+    /// result of a queue. The edits a requery would replace are in any of
+    /// them, so the question and the Discard that answers it read the same set.
+    pub(crate) fn tab_grids(&self, tab: Tab) -> Vec<Entity<TableState<ResultGrid>>> {
+        let mut grids: Vec<_> = self.results(tab).into_iter().cloned().collect();
+        if let Tab::Query(id) = tab
+            && let Some(query) = self.query_tab(id)
+        {
+            grids.extend(query.lent.iter().map(|(grid, _)| grid.clone()));
+            grids.extend(
+                query
+                    .queue
+                    .iter()
+                    .flat_map(|queue| queue.done.iter().map(|finished| finished.grid.clone())),
+            );
+        }
+        grids
+    }
+
     /// Whether one named tab has a statement in flight: its own slot, not
     /// whichever of a queue's results the switcher is showing.
     pub(crate) fn running(&self, tab: Tab) -> bool {
@@ -1578,6 +1681,32 @@ impl Session {
             Tab::Query(id) => self.query_tab_mut(id).map(|tab| &mut tab.sorting),
             Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { sorting, .. } => Some(sorting),
+                ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
+            },
+        }
+    }
+
+    /// When one named tab's edits are sent: its own for a relation, `Draft` for
+    /// every other tab, which has no Row mode to be in.
+    pub(crate) fn edit_mode(&self, tab: Tab) -> EditMode {
+        match tab {
+            Tab::Query(_) => EditMode::Draft,
+            Tab::Object(id) => match self.objects.iter().find(|tab| tab.id == id) {
+                Some(ObjectTab {
+                    body: ObjectBody::Relation { edit_mode, .. },
+                    ..
+                }) => *edit_mode,
+                _ => EditMode::Draft,
+            },
+        }
+    }
+
+    /// `Some` only for a relation tab, the one view with a mode to change.
+    pub(crate) fn edit_mode_mut(&mut self, tab: Tab) -> Option<&mut EditMode> {
+        match tab {
+            Tab::Query(_) => None,
+            Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
+                ObjectBody::Relation { edit_mode, .. } => Some(edit_mode),
                 ObjectBody::Routine(_) | ObjectBody::Structure { .. } => None,
             },
         }
@@ -1668,7 +1797,17 @@ impl Session {
         self.pending_delete = None;
         self.query_rename = None;
         self.query_rename_needs_focus = false;
-        self.pending_discard = None;
+        // The bars a dropped filter prompt was holding go back as Cancel puts
+        // them: they were changed before anything could ask, and the filter
+        // that ran is the one they have to describe.
+        if let Some(PendingDiscard { tab, then, .. }) = self.pending_discard.take() {
+            self.put_back(tab, then);
+        }
+        // An action released by a landed send does not follow the user to
+        // another tab or connection, and its bars go back like a Cancel's.
+        if let Some((tab, then)) = self.resume_after.take() {
+            self.put_back(tab, then);
+        }
         self.auto_commit_prompt = None;
         self.naming = false;
         self.save_name_needs_focus = false;
@@ -1720,11 +1859,102 @@ pub(crate) enum PendingDelete {
     Folder(String, usize),
 }
 
-/// A close held up by the unapplied-edits question, and the saved query to
-/// delete once the tab goes, when deleting it is what closes the tab.
+/// What a tab was asked to do while its grid held edits nobody had applied,
+/// kept as data so the prompt, and in Row mode the send, can carry it out once
+/// the edits are out of the way. Never a stored closure: every variant is the
+/// values the action was raised with, so a Discard runs what the user asked
+/// for and not what the tab has become since.
+#[derive(Clone)]
+pub(crate) enum AfterEdits {
+    /// Close the tab, and delete the saved query first when deleting it is
+    /// what closes the tab.
+    Close { deleting: Option<String> },
+    /// A relation tab's statement again, with the filter, sort, row limit and
+    /// page offset the action produced. The tab's own are untouched until it
+    /// runs, so a cancelled page turn leaves the page on screen as it was.
+    Requery {
+        filter: String,
+        sort: Vec<SortKey>,
+        limit: Option<usize>,
+        offset: usize,
+    },
+    /// A relation tab's rows read again as they stand.
+    Refresh,
+    /// The filter bars as the user just changed them. `before` is what they
+    /// were, put back on Cancel: the bars are the tab's state and were changed
+    /// by the caller before anything could ask.
+    Filter { before: Option<Vec<FilterRow>> },
+    /// The view's sorting switched to the server (`false`) or to memory.
+    ViewSorting(bool),
+    /// A query tab's Run.
+    Run,
+    /// A header click on a grid holding edits: a query tab's, on the server, or
+    /// a Row view's, in memory.
+    Sort(usize),
+    /// One of a finished queue's statements run again, as `sql`.
+    Rerun { index: usize, sql: String },
+    /// Bring this tab forward. Only a Row view's row waits on this, sent first
+    /// (or asked about, when the server refused it): a Draft view's draft stays
+    /// with its tab, so a tab switch asks nothing.
+    Activate(Tab),
+    /// Switch the view's edit mode. Only a Row view's row waits on this, being
+    /// sent before the view becomes a draft (or asked about, when the server
+    /// refused it).
+    EditMode(EditMode),
+}
+
+impl AfterEdits {
+    /// The prompt's title, and the act that discards the edits as the subject
+    /// of its sentence.
+    fn leaves(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Close { .. } => ("Close tab", "Closing it"),
+            Self::Requery { .. }
+            | Self::Refresh
+            | Self::Filter { .. }
+            | Self::ViewSorting(_)
+            | Self::Sort(_) => ("Discard edits", "Reading the rows again"),
+            Self::Run | Self::Rerun { .. } => ("Discard edits", "Running the statement"),
+            // Reached only over a row the server refused: any other Row view's
+            // row is sent first, and a Draft view is not asked.
+            Self::Activate(_) => ("Discard edits", "Switching to another tab"),
+            Self::EditMode(_) => ("Discard edits", "Switching the edit mode"),
+        }
+    }
+
+    /// The prompt's title and its sentence: what the edits are discarded by.
+    pub(crate) fn discards(&self) -> (&'static str, String) {
+        let (title, act) = self.leaves();
+        (
+            title,
+            format!("This tab has cell edits that have not been applied. {act} discards them."),
+        )
+    }
+
+    /// The same prompt over a row of a Row view the server refused, whose
+    /// edits are all that Discard drops.
+    pub(crate) fn discards_refused_row(&self) -> (&'static str, String) {
+        let (title, act) = self.leaves();
+        (
+            title,
+            format!(
+                "The server refused a row of this tab, so its edits have not been applied. \
+                 {act} discards that row's edits."
+            ),
+        )
+    }
+}
+
+/// An action held up by the unapplied-edits question, and what to do once the
+/// edits are gone. One slot: the prompt covers the tab, so no second action can
+/// be raised behind it.
 pub(crate) struct PendingDiscard {
     pub(crate) tab: Tab,
-    pub(crate) deleting: Option<String>,
+    pub(crate) then: AfterEdits,
+    /// The row of a Row view the server refused, when that is what the prompt
+    /// is over: Discard drops its edits and no other row's, which are sent as
+    /// the action meets them. `None` for a draft, all of whose edits go.
+    pub(crate) row: Option<usize>,
 }
 
 /// The question Auto asks while a transaction is open, and whether its list
@@ -2153,6 +2383,56 @@ impl Sorting {
                     .collect(),
             ),
             None => Self::Server,
+        }
+    }
+}
+
+/// When a view's edits are sent. `Row` sends a row's `UPDATE` as the row is
+/// left or saved, with no review; `Draft` holds every edit until it is applied
+/// through the review. Per view, because a table the user is correcting row by
+/// row and a result they are drafting a batch against want different answers;
+/// a new view starts from the Edit mode setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EditMode {
+    #[default]
+    Draft,
+    Row,
+}
+
+impl EditMode {
+    /// This mode, but `Draft` where the target does not offer Row: Row is
+    /// offered exactly where `Target::row_edits` holds, the targets whose edit
+    /// send keeps the grid, so a Row send is never made on one that clears it.
+    pub(crate) fn on(self, target: Target) -> Self {
+        match (self, target.row_edits()) {
+            (Self::Row, false) => Self::Draft,
+            (mode, _) => mode,
+        }
+    }
+}
+
+impl EditMode {
+    pub(crate) const ALL: [EditMode; 2] = [EditMode::Draft, EditMode::Row];
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Row => "row",
+        }
+    }
+
+    /// Absent or unknown is `Draft`, the mode that sends nothing unasked.
+    pub(crate) fn from_slug(slug: Option<&str>) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|mode| Some(mode.slug()) == slug)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Row => "Row",
         }
     }
 }
@@ -3178,6 +3458,9 @@ pub(crate) enum ObjectBody {
         /// this page alone, and is never written into `sort`, which is what
         /// the statement is rebuilt from.
         sorting: Sorting,
+        /// When this view's edits are sent. Per view and never in the tab's
+        /// snapshot, so a restored tab starts from the default.
+        edit_mode: EditMode,
         /// The `WHERE` expression this preview narrows the relation by, without
         /// the keyword; empty means none. The fifth control of the same kind as
         /// the sort, the limit and the offset: a change regenerates the
@@ -3363,6 +3646,36 @@ pub(crate) enum Refresh {
     /// A relation tab, refreshed the way its own controls refresh it — so it
     /// picks up whatever sort and row limit the tab is now set to.
     Relation(u64),
+    /// A Row-mode send of one row's `UPDATE`, which is followed in the same
+    /// task by `read`, the row read back by its key, landing in `row` of the
+    /// grid whose rows are `rows_id`. No refresh of the relation follows: the
+    /// row is replaced where it stands.
+    Row {
+        row: usize,
+        rows_id: u64,
+        read: String,
+        /// The cells that went with the send, by column, which the landing
+        /// clears: an edit staged on the row while it was out is not among them.
+        sent: Vec<(usize, NewValue)>,
+        /// The row the ring moved to when a row leave started the send, which a
+        /// refusal puts the ring back from; `None` for Save, which does not
+        /// move it.
+        to: Option<usize>,
+        /// What the user asked for that this row had to be saved before: a page
+        /// turn, a sort, a tab switch. Carried out only when the send lands.
+        then: Option<AfterEdits>,
+    },
+}
+
+impl Refresh {
+    /// The action a Row send was carrying, for a send that is dropped before
+    /// it runs: its owner puts back what the action had changed.
+    pub(crate) fn into_parked(self) -> Option<AfterEdits> {
+        match self {
+            Self::Row { then, .. } => then,
+            _ => None,
+        }
+    }
 }
 
 /// `Clone` because a queue keeps the state of every statement it has run
@@ -3810,6 +4123,8 @@ mod tests {
             title: "Apply edits",
             sql: "UPDATE t SET a = 1".into(),
             notes: Vec::new(),
+            error: None,
+            edits: true,
         }
     }
 
@@ -4092,6 +4407,29 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_mode_reads_back_from_its_slug_and_anything_else_is_draft() {
+        assert_eq!(EditMode::default(), EditMode::Draft);
+        for mode in EditMode::ALL {
+            assert_eq!(EditMode::from_slug(Some(mode.slug())), mode);
+        }
+        for unknown in [None, Some(""), Some("instant")] {
+            assert_eq!(EditMode::from_slug(unknown), EditMode::Draft, "{unknown:?}");
+        }
+        assert_eq!(
+            EditMode::Row.on(Target::built_in(Engine::Redis)),
+            EditMode::Draft
+        );
+        assert_eq!(
+            EditMode::Row.on(Target::built_in(Engine::Postgres)),
+            EditMode::Row
+        );
+        assert_eq!(
+            EditMode::Draft.on(Target::built_in(Engine::Postgres)),
+            EditMode::Draft
+        );
+    }
+
+    #[test]
     fn a_views_sorting_survives_its_snapshot_and_an_unsorted_client_view_stays_client() {
         for sorting in [
             Sorting::Server,
@@ -4125,6 +4463,33 @@ mod tests {
             Sorting::new(settings.client_sort.unwrap_or(false)),
             Sorting::Server
         );
+    }
+
+    #[test]
+    fn settings_from_before_the_edit_mode_read_as_draft() {
+        let read = |text: &str| -> store::StoredSettings {
+            toml::from_str(text).expect("the settings must still decode")
+        };
+        let settings = read("color_titlebar = true");
+        assert_eq!(settings.edit_mode, None);
+        assert_eq!(
+            EditMode::from_slug(settings.edit_mode.as_deref()),
+            EditMode::Draft
+        );
+
+        let settings = read("edit_mode = \"row\"");
+        assert_eq!(
+            EditMode::from_slug(settings.edit_mode.as_deref()),
+            EditMode::Row
+        );
+        for unreadable in ["instant", ""] {
+            let settings = read(&format!("edit_mode = \"{unreadable}\""));
+            assert_eq!(
+                EditMode::from_slug(settings.edit_mode.as_deref()),
+                EditMode::Draft,
+                "{unreadable:?}"
+            );
+        }
     }
 
     #[test]
@@ -4966,5 +5331,69 @@ mod tests {
             assert_eq!(Depth::from_slug(depth.slug()), Some(depth));
         }
         assert_eq!(Depth::from_slug("everything"), None);
+    }
+
+    #[test]
+    fn the_discard_prompt_names_what_discards_the_edits() {
+        let close = (
+            "Close tab",
+            "This tab has cell edits that have not been applied. Closing it discards them."
+                .to_string(),
+        );
+        assert_eq!(AfterEdits::Close { deleting: None }.discards(), close);
+        let reading = (
+            "Discard edits",
+            "This tab has cell edits that have not been applied. Reading the rows again \
+             discards them."
+                .to_string(),
+        );
+        for then in [
+            AfterEdits::Requery {
+                filter: String::new(),
+                sort: Vec::new(),
+                limit: Some(2),
+                offset: 2,
+            },
+            AfterEdits::Refresh,
+            AfterEdits::Filter { before: None },
+            AfterEdits::ViewSorting(false),
+            AfterEdits::Sort(1),
+        ] {
+            assert_eq!(then.discards(), reading);
+        }
+        let running = (
+            "Discard edits",
+            "This tab has cell edits that have not been applied. Running the statement \
+             discards them."
+                .to_string(),
+        );
+        assert_eq!(AfterEdits::Run.discards(), running);
+        assert_eq!(
+            AfterEdits::Rerun {
+                index: 0,
+                sql: "select 1".into()
+            }
+            .discards(),
+            running
+        );
+    }
+
+    #[test]
+    fn the_prompt_over_a_refused_row_says_whose_edits_go_and_what_discards_them() {
+        let refused = |then: AfterEdits| then.discards_refused_row().1;
+        assert_eq!(
+            refused(AfterEdits::Close { deleting: None }),
+            "The server refused a row of this tab, so its edits have not been applied. \
+             Closing it discards that row's edits."
+        );
+        assert!(refused(AfterEdits::Refresh).contains("Reading the rows again discards"));
+        assert!(
+            refused(AfterEdits::Activate(Tab::Query(0)))
+                .contains("Switching to another tab discards")
+        );
+        assert!(
+            refused(AfterEdits::EditMode(EditMode::Draft))
+                .contains("Switching the edit mode discards")
+        );
     }
 }

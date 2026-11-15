@@ -34,7 +34,7 @@ mod welcome;
 use std::collections::{HashMap, HashSet};
 
 use crate::export::ClipboardFormat;
-use gpui_component::menu::DropdownMenu;
+use gpui_component::{menu::DropdownMenu, tooltip::Tooltip};
 
 pub(crate) use import_dialog::PreviewGrid;
 #[cfg(test)]
@@ -85,6 +85,9 @@ pub(crate) struct Settings {
     /// holds rather than by asking the server again. Off by default, which is
     /// how every tab sorted before this was a choice.
     pub(crate) client_sort: bool,
+    /// The edit mode a new table tab starts in. Draft by default, so nothing
+    /// is sent without a review until the user chooses otherwise.
+    pub(crate) edit_mode: EditMode,
     /// Whether completing a relation writes it as `schema.relation`, for
     /// databases whose search path does not reach every schema.
     pub(crate) qualify_completions: bool,
@@ -139,6 +142,7 @@ impl Default for Settings {
             check_for_updates: true,
             color_titlebar: true,
             client_sort: false,
+            edit_mode: EditMode::Draft,
             qualify_completions: false,
             verbose_logging: false,
             welcomed: false,
@@ -707,6 +711,8 @@ impl Workspace {
                     stored_settings.check_for_updates.unwrap_or(true);
                 workspace.settings.color_titlebar = stored_settings.color_titlebar.unwrap_or(true);
                 workspace.settings.client_sort = stored_settings.client_sort.unwrap_or(false);
+                workspace.settings.edit_mode =
+                    EditMode::from_slug(stored_settings.edit_mode.as_deref());
                 workspace.settings.qualify_completions =
                     stored_settings.qualify_completions.unwrap_or(false);
                 workspace.settings.verbose_logging =
@@ -1218,6 +1224,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The edit mode a new table tab starts in. Not applied to the tabs already
+    /// open, each of which holds its own.
+    pub(crate) fn set_default_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
+        if self.settings.edit_mode == mode {
+            return;
+        }
+        self.settings.edit_mode = mode;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     /// Rebuilt on every profile now rather than at its next catalog load, which
     /// may be a reconnect away.
     pub(crate) fn set_qualify_completions(&mut self, qualify: bool, cx: &mut Context<Self>) {
@@ -1431,12 +1448,14 @@ impl Render for Workspace {
         if self.form.is_some() && self.settings_open {
             self.drop_settings(window, cx);
         }
-        // Both deferred to render for the `&mut Window` a background task
-        // does not have: a connect finds the picked database gone, and the
+        // All three deferred to render for the `&mut Window` a background task
+        // does not have: a connect finds the picked database gone, the
         // catalog that names these tabs resolves, off-thread, and neither a
-        // tab can be closed nor a grid built without a window.
+        // tab can be closed nor a grid built without a window, and a row send
+        // that landed releases the action it was sent for.
         self.leave_database_left_behind(window, cx);
         self.restore_objects(window, cx);
+        self.resume_parked(window, cx);
         self.sync_page_input(window, cx);
         self.sync_row_panel_filter(window, cx);
         self.sync_row_panel_inputs(window, cx);
@@ -1771,7 +1790,10 @@ impl Render for Workspace {
         let paging =
             running.or_else(|| views::render_paging(profile, self.custom_limit.as_ref(), cx));
         let view_sorting = views::render_view_sorting(profile, cx);
+        let edit_mode = views::render_edit_mode(profile, cx);
+        let apply_label = views::apply_label(views::view_edit_mode(profile));
         let transaction = views::render_transaction(profile, cx);
+        let uncommitted = views::render_uncommitted(profile, cx);
         let hidden_columns = views::render_hidden_columns(profile, cx);
         let relation = profile
             .session
@@ -1844,6 +1866,7 @@ impl Render for Workspace {
                         let sql = explorer::count_sql(engine, &tab.schema, &tab.name, filter);
                         Some(
                             button("count-rows", "Count", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "count-rows".into())
                                 .tooltip(sql)
                                 .on_click(move |_, _, cx| {
                                     _ = workspace.update(cx, |workspace, cx| {
@@ -1954,10 +1977,15 @@ impl Render for Workspace {
         // status line in green shouts about being connected, which is the
         // least interesting thing dbdelve can tell you.
         let status_group = div()
+            .debug_selector(|| "status-connection".into())
             .flex()
             .items_center()
             .gap(px(layout::SPACE_SM))
+            // First to give way in a narrow bar: the switcher in the titlebar
+            // already names the connection.
+            .flex_shrink(32.)
             .min_w_0()
+            .overflow_hidden()
             .child(ui::status_dot(t, &profile.state))
             .child(
                 div()
@@ -2033,7 +2061,9 @@ impl Render for Workspace {
             || notice.is_some()
             || paging.is_some()
             || view_sorting.is_some()
+            || edit_mode.is_some()
             || transaction.is_some()
+            || uncommitted.is_some()
             || hidden_columns.is_some()
             || query_status.is_some()
             || refreshable_snapshot
@@ -2041,80 +2071,244 @@ impl Render for Workspace {
             || structure_copies.is_some()
             || has_pending;
 
+        // What gives way when the window is too narrow for all of the bar,
+        // in two tiers. A group clips what it holds at its own edge and an
+        // item that does not narrow is never narrower than its content, so
+        // nothing is painted over its neighbour.
+        //
+        // First, three groups narrow, before anything else gives up any
+        // width. Not all of what they hold is a readout: the inline
+        // endpoint, with the reconnect button when the connection failed or
+        // idled; the row-statistics group, with the hidden-columns Show
+        // button and the export progress with its Cancel; and the right-hand
+        // cluster, whose readout goes before its Refresh, Import, Export and
+        // the structure copies. They share the cut in proportion to the
+        // factors below, the larger the sooner.
+        //
+        // Every other item keeps its width, and a bar narrower than those is
+        // cut at its right edge, so the order they are laid out in is the
+        // order they go in: Count, the paging, Sort, the notice at its
+        // minimum, the pending count, Discard and Apply edits, the badge and
+        // the Edit chips, the control that ends the transaction. It is not
+        // done with shrink factors because a proportional factor always
+        // leaves an item a share of the cut: it cannot say that this goes
+        // before that.
+        const NOTICE_MIN_WIDTH: f32 = 120.;
+        const STATS_SHRINK: f32 = 64.;
+        const ACTIONS_SHRINK: f32 = 8.;
         let results_status = bar_has_content.then(|| {
             div()
+                .debug_selector(|| "status-bar".into())
                 .h(px(layout::chrome(layout::STATUS_HEIGHT)))
                 .flex_shrink_0()
                 .border_t_1()
                 .border_color(t.border)
                 .text_size(px(layout::chrome(layout::TEXT_SM)))
                 .min_w_0()
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
                 .px(px(layout::SPACE_MD))
                 .bg(t.data_glass())
                 .children(inline_status)
-                // The control ends a transaction, so it takes its room before
-                // either side shares the rest. One that overflows its group is
-                // painted under whatever comes after it, and that element
-                // takes the click.
                 .children(transaction)
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
+                        .debug_selector(|| "status-chips".into())
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
-                        .children(view_sorting)
+                        .children(edit_mode)
+                        .children(uncommitted),
+                )
+                // The staged edits, right behind the control that ends the
+                // transaction and the chips that say what a keystroke will do
+                // to the database: past the bar's edge only after those are.
+                // Their buttons never narrow, and the count of the edits about
+                // to be written is not a readout, so it keeps its width too. It
+                // sits behind the buttons, so where the bar is too narrow for
+                // all three its edge reaches the count before the buttons that
+                // apply or drop the edits. Its arrows stay with it. A tinted
+                // cell scrolled out of view is an edit nobody knows is about
+                // to be written.
+                .children(has_pending.then(|| {
+                    div()
+                        .debug_selector(|| "status-pending".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .child(
+                            button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
+                                .debug_selector(|| "discard-edits".into())
+                                .on_click(move |_, window, cx| {
+                                    _ = discard_workspace.update(cx, |workspace, cx| {
+                                        workspace.discard_edits(&DiscardEdits, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            button(
+                                "apply-edits",
+                                apply_label,
+                                Tone::Primary,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "apply-edits".into())
+                            .on_click(move |_, window, cx| {
+                                _ = apply_workspace.update(cx, |workspace, cx| {
+                                    workspace.apply_edits(&ApplyEdits, window, cx);
+                                });
+                            }),
+                        )
+                }))
+                .children(has_pending.then(|| {
+                    div()
+                        .debug_selector(|| "status-pending-count".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(
+                            icon_button(
+                                "previous-edit",
+                                icon::CHEVRON_LEFT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "previous-edit".into())
+                            .tooltip("Previous edit")
+                            .on_click(move |_, window, cx| {
+                                _ = previous_workspace.update(cx, |workspace, cx| {
+                                    workspace.previous_edit(&PreviousEdit, window, cx);
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(t.text_muted)
+                                .child(format!(
+                                    "{pending_count} pending {}",
+                                    if pending_count == 1 { "edit" } else { "edits" }
+                                )),
+                        )
+                        .child(
+                            icon_button(
+                                "next-edit",
+                                icon::CHEVRON_RIGHT,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .debug_selector(|| "next-edit".into())
+                            .tooltip("Next edit")
+                            .on_click(move |_, window, cx| {
+                                _ = next_workspace.update(cx, |workspace, cx| {
+                                    workspace.next_edit(&NextEdit, window, cx);
+                                });
+                            }),
+                        )
+                }))
+                .child(
+                    div()
+                        .debug_selector(|| "status-stats-group".into())
+                        .flex_shrink(STATS_SHRINK)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
                         .children(hidden_columns)
                         .children(left_stats.map(|stats| {
                             div()
+                                .debug_selector(|| "status-stats".into())
                                 .flex_shrink_0()
                                 .whitespace_nowrap()
                                 .text_color(t.text_faint)
                                 .child(stats)
                         }))
-                        .children(count_control)
-                        .children(export_status)
-                        .children(notice.map(|notice| {
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(t.text_muted)
-                                .child(one_line(&notice))
-                        })),
+                        .children(export_status),
                 )
-                // Between two sides that share the free space equally, so
-                // it sits at the middle of the bar whatever either holds.
+                // Whatever width the rest leaves, so a notice is cut only
+                // when the bar is full, and then its tooltip has all of it.
+                .child(match notice {
+                    Some(notice) => {
+                        let whole = one_line(&notice);
+                        div()
+                            .id("status-notice")
+                            .debug_selector(|| "status-notice".into())
+                            .flex_1()
+                            .min_w(px(layout::chrome(NOTICE_MIN_WIDTH)))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(t.text_muted)
+                            .child(whole.clone())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(whole.clone()).build(window, cx)
+                            })
+                            .into_any_element()
+                    }
+                    None => div().flex_1().into_any_element(),
+                })
+                // A view preference, so it goes when the bar is full, after
+                // the things above and before the paging and Count.
+                .children(view_sorting.map(|sort| {
+                    div()
+                        .debug_selector(|| "status-sort".into())
+                        .flex_shrink_0()
+                        .child(sort)
+                }))
+                // The row limit and pager are controls, not readouts: they
+                // keep their width, so the cut a narrowing group does not
+                // take lands on the bar's edge, not on the arrow of the pager.
                 .children(paging)
-                // One right-hand cluster taking the other half of that
-                // space, so the readout stays against the edge.
+                // A button, not a readout, so it is its own item: a window
+                // narrower than the cluster beside it squeezes the cluster
+                // and leaves this whole. It is the last to be laid out, so
+                // the first the bar's edge cuts.
+                .children(count_control)
+                // One right-hand cluster, against the edge.
                 //
                 // Each control appears only when it does something. A pair
                 // of buttons that do nothing is a pair to read past --
                 // see `apply_edits` for its `cmd+s` binding.
                 //
-                // Its box holds its content, because a `justify_end` group
-                // narrower than its controls spills them leftward over paging
-                // and the transaction control.
+                // Its box clips, and it is aligned to the end, so a window
+                // too narrow for it loses the readout and then Import first
+                // and keeps the controls at the edge.
                 //
-                // ponytail: below the width that fits the control, paging and
-                // this cluster, the bar runs off its right edge and the
-                // rightmost controls are out of reach. The upgrade is an
-                // overflow menu for the cluster.
+                // ponytail: below the width of the transaction control, the
+                // Edit chips, the badge, the staged-edit buttons, the pending
+                // count and the notice's minimum (about 980px with all of
+                // them showing, plus the count's own width), the bar is cut
+                // at its right edge and what is there is out of reach: Count,
+                // the paging and Sort first, then the notice, then the
+                // pending count, and the staged-edit buttons only when the
+                // transaction is open at 700px. The upgrade is an overflow
+                // menu for the cluster, and for the transaction control's
+                // own Auto and Manual switch.
                 .child(
                     div()
-                        .flex_1()
+                        .debug_selector(|| "status-actions".into())
+                        .flex_shrink(ACTIONS_SHRINK)
+                        .min_w_0()
+                        .overflow_hidden()
                         .justify_end()
                         .flex()
                         .items_center()
                         .gap(px(layout::SPACE_SM))
                         .children(query_status.map(|query_status| {
                             div()
+                                .debug_selector(|| "status-readout".into())
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
                                 .text_color(match stale_buffer {
                                     true => t.text_muted,
                                     false => t.text_faint,
@@ -2214,82 +2408,6 @@ impl Render for Workspace {
                                         },
                                     )
                                 }))
-                        }))
-                        // A tinted cell scrolled out of view is an edit
-                        // nobody knows is about to be written.
-                        .children(has_pending.then(|| {
-                            let label = div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(t.text_muted)
-                                .child(format!(
-                                    "{pending_count} pending {}",
-                                    if pending_count == 1 { "edit" } else { "edits" }
-                                ));
-                            div()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .child(
-                                    icon_button(
-                                        "previous-edit",
-                                        icon::CHEVRON_LEFT,
-                                        Tone::Quiet,
-                                        Control::Compact,
-                                        t,
-                                    )
-                                    .tooltip("Previous edit")
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = previous_workspace.update(cx, |workspace, cx| {
-                                                workspace.previous_edit(&PreviousEdit, window, cx);
-                                            });
-                                        },
-                                    ),
-                                )
-                                .child(label)
-                                .child(
-                                    icon_button(
-                                        "next-edit",
-                                        icon::CHEVRON_RIGHT,
-                                        Tone::Quiet,
-                                        Control::Compact,
-                                        t,
-                                    )
-                                    .tooltip("Next edit")
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            _ = next_workspace.update(cx, |workspace, cx| {
-                                                workspace.next_edit(&NextEdit, window, cx);
-                                            });
-                                        },
-                                    ),
-                                )
-                                .into_any_element()
-                        }))
-                        .children(has_pending.then(|| {
-                            button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
-                                .on_click(move |_, window, cx| {
-                                    _ = discard_workspace.update(cx, |workspace, cx| {
-                                        workspace.discard_edits(&DiscardEdits, window, cx);
-                                    });
-                                })
-                        }))
-                        .children(has_pending.then(|| {
-                            button(
-                                "apply-edits",
-                                "Apply edits",
-                                Tone::Primary,
-                                Control::Compact,
-                                t,
-                            )
-                            .on_click(move |_, window, cx| {
-                                _ = apply_workspace.update(cx, |workspace, cx| {
-                                    workspace.apply_edits(&ApplyEdits, window, cx);
-                                });
-                            })
                         })),
                 )
         });

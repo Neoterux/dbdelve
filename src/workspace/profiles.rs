@@ -11,8 +11,8 @@ use crate::db::{ExternalConfig, Include, Plugin, Properties, Target, check_time_
 use crate::explorer::Shortcuts;
 use crate::import::{self, Source};
 use crate::session::{
-    Behaviour, BoundSession, Depth, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, STALE_ROWS,
-    restored_shortcuts,
+    Behaviour, BoundSession, Depth, EditMode, MAX_IDLE_TIMEOUT, MAX_KEEP_ALIVE, MIN_KEEP_ALIVE,
+    STALE_ROWS, restored_shortcuts,
 };
 use crate::sidebar::OPEN_ROWS_CAP;
 use crate::sql::{Destructive, Mode};
@@ -143,6 +143,8 @@ impl Workspace {
             agent_access,
             view_mode: Some(self.settings.view_mode.slug().into()),
             listing_scope: Some(self.settings.listing_scope.slug().into()),
+            edit_mode: (self.settings.edit_mode != EditMode::default())
+                .then(|| self.settings.edit_mode.slug().into()),
             sidebar_density: Some(self.settings.density.slug().into()),
             sidebar_show_host: Some(self.settings.show_host),
             sidebar_show_sizes: Some(self.settings.show_sizes),
@@ -336,6 +338,7 @@ impl Workspace {
             state: ProfileState::Idle,
             in_transaction: false,
             transaction_statements: Vec::new(),
+            uncommitted: Default::default(),
             auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
@@ -420,6 +423,7 @@ impl Workspace {
             state: ProfileState::Idle,
             in_transaction: false,
             transaction_statements: Vec::new(),
+            uncommitted: Default::default(),
             auto_commit: true,
             session_changed: false,
             catalog: CatalogState::Loading,
@@ -1502,6 +1506,7 @@ impl Workspace {
         profile.state = ProfileState::Idle;
         profile.in_transaction = false;
         profile.transaction_statements.clear();
+        profile.end_uncommitted();
         profile.session.auto_after_end = None;
         profile.session_changed = false;
         profile.session.clear_prompts();
@@ -2066,6 +2071,7 @@ impl Workspace {
         profile.state = ProfileState::Connecting;
         profile.in_transaction = false;
         profile.transaction_statements.clear();
+        profile.end_uncommitted();
         profile.session.auto_after_end = None;
         // The transaction it was holding died with the session, and silently
         // opening another on a connection the user has just watched drop is
