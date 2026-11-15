@@ -1751,7 +1751,9 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
         generated(draft)
     };
 
-    let cleanup: Vec<(&str, String)> = ["901", "902"]
+    // Keys apart from `generated_writes_round_trip`'s 901 and the verified scenarios'
+    // 911 to 914: suites on a shared server run in parallel.
+    let cleanup: Vec<(&str, String)> = ["931", "932"]
         .into_iter()
         .filter_map(|id| {
             sql::delete_row(engine, schema, relation, &[(key, id)], &types)
@@ -1778,7 +1780,7 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
         engine,
         schema,
         relation,
-        &[(key, Some("901")), (label, Some("inserted"))],
+        &[(key, Some("931")), (label, Some("inserted"))],
         &types,
     )
     .unwrap_or_else(|error| panic!("{at}: insert_row: {error}"));
@@ -1787,20 +1789,20 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
     // The delete runs first, so the key it frees is the key an insert takes.
     let replace = sql::draft_batch(
         engine,
-        &[delete("901")],
+        &[delete("931")],
         &[],
-        &[insert("901", "replaced"), insert("902", "added")],
+        &[insert("931", "replaced"), insert("932", "added")],
         true,
     )
     .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"));
     apply(&replace).unwrap_or_else(|error| panic!("{at}: `{replace}`: {error}"));
     assert_eq!(
-        subject.label_of(scenario, "901"),
+        subject.label_of(scenario, "931"),
         [Some("replaced".to_string())],
         "{at}"
     );
     assert_eq!(
-        subject.label_of(scenario, "902"),
+        subject.label_of(scenario, "932"),
         [Some("added".to_string())],
         "{at}"
     );
@@ -1809,9 +1811,9 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
     // takes the delete back with it.
     let collide = sql::draft_batch(
         engine,
-        &[delete("901")],
+        &[delete("931")],
         &[],
-        &[insert("902", "again")],
+        &[insert("932", "again")],
         true,
     )
     .unwrap_or_else(|error| panic!("{at}: draft_batch: {error}"));
@@ -1820,12 +1822,12 @@ pub(super) fn generated_draft_round_trip(subject: &Subject) {
         "{at}: the duplicate key was accepted: {collide}"
     );
     assert_eq!(
-        subject.label_of(scenario, "901"),
+        subject.label_of(scenario, "931"),
         [Some("replaced".to_string())],
         "{at}: the failed draft's delete stayed applied"
     );
     assert_eq!(
-        subject.label_of(scenario, "902"),
+        subject.label_of(scenario, "932"),
         [Some("added".to_string())],
         "{at}"
     );
