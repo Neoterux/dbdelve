@@ -2628,9 +2628,11 @@ impl Workspace {
         // An edit dbdelve applies on the connection's own session runs inside
         // the user's open transaction and is committed or rolled back with it,
         // so the prompt that ends it lists it. Its reads stay out.
-        // Whether a Row send runs inside the user's open transaction, which a
-        // ROLLBACK would undo under a grid that shows it as saved.
-        let mut joined_row = false;
+        // Whether this is a verified write that joined the user's open
+        // transaction (a Row send, a one-statement draft, a New row form's
+        // INSERT, a lone Delete row, a query tab's Apply): a ROLLBACK undoes
+        // it under a grid that shows it as applied.
+        let mut joined = false;
         if generated
             && edit
             && binding.is_none()
@@ -2638,7 +2640,7 @@ impl Workspace {
             && let Some(profile) = self.issued_to(&id, generation)
         {
             profile.record_sent(&sql, None);
-            joined_row = row_sent.is_some() && profile.in_transaction;
+            joined = verification.is_some() && bracket == Bracket::Joined;
         }
         // A plan is never cut short: its rows are the plan, not data.
         let limit = match tab {
@@ -3455,8 +3457,8 @@ impl Workspace {
                     }
                     // Not tied to the profile being in front: its transaction
                     // holds the write whichever one the user is looking at.
-                    if joined_row
-                        && row_said.is_some()
+                    if joined
+                        && succeeded
                         && let Tab::Object(object) = tab
                         && let Some(profile) = workspace.issued_to(&id, generation)
                         && profile.in_transaction
