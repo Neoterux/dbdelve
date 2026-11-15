@@ -247,7 +247,7 @@ impl Workspace {
                     name: &profile.name,
                     content: match (&profile.state, &profile.catalog) {
                         (ProfileState::Idle, _) => Content::Unloaded,
-                        (ProfileState::Connecting, _) | (_, CatalogState::Loading) => {
+                        (ProfileState::Connecting { .. }, _) | (_, CatalogState::Loading) => {
                             Content::Loading
                         }
                         (ProfileState::Failed(message), _) | (_, CatalogState::Failed(message)) => {

@@ -127,6 +127,11 @@ impl Workspace {
         else {
             return;
         };
+        // A grid that is not drawn cannot hold the keyboard: the window would
+        // be left focused on nothing, with no path for the chord back.
+        if let Some(session) = self.profile_mut().map(|profile| &mut profile.session) {
+            session.reveal_results(session.active);
+        }
         let focused = results.update(cx, |table, cx| {
             crate::result_grid::reveal_column(table, col, window, cx)
         });

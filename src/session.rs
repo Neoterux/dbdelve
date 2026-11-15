@@ -653,8 +653,8 @@ impl Profile {
             // A plugin profile's engine is the plugin, and its dialect is
             // `speaks`: `engine()` answers with the dialect.
             engine: Some(match external {
-                Some(external) => format!("{}{}", store::PLUGIN_TAG, external.plugin.id),
-                None => engine.as_str().to_string(),
+                Some(external) => format!("{}{}", store::PLUGIN_TAG, external.plugin.id).into(),
+                None => engine.as_str().into(),
             }),
             speaks: external.map(|external| external.speaks.as_str().to_string()),
             connection: external.map(|external| external.connection.clone()),
@@ -713,6 +713,7 @@ impl Profile {
                 .take(OPEN_ROWS_CAP)
                 .cloned()
                 .collect(),
+            ssm: self.config.ssm().cloned(),
             ssh: self.config.ssh().cloned(),
             open_queries: self
                 .session
@@ -814,7 +815,7 @@ pub(crate) fn restored_shortcuts(
 
 pub(crate) enum ProfileState {
     Idle,
-    Connecting,
+    Connecting { _attempt: crate::db::ConnectGuard },
     // Boxed: a server profile's `ssh` tunnel made `Connection` far larger than
     // `Failed`'s `String`, and this variant is the one every idle profile pays
     // for.
@@ -1505,6 +1506,16 @@ impl Session {
     /// on that database's session and never beside one another.
     pub(crate) fn is_bound(&self, tab: Tab) -> bool {
         matches!(tab, Tab::Query(id) if self.query_tab(id).is_some_and(|tab| tab.binding.is_some()))
+    }
+
+    /// Bring `tab`'s results pane back, for an answer written into it or a
+    /// command that acts on what it shows: neither may happen out of sight.
+    pub(crate) fn reveal_results(&mut self, tab: Tab) {
+        if let Tab::Query(id) = tab
+            && let Some(query) = self.query_tab_mut(id)
+        {
+            query.results_hidden = false;
+        }
     }
 
     /// Put away the new-row form and the review a closed tab, query or
@@ -4098,11 +4109,17 @@ pub(crate) fn result_pane_is_expanded(query: &QueryState) -> bool {
 }
 
 /// Whether a run that just landed brings a hidden results pane back: rows
-/// (or the columns of an empty set), a plan, and an error are answers the
-/// user would otherwise not know were there. A statement that returned
-/// nothing to read, a `CREATE TABLE` say, leaves the pane as it was.
+/// (or the columns of an empty set), a plan, an error and what the server
+/// said while running are answers the user would otherwise not know were
+/// there. A statement that returned nothing to read, a `CREATE TABLE` say,
+/// leaves the pane as it was.
 pub(crate) fn reveals_results(landed: &QueryState, produced_grid: bool) -> bool {
-    produced_grid || matches!(landed, QueryState::Failed(_) | QueryState::Explained { .. })
+    produced_grid
+        || match landed {
+            QueryState::Failed(_) | QueryState::Explained { .. } => true,
+            QueryState::Complete { messages, .. } => !messages.is_empty(),
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -4261,6 +4278,18 @@ mod tests {
             messages: Vec::new(),
         };
         assert!(reveals_results(&explained, false));
+    }
+
+    #[test]
+    fn a_statement_that_only_sent_messages_shows_hidden_results_so_they_are_read() {
+        let notice = QueryState::Complete {
+            rows: 0,
+            bytes: 0,
+            elapsed: std::time::Duration::ZERO,
+            rows_affected: None,
+            messages: vec!["NOTICE: vacuumed".into()],
+        };
+        assert!(reveals_results(&notice, false));
     }
 
     #[test]

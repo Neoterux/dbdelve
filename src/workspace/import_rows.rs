@@ -361,7 +361,7 @@ impl Workspace {
         let Some(found) = self.profiles.iter_mut().find(|found| found.id == profile) else {
             return;
         };
-        let connecting = matches!(found.state, ProfileState::Connecting);
+        let connecting = matches!(found.state, ProfileState::Connecting { .. });
         let generation = found.generation;
         let routed = found.route(
             found

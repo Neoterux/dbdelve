@@ -1947,7 +1947,9 @@ impl Render for Workspace {
         let idle = matches!(profile.state, ProfileState::Idle);
         let status = match &profile.state {
             ProfileState::Idle => "Connection is idle.".to_string(),
-            ProfileState::Connecting => format!("Connecting to {}…", profile.config.endpoint()),
+            ProfileState::Connecting { .. } => {
+                format!("Connecting to {}…", profile.config.endpoint())
+            }
             // Connected is the one state worth spending on decoration: every
             // other one is news, and news beats where the connection points.
             // Its name is already on the switcher in the titlebar.
@@ -3279,6 +3281,7 @@ mod tests {
             user: String::new(),
             password: String::new(),
             statement_timeout: 0,
+            ssm: None,
             ssh: None,
         }))
         .unwrap();

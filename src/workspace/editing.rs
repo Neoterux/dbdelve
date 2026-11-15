@@ -37,14 +37,6 @@ impl Workspace {
             return;
         }
         self.clear_notice();
-        // The form is drawn in the results pane, so asking for one brings a
-        // hidden pane back rather than filling in a form nobody can see.
-        if let Some(session) = self.profile_mut().map(|profile| &mut profile.session)
-            && let Tab::Query(id) = session.active
-            && let Some(tab) = session.query_tab_mut(id)
-        {
-            tab.results_hidden = false;
-        }
         let engine = self.engine();
         let Some(profile) = self.profile() else {
             return;
@@ -58,6 +50,11 @@ impl Workspace {
         {
             if let Some(field) = form.fields.first() {
                 field.input.focus_handle(cx).focus(window, cx);
+            }
+            // The form is drawn in the results pane, so asking for one brings
+            // a hidden pane back rather than filling in a form nobody can see.
+            if let Some(profile) = self.profile_mut() {
+                profile.session.reveal_results(active);
             }
             return;
         }
@@ -153,6 +150,7 @@ impl Workspace {
                 table,
                 fields,
             });
+            profile.session.reveal_results(active);
         }
         cx.notify();
     }

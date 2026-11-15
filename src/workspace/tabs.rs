@@ -193,7 +193,7 @@ impl Workspace {
     pub(crate) fn toggle_results(
         &mut self,
         _: &ToggleResults,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.profile_mut().map(|profile| &mut profile.session) else {
@@ -206,10 +206,10 @@ impl Workspace {
             return;
         };
         tab.results_hidden = !tab.results_hidden;
-        // The grid is about to be unmounted, and a window focused on nothing
-        // has no path left for the chord that would bring it back.
-        let grid_focused = tab.shown().1.focus_handle(cx).contains_focused(window, cx);
-        if tab.results_hidden && grid_focused {
+        // The grid and the new-row form beside it are about to be unmounted,
+        // and a window focused on either has no path left for the chord that
+        // would bring them back.
+        if tab.results_hidden {
             self.refocus_front();
         }
         cx.notify();

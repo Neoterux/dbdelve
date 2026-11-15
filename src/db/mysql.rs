@@ -27,7 +27,7 @@ use ::mysql::consts::{ColumnFlags, ColumnType};
 use ::mysql::prelude::Queryable;
 use ::mysql::{Conn, OptsBuilder, SslOpts, Value};
 
-use super::ssh::{Tunnel, tunnelled};
+use super::tunnel::{Tunnel, tunnelled};
 use super::{
     ApplyOutcome, ApplyStage, Bracket, Catalog, Column, DbError, EditTarget, Engine, Fetch, Index,
     IndexKind, QueryResult, Reference, RowBuilder, RowMatch, Schema, Sending, ServerConfig, Shown,
@@ -743,7 +743,7 @@ fn replay(connection: &mut Conn, startup: &[String]) -> Result<(), DbError> {
 impl Connection {
     pub fn open(server: &ServerConfig, engine: Engine) -> Result<Self, DbError> {
         // Before the tunnel, which may have cost a hardware-key touch.
-        if server.ssh.is_some() && server.sslmode == SslMode::VerifyFull {
+        if server.has_tunnel() && server.sslmode == SslMode::VerifyFull {
             return Err(unverifiable_through_a_tunnel(server, engine));
         }
         tunnelled(server, DEFAULT_PORT, |tunnel| {
@@ -1827,9 +1827,10 @@ fn ssl_options(server: &ServerConfig) -> Option<SslOpts> {
 /// ever check the name against the loopback address (AGENTS.md, hard rule 6).
 fn unverifiable_through_a_tunnel(server: &ServerConfig, engine: Engine) -> DbError {
     plain_error(format!(
-        "sslmode=verify-full cannot be honoured through an SSH tunnel on {}: \
+        "sslmode=verify-full cannot be honoured through an {} tunnel on {}: \
          the driver checks the certificate against the address it dials, which is \
          the tunnel's loopback address rather than {}.",
+        if server.ssm.is_some() { "SSM" } else { "SSH" },
         engine.label(),
         server.host
     ))
@@ -2221,6 +2222,7 @@ mod tests {
             host: "mysql".into(),
             port: Some(3306),
             sslmode: SslMode::Disable,
+            ssm: None,
             ssh: crate::db::ssh::live_bastion("dbdelve-bastion"),
             ..config_from_url(&url).expect("dbdelve_MYSQL_URL should parse")
         }
@@ -3106,6 +3108,7 @@ ORDER BY 1, 2
             host: "db.example.test".into(),
             sslmode: SslMode::VerifyFull,
             // Nothing that resolves: starting ssh at all would fail differently.
+            ssm: None,
             ssh: Some(crate::db::SshTunnel {
                 host: "dbdelve-nowhere.invalid".into(),
                 ..crate::db::SshTunnel::default()
@@ -3121,6 +3124,25 @@ ORDER BY 1, 2
             ),
             "{}",
             error.message
+        );
+    }
+
+    #[test]
+    fn ssm_does_not_weaken_mysql_hostname_verification() {
+        let server = ServerConfig {
+            host: "db.example.test".into(),
+            sslmode: SslMode::VerifyFull,
+            ssm: Some(crate::db::SsmTunnel {
+                target: "i-0123456789abcdef0".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = Connection::open(&server, Engine::MySql).err().unwrap();
+        assert!(
+            error
+                .message
+                .contains("cannot be honoured through an SSM tunnel")
         );
     }
 
