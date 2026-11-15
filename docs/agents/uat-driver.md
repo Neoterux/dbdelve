@@ -43,7 +43,8 @@ cargo build --features uat
 
 Run it against a home of its own, so the window cannot see the profiles of
 the person's own dev variant (which may name production servers) and writes
-nothing into them. `HOME` moves the data directory on macOS and Linux;
+no data into them. The keychain is not part of that: see the habits below.
+`HOME` moves the data directory on macOS and Linux;
 on Windows set `APPDATA`. Clear `PG*` too, or an environment profile is put in
 front.
 
@@ -92,5 +93,15 @@ bar: `dbdelve drive text | awk '$2 > 1060'`.
   transaction: quitting the window (`keys cmd-q`) ends its connections.
 - A connection's own access mode defaults to Read-only in the form; a grid edit
   needs Read-write chosen there.
+- A window under its own `HOME` still reaches the login keychain. Its service
+  is the variant name (`dbdelve-dev`) and its account is the profile id,
+  derived from the profile's name (`store::profile_id`), and in an empty `HOME`
+  nothing makes the id unique. A profile made from a URL keeps the URL's
+  database as its name, so `dbdelve_dev` becomes id `dbdelve-dev` and would
+  overwrite, or on removal delete, the password of the person's own profile of
+  that id. So start from an empty `HOME` made for the run, give every profile
+  the run creates a name no real profile has (a run prefix such as
+  `uat-<plan>-<engine>`), check the Name field before Save, remove those
+  profiles through the window at the end, and record their names.
 - Record what the window showed, verbatim, in the report; a UAT file's recorded
   results are the person's and are not edited by the run.

@@ -45,19 +45,21 @@ require it, stop and raise it instead.
    `mql::format` on MongoDB), never an AST round-trip, which drops every
    comment the user wrote. Row mode is the one exception: on a relation tab
    whose view the user has put in Row mode, a row's `UPDATE` is sent when the
-   user leaves the row, presses Save, or takes an action that saves it first,
-   with no buffer and no dialog, and nothing else sends it (a read after a send
-   never sends another row). That send is the user's own act; it still
-   passes `sql::is_generated_write_on` and the connection-mode check as it is
-   sent, is written to the query history, and the last one is shown in the
-   status line. Draft, the default, sends nothing unread, and no agent's
+   user leaves the row (the ring moves off it, or a step key goes
+   past the grid's edge from a cell's input), presses Save, or takes an
+   action that saves it first, with no buffer and no dialog, and nothing
+   else sends it (a read after a send never sends another row). That send is
+   the user's own act; it still passes `sql::is_generated_write_on` and the
+   connection-mode check as it is sent, is written to the query history, and
+   the last one is shown in the status line. Draft, the default, sends nothing unread, and no agent's
    statement takes this path.
 
    It never writes `DROP` or `TRUNCATE` into a buffer or onto the wire. It
    writes `DELETE` only as the explicit deletion of one named row, by primary
    key (on an engine without unique keys, by all of the row's values as read, and
-   only when exactly one row matches), shown before it runs (`sql::delete_row`).
-   The explorer's Copy DROP and Copy TRUNCATE put text on the clipboard and
+   only when exactly one row matches), shown before it runs (`sql::delete_row`),
+   or as one `DELETE` per row the user marked in a reviewed draft, each naming
+   that row's key. The explorer's Copy DROP and Copy TRUNCATE put text on the clipboard and
    nothing else. It never writes into a statement it cannot parse whole: `sql::with_order_by` refuses rather
    than guessing at a clause boundary, because a corrupted statement is worse
    than an unsorted grid.
@@ -79,10 +81,11 @@ require it, stop and raise it instead.
    edited, deliberately. An engine without unique keys is the one exception: a
    row is named by all of its values as read, and a write runs only when exactly
    one row matches, checked by an exactly-one-row `COUNT(*)` with the identical
-   predicate before each write. **Multi-row deletion is not admitted.** When it is
-   wanted, the path is one `DELETE` per row, each naming its own key, inside
-   the `BEGIN`/`COMMIT` multi-row edits use, never one predicate covering
-   several.
+   predicate before each write. **Multi-row deletion by predicate is not admitted.**
+   A reviewed draft may carry one `DELETE` per marked row, each naming its own
+   key and table, checked against the parse tree (`sql::draft_deletes_match`)
+   and counted against the marks, inside the `BEGIN`/`COMMIT` multi-row edits
+   use, never one predicate covering several.
 
 3. **No environment-specific behaviour.** No vendor binary names in error
    strings, no assumption that a loopback host means plaintext, no hardcoded

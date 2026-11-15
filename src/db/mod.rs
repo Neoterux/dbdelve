@@ -641,6 +641,33 @@ impl Engine {
                 .contains("no transaction is active")
     }
 
+    /// Whether a statement that fails inside a transaction the user opened
+    /// leaves that transaction open, with the statements before it still
+    /// applied in it.
+    ///
+    /// MySQL, MariaDB and SQLite do, whatever the server is set to:
+    /// `innodb_rollback_on_timeout` covers a lock-wait timeout only, and a
+    /// duplicate key or a constraint rolls back the failing statement alone.
+    /// Postgres and DuckDB abort the whole transaction, and SQL Server, where
+    /// dbdelve's generated SQL runs with `XACT_ABORT ON`, rolls all of it back.
+    /// The engines that are not row-edit targets answer false: nothing asks
+    /// them. An explicit arm per engine for the reason
+    /// [`Engine::transaction_start`] has one.
+    pub fn keeps_failed_transaction_open(self) -> bool {
+        match self {
+            Self::MySql | Self::MariaDb | Self::Sqlite => true,
+            Self::Postgres
+            | Self::Turso
+            | Self::DuckDb
+            | Self::Snowflake
+            | Self::ClickHouse
+            | Self::SqlServer
+            | Self::MongoDb
+            | Self::Redis
+            | Self::Generic => false,
+        }
+    }
+
     /// Whether `SET column = DEFAULT` is an assignment this engine accepts.
     ///
     /// Where it is not, the gesture has to be withheld rather than attempted.
@@ -4632,6 +4659,17 @@ mod tests {
         ] {
             assert!(
                 !engine.failed_end_keeps_transaction("could not commit"),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_mysql_mariadb_and_sqlite_keep_a_failed_transaction_open() {
+        for engine in Engine::ALL {
+            assert_eq!(
+                engine.keeps_failed_transaction_open(),
+                matches!(engine, Engine::MySql | Engine::MariaDb | Engine::Sqlite),
                 "{engine:?}"
             );
         }
