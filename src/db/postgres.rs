@@ -415,7 +415,11 @@ SELECT
         AS in_primary_key,
     CASE WHEN type_namespace.nspname = 'pg_catalog' THEN type.typname::text
          ELSE type_namespace.nspname || '.' || type.typname END AS type_name,
-    CASE WHEN attribute.attgenerated <> '' THEN 'yes' ELSE 'no' END AS is_generated
+    -- `attgenerated` is new in 12, so it is read through the row as JSON, where
+    -- an older server has no such key rather than no such column: NULL makes
+    -- this say 'no', which is right there. 'v' is PostgreSQL 18's virtual column.
+    CASE WHEN to_jsonb(attribute) ->> 'attgenerated' IN ('s', 'v') THEN 'yes' ELSE 'no' END
+        AS is_generated
 FROM pg_catalog.pg_class AS class
 JOIN pg_catalog.pg_namespace AS namespace
     ON namespace.oid = class.relnamespace
