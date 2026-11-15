@@ -3084,5 +3084,7 @@ CREATE TRIGGER accounts_touch AFTER INSERT ON Accounts BEGIN SELECT 1; END;"
         read_only_session_refuses_a_write,
         generated_writes_round_trip,
         generated_draft_round_trip,
+        verified_draft_round_trip,
+        verified_keyless_round_trip,
     );
 }
