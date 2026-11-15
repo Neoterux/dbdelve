@@ -850,8 +850,7 @@ Decided, and not to be re-litigated:
   Import Rows offers no All or nothing either (`Engine::all_or_nothing`), so
   each chunk's `insertMany` is kept as it lands.
 - **A MongoDB apply is verified one statement at a time, and not atomically**
-  (`Connection::apply_verified`'s MongoDB arm; plans 11, 13 and 14 of phase
-  10.2). The dev server is a standalone one, so there is no session
+  (`Connection::apply_verified`'s MongoDB arm). The dev server is a standalone one, so there is no session
   transaction to wrap a draft in (it is deferred until a replica set is the
   target) and no bracket: `Target::ordered_edits()` is true for it. Each
   `updateOne` and `deleteOne` carries the `find` of its `_id`
@@ -872,7 +871,9 @@ Decided, and not to be re-litigated:
   its read-back both the `find` of the `_id`, which an `updateOne` never
   changes. A document another client changes between the re-read and the write
   is overwritten, since there is no transaction to hold it (the count still
-  sees one that vanished); a query tab never offers Row.
+  sees one that vanished); a query tab never offers Row. A Row send's read-back
+  that fails after its `updateOne` landed is told as written with the read
+  failing (`read_back_after_write`), never as a refusal that keeps the edits.
 - **A missing field is not a null.** A document may lack a field another has, and
   the grid says so: a missing cell renders empty with no `NULL` label, a null
   renders `NULL`, and a snapshot keeps the difference.
