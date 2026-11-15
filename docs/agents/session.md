@@ -914,22 +914,28 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   leaving `stale` set). `execute_and_then` is the fallback: a run with no
   refresh and no explain over a grid holding edits is not sent and the tab's
   notice says so, so a path nobody guarded costs a notice, not a draft.
-- **A Row-mode write inside the open transaction is shown as uncommitted.**
-  A Row send from a relation tab of the connection's own session that lands
-  while `Profile::in_transaction` holds is recorded in `Profile::uncommitted`
-  (tab ids, in memory only, written by the row landing in `execute_unchecked`),
-  and the status bar draws `Uncommitted` (`views::render_uncommitted`) while
-  that tab is in front, because a ROLLBACK undoes the row the grid shows. The
-  record ends wherever `transaction_statements` clears or restarts
-  (`Profile::record_sent`, a disconnect, a reconnect) through
-  `Profile::end_uncommitted`, and a failed `COMMIT` that keeps the transaction
-  puts it back with the statements (`ended`). Ending it marks every listed tab
-  `stale`, commit and rollback alike, since which it was is not read off the
-  statement: the table is read again on its next visit. A Draft apply and a Row
-  send outside a transaction draw nothing. A tab bound to another database
-  never joins: while that session holds a transaction the send is refused
-  (`Profile::bound_write_refusal`) and the row stays edited, and otherwise it
-  is written to that database.
+- **A verified write inside the open transaction is shown as uncommitted.**
+  A Row send, a one-statement draft, a New row form, a lone Delete row or a
+  query tab's Apply that joins the connection's own session
+  (`Bracket::Joined`) and lands while `Profile::in_transaction` holds is
+  recorded in `Profile::uncommitted` (tabs, in memory only), by one condition
+  decided when it is sent (`joined` in `execute_unchecked`: a verified apply
+  under `Bracket::Joined`, not refused) and the run having landed. The status
+  bar draws `Uncommitted` (`views::render_uncommitted`) while that tab is in
+  front, because a ROLLBACK undoes the write the grid shows. A refusal, a
+  drift, a miscount or a failure records nothing, and an unknown outcome
+  cannot arise there because a joined apply sends no `COMMIT`. The record ends
+  wherever `transaction_statements` clears or restarts (`Profile::record_sent`,
+  a disconnect, a reconnect) through `Profile::end_uncommitted`, and a failed
+  `COMMIT` that keeps the transaction puts it back with the statements
+  (`ended`). Ending it marks every listed relation tab `stale`, commit and
+  rollback alike, since which it was is not read off the statement: the table
+  is read again on its next visit. A query tab is not read again: its rows are
+  its statement's, so after a rollback it shows what it last read until it is
+  run again. A write outside a transaction, or one that did not land, draws
+  nothing. A tab bound to another database never joins: while that session
+  holds a transaction the send is refused (`Profile::bound_write_refusal`) and
+  the row stays edited, and otherwise it is written to that database.
 - **`queries` can be empty.** Any buffer can be closed, the last one
   included, and a profile with no tab open shows an empty pane and relaunches
   that way. A new connection, and one written before buffers were tabs, opens
