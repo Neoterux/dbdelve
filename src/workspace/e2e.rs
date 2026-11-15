@@ -20196,6 +20196,8 @@ fn a_batch_reviewed_before_a_transaction_opened_is_refused_at_run(cx: &mut TestA
             Some(("Apply edits", true, Some(DRAFT_IN_TRANSACTION.into())))
         );
         assert_eq!(pending_of(&grid, cx), 2, "the draft is kept");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
         assert!(
             in_transaction(&workspace, cx),
             "the user's transaction is untouched"
@@ -20302,12 +20304,82 @@ fn a_joined_write_that_counts_no_row_wrote_nothing_and_leaves_the_transaction_op
             "the user's transaction is still open"
         );
         assert_eq!(pending_of(&grid, cx), 1, "the draft keeps its edit");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
 
         run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
         assert_eq!(
             on_disk("select name from birds where id = 2").as_deref(),
             Some("tit")
         );
+        quit(workspace, cx);
+    });
+}
+
+/// A joined apply the server answered with drift or with a refusal wrote
+/// nothing into the user's transaction, so nothing is shown uncommitted.
+#[gpui::test]
+fn a_joined_apply_that_drifts_or_fails_is_not_shown_uncommitted(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        run_in_front(&workspace, cx, "BEGIN");
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+
+        // The row changes inside the session the apply joins, between the
+        // review and Run: a second connection cannot write while this one's
+        // transaction holds the lock.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        run_in_query_tab_then_return(
+            &workspace,
+            cx,
+            id,
+            "update birds set name = 'eagle' where id = 1",
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx)
+                .and_then(|(_, _, error)| error)
+                .as_deref(),
+            Some("Nothing was applied. Row id = 1 does not match the row as it was read.")
+        );
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert!(in_transaction(&workspace, cx));
+        assert_eq!(pending_of(&grid, cx), 1, "the draft keeps its edit");
+
+        // A write the server refuses: a second row with a taken key.
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        workspace.update(cx, |workspace, cx| workspace.close_apply_review(cx));
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        run_in_query_tab_then_return(&workspace, cx, id, "BEGIN");
+        add_bird(&grid, cx, "1", "dup");
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply draft", true, None))
+        );
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        let error = front_review(&workspace, cx)
+            .and_then(|(_, _, error)| error)
+            .expect("the review says what the server refused");
+        assert!(error.contains("UNIQUE constraint failed"), "{error}");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
+        assert!(in_transaction(&workspace, cx));
+        run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
         quit(workspace, cx);
     });
 }
