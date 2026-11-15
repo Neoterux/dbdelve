@@ -2780,6 +2780,14 @@ impl Workspace {
                             .get(..written_before_stop(&outcome))
                             .map(<[StepRow]>::to_vec)
                             .unwrap_or_default();
+                        // The write landed and only its read failed: it lands
+                        // as written, with the read's own failure told by
+                        // `land_row`, and not as a refusal that keeps the edits.
+                        let (written, read_failed) = read_back_after_write(outcome);
+                        outcome = written;
+                        if let Some(error) = read_failed {
+                            verified_read = Some(Err(error));
+                        }
                     }
                     verified_result(outcome, verify, ordered)
                 }
@@ -4306,8 +4314,8 @@ fn verified_result(
 /// other than one row. Nothing was sent after it. A drift and a failure
 /// before the first write wrote nothing.
 ///
-/// `ApplyStage::ReadBack` is not one a draft can reach: a MongoDB draft's steps
-/// carry no read-back.
+/// A read-back that failed follows its step's write, so that step counts too:
+/// only a Row send's step carries one, and the draft's own steps never do.
 fn written_before_stop(outcome: &ApplyOutcome) -> usize {
     match outcome {
         ApplyOutcome::Miscounted { step, .. }
@@ -4315,7 +4323,32 @@ fn written_before_stop(outcome: &ApplyOutcome) -> usize {
             stage: ApplyStage::Write(step),
             ..
         } => *step,
+        ApplyOutcome::Failed {
+            stage: ApplyStage::ReadBack(step),
+            ..
+        } => step + 1,
         _ => 0,
+    }
+}
+
+/// An ordered target's failed read-back as what it is: every statement up to
+/// and including its step was written, there being no transaction to take them
+/// back, and the read is what failed. The outcome is then that of the writes,
+/// applied, and the error is the read's, for the landing to tell
+/// ([`land_row`]); any other outcome is returned as it is.
+fn read_back_after_write(outcome: ApplyOutcome) -> (ApplyOutcome, Option<DbError>) {
+    match outcome {
+        ApplyOutcome::Failed {
+            stage: ApplyStage::ReadBack(step),
+            error,
+        } => (
+            ApplyOutcome::Applied {
+                affected: step as u64 + 1,
+                read_back: None,
+            },
+            Some(error),
+        ),
+        other => (other, None),
     }
 }
 
@@ -4827,6 +4860,8 @@ mod tests {
             }),
             2
         );
+        // A read-back follows its step's write, so that step is written.
+        assert_eq!(written_before_stop(&failed(ApplyStage::ReadBack(0))), 1);
         // Before any write, or with none sent: nothing is written.
         for outcome in [
             failed(ApplyStage::Begin),
@@ -4839,6 +4874,50 @@ mod tests {
         ] {
             assert_eq!(written_before_stop(&outcome), 0, "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_read_back_after_a_written_update_lands_as_written_with_the_read_failing() {
+        let error = DbError {
+            message: "connection reset".into(),
+            position: None,
+        };
+        let (outcome, read_failed) = read_back_after_write(ApplyOutcome::Failed {
+            stage: ApplyStage::ReadBack(0),
+            error: error.clone(),
+        });
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Applied {
+                affected: 1,
+                read_back: None
+            }
+        );
+        assert_eq!(read_failed, Some(error.clone()));
+        // The row lands as written, said with the read's own words, and the
+        // tab reads the relation again.
+        let mut grid = ResultGrid::empty();
+        let rows_id = grid.rows_id();
+        let (said, reread) = land_row(
+            &mut grid,
+            (0, rows_id, &[]),
+            read_failed.map(Err),
+            "ok".into(),
+        );
+        assert_eq!(
+            said,
+            "The row was updated. Reading it back failed: connection reset"
+        );
+        assert!(reread);
+        // A write that failed is not written, and is left as it is.
+        let refused = |error| ApplyOutcome::Failed {
+            stage: ApplyStage::Write(0),
+            error,
+        };
+        assert_eq!(
+            read_back_after_write(refused(error.clone())),
+            (refused(error), None)
+        );
     }
 
     #[test]

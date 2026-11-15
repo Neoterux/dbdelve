@@ -801,10 +801,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   back. A Row write inside the open transaction is shown as uncommitted (see
   that bullet).
 
-  An `UPDATE` matches on the key alone, in both modes. A row changed on the
-  server since it was fetched is overwritten, and nothing detects it: a stale
-  edit (`StaleEdit`) is not drift detection. Verifying that the row is as it was
-  fetched is left to Phase 10.2.
+  An `UPDATE` matches on the key alone, in both modes, but the apply that
+  sends it first reads the row again and compares it with the row as it was
+  fetched, so a row changed on the server since is refused and not overwritten
+  (`Verification`). A stale edit (`StaleEdit`) is a different check, on a
+  restored grid.
 - **A draft holds added rows and marks.** In a Draft view of a relation tab on a
   `Target::keeps_edits()` target (`row_edits()`, or MongoDB below), `NewRow` (Insert) adds a grid row and
   `DeleteRow` toggles a mark on the selected rows (the palette's `Mark row for
@@ -836,7 +837,7 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   marks. The four call sites that decided by `row_edits()` (`kept` in
   `execute_unchecked`, `has_markable_row`, `new_row`'s in-grid row, `delete_row`'s
   marks) ask `keeps_edits()`, and so do `EditMode::on` and the Row control
-  (plan 14: a MongoDB `updateOne` is read back by its `_id`); only the
+  (a MongoDB `updateOne` is read back by its `_id`); only the
   conformance filters stay on `row_edits()`. The review carries a
   `Verification` (`Engine::verifies_applies` is true for MongoDB): each fetched
   cell with its `$type` tag, each `updateOne` and `deleteOne` with the `find` of
