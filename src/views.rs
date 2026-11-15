@@ -3296,16 +3296,13 @@ pub(crate) fn apply_label(mode: Option<EditMode>) -> &'static str {
     }
 }
 
-/// Says that the rows saved on the table in front sit inside the open
+/// Says that the rows written from the tab in front sit inside the open
 /// transaction: the grid shows them, and a rollback undoes them.
 pub(crate) fn render_uncommitted(
     profile: &Profile,
     cx: &mut Context<Workspace>,
 ) -> Option<AnyElement> {
-    let Tab::Object(object) = profile.session.active else {
-        return None;
-    };
-    (profile.in_transaction && profile.uncommitted.contains(&object)).then(|| {
+    (profile.in_transaction && profile.uncommitted.contains(&profile.session.active)).then(|| {
         open_indicator_chip("uncommitted-rows", "Uncommitted", *theme(cx))
             .tooltip(|window, cx| {
                 Tooltip::new(

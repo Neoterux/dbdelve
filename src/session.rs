@@ -113,11 +113,12 @@ pub(crate) struct Profile {
     /// history file, `profiles.toml` or any log, since it is SQL text that
     /// ends with its session. Emptied with [`Profile::in_transaction`].
     pub(crate) transaction_statements: Vec<String>,
-    /// The relation tabs, by id, whose Row-mode writes joined the open
-    /// transaction, for the status bar to say they are not committed. Held in
+    /// The tabs whose verified writes joined the open transaction (a Row
+    /// send, a one-statement draft, a New row form, a lone Delete row, a query
+    /// tab's Apply), for the status bar to say they are not committed. Held in
     /// memory only and ended with [`Profile::transaction_statements`]
     /// ([`Profile::end_uncommitted`]).
-    pub(crate) uncommitted: BTreeSet<u64>,
+    pub(crate) uncommitted: BTreeSet<Tab>,
     /// Whether each of the user's statements commits on its own. Off means
     /// dbdelve keeps a transaction open for them, opening it by writing a
     /// `BEGIN` into the buffer where they can read it -- never onto the wire
@@ -232,13 +233,20 @@ impl Profile {
         }
     }
 
-    /// The transaction the Row-mode writes of [`Profile::uncommitted`] were
-    /// in has ended, so the tabs that showed them are owed a re-read: a
-    /// rollback undid what their grids show, and which way it ended is not
+    /// The transaction the verified writes of [`Profile::uncommitted`] were
+    /// in has ended, so the relation tabs that showed them are owed a re-read:
+    /// a rollback undid what their grids show, and which way it ended is not
     /// read off the statement.
     pub(crate) fn end_uncommitted(&mut self) {
-        for id in std::mem::take(&mut self.uncommitted) {
-            self.session.mark_stale(id);
+        for tab in std::mem::take(&mut self.uncommitted) {
+            match tab {
+                Tab::Object(id) => self.session.mark_stale(id),
+                // ponytail: a query tab's rows are its statement's, so a
+                // rollback leaves them as last read until it is run again; the
+                // upgrade is to run its `last_query` again on its next visit,
+                // as a stale relation is read.
+                Tab::Query(_) => {}
+            }
         }
     }
 
@@ -2255,7 +2263,8 @@ pub(crate) struct Behaviour {
 /// Which surface the main pane is showing, and what a run targets. Both kinds
 /// of tab are addressed by id rather than by index, so closing one cannot land
 /// an in-flight result in its neighbour's grid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// `PartialOrd, Ord` give `Profile::uncommitted` an order for its set; nothing else reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Tab {
     Query(u64),
     Object(u64),
