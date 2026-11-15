@@ -6266,6 +6266,35 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_generated_column_of_a_table_without_a_primary_key_is_matched_and_never_set() {
+        // A generated column cannot be written, so it is still matched on but
+        // named in `fixed`, and the write leaves it out.
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        connection
+            .query(
+                "CREATE TEMP TABLE dbdelve_generated (value integer, \
+                 doubled integer GENERATED ALWAYS AS (value * 2) STORED, label text)",
+                Fetch::default(),
+            )
+            .expect("the temporary table should be created");
+
+        let result = connection
+            .query(
+                "SELECT label, value, doubled FROM dbdelve_generated",
+                Fetch::default(),
+            )
+            .expect("query should succeed");
+
+        let edit = result.edit.expect("every column is of a listed type");
+        assert_eq!(edit.keys, [1, 2, 0]);
+        assert_eq!(
+            edit.row_match,
+            crate::db::RowMatch::EveryColumn { fixed: vec![2] }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_a_table_without_a_primary_key_is_edited_by_every_column() {
         // There is no predicate that names one of two identical rows, so the
         // rows are named by every value and a write is counted.
