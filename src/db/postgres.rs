@@ -2596,6 +2596,27 @@ mod tests {
         }
     }
 
+    /// `attgenerated` is new in PostgreSQL 12: named bare, a server before it
+    /// refuses the query, the refusal is swallowed, and every result set there
+    /// loses its edit target.
+    #[test]
+    fn every_catalog_query_a_result_set_or_table_open_runs_reads_attgenerated_through_the_row_as_json()
+     {
+        for (name, sql) in [
+            ("EDIT_COLUMNS_SQL", EDIT_COLUMNS_SQL),
+            ("STRUCTURE_COLUMNS_SQL", STRUCTURE_COLUMNS_SQL),
+        ] {
+            assert!(
+                !sql.contains("attribute.attgenerated"),
+                "{name} reads attgenerated on the attribute alias directly"
+            );
+        }
+        assert!(
+            EDIT_COLUMNS_SQL.contains("to_jsonb(attribute) ->> 'attgenerated'"),
+            "EDIT_COLUMNS_SQL does not read attgenerated through the row as JSON"
+        );
+    }
+
     /// The server the `live_` tests talk to, from the standard `PG*` variables.
     fn live_config() -> ServerConfig {
         ServerConfig {
