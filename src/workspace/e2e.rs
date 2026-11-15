@@ -28338,6 +28338,68 @@ fn a_row_send_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppC
     });
 }
 
+/// A query tab's Apply of one keyed cell joins the user's open transaction as
+/// a Row send does, so it is shown uncommitted too. What the tab shows after a
+/// rollback is the ceiling: its rows are its statement's and are not read
+/// again until it is run.
+#[gpui::test]
+fn a_query_tabs_apply_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let query = front_query_id(&workspace, cx);
+        run_in_front(&workspace, cx, "BEGIN");
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        let grid = query_tab(&workspace, cx, |tab, _, _| tab.results.clone());
+        assert_eq!(
+            drawn(cx, &["uncommitted-rows"]),
+            [false],
+            "nothing sent yet"
+        );
+        grid.update(cx, |grid, _| {
+            assert!(grid.delegate_mut().set_pending(
+                0,
+                1,
+                crate::result_grid::NewValue::Value("robin".into())
+            ));
+        });
+        cx.dispatch_action(crate::actions::ApplyEdits);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        let sql = front_review_sql(&workspace, cx).expect("a review is open");
+        assert!(!sql.contains("BEGIN") && !sql.contains("COMMIT"), "{sql}");
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(front_review(&workspace, cx), None, "the review closed");
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren"),
+            "a second connection does not see it"
+        );
+
+        // A rollback from another tab ends it.
+        new_query_tab(&workspace, cx);
+        run_in_front(&workspace, cx, "ROLLBACK");
+        bring_forward(&workspace, cx, Tab::Query(query));
+        assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+        assert_eq!(
+            cell_of(&grid, cx, 0, 1).as_deref(),
+            Some("robin"),
+            "the rows the tab last read, until its statement is run again"
+        );
+        run_in_front(&workspace, cx, "select * from birds order by id");
+        assert_eq!(cell_of(&grid, cx, 0, 1).as_deref(), Some("wren"));
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn rolling_back_reads_again_the_rows_saved_inside_the_transaction(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;
