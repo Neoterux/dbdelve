@@ -3459,11 +3459,10 @@ impl Workspace {
                     // holds the write whichever one the user is looking at.
                     if joined
                         && succeeded
-                        && let Tab::Object(object) = tab
                         && let Some(profile) = workspace.issued_to(&id, generation)
                         && profile.in_transaction
                     {
-                        profile.uncommitted.insert(object);
+                        profile.uncommitted.insert(tab);
                     }
                     if let Some((mut said, reread)) = row_said {
                         // The relation is read again first: that clears the

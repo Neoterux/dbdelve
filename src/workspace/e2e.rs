@@ -19988,7 +19988,7 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
             [true],
             "a write inside the user's transaction is shown uncommitted"
         );
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
 
         // A COMMIT ends it.
         run_in_query_tab_then_return(&workspace, cx, id, "COMMIT");
@@ -20007,7 +20007,7 @@ fn a_draft_of_one_statement_joins_the_open_transaction_and_one_of_two_is_refused
         workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
         settle(cx);
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
         run_in_query_tab_then_return(&workspace, cx, id, "ROLLBACK");
         assert!(uncommitted_tabs(&workspace, cx).is_empty());
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
@@ -23794,7 +23794,7 @@ fn a_new_row_form_and_a_lone_delete_row_inside_the_open_transaction_are_shown_un
         settle(cx);
         assert_eq!(front_review(&workspace, cx), None, "the review closed");
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
         assert_eq!(
             on_disk("select count(*) from birds where id = 3").as_deref(),
             Some("0"),
@@ -23818,7 +23818,7 @@ fn a_new_row_form_and_a_lone_delete_row_inside_the_open_transaction_are_shown_un
         settle(cx);
         assert_eq!(front_review(&workspace, cx), None, "the review closed");
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
         assert_eq!(
             on_disk("select count(*) from birds").as_deref(),
             Some("2"),
@@ -28239,9 +28239,9 @@ fn a_row_send_whose_read_back_is_not_a_select_writes_nothing(cx: &mut TestAppCon
     });
 }
 
-/// The relation tabs of the profile in front whose Row-mode writes sit inside
-/// its open transaction.
-fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<u64> {
+/// The tabs of the profile in front whose verified writes sit inside its open
+/// transaction.
+fn uncommitted_tabs(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Tab> {
     workspace.read_with(cx, |workspace, _| {
         workspace
             .profile()
@@ -28312,7 +28312,7 @@ fn a_row_send_inside_the_open_transaction_is_shown_uncommitted(cx: &mut TestAppC
             Some("wren"),
             "a second connection does not see it"
         );
-        assert_eq!(uncommitted_tabs(&workspace, cx), [id]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Object(id)]);
         assert!(
             open_transaction_statements(&workspace, cx)
                 .iter()
@@ -28374,6 +28374,7 @@ fn a_query_tabs_apply_inside_the_open_transaction_is_shown_uncommitted(cx: &mut 
         settle(cx);
         assert_eq!(front_review(&workspace, cx), None, "the review closed");
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [true]);
+        assert_eq!(uncommitted_tabs(&workspace, cx), [Tab::Query(query)]);
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren"),
@@ -28385,6 +28386,7 @@ fn a_query_tabs_apply_inside_the_open_transaction_is_shown_uncommitted(cx: &mut 
         run_in_front(&workspace, cx, "ROLLBACK");
         bring_forward(&workspace, cx, Tab::Query(query));
         assert_eq!(drawn(cx, &["uncommitted-rows"]), [false]);
+        assert!(uncommitted_tabs(&workspace, cx).is_empty());
         assert_eq!(
             on_disk("select name from birds where id = 1").as_deref(),
             Some("wren")
