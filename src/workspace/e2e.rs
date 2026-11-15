@@ -24670,6 +24670,252 @@ fn delete_row_and_new_row_keep_their_review_and_form_in_a_row_view(cx: &mut Test
     });
 }
 
+/// Puts the table in front into Classic.
+fn go_classic(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, cx| {
+        workspace.set_edit_mode(crate::session::EditMode::Classic, cx)
+    });
+}
+
+/// `birds` opened in Classic, as `BIRDS` or a variation of it holds it.
+fn open_in_classic_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (u64, Grid) {
+    let id = open_own_table(workspace, cx, "birds");
+    go_classic(workspace, cx);
+    assert_eq!(
+        edit_mode_of(workspace, cx, id),
+        crate::session::EditMode::Classic
+    );
+    let grid = relation_grid(workspace, cx, id);
+    (id, grid)
+}
+
+#[gpui::test]
+fn new_row_in_a_classic_view_opens_the_insert_form(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_classic_mode(&workspace, cx);
+
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let form = workspace.profile().unwrap().session.insert_form.as_ref();
+            assert_eq!(form.map(|form| form.tab), Some(Tab::Object(id)));
+        });
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            assert_eq!(grid.result().rows.len(), 2);
+            assert!(!grid.holds_rows());
+            assert_eq!(grid.added_count(), 0);
+        });
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn delete_row_in_a_classic_view_reviews_one_delete(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_classic_mode(&workspace, cx);
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Delete row", false, None))
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let review = workspace
+                .profile()
+                .unwrap()
+                .session
+                .apply_review
+                .as_ref()
+                .expect("a review is open");
+            assert!(review.sql.starts_with("DELETE"), "{}", review.sql);
+            assert_eq!(review.sql.matches("DELETE").count(), 1, "{}", review.sql);
+            assert!(!review.sql.contains("UPDATE") && !review.sql.contains("INSERT"));
+            assert!(review.verify.is_some(), "the delete is verified");
+        });
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().marked_count(), 0));
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("2"));
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 1)
+        });
+        assert_eq!(
+            edit_mode_of(&workspace, cx, id),
+            crate::session::EditMode::Classic
+        );
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn save_in_a_classic_view_reviews_the_updates_before_anything_is_sent(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (_, grid) = open_in_classic_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        save(&workspace, cx);
+
+        assert_eq!(
+            front_review(&workspace, cx),
+            Some(("Apply edits", true, None))
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let review = workspace.profile().unwrap().session.apply_review.as_ref();
+            assert!(review.is_some_and(|review| review.verify.is_some()));
+        });
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 0));
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn delete_row_over_staged_edits_in_a_classic_view_keeps_them_and_says_so(cx: &mut TestAppContext) {
+    use crate::result_grid::NewValue;
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let (id, grid) = open_in_classic_mode(&workspace, cx);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        grid.update(cx, |grid, _| grid.delegate_mut().select_row(1));
+
+        cx.dispatch_action(crate::actions::DeleteRow);
+        settle(cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+
+        assert_eq!(on_disk("select count(*) from birds").as_deref(), Some("1"));
+        grid.read_with(cx, |grid, _| {
+            let grid = grid.delegate();
+            assert_eq!(grid.pending_count(), 1);
+            assert_eq!(grid.result().rows.len(), 2, "not read again");
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let session = &workspace.profile().unwrap().session;
+            assert_eq!(
+                session.tab_notice,
+                Some((Tab::Object(id), Workspace::EDITS_KEPT.into()))
+            );
+        });
+
+        save(&workspace, cx);
+        workspace.update(cx, |workspace, cx| workspace.run_apply_review(cx));
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        grid.read_with(cx, |grid, _| {
+            assert_eq!(grid.delegate().result().rows.len(), 1)
+        });
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
+fn switching_into_and_out_of_classic_keeps_reviewed_edits_and_sends_a_row_first(
+    cx: &mut TestAppContext,
+) {
+    use crate::{result_grid::NewValue, session::EditMode};
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite_holding(cx, BIRDS);
+        let id = open_own_table(&workspace, cx, "birds");
+        let grid = relation_grid(&workspace, cx, id);
+        let set = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext, mode| {
+            workspace.update(cx, |workspace, cx| workspace.set_edit_mode(mode, cx))
+        };
+        let pending_discard = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .profile()
+                    .unwrap()
+                    .session
+                    .pending_discard
+                    .is_some()
+            })
+        };
+
+        // Cell edits carry between Draft and Classic with no prompt.
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        set(&workspace, cx, EditMode::Classic);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Classic);
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 1));
+        assert!(!pending_discard(&workspace, cx));
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("wren")
+        );
+
+        // Staged cells are not turned into per-row sends.
+        set(&workspace, cx, EditMode::Row);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Classic);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The draft has 1 edit, so the view was not switched to Row mode.")
+        );
+
+        set(&workspace, cx, EditMode::Draft);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        assert!(!pending_discard(&workspace, cx));
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().pending_count(), 1));
+
+        // A Draft holding an added row cannot become Classic.
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        cx.dispatch_action(crate::actions::NewRow);
+        settle(cx);
+        grid.read_with(cx, |grid, _| assert_eq!(grid.delegate().added_count(), 1));
+        set(&workspace, cx, EditMode::Classic);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Draft);
+        assert_eq!(
+            shown_notice(&workspace, cx).as_deref(),
+            Some("The draft has 1 change, so the view was not switched to Classic mode.")
+        );
+
+        grid.update(cx, |grid, _| grid.delegate_mut().discard_pending());
+        set(&workspace, cx, EditMode::Classic);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Classic);
+        assert_eq!(
+            shown_notice(&workspace, cx),
+            None,
+            "the refusal is taken down"
+        );
+
+        // Leaving Row sends the edited row first.
+        set(&workspace, cx, EditMode::Row);
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Row);
+        stage(&grid, cx, 0, 1, NewValue::Value("robin".into()));
+        set(&workspace, cx, EditMode::Classic);
+        settle(cx);
+        assert_eq!(
+            on_disk("select name from birds where id = 1").as_deref(),
+            Some("robin")
+        );
+        assert_eq!(edit_mode_of(&workspace, cx, id), EditMode::Classic);
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn a_row_save_does_not_send_over_an_open_review(cx: &mut TestAppContext) {
     use crate::result_grid::NewValue;

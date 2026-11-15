@@ -470,7 +470,7 @@ pub enum Command {
     SortActiveColumn,
     /// The status bar's Client (`true`) or Server.
     SetViewSorting(bool),
-    /// The status bar's Draft or Row, on the table in front.
+    /// The status bar's Classic, Draft or Row, on the table in front.
     SetEditMode(crate::session::EditMode),
     /// The explorer menu's Copy DDL, for the relation in front.
     CopyDdl,
@@ -4347,21 +4347,20 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             RESULTS,
         ));
     }
-    // The status bar's Draft and Row, as the one the view is not in.
+    // The status bar's edit modes: one row for each the view is not in.
     let edit_mode = crate::views::view_edit_mode(profile);
     if let Some(mode) = edit_mode {
-        let (label, other) = match mode {
-            crate::session::EditMode::Draft => ("Edit in Row mode", crate::session::EditMode::Row),
-            crate::session::EditMode::Row => {
-                ("Edit in Draft mode", crate::session::EditMode::Draft)
-            }
-        };
-        items.push(command(
-            label,
-            icon::RENAME,
-            Command::SetEditMode(other),
-            RESULTS,
-        ));
+        for other in crate::session::EditMode::ALL
+            .into_iter()
+            .filter(|other| *other != mode)
+        {
+            items.push(command(
+                &format!("Edit in {} mode", other.label()),
+                icon::RENAME,
+                Command::SetEditMode(other),
+                RESULTS,
+            ));
+        }
     }
     // Not the active cell's: the columns come back whichever cell is ringed.
     if let Some(hidden) = shown_grid

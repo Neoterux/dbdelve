@@ -3261,8 +3261,9 @@ pub(crate) fn view_edit_mode(profile: &Profile) -> Option<EditMode> {
         .then(|| session.edit_mode(session.active))
 }
 
-/// How the view in front sends its edits: Draft holds them for a review, Row
-/// sends a row's own `UPDATE`.
+/// How the view in front sends its edits: Classic holds cell edits for a
+/// review on Save, Draft holds every edit, row and delete for one apply, and
+/// Row sends a row's own `UPDATE`.
 pub(crate) fn render_edit_mode(
     profile: &Profile,
     cx: &mut Context<Workspace>,
@@ -3284,6 +3285,7 @@ pub(crate) fn render_edit_mode(
                 div()
                     .debug_selector(move || {
                         match choice {
+                            EditMode::Classic => "edit-mode-classic",
                             EditMode::Draft => "edit-mode-draft",
                             EditMode::Row => "edit-mode-row",
                         }
@@ -3302,7 +3304,7 @@ pub(crate) fn render_edit_mode(
 }
 
 /// What the button over staged edits says it does: a Row view saves the row,
-/// a Draft view applies the draft.
+/// a Classic or Draft view applies the edits through the review.
 pub(crate) fn apply_label(mode: Option<EditMode>) -> &'static str {
     match mode {
         Some(EditMode::Row) => "Save row",

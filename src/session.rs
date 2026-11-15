@@ -2066,8 +2066,8 @@ pub(crate) enum AfterEdits {
     /// with its tab, so a tab switch asks nothing.
     Activate(Tab),
     /// Switch the view's edit mode. Only a Row view's row waits on this, being
-    /// sent before the view becomes a draft (or asked about, when the server
-    /// refused it).
+    /// sent before the view becomes Draft or Classic (or asked about, when the
+    /// server refused it).
     EditMode(EditMode),
 }
 
@@ -2556,13 +2556,18 @@ impl Sorting {
     }
 }
 
-/// When a view's edits are sent. `Row` sends a row's `UPDATE` as the row is
-/// left or saved, with no review; `Draft` holds every edit until it is applied
-/// through the review. Per view, because a table the user is correcting row by
-/// row and a result they are drafting a batch against want different answers;
-/// a new view starts from the Edit mode setting.
+/// When a view's edits are sent. `Classic` holds cell edits until Save shows
+/// their `UPDATE`s, takes a new row through the insert form and reviews one
+/// `DELETE` for Delete row; it adds no grid rows and marks none, which is how
+/// editing worked before Draft existed. `Draft` also holds added rows and
+/// deleted-row marks until one apply shows every statement. `Row` sends a row's
+/// `UPDATE` as the row is left or saved, with no review. Per view, because a
+/// table the user is correcting row by row and a result they are drafting a
+/// batch against want different answers; a new view starts from the Edit mode
+/// setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum EditMode {
+    Classic,
     #[default]
     Draft,
     Row,
@@ -2572,7 +2577,7 @@ impl EditMode {
     /// This mode, but `Draft` where the target does not offer Row: Row is
     /// offered exactly where `Target::keeps_edits` holds, the targets whose edit
     /// send keeps the grid and is verified, so a Row send is never made on one
-    /// that clears it.
+    /// that clears it. Classic and Draft are offered on every target.
     pub(crate) fn on(self, target: Target) -> Self {
         match (self, target.keeps_edits()) {
             (Self::Row, false) => Self::Draft,
@@ -2582,10 +2587,11 @@ impl EditMode {
 }
 
 impl EditMode {
-    pub(crate) const ALL: [EditMode; 2] = [EditMode::Draft, EditMode::Row];
+    pub(crate) const ALL: [EditMode; 3] = [EditMode::Classic, EditMode::Draft, EditMode::Row];
 
     pub(crate) fn slug(self) -> &'static str {
         match self {
+            Self::Classic => "classic",
             Self::Draft => "draft",
             Self::Row => "row",
         }
@@ -2601,6 +2607,7 @@ impl EditMode {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Classic => "Classic",
             Self::Draft => "Draft",
             Self::Row => "Row",
         }
@@ -4709,6 +4716,43 @@ mod tests {
     }
 
     #[test]
+    fn a_classic_view_reads_back_from_its_slug_and_is_offered_on_every_target() {
+        assert_eq!(
+            EditMode::ALL,
+            [EditMode::Classic, EditMode::Draft, EditMode::Row]
+        );
+        assert_eq!(EditMode::Classic.slug(), "classic");
+        assert_eq!(EditMode::Classic.label(), "Classic");
+        assert_eq!(EditMode::from_slug(Some("classic")), EditMode::Classic);
+        assert_eq!(EditMode::default(), EditMode::Draft);
+        let odbc = Box::leak(Box::new(crate::db::Plugin {
+            id: "odbc".into(),
+            name: "ODBC".into(),
+            version: "1".into(),
+            executable: "dbdelve-odbc".into(),
+        }));
+        let plugin = Target {
+            engine: Engine::Postgres,
+            driver: crate::db::Driver::Plugin(odbc),
+        };
+        assert_eq!(EditMode::Classic.on(plugin), EditMode::Classic);
+        for engine in [
+            Engine::Postgres,
+            Engine::Redis,
+            Engine::MongoDb,
+            Engine::ClickHouse,
+            Engine::Snowflake,
+            Engine::Turso,
+        ] {
+            assert_eq!(
+                EditMode::Classic.on(Target::built_in(engine)),
+                EditMode::Classic,
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
     fn row_mode_is_offered_on_mongodb_through_the_target_predicate() {
         assert_eq!(
             EditMode::Row.on(Target::built_in(Engine::MongoDb)),
@@ -4811,6 +4855,16 @@ mod tests {
                 "{unreadable:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_naming_classic_read_as_classic() {
+        let settings: store::StoredSettings =
+            toml::from_str("edit_mode = \"classic\"").expect("the settings must decode");
+        assert_eq!(
+            EditMode::from_slug(settings.edit_mode.as_deref()),
+            EditMode::Classic
+        );
     }
 
     #[test]

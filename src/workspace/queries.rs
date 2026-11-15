@@ -3709,7 +3709,7 @@ impl Workspace {
 
     /// Said after an edit send succeeded over a grid that still holds edits,
     /// which the re-read would have dropped unseen.
-    const EDITS_KEPT: &str =
+    pub(super) const EDITS_KEPT: &str =
         "The change was applied. The rows were not read again: this tab has unapplied edits.";
 
     /// A run's outcome into the history of the profile that sent it, by id

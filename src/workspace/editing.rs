@@ -1814,11 +1814,14 @@ impl Workspace {
     /// (`EditMode::on`). Nothing changes, and nothing is said, for a mode the
     /// view already has or a tab that has none to choose.
     ///
-    /// Draft to Row is refused while the grid holds staged edits: they are a
-    /// draft, and one switch must not turn them into sends, one row at a time,
-    /// that nobody reviewed. Row to Draft over edited rows sends them first, as
-    /// any action that leaves them would (`held_for_edits`), and does not
-    /// switch if one is refused.
+    /// Switching into Row is refused while the grid holds staged edits: they
+    /// are a batch for one review, and one switch must not turn them into
+    /// sends, one row at a time, that nobody reviewed. Switching into Classic
+    /// is refused while the grid holds an added row or a delete mark, which a
+    /// Classic view has no way to show or apply. Cell edits alone carry between
+    /// Classic and Draft with no prompt, since both review the same `UPDATE`s.
+    /// Leaving Row over edited rows sends them first, as any action that leaves
+    /// them would (`held_for_edits`), and does not switch if one is refused.
     pub(crate) fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
         let mode = mode.on(self.target());
         let Some(profile) = self.profile() else {
@@ -1828,16 +1831,17 @@ impl Workspace {
         let Some(results) = profile.session.results(tab) else {
             return;
         };
-        if !matches!(tab, Tab::Object(_)) || profile.session.edit_mode(tab) == mode {
+        let current = profile.session.edit_mode(tab);
+        if !matches!(tab, Tab::Object(_)) || current == mode {
             return;
         }
         let staged = results.read(cx).delegate().pending_count();
         let holds_rows = results.read(cx).delegate().holds_rows();
-        // Row to Draft sends the dirty row first and switches when it lands.
-        if mode == EditMode::Draft && self.held_for_edits(tab, AfterEdits::EditMode(mode), cx) {
+        // Leaving Row sends the dirty row first and switches when it lands.
+        if current == EditMode::Row && self.held_for_edits(tab, AfterEdits::EditMode(mode), cx) {
             return;
         }
-        if mode == EditMode::Row && staged > 0 {
+        if (mode == EditMode::Row && staged > 0) || (mode == EditMode::Classic && holds_rows) {
             // Cells alone are edits; a row added makes the draft's size a
             // count of changes.
             let noun = if holds_rows { "change" } else { "edit" };
@@ -1845,7 +1849,14 @@ impl Workspace {
                 1 => format!("1 {noun}"),
                 count => format!("{count} {noun}s"),
             };
-            self.note(format!("The draft has {size}{}", Self::DRAFT_REFUSAL), cx);
+            self.note(
+                format!(
+                    "The draft has {size}{}{} mode.",
+                    Self::DRAFT_REFUSAL,
+                    mode.label()
+                ),
+                cx,
+            );
             return;
         }
         if let Some(slot) = self
@@ -1858,19 +1869,22 @@ impl Workspace {
         }
     }
 
-    /// What the notice says after how many edits the draft holds, when a
-    /// switch to Row is refused over them.
-    const DRAFT_REFUSAL: &str = ", so the view was not switched to Row mode.";
+    /// What the notice says between how many edits the draft holds and the
+    /// mode a refused switch was headed for.
+    const DRAFT_REFUSAL: &str = ", so the view was not switched to ";
 
     /// Takes the draft's refusal down once what it reported is over: the draft
-    /// is gone or the view is in Row mode. Only that notice goes; whatever else
-    /// the bar says, such as the row a Row send just wrote, is not this call's.
+    /// is gone or the view is in the mode it asked for. Only that notice goes;
+    /// whatever else the bar says, such as the row a Row send just wrote, is
+    /// not this call's.
     fn clear_draft_refusal(&mut self) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
         if profile.session.notice.as_deref().is_some_and(|notice| {
-            notice.starts_with("The draft has ") && notice.ends_with(Self::DRAFT_REFUSAL)
+            notice.starts_with("The draft has ")
+                && notice.contains(Self::DRAFT_REFUSAL)
+                && notice.ends_with(" mode.")
         }) {
             profile.session.notice = None;
         }
@@ -2219,7 +2233,7 @@ impl Workspace {
     /// mode that refuses the write raises the Read-write prompt as Enter does
     /// and sends nothing.
     ///
-    /// A Draft view and a query tab (Draft only) return before any commit: the
+    /// A Classic or Draft view and a query tab (Draft only) return before any commit: the
     /// input stays open and nothing is staged. Click-away is what keeps that
     /// text.
     pub(crate) fn step_past_edge(
