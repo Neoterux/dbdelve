@@ -802,6 +802,9 @@ fn render_object(
             .cached(gpui::StyleRefinement::default().size_full())
             .into_any_element();
     }
+    if let ObjectBody::Users { view, .. } = &tab.body {
+        return view.clone().into_any_element();
+    }
     if let ObjectBody::Structure {
         structure, grid, ..
     } = &tab.body
@@ -3437,6 +3440,7 @@ fn render_tab_strip(
                     match object.body {
                         ObjectBody::Structure { .. } => icon::STRUCTURE,
                         ObjectBody::Diagram { .. } => icon::DIAGRAM,
+                        ObjectBody::Users { .. } => icon::USERS,
                         _ => object.kind.map_or(icon::TABLE, object_icon),
                     },
                 ))
