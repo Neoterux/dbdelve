@@ -1,6 +1,7 @@
 package dev.dbdelve.android
 
 import android.os.Bundle
+import java.io.File
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -16,6 +17,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.dbdelve.android.data.ProfileStore
 import dev.dbdelve.android.data.Secrets
+import dev.dbdelve.android.data.TabStore
 import dev.dbdelve.android.ui.ConnectionForm
 import dev.dbdelve.android.ui.ConnectionsScreen
 import dev.dbdelve.android.ui.DBDelveTheme
@@ -26,7 +28,11 @@ class MainActivity : FragmentActivity() {
     private val model: AppViewModel by viewModels {
         viewModelFactory {
             initializer {
-                AppViewModel(ProfileStore(filesDir), Secrets(applicationContext)) { connection ->
+                AppViewModel(
+                    ProfileStore(filesDir),
+                    Secrets(applicationContext),
+                    TabStore(File(filesDir, "tabs")),
+                ) { connection ->
                     QueryService.keepAlive(applicationContext, connection)
                 }
             }

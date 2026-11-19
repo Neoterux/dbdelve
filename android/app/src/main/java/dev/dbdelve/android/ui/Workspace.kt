@@ -101,7 +101,6 @@ import uniffi.dbdelve_core.Mode
 import uniffi.dbdelve_core.ObjectKind
 import uniffi.dbdelve_core.ResultSet
 import uniffi.dbdelve_core.Stop
-import uniffi.dbdelve_core.holdsReadOnly
 import uniffi.dbdelve_core.statementAt
 
 /** Asks the device's own lock (fingerprint, face or PIN), then runs [onSuccess]. */
@@ -236,7 +235,7 @@ private fun QueryPane(model: AppViewModel) {
             model.tabs.forEachIndexed { at, each ->
                 Tab(
                     selected = at == model.current,
-                    onClick = { model.current = at },
+                    onClick = { model.select(at) },
                     text = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(each.title, maxLines = 1)
@@ -256,7 +255,7 @@ private fun QueryPane(model: AppViewModel) {
 
         BasicTextField(
             value = tab.text,
-            onValueChange = { tab.text = it },
+            onValueChange = { model.edit(tab, it) },
             textStyle = TextStyle(fontFamily = Mono, fontSize = 14.sp, lineHeight = 21.sp, color = MaterialTheme.colorScheme.onSurface),
             cursorBrush = SolidColor(palette.orange),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, autoCorrectEnabled = false),
@@ -278,7 +277,8 @@ private fun QueryPane(model: AppViewModel) {
         )
 
         // What Run will send: the statement under the cursor, as typed.
-        val span = statementAt(engine, tab.text.text, tab.text.selection.start.toUInt())
+        val cursor = tab.text.selection.start
+        val span = remember(tab.text.text, cursor) { statementAt(engine, tab.text.text, cursor.toUInt()) }
         val next = span?.let { tab.text.text.substring(it.start.toInt(), it.end.toInt()) }
         Text(
             next?.let { "Runs: " + it.lineSequence().first().take(60) + if (it.contains('\n') || it.length > 60) " …" else "" }
@@ -307,7 +307,7 @@ private fun QueryPane(model: AppViewModel) {
                 }
             }
         }
-        AccessoryKeys(tab)
+        AccessoryKeys(tab) { model.edit(tab, it) }
     }
 }
 
@@ -326,7 +326,7 @@ private fun RowLimit(model: AppViewModel) {
 
 /** The keys a soft keyboard buries two layers deep. */
 @Composable
-private fun AccessoryKeys(tab: QueryTab) {
+private fun AccessoryKeys(tab: QueryTab, onPress: (TextFieldValue) -> Unit) {
     val keys = listOf("⇥", "(", ")", "'", "\"", ";", "*", "=", ".", ",", "{", "}", "[", "]", ":", "$", "_", "←", "→")
     Row(
         Modifier
@@ -340,7 +340,7 @@ private fun AccessoryKeys(tab: QueryTab) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHighest,
                 shape = RoundedCornerShape(6.dp),
-                modifier = Modifier.clickable { tab.text = press(tab.text, key) },
+                modifier = Modifier.clickable { onPress(press(tab.text, key)) },
             ) {
                 Text(
                     key,
@@ -431,6 +431,16 @@ private fun Rows(result: ResultSet) {
     val clipboard = LocalClipboardManager.current
     var records by remember { mutableStateOf(false) }
     var opened by remember { mutableStateOf<Pair<String, String?>?>(null) }
+    var copyNote by remember(result) { mutableStateOf<String?>(null) }
+    // The clipboard crosses a binder transaction capped near 1 MB; past it
+    // Android throws on the main thread, which is a crash, not an error.
+    val copy = { text: String ->
+        copyNote = when {
+            text.length > CLIPBOARD_LIMIT -> "Too large to copy: lower the row limit and run it again."
+            runCatching { clipboard.setText(AnnotatedString(text)) }.isFailure -> "The clipboard refused it."
+            else -> null
+        }
+    }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
             SingleChoiceSegmentedButtonRow {
@@ -438,8 +448,9 @@ private fun Rows(result: ResultSet) {
                 SegmentedButton(selected = records, onClick = { records = true }, shape = SegmentedButtonDefaults.itemShape(1, 2)) { Text("Records") }
             }
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = { clipboard.setText(AnnotatedString(csv(result))) }) { Text("Copy CSV") }
+            TextButton(onClick = { copy(csv(result)) }) { Text("Copy CSV") }
         }
+        copyNote?.let { Text(it, color = palette.red, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp)) }
         Box(Modifier.weight(1f)) {
             when {
                 result.columns.isEmpty() -> Centered(result.affected?.let { "$it rows affected" } ?: "Done")
@@ -474,7 +485,7 @@ private fun Rows(result: ResultSet) {
                 )
             },
             confirmButton = {
-                TextButton(onClick = { value?.let { clipboard.setText(AnnotatedString(it)) }; opened = null }) { Text("Copy") }
+                TextButton(onClick = { value?.let(copy); opened = null }) { Text("Copy") }
             },
             dismissButton = { TextButton(onClick = { opened = null }) { Text("Close") } },
         )
@@ -482,6 +493,9 @@ private fun Rows(result: ResultSet) {
 }
 
 private const val CHAR_DP = 8.4f
+
+/** Characters, well under the binder's ~1 MB once encoded as UTF-16. */
+private const val CLIPBOARD_LIMIT = 200_000
 
 @Composable
 private fun Grid(result: ResultSet, open: (String, String?) -> Unit) {
@@ -636,8 +650,8 @@ private fun SchemaPane(model: AppViewModel) {
         val shown = model.catalog.filter { filter.isBlank() || it.name.contains(filter.trim(), ignoreCase = true) }
         LazyColumn(Modifier.fillMaxSize()) {
             shown.groupBy { it.schema }.forEach { (schema, entries) ->
-                item(key = "schema:$schema") { SectionHeader(schema, entries.size) }
-                items(entries, key = { "${it.schema}.${it.name}" }) { entry -> CatalogRow(model, entry) }
+                item(key = "schema" to schema) { SectionHeader(schema, entries.size) }
+                items(entries, key = { it.schema to it.name }) { entry -> CatalogRow(model, entry) }
             }
         }
     }
@@ -685,7 +699,6 @@ private fun size(bytes: Long): String = when {
 private fun GateDialog(model: AppViewModel, pending: PendingGate, authenticate: Authenticate) {
     val palette = LocalPalette.current
     val name = model.profile?.name ?: ""
-    val engine = model.session?.engine()
     val stop = pending.stop
     AlertDialog(
         onDismissRequest = { model.dismissGate() },
@@ -706,12 +719,8 @@ private fun GateDialog(model: AppViewModel, pending: PendingGate, authenticate: 
                             if (pending.verdict.destructive.isNotEmpty()) " It ${pending.verdict.destructive.joinToString(" and ") { destroys(it) }}." else ""
                         is Stop.Confirm -> "Check the statement below before it runs on $name."
                         Stop.RunOnce ->
-                            "It may be a typo, or something this app can't classify. " +
-                                if (model.mode == Mode.READ_ONLY && engine != null && holdsReadOnly(engine)) {
-                                    "The server still holds $name to reads."
-                                } else {
-                                    "Nothing but you stops it writing."
-                                }
+                            "It may be a typo, a backslash the server could read differently, or " +
+                                "something this app can't classify. Nothing but you stops it writing."
                     },
                 )
                 Statement(pending.statement)

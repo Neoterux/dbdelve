@@ -28,6 +28,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
@@ -49,17 +50,19 @@ fun ConnectionForm(model: AppViewModel, editing: Profile?, duplicate: Boolean) {
     // A duplicate keeps the mode of the one it copies; an edit never changes
     // one; a new connection starts Read-only.
     val creating = editing == null || duplicate
-    var engine by remember { mutableStateOf(editing?.engine ?: Engine.POSTGRES) }
-    var name by remember { mutableStateOf(editing?.name?.let { if (duplicate) "$it copy" else it } ?: "") }
-    var project by remember { mutableStateOf(editing?.project ?: "") }
-    var host by remember { mutableStateOf(editing?.host ?: "") }
-    var port by remember { mutableStateOf((editing?.port ?: defaultPort(engine).toInt()).toString()) }
-    var user by remember { mutableStateOf(editing?.user ?: "") }
+    var engine by rememberSaveable { mutableStateOf(editing?.engine ?: Engine.POSTGRES) }
+    var name by rememberSaveable { mutableStateOf(editing?.name?.let { if (duplicate) "$it copy" else it } ?: "") }
+    var project by rememberSaveable { mutableStateOf(editing?.project ?: "") }
+    var host by rememberSaveable { mutableStateOf(editing?.host ?: "") }
+    var port by rememberSaveable { mutableStateOf((editing?.port ?: defaultPort(engine).toInt()).toString()) }
+    var user by rememberSaveable { mutableStateOf(editing?.user ?: "") }
+    // Not saveable, on purpose: saved state is a Bundle the system may write
+    // to disk, and a password does not belong there. Rotating re-reads it.
     var password by remember { mutableStateOf(editing?.let { model.password(it) } ?: "") }
     var showPassword by remember { mutableStateOf(false) }
-    var database by remember { mutableStateOf(editing?.database ?: "") }
-    var ssl by remember { mutableStateOf(editing?.sslMode ?: SslMode.VERIFY_FULL) }
-    var mode by remember { mutableStateOf(editing?.mode ?: Mode.READ_ONLY) }
+    var database by rememberSaveable { mutableStateOf(editing?.database ?: "") }
+    var ssl by rememberSaveable { mutableStateOf(editing?.sslMode ?: SslMode.VERIFY_FULL) }
+    var mode by rememberSaveable { mutableStateOf(editing?.mode ?: Mode.READ_ONLY) }
 
     val portNumber = port.toIntOrNull()?.takeIf { it in 1..65535 }
     val databaseNeeded = engine == Engine.MONGO && database.isBlank()

@@ -116,7 +116,7 @@ fun UsersPane(model: AppViewModel) {
             Text(it, color = palette.red, fontFamily = Mono, fontSize = 12.sp, modifier = Modifier.padding(16.dp))
         }
         LazyColumn(Modifier.fillMaxSize()) {
-            items(model.users, key = { it.account.label() }) { user ->
+            items(model.users, key = { it.account.name to it.account.host }) { user ->
                 UserRow(user, abilities) { form = Form.Detail(user) }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }

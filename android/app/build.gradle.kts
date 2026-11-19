@@ -21,12 +21,27 @@ android {
         }
     }
 
+    // The release key comes from the environment (CI's secrets, see the
+    // README), so it never lands in the repository. Without it, the debug
+    // key: the build works, but every machine's debug key differs, so its
+    // APK cannot update one built elsewhere.
+    signingConfigs {
+        System.getenv("DBDELVE_SIGNING_STORE")?.let { store ->
+            create("release") {
+                storeFile = file(store)
+                storePassword = System.getenv("DBDELVE_SIGNING_STORE_PASSWORD")
+                keyAlias = System.getenv("DBDELVE_SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("DBDELVE_SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             // Off: JNA reaches the Rust core by reflection, and the bindings
             // are generated each build. A keep-rules file is the upgrade path.
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {

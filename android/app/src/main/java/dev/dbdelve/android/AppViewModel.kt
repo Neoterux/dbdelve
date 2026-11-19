@@ -11,7 +11,10 @@ import androidx.lifecycle.viewModelScope
 import dev.dbdelve.android.data.Profile
 import dev.dbdelve.android.data.ProfileStore
 import dev.dbdelve.android.data.Secrets
+import dev.dbdelve.android.data.TabStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.dbdelve_core.Account
@@ -71,6 +74,7 @@ fun Throwable.reason(): String = when (this) {
 class AppViewModel(
     private val store: ProfileStore,
     private val secrets: Secrets,
+    private val tabStore: TabStore,
     /** Called with the connection's name while a statement runs, null after. */
     private val keepAlive: (connection: String?) -> Unit,
 ) : ViewModel() {
@@ -90,6 +94,7 @@ class AppViewModel(
 
     val tabs = mutableStateListOf<QueryTab>()
     var current by mutableStateOf(0)
+        private set
     var pane by mutableStateOf(Pane.QUERY)
     var running by mutableStateOf(false)
         private set
@@ -116,12 +121,18 @@ class AppViewModel(
         screen = Screen.Connections
     }
 
-    fun password(profile: Profile): String = secrets.password(profile.id)
+    /**
+     * The saved password, or blank when the Keystore can no longer open it
+     * (a key invalidated by a lock-screen reset): the form then asks again
+     * rather than the app crashing.
+     */
+    fun password(profile: Profile): String = runCatching { secrets.password(profile.id) }.getOrDefault("")
 
     fun deleteProfile(profile: Profile) {
         profiles = profiles.filterNot { it.id == profile.id }
         store.save(profiles)
         secrets.forget(profile.id)
+        tabStore.forget(profile.id)
     }
 
     fun connect(profile: Profile) {
@@ -137,8 +148,7 @@ class AppViewModel(
                 session = opened
                 this@AppViewModel.profile = profile
                 mode = profile.mode
-                tabs.clear()
-                newTab()
+                restoreTabs(profile)
                 pane = Pane.QUERY
                 screen = Screen.Workspace
                 refreshCatalog()
@@ -147,8 +157,10 @@ class AppViewModel(
     }
 
     fun disconnect() {
+        saveTabs(now = true)
         val closing = session
         session = null
+        running = false
         profile = null
         catalog = emptyList()
         gate = null
@@ -164,6 +176,7 @@ class AppViewModel(
         val tab = QueryTab(nextTabId++, title, text)
         tabs.add(tab)
         current = tabs.lastIndex
+        saveTabs()
         return tab
     }
 
@@ -171,6 +184,48 @@ class AppViewModel(
         tabs.remove(tab)
         if (tabs.isEmpty()) newTab()
         current = current.coerceIn(0, tabs.lastIndex)
+        saveTabs()
+    }
+
+    fun select(at: Int) {
+        current = at
+        saveTabs()
+    }
+
+    /** Every keystroke and key-row press goes through here, so none is unsaved. */
+    fun edit(tab: QueryTab, value: TextFieldValue) {
+        val changed = tab.text.text != value.text
+        tab.text = value
+        if (changed) saveTabs()
+    }
+
+    private fun restoreTabs(profile: Profile) {
+        tabs.clear()
+        nextTabId = 0
+        val (saved, at) = tabStore.load(profile.id)
+        if (saved.isEmpty()) {
+            newTab()
+            return
+        }
+        saved.forEach { tabs.add(QueryTab(nextTabId++, it.title, it.text)) }
+        current = at.coerceIn(0, tabs.lastIndex)
+    }
+
+    private var saving: Job? = null
+
+    /**
+     * Writes the tabs a moment after the last change, so typing is not a
+     * write per keystroke; [now] writes at once, for leaving the connection.
+     */
+    private fun saveTabs(now: Boolean = false) {
+        val id = profile?.id ?: return
+        val snapshot = tabs.map { TabStore.Saved(it.title, it.text.text) }
+        val at = current
+        saving?.cancel()
+        saving = viewModelScope.launch {
+            if (!now) delay(600)
+            withContext(Dispatchers.IO) { tabStore.save(id, snapshot, at) }
+        }
     }
 
     /** Runs the statement under the cursor, as typed. */
@@ -228,9 +283,17 @@ class AppViewModel(
         // in the view model, so a statement still ends if Android destroys the
         // activity outright. A service that owns the session is the upgrade path.
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { runCatching { call(session) } }
-            running = false
-            keepAlive(null)
+            val outcome = try {
+                withContext(Dispatchers.IO) { runCatching { call(session) } }
+            } finally {
+                // Also when the view model is cleared mid-statement (the app
+                // swiped away): otherwise the foreground service outlives it.
+                keepAlive(null)
+                if (this@AppViewModel.session === session) running = false
+            }
+            // A statement that ends after a disconnect, or after switching to
+            // another connection, must not land in the new one's state.
+            if (this@AppViewModel.session !== session) return@launch
             outcome.onSuccess { outcome ->
                 when (outcome) {
                     is RunOutcome.Done -> done(outcome.result)
@@ -349,21 +412,27 @@ class AppViewModel(
         val profile = profile ?: return
         viewModelScope.launch {
             val changed = withContext(Dispatchers.IO) { runCatching { session.setMode(next) } }
+            // It may complete after the user left this connection: the
+            // profile still takes the mode, the screen of another does not.
+            val current = this@AppViewModel.session === session
             changed.onSuccess {
-                mode = next
                 val saved = profile.copy(mode = next)
-                this@AppViewModel.profile = saved
                 profiles = profiles.map { if (it.id == saved.id) saved else it }
                 store.save(profiles)
+                if (!current) return@onSuccess
+                mode = next
+                this@AppViewModel.profile = saved
                 then()
-            }.onFailure { failure -> tab?.let { it.error = failure.reason() } }
+            }.onFailure { failure -> if (current) tab?.let { it.error = failure.reason() } }
         }
     }
 
     fun cancel() {
         val session = session ?: return
         // A thread of its own: the session's lock is held by what it stops.
-        Thread { session.cancel() }.start()
+        // A disconnect may destroy the session first; a cancel then has
+        // nothing left to stop, and must not take the app down trying.
+        Thread { runCatching { session.cancel() } }.start()
     }
 
     fun refreshCatalog() {

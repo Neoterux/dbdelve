@@ -10,7 +10,6 @@
 
 use bson::{Bson, Document};
 
-use crate::Engine;
 use crate::gate::{Destructive, Verdict, unreadable};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +117,26 @@ pub fn parse(text: &str) -> Result<Command, String> {
         .into_iter()
         .map(|value| Bson::try_from(value).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
+    // Options this does not pass on (`upsert`, `arrayFilters`, a collation)
+    // are refused, never dropped: dropping one runs a different command
+    // from the one typed.
+    let most = match method {
+        "drop" | "getUsers" => 0,
+        "find"
+        | "updateOne"
+        | "updateMany"
+        | "updateUser"
+        | "grantRolesToUser"
+        | "revokeRolesFromUser" => 2,
+        _ => 1,
+    };
+    if args.len() > most {
+        return Err(format!(
+            "{method} here takes {most} argument{}; options are not passed on, so a command \
+             with them is refused rather than run without them.",
+            if most == 1 { "" } else { "s" }
+        ));
+    }
     let document = |at: usize| -> Result<Document, String> {
         match args.get(at) {
             None => Ok(Document::new()),
@@ -296,7 +315,7 @@ fn runs_javascript(document: &Document) -> bool {
 
 pub fn classify(text: &str) -> Verdict {
     let Ok(command) = parse(text) else {
-        return unreadable(Engine::Mongo);
+        return unreadable();
     };
     let script =
         |documents: &[&Document]| documents.iter().any(|document| runs_javascript(document));
@@ -446,6 +465,13 @@ mod tests {
         assert_eq!(classify("db.getUsers()"), Verdict::READ);
         // A field the gate has not read is refused, not passed along.
         assert!(parse("db.updateUser('a', {pwd: 'c', roles: ['root']})").is_err());
+        // Options it would not pass on are refused, not dropped.
+        assert!(parse("db.t.updateMany({}, {$set: {a: 1}}, {upsert: true})").is_err());
+        assert!(parse("db.t.find({}, {}, {})").is_err());
+        assert_eq!(
+            classify("db.t.aggregate([], {allowDiskUse: true})"),
+            unreadable()
+        );
         // A collection that happens to share a method's name is still one.
         assert_eq!(
             parse("db.dropUser.find()").unwrap().collection.as_deref(),

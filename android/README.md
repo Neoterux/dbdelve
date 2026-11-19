@@ -1,5 +1,9 @@
 # DBDelve for Android
 
+An Android port of [DBDelve](https://github.com/ShayanAbbas1/dbdelve), the
+native desktop database client. It keeps DBDelve's rules and is licensed, like
+DBDelve, under the GPL v3 ([LICENSE](../LICENSE)).
+
 A native Android client for **PostgreSQL, MySQL 5.6.5 or later, and MongoDB**,
 built on the same rules as the desktop app: your statement runs exactly as
 typed, every statement passes the connection's mode first, and a connection
@@ -25,9 +29,8 @@ starts Read-only.
 ## How it is built
 
 ```text
-android/
-  core/   Rust: the three drivers, the gate, statement splitting (UniFFI)
-  app/    Kotlin + Jetpack Compose: the UI, Keystore, the biometric prompt
+core/   Rust: the three drivers, the gate, statement splitting (UniFFI)
+app/    Kotlin + Jetpack Compose: the UI, Keystore, the biometric prompt
 ```
 
 **Kotlin and Compose for everything you touch, Rust for everything that talks
@@ -42,10 +45,11 @@ biometrics and Keystore are built for. The database side is Rust because:
   doesn't target Android. Neither does Rust officially, but these Rust drivers
   are plain Rust, with no JVM classes Android lacks.
 
-`core` is its own Cargo workspace, kept out of the desktop crate, so the
-desktop build and upstream merges are untouched. Its lockfile was seeded from
-the desktop's: `mysql` 28.0.0 has since been yanked from crates.io, and only a
-lockfile that already holds it can still resolve it.
+The gate in `core/src/gate.rs` is adapted from DBDelve's desktop
+`sql::classify` and `sql::gate`. When the desktop's gate changes, port the
+change here. `core`'s lockfile was seeded from the desktop's: `mysql` 28.0.0
+has since been yanked from crates.io, and only a lockfile that already holds it
+can still resolve it. Keep `Cargo.lock` committed.
 
 `Session::run` is the only way a statement reaches a server, and it classifies
 and gates before sending. When the gate stops a statement, the app shows the
@@ -61,8 +65,7 @@ Prerequisites: Android SDK 35 and an NDK, Rust with the Android targets, and
 rustup target add aarch64-linux-android
 cargo install cargo-ndk
 export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/<version>
-cd android
-./gradlew :app:assembleDebug        # or open android/ in Android Studio
+./gradlew :app:assembleDebug        # or open this folder in Android Studio
 ```
 
 To install on the phone, turn on *Developer options → USB debugging* (tap
@@ -73,10 +76,33 @@ To install on the phone, turn on *Developer options → USB debugging* (tap
 generates the Kotlin bindings from the built library itself, so they always
 describe the core that is packaged.
 
+## Installing CI builds
+
+Every push to `main` builds a release APK; open the run under **Actions** and
+download the artifact. A tag starting with `v` (`git tag v0.1.0 && git push
+--tags`) also attaches it to a GitHub Release.
+
+**Sign with your own key, once,** or each CI build is signed with a
+throwaway key, and Android refuses to install it over the previous one
+without uninstalling first, which deletes saved connections:
+
+```sh
+keytool -genkeypair -v -keystore dbdelve-release.jks -alias dbdelve \
+  -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 dbdelve-release.jks      # macOS: base64 -i dbdelve-release.jks
+```
+
+Then add four repository secrets under *Settings → Secrets and variables →
+Actions*: `DBDELVE_SIGNING_KEYSTORE_BASE64` (that base64 output),
+`DBDELVE_SIGNING_STORE_PASSWORD`, `DBDELVE_SIGNING_KEY_ALIAS` (`dbdelve`) and
+`DBDELVE_SIGNING_KEY_PASSWORD`. Keep the `.jks` file and its passwords
+somewhere safe and out of the repository: losing them means no build can
+update the installed app again.
+
 ## Checks
 
 ```sh
-cd android/core
+cd core
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test                                   # gate, Mongo parser, splitting
@@ -106,9 +132,14 @@ They prove, on each engine, that:
 - The row limit keeps two of three rows and reports that it capped.
 - A drop asks for Full and then for confirmation, and a run once leaves the
   mode where it was.
-- On Postgres and MySQL, the server's own hold refuses a write the parser
-  cannot read when it is run once in Read-only.
+- In Read-only, a write the parser cannot read is refused before it is sent;
+  and on Postgres and MySQL the server's own hold still refuses a write
+  hidden in a function the gate reads as a plain `SELECT`.
 - Cancel stops a 30-second sleep.
+- A read past the row limit is stopped, not drained: a twenty-million-row
+  Postgres read and a multi-million-row MySQL cross join both come back in
+  seconds. Inside a Postgres transaction you opened, the read is drained
+  instead, since a cancel would abort the transaction, and it stays usable.
 
 ## MySQL 5.6
 
@@ -124,6 +155,34 @@ They prove, on each engine, that:
   sends `KILL QUERY` on a side connection.
 - Auth is `mysql_native_password`, 5.6's default.
 
+## Connection modes
+
+Every statement is classified before it is sent, and runs only if the
+connection's mode allows it: Read-only, Read-write, or Full, which writes
+and drops need. Three rules keep the gate honest where parser and server could
+read the same text differently:
+
+- **A statement the parser cannot read needs Read-write**, even to run once,
+  and asks first. Read-only runs only what the gate has read as a read. The
+  server's read-only hold is a backstop, not the boundary: a statement can lift
+  it (`BEGIN READ WRITE`), and some writes ignore it (`SELECT … INTO OUTFILE`).
+- **Any backslash makes a statement unreadable.** Whether `\'` ends a string is
+  a server setting (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`) the
+  parser cannot see, and read the other way a string can hide a `DROP`. A
+  regex such as `'\d+'` therefore asks before it runs.
+- **Server-wide settings need Full.** `SET GLOBAL` and `SET @@global.…` reach
+  every other session, and a read-only transaction does not stop them.
+
+## The row limit
+
+The limit keeps that many rows of your statement as they arrive, and never
+changes the statement. A plain single read past the limit is then stopped,
+so a phone doesn't download a table only to throw it away: MySQL ends it
+with `KILL QUERY` from a side connection, and Postgres cancels it once a side
+connection sees, in `pg_stat_activity`, that this session runs exactly that
+statement as a transaction of its own. MongoDB drops the cursor. Anything that
+writes, takes a lock or sets a session variable is read to its end.
+
 ## MongoDB
 
 Commands use the shell's spelling with JSON5 arguments, one per statement:
@@ -131,11 +190,12 @@ Commands use the shell's spelling with JSON5 arguments, one per statement:
 that aren't identifiers. Supported methods: `find`, `aggregate`,
 `countDocuments`, `insertOne`/`insertMany`, `updateOne`/`updateMany`,
 `deleteOne`/`deleteMany`, `drop`. Types go in Extended JSON:
-`{_id: {$oid: '…'}}`.
+`{_id: {$oid: '…'}}`. Options the app does not pass on (`upsert`,
+`arrayFilters`, a collation) are refused, never silently dropped: dropping
+one would run a different command from the one typed.
 
 MongoDB has no server-side read-only hold, so in Read-only the gate is the only
-thing that stops a write. Because of that, a command DBDelve cannot read needs
-Read-write even to run once. Use a read-only role for anything that matters.
+thing that stops a write. Use a read-only role for anything that matters.
 
 ## Users and roles
 
@@ -182,17 +242,17 @@ Deliberate cuts, not oversights; those with a ceiling in the code are marked
 
 - **Row editing.** The grid is read-only. Desktop's generated `UPDATE` with its
   write gate is the next step.
-- **Stopping a capped read.** A read past the limit is drained to its end
-  instead of being cancelled at the limit; Cancel still stops it.
 - **Column types on Postgres.** The simple protocol sends every value as text
   and doesn't say its type.
 - **SSH tunnels.** Desktop shells out to the system `ssh`, which Android
   doesn't have.
+- **Results across restarts.** Query tabs and their text are kept per
+  connection; results are not, and nothing runs again on its own.
 - **A session that outlives its screen.** The foreground service keeps the
   process alive, but the session belongs to the view model, so a statement
   still ends if Android destroys the activity outright.
 - **Command palette, query history, completion, Explain, and the tablet
-  layout from the mockup** (`../design/android/dbdelve-android.html`).
+  layout from the mockup** ([the mockup](../design/android/dbdelve-android.html)).
 
 ## What has and hasn't been compiled
 

@@ -106,51 +106,42 @@ pub fn gate(verdict: &Verdict, mode: Mode, confirmed: &[Destructive]) -> Option<
 pub fn classify(engine: Engine, sql: &str) -> Verdict {
     match engine {
         Engine::Mongo => crate::mongo_cmd::classify(sql),
-        Engine::Postgres => classify_sql(&PostgreSqlDialect {}, sql, true),
+        Engine::Postgres => classify_sql(&PostgreSqlDialect {}, sql),
         Engine::MySql => {
             // `/*! … */` is a comment to the parser and a statement to MySQL.
             if sql.contains("/*!") {
-                return unreadable(engine);
+                return unreadable();
             }
-            classify_sql(&MySqlDialect {}, sql, true)
+            classify_sql(&MySqlDialect {}, sql)
         }
     }
 }
 
-/// An unreadable verdict's mode is the lowest it may run once in: any, where
-/// the server holds Read-only; otherwise Read-only may not run it at all.
-pub fn unreadable(engine: Engine) -> Verdict {
+/// What the gate cannot read needs Read-write even to run once, on every
+/// engine. The server's read-only hold is a backstop, not a boundary: the
+/// statement itself can lift it (`BEGIN READ WRITE`), and some writes ignore
+/// it (`SELECT … INTO OUTFILE`, signalling another backend). So Read-only
+/// runs only what the gate has read as a read.
+pub fn unreadable() -> Verdict {
     Verdict {
-        mode: if holds_read_only(engine) {
-            Mode::ReadOnly
-        } else {
-            Mode::ReadWrite
-        },
+        mode: Mode::ReadWrite,
         destructive: vec![Destructive::Unreadable],
     }
 }
 
-/// Whether the server itself holds a Read-only session to reads.
-pub fn holds_read_only(engine: Engine) -> bool {
-    match engine {
-        Engine::Postgres | Engine::MySql => true,
-        Engine::Mongo => false,
+fn classify_sql(dialect: &dyn Dialect, sql: &str) -> Verdict {
+    // Whether a backslash escapes the next character is the server's own
+    // setting (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`), which
+    // the parser cannot see. Read the other way, `'a\'; DROP TABLE t; -- '`
+    // is one string to the parser and a DROP to the server. The tokenizer has
+    // already unescaped a literal by the time its text could be checked, so
+    // the raw text is: any backslash, and the gate cannot vouch for it.
+    if sql.contains('\\') {
+        return unreadable();
     }
-}
-
-fn classify_sql(dialect: &dyn Dialect, sql: &str, holds: bool) -> Verdict {
     let statements = match Parser::parse_sql(dialect, sql) {
         Ok(statements) if !statements.is_empty() => statements,
-        _ => {
-            return Verdict {
-                mode: if holds {
-                    Mode::ReadOnly
-                } else {
-                    Mode::ReadWrite
-                },
-                destructive: vec![Destructive::Unreadable],
-            };
-        }
+        _ => return unreadable(),
     };
     statements
         .iter()
@@ -219,6 +210,9 @@ fn variant_verdict(statement: &Statement) -> Verdict {
                     .fold(Verdict::READ, Verdict::max)
             }
         }
+        // A server-wide setting outlives the session and reaches every other
+        // one; a read-only transaction does not stop it.
+        Statement::Set(set) if sets_globally(set) => Verdict::FULL,
         Statement::Set(set) if set_lifts_hold(set) => Verdict::WRITE,
         Statement::StartTransaction { modes, .. } if opens_read_write(modes) => Verdict::WRITE,
 
@@ -346,6 +340,16 @@ fn set_lifts_hold(set: &Set) -> bool {
     }
 }
 
+fn sets_globally(set: &Set) -> bool {
+    let text = set.to_string().to_ascii_lowercase();
+    ["global", "persist", "@@global.", "@@persist."]
+        .iter()
+        .any(|word| {
+            text.split(|c: char| c.is_whitespace() || c == '(')
+                .any(|part| part.starts_with(word))
+        })
+}
+
 fn opens_read_write(modes: &[TransactionMode]) -> bool {
     modes.contains(&TransactionMode::AccessMode(
         TransactionAccessMode::ReadWrite,
@@ -402,6 +406,46 @@ fn calls_verdict(dialect: &dyn Dialect, sql: &str) -> Verdict {
         return Verdict::WRITE;
     }
     Verdict::READ
+}
+
+/// Whether a read may be stopped once it passes the row limit, instead of
+/// being drained to its end: one plain query that writes nothing and leaves
+/// nothing behind in the session, so stopping it undoes nothing. Locks and
+/// session variables are what a query can leave behind: an advisory or named
+/// lock, `set_config`, or a MySQL `@x :=`.
+pub fn stoppable(engine: Engine, sql: &str) -> bool {
+    let dialect: Box<dyn Dialect> = match engine {
+        Engine::Postgres => Box::new(PostgreSqlDialect {}),
+        Engine::MySql => Box::new(MySqlDialect {}),
+        // A MongoDB read stops by dropping its cursor, whatever it is.
+        Engine::Mongo => return false,
+    };
+    if classify(engine, sql) != Verdict::READ {
+        return false;
+    }
+    match Parser::parse_sql(dialect.as_ref(), sql) {
+        Ok(statements) if matches!(statements.as_slice(), [Statement::Query(_)]) => {}
+        _ => return false,
+    }
+    let Ok(tokens) = Tokenizer::new(dialect.as_ref(), sql).tokenize() else {
+        return false;
+    };
+    let tokens: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    !tokens.iter().enumerate().any(|(at, token)| match token {
+        Token::Assignment => true,
+        Token::Word(word) if tokens.get(at + 1) == Some(&&Token::LParen) => {
+            let name = word.value.to_ascii_lowercase();
+            name.contains("advisory")
+                || matches!(
+                    name.as_str(),
+                    "get_lock" | "release_lock" | "release_all_locks" | "set_config"
+                )
+        }
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -471,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             verdict(Engine::MySql, "/*! DROP TABLE t */ SELECT 1"),
-            unreadable(Engine::MySql)
+            unreadable()
         );
         assert_eq!(
             verdict(Engine::Postgres, "GRANT SELECT ON t TO u"),
@@ -480,9 +524,83 @@ mod tests {
     }
 
     #[test]
+    fn only_plain_reads_are_stoppable() {
+        assert!(stoppable(Engine::Postgres, "SELECT * FROM t"));
+        assert!(stoppable(Engine::MySql, "SELECT a FROM t WHERE b = ':='"));
+        assert!(!stoppable(Engine::Postgres, "SELECT 1; SELECT 2"));
+        assert!(!stoppable(Engine::Postgres, "SELECT pg_advisory_lock(1)"));
+        assert!(!stoppable(Engine::MySql, "SELECT GET_LOCK('a', 1)"));
+        assert!(!stoppable(Engine::MySql, "SELECT @x := 1"));
+        assert!(!stoppable(
+            Engine::Postgres,
+            "SELECT set_config('a', 'b', false)"
+        ));
+        assert!(!stoppable(
+            Engine::Postgres,
+            "UPDATE t SET a = 1 WHERE b = 2 RETURNING *"
+        ));
+        assert!(!stoppable(Engine::Postgres, "SHOW ALL"));
+        assert!(!stoppable(Engine::Postgres, "SELEC 1"));
+    }
+
+    #[test]
+    fn what_the_server_could_read_otherwise_is_unreadable() {
+        // A backslash escapes or not by a server setting the parser cannot
+        // see; read the other way, each of these hides a DROP.
+        for (engine, sql) in [
+            (
+                Engine::Postgres,
+                r"SELECT 'x\' AS a, '; COMMIT; BEGIN READ WRITE; DROP TABLE t; -- '",
+            ),
+            (Engine::MySql, r"SELECT 'a\'; DROP TABLE t; -- '"),
+            (Engine::Postgres, r"SELECT E'\\'"),
+        ] {
+            assert_eq!(classify(engine, sql), unreadable(), "{sql}");
+        }
+        // Writes the server's read-only hold does not stop: unreadable, so
+        // never run in Read-only.
+        assert_eq!(
+            classify(Engine::MySql, "SELECT * FROM t INTO OUTFILE '/tmp/x'").mode,
+            Mode::ReadWrite
+        );
+        assert_eq!(
+            classify(
+                Engine::Postgres,
+                "DO $$BEGIN PERFORM pg_terminate_backend(1); END$$"
+            )
+            .mode,
+            Mode::ReadWrite
+        );
+    }
+
+    #[test]
+    fn server_wide_settings_need_full() {
+        for sql in ["SET GLOBAL read_only = 0", "SET @@global.general_log = 1"] {
+            assert_eq!(classify(Engine::MySql, sql).mode, Mode::Full, "{sql}");
+        }
+        // MySQL 8's PERSIST does not parse: unreadable, so not in Read-only.
+        assert_eq!(
+            classify(Engine::MySql, "SET PERSIST max_connections = 10"),
+            unreadable()
+        );
+        assert_eq!(
+            classify(Engine::MySql, "SET SESSION sql_select_limit = 5"),
+            Verdict::READ
+        );
+        assert_eq!(classify(Engine::MySql, "SET @globally = 1"), Verdict::READ);
+    }
+
+    #[test]
     fn gate_order() {
-        let typo = unreadable(Engine::Postgres);
-        assert_eq!(gate(&typo, Mode::ReadOnly, &[]), Some(Stop::RunOnce));
+        let typo = unreadable();
+        // Read-only runs only what the gate has read as a read.
+        assert_eq!(
+            gate(&typo, Mode::ReadOnly, &[]),
+            Some(Stop::Upgrade {
+                mode: Mode::ReadWrite
+            })
+        );
+        assert_eq!(gate(&typo, Mode::ReadWrite, &[]), Some(Stop::RunOnce));
         assert_eq!(
             gate(
                 &verdict(Engine::Postgres, "DROP TABLE t"),
@@ -498,13 +616,5 @@ mod tests {
             })
         );
         assert_eq!(gate(&Verdict::READ, Mode::ReadOnly, &[]), None);
-        // Mongo has no server-side hold, so Read-only may not run what it
-        // cannot read even once.
-        assert_eq!(
-            gate(&unreadable(Engine::Mongo), Mode::ReadOnly, &[]),
-            Some(Stop::Upgrade {
-                mode: Mode::ReadWrite
-            })
-        );
     }
 }

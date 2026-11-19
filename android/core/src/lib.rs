@@ -81,13 +81,6 @@ pub fn default_port(engine: Engine) -> u16 {
     }
 }
 
-/// Whether the server holds a Read-only session to reads, so the UI can say
-/// when nothing but the gate does.
-#[uniffi::export]
-pub fn holds_read_only(engine: Engine) -> bool {
-    gate::holds_read_only(engine)
-}
-
 /// What user management can do on an engine.
 #[uniffi::export]
 pub fn user_abilities(engine: Engine) -> UserAbilities {

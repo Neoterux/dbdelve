@@ -102,48 +102,57 @@ fn exercise(session: &Session, create: &str, insert: &str, select: &str, drop: &
     );
 }
 
-/// The server's own hold, behind the gate: a write the parser cannot read,
-/// run once in Read-only, is refused by the server rather than run.
-fn held_by_server(session: &Session, create: &str, unreadable_write: &str) {
+/// Read-only on two layers. The gate refuses a write it cannot read before
+/// anything is sent; and the server's hold refuses what the gate reads as
+/// a plain read but writes underneath, a function call.
+fn held_by_server(session: &Session, setup: &[&str], unreadable_write: &str, writes_inside: &str) {
     session.set_mode(Mode::ReadWrite).unwrap();
-    let drop = "DROP TABLE android_held";
-    let _ = session.run(
-        drop.into(),
-        2,
-        vec![Destructive::Drop],
-        false,
-        Some(Mode::Full),
-    );
-    done(run(session, create));
-    session.set_mode(Mode::ReadOnly).unwrap();
-    let verdict = dbdelve_core::classify(session.engine(), unreadable_write.into());
-    assert_eq!(
-        verdict.destructive,
-        vec![Destructive::Unreadable],
-        "the gate cannot read it"
-    );
-    let held = session.run(unreadable_write.into(), 2, vec![], true, None);
-    match held {
-        Err(CoreError::Query { reason: message }) => {
-            let message = message.to_ascii_lowercase();
-            assert!(
-                message.contains("read-only") || message.contains("read only"),
-                "{message}"
-            );
-        }
-        other => panic!("ran in Read-only: {other:?}"),
-    }
-    done(
-        session
+    for statement in setup {
+        let ran = session
             .run(
-                drop.into(),
+                (*statement).into(),
                 2,
                 vec![Destructive::Drop],
-                false,
+                true,
                 Some(Mode::Full),
             )
-            .unwrap(),
+            .unwrap();
+        assert!(
+            matches!(ran, RunOutcome::Done { .. }),
+            "{statement}: {ran:?}"
+        );
+    }
+    session.set_mode(Mode::ReadOnly).unwrap();
+
+    assert!(
+        matches!(
+            session
+                .run(unreadable_write.into(), 2, vec![], true, None)
+                .unwrap(),
+            RunOutcome::Stopped {
+                stop: Stop::Upgrade {
+                    mode: Mode::ReadWrite
+                },
+                ..
+            }
+        ),
+        "refused before it is sent"
     );
+
+    assert_eq!(
+        dbdelve_core::classify(session.engine(), writes_inside.into()).mode,
+        Mode::ReadOnly
+    );
+    match session.run(writes_inside.into(), 2, vec![], false, None) {
+        Err(CoreError::Query { reason }) => {
+            let reason = reason.to_ascii_lowercase();
+            assert!(
+                reason.contains("read-only") || reason.contains("read only"),
+                "{reason}"
+            );
+        }
+        other => panic!("wrote in Read-only: {other:?}"),
+    }
 }
 
 #[test]
@@ -167,8 +176,14 @@ fn live_postgres() {
 
     held_by_server(
         &session,
-        "CREATE TABLE android_held (a int)",
+        &[
+            "DROP TABLE IF EXISTS android_held",
+            "CREATE TABLE android_held (a int)",
+            "CREATE OR REPLACE FUNCTION android_writes() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO android_held VALUES (1) RETURNING 1'",
+        ],
         "INSERT INTO android_held OVERRIDING SYSTEM VALUE VALUES (1)",
+        "SELECT android_writes()",
     );
 
     let session = Arc::new(session);
@@ -203,8 +218,15 @@ fn live_mysql() {
 
     held_by_server(
         &session,
-        "CREATE TABLE android_held (a int)",
+        &[
+            "DROP TABLE IF EXISTS android_held",
+            "CREATE TABLE android_held (a int)",
+            "DROP FUNCTION IF EXISTS android_writes",
+            "CREATE FUNCTION android_writes() RETURNS INT MODIFIES SQL DATA \
+             BEGIN INSERT INTO android_held VALUES (1); RETURN 1; END",
+        ],
         "UPDATE LOW_PRIORITY IGNORE android_held SET a = 3 ORDER BY a LIMIT 1",
+        "SELECT android_writes()",
     );
 
     let session = Arc::new(session);
@@ -499,4 +521,72 @@ fn live_users_mongo() {
             role_database: String::new(),
         },
     );
+}
+
+fn timed(session: &Session, text: &str, limit: u32) -> (dbdelve_core::ResultSet, Duration) {
+    let started = Instant::now();
+    let result = done(
+        session
+            .run(text.into(), limit, vec![], false, None)
+            .unwrap(),
+    );
+    (result, started.elapsed())
+}
+
+#[test]
+#[ignore]
+fn live_postgres_stops_at_the_limit() {
+    let Some(config) = config(
+        Engine::Postgres,
+        "DBDELVE_ANDROID_POSTGRES",
+        SslMode::Disable,
+    ) else {
+        return;
+    };
+    let session = Session::connect(config, Mode::ReadOnly).unwrap();
+    // Twenty million rows: drained, this takes many seconds.
+    let (result, took) = timed(&session, "SELECT g FROM generate_series(1, 20000000) g", 10);
+    assert_eq!(result.rows.len(), 10);
+    assert!(result.capped);
+    assert!(
+        took < Duration::from_secs(4),
+        "stopped, not drained: {took:?}"
+    );
+    done(run(&session, "SELECT 1"));
+
+    // Inside a transaction the user opened, a cancel would abort all of it:
+    // the read is drained instead, and the transaction carries on.
+    done(run(&session, "BEGIN"));
+    let (result, _) = timed(&session, "SELECT g FROM generate_series(1, 300000) g", 10);
+    assert!(result.capped);
+    let after = session.run("SELECT 1".into(), 10, vec![], false, None);
+    assert!(
+        matches!(after, Ok(RunOutcome::Done { .. })),
+        "still usable: {after:?}"
+    );
+    done(run(&session, "ROLLBACK"));
+}
+
+#[test]
+#[ignore]
+fn live_mysql_stops_at_the_limit() {
+    let Some(config) = config(Engine::MySql, "DBDELVE_ANDROID_MYSQL", SslMode::Disable) else {
+        return;
+    };
+    let session = Session::connect(config, Mode::ReadOnly).unwrap();
+    // A cross join of the catalog with itself, twice: millions of rows.
+    let (result, took) = timed(
+        &session,
+        "SELECT a.ORDINAL_POSITION FROM information_schema.COLUMNS a, \
+         information_schema.COLUMNS b, information_schema.COLUMNS c",
+        10,
+    );
+    assert_eq!(result.rows.len(), 10);
+    assert!(result.capped);
+    assert!(
+        took < Duration::from_secs(8),
+        "killed, not drained: {took:?}"
+    );
+    let after = done(run(&session, "SELECT 1"));
+    assert_eq!(after.rows, vec![vec![Some("1".into())]]);
 }

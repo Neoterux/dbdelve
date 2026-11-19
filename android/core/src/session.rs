@@ -5,14 +5,15 @@
 //! a runtime of its own, from the caller's thread: nothing that leaves this
 //! module is a future.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bson::{Bson, Document};
 use futures_util::{StreamExt, TryStreamExt, pin_mut};
 use mysql::prelude::Queryable;
 use tokio::runtime::Runtime;
-use tokio_postgres::{CancelToken, SimpleQueryMessage};
+use tokio_postgres::{CancelToken, SimpleQueryMessage, SimpleQueryRow};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::gate::{self, Destructive, Mode, Stop, Verdict};
@@ -79,10 +80,7 @@ enum Driver {
 }
 
 enum Canceller {
-    Postgres {
-        token: CancelToken,
-        tls: Option<MakeRustlsConnect>,
-    },
+    Postgres(Box<PostgresStop>),
     MySql {
         opts: mysql::Opts,
         id: u32,
@@ -182,14 +180,14 @@ impl Session {
     }
 
     pub fn mode(&self) -> Mode {
-        *self.mode.lock().unwrap()
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The only place a session's mode changes. The server's hold follows it,
     /// and the mode is not changed if the server will not.
     pub fn set_mode(&self, mode: Mode) -> Result<(), CoreError> {
         self.hold(mode)?;
-        *self.mode.lock().unwrap() = mode;
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner) = mode;
         Ok(())
     }
 
@@ -232,7 +230,7 @@ impl Session {
     }
 
     pub fn prepare_user(&self, action: UserAction) -> Result<Arc<Prepared>, CoreError> {
-        let database = match &*self.driver.lock().unwrap() {
+        let database = match &*self.driver.lock().unwrap_or_else(PoisonError::into_inner) {
             Driver::Mongo { database, .. } => database.name().to_owned(),
             _ => String::new(),
         };
@@ -242,7 +240,7 @@ impl Session {
     /// The server's users and roles. DBDelve's own catalog read, like
     /// [`Session::catalog`].
     pub fn users(&self) -> Result<Vec<DbUser>, CoreError> {
-        let mut driver = self.driver.lock().unwrap();
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *driver {
             Driver::Postgres { runtime, client } => {
                 let rows = runtime
@@ -265,7 +263,7 @@ impl Session {
                     })
                     .map(|row| {
                         // `::text` on a boolean spells it out: `true`, not the bare `t`.
-                        let flag = |at: usize| row.get(at) == Some("true");
+                        let flag = |at: usize| text(row, at) == Some("true");
                         let mut attributes = Vec::new();
                         for (at, name) in [
                             (3, "create db"),
@@ -277,28 +275,30 @@ impl Session {
                                 attributes.push(name.to_owned());
                             }
                         }
-                        if let Some(limit) = row.get(7).filter(|limit| *limit != "-1") {
+                        if let Some(limit) = text(row, 7).filter(|limit| *limit != "-1") {
                             attributes.push(format!("{limit} connections"));
                         }
-                        if let Some(until) = row.get(8).filter(|until| !until.is_empty()) {
+                        if let Some(until) = text(row, 8).filter(|until| !until.is_empty()) {
                             attributes.push(format!("valid until {until}"));
                         }
                         DbUser {
                             account: Account {
-                                name: row.get(0).unwrap_or_default().to_owned(),
+                                name: text(row, 0).unwrap_or_default().to_owned(),
                                 host: String::new(),
                             },
                             can_login: flag(1),
                             superuser: flag(2),
                             attributes,
-                            roles: serde_json::from_str::<Vec<String>>(row.get(9).unwrap_or("[]"))
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|role| RoleRef {
-                                    role,
-                                    database: String::new(),
-                                })
-                                .collect(),
+                            roles: serde_json::from_str::<Vec<String>>(
+                                text(row, 9).unwrap_or("[]"),
+                            )
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|role| RoleRef {
+                                role,
+                                database: String::new(),
+                            })
+                            .collect(),
                         }
                     })
                     .collect())
@@ -357,7 +357,7 @@ impl Session {
         if account.name.contains('\\') || account.host.contains('\\') {
             return Err(query_error("Names with a backslash are not looked up."));
         }
-        let mut driver = self.driver.lock().unwrap();
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *driver {
             Driver::Postgres { runtime, client } => {
                 let rows = runtime
@@ -372,7 +372,7 @@ impl Session {
                 Ok(rows
                     .iter()
                     .filter_map(|message| match message {
-                        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                        SimpleQueryMessage::Row(row) => text(row, 0).map(str::to_owned),
                         _ => None,
                     })
                     .collect())
@@ -448,7 +448,8 @@ impl Session {
     /// Stops the statement running now, from any thread.
     pub fn cancel(&self) {
         match &self.canceller {
-            Canceller::Postgres { token, tls } => {
+            Canceller::Postgres(stop) => {
+                let PostgresStop { token, tls, .. } = &**stop;
                 let Ok(runtime) = runtime() else { return };
                 // Best effort: a cancel that cannot reach the server leaves the
                 // statement to finish, which is what not cancelling does.
@@ -470,7 +471,7 @@ impl Session {
     }
 
     pub fn catalog(&self) -> Result<Vec<CatalogEntry>, CoreError> {
-        let mut driver = self.driver.lock().unwrap();
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *driver {
             Driver::Postgres { runtime, client } => {
                 let rows = runtime
@@ -488,14 +489,14 @@ impl Session {
                     .iter()
                     .filter_map(|message| match message {
                         SimpleQueryMessage::Row(row) => Some(CatalogEntry {
-                            schema: row.get(0).unwrap_or_default().to_owned(),
-                            name: row.get(1).unwrap_or_default().to_owned(),
-                            kind: if matches!(row.get(2), Some("v" | "m")) {
+                            schema: text(row, 0).unwrap_or_default().to_owned(),
+                            name: text(row, 1).unwrap_or_default().to_owned(),
+                            kind: if matches!(text(row, 2), Some("v" | "m")) {
                                 ObjectKind::View
                             } else {
                                 ObjectKind::Table
                             },
-                            size_bytes: row.get(3).and_then(|size| size.parse().ok()),
+                            size_bytes: text(row, 3).and_then(|size| size.parse().ok()),
                         }),
                         _ => None,
                     })
@@ -600,7 +601,7 @@ impl Session {
     /// behind the gate, not the boundary: a write-less role is.
     fn hold(&self, mode: Mode) -> Result<(), CoreError> {
         let read_only = mode == Mode::ReadOnly;
-        let mut driver = self.driver.lock().unwrap();
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *driver {
             Driver::Postgres { runtime, client } => runtime
                 .block_on(client.batch_execute(if read_only {
@@ -627,19 +628,34 @@ impl Session {
 
     fn send(&self, statement: &str, limit: usize) -> Result<ResultSet, CoreError> {
         let started = Instant::now();
-        let mut driver = self.driver.lock().unwrap();
-        let mut result = match &mut *driver {
-            Driver::Postgres { runtime, client } => {
-                runtime.block_on(run_postgres(client, statement, limit))?
+        let stoppable = gate::stoppable(self.engine, statement);
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut result = match (&mut *driver, &self.canceller) {
+            (Driver::Postgres { runtime, client }, Canceller::Postgres(stop)) => {
+                runtime.block_on(run_postgres(
+                    client,
+                    statement,
+                    limit,
+                    stoppable.then(|| (**stop).clone()),
+                ))?
             }
-            Driver::MySql(conn) => run_mysql(conn, statement, limit)?,
-            Driver::Mongo { runtime, database } => {
+            (Driver::MySql(conn), Canceller::MySql { opts, id }) => {
+                run_mysql(conn, statement, limit, stoppable.then_some((opts, *id)))?
+            }
+            (Driver::Mongo { runtime, database }, _) => {
                 runtime.block_on(run_mongo(database, statement, limit))?
             }
+            _ => unreachable!("a session's driver and canceller are made together"),
         };
         result.elapsed_ms = started.elapsed().as_millis() as u64;
         Ok(result)
     }
+}
+
+/// A Postgres value as text. `SimpleQueryRow::get` panics on bytes that are
+/// not UTF-8, which a `SQL_ASCII` database can hold; those are marked instead.
+fn text(row: &SimpleQueryRow, at: usize) -> Option<&str> {
+    row.try_get(at).unwrap_or(Some("\u{FFFD} (not UTF-8)"))
 }
 
 fn empty_result() -> ResultSet {
@@ -685,20 +701,106 @@ fn connect_postgres(config: &ConnectionConfig) -> Result<(Driver, Canceller), Co
             (client, Some(tls))
         }
     };
-    let token = client.cancel_token();
+    let pid = runtime
+        .block_on(client.simple_query("SELECT pg_backend_pid()"))
+        .map_err(|error| connect_error(postgres_error(error)))?
+        .iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => text(row, 0).and_then(|pid| pid.parse().ok()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            connect_error("The server did not say which process serves this session.")
+        })?;
+    let stop = PostgresStop {
+        token: client.cancel_token(),
+        tls,
+        config: pg,
+        pid,
+    };
     Ok((
         Driver::Postgres { runtime, client },
-        Canceller::Postgres { token, tls },
+        Canceller::Postgres(Box::new(stop)),
     ))
 }
 
-// ponytail: a read past the limit is drained to its end, where the desktop
-// cancels it once it can prove the cancel undoes nothing. Bounded by the
-// statement, not the limit; a cancel (`Session::cancel`) stops it.
+/// What stopping a Postgres read at the row limit needs: a side session to
+/// ask the server what this one is doing, and the token to cancel it.
+#[derive(Clone)]
+struct PostgresStop {
+    token: CancelToken,
+    tls: Option<MakeRustlsConnect>,
+    config: tokio_postgres::Config,
+    pid: i32,
+}
+
+impl PostgresStop {
+    /// Cancels `statement` only if a side session sees this session's
+    /// process running exactly it as a transaction of its own: a cancel
+    /// inside a transaction the user opened would abort all of it. Anything
+    /// it cannot confirm leaves the read to drain, which is only slower.
+    ///
+    /// `finished` is set once the read has ended; a later run of the same
+    /// text must never be the one cancelled.
+    async fn stop_if_alone(
+        self,
+        statement: String,
+        requested: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    ) {
+        let side = match &self.tls {
+            Some(tls) => self
+                .config
+                .connect(tls.clone())
+                .await
+                .map(|(client, connection)| {
+                    tokio::spawn(connection);
+                    client
+                }),
+            None => self
+                .config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map(|(client, connection)| {
+                    tokio::spawn(connection);
+                    client
+                }),
+        };
+        let Ok(side) = side else { return };
+        let alone = side
+            .query_opt(
+                "SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active' \
+                 AND xact_start = query_start AND query = $2",
+                &[&self.pid, &statement],
+            )
+            .await;
+        if matches!(alone, Ok(Some(_))) && !finished.load(Ordering::SeqCst) {
+            requested.store(true, Ordering::SeqCst);
+            let _ = match &self.tls {
+                Some(tls) => self.token.cancel_query(tls.clone()).await,
+                None => self.token.cancel_query(tokio_postgres::NoTls).await,
+            };
+        }
+    }
+}
+
+/// Set when a read ends, however it ends.
+struct Finished(Arc<AtomicBool>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Runs one statement and keeps `limit` rows. Past the limit a stoppable
+/// read is cancelled when [`PostgresStop`] can prove that undoes nothing,
+/// and drained otherwise.
 async fn run_postgres(
     client: &tokio_postgres::Client,
     statement: &str,
     limit: usize,
+    stop: Option<PostgresStop>,
 ) -> Result<ResultSet, CoreError> {
     let stream = client
         .simple_query_raw(statement)
@@ -706,11 +808,23 @@ async fn run_postgres(
         .map_err(|error| query_error(postgres_error(error)))?;
     pin_mut!(stream);
     let mut result = empty_result();
-    while let Some(message) = stream
-        .try_next()
-        .await
-        .map_err(|error| query_error(postgres_error(error)))?
-    {
+    let mut stop = stop;
+    let requested = Arc::new(AtomicBool::new(false));
+    let finished = Finished(Arc::new(AtomicBool::new(false)));
+    loop {
+        let message = match stream.try_next().await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            // The cancel asked for at the limit: the rows kept are the result.
+            Err(error)
+                if requested.load(Ordering::SeqCst)
+                    && error.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) =>
+            {
+                result.capped = true;
+                break;
+            }
+            Err(error) => return Err(query_error(postgres_error(error))),
+        };
         match message {
             SimpleQueryMessage::RowDescription(columns) => {
                 // The simple protocol names columns and sends every value as
@@ -728,11 +842,24 @@ async fn run_postgres(
                 if result.rows.len() < limit {
                     result.rows.push(
                         (0..row.len())
-                            .map(|at| row.get(at).map(str::to_owned))
+                            .map(|at| text(&row, at).map(str::to_owned))
                             .collect(),
                     );
                 } else {
                     result.capped = true;
+                    if let Some(stop) = stop.take() {
+                        // A thread of its own: rows already buffered never
+                        // yield this runtime, so a task here would wait for
+                        // the very drain it is meant to cut short.
+                        let (statement, requested, finished) =
+                            (statement.to_owned(), requested.clone(), finished.0.clone());
+                        std::thread::spawn(move || {
+                            if let Ok(runtime) = runtime() {
+                                runtime
+                                    .block_on(stop.stop_if_alone(statement, requested, finished));
+                            }
+                        });
+                    }
                 }
             }
             SimpleQueryMessage::CommandComplete(count) => result.affected = Some(count),
@@ -761,12 +888,14 @@ fn connect_mysql(config: &ConnectionConfig) -> Result<(Driver, Canceller), CoreE
     Ok((Driver::MySql(conn), Canceller::MySql { opts, id }))
 }
 
-// ponytail: as on Postgres, a read past the limit is drained rather than
-// killed; the desktop's `KILL QUERY` at the limit is the upgrade path.
+/// Runs one statement and keeps `limit` rows. Past the limit a stoppable
+/// read is ended with `KILL QUERY` from a side session, which stops the
+/// statement and never a transaction; otherwise it is drained.
 fn run_mysql(
     conn: &mut mysql::Conn,
     statement: &str,
     limit: usize,
+    stop: Option<(&mysql::Opts, u32)>,
 ) -> Result<ResultSet, CoreError> {
     let mut rows = conn.query_iter(statement).map_err(query_error)?;
     let mut result = empty_result();
@@ -785,15 +914,31 @@ fn run_mysql(
             .collect();
         result.rows.clear();
         result.capped = false;
+        let mut killed = false;
         for row in set {
-            let row = row.map_err(query_error)?;
+            let row = match row {
+                Ok(row) => row,
+                // ER_QUERY_INTERRUPTED: the kill asked for at the limit.
+                Err(mysql::Error::MySqlError(error)) if killed && error.code == 1317 => break,
+                Err(error) => return Err(query_error(error)),
+            };
             if result.rows.len() < limit {
                 result
                     .rows
                     .push(row.unwrap().into_iter().map(mysql_text).collect());
             } else {
                 result.capped = true;
+                if let (Some((opts, id)), false) = (stop, killed) {
+                    // A side session: this one is busy reading. If it cannot
+                    // connect, the rest is drained, which is only slower.
+                    if let Ok(mut side) = mysql::Conn::new(opts.clone()) {
+                        killed = side.query_drop(format!("KILL QUERY {id}")).is_ok();
+                    }
+                }
             }
+        }
+        if killed {
+            return Ok(result);
         }
     }
     result.affected = Some(rows.affected_rows());
