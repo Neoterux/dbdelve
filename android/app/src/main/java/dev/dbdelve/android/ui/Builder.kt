@@ -152,25 +152,29 @@ fun QueryBuilder(model: AppViewModel) {
                     }
                 }
 
-                val built = state.built(engine)
-                val filled = built?.let { runCatching { fillParameters(engine, it.text, state.bindings(it)) } }
-                Text("Runs as", style = MaterialTheme.typography.labelLarge)
-                Text(
-                    filled?.fold({ it }, { it.reason() }).orEmpty(),
-                    fontFamily = Mono,
-                    fontSize = 12.sp,
-                    color = if (filled?.isFailure == true) LocalPalette.current.red else MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(8.dp))
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
-                        .padding(10.dp),
-                )
                 error?.let { Text(it, color = LocalPalette.current.red, fontSize = 12.sp) }
                 Spacer(Modifier.size(8.dp))
             }
         }
+        // What will run, pinned where it can't scroll away from the Run button.
+        val built = state.built(engine)
+        val filled = built?.let { runCatching { fillParameters(engine, it.text, state.bindings(it)) } }
         HorizontalDivider()
+        if (filled != null) {
+            Text(
+                filled.fold({ it }, { it.reason() }),
+                fontFamily = Mono,
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                color = if (filled.isFailure) LocalPalette.current.red else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 132.dp)
+                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        }
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,

@@ -30,6 +30,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
@@ -203,7 +204,12 @@ private fun ProfileRow(profile: Profile, connecting: Boolean, model: AppViewMode
                     .border(1.dp, palette.rule, RoundedCornerShape(8.dp)),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(profile.engine.badge(), fontFamily = Mono, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = palette.of(profile.engine))
+                Icon(
+                    painterResource(profile.engine.logo()),
+                    contentDescription = profile.engine.label(),
+                    tint = palette.of(profile.engine),
+                    modifier = Modifier.size(20.dp),
+                )
             }
             Column(Modifier.weight(1f)) {
                 Text(profile.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)

@@ -26,6 +26,8 @@ to its version and date.
   object, and every action sheet. The bottom bar's Results shows the row
   count, a dot while a statement runs, and ! after an error.
 - Cancel is now Stop.
+- Each connection shows its engine's logo (PostgreSQL, MySQL, MongoDB), in
+  the list and beside its name once connected.
 
 ## 0.1.0 (2026-11-19)
 

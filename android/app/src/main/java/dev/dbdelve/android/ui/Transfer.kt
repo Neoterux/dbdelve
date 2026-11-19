@@ -1,5 +1,8 @@
 package dev.dbdelve.android.ui
 
+import androidx.compose.ui.res.painterResource
+import androidx.compose.material3.Icon
+import androidx.compose.foundation.layout.size
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -254,7 +257,13 @@ private fun ChoiceCard(choice: Choice) {
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = choice.include, onCheckedChange = { choice.include = it })
-                Text("${choice.engine.badge()}  ${choice.name}", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Icon(
+                    painterResource(choice.engine.logo()),
+                    contentDescription = choice.engine.label(),
+                    tint = LocalPalette.current.of(choice.engine),
+                    modifier = Modifier.padding(end = 8.dp).size(18.dp),
+                )
+                Text(choice.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
             }
             if (!choice.include) return@Column
             Field("Name", choice.name) { choice.name = it }

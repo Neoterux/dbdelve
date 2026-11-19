@@ -19,6 +19,19 @@ when Android asks). It needs a 64-bit ARM phone on Android 15.
 What changed in each version is in [CHANGELOG.md](CHANGELOG.md), and in the
 app under **What's new**.
 
+## Screenshots
+
+Drawn by `ScreensTest` from the app's own screens, connected to a Postgres
+(see [Checks](#checks)).
+
+| Connections | SQL editor | Tab switcher | Results |
+|---|---|---|---|
+| ![Connections grouped by project, each with its engine's logo and mode](screenshots/connections.png) | ![The SQL editor with query tabs as chips, the row limit, saved queries and Run](screenshots/editor.png) | ![Every query tab as a card, with its text and whether it ran](screenshots/tab-switcher.png) | ![A query's rows in the grid, with the row count on the Results tab](screenshots/results.png) |
+
+| Schema | Query builder | Built query's rows | Built query as SQL |
+|---|---|---|---|
+| ![Tables and views with their sizes](screenshots/schema.png) | ![The builder: columns, two filters, and the statement it writes pinned above Run](screenshots/builder.png) | ![The built query's rows](screenshots/builder-results.png) | ![The built statement in a tab of its own](screenshots/built-tab.png) |
+
 ## Target
 
 64-bit ARM phones on Android 15.
@@ -165,6 +178,22 @@ They prove, on each engine, that:
   seconds. Inside a Postgres transaction you opened, the read is drained
   instead, since a cancel would abort the transaction, and it stays usable.
 
+### Screenshots
+
+`ScreensTest` draws the screens under Robolectric, through the core built for
+the host, against a live Postgres; it is skipped unless `DBDELVE_SCREENS_PG`
+is set. It writes `app/build/screens/`, from which `screenshots/` is copied
+at half size.
+
+```sh
+psql -h 127.0.0.1 -p 55432 -U dbdelve -c 'CREATE DATABASE shop'   # any database with tables
+(cd core && cargo build --release --lib)                          # the host's libdbdelve_core
+DBDELVE_SCREENS_PG=127.0.0.1:55432/shop/dbdelve \
+  ./gradlew :app:testDebugUnitTest --tests dev.dbdelve.android.ScreensTest
+```
+
+The user must log in with a blank password (`trust` authentication).
+
 ## MySQL 5.6
 
 - **5.6.5 or later.** That release added `SET SESSION TRANSACTION READ ONLY`,
@@ -221,10 +250,28 @@ one would run a different command from the one typed.
 MongoDB has no server-side read-only hold, so in Read-only the gate is the only
 thing that stops a write. Use a read-only role for anything that matters.
 
+## Query builder
+
+**Builder**, beside **SQL** at the top of the Query screen, makes a query by
+tapping: choose a table (or **Build a query** on one in Schema), tap its
+columns, add filters (=, ≠, <, ≤, >, ≥, like, is null, not null), a sort and
+a limit. The statement it writes stays on screen above **Run** as it changes.
+
+The core writes the statement (`core/src/builder.rs`), quoting every name in
+the engine's own way, and every value typed into a filter becomes a `:name`
+parameter that is filled exactly as a saved query's is (below): nothing typed
+is spliced into SQL. **Run** and **SQL** both put the filled statement in a
+tab of its own, where it can be read and edited, and it passes the gate like
+anything typed. The bookmark saves it *with* its parameters, so each run asks
+for the values again. A value is text or a number (the icon in its field
+switches); on MongoDB, where `"5"` and `5` differ, that choice matters. With
+a sort or a limit, a MongoDB query is written as an `aggregate` pipeline,
+since this app's MongoDB commands take no cursor chains.
+
 ## Saved queries and parameters
 
-Save the tab you are writing (**Save** under the editor) and it is kept for
-that connection; the star opens the list. Write `:name` wherever a value
+Save the tab you are writing (the bookmark with a plus, under the editor) and
+it is kept for that connection; the bookmarks beside it open the list. Write `:name` wherever a value
 goes:
 
 ```sql
@@ -315,9 +362,11 @@ Deliberate cuts, not oversights; those with a ceiling in the code are marked
 ## What has and hasn't been compiled
 
 The Rust core is built, linted and tested, including against MySQL 5.6.51,
-Postgres 16 and MongoDB 7. The generated Kotlin bindings were compiled on the
-JVM and called through JNA against those same servers.
+Postgres 16 and MongoDB 7. The app builds as an R8 release APK
+(`./gradlew :app:assembleRelease`), and `ScreensTest` runs its screens on the
+JVM against Postgres 16: connecting, the editor and its tabs, results,
+schema, and a query built, run and opened as SQL.
 
-**The Compose app has not been compiled.** The environment it was written in
-could not reach Google's Maven repository, so nothing Android-specific could
-resolve. Expect to fix small compile errors on the first `assembleDebug`.
+Not yet checked on a phone: touch, the keyboard and its key row, the
+biometric prompt, the foreground service, and MySQL and MongoDB through the
+UI.

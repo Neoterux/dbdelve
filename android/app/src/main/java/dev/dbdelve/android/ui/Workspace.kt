@@ -124,6 +124,7 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.InputChip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import dev.dbdelve.android.QueryInput
@@ -168,7 +169,15 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
                     },
                     title = {
                         Column {
-                            Text(profile.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    painterResource(profile.engine.logo()),
+                                    contentDescription = profile.engine.label(),
+                                    tint = palette.of(profile.engine),
+                                    modifier = Modifier.padding(end = 6.dp).size(16.dp),
+                                )
+                                Text(profile.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
+                            }
                             Text(
                                 listOf(profile.host, profile.database).filter { it.isNotBlank() }.joinToString(" / "),
                                 fontFamily = Mono,
@@ -196,11 +205,19 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
                             icon = {
                                 val rows = model.tab?.result?.rows?.size
                                 when {
-                                    pane == Pane.RESULTS && model.running -> BadgedBox(badge = { Badge() }) { Icon(pane.icon(), null) }
+                                    pane == Pane.RESULTS && model.running ->
+                                        BadgedBox(badge = { Badge(containerColor = palette.orange) }) { Icon(pane.icon(), null) }
                                     pane == Pane.RESULTS && model.tab?.error != null ->
                                         BadgedBox(badge = { Badge(containerColor = palette.red) { Text("!") } }) { Icon(pane.icon(), null) }
                                     pane == Pane.RESULTS && rows != null ->
-                                        BadgedBox(badge = { Badge { Text(if (rows > 999) "999+" else "$rows") } }) { Icon(pane.icon(), null) }
+                                        BadgedBox(
+                                            badge = {
+                                                Badge(
+                                                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                ) { Text(if (rows > 999) "999+" else "$rows") }
+                                            },
+                                        ) { Icon(pane.icon(), null) }
                                     else -> Icon(pane.icon(), null)
                                 }
                             },

@@ -1,6 +1,8 @@
 package dev.dbdelve.android.ui
 
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.isSystemInDarkTheme
+import dev.dbdelve.android.R
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -128,10 +130,12 @@ fun Engine.label(): String = when (this) {
     Engine.MONGO -> "MongoDB"
 }
 
-fun Engine.badge(): String = when (this) {
-    Engine.POSTGRES -> "PG"
-    Engine.MY_SQL -> "MY"
-    Engine.MONGO -> "MG"
+/** The engine's logo, from Simple Icons as on the desktop; tint it with [Palette.of]. */
+@DrawableRes
+fun Engine.logo(): Int = when (this) {
+    Engine.POSTGRES -> R.drawable.engine_postgres
+    Engine.MY_SQL -> R.drawable.engine_mysql
+    Engine.MONGO -> R.drawable.engine_mongodb
 }
 
 fun Palette.of(engine: Engine): Color = when (engine) {
