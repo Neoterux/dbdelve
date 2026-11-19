@@ -11,10 +11,12 @@ pub mod gate;
 pub mod mongo_cmd;
 mod session;
 pub mod split;
+pub mod users;
 
 pub use gate::{Destructive, Mode, Stop, Verdict};
 pub use session::{CatalogEntry, Column, ObjectKind, ResultSet, RunOutcome, Session};
 pub use split::Span;
+pub use users::{Account, DbUser, Prepared, RoleRef, Scope, ScopeKind, UserAbilities, UserAction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum Engine {
@@ -84,4 +86,10 @@ pub fn default_port(engine: Engine) -> u16 {
 #[uniffi::export]
 pub fn holds_read_only(engine: Engine) -> bool {
     gate::holds_read_only(engine)
+}
+
+/// What user management can do on an engine.
+#[uniffi::export]
+pub fn user_abilities(engine: Engine) -> UserAbilities {
+    users::abilities(engine)
 }

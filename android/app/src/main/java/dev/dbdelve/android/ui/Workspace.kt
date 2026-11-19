@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -164,6 +165,12 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
                         icon = { Icon(Icons.Default.Menu, contentDescription = null) },
                         label = { Text("Schema") },
                     )
+                    NavigationBarItem(
+                        selected = model.pane == Pane.USERS,
+                        onClick = { model.pane = Pane.USERS },
+                        icon = { Icon(Icons.Default.Person, contentDescription = null) },
+                        label = { Text("Users") },
+                    )
                 }
             }
         },
@@ -173,6 +180,7 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
                 Pane.QUERY -> QueryPane(model)
                 Pane.RESULTS -> ResultsPane(model)
                 Pane.SCHEMA -> SchemaPane(model)
+                Pane.USERS -> UsersPane(model)
             }
         }
     }

@@ -99,6 +99,9 @@ cargo test -- --include-ignored
 
 They prove, on each engine, that:
 
+- A user created here with a password hashed on this side can log in, its
+  grant shows, its revoke clears it, its drop asks first, and it can no longer
+  log in afterwards.
 - Read-only refuses a write before sending it.
 - The row limit keeps two of three rows and reports that it capped.
 - A drop asks for Full and then for confirmation, and a run once leaves the
@@ -133,6 +136,44 @@ that aren't identifiers. Supported methods: `find`, `aggregate`,
 MongoDB has no server-side read-only hold, so in Read-only the gate is the only
 thing that stops a write. Because of that, a command DBDelve cannot read needs
 Read-write even to run once. Use a read-only role for anything that matters.
+
+## Users and roles
+
+The **Users** tab lists the server's accounts: Postgres roles, MySQL
+`user@host` accounts, or the users of the connected MongoDB database. Tap one to
+see what it may do and to change it. From there you can create a user, change
+its password, grant or revoke privileges on all tables in a schema or database
+or on one table, grant or revoke roles (Postgres, MongoDB), turn login off or
+on (Postgres), or drop it.
+
+The same rules as everything else apply:
+
+- **You read the exact statement before it runs.** The core builds it from
+  validated parts: names quoted, privileges from a fixed list, nothing typed
+  spliced in. It is held where the UI cannot edit it, so the reviewed text is
+  the text that runs.
+- **Every change needs Full.** It goes through the same gate and the same
+  biometric "run once" as a typed statement. Dropping a user is named in the
+  review, and Run confirms it.
+- **Passwords are hashed on the phone for Postgres and MySQL.** Postgres gets a
+  SCRAM-SHA-256 verifier (Postgres 10+), MySQL its `mysql_native_password`
+  hash (5.6 and 5.7; 8.0 removed `IDENTIFIED BY PASSWORD`). The server, its
+  statement log and the review only ever see the hash. Postgres passwords must
+  be printable ASCII, so the hash matches the server's own. **MongoDB hashes
+  on the server, so its password crosses the connection: use TLS.** The review
+  masks it.
+- **Names with a backslash are refused.** Whether a backslash escapes depends
+  on server settings the app cannot see.
+- **Postgres won't drop a role that still holds privileges.** Revoking on a
+  whole schema also revokes the schema's `USAGE` that granting added. If a drop
+  is still refused, the server's message says what is left.
+- **MySQL 5.6 has no roles and no account locking**, and caps user names at 16
+  characters. The form shows the limit.
+
+The typed MongoDB commands `db.getUsers()`, `db.createUser({…})`,
+`db.updateUser(name, {pwd})`, `db.grantRolesToUser(…)`,
+`db.revokeRolesFromUser(…)` and `db.dropUser(name)` also work in the editor,
+classified the same way.
 
 ## Not here yet
 

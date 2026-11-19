@@ -1,8 +1,9 @@
 //! MongoDB commands in the shell's spelling, and what each may do.
 //!
-//! One call per statement, `db.<collection>.<method>(<args>)` or
-//! `db.getCollection('<name>').<method>(<args>)`, with arguments in JSON5 (the
-//! shell's unquoted keys and single quotes) holding Extended JSON for types.
+//! One call per statement, `db.<collection>.<method>(<args>)`,
+//! `db.getCollection('<name>').<method>(<args>)`, or one of the database's own
+//! user methods (`db.createUser(…)`), with arguments in JSON5 (the shell's
+//! unquoted keys and single quotes) holding Extended JSON for types.
 // ponytail: no cursor chains (`.sort().limit()`), no `ObjectId("…")` helper
 // calls (`{"$oid": "…"}` instead) and no JavaScript. The desktop's `mql`
 // module is the upgrade path once it can be shared.
@@ -45,23 +46,65 @@ pub enum Call {
         filter: Document,
     },
     Drop,
+    GetUsers,
+    CreateUser {
+        user: String,
+        password: String,
+        roles: Vec<Bson>,
+    },
+    SetPassword {
+        user: String,
+        password: String,
+    },
+    GrantRoles {
+        user: String,
+        roles: Vec<Bson>,
+    },
+    RevokeRoles {
+        user: String,
+        roles: Vec<Bson>,
+    },
+    DropUser {
+        user: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Command {
-    pub collection: String,
+    /// None for the database's own methods.
+    pub collection: Option<String>,
     pub call: Call,
 }
+
+/// The database's methods, called as `db.<method>(…)`: users only.
+const DATABASE_METHODS: &[&str] = &[
+    "getUsers",
+    "createUser",
+    "updateUser",
+    "grantRolesToUser",
+    "revokeRolesFromUser",
+    "dropUser",
+];
 
 pub fn parse(text: &str) -> Result<Command, String> {
     let text = text.trim().trim_end_matches(';').trim_end();
     let rest = text
         .strip_prefix("db.")
         .ok_or("A MongoDB command starts with db.<collection>.")?;
-    let (collection, rest) = collection(rest)?;
-    let rest = rest
-        .strip_prefix('.')
-        .ok_or("Expected .<method>(…) after the collection.")?;
+    let database_method = DATABASE_METHODS.iter().find(|method| {
+        rest.strip_prefix(**method)
+            .is_some_and(|after| after.starts_with('('))
+    });
+    let (collection, rest) = match database_method {
+        Some(_) => (None, rest),
+        None => {
+            let (collection, rest) = collection(rest)?;
+            let rest = rest
+                .strip_prefix('.')
+                .ok_or("Expected .<method>(…) after the collection.")?;
+            (Some(collection), rest)
+        }
+    };
     let open = rest
         .find('(')
         .ok_or("Expected (…) after the method name.")?;
@@ -132,9 +175,77 @@ pub fn parse(text: &str) -> Result<Command, String> {
             filter: required(0)?,
         },
         "drop" => Call::Drop,
+        _ if collection.is_none() => database_call(method, &args)?,
         other => return Err(format!("{other} is not a method this app runs.")),
     };
     Ok(Command { collection, call })
+}
+
+fn database_call(method: &str, args: &[Bson]) -> Result<Call, String> {
+    let name = |at: usize| match args.get(at) {
+        Some(Bson::String(name)) if !name.is_empty() => Ok(name.clone()),
+        _ => Err(format!(
+            "{method} takes the user's name as argument {}.",
+            at + 1
+        )),
+    };
+    let roles = |at: usize| match args.get(at) {
+        Some(Bson::Array(roles)) => Ok(roles.clone()),
+        _ => Err(format!(
+            "{method} takes an array of roles as argument {}.",
+            at + 1
+        )),
+    };
+    // Only the fields named here: a field this does not know could change
+    // what the command does without the gate having read it.
+    let only = |document: &Document, allowed: &[&str]| match document
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        Some(key) => Err(format!("{method} here takes no {key}.")),
+        None => Ok(()),
+    };
+    let text = |document: &Document, key: &str| match document.get(key) {
+        Some(Bson::String(value)) => Ok(value.clone()),
+        _ => Err(format!("{method} needs {key} as a string.")),
+    };
+    Ok(match method {
+        "getUsers" if args.is_empty() => Call::GetUsers,
+        "createUser" => {
+            let Some(Bson::Document(spec)) = args.first() else {
+                return Err("createUser takes one document: {user, pwd, roles}.".into());
+            };
+            only(spec, &["user", "pwd", "roles"])?;
+            Call::CreateUser {
+                user: text(spec, "user")?,
+                password: text(spec, "pwd")?,
+                roles: match spec.get("roles") {
+                    Some(Bson::Array(roles)) => roles.clone(),
+                    _ => return Err("createUser needs roles, an array (it may be empty).".into()),
+                },
+            }
+        }
+        "updateUser" => {
+            let Some(Bson::Document(update)) = args.get(1) else {
+                return Err("updateUser takes the name and {pwd}.".into());
+            };
+            only(update, &["pwd"])?;
+            Call::SetPassword {
+                user: name(0)?,
+                password: text(update, "pwd")?,
+            }
+        }
+        "grantRolesToUser" => Call::GrantRoles {
+            user: name(0)?,
+            roles: roles(1)?,
+        },
+        "revokeRolesFromUser" => Call::RevokeRoles {
+            user: name(0)?,
+            roles: roles(1)?,
+        },
+        "dropUser" => Call::DropUser { user: name(0)? },
+        _ => return Err(format!("{method} takes different arguments.")),
+    })
 }
 
 fn collection(rest: &str) -> Result<(String, &str), String> {
@@ -244,6 +355,13 @@ pub fn classify(text: &str) -> Verdict {
             }
         }
         Call::Drop => Verdict::destroys(Destructive::Drop),
+        Call::GetUsers => Verdict::READ,
+        // Who may do what is the server's own boundary: as `GRANT` is.
+        Call::CreateUser { .. }
+        | Call::SetPassword { .. }
+        | Call::GrantRoles { .. }
+        | Call::RevokeRoles { .. } => Verdict::FULL,
+        Call::DropUser { .. } => Verdict::destroys(Destructive::Drop),
     }
 }
 
@@ -256,7 +374,7 @@ mod tests {
     fn parses_the_shell_spelling() {
         let command =
             parse("db.orders.find({status: 'open', total: {$gt: 10}}, {_id: 0});").unwrap();
-        assert_eq!(command.collection, "orders");
+        assert_eq!(command.collection.as_deref(), Some("orders"));
         let Call::Find { filter, projection } = command.call else {
             panic!()
         };
@@ -265,7 +383,7 @@ mod tests {
 
         let command =
             parse("db.getCollection('a.b').aggregate([{$match: {}}, {$count: 'n'}])").unwrap();
-        assert_eq!(command.collection, "a.b");
+        assert_eq!(command.collection.as_deref(), Some("a.b"));
         assert!(matches!(command.call, Call::Aggregate { pipeline } if pipeline.len() == 2));
 
         let oid = parse(r#"db.x.find({_id: {"$oid": "65a1f0c2e4b0a1b2c3d4e5f6"}})"#).unwrap();
@@ -303,14 +421,48 @@ mod tests {
     }
 
     #[test]
+    fn user_methods() {
+        let create = parse(
+            "db.createUser({user: 'app', pwd: 's3cret', roles: [{role: 'read', db: 'dev'}]})",
+        )
+        .unwrap();
+        assert_eq!(create.collection, None);
+        assert!(
+            matches!(&create.call, Call::CreateUser { user, roles, .. } if user == "app" && roles.len() == 1)
+        );
+        assert_eq!(
+            classify("db.createUser({user: 'a', pwd: 'b', roles: []})"),
+            Verdict::FULL
+        );
+        assert_eq!(
+            classify("db.grantRolesToUser('a', ['read'])"),
+            Verdict::FULL
+        );
+        assert_eq!(classify("db.updateUser('a', {pwd: 'c'})"), Verdict::FULL);
+        assert_eq!(
+            classify("db.dropUser('a')"),
+            Verdict::destroys(Destructive::Drop)
+        );
+        assert_eq!(classify("db.getUsers()"), Verdict::READ);
+        // A field the gate has not read is refused, not passed along.
+        assert!(parse("db.updateUser('a', {pwd: 'c', roles: ['root']})").is_err());
+        // A collection that happens to share a method's name is still one.
+        assert_eq!(
+            parse("db.dropUser.find()").unwrap().collection.as_deref(),
+            Some("dropUser")
+        );
+    }
+
+    #[test]
     fn collection_refs_read_back() {
         assert_eq!(collection_ref("orders"), "db.orders");
         assert_eq!(collection_ref("a.b"), r#"db.getCollection("a.b")"#);
         assert_eq!(
             parse(&format!("{}.find()", collection_ref("a.b")))
                 .unwrap()
-                .collection,
-            "a.b"
+                .collection
+                .as_deref(),
+            Some("a.b")
         );
     }
 }

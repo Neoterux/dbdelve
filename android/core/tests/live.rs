@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use dbdelve_core::{
     ConnectionConfig, CoreError, Destructive, Engine, Mode, ObjectKind, RunOutcome, Session,
-    SslMode, Stop,
+    SslMode, Stop, UserAction,
 };
 
 fn config(engine: Engine, variable: &str, ssl_mode: SslMode) -> Option<ConnectionConfig> {
@@ -265,4 +265,238 @@ fn live_mongo() {
     ));
     let preview = session.preview("dev".into(), "odd.name".into(), 10);
     assert_eq!(preview, r#"db.getCollection("odd.name").find({})"#);
+}
+
+/// Creates a user with a password hashed on this side, logs in as it, grants
+/// it something the server then reports, and drops it: the whole loop, on
+/// the server's own terms.
+fn manage_users(
+    admin: &Session,
+    mut login: ConnectionConfig,
+    grant: UserAction,
+    expect_grant: &str,
+    revoke: UserAction,
+) {
+    use dbdelve_core::{Account, UserAction};
+    let account = Account {
+        name: "droid_live".into(),
+        host: String::new(),
+    };
+    let password = "pa ss'w\"rd";
+    let run = |action: UserAction, confirmed: Vec<Destructive>| {
+        let prepared = admin.prepare_user(action).unwrap();
+        admin
+            .run_prepared(prepared, confirmed, Some(Mode::Full))
+            .unwrap()
+    };
+    // Left over from a run that failed half-way; absent is fine.
+    if let Ok(prepared) = admin.prepare_user(UserAction::Drop {
+        account: account.clone(),
+    }) {
+        let _ = admin.run_prepared(prepared, vec![Destructive::Drop], Some(Mode::Full));
+    }
+
+    // Read-only refuses it before anything is sent.
+    let prepared = admin
+        .prepare_user(UserAction::Create {
+            account: account.clone(),
+            password: password.into(),
+            can_login: true,
+        })
+        .unwrap();
+    assert!(matches!(
+        admin.run_prepared(prepared, vec![], None).unwrap(),
+        RunOutcome::Stopped {
+            stop: Stop::Upgrade { mode: Mode::Full },
+            ..
+        }
+    ));
+    done(run(
+        UserAction::Create {
+            account: account.clone(),
+            password: password.into(),
+            can_login: true,
+        },
+        vec![],
+    ));
+
+    login.user = account.name.clone();
+    login.password = password.into();
+    // Authentication is the point; on MySQL the new user may not open the
+    // database yet. Postgres would default to one named after the user.
+    if login.engine == Engine::MySql {
+        login.database = String::new();
+    }
+    let session = Session::connect(login.clone(), Mode::ReadOnly).expect("logs in as the new user");
+    drop(session);
+
+    done(run(grant, vec![]));
+    let grants = admin.user_grants(account.clone()).unwrap();
+    assert!(
+        grants.iter().any(|line| line.contains(expect_grant)),
+        "{grants:?}"
+    );
+    assert!(
+        grants.iter().all(|line| !line.contains("PASSWORD")),
+        "no hash shown: {grants:?}"
+    );
+    assert!(
+        admin
+            .users()
+            .unwrap()
+            .iter()
+            .any(|user| user.account.name == account.name && user.can_login && !user.superuser)
+    );
+    done(run(revoke, vec![]));
+    let left = admin.user_grants(account.clone()).unwrap();
+    assert!(
+        left.iter().all(|line| !line.contains(expect_grant)),
+        "{left:?}"
+    );
+
+    // Dropping asks, and then runs.
+    let prepared = admin
+        .prepare_user(UserAction::Drop {
+            account: account.clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        admin
+            .run_prepared(prepared, vec![], Some(Mode::Full))
+            .unwrap(),
+        RunOutcome::Stopped {
+            stop: Stop::Confirm {
+                kind: Destructive::Drop
+            },
+            ..
+        }
+    ));
+    done(run(
+        UserAction::Drop {
+            account: account.clone(),
+        },
+        vec![Destructive::Drop],
+    ));
+    assert!(Session::connect(login, Mode::ReadOnly).is_err(), "gone");
+    assert_eq!(
+        admin.mode(),
+        Mode::ReadOnly,
+        "a run once leaves the mode where it was"
+    );
+}
+
+#[test]
+#[ignore]
+fn live_users_postgres() {
+    use dbdelve_core::{Account, Scope, UserAction};
+    let Some(config) = config(
+        Engine::Postgres,
+        "DBDELVE_ANDROID_POSTGRES",
+        SslMode::Disable,
+    ) else {
+        return;
+    };
+    let admin = Session::connect(config.clone(), Mode::ReadOnly).unwrap();
+    let me = admin.users().unwrap();
+    assert!(
+        me.iter()
+            .any(|user| user.account.name == "postgres" && user.superuser && user.can_login),
+        "{me:?}"
+    );
+    admin.set_mode(Mode::ReadWrite).unwrap();
+    let _ = admin.run(
+        "CREATE TABLE IF NOT EXISTS android_granted (a int)".into(),
+        1,
+        vec![],
+        false,
+        None,
+    );
+    admin.set_mode(Mode::ReadOnly).unwrap();
+    manage_users(
+        &admin,
+        config,
+        UserAction::Grant {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            privileges: vec!["SELECT".into(), "INSERT".into()],
+            scope: Scope::Schema {
+                name: "public".into(),
+            },
+        },
+        "public.android_granted: INSERT, SELECT",
+        UserAction::Revoke {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            privileges: vec!["SELECT".into(), "INSERT".into()],
+            scope: Scope::Schema {
+                name: "public".into(),
+            },
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn live_users_mysql() {
+    use dbdelve_core::{Account, Scope, UserAction};
+    let Some(config) = config(Engine::MySql, "DBDELVE_ANDROID_MYSQL", SslMode::Disable) else {
+        return;
+    };
+    let admin = Session::connect(config.clone(), Mode::ReadOnly).unwrap();
+    manage_users(
+        &admin,
+        config,
+        UserAction::Grant {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            privileges: vec!["SELECT".into(), "SHOW VIEW".into()],
+            scope: Scope::Schema { name: "dev".into() },
+        },
+        "GRANT SELECT, SHOW VIEW ON `dev`.* TO 'droid_live'@'%'",
+        UserAction::Revoke {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            privileges: vec!["SELECT".into(), "SHOW VIEW".into()],
+            scope: Scope::Schema { name: "dev".into() },
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn live_users_mongo() {
+    use dbdelve_core::{Account, UserAction};
+    let Some(config) = config(Engine::Mongo, "DBDELVE_ANDROID_MONGO", SslMode::Disable) else {
+        return;
+    };
+    let admin = Session::connect(config.clone(), Mode::ReadOnly).unwrap();
+    manage_users(
+        &admin,
+        config,
+        UserAction::GrantRole {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            role: "read".into(),
+            role_database: String::new(),
+        },
+        "dev: ",
+        UserAction::RevokeRole {
+            account: Account {
+                name: "droid_live".into(),
+                host: String::new(),
+            },
+            role: "read".into(),
+            role_database: String::new(),
+        },
+    );
 }

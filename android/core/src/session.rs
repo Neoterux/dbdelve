@@ -17,6 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::gate::{self, Destructive, Mode, Stop, Verdict};
 use crate::mongo_cmd::{self, Call};
+use crate::users::{self, Account, DbUser, Prepared, RoleRef, UserAction};
 use crate::{ConnectionConfig, CoreError, Engine, SslMode};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -206,23 +207,242 @@ impl Session {
         run_once: bool,
         once_in: Option<Mode>,
     ) -> Result<RunOutcome, CoreError> {
-        let mode = self.mode();
-        let allowed = once_in.map_or(mode, |once| once.max(mode));
         let verdict = gate::classify(self.engine, &statement);
-        match gate::gate(&verdict, allowed, &confirmed) {
-            Some(Stop::RunOnce) if run_once => {}
-            Some(stop) => return Ok(RunOutcome::Stopped { stop, verdict }),
-            None => {}
+        self.gated(
+            &statement, verdict, row_limit, &confirmed, run_once, once_in,
+        )
+    }
+
+    /// A user-management statement built by [`Session::prepare_user`],
+    /// through the same gate as any other, on the verdict it was built with.
+    pub fn run_prepared(
+        &self,
+        prepared: Arc<Prepared>,
+        confirmed: Vec<Destructive>,
+        once_in: Option<Mode>,
+    ) -> Result<RunOutcome, CoreError> {
+        self.gated(
+            &prepared.text,
+            prepared.verdict.clone(),
+            1_000,
+            &confirmed,
+            false,
+            once_in,
+        )
+    }
+
+    pub fn prepare_user(&self, action: UserAction) -> Result<Arc<Prepared>, CoreError> {
+        let database = match &*self.driver.lock().unwrap() {
+            Driver::Mongo { database, .. } => database.name().to_owned(),
+            _ => String::new(),
+        };
+        users::prepare(self.engine, &database, &action).map(Arc::new)
+    }
+
+    /// The server's users and roles. DBDelve's own catalog read, like
+    /// [`Session::catalog`].
+    pub fn users(&self) -> Result<Vec<DbUser>, CoreError> {
+        let mut driver = self.driver.lock().unwrap();
+        match &mut *driver {
+            Driver::Postgres { runtime, client } => {
+                let rows = runtime
+                    .block_on(client.simple_query(
+                        "SELECT r.rolname, r.rolcanlogin::text, r.rolsuper::text, \
+                         r.rolcreatedb::text, r.rolcreaterole::text, r.rolreplication::text, \
+                         r.rolbypassrls::text, r.rolconnlimit::text, \
+                         COALESCE(r.rolvaliduntil::text, ''), \
+                         COALESCE((SELECT array_to_json(array_agg(g.rolname ORDER BY g.rolname)) \
+                         FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid \
+                         WHERE m.member = r.oid)::text, '[]') \
+                         FROM pg_roles r WHERE r.rolname !~ '^pg_' ORDER BY 1",
+                    ))
+                    .map_err(|error| query_error(postgres_error(error)))?;
+                Ok(rows
+                    .iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::Row(row) => Some(row),
+                        _ => None,
+                    })
+                    .map(|row| {
+                        // `::text` on a boolean spells it out: `true`, not the bare `t`.
+                        let flag = |at: usize| row.get(at) == Some("true");
+                        let mut attributes = Vec::new();
+                        for (at, name) in [
+                            (3, "create db"),
+                            (4, "create role"),
+                            (5, "replication"),
+                            (6, "bypass RLS"),
+                        ] {
+                            if flag(at) {
+                                attributes.push(name.to_owned());
+                            }
+                        }
+                        if let Some(limit) = row.get(7).filter(|limit| *limit != "-1") {
+                            attributes.push(format!("{limit} connections"));
+                        }
+                        if let Some(until) = row.get(8).filter(|until| !until.is_empty()) {
+                            attributes.push(format!("valid until {until}"));
+                        }
+                        DbUser {
+                            account: Account {
+                                name: row.get(0).unwrap_or_default().to_owned(),
+                                host: String::new(),
+                            },
+                            can_login: flag(1),
+                            superuser: flag(2),
+                            attributes,
+                            roles: serde_json::from_str::<Vec<String>>(row.get(9).unwrap_or("[]"))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|role| RoleRef {
+                                    role,
+                                    database: String::new(),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect())
+            }
+            Driver::MySql(conn) => {
+                // `password_expired` arrived in 5.6.6.
+                let rows: Vec<(String, String, String, String)> = conn
+                    .query(
+                        "SELECT User, Host, Super_priv, password_expired FROM mysql.user \
+                         ORDER BY User, Host",
+                    )
+                    .or_else(|_| {
+                        conn.query("SELECT User, Host, Super_priv, 'N' FROM mysql.user ORDER BY User, Host")
+                    })
+                    .map_err(query_error)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(name, host, superuser, expired)| DbUser {
+                        account: Account { name, host },
+                        can_login: true,
+                        superuser: superuser == "Y",
+                        attributes: if expired == "Y" {
+                            vec!["password expired".to_owned()]
+                        } else {
+                            Vec::new()
+                        },
+                        roles: Vec::new(),
+                    })
+                    .collect())
+            }
+            Driver::Mongo { runtime, database } => {
+                let reply = runtime
+                    .block_on(async { database.run_command(bson::doc! { "usersInfo": 1 }).await })
+                    .map_err(query_error)?;
+                let users = reply.get_array("users").map_err(query_error)?;
+                Ok(users
+                    .iter()
+                    .filter_map(Bson::as_document)
+                    .map(|user| DbUser {
+                        account: Account {
+                            name: user.get_str("user").unwrap_or_default().to_owned(),
+                            host: String::new(),
+                        },
+                        can_login: true,
+                        superuser: false,
+                        attributes: Vec::new(),
+                        roles: mongo_roles(user.get_array("roles").ok()),
+                    })
+                    .collect())
+            }
         }
-        let lifted = allowed != mode;
-        if lifted {
-            self.hold(allowed)?;
+    }
+
+    /// What one account may do, a line per object.
+    pub fn user_grants(&self, account: Account) -> Result<Vec<String>, CoreError> {
+        if account.name.contains('\\') || account.host.contains('\\') {
+            return Err(query_error("Names with a backslash are not looked up."));
         }
-        let result = self.send(&statement, row_limit as usize);
-        if lifted {
-            self.hold(mode)?;
+        let mut driver = self.driver.lock().unwrap();
+        match &mut *driver {
+            Driver::Postgres { runtime, client } => {
+                let rows = runtime
+                    .block_on(client.simple_query(&format!(
+                        "SELECT table_schema || '.' || table_name || ': ' || \
+                         string_agg(privilege_type, ', ' ORDER BY privilege_type) \
+                         FROM information_schema.table_privileges WHERE grantee = '{}' \
+                         GROUP BY table_schema, table_name ORDER BY 1",
+                        account.name.replace('\'', "''")
+                    )))
+                    .map_err(|error| query_error(postgres_error(error)))?;
+                Ok(rows
+                    .iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect())
+            }
+            Driver::MySql(conn) => {
+                let host = if account.host.is_empty() {
+                    "%"
+                } else {
+                    &account.host
+                };
+                let grants: Vec<String> = conn
+                    .query(format!(
+                        "SHOW GRANTS FOR '{}'@'{}'",
+                        account.name.replace('\'', "''"),
+                        host.replace('\'', "''")
+                    ))
+                    .map_err(query_error)?;
+                Ok(grants
+                    .into_iter()
+                    .map(|grant| without_hash(&grant))
+                    .collect())
+            }
+            Driver::Mongo { runtime, database } => {
+                let reply = runtime
+                    .block_on(async {
+                        database
+                            .run_command(bson::doc! {
+                                "usersInfo": { "user": account.name.clone(), "db": database.name() },
+                                "showPrivileges": true,
+                            })
+                            .await
+                    })
+                    .map_err(query_error)?;
+                let users = reply.get_array("users").map_err(query_error)?;
+                let Some(user) = users.first().and_then(Bson::as_document) else {
+                    return Ok(Vec::new());
+                };
+                Ok(user
+                    .get_array("inheritedPrivileges")
+                    .map(|privileges| {
+                        privileges
+                            .iter()
+                            .filter_map(Bson::as_document)
+                            .map(|privilege| {
+                                let resource = privilege.get_document("resource").ok();
+                                let on = resource.map_or("cluster".to_owned(), |resource| {
+                                    match (resource.get_str("db"), resource.get_str("collection")) {
+                                        (Ok(""), _) => "every database".to_owned(),
+                                        (Ok(db), Ok("")) => db.to_owned(),
+                                        (Ok(db), Ok(collection)) => format!("{db}.{collection}"),
+                                        _ => "cluster".to_owned(),
+                                    }
+                                });
+                                let actions = privilege
+                                    .get_array("actions")
+                                    .map(|actions| {
+                                        actions
+                                            .iter()
+                                            .filter_map(Bson::as_str)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                format!("{on}: {actions}")
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            }
         }
-        result.map(|result| RunOutcome::Done { result })
     }
 
     /// Stops the statement running now, from any thread.
@@ -349,6 +569,33 @@ fn quote(name: &str, mark: char) -> String {
 }
 
 impl Session {
+    fn gated(
+        &self,
+        statement: &str,
+        verdict: Verdict,
+        row_limit: u32,
+        confirmed: &[Destructive],
+        run_once: bool,
+        once_in: Option<Mode>,
+    ) -> Result<RunOutcome, CoreError> {
+        let mode = self.mode();
+        let allowed = once_in.map_or(mode, |once| once.max(mode));
+        match gate::gate(&verdict, allowed, confirmed) {
+            Some(Stop::RunOnce) if run_once => {}
+            Some(stop) => return Ok(RunOutcome::Stopped { stop, verdict }),
+            None => {}
+        }
+        let lifted = allowed != mode;
+        if lifted {
+            self.hold(allowed)?;
+        }
+        let result = self.send(statement, row_limit as usize);
+        if lifted {
+            self.hold(mode)?;
+        }
+        result.map(|result| RunOutcome::Done { result })
+    }
+
     /// Puts the server's own read-only hold where `mode` says. A backstop
     /// behind the gate, not the boundary: a write-less role is.
     fn hold(&self, mode: Mode) -> Result<(), CoreError> {
@@ -608,7 +855,10 @@ async fn run_mongo(
     limit: usize,
 ) -> Result<ResultSet, CoreError> {
     let command = mongo_cmd::parse(statement).map_err(query_error)?;
-    let collection = database.collection::<Document>(&command.collection);
+    let Some(collection) = command.collection else {
+        return run_mongo_users(database, command.call, limit).await;
+    };
+    let collection = database.collection::<Document>(&collection);
     let one = |name: &str, value: u64| ResultSet {
         columns: vec![Column {
             name: name.to_owned(),
@@ -686,7 +936,52 @@ async fn run_mongo(
             collection.drop().await.map_err(query_error)?;
             Ok(empty_result())
         }
+        _ => Err(query_error(
+            "That method belongs to the database: db.<method>(…).",
+        )),
     }
+}
+
+/// The database's own user methods, as the commands the shell sends.
+async fn run_mongo_users(
+    database: &mongodb::Database,
+    call: Call,
+    limit: usize,
+) -> Result<ResultSet, CoreError> {
+    let command = match call {
+        Call::GetUsers => {
+            let reply = database
+                .run_command(bson::doc! { "usersInfo": 1 })
+                .await
+                .map_err(query_error)?;
+            let users = reply
+                .get_array("users")
+                .map_err(query_error)?
+                .iter()
+                .filter_map(|user| user.as_document().cloned())
+                .collect::<Vec<_>>();
+            let capped = users.len() > limit;
+            return Ok(rows_of(users.into_iter().take(limit).collect(), capped));
+        }
+        Call::CreateUser {
+            user,
+            password,
+            roles,
+        } => bson::doc! { "createUser": user, "pwd": password, "roles": roles },
+        Call::SetPassword { user, password } => bson::doc! { "updateUser": user, "pwd": password },
+        Call::GrantRoles { user, roles } => bson::doc! { "grantRolesToUser": user, "roles": roles },
+        Call::RevokeRoles { user, roles } => {
+            bson::doc! { "revokeRolesFromUser": user, "roles": roles }
+        }
+        Call::DropUser { user } => bson::doc! { "dropUser": user },
+        _ => {
+            return Err(query_error(
+                "That method belongs to a collection: db.<collection>.<method>(…).",
+            ));
+        }
+    };
+    database.run_command(command).await.map_err(query_error)?;
+    Ok(empty_result())
 }
 
 /// Documents as rows: a column per top-level field in the order fields first
@@ -707,6 +1002,10 @@ async fn documents(
         read.push(document);
     }
     drop(cursor);
+    Ok(rows_of(read, capped))
+}
+
+fn rows_of(read: Vec<Document>, capped: bool) -> ResultSet {
     let mut columns: Vec<Column> = Vec::new();
     for document in &read {
         for (key, value) in document {
@@ -739,15 +1038,43 @@ async fn documents(
                 .collect()
         })
         .collect();
-    Ok(ResultSet {
+    ResultSet {
         columns,
         rows,
         capped,
         affected: None,
         elapsed_ms: 0,
-    })
+    }
 }
 
 fn bson_type(value: &Bson) -> String {
     format!("{:?}", value.element_type()).to_ascii_lowercase()
+}
+
+fn mongo_roles(roles: Option<&Vec<Bson>>) -> Vec<RoleRef> {
+    roles
+        .into_iter()
+        .flatten()
+        .filter_map(Bson::as_document)
+        .map(|role| RoleRef {
+            role: role.get_str("role").unwrap_or_default().to_owned(),
+            database: role.get_str("db").unwrap_or_default().to_owned(),
+        })
+        .collect()
+}
+
+/// A `SHOW GRANTS` line without its password hash: what an account may do is
+/// the point, and the hash is not.
+fn without_hash(grant: &str) -> String {
+    const MARK: &str = " IDENTIFIED BY PASSWORD '";
+    match grant.find(MARK) {
+        Some(start) => {
+            let after = start + MARK.len();
+            let end = grant[after..]
+                .find('\'')
+                .map_or(grant.len(), |end| after + end + 1);
+            format!("{}{}", &grant[..start], &grant[end..])
+        }
+        None => grant.to_owned(),
+    }
 }

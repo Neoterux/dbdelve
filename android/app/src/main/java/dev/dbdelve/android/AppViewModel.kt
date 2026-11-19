@@ -14,14 +14,18 @@ import dev.dbdelve.android.data.Secrets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.dbdelve_core.Account
 import uniffi.dbdelve_core.CatalogEntry
 import uniffi.dbdelve_core.CoreException
 import uniffi.dbdelve_core.Destructive
+import uniffi.dbdelve_core.DbUser
 import uniffi.dbdelve_core.Mode
+import uniffi.dbdelve_core.Prepared
 import uniffi.dbdelve_core.ResultSet
 import uniffi.dbdelve_core.RunOutcome
 import uniffi.dbdelve_core.Session
 import uniffi.dbdelve_core.Stop
+import uniffi.dbdelve_core.UserAction
 import uniffi.dbdelve_core.Verdict
 import uniffi.dbdelve_core.statementAt
 
@@ -34,15 +38,21 @@ class QueryTab(val id: Long, title: String, text: String) {
     var ran by mutableStateOf<String?>(null)
 }
 
-/** A statement the gate stopped, held while the user answers. Nothing was sent. */
+/**
+ * A statement the gate stopped, held while the user answers. Nothing was
+ * sent. [retry] sends it again with the answer, through the same gate.
+ */
 data class PendingGate(
-    val tab: QueryTab,
     val statement: String,
     val stop: Stop,
     val verdict: Verdict,
     val confirmed: List<Destructive>,
     val onceIn: Mode?,
+    val retry: (confirmed: List<Destructive>, runOnce: Boolean, onceIn: Mode?) -> Unit,
 )
+
+/** A user-management statement built and waiting for the user to read it. */
+class Review(val title: String, val prepared: Prepared)
 
 sealed interface Screen {
     data object Connections : Screen
@@ -50,7 +60,7 @@ sealed interface Screen {
     data object Workspace : Screen
 }
 
-enum class Pane { QUERY, RESULTS, SCHEMA }
+enum class Pane { QUERY, RESULTS, SCHEMA, USERS }
 
 fun Throwable.reason(): String = when (this) {
     is CoreException.Connect -> reason
@@ -142,6 +152,10 @@ class AppViewModel(
         profile = null
         catalog = emptyList()
         gate = null
+        users = emptyList()
+        grants = emptyMap()
+        review = null
+        userMessage = null
         screen = Screen.Connections
         viewModelScope.launch(Dispatchers.IO) { closing?.close() }
     }
@@ -175,35 +189,55 @@ class AppViewModel(
         runOnce: Boolean,
         onceIn: Mode?,
     ) {
+        val limit = rowLimit.toUInt()
+        send(
+            shown = statement,
+            confirmed = confirmed,
+            onceIn = onceIn,
+            retry = { again, once, mode -> execute(tab, statement, again, once, mode) },
+            call = { it.run(statement, limit, confirmed, runOnce, onceIn) },
+            done = { result ->
+                tab.result = result
+                tab.error = null
+                tab.ran = statement
+                pane = Pane.RESULTS
+            },
+            failed = { reason ->
+                tab.error = reason
+                tab.ran = statement
+                pane = Pane.RESULTS
+            },
+        )
+    }
+
+    /** Sends one statement through the gate; a stop becomes [gate]. */
+    private fun send(
+        shown: String,
+        confirmed: List<Destructive>,
+        onceIn: Mode?,
+        retry: (List<Destructive>, Boolean, Mode?) -> Unit,
+        call: (Session) -> RunOutcome,
+        done: (ResultSet) -> Unit,
+        failed: (String) -> Unit,
+    ) {
         val session = session ?: return
         if (running) return
         running = true
-        val limit = rowLimit
         keepAlive(profile?.name)
         // ponytail: the service keeps the process alive, but the session lives
         // in the view model, so a statement still ends if Android destroys the
         // activity outright. A service that owns the session is the upgrade path.
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                runCatching { session.run(statement, limit.toUInt(), confirmed, runOnce, onceIn) }
-            }
+            val outcome = withContext(Dispatchers.IO) { runCatching { call(session) } }
             running = false
             keepAlive(null)
             outcome.onSuccess { outcome ->
                 when (outcome) {
-                    is RunOutcome.Done -> {
-                        tab.result = outcome.result
-                        tab.error = null
-                        tab.ran = statement
-                        pane = Pane.RESULTS
-                    }
-                    is RunOutcome.Stopped -> gate = PendingGate(tab, statement, outcome.stop, outcome.verdict, confirmed, onceIn)
+                    is RunOutcome.Done -> done(outcome.result)
+                    is RunOutcome.Stopped ->
+                        gate = PendingGate(shown, outcome.stop, outcome.verdict, confirmed, onceIn, retry)
                 }
-            }.onFailure {
-                tab.error = it.reason()
-                tab.ran = statement
-                pane = Pane.RESULTS
-            }
+            }.onFailure { failed(it.reason()) }
         }
     }
 
@@ -215,26 +249,98 @@ class AppViewModel(
     fun runOnceIn(mode: Mode) {
         val pending = gate ?: return
         gate = null
-        execute(pending.tab, pending.statement, pending.confirmed, runOnce = false, onceIn = mode)
+        pending.retry(pending.confirmed, false, mode)
     }
 
     fun confirm(kind: Destructive) {
         val pending = gate ?: return
         gate = null
-        execute(pending.tab, pending.statement, pending.confirmed + kind, runOnce = false, onceIn = pending.onceIn)
+        pending.retry(pending.confirmed + kind, false, pending.onceIn)
     }
 
     fun runUnreadableOnce() {
         val pending = gate ?: return
         gate = null
-        execute(pending.tab, pending.statement, pending.confirmed, runOnce = true, onceIn = pending.onceIn)
+        pending.retry(pending.confirmed, true, pending.onceIn)
     }
 
     /** Switches the connection, then runs what was stopped. */
     fun switchAndRun(mode: Mode) {
         val pending = gate ?: return
         gate = null
-        setMode(mode) { execute(pending.tab, pending.statement, pending.confirmed, runOnce = false, onceIn = null) }
+        setMode(mode) { pending.retry(pending.confirmed, false, null) }
+    }
+
+    var users by mutableStateOf<List<DbUser>>(emptyList())
+        private set
+    var usersError by mutableStateOf<String?>(null)
+        private set
+    var grants by mutableStateOf<Map<Account, List<String>>>(emptyMap())
+        private set
+    var review by mutableStateOf<Review?>(null)
+        private set
+    /** What the last user-management statement did, or why it failed. */
+    var userMessage by mutableStateOf<String?>(null)
+
+    fun refreshUsers() {
+        val session = session ?: return
+        viewModelScope.launch {
+            val listed = withContext(Dispatchers.IO) { runCatching { session.users() } }
+            listed.onSuccess {
+                users = it
+                usersError = null
+            }.onFailure { usersError = it.reason() }
+        }
+    }
+
+    fun loadGrants(account: Account) {
+        val session = session ?: return
+        viewModelScope.launch {
+            val read = withContext(Dispatchers.IO) { runCatching { session.userGrants(account) } }
+            grants = grants + (account to read.getOrElse { listOf(it.reason()) })
+        }
+    }
+
+    /** Builds the statement for [action] and holds it for the user to read. */
+    fun prepare(title: String, action: UserAction) {
+        val session = session ?: return
+        viewModelScope.launch {
+            val built = withContext(Dispatchers.IO) { runCatching { session.prepareUser(action) } }
+            built.onSuccess { review = Review(title, it) }
+                .onFailure { userMessage = it.reason() }
+        }
+    }
+
+    fun dismissReview() {
+        review?.prepared?.close()
+        review = null
+    }
+
+    /**
+     * Runs the reviewed statement. The review named any destructive kind, so
+     * reading it is the confirmation; a mode it needs still goes through the
+     * gate's own dialog.
+     */
+    fun runReviewed() {
+        val reviewed = review ?: return
+        review = null
+        runPrepared(reviewed, reviewed.prepared.verdict().destructive, null)
+    }
+
+    private fun runPrepared(reviewed: Review, confirmed: List<Destructive>, onceIn: Mode?) {
+        send(
+            shown = reviewed.prepared.shown(),
+            confirmed = confirmed,
+            onceIn = onceIn,
+            retry = { again, _, mode -> runPrepared(reviewed, again, mode) },
+            call = { it.runPrepared(reviewed.prepared, confirmed, onceIn) },
+            done = {
+                userMessage = "${reviewed.title}: done."
+                refreshUsers()
+                grants.keys.forEach(::loadGrants)
+            },
+            failed = { userMessage = "${reviewed.title}: $it" },
+        )
     }
 
     /** The only place a connection's mode changes, and it is saved with it. */
