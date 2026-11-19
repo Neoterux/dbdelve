@@ -124,6 +124,8 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.InputChip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import dev.dbdelve.android.QueryInput
 import dev.dbdelve.android.AppViewModel
 import dev.dbdelve.android.Pane
@@ -299,7 +301,7 @@ private fun QueryPane(model: AppViewModel) {
 @Composable
 private fun TabCount(model: AppViewModel) {
     var open by remember { mutableStateOf(false) }
-    IconButton(onClick = { open = true }) {
+    IconButton(onClick = { open = true }, modifier = Modifier.semantics { contentDescription = "${model.tabs.size} open tabs" }) {
         Box(
             Modifier.size(24.dp).border(2.dp, MaterialTheme.colorScheme.onSurface, RoundedCornerShape(6.dp)),
             contentAlignment = Alignment.Center,
