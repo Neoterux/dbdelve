@@ -38,9 +38,13 @@ android {
 
     buildTypes {
         release {
-            // Off: JNA reaches the Rust core by reflection, and the bindings
-            // are generated each build. A keep-rules file is the upgrade path.
-            isMinifyEnabled = false
+            // R8 shrinks, optimises and obfuscates; proguard-rules.pro keeps
+            // what it cannot see being used (JNA's reflection into the core)
+            // and strips logging, so a release carries no debug code.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            isDebuggable = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
@@ -56,6 +60,7 @@ android {
     }
     sourceSets["main"].java.srcDir(layout.buildDirectory.dir("generated/uniffi"))
     sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/changelog"))
 }
 
 val coreDir = rootProject.file("core")
@@ -106,7 +111,13 @@ val uniffiBindings by tasks.registering(Exec::class) {
     }
 }
 
-tasks.named("preBuild") { dependsOn(uniffiBindings) }
+// The changelog the app shows under "What's new": the repository's own.
+val changelog by tasks.registering(Copy::class) {
+    from(rootProject.file("CHANGELOG.md"))
+    into(layout.buildDirectory.dir("generated/changelog"))
+}
+
+tasks.named("preBuild") { dependsOn(uniffiBindings, changelog) }
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
@@ -120,5 +131,4 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.5")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
-    debugImplementation("androidx.compose.ui:ui-tooling")
 }

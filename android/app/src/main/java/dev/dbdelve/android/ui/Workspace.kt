@@ -1,6 +1,18 @@
 package dev.dbdelve.android.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
@@ -41,7 +53,6 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -114,6 +125,13 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
     BackHandler {
         if (model.pane != Pane.QUERY) model.pane = Pane.QUERY else model.disconnect()
     }
+    // The four screens are pages a thumb swipes between, and the bottom bar
+    // follows: tapping it and swiping are one navigation, not two.
+    val pager = rememberPagerState(initialPage = model.pane.ordinal) { Pane.entries.size }
+    LaunchedEffect(model.pane) {
+        if (pager.targetPage != model.pane.ordinal) pager.animateScrollToPage(model.pane.ordinal)
+    }
+    LaunchedEffect(pager.settledPage) { model.pane = Pane.entries[pager.settledPage] }
     Scaffold(
         topBar = {
             Column {
@@ -174,8 +192,13 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
             }
         },
     ) { padding ->
-        Box(Modifier.padding(padding).fillMaxSize()) {
-            when (model.pane) {
+        HorizontalPager(
+            state = pager,
+            // While typing, a sideways drag is the user moving through text.
+            userScrollEnabled = !WindowInsets.isImeVisible,
+            modifier = Modifier.padding(padding).fillMaxSize(),
+        ) { page ->
+            when (Pane.entries[page]) {
                 Pane.QUERY -> QueryPane(model)
                 Pane.RESULTS -> ResultsPane(model)
                 Pane.SCHEMA -> SchemaPane(model)
@@ -290,21 +313,44 @@ private fun QueryPane(model: AppViewModel) {
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
         )
 
+        val haptics = LocalHapticFeedback.current
+        var savedOpen by remember { mutableStateOf(false) }
+        var saving by remember { mutableStateOf(false) }
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             RowLimit(model)
+            IconButton(onClick = { savedOpen = true }) { Icon(Icons.Default.Star, contentDescription = "Saved queries") }
+            TextButton(onClick = { saving = true }, enabled = tab.text.text.isNotBlank()) { Text("Save") }
             Spacer(Modifier.weight(1f))
             if (model.running) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 FilledTonalButton(onClick = { model.cancel() }) { Text("Cancel") }
             } else {
-                Button(onClick = { model.runAtCursor() }, enabled = next != null) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Text("Run", modifier = Modifier.padding(start = 4.dp))
+                // Wide and at the thumb's corner: the one control used most.
+                Button(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        model.runAtCursor()
+                    },
+                    enabled = next != null,
+                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Text("Run", modifier = Modifier.padding(start = 6.dp))
                 }
+            }
+        }
+        if (savedOpen) SavedQueriesSheet(model) { savedOpen = false }
+        if (saving) {
+            SaveQueryDialog(
+                initial = tab.title.takeUnless { it.startsWith("Query ") }.orEmpty(),
+                onDismiss = { saving = false },
+            ) { name ->
+                model.saveQuery(name, tab.text.text)
+                saving = false
             }
         }
         AccessoryKeys(tab) { model.edit(tab, it) }
@@ -421,16 +467,17 @@ private fun ResultsPane(model: AppViewModel) {
             Text(error, fontFamily = Mono, fontSize = 13.sp, modifier = Modifier.padding(vertical = 10.dp))
             tab?.ran?.let { Statement(it) }
         }
-        result != null -> Rows(result)
+        result != null -> Rows(result, tab?.title.orEmpty())
     }
 }
 
 @Composable
-private fun Rows(result: ResultSet) {
+private fun Rows(result: ResultSet, title: String) {
     val palette = LocalPalette.current
     val clipboard = LocalClipboardManager.current
     var records by remember { mutableStateOf(false) }
-    var opened by remember { mutableStateOf<Pair<String, String?>?>(null) }
+    val context = LocalContext.current
+    var opened by remember(result) { mutableStateOf<Int?>(null) }
     var copyNote by remember(result) { mutableStateOf<String?>(null) }
     // The clipboard crosses a binder transaction capped near 1 MB; past it
     // Android throws on the main thread, which is a crash, not an error.
@@ -448,14 +495,17 @@ private fun Rows(result: ResultSet) {
                 SegmentedButton(selected = records, onClick = { records = true }, shape = SegmentedButtonDefaults.itemShape(1, 2)) { Text("Records") }
             }
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = { copy(csv(result)) }) { Text("Copy CSV") }
+            IconButton(onClick = { runCatching { shareCsv(context, title, csv(result)) } }) {
+                Icon(Icons.Default.Share, contentDescription = "Share as CSV")
+            }
+            TextButton(onClick = { copy(csv(result)) }) { Text("Copy") }
         }
         copyNote?.let { Text(it, color = palette.red, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp)) }
         Box(Modifier.weight(1f)) {
             when {
                 result.columns.isEmpty() -> Centered(result.affected?.let { "$it rows affected" } ?: "Done")
-                records -> Records(result) { column, value -> opened = column to value }
-                else -> Grid(result) { column, value -> opened = column to value }
+                records -> Records(result) { opened = it }
+                else -> Grid(result) { opened = it }
             }
         }
         Row(
@@ -472,24 +522,7 @@ private fun Rows(result: ResultSet) {
             Text("${result.elapsedMs} ms", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
-    opened?.let { (column, value) ->
-        AlertDialog(
-            onDismissRequest = { opened = null },
-            title = { Text(column, fontFamily = Mono) },
-            text = {
-                Text(
-                    value ?: "NULL",
-                    fontFamily = Mono,
-                    fontStyle = if (value == null) FontStyle.Italic else FontStyle.Normal,
-                    modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { value?.let(copy); opened = null }) { Text("Copy") }
-            },
-            dismissButton = { TextButton(onClick = { opened = null }) { Text("Close") } },
-        )
-    }
+    opened?.let { index -> RowSheet(result, index, copy) { opened = null } }
 }
 
 private const val CHAR_DP = 8.4f
@@ -498,7 +531,7 @@ private const val CHAR_DP = 8.4f
 private const val CLIPBOARD_LIMIT = 200_000
 
 @Composable
-private fun Grid(result: ResultSet, open: (String, String?) -> Unit) {
+private fun Grid(result: ResultSet, open: (Int) -> Unit) {
     val palette = LocalPalette.current
     // Wide enough for what most of the column holds, not for its longest value.
     val widths = remember(result) {
@@ -523,7 +556,7 @@ private fun Grid(result: ResultSet, open: (String, String?) -> Unit) {
                             Modifier
                                 .width(widths[at])
                                 .height(34.dp)
-                                .clickable { open(result.columns[at].name, value) }
+                                .clickable { open(index) }
                                 .padding(horizontal = 10.dp),
                             contentAlignment = Alignment.CenterStart,
                         ) {
@@ -592,7 +625,7 @@ private fun Cell(text: String, width: androidx.compose.ui.unit.Dp, color: androi
 }
 
 @Composable
-private fun Records(result: ResultSet, open: (String, String?) -> Unit) {
+private fun Records(result: ResultSet, open: (Int) -> Unit) {
     val palette = LocalPalette.current
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         itemsIndexed(result.rows) { index, row ->
@@ -600,7 +633,7 @@ private fun Records(result: ResultSet, open: (String, String?) -> Unit) {
                 Column(Modifier.fillMaxWidth().padding(10.dp)) {
                     Text("#${index + 1}", fontFamily = Mono, fontSize = 11.sp, color = palette.faint)
                     row.forEachIndexed { at, value ->
-                        Row(Modifier.fillMaxWidth().clickable { open(result.columns[at].name, value) }.padding(vertical = 2.dp)) {
+                        Row(Modifier.fillMaxWidth().clickable { open(index) }.padding(vertical = 2.dp)) {
                             Text(result.columns[at].name, fontFamily = Mono, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(120.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(
                                 value ?: "NULL",
@@ -631,6 +664,7 @@ private fun csv(result: ResultSet): String {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SchemaPane(model: AppViewModel) {
     var filter by remember { mutableStateOf("") }
@@ -644,47 +678,58 @@ private fun SchemaPane(model: AppViewModel) {
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = { model.refreshCatalog() }) { Icon(Icons.Default.Refresh, contentDescription = "Refresh") }
         }
         model.catalogError?.let { Text(it, color = LocalPalette.current.red, fontFamily = Mono, fontSize = 12.sp, modifier = Modifier.padding(12.dp)) }
         val shown = model.catalog.filter { filter.isBlank() || it.name.contains(filter.trim(), ignoreCase = true) }
-        LazyColumn(Modifier.fillMaxSize()) {
-            shown.groupBy { it.schema }.forEach { (schema, entries) ->
-                item(key = "schema" to schema) { SectionHeader(schema, entries.size) }
-                items(entries, key = { it.schema to it.name }) { entry -> CatalogRow(model, entry) }
+        PullToRefreshBox(isRefreshing = model.refreshingCatalog, onRefresh = { model.refreshCatalog() }, modifier = Modifier.fillMaxSize()) {
+            LazyColumn(Modifier.fillMaxSize()) {
+                shown.groupBy { it.schema }.forEach { (schema, entries) ->
+                    item(key = "schema" to schema) { SectionHeader(schema, entries.size) }
+                    items(entries, key = { it.schema to it.name }) { entry -> CatalogRow(model, entry) }
+                }
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CatalogRow(model: AppViewModel, entry: CatalogEntry) {
     val palette = LocalPalette.current
     val clipboard = LocalClipboardManager.current
     var open by remember { mutableStateOf(false) }
-    Box {
-        Row(
-            Modifier.fillMaxWidth().clickable { open = true }.padding(horizontal = 16.dp, vertical = 11.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                when (entry.kind) {
-                    ObjectKind.TABLE -> "T"
-                    ObjectKind.VIEW -> "V"
-                    ObjectKind.COLLECTION -> "C"
-                },
-                fontFamily = Mono,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = palette.blue,
-            )
-            Text(entry.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-            entry.sizeBytes?.let { Text(size(it.toLong()), fontFamily = Mono, fontSize = 11.sp, color = palette.faint) }
-        }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            DropdownMenuItem(text = { Text("Preview rows") }, onClick = { open = false; model.preview(entry) })
-            DropdownMenuItem(text = { Text("Copy name") }, onClick = { open = false; clipboard.setText(AnnotatedString(entry.name)) })
+    Row(
+        Modifier.fillMaxWidth().clickable { open = true }.padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            when (entry.kind) {
+                ObjectKind.TABLE -> "T"
+                ObjectKind.VIEW -> "V"
+                ObjectKind.COLLECTION -> "C"
+            },
+            fontFamily = Mono,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = palette.blue,
+        )
+        Text(entry.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        entry.sizeBytes?.let { Text(size(it.toLong()), fontFamily = Mono, fontSize = 11.sp, color = palette.faint) }
+    }
+    if (open) {
+        ModalBottomSheet(onDismissRequest = { open = false }) {
+            SheetTitle(entry.name, entry.schema)
+            Column(Modifier.navigationBarsPadding()) {
+                SheetAction("Preview rows", detail = "DBDelve's own query, with a LIMIT, in a tab of its own") {
+                    open = false
+                    model.preview(entry)
+                }
+                SheetAction("Copy name") {
+                    open = false
+                    runCatching { clipboard.setText(AnnotatedString(entry.name)) }
+                }
+            }
         }
     }
 }

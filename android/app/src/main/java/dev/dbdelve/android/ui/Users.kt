@@ -21,8 +21,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -78,6 +81,7 @@ private fun Account.label() = if (host.isEmpty()) name else "$name@$host"
 
 private fun RoleRef.label() = if (database.isEmpty()) role else "$role@$database"
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UsersPane(model: AppViewModel) {
     val session = model.session ?: return
@@ -89,7 +93,6 @@ fun UsersPane(model: AppViewModel) {
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Users", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            IconButton(onClick = { model.refreshUsers() }) { Icon(Icons.Default.Refresh, contentDescription = "Refresh") }
             TextButton(onClick = { form = Form.Create }) {
                 Icon(Icons.Default.Add, contentDescription = null)
                 Text("New user", modifier = Modifier.padding(start = 4.dp))
@@ -115,10 +118,12 @@ fun UsersPane(model: AppViewModel) {
         model.usersError?.let {
             Text(it, color = palette.red, fontFamily = Mono, fontSize = 12.sp, modifier = Modifier.padding(16.dp))
         }
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(model.users, key = { it.account.name to it.account.host }) { user ->
-                UserRow(user, abilities) { form = Form.Detail(user) }
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        PullToRefreshBox(isRefreshing = model.refreshingUsers, onRefresh = { model.refreshUsers() }, modifier = Modifier.fillMaxSize()) {
+            LazyColumn(Modifier.fillMaxSize()) {
+                items(model.users, key = { it.account.name to it.account.host }) { user ->
+                    UserRow(user, abilities) { form = Form.Detail(user) }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                }
             }
         }
     }
@@ -177,6 +182,7 @@ private fun Tag(text: String, color: androidx.compose.ui.graphics.Color) {
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun UserDetail(
     model: AppViewModel,
@@ -188,11 +194,12 @@ private fun UserDetail(
     val palette = LocalPalette.current
     val account = user.account
     LaunchedEffect(account) { model.loadGrants(account) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(account.label(), fontFamily = Mono) },
-        text = {
-            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        SheetTitle(account.label())
+            Column(
+                Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()).navigationBarsPadding().padding(horizontal = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
                 Text("What it may do", style = MaterialTheme.typography.labelLarge)
                 val grants = model.grants[account]
                 when {
@@ -236,9 +243,7 @@ private fun UserDetail(
                     model.prepare("Drop ${account.label()}", UserAction.Drop(account))
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
+    }
 }
 
 @Composable

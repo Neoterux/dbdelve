@@ -17,6 +17,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.dbdelve.android.data.ProfileStore
 import dev.dbdelve.android.data.Secrets
+import dev.dbdelve.android.data.SavedQueryStore
 import dev.dbdelve.android.data.TabStore
 import dev.dbdelve.android.ui.ConnectionForm
 import dev.dbdelve.android.ui.ConnectionsScreen
@@ -32,6 +33,7 @@ class MainActivity : FragmentActivity() {
                     ProfileStore(filesDir),
                     Secrets(applicationContext),
                     TabStore(File(filesDir, "tabs")),
+                    SavedQueryStore(filesDir),
                 ) { connection ->
                     QueryService.keepAlive(applicationContext, connection)
                 }
