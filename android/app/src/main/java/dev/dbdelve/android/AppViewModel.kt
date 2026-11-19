@@ -73,6 +73,9 @@ sealed interface Screen {
 
 enum class Pane { QUERY, RESULTS, SCHEMA, USERS }
 
+/** How the Query screen makes a statement: typed, or built by tapping. */
+enum class QueryInput { TEXT, BUILDER }
+
 fun Throwable.reason(): String = when (this) {
     is CoreException.Connect -> reason
     is CoreException.Query -> reason
@@ -203,13 +206,15 @@ class AppViewModel(
         get() = profile?.let { open -> allSaved.filter { it.profileId == open.id }.sortedBy { it.name.lowercase() } }.orEmpty()
 
     /** Saves [text] as [name] for this connection, replacing one of that name. */
-    fun saveQuery(name: String, text: String) {
+    fun saveQuery(name: String, text: String, fromTab: Boolean = true) {
         val profileId = profile?.id ?: return
         val kept = allSaved.filterNot { it.profileId == profileId && it.name == name }
         allSaved = kept + SavedQuery(SavedQueryStore.newId(), profileId, name, text)
         savedStore.save(allSaved)
-        tab?.title = name
-        saveTabs()
+        if (fromTab) {
+            tab?.title = name
+            saveTabs()
+        }
     }
 
     fun deleteSaved(query: SavedQuery) {
@@ -251,6 +256,8 @@ class AppViewModel(
                 this@AppViewModel.profile = profile
                 mode = profile.mode
                 restoreTabs(profile)
+                builder = BuilderState()
+                input = QueryInput.TEXT
                 pane = Pane.QUERY
                 screen = Screen.Workspace
                 refreshCatalog()
@@ -556,6 +563,51 @@ class AppViewModel(
                 catalogError = null
             }.onFailure { catalogError = it.reason() }
         }
+    }
+
+    var input by mutableStateOf(QueryInput.TEXT)
+
+    /** The builder's choices for this connection, kept while it is open. */
+    var builder by mutableStateOf(BuilderState())
+        private set
+
+    /** Starts the builder on [entry], reading its columns to choose from. */
+    fun build(entry: CatalogEntry) {
+        val session = session ?: return
+        val state = BuilderState(entry)
+        builder = state
+        input = QueryInput.BUILDER
+        pane = Pane.QUERY
+        viewModelScope.launch {
+            val read = withContext(Dispatchers.IO) { runCatching { session.columns(entry.schema, entry.name) } }
+            if (builder !== state) return@launch
+            state.loadingColumns = false
+            read.onSuccess { state.columns = it }.onFailure { state.columnsError = it.reason() }
+        }
+    }
+
+    /**
+     * The builder's statement with its values filled in, in a tab of its own:
+     * what runs is on screen and passes the gate like anything typed. Returns
+     * why it could not be filled, or null.
+     */
+    fun openBuilt(run: Boolean): String? {
+        val session = session ?: return "Not connected."
+        val entry = builder.table ?: return "Choose a table first."
+        val built = builder.built(session.engine()) ?: return "Choose a table first."
+        val filled = runCatching { fillParameters(session.engine(), built.text, builder.bindings(built)) }
+            .getOrElse { return it.reason() }
+        val tab = newTab(entry.name, filled)
+        input = QueryInput.TEXT
+        if (run) execute(tab, filled, emptyList(), runOnce = false, onceIn = null) else pane = Pane.QUERY
+        return null
+    }
+
+    /** Saves the builder's statement with its `:name` parameters, asked for at each run. */
+    fun saveBuilt(name: String) {
+        val engine = session?.engine() ?: return
+        val built = builder.built(engine) ?: return
+        saveQuery(name, built.text, fromTab = false)
     }
 
     /** DBDelve's own preview query, in a tab of its own where it can be read. */

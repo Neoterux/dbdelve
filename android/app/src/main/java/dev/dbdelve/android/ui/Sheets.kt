@@ -16,7 +16,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -36,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -52,15 +60,26 @@ import uniffi.dbdelve_core.parameters
 
 /** One tappable line of a bottom sheet: a sheet is a list of these. */
 @Composable
-fun SheetAction(text: String, color: Color = MaterialTheme.colorScheme.onSurface, detail: String? = null, onClick: () -> Unit) {
-    Column(
+fun SheetAction(
+    text: String,
+    color: Color = MaterialTheme.colorScheme.onSurface,
+    detail: String? = null,
+    icon: ImageVector? = null,
+    onClick: () -> Unit,
+) {
+    Row(
         Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
             .padding(horizontal = 24.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text(text, color = color, fontSize = 16.sp)
-        detail?.let { Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+        icon?.let { Icon(it, contentDescription = null, tint = if (color == MaterialTheme.colorScheme.onSurface) MaterialTheme.colorScheme.onSurfaceVariant else color) }
+        Column(Modifier.weight(1f)) {
+            Text(text, color = color, fontSize = 16.sp)
+            detail?.let { Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+        }
     }
 }
 
@@ -90,7 +109,7 @@ fun SavedQueriesSheet(model: AppViewModel, onDismiss: () -> Unit) {
         val shown = model.saved.filter { filter.isBlank() || it.name.contains(filter.trim(), ignoreCase = true) }
         if (model.saved.isEmpty()) {
             Text(
-                "Nothing saved for this connection yet. Write a query, then Save it from the editor's menu.",
+                "Nothing saved for this connection yet. Save a query from the editor or the builder with the bookmark button.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(24.dp),
             )
@@ -103,18 +122,25 @@ fun SavedQueriesSheet(model: AppViewModel, onDismiss: () -> Unit) {
                     Text(query.name, fontWeight = FontWeight.SemiBold)
                     Text(query.text.lineSequence().first().take(80), fontFamily = Mono, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (names.isNotEmpty()) Text(names.joinToString("  ") { ":$it" }, fontFamily = Mono, fontSize = 11.sp, color = LocalPalette.current.aqua)
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        TextButton(onClick = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        FilledTonalButton(onClick = {
                             if (names.isEmpty()) {
                                 model.runSaved(query, emptyList())
                                 onDismiss()
                             } else {
                                 running = query
                             }
-                        }) { Text("Run") }
-                        TextButton(onClick = { model.openSaved(query); onDismiss() }) { Text("Open") }
+                        }) {
+                            Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                            Text("Run", Modifier.padding(start = 6.dp))
+                        }
+                        IconButton(onClick = { model.openSaved(query); onDismiss() }) {
+                            Icon(Icons.Default.Edit, contentDescription = "Open ${query.name} in a tab")
+                        }
                         Spacer(Modifier.weight(1f))
-                        TextButton(onClick = { confirmDelete = query }) { Text("Delete", color = LocalPalette.current.red) }
+                        IconButton(onClick = { confirmDelete = query }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete ${query.name}", tint = LocalPalette.current.red)
+                        }
                     }
                 }
                 HorizontalDivider()

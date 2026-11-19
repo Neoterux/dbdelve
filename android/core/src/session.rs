@@ -544,6 +544,66 @@ impl Session {
         }
     }
 
+    /// An object's columns, in table order, for the query builder. MongoDB
+    /// has no schema, so there it is the fields of one document.
+    pub fn columns(&self, schema: String, name: String) -> Result<Vec<Column>, CoreError> {
+        let mut driver = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *driver {
+            Driver::Postgres { runtime, client } => {
+                let rows = runtime
+                    .block_on(client.query(
+                        "SELECT column_name::text, data_type::text \
+                         FROM information_schema.columns \
+                         WHERE table_schema = $1 AND table_name = $2 \
+                         ORDER BY ordinal_position",
+                        &[&schema, &name],
+                    ))
+                    .map_err(|error| query_error(postgres_error(error)))?;
+                Ok(rows
+                    .iter()
+                    .map(|row| Column {
+                        name: row.get(0),
+                        type_tag: row.get(1),
+                    })
+                    .collect())
+            }
+            Driver::MySql(conn) => {
+                let rows: Vec<(String, String)> = conn
+                    .exec(
+                        "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                        (schema, name),
+                    )
+                    .map_err(query_error)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(name, type_tag)| Column { name, type_tag })
+                    .collect())
+            }
+            Driver::Mongo { runtime, database } => {
+                let first = runtime
+                    .block_on(async {
+                        database
+                            .collection::<Document>(&name)
+                            .find_one(Document::new())
+                            .await
+                    })
+                    .map_err(query_error)?;
+                Ok(first
+                    .map(|document| {
+                        document
+                            .keys()
+                            .map(|key| Column {
+                                name: key.clone(),
+                                type_tag: String::new(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            }
+        }
+    }
+
     /// DBDelve's own preview of an object: the one place it writes a `LIMIT`,
     /// returned as text so the UI shows what it runs.
     pub fn preview(&self, schema: String, name: String, limit: u32) -> String {

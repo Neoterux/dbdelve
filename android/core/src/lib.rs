@@ -7,6 +7,7 @@
 
 uniffi::setup_scaffolding!();
 
+pub mod builder;
 pub mod bundle;
 pub mod gate;
 pub mod mongo_cmd;
@@ -15,6 +16,7 @@ mod session;
 pub mod split;
 pub mod users;
 
+pub use builder::{BuiltQuery, Filter, FilterOp, QuerySpec};
 pub use gate::{Destructive, Mode, Stop, Verdict};
 pub use params::{Binding, ParamValue};
 pub use session::{CatalogEntry, Column, ObjectKind, ResultSet, RunOutcome, Session};
@@ -105,6 +107,13 @@ pub fn fill_parameters(
     bindings: Vec<Binding>,
 ) -> Result<String, CoreError> {
     params::fill(engine, &text, &bindings)
+}
+
+/// A query from the builder's choices, every typed value left as a `:name`
+/// parameter for [`fill_parameters`].
+#[uniffi::export]
+pub fn build_query(engine: Engine, spec: QuerySpec) -> BuiltQuery {
+    builder::build(engine, &spec)
 }
 
 /// Seals the app's connections JSON into a file to share, under a passphrase.

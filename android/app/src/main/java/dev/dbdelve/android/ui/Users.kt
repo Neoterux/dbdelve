@@ -21,6 +21,18 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddModerator
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.GroupAdd
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.PersonRemove
+import androidx.compose.material.icons.filled.RemoveCircleOutline
+import androidx.compose.material.icons.filled.RemoveModerator
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.AlertDialog
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -212,25 +224,25 @@ private fun UserDetail(
                     user.roles.forEach { role ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(role.label(), fontFamily = Mono, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                            TextButton(onClick = {
+                            IconButton(onClick = {
                                 onDismiss()
                                 model.prepare(
                                     "Revoke ${role.label()} from ${account.label()}",
                                     UserAction.RevokeRole(account, role.role, role.database),
                                 )
-                            }) { Text("Revoke") }
+                            }) { Icon(Icons.Default.RemoveCircleOutline, contentDescription = "Revoke ${role.label()}", tint = palette.red) }
                         }
                     }
                 }
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                Action("Change password") { open(Form.Password(account)) }
+                Action("Change password", Icons.Default.Key) { open(Form.Password(account)) }
                 if (abilities.privileges.isNotEmpty()) {
-                    Action("Grant privileges") { open(Form.Privileges(account, grant = true)) }
-                    Action("Revoke privileges") { open(Form.Privileges(account, grant = false)) }
+                    Action("Grant privileges", Icons.Default.AddModerator) { open(Form.Privileges(account, grant = true)) }
+                    Action("Revoke privileges", Icons.Default.RemoveModerator) { open(Form.Privileges(account, grant = false)) }
                 }
-                if (abilities.roles) Action("Grant a role") { open(Form.Role(account)) }
+                if (abilities.roles) Action("Grant a role", Icons.Default.GroupAdd) { open(Form.Role(account)) }
                 if (abilities.loginToggle) {
-                    Action(if (user.canLogin) "Disable login" else "Enable login") {
+                    Action(if (user.canLogin) "Disable login" else "Enable login", if (user.canLogin) Icons.Default.Block else Icons.AutoMirrored.Filled.Login) {
                         onDismiss()
                         model.prepare(
                             "${if (user.canLogin) "Disable" else "Enable"} login for ${account.label()}",
@@ -238,7 +250,7 @@ private fun UserDetail(
                         )
                     }
                 }
-                Action("Drop ${account.label()}", palette.red) {
+                Action("Drop ${account.label()}", Icons.Default.PersonRemove, palette.red) {
                     onDismiss()
                     model.prepare("Drop ${account.label()}", UserAction.Drop(account))
                 }
@@ -247,13 +259,20 @@ private fun UserDetail(
 }
 
 @Composable
-private fun Action(text: String, color: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.primary, onClick: () -> Unit) {
-    Text(
-        text,
-        color = color,
-        fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
-    )
+private fun Action(
+    text: String,
+    icon: ImageVector,
+    color: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.primary,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Icon(icon, null, tint = color, modifier = Modifier.size(20.dp))
+        Text(text, color = color, fontWeight = FontWeight.SemiBold)
+    }
 }
 
 @Composable
@@ -266,7 +285,14 @@ private fun PasswordField(password: String, note: String, onChange: (String) -> 
         singleLine = true,
         visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        trailingIcon = { TextButton(onClick = { visible = !visible }) { Text(if (visible) "Hide" else "Show") } },
+        trailingIcon = {
+            IconButton(onClick = { visible = !visible }) {
+                Icon(
+                    if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                    contentDescription = if (visible) "Hide password" else "Show password",
+                )
+            }
+        },
         modifier = Modifier.fillMaxWidth(),
     )
     Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

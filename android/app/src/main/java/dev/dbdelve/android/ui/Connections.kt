@@ -4,6 +4,13 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.NewReleases
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -86,14 +93,20 @@ fun ConnectionsScreen(model: AppViewModel) {
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                             DropdownMenuItem(
                                 text = { Text("Share connections") },
+                                leadingIcon = { Icon(Icons.Default.Share, null) },
                                 enabled = model.profiles.isNotEmpty(),
                                 onClick = { menu = false; exporting = true },
                             )
                             DropdownMenuItem(
                                 text = { Text("Import connections") },
+                                leadingIcon = { Icon(Icons.Default.FileOpen, null) },
                                 onClick = { menu = false; pick.launch(arrayOf("*/*")) },
                             )
-                            DropdownMenuItem(text = { Text("What's new") }, onClick = { menu = false; changelog = true })
+                            DropdownMenuItem(
+                                text = { Text("What's new") },
+                                leadingIcon = { Icon(Icons.Default.NewReleases, null) },
+                                onClick = { menu = false; changelog = true },
+                            )
                         }
                     }
                 },
@@ -213,10 +226,10 @@ private fun ProfileRow(profile: Profile, connecting: Boolean, model: AppViewMode
         ModalBottomSheet(onDismissRequest = { menu = false }) {
             SheetTitle(profile.name, "${profile.host}:${profile.port}")
             Column(Modifier.navigationBarsPadding()) {
-                SheetAction("Connect") { menu = false; model.connect(profile) }
-                SheetAction("Edit") { menu = false; model.screen = Screen.Edit(profile) }
-                SheetAction("Duplicate", detail = "Keeps its mode") { menu = false; model.screen = Screen.Edit(profile, duplicate = true) }
-                SheetAction("Remove", color = LocalPalette.current.red) { menu = false; removing = true }
+                SheetAction("Connect", icon = Icons.Default.Link) { menu = false; model.connect(profile) }
+                SheetAction("Edit", icon = Icons.Default.Edit) { menu = false; model.screen = Screen.Edit(profile) }
+                SheetAction("Duplicate", detail = "Keeps its mode", icon = Icons.Default.ContentCopy) { menu = false; model.screen = Screen.Edit(profile, duplicate = true) }
+                SheetAction("Remove", color = LocalPalette.current.red, icon = Icons.Default.Delete) { menu = false; removing = true }
             }
         }
     }

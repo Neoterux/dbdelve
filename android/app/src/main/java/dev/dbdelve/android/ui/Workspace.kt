@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.LaunchedEffect
@@ -45,13 +44,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
@@ -69,12 +64,10 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -102,6 +95,36 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.filled.AccountTree
+import androidx.compose.material.icons.filled.BookmarkAdd
+import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.CheckCircleOutline
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DataObject
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.TableChart
+import androidx.compose.material.icons.filled.TableRows
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VerticalAlignBottom
+import androidx.compose.material.icons.filled.ViewAgenda
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.InputChip
+import androidx.compose.ui.graphics.vector.ImageVector
+import dev.dbdelve.android.QueryInput
 import dev.dbdelve.android.AppViewModel
 import dev.dbdelve.android.Pane
 import dev.dbdelve.android.PendingGate
@@ -164,30 +187,24 @@ fun WorkspaceScreen(model: AppViewModel, authenticate: Authenticate) {
         bottomBar = {
             if (!WindowInsets.isImeVisible) {
                 NavigationBar {
-                    NavigationBarItem(
-                        selected = model.pane == Pane.QUERY,
-                        onClick = { model.pane = Pane.QUERY },
-                        icon = { Icon(Icons.Default.Edit, contentDescription = null) },
-                        label = { Text("Query") },
-                    )
-                    NavigationBarItem(
-                        selected = model.pane == Pane.RESULTS,
-                        onClick = { model.pane = Pane.RESULTS },
-                        icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
-                        label = { Text("Results") },
-                    )
-                    NavigationBarItem(
-                        selected = model.pane == Pane.SCHEMA,
-                        onClick = { model.pane = Pane.SCHEMA },
-                        icon = { Icon(Icons.Default.Menu, contentDescription = null) },
-                        label = { Text("Schema") },
-                    )
-                    NavigationBarItem(
-                        selected = model.pane == Pane.USERS,
-                        onClick = { model.pane = Pane.USERS },
-                        icon = { Icon(Icons.Default.Person, contentDescription = null) },
-                        label = { Text("Users") },
-                    )
+                    Pane.entries.forEach { pane ->
+                        NavigationBarItem(
+                            selected = model.pane == pane,
+                            onClick = { model.pane = pane },
+                            icon = {
+                                val rows = model.tab?.result?.rows?.size
+                                when {
+                                    pane == Pane.RESULTS && model.running -> BadgedBox(badge = { Badge() }) { Icon(pane.icon(), null) }
+                                    pane == Pane.RESULTS && model.tab?.error != null ->
+                                        BadgedBox(badge = { Badge(containerColor = palette.red) { Text("!") } }) { Icon(pane.icon(), null) }
+                                    pane == Pane.RESULTS && rows != null ->
+                                        BadgedBox(badge = { Badge { Text(if (rows > 999) "999+" else "$rows") } }) { Icon(pane.icon(), null) }
+                                    else -> Icon(pane.icon(), null)
+                                }
+                            },
+                            label = { Text(pane.label()) },
+                        )
+                    }
                 }
             }
         },
@@ -246,34 +263,167 @@ private fun ModeChip(model: AppViewModel, authenticate: Authenticate) {
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun QueryPane(model: AppViewModel) {
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SingleChoiceSegmentedButtonRow {
+                QueryInput.entries.forEachIndexed { at, input ->
+                    SegmentedButton(
+                        selected = model.input == input,
+                        onClick = { model.input = input },
+                        shape = SegmentedButtonDefaults.itemShape(at, QueryInput.entries.size),
+                        icon = {},
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(input.icon(), null, Modifier.size(18.dp))
+                            Text(input.label(), Modifier.padding(start = 6.dp), fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            if (model.input == QueryInput.TEXT) TabCount(model)
+        }
+        when (model.input) {
+            QueryInput.TEXT -> Editor(model)
+            QueryInput.BUILDER -> QueryBuilder(model)
+        }
+    }
+}
+
+/** The open tabs as a count, the way a phone's browser shows them; tap for every tab at once. */
+@Composable
+private fun TabCount(model: AppViewModel) {
+    var open by remember { mutableStateOf(false) }
+    IconButton(onClick = { open = true }) {
+        Box(
+            Modifier.size(24.dp).border(2.dp, MaterialTheme.colorScheme.onSurface, RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("${model.tabs.size.coerceAtMost(99)}", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+    if (open) TabsSheet(model) { open = false }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TabsSheet(model: AppViewModel, onDismiss: () -> Unit) {
+    val palette = LocalPalette.current
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("${model.tabs.size} tabs", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            FilledTonalButton(onClick = { model.newTab(); onDismiss() }) {
+                Icon(Icons.Default.Add, null, Modifier.size(18.dp))
+                Text("New tab", Modifier.padding(start = 6.dp))
+            }
+        }
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            contentPadding = PaddingValues(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.heightIn(max = 560.dp).navigationBarsPadding(),
+        ) {
+            itemsIndexed(model.tabs, key = { _, tab -> tab.id }) { at, tab ->
+                val current = at == model.current
+                Surface(
+                    onClick = { model.select(at); onDismiss() },
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = RoundedCornerShape(12.dp),
+                    border = if (current) androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+                ) {
+                    Column(Modifier.padding(start = 10.dp, bottom = 10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(tab.title, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            IconButton(onClick = { model.closeTab(tab) }, modifier = Modifier.size(36.dp)) {
+                                Icon(Icons.Default.Close, contentDescription = "Close ${tab.title}", modifier = Modifier.size(16.dp))
+                            }
+                        }
+                        Text(
+                            tab.text.text.ifBlank { "Empty" },
+                            fontFamily = Mono,
+                            fontSize = 10.sp,
+                            lineHeight = 13.sp,
+                            color = if (tab.text.text.isBlank()) palette.faint else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(end = 10.dp).heightIn(min = 52.dp),
+                        )
+                        val result = tab.result
+                        val (icon, note, tint) = when {
+                            tab.error != null -> Triple(Icons.Default.ErrorOutline, "Error", palette.red)
+                            result != null -> Triple(Icons.Default.CheckCircleOutline, "%,d rows".format(result.rows.size), palette.green)
+                            else -> Triple(Icons.Default.Schedule, "Not run", palette.faint)
+                        }
+                        Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(icon, null, Modifier.size(14.dp), tint = tint)
+                            Text(note, fontSize = 11.sp, color = tint, modifier = Modifier.padding(start = 4.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun Editor(model: AppViewModel) {
     val session = model.session ?: return
     val engine = session.engine()
     val palette = LocalPalette.current
     val tab = model.tab ?: return
     Column(Modifier.fillMaxSize().imePadding()) {
-        ScrollableTabRow(selectedTabIndex = model.current, edgePadding = 8.dp) {
-            model.tabs.forEachIndexed { at, each ->
-                Tab(
-                    selected = at == model.current,
+        val strip = rememberLazyListState()
+        LaunchedEffect(model.current, model.tabs.size) {
+            if (model.current in model.tabs.indices) strip.animateScrollToItem(model.current)
+        }
+        LazyRow(
+            state = strip,
+            contentPadding = PaddingValues(horizontal = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            itemsIndexed(model.tabs, key = { _, each -> each.id }) { at, each ->
+                val selected = at == model.current
+                InputChip(
+                    selected = selected,
                     onClick = { model.select(at) },
-                    text = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(each.title, maxLines = 1)
-                            if (at == model.current) {
-                                Icon(
-                                    Icons.Default.Close,
-                                    contentDescription = "Close ${each.title}",
-                                    modifier = Modifier.padding(start = 6.dp).size(14.dp).clickable { model.closeTab(each) },
-                                )
-                            }
+                    label = { Text(each.title, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 140.dp)) },
+                    leadingIcon = if (each.error != null || each.result != null) {
+                        {
+                            val failed = each.error != null
+                            Icon(
+                                if (failed) Icons.Default.ErrorOutline else Icons.Default.CheckCircleOutline,
+                                contentDescription = if (failed) "Error" else "Ran",
+                                modifier = Modifier.size(16.dp),
+                                tint = if (failed) palette.red else palette.green,
+                            )
                         }
+                    } else {
+                        null
+                    },
+                    trailingIcon = if (selected) {
+                        {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Close ${each.title}",
+                                modifier = Modifier.size(16.dp).clickable { model.closeTab(each) },
+                            )
+                        }
+                    } else {
+                        null
                     },
                 )
             }
-            Tab(selected = false, onClick = { model.newTab() }, icon = { Icon(Icons.Default.Add, contentDescription = "New query") })
+            item {
+                IconButton(onClick = { model.newTab() }) { Icon(Icons.Default.Add, contentDescription = "New tab") }
+            }
         }
 
         BasicTextField(
@@ -322,12 +472,17 @@ private fun QueryPane(model: AppViewModel) {
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             RowLimit(model)
-            IconButton(onClick = { savedOpen = true }) { Icon(Icons.Default.Star, contentDescription = "Saved queries") }
-            TextButton(onClick = { saving = true }, enabled = tab.text.text.isNotBlank()) { Text("Save") }
+            IconButton(onClick = { savedOpen = true }) { Icon(Icons.Default.Bookmarks, contentDescription = "Saved queries") }
+            IconButton(onClick = { saving = true }, enabled = tab.text.text.isNotBlank()) {
+                Icon(Icons.Default.BookmarkAdd, contentDescription = "Save this query")
+            }
             Spacer(Modifier.weight(1f))
             if (model.running) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                FilledTonalButton(onClick = { model.cancel() }) { Text("Cancel") }
+                FilledTonalButton(onClick = { model.cancel() }) {
+                    Icon(Icons.Default.Stop, null, Modifier.size(18.dp))
+                    Text("Stop", Modifier.padding(start = 6.dp))
+                }
             } else {
                 // Wide and at the thumb's corner: the one control used most.
                 Button(
@@ -361,7 +516,12 @@ private fun QueryPane(model: AppViewModel) {
 private fun RowLimit(model: AppViewModel) {
     var open by remember { mutableStateOf(false) }
     Box {
-        TextButton(onClick = { open = true }) { Text("%,d rows ▾".format(model.rowLimit)) }
+        // The cap on rows kept from a read: the statement itself is sent as typed.
+        AssistChip(
+            onClick = { open = true },
+            label = { Text("%,d".format(model.rowLimit)) },
+            leadingIcon = { Icon(Icons.Default.VerticalAlignBottom, contentDescription = "Row limit", modifier = Modifier.size(16.dp)) },
+        )
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             listOf(100, 1_000, 10_000).forEach { limit ->
                 DropdownMenuItem(text = { Text("%,d rows".format(limit)) }, onClick = { model.rowLimit = limit; open = false })
@@ -461,7 +621,7 @@ private fun ResultsPane(model: AppViewModel) {
     val error = tab?.error
     val result = tab?.result
     when {
-        tab == null || (error == null && result == null) -> Centered("Run a statement to see its rows here.")
+        tab == null || (error == null && result == null) -> Centered("Run a statement to see its rows here.", Icons.Default.TableRows)
         error != null -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
             Text("The server returned an error", color = palette.red, fontWeight = FontWeight.SemiBold)
             Text(error, fontFamily = Mono, fontSize = 13.sp, modifier = Modifier.padding(vertical = 10.dp))
@@ -491,14 +651,24 @@ private fun Rows(result: ResultSet, title: String) {
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
             SingleChoiceSegmentedButtonRow {
-                SegmentedButton(selected = !records, onClick = { records = false }, shape = SegmentedButtonDefaults.itemShape(0, 2)) { Text("Grid") }
-                SegmentedButton(selected = records, onClick = { records = true }, shape = SegmentedButtonDefaults.itemShape(1, 2)) { Text("Records") }
+                SegmentedButton(selected = !records, onClick = { records = false }, shape = SegmentedButtonDefaults.itemShape(0, 2), icon = {}) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.GridOn, null, Modifier.size(18.dp))
+                        Text("Grid", Modifier.padding(start = 6.dp), fontSize = 13.sp)
+                    }
+                }
+                SegmentedButton(selected = records, onClick = { records = true }, shape = SegmentedButtonDefaults.itemShape(1, 2), icon = {}) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.ViewAgenda, null, Modifier.size(18.dp))
+                        Text("Cards", Modifier.padding(start = 6.dp), fontSize = 13.sp)
+                    }
+                }
             }
             Spacer(Modifier.weight(1f))
             IconButton(onClick = { runCatching { shareCsv(context, title, csv(result)) } }) {
                 Icon(Icons.Default.Share, contentDescription = "Share as CSV")
             }
-            TextButton(onClick = { copy(csv(result)) }) { Text("Copy") }
+            IconButton(onClick = { copy(csv(result)) }) { Icon(Icons.Default.ContentCopy, contentDescription = "Copy as CSV") }
         }
         copyNote?.let { Text(it, color = palette.red, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp)) }
         Box(Modifier.weight(1f)) {
@@ -703,17 +873,7 @@ private fun CatalogRow(model: AppViewModel, entry: CatalogEntry) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text(
-            when (entry.kind) {
-                ObjectKind.TABLE -> "T"
-                ObjectKind.VIEW -> "V"
-                ObjectKind.COLLECTION -> "C"
-            },
-            fontFamily = Mono,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            color = palette.blue,
-        )
+        Icon(entry.kind.icon(), contentDescription = entry.kind.name.lowercase(), tint = palette.blue, modifier = Modifier.size(20.dp))
         Text(entry.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         entry.sizeBytes?.let { Text(size(it.toLong()), fontFamily = Mono, fontSize = 11.sp, color = palette.faint) }
     }
@@ -721,11 +881,15 @@ private fun CatalogRow(model: AppViewModel, entry: CatalogEntry) {
         ModalBottomSheet(onDismissRequest = { open = false }) {
             SheetTitle(entry.name, entry.schema)
             Column(Modifier.navigationBarsPadding()) {
-                SheetAction("Preview rows", detail = "DBDelve's own query, with a LIMIT, in a tab of its own") {
+                SheetAction("Preview rows", detail = "DBDelve's own query, with a LIMIT, in a tab of its own", icon = Icons.Default.PlayArrow) {
                     open = false
                     model.preview(entry)
                 }
-                SheetAction("Copy name") {
+                SheetAction("Build a query", detail = "Pick columns, filters and a sort by tapping", icon = Icons.Default.Tune) {
+                    open = false
+                    model.build(entry)
+                }
+                SheetAction("Copy name", icon = Icons.Default.ContentCopy) {
                     open = false
                     runCatching { clipboard.setText(AnnotatedString(entry.name)) }
                 }
@@ -823,8 +987,43 @@ private fun Statement(text: String) {
 }
 
 @Composable
-private fun Centered(text: String) {
-    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+private fun Centered(text: String, icon: ImageVector? = null) {
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        icon?.let { Icon(it, null, Modifier.size(48.dp).padding(bottom = 8.dp), tint = LocalPalette.current.faint) }
         Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+}
+
+fun ObjectKind.icon(): ImageVector = when (this) {
+    ObjectKind.TABLE -> Icons.Default.TableChart
+    ObjectKind.VIEW -> Icons.Default.Visibility
+    ObjectKind.COLLECTION -> Icons.Default.DataObject
+}
+
+private fun Pane.icon(): ImageVector = when (this) {
+    Pane.QUERY -> Icons.Default.Code
+    Pane.RESULTS -> Icons.Default.TableRows
+    Pane.SCHEMA -> Icons.Default.AccountTree
+    Pane.USERS -> Icons.Default.Group
+}
+
+private fun Pane.label(): String = when (this) {
+    Pane.QUERY -> "Query"
+    Pane.RESULTS -> "Results"
+    Pane.SCHEMA -> "Schema"
+    Pane.USERS -> "Users"
+}
+
+private fun QueryInput.icon(): ImageVector = when (this) {
+    QueryInput.TEXT -> Icons.Default.Code
+    QueryInput.BUILDER -> Icons.Default.Tune
+}
+
+private fun QueryInput.label(): String = when (this) {
+    QueryInput.TEXT -> "SQL"
+    QueryInput.BUILDER -> "Builder"
 }
