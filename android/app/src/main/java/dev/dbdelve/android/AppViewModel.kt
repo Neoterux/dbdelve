@@ -61,6 +61,8 @@ fun Throwable.reason(): String = when (this) {
 class AppViewModel(
     private val store: ProfileStore,
     private val secrets: Secrets,
+    /** Called with the connection's name while a statement runs, null after. */
+    private val keepAlive: (connection: String?) -> Unit,
 ) : ViewModel() {
     var profiles by mutableStateOf(store.load())
         private set
@@ -177,14 +179,16 @@ class AppViewModel(
         if (running) return
         running = true
         val limit = rowLimit
-        // ponytail: runs in the view model's scope, so Android may kill a long
-        // statement once the app leaves the screen. A foreground service that
-        // owns the session is the upgrade path.
+        keepAlive(profile?.name)
+        // ponytail: the service keeps the process alive, but the session lives
+        // in the view model, so a statement still ends if Android destroys the
+        // activity outright. A service that owns the session is the upgrade path.
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 runCatching { session.run(statement, limit.toUInt(), confirmed, runOnce, onceIn) }
             }
             running = false
+            keepAlive(null)
             outcome.onSuccess { outcome ->
                 when (outcome) {
                     is RunOutcome.Done -> {

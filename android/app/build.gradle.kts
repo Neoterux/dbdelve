@@ -10,14 +10,14 @@ android {
 
     defaultConfig {
         applicationId = "dev.dbdelve.android"
-        // 26: Keystore AES-GCM without workarounds, and every biometric API
-        // the gate's fingerprint step uses.
-        minSdk = 26
+        // Android 15 only: nothing older to stay compatible with.
+        minSdk = 35
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // 64-bit ARM only. No x86_64, so no emulator: test on a phone.
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -54,8 +54,7 @@ val cargoNdk by tasks.registering(Exec::class) {
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-t", "x86_64",
-        "-P", "26",
+        "-P", "35",
         "-o", jniLibsDir.get().asFile.absolutePath,
         "build", "--release", "--lib",
     )

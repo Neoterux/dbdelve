@@ -25,7 +25,11 @@ import dev.dbdelve.android.ui.WorkspaceScreen
 class MainActivity : FragmentActivity() {
     private val model: AppViewModel by viewModels {
         viewModelFactory {
-            initializer { AppViewModel(ProfileStore(filesDir), Secrets(applicationContext)) }
+            initializer {
+                AppViewModel(ProfileStore(filesDir), Secrets(applicationContext)) { connection ->
+                    QueryService.keepAlive(applicationContext, connection)
+                }
+            }
         }
     }
 

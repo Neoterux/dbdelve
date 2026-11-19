@@ -5,6 +5,23 @@ built on the same rules as the desktop app: your statement runs exactly as
 typed, every statement passes the connection's mode first, and a connection
 starts Read-only.
 
+## Target
+
+64-bit ARM phones on Android 15.
+
+- **Only `arm64-v8a`, only Android 15 (`minSdk 35`).** That halves the native
+  build and drops every compatibility path. It also means no x86_64 emulator
+  image: test on a phone.
+- **No CPU-specific tuning of the Rust core.** It waits on the network, not
+  the CPU, and rustls's crypto already detects and uses the chip's AES and SHA
+  instructions at runtime.
+- **A foreground service while a statement runs** (`QueryService`), because
+  some Android builds reclaim background apps within minutes. For long
+  statements, also allow DBDelve to run in the background in the phone's
+  battery settings.
+- **The mode prompt takes face unlock, fingerprint or PIN.** It accepts weak
+  biometrics, and many phones' face unlock is not a strong biometric.
+
 ## How it is built
 
 ```text
@@ -41,14 +58,18 @@ Prerequisites: Android SDK 35 and an NDK, Rust with the Android targets, and
 `cargo-ndk`.
 
 ```sh
-rustup target add aarch64-linux-android x86_64-linux-android
+rustup target add aarch64-linux-android
 cargo install cargo-ndk
 export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/<version>
 cd android
 ./gradlew :app:assembleDebug        # or open android/ in Android Studio
 ```
 
-`preBuild` runs `cargo ndk` for `arm64-v8a` and `x86_64` (the emulator), then
+To install on the phone, turn on *Developer options → USB debugging* (tap
+*Settings → About phone → Build number* seven times first), connect it, and run
+`./gradlew :app:installDebug`, or `adb install app/build/outputs/apk/debug/app-debug.apk`.
+
+`preBuild` runs `cargo ndk` for `arm64-v8a`, then
 generates the Kotlin bindings from the built library itself, so they always
 describe the core that is packaged.
 
@@ -126,8 +147,9 @@ Deliberate cuts, not oversights; those with a ceiling in the code are marked
   and doesn't say its type.
 - **SSH tunnels.** Desktop shells out to the system `ssh`, which Android
   doesn't have.
-- **Background runs.** A long statement can be killed by Android if you leave
-  the app. A foreground service is the fix.
+- **A session that outlives its screen.** The foreground service keeps the
+  process alive, but the session belongs to the view model, so a statement
+  still ends if Android destroys the activity outright.
 - **Command palette, query history, completion, Explain, and the tablet
   layout from the mockup** (`../design/android/dbdelve-android.html`).
 
