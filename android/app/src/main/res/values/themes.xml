@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; this only sets the window before it does. -->
+    <style name="Theme.DBDelve" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#1D2021</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

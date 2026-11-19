@@ -354,6 +354,9 @@ Read the file a task touches before changing that area:
 - `docs/agents/plugins.md`: **plugins and the ODBC bridge**: the protocol,
   the manifest and discovery, stop vs drain, cancel and resets, the bridge's
   ODBC decisions, and what a plugin connection may not do.
+- `android/README.md`: **the Android app**: its Rust core (Postgres, MySQL
+  5.6, MongoDB) kept out of the desktop crate, the Compose UI, and what each
+  engine does there.
 - `docs/agents/shipping.md`: **bundling and releasing**: `dev/bundle.sh`, the
   dev and release variants, signing and the Keychain, where the ODBC bridge
   lands in each artifact, and cutting a release.

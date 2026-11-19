@@ -1,0 +1,47 @@
+[package]
+name = "dbdelve-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+# Its own workspace: the Android core builds for Android targets with
+# cargo-ndk and must not drag the desktop's GPUI graph or lockfile along.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "dbdelve_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+# The drivers and the parser are the desktop's, at the versions its lockfile
+# holds, so a statement reads and runs here exactly as it does there.
+tokio-postgres = "=0.7.18"
+tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Android has no system store rustls can read, so trust Mozilla's roots.
+webpki-roots = "=1.0.9"
+mysql = { version = "=28.0.0", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+mongodb = { version = "=3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver"] }
+bson = "=2.15.0"
+sqlparser = { version = "=0.63.0", default-features = false, features = ["std", "visitor"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "net", "time", "sync"] }
+futures-util = { version = "=0.3.34", default-features = false }
+serde_json = "=1.0.151"
+# MongoDB arguments in the shell's own spelling: unquoted keys, single quotes.
+json5 = "=0.4.1"
+thiserror = "=2.0.20"
+uniffi = { version = "=0.29.4", features = ["cli"] }
+
+[build-dependencies]
+uniffi = { version = "=0.29.4", features = ["build"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

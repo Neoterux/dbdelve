@@ -1,0 +1,100 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "dev.dbdelve.android"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "dev.dbdelve.android"
+        // 26: Keystore AES-GCM without workarounds, and every biometric API
+        // the gate's fingerprint step uses.
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "0.1.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    buildTypes {
+        release {
+            // Off: JNA reaches the Rust core by reflection, and the bindings
+            // are generated each build. A keep-rules file is the upgrade path.
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    buildFeatures {
+        compose = true
+    }
+    sourceSets["main"].java.srcDir(layout.buildDirectory.dir("generated/uniffi"))
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
+}
+
+val coreDir = rootProject.file("core")
+val jniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
+val bindingsDir = layout.buildDirectory.dir("generated/uniffi")
+
+// The Rust core, cross-compiled per ABI by cargo-ndk (`cargo install
+// cargo-ndk`, and the NDK that ANDROID_NDK_HOME or the SDK names).
+val cargoNdk by tasks.registering(Exec::class) {
+    workingDir = coreDir
+    commandLine(
+        "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-t", "x86_64",
+        "-P", "26",
+        "-o", jniLibsDir.get().asFile.absolutePath,
+        "build", "--release", "--lib",
+    )
+    inputs.dir(coreDir.resolve("src"))
+    inputs.file(coreDir.resolve("Cargo.toml"))
+    inputs.file(coreDir.resolve("Cargo.lock"))
+    outputs.dir(jniLibsDir)
+}
+
+// Kotlin bindings read from the built library itself, so they can never
+// describe a different core from the one packaged.
+val uniffiBindings by tasks.registering(Exec::class) {
+    dependsOn(cargoNdk)
+    workingDir = coreDir
+    commandLine(
+        "cargo", "run", "--quiet", "--bin", "uniffi-bindgen", "--",
+        "generate",
+        "--library", jniLibsDir.get().file("arm64-v8a/libdbdelve_core.so").asFile.absolutePath,
+        "--language", "kotlin",
+        "--no-format",
+        "--out-dir", bindingsDir.get().asFile.absolutePath,
+    )
+    inputs.dir(jniLibsDir)
+    outputs.dir(bindingsDir)
+}
+
+tasks.named("preBuild") { dependsOn(uniffiBindings) }
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    implementation(composeBom)
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.5")
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
